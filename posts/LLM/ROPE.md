@@ -238,3 +238,102 @@ So RoPE supports:
 4.  **Retains Long-Range Context:** The use of low-frequency rotations for some dimensions allows the model to effectively keep track of long-range dependencies in the text.
 
 In conclusion, RoPE is a sophisticated and highly effective solution to one of the Transformer's original challenges, enabling models to be more flexible, robust, and powerful.
+
+### 10. Order of Operation in RoPE  
+
+The RoPE transformation is applied **after** projecting the input embeddings with the $W_Q$ and $W_K$ matrices, but **before** the dot product between the Query and Key vectors is calculated.
+
+Crucially, it is **not applied to the Value vector** at all.
+
+### Step-by-Step Data Flow
+
+Let's trace the data flow for a single token representation, $x_m$, at position `m` as it enters a self-attention block:
+
+1.  **Input:** We start with the token representation $x_m$ from the previous layer. This vector is considered "position-unaware" at this stage.
+
+2.  **Projection (Creating Q, K, and V):** The first step within the attention block is to project $x_m$ into the Query, Key, and Value spaces using their respective learned weight matrices.
+    * $q_m = x_m W_Q$
+    * $k_m = x_m W_K$
+    * $v_m = x_m W_V$
+
+    At this point, we have three distinct vectors representing the token's role as a query, a key, and its actual content. They still do not have explicit relative position information.
+
+3.  **Apply RoPE (The Crucial Step):** Now, we apply the rotary positional transformation, $R_m$, *only* to the Query and Key vectors.
+    * $q'_m = R_m q_m$
+    * $k'_m = R_m k_m$
+    * The value vector, $v_m$, **is left unchanged.**
+
+4.  **Calculate Attention Scores:** The attention scores are calculated using the **rotated**, position-aware Query and Key vectors. For the interaction between tokens at position `m` and `n`:
+    $$\text{score}_{mn} \propto \langle q'_m, k'_n \rangle$$
+
+5.  **Aggregate Values:** The resulting position-aware attention weights are then used to aggregate the **original, un-rotated** Value vectors.
+    $$\text{output}_m = \sum_n \text{softmax}(\text{scores})_{mn} \cdot v_n$$
+
+### Rationale for this Order
+
+This specific order is deliberate and highly effective for two main reasons:
+
+1.  **Role Specialization:** The projection matrices $W_Q$ and $W_K$ have the job of transforming the general token representation `x` into a vector space that is specialized for "querying" and "keying." RoPE's job is to then embed positional geometry into this specialized space. Applying the rotation *after* the projection allows each transformation to do its job cleanly.
+
+2.  **Separation of Relevance and Content:** This design perfectly isolates the two functions of attention.
+    * The Q-K interaction, now modified by RoPE, computes a relevance score that is a function of both content and relative position.
+    * The V vector remains a pure representation of the token's content, free of positional artifacts.
+
+This ensures that we are using position-aware weights to aggregate position-unaware content, which is the central philosophy behind RoPE's design and success.
+
+### 10. Important Visualization
+
+1- *In Absolute positional Embedding, we apply the encoding to all $K$, $Q$, and $V$, however, in Rope we apply the encoding only on $K$ and $Q$*.
+2- In Absolute positional Embedding, the encoding happens before applying the projection matrices $W_Q$ and $W_k$ and $W_v$ but in Rope we apply the positional embedding after applying the projection matrices to $Q$ and $K$.
+
+The distinction arises from the fundamental design differences between **absolute positional embeddings** (like in the original Transformer) and **Rotary Position Embedding (RoPE)**, particularly in how they integrate positional information into the attention mechanism. Below is a clear breakdown:
+
+### 1. **Absolute Positional Embeddings (e.g., Original Transformer)**
+   - **Mechanism**:  
+     Positional embeddings (e.g., sine/cosine or learned) are **added directly to the input token embeddings** before computing queries (\(Q\)), keys (\(K\)), and values (\(V\)).  
+     - Input: \(\text{Input} = \text{Token Embedding} + \text{Positional Embedding}\)  
+     - Then: \(Q, K, V\) are derived from this modified input via linear projections.  
+   - **Why Values (\(V\)) are Position-Encoded**:  
+     Since positional embeddings are fused into the input *before* \(Q\), \(K\), and \(V\) are computed, **all three vectors inherently carry positional information**. This ensures the value vectors (\(V\)) are "position-aware" during the attention-weighted aggregation.  
+     - **Intuition**: The value vector represents the token's content *in its positional context*. Positional info in \(V\) helps preserve location-specific nuances when aggregating values.
+
+---
+
+### 2. **Rotary Position Embedding (RoPE)**
+   - **Mechanism**:  
+     RoPE applies a **rotation transformation** directly to \(Q\) and \(K\) vectors *after* they are projected from token embeddings. This rotation encodes relative positional information into \(Q\) and \(K\) via rotation matrices.  
+     - **Input**: Raw token embeddings (no positional addition).  
+     - **Transform**:  
+       - \(Q\) and \(K\) are rotated based on their positions: \(Q_{\text{rot}} = f(Q, m)\), \(K_{\text{rot}} = f(K, n)\) (for positions \(m\), \(n\)).  
+       - \(V\) **remains unchanged**.  
+   - **Why Values (\(V\)) are NOT Position-Encoded**:  
+     1. **Role in Attention**:  
+        - The attention score \(A_{mn} = Q_m^\top K_n\) depends *only* on \(Q\) and \(K\). RoPE encodes relative positions \((m-n)\) into \(Q_m^\top K_n\) via rotational invariance.  
+        - \(V\) vectors are merely **weighted by the attention scores** \(\text{softmax}(A)\). They do not participate in position-dependent interactions.  
+        - **Key Insight**: Once attention weights are computed (using position-aware \(Q/K\)), they already capture how much each value should contribute *based on position*. Adding positional info to \(V\) is redundant.  
+     2. **Preserving Information Integrity**:  
+        - \(V\) represents the token's semantic content. Rotating \(V\) could distort this information, as rotations are optimized for preserving relative positions in dot products (\(Q^\top K\)), not for representing content.  
+     3. **Efficiency and Simplicity**:  
+        - Omitting \(V\) rotation reduces computation and aligns with RoPE's goal: inject positional info *only where necessary* (i.e., the \(Q^\top K\) interaction).  
+
+---
+
+### **Why the Difference? Core Philosophy**
+- **Absolute Embeddings**:  
+  Positional info is treated as part of the input's identity. Thus, it propagates to \(Q\), \(K\), *and* \(V\) to ensure all components are location-sensitive.  
+- **RoPE**:  
+  Positional info is a *relational bias* for attention scores. It only modifies \(Q\) and \(K\) to make \(Q_m^\top K_n\) position-dependent. \(V\) remains a pure content vector, as the position-aware attention weights suffice for context aggregation.  
+
+### **Supporting Evidence from RoPE Paper**
+The original RoPE paper ([Su et al., 2021](https://arxiv.org/abs/2104.09864)) explicitly states:
+> "We only apply the rotary embedding to the query and key vectors. [...] Since the attention score is computed by the query and key, the rotary embedding is only applied to them."  
+
+This design choice is validated empirically—RoPE achieves superior performance without rotating \(V\).
+
+### **Key Takeaway**
+RoPE avoids rotating \(V\) because:  
+1. Positional dependencies are fully handled in \(Q^\top K\).  
+2. \(V\)'s role is content representation, not position interaction.  
+3. Efficiency: Fewer operations without sacrificing expressiveness.  
+
+In contrast, absolute embeddings modify \(V\) because positional info is baked into the input before \(Q/K/V\) projection.
