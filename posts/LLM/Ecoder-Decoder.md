@@ -15,7 +15,7 @@ The **T5 (Text-to-Text Transfer Transformer)** model unified many NLP tasks unde
 
 -----
 
-![image](../../images/VIT.png)
+![image](../../images/Encoder-Decoder.png)
 
 *Fig. 1: A common Encoder decoder architecture in LLMs*
 
