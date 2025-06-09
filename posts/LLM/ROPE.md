@@ -10,7 +10,7 @@ The self-attention mechanism is permutation-invariant—it has no inherent sense
 
 This approach has two major drawbacks:
 
-![image](../../images/PostionalEmbedding.png)
+![image](../../images/PositionalEmbedding.png)
 
 *Fig.1: How positional embedding encodes the embeddings with different frequencies along the embedding dimension and the position in the sequence. This figure relates to absolute positional embedding.*
 
