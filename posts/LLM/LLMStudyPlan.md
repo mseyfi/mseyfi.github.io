@@ -14,8 +14,8 @@ Understand how GPT-style models process text via self-attention and how tokeniza
 
 * Transformer decoder stack: self-attention, FFN, residuals, LayerNorm
 * Causal attention masking
-* Positional encodings: sinusoidal vs learned
-* Tokenization: BPE, WordPiece, SentencePiece
+* Positional encodings: sinusoidal vs learned, ROPE
+* Tokenization: BPE, WordPiece, SentencePiece (shallow)
 * Special tokens (PAD, BOS, EOS, CLS)
 * Autoregressive language modeling objective
 * Perplexity and cross-entropy loss
@@ -23,12 +23,13 @@ Understand how GPT-style models process text via self-attention and how tokeniza
 ### 🔗 Key Papers:
 
 * Attention is All You Need – Vaswani et al. (2017)
-* Language Models are Few-Shot Learners (GPT-3)
+* Language Models are Few-Shot Learners (GPT-2, GPT-3)
 
 ### 💻 GitHub Repos:
 
 * nanoGPT: [https://github.com/karpathy/nanoGPT](https://github.com/karpathy/nanoGPT)
 * minGPT: [https://github.com/karpathy/minGPT](https://github.com/karpathy/minGPT)
+* https://jaykmody.com/blog/gpt-from-scratch/
 * HuggingFace Tokenizers: [https://github.com/huggingface/tokenizers](https://github.com/huggingface/tokenizers)
 * tiktoken: [https://github.com/openai/tiktoken](https://github.com/openai/tiktoken)
 
@@ -101,7 +102,7 @@ Learn how to adapt pretrained LLMs efficiently.
 
 ### 📘 Topics:
 
-* Supervised instruction tuning: FLAN, Alpaca, Dolly
+* Supervised instruction tuning: FLAN, Alpaca, Doll-E
 * Prompt-response dataset formatting
 * LoRA (Low-Rank Adaptation), QLoRA (4-bit quantization)
 * Prefix tuning, BitFit
