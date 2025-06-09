@@ -14,7 +14,7 @@ Encoder-decoder models are the canonical choice for any task that maps one seque
   * **Classic Examples:**
       * **Machine Translation:** Translating a sentence from English (input sequence) to German (output sequence).
       * **Summarization:** Condensing a long article (input sequence) into a short paragraph (output sequence).
-      * **Conversational Response Generation:** Taking a user's question (input sequence) and generating a helpful answer (output sequence).
+      * **Conversational Response Generation: (Q&A)** Taking a user's question (input sequence) and generating a helpful answer (output sequence).
 
 The **T5 (Text-to-Text Transfer Transformer)** model unified many NLP tasks under this single, powerful framework by framing every problem as a text-to-text conversion.
 
