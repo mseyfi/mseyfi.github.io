@@ -24,7 +24,7 @@ Imagine each token's embedding vector as a point in a high-dimensional space. Ro
 
 Why is this so powerful?
 
-Consider the dot product, which is the heart of the attention mechanism: $\langle q, k \rangle$. In 2D space, the dot product is defined as $\langle q, k \rangle = ||q|| \cdot ||k|| \cdot \cos(\alpha)$, where $\alpha$ is the angle between the vectors.
+Consider the dot product, which is the heart of the attention mechanism: $\langle q, k \rangle$. In 2D space, the dot product is defined as $\langle q, k \rangle = \|q\| \cdot \|k\| \cdot \cos(\alpha)$, where $\alpha$ is the angle between the vectors.
 
 * If we take a query vector $q$ at position **m** and rotate it by an angle $\theta_m$, and we take a key vector $k$ at position **n** and rotate it by an angle $\theta_n$, the angle between the *new*, rotated vectors will be $\alpha + (\theta_m - \theta_n)$.
 * The dot product between these new vectors, $\langle q', k' \rangle$, will now depend on the *relative difference* in their rotation angles, $\theta_m - \theta_n$.
