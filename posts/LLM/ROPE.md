@@ -9,7 +9,8 @@
 The self-attention mechanism is permutation-invariant—it has no inherent sense of word order. The original Transformer and models like BERT and GPT-3 solve this by *adding* a learned **Absolute Positional Embedding** to each token.
 
 This approach has two major drawbacks:
-![image](../../PostionalEmbedding.png)
+
+![image](../../images/PostionalEmbedding.png)
 
 *Fig.1: How positional embedding encodes the embeddings with different frequencies along the embedding dimension and the position in the sequence. This figure relates to absolute positional embedding.*
 
