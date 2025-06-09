@@ -283,7 +283,8 @@ This ensures that we are using position-aware weights to aggregate position-unaw
 
 ### 10. Important Visualization
 
-1- *In Absolute positional Embedding, we apply the encoding to all $K$, $Q$, and $V$, however, in Rope we apply the encoding only on $K$ and $Q$*.
+1- In Absolute positional Embedding, we apply the encoding to all $K$, $Q$, and $V$, however, in Rope we apply the encoding only on $K$ and $Q$.
+
 2- In Absolute positional Embedding, the encoding happens before applying the projection matrices $W_Q$ and $W_k$ and $W_v$ but in Rope we apply the positional embedding after applying the projection matrices to $Q$ and $K$.
 
 The distinction arises from the fundamental design differences between **absolute positional embeddings** (like in the original Transformer) and **Rotary Position Embedding (RoPE)**, particularly in how they integrate positional information into the attention mechanism. Below is a clear breakdown:
