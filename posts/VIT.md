@@ -54,6 +54,8 @@
 
 ---
 ![encoding](https://gist.github.com/user-attachments/assets/4ef9c03e-17bc-448f-80fd-3888ab65d12a)
+![encoding](../images/PositionalEmbedding.png)
+
 
 <a name="positional-encoding"></a>
 ## 2. Positional Encoding
