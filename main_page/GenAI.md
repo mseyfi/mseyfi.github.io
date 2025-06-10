@@ -89,8 +89,8 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for la
 ## [![EVALUATION](https://img.shields.io/badge/Evaluation-Evaluation_Metrics_for_LLMs-blue?style=for-the-badge&logo=github)](../posts/LLM/EvaluationMetricsLLM)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Language models are evaluated across diverse tasks such as next-token prediction, text classification, summarization, translation, code generation, and question answering. Each task requires a suitable metric that reflects model performance both quantitatively and qualitatively.
-
 </div>
+
 ## [![Encoder-Decoder](https://img.shields.io/badge/T5-Encoder_Decoder_Transformers-blue?style=for-the-badge&logo=github)](../posts/LLM/Encoder-Decoder)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Encoder-decoder models are the canonical choice for any task that maps one sequence of arbitrary length to another. They form a powerful and flexible framework for problems where the input and output have different lengths, structures, or even languages.
