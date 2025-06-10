@@ -9,7 +9,7 @@
 
 Of course. I'm glad the tutorial has been helpful.
 
-Here is the complete, unabridged, and final version of our deep dive into Encoder-Decoder architectures, with all of our detailed discussions, mathematical formulations, code, and examples consolidated into a single document for your reference.
+Here is the complete, unabridged, deep dive into Encoder-Decoder architectures, with all of our detailed discussions, mathematical formulations, code, and examples consolidated into a single document for your reference.
 
 -----
 
