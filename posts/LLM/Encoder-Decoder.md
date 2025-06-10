@@ -75,10 +75,16 @@ The Cross-Entropy Loss will be calculated by comparing the model's prediction at
 Because the self-attention mechanism is permutation-invariant, we must inject information about the order of tokens. In the standard Transformer, this is done via an additive positional encoding ($PE$).
 
   * **In the Encoder:** The positional encoding is added to the input token embeddings at the bottom of the encoder stack. For an input sequence $X = (x\_1, ..., x\_n)$, the input to the first layer is $X'\_{pos}$:
-    $$x'_{pos, i} = x_{token, i} + PE_i$$
+
+    $$
+    x'_{pos, i} = x_{token, i} + PE_i
+    $$
 
   * **In the Decoder:** The exact same process is applied independently to the decoder's inputs. For the target sequence $Y = (y\_1, ..., y\_m)$ being generated, the input to the decoder's self-attention at step `t` is based on the embedding of the previously generated token, $y\_{t-1}$, plus its positional encoding, $PE\_{t-1}$:
-    $$y'_{pos, t-1} = y_{token, t-1} + PE_{t-1}$$
+
+    $$
+    y'_{pos, t-1} = y_{token, t-1} + PE_{t-1}
+    $$
 
 #### 4.2 Data Representation and Special Tokens
 
@@ -93,7 +99,11 @@ Because the self-attention mechanism is permutation-invariant, we must inject in
   * **Mathematical Formulation:** A mask matrix, $M\_{causal}$, is added to the attention scores before the softmax.
 
     $$
-      M_{ij} = \begin{cases} 0 & \text{if } i \geq j \\ -\infty & \text{if } i < j \end{cases}$$ $$\text{MaskedSelfAttention}(Q_d, K_d, V_d) = \text{softmax}\left(\frac{Q_d K_d^T}{\sqrt{d_k}} + M_{causal}\right)V_d
+      M_{ij} = \begin{cases} 0 & \text{if } i \geq j \\ -\infty & \text{if } i < j \end{cases}
+    $$
+
+    $$
+    \text{MaskedSelfAttention}(Q_d, K_d, V_d) = \text{softmax}\left(\frac{Q_d K_d^T}{\sqrt{d_k}} + M_{causal}\right)V_d
     $$
 
 #### 4.4 The Decoder Block Data Flow: From Self-Attention to Cross-Attention
@@ -157,7 +167,7 @@ Cross-attention allows the decoder to query the full encoded input at each gener
 
     2.  The **Key (K) and Value (V)** vectors are generated from the **final output of the encoder stack**, `encoder_outputs`. These are generated once and reused by every decoder layer.
 
-         $$K_e = \text{encoder\_outputs} \cdot W^K_{cross}$$ $$V_e = \text{encoder\_outputs} \cdot W^V_{cross}$$
+         $$K_e = \text{encoder_\text{outputs}} \cdot W^K_{cross}$$ $$V_e = \text{encoder_\text{outputs}} \cdot W^V_{cross}$$
       
     4.  The attention is calculated **without a causal mask**:
        
@@ -183,7 +193,9 @@ The T5 model was released in several sizes, scaling the same core architecture.
 
   * **Final Output Layer:** A single linear layer at the top of the decoder stack projects the final hidden state to the vocabulary size to produce logits.
   * **Loss Function:** The model is trained to minimize the **Cross-Entropy Loss** between the predicted logits and the true target tokens.
+
     $$L(\theta) = - \sum_{t=1}^{m} \log P(y_t | y_{<t}, X; \theta)$$
+  
   * **Evaluation Metrics:** For seq2seq tasks, we use metrics like **BLEU** (for translation) and **ROUGE** (for summarization) to compare the generated output against a human-written reference.
 
 -----
