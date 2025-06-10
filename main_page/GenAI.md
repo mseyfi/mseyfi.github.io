@@ -91,6 +91,12 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for la
 Language models are evaluated across diverse tasks such as next-token prediction, text classification, summarization, translation, code generation, and question answering. Each task requires a suitable metric that reflects model performance both quantitatively and qualitatively.
 </div>
 
+## [![Span-Corruption](https://img.shields.io/badge/Span-Corruption_In_Encoder_Decoder_LLM_Architectures(T5)-blue?style=for-the-badge&logo=github)](../posts/LLM/SpanCorruption)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+Span corruption is a key self-supervised pre-training objective introduced in the T5 (Text-to-Text Transfer Transformer) model. It's designed to make the model learn to reconstruct missing contiguous spans of text, which is crucial for tasks like denoising, summarization, and machine translation.
+</div>
+
+
 ## [![Encoder-Decoder](https://img.shields.io/badge/Encoder_Decoder-Encoder_Decoder_Transformers(T5)-blue?style=for-the-badge&logo=github)](../posts/LLM/Encoder-Decoder)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Encoder-decoder models are the canonical choice for any task that maps one sequence of arbitrary length to another. They form a powerful and flexible framework for problems where the input and output have different lengths, structures, or even languages.
