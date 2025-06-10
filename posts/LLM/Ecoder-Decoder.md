@@ -376,3 +376,74 @@ generated_text = decode(generated_tokens)
 print(f"Source Text:\n'{src_text_full}'")
 print(f"\nGenerated Text:\n'{generated_text}'")
 ```
+
+
+## Responding to important questions and addressing confusion
+
+### **1. How Positional Encoding is Applied to Cross-Attention**
+
+This is a subtle but critical point. The direct answer is that positional encoding is **not explicitly applied again** during the cross-attention step. Instead, the necessary positional information is already **"baked into"** the vectors that serve as inputs to the cross-attention mechanism.
+
+Let's trace the information:
+
+1.  **Encoder-Side:** The source sequence tokens are combined with their positional embeddings (`x' = x_token + PE_pos`). The encoder processes these position-aware vectors. Therefore, the final `encoder_outputs` are a sequence of vectors where each vector is a rich contextual representation that is implicitly aware of its original position in the source sentence.
+
+2.  **Decoder-Side:** The decoder's Query vector ($Q_d$) is derived from its own state. This state was also built using positional embeddings for the target sequence. So, the Query "knows" its position within the *output* sequence. It asks a question like, "I am at position `t` of the translation; what from the source is relevant now?"
+
+3.  **The Cross-Attention Step:**
+    * The **Key ($K_e$) and Value ($V_e$)** vectors are linear projections of the `encoder_outputs`. Since the `encoder_outputs` are already position-aware, the Key and Value vectors inherit this information. They represent the content *and* original position of the source tokens.
+    * The **Query ($Q_d$)** from the decoder attends to these Keys.
+
+The model learns, through training, to interpret the relationships between the position-aware decoder Queries and the position-aware encoder Keys. The positional information isn't added again; it's already an intrinsic property of the vectors being used. The model learns to map "the query from decoder position 5" to "the keys from encoder positions 2, 3, and 4" if that is the pattern required by the task (e.g., translation).
+
+---
+
+### **2. Decoder Input During Inference Time**
+
+We do not pad the decoder's input during inference. The process is **autoregressive**, meaning we build the sequence one token at a time.
+
+Let's walk through the first few steps of generating a translation:
+
+* **Step t=1:**
+    * The *only* input to the decoder is a single "start-of-sequence" token (`<s>`).
+    * The decoder's input tensor therefore, has a sequence length of 1. Shape: `[batch_size, 1]`.
+    * The decoder performs a trivial self-attention on this single token, then cross-attends to the full `encoder_output`, and finally produces logits for the *first* real output token.
+
+* **Step t=2:**
+    * We take the token predicted at Step 1 (e.g., "Die") and append it to our running sequence.
+    * The new input to the decoder is now the sequence `[<s>, Die]`.
+    * The decoder's input tensor now has a sequence length of 2. Shape: `[batch_size, 2]`.
+    * The process repeats: masked self-attention is performed on `[<s>, Die]`, followed by cross-attention, to produce logits for the *second* real output token.
+
+* **Step t=3 and beyond:**
+    * The process continues, with the decoder's input sequence growing by one token at each step.
+
+**Conclusion:** Padding is a technique used during training to handle batches of *known but differing* lengths. During inference, the decoder's input sequence is built dynamically, so there is no "rest of the tokens" to pad.
+
+---
+
+### **3. How Padding is Ignored by the Attention Mask**
+
+This is an excellent question that reveals a common point of confusion. The attention mask does **not** change the *size* of the attention matrix. It changes the *values within the matrix* before the softmax step, effectively nullifying the influence of padded tokens.
+
+Let's break down the mechanism precisely.
+
+1.  **The `[PAD]` Token Embedding:** You are correct that the padding token does have its own embedding vector. However, this is largely irrelevant because the attention mask prevents this embedding from contributing to the context of other tokens.
+
+2.  **The Attention Score Calculation:** After the scaled dot product, we have an attention score matrix of shape `[batch_size, num_heads, sequence_length, sequence_length]`. Let's call it `scores`. This matrix contains scores indicating the relevance of every token to every other token.
+
+3.  **Applying the Mask (The Critical Step):**
+    * We have an `attention_mask` tensor, typically of shape `[batch_size, sequence_length]`, with `1`s for real tokens and `0`s for `[PAD]` tokens.
+    * This mask is broadcast to match the shape of the `scores` matrix.
+    * We use the mask to replace the attention scores of the padding tokens with a very large negative number (e.g., -10,000 or `-inf`).
+    * In PyTorch, this looks like: `scores.masked_fill_(attention_mask == 0, -1e9)`
+
+4.  **The Effect of Softmax:**
+    * The softmax function is applied along the last dimension of the score matrix: `softmax(scores)`.
+    * The softmax function involves exponentiation ($e^x$). When applied to the scores:
+        * A normal score, say `3.4`, becomes $e^{3.4}$.
+        * A masked score, `-1e9`, becomes $e^{-1000000000}$, which is a number so infinitesimally close to **zero** that for all practical purposes, it is zero.
+
+5.  **The Final Result:** After the softmax, the attention weights for all `[PAD]` tokens are effectively zero. When we perform the final step of multiplying the attention weights with the Value vectors, the Value vectors of the padding tokens are multiplied by zero. This means they contribute absolutely nothing to the final contextual representation of the real tokens.
+
+In summary, the model ignores padding not by learning that the padding embedding is unimportant, but through a direct, mathematical knockout blow delivered by the attention mask **before** the softmax calculation.
