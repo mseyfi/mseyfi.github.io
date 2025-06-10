@@ -73,6 +73,30 @@ Let's say we corrupt "fox jumps" and "lazy".
     `["fox", "jumps", "<extra_id_1>", "lazy", "<extra_id_2>"]`
     Notice the target sequence reconstructs the corrupted spans, each followed by the *next* sentinel token, indicating the end of that span and the start of the next. The final sentinel token `<extra_id_2>` in this example acts as an end-of-sequence marker for the target.
 
+### 4.1 Another example with another way of implementation
+
+🔹 Encoder Input:
+Replace masked spans with sentinel tokens:
+
+```python
+["I", "enjoy", "<extra_id_0>", "in", "the", "evening", "<extra_id_1>", "lake", "."]
+```
+🔹 Decoder Target:
+Only the missing spans, prefixed by sentinels:
+
+```python
+["<extra_id_0>", "walking", "my", "dog", "<extra_id_1>", "by", "the", "<extra_id_2>"]
+```
+The sentinel tokens segment the spans, and <extra_id_2> marks the end.
+
+🔹 Decoder Input:
+Shifted right version of decoder target (for teacher forcing):
+
+```python
+["<pad>", "<extra_id_0>", "walking", "my", "dog", "<extra_id_1>", "by", "the"]
+```
+
+
 ### 5. Sentinel Tokens Explained
 
 * **Purpose:** Sentinel tokens serve two critical roles:
