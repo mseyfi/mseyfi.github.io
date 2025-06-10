@@ -17,7 +17,7 @@ Here is the complete, unabridged, deep dive into Encoder-Decoder architectures, 
 
 *Last Updated: June 9, 2025*
 
-### 1\. The Task: Sequence-to-Sequence (Seq2Seq) Transformation 📝
+### 1\. The Task: Sequence-to-Sequence (Seq2Seq) Transformation 
 
 Encoder-decoder models are the canonical choice for any task that maps one sequence of arbitrary length to another. They form a powerful and flexible framework for problems where the input and output have different lengths, structures, or even languages.
 
@@ -68,7 +68,7 @@ The Cross-Entropy Loss will be calculated by comparing the model's prediction at
 
 -----
 
-### 4\. Key Mathematical and Structural Concepts 🧠
+### 4\. Key Mathematical and Structural Concepts 
 
 #### 4.1 Positional Encoding in the Encoder and Decoder
 
@@ -175,7 +175,7 @@ Cross-attention allows the decoder to query the full encoded input at each gener
 
 -----
 
-### 5\. T5 Architecture by the Numbers 🔢
+### 5\. T5 Architecture by the Numbers 
 
 The T5 model was released in several sizes, scaling the same core architecture.
 
@@ -200,7 +200,7 @@ The T5 model was released in several sizes, scaling the same core architecture.
 
 -----
 
-### 7\. From-Scratch Implementation of an Encoder-Decoder Model 💻
+### 7\. From-Scratch Implementation of an Encoder-Decoder Model 
 
 This section provides a simple, end-to-end implementation using PyTorch to demonstrate the fundamental data flow.
 
