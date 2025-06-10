@@ -382,7 +382,8 @@ This sparsity is a key reason why SVMs are efficient at prediction time.
 
 #### **Why Do We Need Kernels? (Intuition)**
 
-![Kernel](../images/Kernel.ipg)
+![Kernel](../images/Kernel.jpg)
+
 *Fig.3 Mapping the features to a new space via a nonlinear transformation does the trick and helps the SVM to linearly separate the data using a hyperplane.*
 
 Suppose you have a dataset where class 0 lies in a small circle centered at the origin, and class 1 surrounds it in a ring. Clearly, no straight line (or hyperplane) can separate them in 2D space — **the problem is nonlinear**.
