@@ -91,7 +91,10 @@ Because the self-attention mechanism is permutation-invariant, we must inject in
   * **Purpose:** To preserve the autoregressive property. When predicting token `t`, the decoder must only see tokens `< t`.
   * **Application:** Causal masking is applied **only within the decoder's self-attention layer**.
   * **Mathematical Formulation:** A mask matrix, $M\_{causal}$, is added to the attention scores before the softmax.
-    $$M_{ij} = \begin{cases} 0 & \text{if } i \geq j \\ -\infty & \text{if } i < j \end{cases}$$ $$\text{MaskedSelfAttention}(Q_d, K_d, V_d) = \text{softmax}\left(\frac{Q_d K_d^T}{\sqrt{d_k}} + M_{causal}\right)V_d$$
+
+    $$
+      M_{ij} = \begin{cases} 0 & \text{if } i \geq j \\ -\infty & \text{if } i < j \end{cases}$$ $$\text{MaskedSelfAttention}(Q_d, K_d, V_d) = \text{softmax}\left(\frac{Q_d K_d^T}{\sqrt{d_k}} + M_{causal}\right)V_d
+    $$
 
 #### 4.4 The Decoder Block Data Flow: From Self-Attention to Cross-Attention
 
