@@ -96,7 +96,7 @@ Language models are evaluated across diverse tasks such as next-token prediction
 Encoder-decoder models are the canonical choice for any task that maps one sequence of arbitrary length to another. They form a powerful and flexible framework for problems where the input and output have different lengths, structures, or even languages.
 </div>
 
-## [![Decoder](https://img.shields.io/badge/Decoder_Only-Decoder_Only_Transformers_(Llama,_GPT)-blue?style=for-the-badge&logo=github)](../posts/LLM/DecoderOnly)
+## [![Decoder](https://img.shields.io/badge/Decoder_Only-Decoder_Only_Transformers_(Llama,_GPT)-blue?style=for-the-badge&logo=github)](../posts/LLM/Decoder-Only)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 The core task of a decoder-only model is autoregressive text generation. The model learns to predict the very next word given a sequence of preceding words. It generates text one token at a time, feeding its own previous output back in as input to predict the next token. This simple, self-supervised objective, when applied at a massive scale, enables the model to learn grammar, facts, reasoning abilities, and style.
 </div>
