@@ -2,6 +2,16 @@
 
 ## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](../../main_page/GenAI)
 
+![image](../../images/Encoder-Decoder.png)
+
+*Fig. 1: A common Encoder decoder architecture in LLMs*
+
+
+Of course. I'm glad the tutorial has been helpful.
+
+Here is the complete, unabridged, and final version of our deep dive into Encoder-Decoder architectures, with all of our detailed discussions, mathematical formulations, code, and examples consolidated into a single document for your reference.
+
+-----
 
 ## A Deep Dive into Encoder-Decoder Transformers (Definitive Edition)
 
@@ -11,41 +21,56 @@
 
 Encoder-decoder models are the canonical choice for any task that maps one sequence of arbitrary length to another. They form a powerful and flexible framework for problems where the input and output have different lengths, structures, or even languages.
 
-  * **Classic Examples:**
-      * **Machine Translation:** Translating a sentence from English (input sequence) to German (output sequence).
-      * **Summarization:** Condensing a long article (input sequence) into a short paragraph (output sequence).
-      * **Conversational Response Generation: (Q&A)** Taking a user's question (input sequence) and generating a helpful answer (output sequence).
-
-The **T5 (Text-to-Text Transfer Transformer)** model unified many NLP tasks under this single, powerful framework by framing every problem as a text-to-text conversion.
+  * **Classic Examples:** Machine Translation, Summarization, Conversational Response Generation.
+  * **The T5 Approach:** The **T5 (Text-to-Text Transfer Transformer)** model unified many NLP tasks under this single, powerful framework by framing every problem as a text-to-text conversion (e.g., prefixing input with `summarize:`).
 
 -----
-
-![image](../../images/Encoder-Decoder.png)
-
-*Fig. 1: A common Encoder decoder architecture in LLMs*
 
 ### 2\. The Encoder-Decoder Architecture 🏛️
 
-This architecture consists of two distinct Transformer stacks connected by a specific attention mechanism.
+This architecture consists of two distinct Transformer stacks connected by a cross-attention mechanism.
 
-#### 2.1 The Encoder Stack
-
-  * **Function:** To "understand" and "encode" the input sequence.
-  * **Mechanism:** A stack of Transformer encoder layers. Each layer contains a **bidirectional self-attention** mechanism, allowing every token in the input to attend to every other token. This creates a rich, contextualized representation of the entire input sequence.
-  * **Output:** A sequence of hidden state vectors, `encoder_outputs`, one for each input token, representing the context-aware meaning of those tokens.
-
-#### 2.2 The Decoder Stack
-
-  * **Function:** To "generate" the output sequence autoregressively (one token at a time).
-  * **Mechanism:** A stack of Transformer decoder layers. The decoder is more complex and has two types of attention layers:
-    1.  **Masked Self-Attention:** This is the same causal self-attention we saw in decoder-only models. It allows each token being generated to attend to the *previous* tokens in the generated output sequence.
-    2.  **Cross-Attention:** This is the crucial link between the encoder and decoder.
+  * **The Encoder:** Uses **bidirectional self-attention** to read the entire input sequence and create a rich, contextualized representation, `encoder_outputs`.
+  * **The Decoder:** Uses **masked (causal) self-attention** to generate the output sequence autoregressively, token by token. It uses **cross-attention** to consult the `encoder_outputs` at each step.
 
 -----
 
-### 3\. Key Mathematical Concepts in the Architecture 🧠
+### 3\. The Lifecycle of an Input: A Concrete Example
 
-#### 3.1 Positional Encoding in the Encoder and Decoder
+To make the data flow tangible, let's trace a single example for an **English-to-German translation** task.
+
+  * **Source Sentence:** `The cat is black.`
+  * **Target Sentence:** `Die Katze ist schwarz.`
+
+#### 3.1 Input to the Encoder
+
+The encoder's job is to understand the source sentence. Its input is the tokenized source text, including special tokens.
+
+  * **Encoder Input Sequence:** `[<s>, The, cat, is, black, ., </s>]`
+
+#### 3.2 Output of the Encoder
+
+After processing the input through its bidirectional self-attention layers, the encoder produces a sequence of rich, contextual embeddings—one for each input token. This output is the "memory" of the source sentence.
+
+  * **Encoder Output (`encoder_outputs`):** A sequence of vectors: `[vec_<s>, vec_The, vec_cat, vec_is, vec_black, vec_., vec_</s>]`
+  * **Tensor Shape:** `[T_src, hidden_size]` (e.g., `[7, 768]`)
+
+#### 3.3 Inputs and Outputs for the Decoder (During Training)
+
+During training, the decoder uses "teacher forcing." It receives the entire ground-truth target sequence at once to predict all next tokens in parallel. This requires two versions of the target sequence:
+
+1.  **Decoder Input:** The target sequence, shifted right and prepended with a start token. This is what the decoder *sees* to predict the next token.
+      * **Example:** `[<s>, Die, Katze, ist, schwarz, .]`
+2.  **Decoder Labels (Ground Truth):** The target sequence, shifted left. This is what the decoder *should predict*.
+      * **Example:** `[Die, Katze, ist, schwarz, ., </s>]`
+
+The Cross-Entropy Loss will be calculated by comparing the model's prediction at each step against the corresponding token in the label sequence.
+
+-----
+
+### 4\. Key Mathematical and Structural Concepts 🧠
+
+#### 4.1 Positional Encoding in the Encoder and Decoder
 
 Because the self-attention mechanism is permutation-invariant, we must inject information about the order of tokens. In the standard Transformer, this is done via an additive positional encoding ($PE$).
 
@@ -55,34 +80,91 @@ Because the self-attention mechanism is permutation-invariant, we must inject in
   * **In the Decoder:** The exact same process is applied independently to the decoder's inputs. For the target sequence $Y = (y\_1, ..., y\_m)$ being generated, the input to the decoder's self-attention at step `t` is based on the embedding of the previously generated token, $y\_{t-1}$, plus its positional encoding, $PE\_{t-1}$:
     $$y'_{pos, t-1} = y_{token, t-1} + PE_{t-1}$$
 
-#### 3.2 Causal Masking in the Decoder
+#### 4.2 Data Representation and Special Tokens
 
-  * **Purpose:** To preserve the autoregressive property of the decoder. When predicting the token at position `t`, the decoder must only be allowed to see the tokens at positions `< t`.
-  * **Application:** Causal masking is applied **only within the decoder's first attention block (the masked self-attention layer)**. It is **not** used in the encoder (which must be bidirectional) and it is **not** used in the cross-attention layer.
-  * **Mathematical Formulation:** The causal mask is a matrix, $M\_{causal}$, that is added to the attention scores before the softmax.
-    $$M_{ij} = \begin{cases} 0 & \text{if } i \geq j \\ -\infty & \text{if } i < j \end{cases}$$
-    The masked self-attention calculation in the decoder is therefore:
-    $$\text{MaskedSelfAttention}(Q_d, K_d, V_d) = \text{softmax}\left(\frac{Q_d K_d^T}{\sqrt{d_k}} + M_{causal}\right)V_d$$
-    where $Q\_d, K\_d, V\_d$ are all derived from the decoder's own input sequence. The `-∞` values become zero after the softmax, preventing any "flow" of information from future tokens.
+  * **`<pad>` (Padding Token):** Used to make all sequences in a batch the same length. It is ignored during attention calculations via the **attention mask**.
+  * **`<sos>` (Start-of-Sequence) or `<s>`:** The initial input token for the **decoder** during inference, which kicks off the generation process.
+  * **`<eos>` (End-of-Sequence) or `</s>`:** Signals the end of a sequence. The model learns to stop generating when it produces this token.
 
-#### 3.3 Cross-Attention: The Mathematical Bridge
+#### 4.3 Causal Masking in the Decoder
 
-Cross-attention is the mechanism that allows the decoder to "look at" the input sequence to inform its generation process. It occurs in the second attention block of every decoder layer.
+  * **Purpose:** To preserve the autoregressive property. When predicting token `t`, the decoder must only see tokens `< t`.
+  * **Application:** Causal masking is applied **only within the decoder's self-attention layer**.
+  * **Mathematical Formulation:** A mask matrix, $M\_{causal}$, is added to the attention scores before the softmax.
+    $$M_{ij} = \begin{cases} 0 & \text{if } i \geq j \\ -\infty & \text{if } i < j \end{cases}$$ $$\text{MaskedSelfAttention}(Q_d, K_d, V_d) = \text{softmax}\left(\frac{Q_d K_d^T}{\sqrt{d_k}} + M_{causal}\right)V_d$$
 
-  * **Mechanism:**
-    1.  The **Query (Q)** vectors are generated from the output of the decoder's masked self-attention sub-layer below it. Let's call this intermediate decoder representation $H\_d$.
-        $$Q_d = H_d W^Q_{cross}$$
-    2.  The **Key (K) and Value (V)** vectors are generated from the **final output of the encoder stack**, `encoder_outputs`. These vectors are created once and are used in every decoder layer.
-        $$K_e = \text{encoder\_outputs} \cdot W^K_{cross}$$     $$V_e = \text{encoder\_outputs} \cdot W^V_{cross}$$
-  * **Mathematical Formulation:** The cross-attention calculation is a standard attention formula, but with inputs from different sources. **Crucially, no causal mask is applied here.** The decoder is allowed to attend to *all* parts of the input sentence at every step.
-    $$\text{CrossAttention}(Q_d, K_e, V_e) = \text{softmax}\left(\frac{Q_d K_e^T}{\sqrt{d_k}}\right)V_e$$
-    This operation produces a context vector that is a weighted sum of the encoder's output values, where the weights are determined by how relevant each input token is to the decoder's current generation step.
+#### 4.4 The Decoder Block Data Flow: From Self-Attention to Cross-Attention
+
+The Query for self-attention and the Query for cross-attention are **two different vectors**, generated at different stages within the same decoder block. Let's trace a tensor `x` (the output from the previous decoder layer) as it passes through a single decoder block.
+
+```
+          Input to Decoder Block (x)
+          (Shape: [B, T_tgt, C])
+                   │
+                   ▼
+┌──────────────────────────────────────────────────────────────────────────────┐
+│           Sub-layer 1: MASKED SELF-ATTENTION                                 │
+│                                                                              │
+│   x_norm1 = LayerNorm(x)                                                     │
+│   Q_self, K_self, V_self = projections from x_norm1                          │
+│   self_attn_output = Attention(Q_self, K_self, V_self, causal_mask=True)     |
+│                                                                              │
+└──────────────────────────────────────────────────────────────────────────────┘
+                   │
+                   ▼
+    x_residual1 = x + self_attn_output
+    (Shape: [B, T_tgt, C])
+                   │
+                   ▼
+┌───────────────────────────────────────────────────────────────────────────────┐
+│           Sub-layer 2: CROSS-ATTENTION                                        │
+│                                                                               │
+│   x_norm2 = LayerNorm(x_residual1)                                            │
+│                                                                               │
+│   Q_cross = x_norm2 * W_Q_cross <─────────── This is the new Query            |
+│                                                                               │
+│   K_cross = encoder_output * W_K_cross <───┐                                  |
+│   V_cross = encoder_output * W_V_cross <───┴── From Encoder                   |
+│                                                                               │      
+│   cross_attn_output = Attention(Q_cross, K_cross, V_cross, causal_mask=False) |
+│                                                                               │
+└───────────────────────────────────────────────────────────────────────────────┘
+                   │
+                   ▼
+    x_residual2 = x_residual1 + cross_attn_output
+    (Shape: [B, T_tgt, C])
+                   │
+                   ▼
+┌────────────────────────────────────────────────────────┐
+│          Sub-layer 3: FEED-FORWARD NETWORK             │
+└────────────────────────────────────────────────────────┘
+                   │
+                   ▼
+    Output of Decoder Block
+```
+
+#### 4.5 Cross-Attention: The Mathematical Bridge
+
+Cross-attention allows the decoder to query the full encoded input at each generation step.
+
+  * **Mechanism & Formulation:**
+    1.  The **Query (Q)** vectors are generated from the decoder's own state (output of its self-attention sub-layer, $x_{\text{norm2}}$).
+     
+        $$Q_d = x_{\text{norm2}} W^Q_{cross}$$
+
+    2.  The **Key (K) and Value (V)** vectors are generated from the **final output of the encoder stack**, `encoder_outputs`. These are generated once and reused by every decoder layer.
+
+         $$K_e = \text{encoder\_outputs} \cdot W^K_{cross}$$ $$V_e = \text{encoder\_outputs} \cdot W^V_{cross}$$
+      
+    4.  The attention is calculated **without a causal mask**:
+       
+        $$\text{CrossAttention}(Q_d, K_e, V_e) = \text{softmax}\left(\frac{Q_d K_e^T}{\sqrt{d_k}}\right)V_e$$
 
 -----
 
-### 4\. T5 Architecture by the Numbers 🔢
+### 5\. T5 Architecture by the Numbers 🔢
 
-The T5 model was released in several sizes. The core architecture remains the same, but the depth, width, and number of attention heads are scaled.
+The T5 model was released in several sizes, scaling the same core architecture.
 
 | Model Variant | Total Parameters | Num. Layers (Encoder/Decoder) | Hidden Size ($d\_{model}$) | Feed-Forward Size ($d\_{ff}$) | Num. Heads | Head Size ($d\_{kv}$) |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
@@ -94,74 +176,47 @@ The T5 model was released in several sizes. The core architecture remains the sa
 
 -----
 
-### 5\. The Final Output Layer and Training ⚙️
+### 6\. The Final Output Layer and Training ⚙️
 
-#### 5.1 Final Output Layer
-
-The final output layer exists at the top of the **decoder stack**. It is a single linear layer that takes the final hidden state vector from the top decoder layer at a given timestep `t` and projects it to the size of the vocabulary (`[hidden_size, vocab_size]`). A `softmax` function is then applied to these logits to get a probability distribution for the next token.
-
-#### 5.2 Input-Output Training Pairs
-
-All tasks are framed as text-to-text. The input is a text string, often with a task-specific prefix, and the output is the target text string.
-
-  * **Pre-training (Denoising Objective):**
-      * **Input:** A corrupted sentence. e.g., `Thank you <X> me to your party <Y> week.`
-      * **Output (Label):** The sentinel tokens and the text they replaced. e.g., `<X> for inviting <Y> last <Z>`
-  * **Fine-tuning (Summarization Task):**
-      * **Input:** `summarize: <long article text>`
-      * **Output (Label):** `<short summary text>`
-
-#### 5.3 Loss Function and Metrics
-
-  * **Loss Function:** The model is trained to minimize the **Cross-Entropy Loss** between the decoder's predicted output and the true target sequence.
+  * **Final Output Layer:** A single linear layer at the top of the decoder stack projects the final hidden state to the vocabulary size to produce logits.
+  * **Loss Function:** The model is trained to minimize the **Cross-Entropy Loss** between the predicted logits and the true target tokens.
     $$L(\theta) = - \sum_{t=1}^{m} \log P(y_t | y_{<t}, X; \theta)$$
-  * **Metrics:** For seq2seq tasks, we often use metrics like **BLEU** (for translation) and **ROUGE** (for summarization) to compare the generated output against a human-written reference.
+  * **Evaluation Metrics:** For seq2seq tasks, we use metrics like **BLEU** (for translation) and **ROUGE** (for summarization) to compare the generated output against a human-written reference.
 
 -----
 
-### 6\. From-Scratch Implementation of an Encoder-Decoder Model 💻
+### 7\. From-Scratch Implementation of an Encoder-Decoder Model 💻
 
-This section provides a simple, end-to-end implementation of an Encoder-Decoder Transformer using PyTorch's fundamental building blocks. This code prioritizes clarity to demonstrate the fundamental data flow.
+This section provides a simple, end-to-end implementation using PyTorch to demonstrate the fundamental data flow.
 
 ```python
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# --- Hyperparameters for our Toy Model ---
+# --- Hyperparameters ---
 batch_size = 32
-block_size = 128 # Max sequence length for both source and target
+block_size = 128
 learning_rate = 3e-4
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
-n_embd = 256 # Embedding dimension
-n_head = 4   # Number of attention heads
-n_layer = 2  # Number of encoder and decoder layers
+n_embd = 256
+n_head = 4
+n_layer = 2
 dropout = 0.2
 eval_interval = 500
 max_steps = 5001
 
-# --- 1. Data Preparation and Tokenizer ---
-# For this toy example, we'll use a simple character-level tokenizer.
-try:
-    with open('input.txt', 'r', encoding='utf-8') as f:
-        text = f.read()
-except FileNotFoundError:
-    print("Warning: 'input.txt' not found. Using dummy text for demonstration.")
-    text = "This is a simple demonstration of an encoder-decoder model. The task will be to 'summarize' a short text by learning to replicate its first half."
-
+# --- 1. Data Preparation ---
+text = "This is a simple demonstration of an encoder-decoder model. The task will be to 'summarize' a short text by learning to replicate its first half."
 chars = sorted(list(set(text)))
 vocab_size = len(chars)
 stoi = { ch:i for i,ch in enumerate(chars) }
 itos = { i:ch for i,ch in enumerate(chars) }
 encode = lambda s: [stoi.get(c, 0) for c in s]
 decode = lambda l: ''.join([itos.get(i, '?') for i in l])
-
 data = torch.tensor(encode(text), dtype=torch.long)
-n = int(0.9*len(data))
-train_data = data[:n]
-val_data = data[n:]
+train_data, val_data = data[:int(0.9*len(data))], data[int(0.9*len(data)):]
 
-# Create a simple seq2seq task: given the first half of a block, predict the second half
 def get_batch(split):
     data = train_data if split == 'train' else val_data
     ix = torch.randint(len(data) - block_size, (batch_size,))
@@ -170,33 +225,30 @@ def get_batch(split):
     return src.to(device), tgt.to(device)
 
 # --- 2. Model Components ---
-
 class MultiHeadAttention(nn.Module):
-    """ Multi-Head Attention (Can be causal or non-causal) """
     def __init__(self, n_embd, num_heads, is_causal=False):
         super().__init__()
         self.num_heads, self.head_size = num_heads, n_embd // num_heads
         assert n_embd % num_heads == 0
-        # Using a fused layer for Q, K, V for efficiency
         self.c_attn = nn.Linear(n_embd, 3 * n_embd)
         self.c_proj = nn.Linear(n_embd, n_embd)
         self.resid_dropout = nn.Dropout(dropout)
         self.is_causal = is_causal
         if self.is_causal:
-            # Causal mask to ensure attention is only applied to the left in the decoder.
             self.register_buffer('tril', torch.tril(torch.ones(block_size, block_size)).view(1, 1, block_size, block_size))
 
     def forward(self, x, context=None):
         B, T, C = x.shape
-        # If context is provided, this is cross-attention. Q is from x, K and V are from context.
-        if context is not None:
+        is_cross_attention = context is not None
+        
+        if is_cross_attention:
             q = self.c_attn(x).split(self.n_embd, dim=2)[0]
             k, v = self.c_attn(context).split(self.n_embd, dim=2)[1:]
-        else: # This is self-attention. Q, K, and V are all from x.
+        else:
             q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
 
         q = q.view(B, T, self.num_heads, self.head_size).transpose(1, 2)
-        T_ctx = context.shape[1] if context is not None else T
+        T_ctx = context.shape[1] if is_cross_attention else T
         k = k.view(B, T_ctx, self.num_heads, self.head_size).transpose(1, 2)
         v = v.view(B, T_ctx, self.num_heads, self.head_size).transpose(1, 2)
 
@@ -215,7 +267,6 @@ class FeedForward(nn.Module):
     def forward(self, x): return self.net(x)
 
 class EncoderBlock(nn.Module):
-    """ Encoder Block: Bidirectional self-attention followed by FF """
     def __init__(self, n_embd, n_head):
         super().__init__()
         self.sa = MultiHeadAttention(n_embd, n_head, is_causal=False)
@@ -228,7 +279,6 @@ class EncoderBlock(nn.Module):
         return x
 
 class DecoderBlock(nn.Module):
-    """ Decoder Block: Causal self-attention, cross-attention, then FF """
     def __init__(self, n_embd, n_head):
         super().__init__()
         self.sa = MultiHeadAttention(n_embd, n_head, is_causal=True)
@@ -237,10 +287,8 @@ class DecoderBlock(nn.Module):
         self.ln1, self.ln2, self.ln3 = nn.LayerNorm(n_embd), nn.LayerNorm(n_embd), nn.LayerNorm(n_embd)
 
     def forward(self, x, context):
-        # x is the target sequence from the decoder
-        # context is the output from the encoder
-        x = x + self.sa(self.ln1(x)) # Causal self-attention on decoder's own output
-        x = x + self.cross_attn(self.ln2(x), context=context) # Cross-attention with encoder output
+        x = x + self.sa(self.ln1(x))
+        x = x + self.cross_attn(self.ln2(x), context=context)
         x = x + self.ffwd(self.ln3(x))
         return x
 
@@ -250,12 +298,8 @@ class EncoderDecoderModel(nn.Module):
         super().__init__()
         self.token_embedding_table = nn.Embedding(vocab_size, n_embd)
         self.position_embedding_table = nn.Embedding(block_size, n_embd)
-        
         self.encoder = nn.Sequential(*[EncoderBlock(n_embd, n_head=n_head) for _ in range(n_layer)])
-        
-        # We must implement the decoder as a module list to handle the context passing
         self.decoder_blocks = nn.ModuleList([DecoderBlock(n_embd, n_head=n_head) for _ in range(n_layer)])
-        
         self.ln_f = nn.LayerNorm(n_embd)
         self.lm_head = nn.Linear(n_embd, vocab_size)
 
@@ -263,55 +307,41 @@ class EncoderDecoderModel(nn.Module):
         B_src, T_src = src.shape
         B_tgt, T_tgt = tgt.shape
         
-        # --- Encoder Pass ---
-        src_tok_emb = self.token_embedding_table(src) # (B, T_src, C)
-        src_pos_emb = self.position_embedding_table(torch.arange(T_src, device=device)) # (T_src, C)
+        src_tok_emb = self.token_embedding_table(src)
+        src_pos_emb = self.position_embedding_table(torch.arange(T_src, device=device))
         src_x = src_tok_emb + src_pos_emb
-        encoder_output = self.encoder(src_x) # (B, T_src, C)
+        encoder_output = self.encoder(src_x)
 
-        # --- Decoder Pass ---
-        tgt_tok_emb = self.token_embedding_table(tgt) # (B, T_tgt, C)
-        tgt_pos_emb = self.position_embedding_table(torch.arange(T_tgt, device=device)) # (T_tgt, C)
+        tgt_tok_emb = self.token_embedding_table(tgt)
+        tgt_pos_emb = self.position_embedding_table(torch.arange(T_tgt, device=device))
         decoder_x = tgt_tok_emb + tgt_pos_emb
         
-        # Manually pass through decoder blocks with context
         for block in self.decoder_blocks:
             decoder_x = block(decoder_x, context=encoder_output)
 
-        logits = self.lm_head(self.ln_f(decoder_x)) # (B, T_tgt, vocab_size)
+        logits = self.lm_head(self.ln_f(decoder_x))
 
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
-            
         return logits, loss
 
     @torch.no_grad()
     def generate(self, src, max_new_tokens):
         self.eval()
         src = src.to(device)
-        # Start with a beginning-of-sequence token (0) for the decoder
         tgt = torch.zeros((src.shape[0], 1), dtype=torch.long, device=device)
 
-        # Encoder pass is done only once
-        src_tok_emb = self.token_embedding_table(src)
-        src_pos_emb = self.position_embedding_table(torch.arange(src.shape[1], device=device))
-        encoder_output = self.encoder(src_tok_emb + src_pos_emb)
+        src_emb = self.token_embedding_table(src) + self.position_embedding_table(torch.arange(src.shape[1], device=device))
+        encoder_output = self.encoder(src_emb)
         
         for _ in range(max_new_tokens):
-            # Decoder pass in a loop
-            tgt_cond = tgt[:, -block_size:] # Ensure context doesn't exceed block size
-            
-            tgt_tok_emb = self.token_embedding_table(tgt_cond)
-            tgt_pos_emb = self.position_embedding_table(torch.arange(tgt_cond.shape[1], device=device))
-            decoder_x = tgt_tok_emb + tgt_pos_emb
-            
+            tgt_cond = tgt[:, -block_size:]
+            tgt_emb = self.token_embedding_table(tgt_cond) + self.position_embedding_table(torch.arange(tgt_cond.shape[1], device=device))
+            decoder_x = tgt_emb
             for block in self.decoder_blocks:
                 decoder_x = block(decoder_x, context=encoder_output)
-            
             logits = self.lm_head(self.ln_f(decoder_x))
-            
-            # Focus on the last token's prediction
             next_token_logits = logits[:, -1, :]
             probs = F.softmax(next_token_logits, dim=-1)
             next_token = torch.multinomial(probs, num_samples=1)
@@ -327,8 +357,6 @@ optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 print("Starting training...")
 for steps in range(max_steps):
     src, tgt = get_batch('train')
-    # For training, the target `y` is the same as the decoder input `tgt`.
-    # The loss function handles the shifting automatically.
     logits, loss = model(src, tgt, targets=tgt)
     optimizer.zero_grad(set_to_none=True)
     loss.backward()
@@ -337,11 +365,10 @@ for steps in range(max_steps):
         print(f"Step {steps}, Training Loss: {loss.item():.4f}")
 
 # --- 5. Inference from the model ---
-print("\n--- Generating Text from Trained Model ---")
+print("\n--- Generating Text ---")
 src, _ = get_batch('val')
 src_text_full = decode(src[0].tolist())
-# We need to provide the same source sequence to the generate function
-src_for_gen = src[:1, :] # Use the first sequence from the validation batch
+src_for_gen = src[:1, :]
 
 generated_tokens = m.generate(src_for_gen, max_new_tokens=src.shape[1])[0].tolist()
 generated_text = decode(generated_tokens)
