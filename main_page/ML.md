@@ -26,7 +26,7 @@ This tutorial provides an in-depth exploration of quantizing machine learning mo
 ## [![RANSAC](https://img.shields.io/badge/RANSAC-Random_Sample_Consensus-blue?style=for-the-badge&logo=github)](../posts/RANSAC)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-**RANSAC (Random Sample Consensus)</b> is an iterative method for robust parameter estimation. It attempts to find a model that best fits the <b>inlier</b> data points while minimizing the effect of <b>outlier</b> points.
+<b>RANSAC (Random Sample Consensus)</b> is an iterative method for robust parameter estimation. It attempts to find a model that best fits the <b>inlier</b> data points while minimizing the effect of <b>outlier</b> points.
 
 <p></p>
 
@@ -55,7 +55,7 @@ Ensemble Learning: Bootstrap Sampling, Bagging (Random Forest), Boosting (AdaBoo
 
 ## [![DecisionTrees](https://img.shields.io/badge/DecisionTrees-Rule_Based_Model-blue?style=for-the-badge&logo=github)](../posts/DecisionTrees)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-A Decision Tree is a recursive, rule-based model that partitions the feature space $R^n$ into disjoint regions and assigns a prediction to each region. It works by splitting the dataset at each node based on feature values to reduce some measure of impurity or error.
+A Decision Tree is a recursive, rule-based model that partitions the feature space R^n into disjoint regions and assigns a prediction to each region. It works by splitting the dataset at each node based on feature values to reduce some measure of impurity or error.
 <p></p>
 </div>
 
