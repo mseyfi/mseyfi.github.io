@@ -6,7 +6,7 @@
 ## [![MixedPrecision](https://img.shields.io/badge/Optimization_Series-Mixed_Precision_Training-blue?style=for-the-badge&logo=github)](../posts/MixedPrecision)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-Mixed precision training is a technique in deep learning where computations are performed using different numerical precisions—typically a mix of **16-bit floating point (FP16)** and **32-bit floating point (FP32)**—to accelerate training and reduce memory usage while maintaining model accuracy. 
+Mixed precision training is a technique in deep learning where computations are performed using different numerical precisions—typically a mix of <b>16-bit floating point (FP16)</b> and <b>32-bit floating point (FP32)**—to accelerate training and reduce memory usage while maintaining model accuracy. 
 <p></p>
 </div>
 
@@ -26,7 +26,7 @@ This tutorial provides an in-depth exploration of quantizing machine learning mo
 ## [![RANSAC](https://img.shields.io/badge/RANSAC-Random_Sample_Consensus-blue?style=for-the-badge&logo=github)](../posts/RANSAC)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-**RANSAC (Random Sample Consensus)** is an iterative method for robust parameter estimation. It attempts to find a model that best fits the *inlier* data points while minimizing the effect of *outlier* points.
+**RANSAC (Random Sample Consensus)</b> is an iterative method for robust parameter estimation. It attempts to find a model that best fits the <b>inlier</b> data points while minimizing the effect of <b>outlier</b> points.
 
 <p></p>
 
@@ -43,7 +43,7 @@ Focal Loss is a modified version of the standard cross-entropy loss, designed to
 ## [![Kmeans](https://img.shields.io/badge/KMEANS-Unsupervised_Learning-blue?style=for-the-badge&logo=github)](../posts/Kmeans)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-K-Means is a popular clustering algorithm used to partition a dataset into **K clusters** by minimizing intra-cluster variance. A crucial factor in its performance is how you initialize the cluster centroids. 
+K-Means is a popular clustering algorithm used to partition a dataset into <b>K clusters</b> by minimizing intra-cluster variance. A crucial factor in its performance is how you initialize the cluster centroids. 
 <p></p>
 </div>
 
