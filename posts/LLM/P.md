@@ -10,7 +10,9 @@ Performers are Transformer architectures which can estimate regular (softmax) fu
 
 A **kernel** is a function that computes similarity between two inputs in a possibly high- or infinite-dimensional space without explicitly transforming the data. Formally:
 
-$k(x, x') = \langle \phi(x), \phi(x') \rangle_\mathcal{H} \tag{1}$
+$$
+k(x, x') = \langle \phi(x), \phi(x') \rangle_\mathcal{H} \tag{1}
+$$
 
 where:
 
@@ -22,11 +24,15 @@ where:
 
 A **shift-invariant kernel** is one that depends only on the difference between its inputs, not on their absolute location:
 
-$k(x, x') = k(x - x') = k(\delta) \tag{2}$
+$$
+k(x, x') = k(x - x') = k(\delta) \tag{2}
+$$
 
 Such kernels are translation-invariant, meaning the similarity between two inputs does not change if both are shifted by the same amount. The **RBF kernel** is a prime example:
 
-$k(x - x') = \exp\left(-\frac{\|x - x'\|^2}{2\sigma^2}\right) \tag{3}$
+$$
+k(x - x') = \exp\left(-\frac{\|x - x'\|^2}{2\sigma^2}\right) \tag{3}
+$$
 
 ---
 
@@ -38,41 +44,56 @@ Bochner's theorem tells us:
 
 Therefore:
 
-$k(x, x') = \int e^{i\omega^\top(x - x')} p(\omega) \, d\omega = \mathbb{E}_{\omega \sim p(\omega)}[e^{i\omega^\top x} e^{-i\omega^\top x'}] \tag{4}$
+$$
+k(x, x') = \int e^{i\omega^\top(x - x')} p(\omega) \, d\omega = \mathbb{E}_{\omega \sim p(\omega)}[e^{i\omega^\top x} e^{-i\omega^\top x'}] \tag{4}
+$$
 
 Using Euler's identity:
 
-$e^{i\theta} = \cos \theta + i \sin \theta \tag{5}$
-
+$$
+e^{i\theta} = \cos \theta + i \sin \theta \tag{5}
+$$
 we get:
 
-$k(x, x') = \mathbb{E}_\omega[\cos(\omega^\top x - \omega^\top x')] = \mathbb{E}_\omega[\cos(\omega^\top x) \cos(\omega^\top x') + \sin(\omega^\top x) \sin(\omega^\top x')] \tag{6}$
+$$
+k(x, x') = \mathbb{E}_\omega[\cos(\omega^\top x - \omega^\top x')] = \mathbb{E}_\omega[\cos(\omega^\top x) \cos(\omega^\top x') + \sin(\omega^\top x) \sin(\omega^\top x')] \tag{6}
+$$
 
 This yields a 2D feature map:
 
-$\phi_\omega(x) = \begin{bmatrix} \cos(\omega^\top x) \\ \sin(\omega^\top x) \end{bmatrix}, \quad k(x, x') \approx \frac{1}{D} \sum_{j=1}^D \phi_{\omega_j}(x)^\top \phi_{\omega_j}(x') \tag{7}$
+$$
+\phi_\omega(x) = \begin{bmatrix} \cos(\omega^\top x) \\ \sin(\omega^\top x) \end{bmatrix}, \quad k(x, x') \approx \frac{1}{D} \sum_{j=1}^D \phi_{\omega_j}(x)^\top \phi_{\omega_j}(x') \tag{7}
+$$
 
 ### Why We Can Omit the Sine Term
 
 To reduce dimensionality and variance, we instead use a **random phase shift**:
 
-$\cos(\omega^\top x + b) \cos(\omega^\top x' + b) = \cos(\omega^\top x - \omega^\top x') \tag{8}$
-
+$$
+\cos(\omega^\top x + b) \cos(\omega^\top x' + b) = \cos(\omega^\top x - \omega^\top x') \tag{8}
+$$
 by sampling $b \sim \text{Uniform}[0, 2\pi]$. This yields:
 
-$\phi(x) = \sqrt{\frac{2}{D}} \begin{bmatrix} \cos(\omega_1^\top x + b_1) \\ \vdots \\ \cos(\omega_D^\top x + b_D) \end{bmatrix} \tag{9}$
+$$
+\phi(x) = \sqrt{\frac{2}{D}} \begin{bmatrix} \cos(\omega_1^\top x + b_1) \\ \vdots \\ \cos(\omega_D^\top x + b_D) \end{bmatrix} \tag{9}
+$$
 
 Then the kernel becomes:
 
-$k(x, x') \approx \phi(x)^\top \phi(x') \tag{10}$
-
+$$
+k(x, x') \approx \phi(x)^\top \phi(x') \tag{10}
+$$
 For the **RBF kernel**:
 
-$p(\omega) = \mathcal{N}(0, \sigma^{-2} I), \quad \omega_j \sim \mathcal{N}(0, \sigma^{-2} I) \tag{11}$
+$$
+p(\omega) = \mathcal{N}(0, \sigma^{-2} I), \quad \omega_j \sim \mathcal{N}(0, \sigma^{-2} I) \tag{11}
+$$
 
 ### Infinite-Dimensional Nature of the RBF Kernel
 
-$k(x, x') = \exp\left(-\frac{\|x - x'\|^2}{2\sigma^2}\right) \tag{12}$
+$$
+k(x, x') = \exp\left(-\frac{\|x - x'\|^2}{2\sigma^2}\right) \tag{12}
+$$
 
 This kernel cannot be represented by a finite-dimensional $\phi(x)$, and thus must be approximated with RFF.
 
@@ -82,17 +103,24 @@ This kernel cannot be represented by a finite-dimensional $\phi(x)$, and thus mu
 
 The standard softmax attention formulation is:
 
-$\text{Attention}(Q, K, V) = D^{-1} A V, \quad A = \exp\left(\frac{QK^\top}{\sqrt{d}}\right), \quad D = \text{diag}(A \mathbf{1}_L) \tag{13}$
+$$
+\text{Attention}(Q, K, V) = D^{-1} A V, \quad A = \exp\left(\frac{QK^\top}{\sqrt{d}}\right), \quad D = \text{diag}(A \mathbf{1}_L) \tag{13}
+$$
+
 
 This is computationally expensive due to the $O(n^2)$ complexity from computing all pairwise dot-products in $QK^\top$.
 
 Performer replaces this with a kernel-based approximation using **Random Fourier Features**:
 
-$\text{Attention}(Q, K, V) \approx \hat{D}^{-1} \left(\phi(Q)(\phi(K)^\top V)\right), \quad \hat{D} = \text{diag}(\phi(Q)(\phi(K)^\top \mathbf{1}_L)) \tag{14}$
+$$
+\text{Attention}(Q, K, V) \approx \hat{D}^{-1} \left(\phi(Q)(\phi(K)^\top V)\right), \quad \hat{D} = \text{diag}(\phi(Q)(\phi(K)^\top \mathbf{1}_L)) \tag{14}
+$$
 
 Let the feature map be:
 
-$\phi(x) = \sqrt{\frac{2}{D}} [\cos(\omega_1^\top x + b_1), ..., \cos(\omega_D^\top x + b_D)]^\top \tag{15}$
+$$
+\phi(x) = \sqrt{\frac{2}{D}} [\cos(\omega_1^\top x + b_1), ..., \cos(\omega_D^\top x + b_D)]^\top \tag{15}
+$$
 
 ### Step-by-Step Matrix Operations
 
@@ -107,11 +135,15 @@ Then:
 * Multiply $\tilde{Q} Z$ to get numerator $A \in \mathbb{R}^{n \times d}$
 * Normalize by:
 
-$\text{norm}_i = \tilde{Q}_i^\top (\tilde{K}^\top \mathbf{1}) \tag{16}$
+$$
+\text{norm}_i = \tilde{Q}_i^\top (\tilde{K}^\top \mathbf{1}) \tag{16}
+$$
+
 
 Final output:
-
-$\text{PerformerAttn}(Q, K, V)_i = \frac{\tilde{Q}_i^\top (\tilde{K}^\top V)}{\tilde{Q}_i^\top (\tilde{K}^\top \mathbf{1})} \tag{17}$
+$$
+\text{PerformerAttn}(Q, K, V)_i = \frac{\tilde{Q}_i^\top (\tilde{K}^\top V)}{\tilde{Q}_i^\top (\tilde{K}^\top \mathbf{1})} \tag{17}
+$$
 
 ### Minimal PyTorch-Style Implementation
 
@@ -137,5 +169,3 @@ def performer_attention(Q, K, V, omega, b, eps=1e-6):
 This approximation reduces time and space complexity from $O(n^2)$ to $O(n)$, while retaining expressive power.
 
 ---
-
-Would you like me to now continue by inserting the CosFormer, FAVOR+, and Nyströmformer sections?
