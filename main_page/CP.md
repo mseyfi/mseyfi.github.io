@@ -28,13 +28,13 @@ Motion estimation and motion compensation are critical components in video compr
 
 ## [![DenoisingIII](https://img.shields.io/badge/Denoising-Noise_Estimation-blue?style=for-the-badge&logo=github)](../posts/NoiseEstimation)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-To <b>estimate noise in a single image<\b>, especially when the ground truth is not available, you need to make statistical assumptions about the noise and the image content. Here's a full tutorial that outlines <b>multiple practical techniques<\b> for noise estimation:
+To estimate noise in a single image, especially when the ground truth is not available, you need to make statistical assumptions about the noise and the image content. Here's a full tutorial that outlines multiple practical techniques for noise estimation:
 <p></p>
 </div>
 
 ## [![DenoisingII](https://img.shields.io/badge/Denoising-Bilateral_Filtering-blue?style=for-the-badge&logo=github)](../posts/BilateralFiltering)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-In image denoising, we often want to remove <b>noise<\b> but preserve <b>edges<\b>. Classical filters like Gaussian blur are fast but <b>blur across edges<\b>, causing loss of detail.
+In image denoising, we often want to remove noise but preserve edges. Classical filters like Gaussian blur are fast but blur across edges, causing loss of detail.
 <p></p>
 </div>
 
