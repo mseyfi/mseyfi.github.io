@@ -38,13 +38,13 @@ Stable Diffusion is a powerful generative model that synthesizes high-quality im
 ## [![NCSN](https://img.shields.io/badge/NCSN-Noise_Conditional_Score_Networks/Score_Based_Generative_Models-blue?style=for-the-badge&logo=github)](../posts/NCSN)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-A **Score-based Generative Model** learns the gradient of the log-probability (the “score”) for a family of **noisy** versions of data. Instead of directly learning a generative model $ p(x) $, we train a network $ s_\theta(x, \sigma) $ that approximates:
+A<b>Score-based Generative Model</b> learns the gradient of the log-probability (the “score”) for a family of<b>noisy</b> versions of data. Instead of directly learning a generative model $ p(x) $, we train a network $ s_\theta(x, \sigma) $ that approximates:
 
 $$
 \nabla_x \log p_\sigma(x) \quad \text{where} \quad p_\sigma(x)
 $$
 
-is the distribution of data *corrupted* by noise of scale $\sigma$. Once we learn a good approximation of the score $\nabla_x \log p_\sigma(x)$, we can sample from the (clean) distribution by **progressively denoising** data using **Langevin dynamics** (or an equivalent Stochastic Differential Equation).
+is the distribution of data <b>corrupted</b> by noise of scale $\sigma$. Once we learn a good approximation of the score $\nabla_x \log p_\sigma(x)$, we can sample from the (clean) distribution by<b>progressively denoising</b> data using<b>Langevin dynamics</b> (or an equivalent Stochastic Differential Equation).
 <p></p>
 </div>
 
@@ -123,7 +123,7 @@ ROPE injects positional information into queries and keys by rotating their comp
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 After BERT established the paradigm of pre-training and fine-tuning, the natural next step in the scientific process was to ask: "Was this done optimally?" The original BERT paper left several questions unanswered regarding its design choices. Was the Next Sentence Prediction task truly necessary? How much did the data size and other hyperparameters matter?
 
-This brings us to our next topic: **RoBERTa**, a 2019 model from Facebook AI that stands for **R**obustly **O**ptimized **BERT** **A**pproach. RoBERTa is not a new architecture. Rather, it is a meticulous study that takes the original BERT architecture and systematically evaluates its pre-training recipe, resulting in a significantly more powerful model.
+This brings us to our next topic:<b>RoBERTa</b>, a 2019 model from Facebook AI that stands for<b>R</b>obustly<b>O</b>ptimized<b>BERT<b>A</b>pproach. RoBERTa is not a new architecture. Rather, it is a meticulous study that takes the original BERT architecture and systematically evaluates its pre-training recipe, resulting in a significantly more powerful model.
 
 Think of BERT as the revolutionary prototype. RoBERTa is the production model, fine-tuned and optimized for maximum performance. Let's begin the tutorial.
 </div>
