@@ -6,7 +6,7 @@
 ## [![MixedPrecision](https://img.shields.io/badge/Optimization_Series-Mixed_Precision_Training-blue?style=for-the-badge&logo=github)](../posts/MixedPrecision)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-Mixed precision training is a technique in deep learning where computations are performed using different numerical precisions—typically a mix of <b>16-bit floating point (FP16)</b> and <b>32-bit floating point (FP32)**—to accelerate training and reduce memory usage while maintaining model accuracy. 
+Mixed precision training is a technique in deep learning where computations are performed using different numerical precisions—typically a mix of <b>16-bit floating point (FP16)</b> and <b>32-bit floating point (FP32)</b>—to accelerate training and reduce memory usage while maintaining model accuracy. 
 <p></p>
 </div>
 
