@@ -30,8 +30,6 @@ where:
 
 ---
 
-#######################################################################################################
-
 
 ## 2. Random Fourier Features (RFF)
 
@@ -56,6 +54,7 @@ So:
 $$
 k(x, x') = \mathbb{E}_\omega[\cos(\omega^\top x - \omega^\top x')] = \mathbb{E}_\ome\cos(\omega^\top x) \cos(\omega^\top x') + \sin(\omega^\top x) \sin(\omega^\top x')]
 $$
+
 Using Monte Carlo approximation we have
 
 $$
