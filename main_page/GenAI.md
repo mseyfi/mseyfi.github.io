@@ -62,7 +62,6 @@ In this guide, we'll provide sample code for training and inference of a diffusi
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 GLIP (Grounded Language-Image Pre-training) is a unified model architecture that bridges the gap between vision and language by integrating object detection and phrase grounding tasks. It leverages both visual and textual data to perform object detection conditioned on textual descriptions, enabling the model to recognize objects based on their semantic meanings.
 <p></p>
-_Last updated: {{ site.time | date: "%B %d, %Y" }}_
 </div>
 
 
