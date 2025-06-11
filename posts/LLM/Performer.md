@@ -169,7 +169,99 @@ has **no finite-dimensional** feature map $\phi(x)$ such that $k(x, x') = \langl
 
 ---
 
-## 3. Performer: FAVOR+ Attention
+
+##  Unified View: Kernel Approximations via Random Features
+
+We’ll compare:
+
+| Kernel Type | Formula                                                       | Shift-Invariant? | Approx Method      | Theoretical Tool           |
+| ----------- | ------------------------------------------------------------- | ---------------- | ------------------ | -------------------------- |
+| **RBF**     | $k(x, x') = \exp\left(-\frac{\|x - x'\|^2}{2\sigma^2}\right)$ | ✅ Yes            | Bochner’s Theorem  | Fourier Transform          |
+| **Softmax** | $k(q, k) = \exp(q^\top k)$                                    | ❌ No             | Gaussian MGF Trick | Moment-Generating Function |
+
+---
+
+### 3. Softmax Kernel Approximation (via Gaussian MGF Trick)
+
+---
+
+#### ① **Kernel:**
+
+$$
+k(q, k') = \exp(q^\top k')
+$$
+
+**Not shift-invariant** → **Bochner’s theorem doesn’t apply**
+
+---
+
+#### **Moment-Generating Function (MGF)** of Gaussian:
+
+Let $\omega \sim \mathcal{N}(0, I)$, then:
+
+$$
+\mathbb{E}[e^{\omega^\top z}] = e^{\frac{1}{2} \|z\|^2}
+$$
+
+Apply this:
+
+$$
+\mathbb{E}_\omega \left[ e^{\omega^\top q} e^{\omega^\top k} \right]
+= \mathbb{E}_\omega \left[ e^{\omega^\top (q + k)} \right] = e^{\frac{1}{2} \|q + k\|^2}
+= e^{q^\top k} \cdot e^{\frac{1}{2} \|q\|^2} \cdot e^{\frac{1}{2} \|k\|^2}
+$$
+
+#### ③ **Rearranged:**
+
+$$
+\boxed{
+e^{q^\top k} = \mathbb{E}_{\omega \sim \mathcal{N}(0, I)} \left[ e^{\omega^\top q} \cdot e^{\omega^\top k} \right] \cdot e^{- \frac{1}{2} \|q\|^2} \cdot e^{- \frac{1}{2} \|k\|^2}
+}
+$$
+
+---
+
+### Final Feature Map (Performer-style):
+
+Use cosine/sine basis (to avoid unbounded exponential):
+
+$$
+\phi(q) = e^{- \frac{1}{2} \|q\|^2} \cdot
+\begin{bmatrix}
+\cos(\omega_1^\top q) \\
+\sin(\omega_1^\top q) \\
+\vdots \\
+\cos(\omega_D^\top q) \\
+\sin(\omega_D^\top q)
+\end{bmatrix}
+\quad \omega_i \sim \mathcal{N}(0, I)
+$$
+
+Then:
+
+$$
+\boxed{
+e^{q^\top k} \approx \phi(q)^\top \phi(k)
+}
+$$
+
+---
+
+## Comparison Table
+
+| Aspect          | **RBF Kernel**                                         | **Softmax Kernel**                                                    |
+| --------------- | ------------------------------------------------------ | --------------------------------------------------------------------- |
+| Formula         | $e^{-\|x - x'\|^2 / 2\sigma^2}$                        | $e^{q^\top k}$                                                        |
+| Shift-invariant | ✅ Yes                                                  | ❌ No                                                                  |
+| Theorem used    | Bochner's Theorem                                      | Gaussian MGF                                                          |
+| Distribution    | $\omega \sim \mathcal{N}(0, \sigma^{-2} I)$            | $\omega \sim \mathcal{N}(0, I)$                                       |
+| Feature map     | $\phi(x) = \sqrt{\frac{2}{D}} \cos(\omega^\top x + b)$ | $\phi(q) = e^{-\|q\|^2/2} [\cos(\omega^\top q), \sin(\omega^\top q)]$ |
+| Applications    | SVM, kernel methods                                    | Performer attention                                                   |
+| Output Range    | \[0, 1]                                                | Unbounded positive                                                    |
+
+---
+
+## 4. Performer: FAVOR+ Attention
 
 The standard softmax attention formulation is:
 
