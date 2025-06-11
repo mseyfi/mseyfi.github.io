@@ -30,6 +30,9 @@ where:
 
 ---
 
+#######################################################################################################
+
+
 ## 2. Random Fourier Features (RFF)
 
 For shift-invariant kernels $k(x - x')$, **Bochner's theorem** tells us:
@@ -45,44 +48,114 @@ $$
 Using Euler's formula:
 
 $$
-e^{i\theta} = \cos \theta + i \sin \theta
+  e^{i\theta} = \cos \theta + i \sin \theta
 $$
 
 So:
 
 $$
-k(x, x') = \mathbb{E}_\omega[\cos(\omega^\top x - \omega^\top x')] = \mathbb{E}_\omega[\cos(\omega^\top x) \cos(\omega^\top x') + \sin(\omega^\top x) \sin(\omega^\top x')]
+k(x, x') = \mathbb{E}_\omega[\cos(\omega^\top x - \omega^\top x')] = \mathbb{E}_\ome\cos(\omega^\top x) \cos(\omega^\top x') + \sin(\omega^\top x) \sin(\omega^\top x')]
+$$
+Using Monte Carlo approximation we have
+
+$$
+k(x, x') = \frac1{D}\sum_j\cos(\omega_j^\top x - \omega_j^\top x') = \frac1{D}\sum_j\cos(\omega_j^\top x) \cos(\omega_j^\top x') + \sin(\omega_j^\top x) \sin(\omega_j^\top x')]
 $$
 
-This suggests a 2D feature map:
+Defining $\phi_\omega(x)$ we have 
 
 $$
 \phi_\omega(x) = \begin{bmatrix} \cos(\omega^\top x) \\ \sin(\omega^\top x) \end{bmatrix}
 \Rightarrow k(x, x') \approx \frac{1}{D} \sum_{j=1}^D \phi_{\omega_j}(x)^\top \phi_{\omega_j}(x')
 $$
 
-To reduce this to $D$ dimensions, we use a phase shift trick:
+with explicit features
 
 $$
-\cos(\omega^\top x + b) \cos(\omega^\top x' + b) = \cos(\omega^\top x - \omega^\top x')
+\phi(x) = \sqrt{\frac{1}{D}} \begin{bmatrix}
+\cos(\omega_1^\top x) \\
+\sin(\omega_1^\top x) \\
+\vdots \\
+\cos(\omega_D^\top x) \\
+\sin(\omega_D^\top x)
+\end{bmatrix} \in \mathbb{R}^{2D}
 $$
 
-when $b \sim \text{Uniform}[0, 2\pi]$. This gives:
+But this requires **2D** values per frequency $\omega_i$.
+
+---
+
+### Reduce dimensionality using random phase shifts
+
+To reduce this to **D dimensions**, we use a well-known trick:
 
 $$
-\phi(x) = \sqrt{\frac{2}{D}} \begin{bmatrix} \cos(\omega_1^\top x + b_1) \\ \vdots \\ \cos(\omega_D^\top x + b_D) \end{bmatrix}
+\cos(\omega^\top x + b) = \cos(\omega^\top x) \cos(b) - \sin(\omega^\top x) \sin(b)
 $$
 
-Then:
+Let $b \sim \text{Uniform}[0, 2\pi]$. Then:
+
+$$
+\mathbb{E}_b \left[ \cos(\omega^\top x + b) \cos(\omega^\top x' + b) \right]
+= \cos(\omega^\top x) \cos(\omega^\top x') + \sin(\omega^\top x) \sin(\omega^\top x')
+$$
+
+This identity comes from integrating over $b \in [0, 2\pi]$, and it **averages out the phase shift**, preserving the desired kernel structure.
+
+So:
+
+$$
+\mathbb{E}_{b \sim \text{Uniform}[0, 2\pi]} \left[ \cos(\omega^\top x + b) \cos(\omega^\top x' + b) \right] = \cos(\omega^\top x - \omega^\top x')
+$$
+
+Thus:
+
+$$
+k(x, x') = \mathbb{E}_{\omega \sim p(\omega)} \left[ \cos(\omega^\top x - \omega^\top x') \right]
+= \mathbb{E}_{\omega, b} \left[ \cos(\omega^\top x + b) \cos(\omega^\top x' + b) \right]
+$$
+
+---
+
+### Monte Carlo Approximation
+
+Now sample $(\omega_j, b_j) \sim p(\omega) \times \text{Uniform}[0, 2\pi]$
+
+Define feature map:
+
+$$
+\phi(x) = \sqrt{\frac{2}{D}} \left[
+\cos(\omega_1^\top x + b_1), \dots, \cos(\omega_D^\top x + b_D)
+\right]^\top
+$$
+
+Then the kernel is approximated as:
 
 $$
 k(x, x') \approx \phi(x)^\top \phi(x')
 $$
 
+### Why This Works
+
+* You're using cosine with **random phase shift $b$** to combine both $\cos$ and $\sin$ information into a **single cosine term**
+* You **avoid doubling the number of features**, going from $2D$ to $D$
+* This is made possible by the identity:
+
+$$
+\mathbb{E}_{b \sim \text{Unif}[0, 2\pi]}[\cos(a + b) \cos(a' + b)] = \cos(a - a')
+$$
+
+* The **variance** is slightly higher than the 2D version, but this is a **practical trade-off**
+
 For **RBF kernel**:
 
 $$
-p(\omega) = \mathcal{N}(0, \sigma^{-2} I)\text{, so sample } \omega_j \sim \mathcal{N}(0, \sigma^{-2} I)
+p(\omega) = \mathcal{N}(0, \sigma^{-2} I)
+$$
+so sample
+
+$$
+\omega_j \sim \mathcal{N}(0, \sigma^{-2} I)
 $$
 
 ### Note on RBF Kernel and Infinite Dimensions
