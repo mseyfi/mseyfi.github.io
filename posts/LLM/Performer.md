@@ -354,6 +354,55 @@ While both are valid, the **second variant is theoretically superior** due to it
 So, the ultimate $\phi$ for softmax approximation is the positive random feature map (ideally the variance-reduced version) where the random projection vectors $\omega_i$ are orthogonalized.
 
 
+
+That's an excellent question that gets to the heart of the "Random Features" method. The notation $\omega_i$ represents the **i-th random feature vector**. These are the crucial random components that allow the Performer to approximate the complex softmax kernel.
+
+The "choice" of $\omega_i$ involves two main aspects: the **distribution** they are sampled from, and the **relationship** between them.
+
+### 1. The Distribution of each $\omega_i$
+
+For the primary goal of approximating the softmax and Gaussian kernels, each individual random vector $\omega_i$ is drawn from a **standard multivariate normal (Gaussian) distribution**.
+
+This is written as:
+$$ \omega_i \sim \mathcal{N}(0, I_d) $$
+
+Let's break this down:
+
+*   $\omega_i$: This is a vector with `d` dimensions, the same as the input query and key vectors (`Q` and `K`).
+*   $N$: This signifies a Normal (Gaussian) distribution.
+*   $0$ : The mean of the distribution is the zero vector. This means the random vectors are centered around the origin.
+*   $I_d$: The covariance matrix is the $d \times d$ identity matrix. This is a very important property. It means:
+    1.  Each of the $d$ components within a single vector $\omega_i$ is independent of the others.
+    2.  Each component has a variance of 1.
+    3.  The distribution is **isotropic**, meaning it's symmetric around the origin and has no preferred direction. This is a necessary condition for the kernel approximation theory to hold.
+
+### 2. The Relationship Between Different $\omega_i$ Vectors
+
+This is where the key innovation of FAVOR**+** comes in. While each $\omega_i$ comes from the same underlying distribution, you can choose how the different vectors in the set $\{\omega_1, \omega_2, ..., \omega_r\}$ relate to each other.
+
+There are two choices presented in the paper:
+
+**Choice A: Independent and Identically Distributed (IID) Sampling**
+This is the standard, baseline approach. You simply draw each of the $r$ vectors from the $N(0, I)$ distribution independently.
+*   **Pro**: Simple to implement.
+*   **Con**: The approximation has higher variance, meaning you need a larger $r$ to get a good result, which makes it less efficient.
+
+**Choice B: Orthogonal Random Features (ORFs)**
+This is the superior method and the "O" in FAVOR**+**. The set of $r$ random vectors $\{\omega_1, \omega_2, ..., \omega_r\}$ is constructed to be **mutually orthogonal**. This means that for any two different vectors $\omega_i$ and $\omega_j$ in the set, their dot product is zero:
+$$ \omega_i^T \omega_j = 0 \quad \text{for all } i \neq j $$
+This is typically achieved by first sampling $r$ vectors independently (like in Choice A) and then applying a procedure like the **Gram-Schmidt process** to make them orthogonal while preserving the properties of their marginal distribution.
+
+*   **Pro**: As proven in **Theorem 2**, this method **provably reduces the variance** of the kernel approximation. This means you can achieve the same accuracy with a smaller $r$, making the attention mechanism faster and more memory-efficient.
+*   **Con**: Slightly more complex to implement due to the extra orthogonalization step.
+
+### Summary
+
+The "ultimate" choice of $\omega_i$ for the Performer's FAVOR+ mechanism is **Choice B: Orthogonal Random Features**.
+
+So, in summary:
+1.  **What they are**: Each $\omega_i$ is a `d`-dimensional random vector.
+2.  **How they are chosen**: They are sampled from a standard Gaussian distribution $N(0, I)$ and then are made mutually orthogonal to each other.
+
 ### Code Snippet 
 ---
 ```python
