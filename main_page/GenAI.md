@@ -19,7 +19,6 @@ Classifier-Free Diffusion is a powerful technique in generative modeling, partic
 </div>
 
 
-
 ## [![Classifier-Guided Diffusion](https://img.shields.io/badge/CGD-Classifier_Guided_Diffusion-blue?style=for-the-badge&logo=github)](../posts/Classifier_Guided_Diffusion)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
