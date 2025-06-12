@@ -354,28 +354,7 @@ While both are valid, the **second variant is theoretically superior** due to it
 So, the ultimate $\phi$ for softmax approximation is the positive random feature map (ideally the variance-reduced version) where the random projection vectors $\omega_i$ are orthogonalized.
 
 
-### Minimal Code Snippet (PyTorch-style)
-
-```python
-import torch
-import math
-
-def random_features(x, omega, b):
-    # x: (batch_size, seq_len, dim)
-    # omega: (dim, n_features), b: (n_features,)
-    projection = torch.matmul(x, omega) + b  # shape: (batch, seq_len, n_features)
-    return math.sqrt(2.0 / omega.shape[1]) * torch.cos(projection)
-
-def performer_attention(Q, K, V, omega, b, eps=1e-6):
-    Q_prime = random_features(Q, omega, b)  # (batch, seq_len, n_features)
-    K_prime = random_features(K, omega, b)  # (batch, seq_len, n_features)
-
-    KV = torch.einsum('bnd,bne->bde', K_prime, V)  # (batch, n_features, dim)
-    denom = 1.0 / (torch.einsum('bnd,bd->bn', Q_prime, K_prime.sum(dim=1)) + eps).unsqueeze(-1)
-    out = torch.einsum('bnd,bde->bne', Q_prime, KV) * denom
-    return out  # (batch, seq_len, dim)
-```
-
+### Code Snippet 
 ---
 ```python
 import torch
