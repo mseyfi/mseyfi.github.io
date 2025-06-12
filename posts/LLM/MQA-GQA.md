@@ -8,6 +8,10 @@ The Transformer architecture's self-attention mechanism is the engine of modern 
 
 This tutorial provides an in-depth exploration of two powerful solutions: **Multi-Query Attention (MQA)** and **Grouped-Query Attention (GQA)**. Understanding these architectural details, including their mathematical foundations and impact on memory, is essential for grasping how models like Google's Gemini, Meta's Llama 3, and Mistral AI's models operate so efficiently.
 
+![KV](../../images/KV-cache-optimization.png)
+
+*Fig.2: KV caching in the sequence2sequence Transformer architectures*
+
 ### A Deeper Look at the KV Cache
 
 To understand MQA and GQA, one must first understand the **KV Cache**.
@@ -20,9 +24,6 @@ The **KV Cache** solves this by storing the Key and Value vectors for all tokens
 
 The bottleneck then shifts from computation to **memory bandwidth**. At every single generation step, the entire KV cache must be loaded from slow High-Bandwidth Memory (HBM) into the fast on-chip SRAM of the processor. This memory transfer is the primary factor limiting inference speed. The goal of MQA and GQA is to shrink this cache.
 
-![KV](../../images/KV-cache-optimization.png)
-
-*Fig.2: KV caching in the sequence2sequence Transformer architectures*
 ---
 
 ### Part 1: Revisiting Multi-Head Attention (MHA)
