@@ -114,6 +114,64 @@ Since $k$ is a small constant (e.g., $k=256$ even for $L=32768$), the complexity
 * The fixed size $k$ might act as a bottleneck for extremely complex long-range dependencies where a truly high-rank attention might be beneficial.
 * The projection matrices $E$ and $F$ need to be learned effectively.
 
+
+## Why only project K and V and not Q? 
+
+The fundamental reason is both mathematical and conceptual: **you need to generate an output for every token in the sequence, and the Query (Q) is what drives this process for each individual token.**
+
+Let's break this down into a conceptual reason and a mathematical one.
+
+### 1. The Conceptual Reason: The Role of Q, K, and V
+
+Think of the attention mechanism as a search in a library for each word in your sentence.
+
+* **Query (Q):** This is your **search query**. For every single token in the input sequence, you generate a unique Query. It's the token that is actively "looking for" context from the rest of the sequence. If you have a sequence of `n` tokens, you *must* have `n` queries to produce `n` updated tokens.
+* **Key (K):** This is like the **card catalog or index** of the library. Each token in the sequence has a Key that says, "this is the kind of information I represent."
+* **Value (V):** This is the **actual content of the books** on the shelves. Each token has a Value that contains its informational content.
+
+The core hypothesis of Linformer is that you don't need to check the entire, highly-detailed card catalog (K) and read every single book (V) to get the necessary context. You can create a **compressed summary** of the library's contents.
+
+* **Projecting K and V:** This is like creating a "CliffsNotes" or a summarized index of the library. You are reducing the `n` key-value pairs to a smaller, representative set of `k` key-value pairs. This summary still captures the most important information from the full sequence.
+* **Why NOT Project Q:** You still need to perform the search for **every single one of your original `n` tokens**. Each token needs to take its unique query, compare it against the *summarized library* (the projected K), and then retrieve information from the *summarized content* (the projected V). If you were to project the Queries down to `k` queries, you would only be asking `k` questions and would therefore only get `k` outputs. The goal of a self-attention layer is to update *all `n` tokens*, not just a small subset.
+
+Projecting Q would mean losing the one-to-one mapping between input tokens and output tokens, which would fundamentally break the structure of the Transformer.
+
+### 2. The Mathematical Reason: Breaking the Bottleneck
+
+The computational bottleneck in standard self-attention is the matrix multiplication of `Q` and `K^T`.
+
+Let's look at the matrix dimensions:
+* `Q` has shape `(n, d_k)`  (sequence length x dimension of key)
+* `K` has shape `(n, d_k)`
+* `V` has shape `(n, d_v)`  (sequence length x dimension of value)
+
+The bottleneck operation is `Q @ K.transpose(-1, -2)`, which results in an `(n, n)` attention matrix. The complexity is $O(n^2)$, which is very expensive for long sequences.
+
+**Linformer's Approach:**
+
+Linformer introduces a projection matrix `E` of shape `(k, n)` that projects the sequence dimension `n` down to a smaller, fixed dimension `k`.
+
+1.  **Project K and V:**
+    * `K_proj = E @ K`  --> resulting effective shape is `(k, d_k)`
+    * `V_proj = E @ V`  --> resulting effective shape is `(k, d_v)`
+
+2.  **Perform Attention:**
+    * **First multiplication:** `Q @ K_proj.transpose(-1, -2)`
+        * Dimensions: `(n, d_k) @ (d_k, k)` -> `(n, k)`
+        * This creates a much smaller attention-like score matrix. The complexity is now $O(n \cdot k \cdot d_k)$, which is linear with respect to `n`.
+    * **Second multiplication:** `(n, k) @ V_proj`
+        * Dimensions: `(n, k) @ (k, d_v)` -> `(n, d_v)`
+        * This produces the final output with the correct shape, where each of the `n` tokens has an updated representation.
+
+**What if we projected Q instead?**
+
+If you projected `Q` to `Q_proj` (shape `k, d_k`) and used the full `K`, your first multiplication would be `Q_proj @ K.transpose`, resulting in a `(k, n)` matrix. The final output after multiplying with `V` would have a sequence length of `k`, not `n`. You would have failed to compute an output for every input token.
+
+***
+
+**In summary:** The low-rank approximation is applied to the Key and Value matrices because they represent the global "context" or "information source" of the entire sequence, which can be effectively summarized. The Query matrix is left untouched because it represents the specific, individual need of each token in the sequence to gather that context, and you must preserve one query per token to get one output per token.
+
+
 ### Code Snippet (Conceptual Linformer Attention Module)
 
 ```python
