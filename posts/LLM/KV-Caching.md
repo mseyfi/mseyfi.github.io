@@ -1,5 +1,9 @@
+[![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](../../)
+
+## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](../../main_page/GenAI)
 
 ## The Ultimate Guide to the KV Cache: Speeding up Transformer Inference
+*Last Updated: June 12, 2025*
 
 Generative Large Language Models (LLMs) have transformed technology, but their power comes at a cost: inference (the process of generating new text) can be slow. The primary bottleneck is the "autoregressive" way they produce text—one token at a time. A simple but profound optimization called the **KV Cache** is the key to making this process practical and fast.
 
