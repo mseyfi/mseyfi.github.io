@@ -89,7 +89,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for la
 Language models are evaluated across diverse tasks such as next-token prediction, text classification, summarization, translation, code generation, and question answering. Each task requires a suitable metric that reflects model performance both quantitatively and qualitatively.
 </div>
 
-[![Linformer](https://img.shields.io/badge/Linformer-An_Efficient_Transformer-blue?style=for-the-badge&logo=github)](../posts/LLM/Linformer)
+[![Linformer](https://img.shields.io/badge/Linformer-A_Primary_Example_of_Explicit_Low_Rank_Attention-blue?style=for-the-badge&logo=github)](../posts/LLM/Linformer)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Overview of Linformer, why we need it, and side-by-side pseudo-code comparing traditional self-attention to Linformer self-attention. We’ll keep the example to single-head attention for clarity, but in practice you would typically use multi-head attention (with separate projections for each head).
 
