@@ -2,7 +2,7 @@ Of course. Here is the updated tutorial with more mathematical depth, code snipp
 
 ***
 
-## A Deep Dive into Multi-Query and Grouped-Query Attention (MQA & GQA) [Updated]
+## A Deep Dive into Multi-Query and Grouped-Query Attention (MQA & GQA)
 
 The Transformer architecture's self-attention mechanism is the engine of modern AI. However, as models and their context windows grow, the computational and memory costs of standard Multi-Head Attention (MHA) become a significant bottleneck, especially during inference.
 
