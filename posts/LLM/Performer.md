@@ -324,7 +324,7 @@ $$
 
 Let's break this down:
 
-*   $\exp(-||x||²/2)$ : This is the $h(x)$ scaling factor.
+*   $\exp(-\|x\|^2/2)$ : This is the $h(x)$ scaling factor.
 *   $\omega_1, \omega_2, ..., \omega_r$ : These are $r$ random vectors drawn from a Gaussian distribution $N(0, I)$. These are the "random features." For the full FAVOR**+** mechanism, these vectors are made **orthogonal** to each other.
 *   $\exp(\omega_i^T x)$: This is the $f(u)$ function, where $u = \omega_i^Tx$.
 *   **The result**: The final $\phi(x)$ is a new vector of dimension $r$.
