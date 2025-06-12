@@ -136,7 +136,12 @@ The core hypothesis of Linformer is that you don't need to check the entire, hig
 
 Projecting Q would mean losing the one-to-one mapping between input tokens and output tokens, which would fundamentally break the structure of the Transformer.
 
-### 2. The Mathematical Reason: Breaking the Bottleneck
+### 2. We Still Need an Output Token for Each Position ($L$)
+   - The output of the attention mechanism is still $(B, L, d)$, meaning we produce a new embedding for each of the $L$ tokens.  
+   - The Query dimension (the “rows” of the attention matrix) corresponds directly to the number of tokens ($L$) for which we want to compute an updated representation.  
+   - If we also projected $Q$ down to size $k$, we would effectively reduce the number of output tokens from $L$ to $k$, which is **not** what we want—each position in the input still needs its own separate query and 
+
+### 3. The Mathematical Reason: Breaking the Bottleneck
 
 The computational bottleneck in standard self-attention is the matrix multiplication of `Q` and `K^T`.
 
