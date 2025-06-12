@@ -209,7 +209,7 @@ Think of $W$ as the pre-trained brain, and $AB$ as adjustable reading glasses:
 
 ---
 
-## 6. LoRA Multi-Head Attention Code (No LLM Libraries)
+## 6. LoRA Multi-Head Attention Code
 
 ```python
 import torch
