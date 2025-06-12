@@ -308,9 +308,9 @@ $$
 ![performer](../../images/Performer.png)
 
 ## The ultimate choice
-Of course. The ultimate $\phi(x)$ used for softmax approximation in the Performer is the **Positive Random Feature (PRF) map**. It combines the $h(x)$ and $f(u)$ functions we discussed into a single, concrete feature mapping.
+The ultimate $\phi(x)$ used for softmax approximation in the Performer is the **Positive Random Feature (PRF) map**. It combines the $h(x)$ and $f(u)$ functions we discussed into a single, concrete feature mapping.
 
-The paper actually presents two slightly different but related versions of this $\phi(x)$, both derived from **Lemma 1**.
+The paper actually presents two slightly different but related versions of this $\phi(x)$, both derived from **Lemma 1** in the paper.
 
 ### Variant 1: The Standard Positive Feature Map (`SM⁺ₘ`)
 
