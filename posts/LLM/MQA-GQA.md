@@ -20,6 +20,9 @@ The **KV Cache** solves this by storing the Key and Value vectors for all tokens
 
 The bottleneck then shifts from computation to **memory bandwidth**. At every single generation step, the entire KV cache must be loaded from slow High-Bandwidth Memory (HBM) into the fast on-chip SRAM of the processor. This memory transfer is the primary factor limiting inference speed. The goal of MQA and GQA is to shrink this cache.
 
+![KV](../../images/KV-cache-optimization.png)
+
+*Fig.2: KV caching in the sequence2sequence Transformer architectures*
 ---
 
 ### Part 1: Revisiting Multi-Head Attention (MHA)
