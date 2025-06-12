@@ -57,6 +57,10 @@ Instead of asking each token to compute attention with *every other* token, Linf
 
 Imagine taking a very long document and summarizing it into $k$ key sentences. Then, when a word in the original document needs context, it attends to these $k$ summarized sentences, rather than the entire original document.
 
+![Linformer](../../images/Linformer.png)
+
+*Fig. 1: Linformer architecture along with its performance for different values of $K$*
+
 **Mathematical Description:**
 
 For each attention head, given input $X \in \mathbb{R}^{L \times d_{model}}$, the standard Transformer first projects it to $Q, K, V \in \mathbb{R}^{L \times d_k}$ (or $d_v$).
