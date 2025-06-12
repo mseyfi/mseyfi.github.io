@@ -298,13 +298,14 @@ $$
 \text{norm}_i = \tilde{Q}_i^\top (\tilde{K}^\top \mathbf{1}) \tag{3}
 $$
 
-![performer](../../images/Performer.png)
 
 ### Final Output:
 
 $$
 \text{PerformerAttn}(Q, K, V)_i = \frac{\tilde{Q}_i^\top (\tilde{K}^\top V)}{\tilde{Q}_i^\top (\tilde{K}^\top \mathbf{1})} \tag{4}
 $$
+
+![performer](../../images/Performer.png)
 
 ### Minimal Code Snippet (PyTorch-style)
 
