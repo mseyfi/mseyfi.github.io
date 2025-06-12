@@ -329,7 +329,7 @@ def performer_attention(Q, K, V, omega, b, eps=1e-6):
 ```
 
 ---
-
+```python
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -424,6 +424,7 @@ if __name__ == "__main":
     performer_attn = PerformerAttention(d_model, num_heads, num_random_features=num_random_features)
     output_performer = performer_attn(query, key, value)
     print(f"Performer Attention output shape: {output_performer.shape}") # (2, 1024, 256)
+```
 
 ## 4. Advantages of Performer
 
