@@ -1,6 +1,6 @@
-Of course. Here is the updated tutorial with more mathematical depth, code snippets, and a more detailed analysis of the KV cache reduction for each attention variant.
+[![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](../../)
 
-***
+## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](../../main_page/GenAI)
 
 ## A Deep Dive into Multi-Query and Grouped-Query Attention (MQA & GQA)
 
