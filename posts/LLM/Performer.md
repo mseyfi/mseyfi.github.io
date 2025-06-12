@@ -330,6 +330,101 @@ def performer_attention(Q, K, V, omega, b, eps=1e-6):
 
 ---
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+class PerformerAttention(nn.Module):
+    def __init__(self, d_model: int, num_heads: int, num_random_features: int = 256):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = d_model // num_heads
+        if d_model % num_heads != 0:
+            raise ValueError(f"d_model ({d_model}) must be divisible by num_heads ({num_heads})")
+
+        self.query_proj = nn.Linear(d_model, d_model)
+        self.key_proj = nn.Linear(d_model, d_model)
+        self.value_proj = nn.Linear(d_model, d_model)
+        self.out_proj = nn.Linear(d_model, d_model)
+
+        self.num_random_features = num_random_features
+        # Random features for queries and keys
+        # Omega: (num_heads, head_dim, num_random_features) - fixed during training
+        # This is a key difference from standard layers where weights are learnable
+        self.register_buffer("omega", torch.randn(num_heads, self.head_dim, num_random_features))
+
+    def _apply_random_features(self, x: torch.Tensor, omega: torch.Tensor):
+        # x shape: (batch_size, num_heads, seq_len, head_dim)
+        # omega shape: (num_heads, head_dim, num_random_features)
+        
+        # Project x using random features
+        # (batch_size, num_heads, seq_len, head_dim) @ (num_heads, head_dim, num_random_features)
+        # -> (batch_size, num_heads, seq_len, num_random_features)
+        projection = torch.einsum('bhid,hdo->bhis', x, omega)
+        
+        # Non-negative feature map (e.g., using exp, or cos/sin pair)
+        # A simple non-negative approximation for demonstration:
+        # Performer's actual phi is more complex and involves careful normalization.
+        phi_x = torch.exp(projection) # or use other forms for robustness
+        return phi_x # (batch_size, num_heads, seq_len, num_random_features)
+
+    def forward(self, query: torch.Tensor, key: torch.Tensor, value: torch.Tensor):
+        batch_size, q_seq_len, _ = query.size()
+        _, kv_seq_len, _ = key.size()
+
+        q = self.query_proj(query)
+        k = self.key_proj(key)
+        v = self.value_proj(value)
+
+        q = q.view(batch_size, q_seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        k = k.view(batch_size, kv_seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        v = v.view(batch_size, kv_seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+
+        # Apply random feature map to Q and K
+        # q_phi, k_phi shapes: (batch_size, num_heads, seq_len, num_random_features)
+        q_phi = self._apply_random_features(q, self.omega)
+        k_phi = self._apply_random_features(k, self.omega)
+
+        # Compute K_phi^T @ V
+        # (batch_size, num_heads, num_random_features, seq_len) @ (batch_size, num_heads, seq_len, head_dim)
+        # -> (batch_size, num_heads, num_random_features, head_dim)
+        kv_context = torch.matmul(k_phi.transpose(-2, -1), v)
+
+        # Compute unnormalized attention output: Q_phi @ (K_phi^T @ V)
+        # (batch_size, num_heads, q_seq_len, num_random_features) @ (batch_size, num_heads, num_random_features, head_dim)
+        # -> (batch_size, num_heads, q_seq_len, head_dim)
+        unnormalized_attn_output = torch.matmul(q_phi, kv_context)
+
+        # Compute normalization factor: Q_phi @ (K_phi^T @ ones)
+        # (batch_size, num_heads, num_random_features, 1) after summing K_phi
+        # -> (batch_size, num_heads, q_seq_len, 1)
+        k_phi_sum = torch.sum(k_phi, dim=-2, keepdim=True) # sum over sequence length of k_phi
+        normalization_factor = torch.matmul(q_phi, k_phi_sum.transpose(-2,-1))
+        
+        epsilon = 1e-6
+        normalized_attn_output = unnormalized_attn_output / (normalization_factor + epsilon)
+
+        # Reshape and final projection
+        output = normalized_attn_output.transpose(1, 2).contiguous().view(batch_size, q_seq_len, self.num_heads * self.head_dim)
+        output = self.out_proj(output)
+        return output
+
+# Example Usage
+if __name__ == "__main":
+    batch_size = 2
+    seq_len = 1024
+    d_model = 256
+    num_heads = 4
+    num_random_features = 256 # This M dimension is crucial for Performer
+
+    query = torch.randn(batch_size, seq_len, d_model)
+    key = torch.randn(batch_size, seq_len, d_model)
+    value = torch.randn(batch_size, seq_len, d_model)
+
+    performer_attn = PerformerAttention(d_model, num_heads, num_random_features=num_random_features)
+    output_performer = performer_attn(query, key, value)
+    print(f"Performer Attention output shape: {output_performer.shape}") # (2, 1024, 256)
+
 ## 4. Advantages of Performer
 
 | Aspect           | Performer (FAVOR+)                                  |
