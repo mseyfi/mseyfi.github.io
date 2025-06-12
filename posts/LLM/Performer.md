@@ -307,6 +307,53 @@ $$
 
 ![performer](../../images/Performer.png)
 
+## The ultimate choice
+Of course. The ultimate $φ(x)$ used for softmax approximation in the Performer is the **Positive Random Feature (PRF) map**. It combines the $h(x)$ and $f(u)$ functions we discussed into a single, concrete feature mapping.
+
+The paper actually presents two slightly different but related versions of this `φ(x)`, both derived from **Lemma 1**.
+
+### Variant 1: The Standard Positive Feature Map (`SM⁺ₘ`)
+
+This is the most straightforward version, directly implementing the core idea of using exponential functions to ensure positivity.
+
+The ultimate mapping $φ(x)$ for a single input vector $x$ (which could be a query $q_i$ or a key $k_j$) is:
+
+$$
+\phi(x) = \exp\left(-\frac{\|x\|^2}{2}\right) \begin{bmatrix} \exp(\omega_1^T x) \\ \exp(\omega_2^T x) \\ \vdots \\ \exp(\omega_r^T x) \end{bmatrix} 
+$$
+
+Let's break this down:
+
+*   $\exp(-||x||²/2)$ : This is the $h(x)$ scaling factor.
+*   $\omega_1, \omega_2, ..., \omega_r$ : These are $r$ random vectors drawn from a Gaussian distribution $N(0, I)$. These are the "random features." For the full FAVOR**+** mechanism, these vectors are made **orthogonal** to each other.
+*   $\exp(\omega_i^T x)$: This is the $f(u)$ function, where $u = \omega_i^Tx$.
+*   **The result**: The final $\phi(x)$ is a new vector of dimension $r$.
+
+The magic is that the dot product of two such mapped vectors, $\phi(q)^T\phi(k)$, gives an unbiased estimate of the original softmax kernel $\exp(q^Tk)$.
+
+### Variant 2: The Variance-Reduced Feature Map (`SM⁺⁺ₘ`)
+
+The paper mentions this second version as a way to "further reduce variance," meaning it gives a more accurate approximation. It's based on the hyperbolic cosine (`cosh`) identity from the derivation in Lemma 1.
+
+The ultimate mapping `φ(x)` in this case is:
+
+$$ 
+\phi(x) = \frac{1}{\sqrt{2}} \exp\left(-\frac{\|x\|^2}{2}\right) \begin{bmatrix} \exp(\omega_1^T x) \\ \vdots \\ \exp(\omega_r^T x) \\ \exp(-\omega_1^T x) \\ \vdots \\ \exp(-\omega_r^T x) \end{bmatrix} 
+$$
+
+The key differences are:
+
+1.  **Two Feature Functions**: It uses both $\exp(u)$ and $\exp(-u)$ as feature functions.
+2.  **Double the Dimension**: The resulting feature vector $\phi(x)$ is now in a higher-dimensional space ($2r$ instead of $r$), which helps capture more information and reduce error.
+3.  **Scaling Factor**: A $1/\sqrt2$ scaling factor is introduced to keep the approximation unbiased.
+
+### The "Ultimate" Choice
+
+While both are valid, the **second variant is theoretically superior** due to its lower variance. In practice, the Performer's FAVOR+ mechanism combines one of these $\phi(x)$ mappings with **orthogonal random features** (\omega_i` are orthogonal) to create the final, highly efficient and accurate linear attention mechanism.
+
+So, the ultimate $\phi$ for softmax approximation is the positive random feature map (ideally the variance-reduced version) where the random projection vectors $\omega_i$ are orthogonalized.
+
+
 ### Minimal Code Snippet (PyTorch-style)
 
 ```python
