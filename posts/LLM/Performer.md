@@ -308,9 +308,9 @@ $$
 ![performer](../../images/Performer.png)
 
 ## The ultimate choice
-Of course. The ultimate $φ(x)$ used for softmax approximation in the Performer is the **Positive Random Feature (PRF) map**. It combines the $h(x)$ and $f(u)$ functions we discussed into a single, concrete feature mapping.
+Of course. The ultimate $\phi(x)$ used for softmax approximation in the Performer is the **Positive Random Feature (PRF) map**. It combines the $h(x)$ and $f(u)$ functions we discussed into a single, concrete feature mapping.
 
-The paper actually presents two slightly different but related versions of this `φ(x)`, both derived from **Lemma 1**.
+The paper actually presents two slightly different but related versions of this $\phi(x)$, both derived from **Lemma 1**.
 
 ### Variant 1: The Standard Positive Feature Map (`SM⁺ₘ`)
 
@@ -349,7 +349,7 @@ The key differences are:
 
 ### The "Ultimate" Choice
 
-While both are valid, the **second variant is theoretically superior** due to its lower variance. In practice, the Performer's FAVOR+ mechanism combines one of these $\phi(x)$ mappings with **orthogonal random features** (\omega_i` are orthogonal) to create the final, highly efficient and accurate linear attention mechanism.
+While both are valid, the **second variant is theoretically superior** due to its lower variance. In practice, the Performer's FAVOR+ mechanism combines one of these $\phi(x)$ mappings with **orthogonal random features** ($\omega_i$ are orthogonal) to create the final, highly efficient and accurate linear attention mechanism.
 
 So, the ultimate $\phi$ for softmax approximation is the positive random feature map (ideally the variance-reduced version) where the random projection vectors $\omega_i$ are orthogonalized.
 
