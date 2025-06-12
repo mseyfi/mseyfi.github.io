@@ -90,15 +90,12 @@ Language models are evaluated across diverse tasks such as next-token prediction
   
 </div>
 
-
 ## [![MQA](https://img.shields.io/badge/MQA_GQA-Multi_Query_Attention,_Grouped_Query_Attention-blue?style=for-the-badge&logo=github)](../posts/LLM/MQA-GQA)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 The Transformer architecture's self-attention mechanism is the engine of modern AI. However, as models and their context windows grow, the computational and memory costs of standard Multi-Head Attention (MHA) become a significant bottleneck, especially during inference.
 
-This tutorial provides an in-depth exploration of two powerful solutions: Multi-Query Attention <p>(MQA)<\p> and Grouped-Query Attention <p>(GQA)</p>. Understanding these architectural details, including their mathematical foundations and impact on memory, is essential for grasping how models like Google's Gemini, Meta's Llama 3, and Mistral AI's models operate so efficiently.
-
+This tutorial provides an in-depth exploration of two powerful solutions: Multi-Query Attention <p>(MQA)</p> and Grouped-Query Attention <p>(GQA)</p>. Understanding these architectural details, including their mathematical foundations and impact on memory, is essential for grasping how models like Google's Gemini, Meta's Llama 3, and Mistral AI's models operate so efficiently.
 </div>
-
 
 ## [![Linformer](https://img.shields.io/badge/Linformer-A_Primary_Example_of_Explicit_Low_Rank_Attention-blue?style=for-the-badge&logo=github)](../posts/LLM/Linformer)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
