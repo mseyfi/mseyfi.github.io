@@ -335,7 +335,7 @@ The magic is that the dot product of two such mapped vectors, $\phi(q)^T\phi(k)$
 
 The paper mentions this second version as a way to "further reduce variance," meaning it gives a more accurate approximation. It's based on the hyperbolic cosine (`cosh`) identity from the derivation in Lemma 1.
 
-The ultimate mapping `\phi(x)` in this case is:
+The ultimate mapping $\phi(x)$ in this case is:
 
 $$ 
 \phi(x) = \frac{1}{\sqrt{2}} \exp\left(-\frac{\|x\|^2}{2}\right) \begin{bmatrix} \exp(\omega_1^T x) \\ \vdots \\ \exp(\omega_r^T x) \\ \exp(-\omega_1^T x) \\ \vdots \\ \exp(-\omega_r^T x) \end{bmatrix} 
