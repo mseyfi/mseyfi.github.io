@@ -90,6 +90,11 @@ Language models are evaluated across diverse tasks such as next-token prediction
   
 </div>
 
+## [![FFN](https://img.shields.io/badge/Efficient_FFN-Efficient_FFN_Structures-blue?style=for-the-badge&logo=github)](../posts/LLM/Efficient-FFN)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+While attention mechanisms get much of the spotlight, the Feed-Forward Network (FFN) is the computational workhorse of the Transformer. Typically comprising two-thirds of a model's parameters, the FFN block is a critical target for efficiency innovations. As of mid-2025, the strategies have evolved far beyond simply tweaking dimensions.
+</div>
+
 ## [![KV](https://img.shields.io/badge/KV_Caching-How_to_optimize_the_inference_by_caching_key_value-blue?style=for-the-badge&logo=github)](../posts/LLM/KV-Caching)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Generative Large Language Models (LLMs) have transformed technology, but their power comes at a cost: inference (the process of generating new text) can be slow. The primary bottleneck is the "autoregressive" way they produce text—one token at a time. A simple but profound optimization called the KV Cache is the key to making this process practical and fast.
