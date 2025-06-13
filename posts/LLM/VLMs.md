@@ -147,3 +147,5 @@ These can generate images from text or text from images:
 ---
 
 Would you like me to generate a **course plan with resources and projects** based on this structure?
+LiteVLM: A Low-Latency Vision-Language Model Inference Pipeline for Resource-Constrained Environments
+
