@@ -79,6 +79,46 @@ Let's trace the generation of token $t$, assuming we have already processed toke
 
 This mathematical flow proves the concept: $q_t$ is computed fresh and used once per step, while $K_{total}$ and $V_{total}$ are cumulative and persistent. There is no mathematical role for a "Query cache."
 
+### The Crucial Distinction: Training (Parallel) vs. Generation (Sequential)
+
+#### 1. How the Decoder Works During **Training**?
+
+During training, we have the entire ground-truth sequence (e.g., "The quick brown fox jumps"). We can process it in parallel for maximum efficiency.
+
+1.  **Input:** The entire sequence of embeddings for "The quick brown fox" is fed in at once. This is a tensor of shape `(L, d_model)`.
+2.  **Attention:** The model calculates `Output = Attention(Q_total, K_total, V_total)` using a causal mask. `Q_total`, `K_total`, and `V_total` are all sequences of length `L`. The output is also a sequence of shape `(L, d_model)`.
+3.  **FFN:** The **entire output sequence** `(L, d_model)` is passed through the Feed-Forward Network (FFN). The result is another sequence of shape `(L, d_model)`.
+4.  **Final Linear Layer (LM Head):** This entire `(L, d_model)` tensor is passed to the final linear layer, which produces logits of shape `(L, vocab_size)`.
+5.  **Loss:** The logit at position `i` is used to predict token `i+1`. The loss is calculated across all `L` positions simultaneously.
+
+In this parallel training process, you are absolutely right. `Q_total` is used, and a full sequence goes through the FFN and final layer.
+
+#### 2. How the Decoder Works During **Generation** (The part that needs clarification)
+
+During generation, we don't have the future. We are in a strict `for` loop, creating one token at a time. The goal at each step is to predict only the *very next* token.
+
+Let's trace the process precisely when we have already generated "The quick brown fox" and want to predict "jumps".
+
+1.  **Input:** The input to the model is **only the embedding for the last token, "fox"**. This is a tensor of shape `(1, d_model)`. We do not re-process the embeddings for "The", "quick", or "brown".
+
+2.  **Attention:**
+    * We use the input "fox" to generate a **single query vector**, `q_fox`. This is our `q_current` of shape `(1, d_k)`.
+    * We retrieve the `K_total` and `V_total` from our cache, which contains the Keys/Values for "The", "quick", "brown", and "fox".
+    * We calculate `output_fox = Attention(q_fox, K_total, V_total)`.
+    * The result of this is a **single output vector**, `output_fox`, of shape `(1, d_model)`. There is no `Output_Sequence` here.
+
+3.  **FFN:**
+    * The FFN receives **only `output_fox`**. Its input is a tensor of shape `(1, d_model)`.
+    * It processes this single vector and produces a new vector, `ffn_output_fox`, also of shape `(1, d_model)`.
+
+4.  **Final Linear Layer (LM Head):**
+    * The final layer receives **only `ffn_output_fox`**. Its input is a tensor of shape `(1, d_model)`.
+    * It produces logits for the single next word, with a shape of `(1, vocab_size)`.
+
+5.  **Prediction:** We apply a softmax to these logits and sample from the vocabulary to get our next token, "jumps".
+
+This is the "aha!" moment. During generation, **only the information for the very last token in the sequence ever flows through the FFN and the final prediction layer.**
+
 ### 3. A Practical Code Implementation
 
 Here is a simplified PyTorch module demonstrating self-attention with a KV Cache.
