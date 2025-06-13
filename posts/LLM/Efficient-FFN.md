@@ -64,10 +64,10 @@ MoE fundamentally changes the scaling law of Transformers by introducing conditi
 * **Intuition:** The specialist analogy is key 🧑‍⚕️. A single, monolithic FFN must be a generalist. MoE posits that it's more efficient to have a large team of "specialists" (expert FFNs), each skilled at handling different types of information. A lightweight "router" acts as a manager, quickly examining each incoming token and dispatching it to the two most relevant specialists. This allows the model's total knowledge (parameter count) to be vast, while the amount of work done for any single token remains small and fixed.
 
 * **Mathematical Formulation:**
-    Let there be $N$ experts, where each expert $E_i$ is a standard FFN. Let `k` be the number of experts to activate (e.g., k=2).
+    Let there be $N$ experts, where each expert $E_i$ is a standard FFN. Let $k$ be the number of experts to activate (e.g., k=2).
     1.  **Routing:** An input token representation $x \in \mathbb{R}^{d_{model}}$ is passed through a gating network (a linear layer $W_g \in \mathbb{R}^{d_{model} \times N}$) to produce logits.
         $$\text{logits} = x W_g$$
-    2.  **Gate Values & Selection:** A softmax is applied to the logits. The `Top-K` function selects the indices and weights of the `k` most likely experts.
+    2.  **Gate Values & Selection:** A softmax is applied to the logits. The 'Top-K` function selects the indices and weights of the $k$ most likely experts.
         $$G = \text{Softmax}(\text{logits})$$     $$(\text{indices}, \text{gates}) = \text{TopK}(G, k)$$
     3.  **Conditional Expert Processing:** The input token $x$ is processed *only* by the selected experts.
         $$\text{expert\_outputs}_i = E_i(x) \quad \text{for } i \in \text{indices}$$
@@ -75,13 +75,13 @@ MoE fundamentally changes the scaling law of Transformers by introducing conditi
         $$y = \sum_{i \in \text{indices}} \text{gates}_i \cdot \text{expert\_outputs}_i$$
 
 * **Complexity Analysis:**
-    * **Parameter Count:** The parameters are the sum of the router and all `N` experts.
+    * **Parameter Count:** The parameters are the sum of the router and all $N$ experts.
         $$P_{MoE} = (d_{model} \cdot N) + (N \cdot P_{FFN})$$
         This is enormous. For a model with 64 experts, the FFN parameters are roughly 64 times larger than the baseline.
-    * **Computational Complexity (FLOPs):** This is the magic of MoE. The computation is decoupled from the total number of experts, `N`.
+    * **Computational Complexity (FLOPs):** This is the magic of MoE. The computation is decoupled from the total number of experts, $N$.
         * Router FLOPs: $B \cdot L \cdot (2 \cdot d_{model} \cdot N)$
-        * Expert FLOPs: $B \cdot L \cdot k \cdot (4 \cdot d_{model} \cdot d_{ff})$  (Each token is processed by `k` experts)
-        * **Total FLOPs:** $\approx B \cdot L \cdot (2 \cdot d_{model} \cdot N + 4 \cdot k \cdot d_{model} \cdot d_{ff})$. The expert computation dominates. Crucially, the FLOPs scale with `k` (e.g., 2), not `N` (e.g., 64).
+        * Expert FLOPs: $B \cdot L \cdot k \cdot (4 \cdot d_{model} \cdot d_{ff})$  (Each token is processed by $k$ experts)
+        * **Total FLOPs:** $\approx B \cdot L \cdot (2 \cdot d_{model} \cdot N + 4 \cdot k \cdot d_{model} \cdot d_{ff})$. The expert computation dominates. Crucially, the FLOPs scale with $k$ (e.g., 2), not $N$ (e.g., 64).
 
 * **Code Snippet:**
     ```python
