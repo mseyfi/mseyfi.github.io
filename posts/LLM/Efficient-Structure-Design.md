@@ -8,10 +8,14 @@
 *Fig.1 Efficient Structure Design for LLMS*
 
 
+# Efficient FFN
+## [![FFN](https://img.shields.io/badge/Efficient_FFN-Efficient_FFN_Structures-blue?style=for-the-badge&logo=github)](Efficient-FFN)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+While attention mechanisms get much of the spotlight, the Feed-Forward Network (FFN) is the computational workhorse of the Transformer. Typically comprising two-thirds of a model's parameters, the FFN block is a critical target for efficiency innovations. As of mid-2025, the strategies have evolved far beyond simply tweaking dimensions.
+</div>
 
 
 # Low Complexity Attention
-
 ## Low Rank Attention
 
 ## [![Linformer](https://img.shields.io/badge/Linformer-A_Primary_Example_of_Explicit_Low_Rank_Attention-blue?style=for-the-badge&logo=github)](Linformer)
