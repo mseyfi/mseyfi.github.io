@@ -70,9 +70,9 @@ MoE fundamentally changes the scaling law of Transformers by introducing conditi
     2.  **Gate Values & Selection:** A softmax is applied to the logits. The 'Top-K` function selects the indices and weights of the $k$ most likely experts.
         $$G = \text{Softmax}(\text{logits})$$     $$(\text{indices}, \text{gates}) = \text{TopK}(G, k)$$
     3.  **Conditional Expert Processing:** The input token $x$ is processed *only* by the selected experts.
-        $$\text{expert_{outputs_i}} = E_i(x) \quad \text{for } i \in \text{indices}$$
+        $$\text{expert}_{\text{outputs}_i} = E_i(x) \quad \text{for } i \in \text{indices}$$
     4.  **Weighted Combination:** The final output is the sum of the expert outputs, weighted by their corresponding gate values.
-        $$y = \sum_{i \in \text{indices}} \text{gates}_i \cdot \text{expert_{outputs_i}}$$
+        $$y = \sum_{i \in \text{indices}} \text{gates}_i \cdot \text{expert}_{\text{outputs}_i}$$
 
 * **Complexity Analysis:**
     * **Parameter Count:** The parameters are the sum of the router and all $N$ experts.
