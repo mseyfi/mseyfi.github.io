@@ -13,7 +13,7 @@ This tutorial provides a deep, technical breakdown of the most prominent efficie
 
 This is the vanilla FFN architecture introduced in "Attention Is All You Need" and used in many early models.
 
-* **Intuition:** The FFN's role is often described as a "memory" or "knowledge" layer. A more functional intuition is that of a **feature expander and refiner** 💡. The up-projection layer takes token representations and projects them into a much higher-dimensional space. In this expanded space, the model has more "room" to identify, separate, and amplify complex combinations of features. The down-projection then integrates this richer feature information back into the original dimension, providing a more refined representation to the next layer.
+* **Intuition:** The FFN's role is often described as a "memory" or "knowledge" layer. A more functional intuition is that of a **feature expander and refiner**. The up-projection layer takes token representations and projects them into a much higher-dimensional space. In this expanded space, the model has more "room" to identify, separate, and amplify complex combinations of features. The down-projection then integrates this richer feature information back into the original dimension, providing a more refined representation to the next layer.
 
 * **Mathematical Formulation:**
     Let the input be $x \in \mathbb{R}^{B \times L \times d_{model}}$, where $B$ is batch size, $L$ is sequence length. The FFN has an intermediate dimension $d_{ff}$ (typically $4 \times d_{model}$).
@@ -70,9 +70,9 @@ MoE fundamentally changes the scaling law of Transformers by introducing conditi
     2.  **Gate Values & Selection:** A softmax is applied to the logits. The 'Top-K` function selects the indices and weights of the $k$ most likely experts.
         $$G = \text{Softmax}(\text{logits})$$     $$(\text{indices}, \text{gates}) = \text{TopK}(G, k)$$
     3.  **Conditional Expert Processing:** The input token $x$ is processed *only* by the selected experts.
-        $$\text{expert\_outputs}_i = E_i(x) \quad \text{for } i \in \text{indices}$$
+        $$\text{expert_{outputs_i}} = E_i(x) \quad \text{for } i \in \text{indices}$$
     4.  **Weighted Combination:** The final output is the sum of the expert outputs, weighted by their corresponding gate values.
-        $$y = \sum_{i \in \text{indices}} \text{gates}_i \cdot \text{expert\_outputs}_i$$
+        $$y = \sum_{i \in \text{indices}} \text{gates}_i \cdot \text{expert_{outputs_i}}$$
 
 * **Complexity Analysis:**
     * **Parameter Count:** The parameters are the sum of the router and all $N$ experts.
