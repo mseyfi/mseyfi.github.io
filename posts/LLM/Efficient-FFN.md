@@ -85,7 +85,9 @@ An MoE layer does not replace the FFN with a completely alien structure. Instead
 
 #### Vanilla FFN Structure (Monolithic)
 A standard FFN is a single, dense block with two linear transformations and a non-linearity.
+
 $$y_{FFN}(x) = W_2 (\text{Activation}(xW_1 + b_1)) + b_2$$
+
 * $W_1 \in \mathbb{R}^{d_{model} \times d_{ff}}$, $b_1 \in \mathbb{R}^{d_{ff}}$
 * $W_2 \in \mathbb{R}^{d_{ff} \times d_{model}}$, $b_2 \in \mathbb{R}^{d_{model}}$
 * **Nature:** Static and monolithic. Every token `x` is processed by the exact same weights, $W_1$ and $W_2$.
@@ -94,18 +96,24 @@ $$y_{FFN}(x) = W_2 (\text{Activation}(xW_1 + b_1)) + b_2$$
 An MoE layer is a composite function composed of three distinct parts: a router, multiple experts, and a combination rule.
 
 **A. The Router:** A single linear layer that produces routing probabilities.
+
 $$\text{Gates} = G(x) = \text{Softmax}(xW_g)$$
+
 * $W_g \in \mathbb{R}^{d_{model} \times N}$
 * **Nature:** Its output is a probability vector of size `N`, determining which experts are best suited for `x`.
 
 **B. The Experts:** A set of `N` independent FFNs. Each expert $E_i$ has its own unique weights.
+
 $$E_i(x) = W_{2,i} (\text{Activation}(xW_{1,i} + b_{1,i})) + b_{2,i}$$
+
 * $W_{1,i} \in \mathbb{R}^{d_{model} \times d_{ff}}$, $b_{1,i} \in \mathbb{R}^{d_{ff}}$ for each expert `i`.
 * $W_{2,i} \in \mathbb{R}^{d_{ff} \times d_{model}}$, $b_{2,i} \in \mathbb{R}^{d_{model}}$ for each expert `i`.
 * **Nature:** Each expert is a specialist, with weights learned for specific types of patterns.
 
 **C. The Final MoE Output:** A combination of the above parts.
+
 $$y_{MoE}(x) = \sum_{i \in \text{TopK}(G(x), k)} G(x)_i \cdot E_i(x)$$
+
 * **Nature:** Dynamic and sparse. The final computation for `x` is a weighted sum of the outputs from only the top `k` selected experts.
 
 ### 3. The Full Architecture and Mathematical Formulation
@@ -125,12 +133,18 @@ We use sparse top-k gating to select the `k` experts with the highest gate proba
 
 * **Mathematical Formulation:** The loss is designed to increase when some experts receive a disproportionately large load. For a batch of $T = B \times L$ tokens and $N$ experts:
     1.  Define $f_i$: The fraction of tokens in the batch dispatched to expert `i`.
+  
         $$f_i = \frac{1}{T} \sum_{t=1}^{T} \mathbb{I}(\text{expert chosen for token } t \text{ is } i)$$
+
         where $\mathbb{I}$ is the indicator function.
     2.  Define $P_i$: The average router probability assigned to expert `i` across all tokens in the batch.
+
         $$P_i = \frac{1}{T} \sum_{t=1}^{T} G(x_t)_i$$
+    
     3.  The load balancing loss is then their dot product, scaled by the number of experts:
+     
         $$L_{aux} = \alpha \cdot N \cdot \sum_{i=1}^{N} f_i \cdot P_i$$
+    
     Here, $\alpha$ is a small, tunable hyperparameter that controls the strength of this loss. By minimizing $L_{aux}$, the model is forced to keep both the dispatch assignments ($f_i$) and the router probabilities ($P_i$) relatively flat, ensuring all experts receive traffic and continue to learn.
 
 #### Why this loss works
@@ -190,10 +204,12 @@ By penalizing this specific condition, the loss function creates a gradient that
 Think of it as a "portfolio diversification" penalty. The loss is low if your investments are spread out. The loss is high if you put all your money (`f_i`) into a stock you are already overly confident in (`P_i`). To minimize risk (loss), you must diversify.
 #### Alternative solutions for load  balancing loss
 1- Maximize the entropy (minimize negative entropy)
+
 $$
 loss = \sum_i^N p_i \log p_i
 $$
-2- minimize variace
+2- minimize variance
+
 $$
 \mathcal{L}_{\text{balance}} = \left( \frac{1}{N} \sum_{i=1}^N p_i \right)^2 - \frac{1}{N} \sum_{i=1}^N p_i^2
 = \text{mean}(p)^2 - \text{mean}(p^2)
@@ -202,7 +218,9 @@ $$
 ### 4. Full Complexity Analysis
 
     * **Parameter Count:** The parameters are the sum of the router and all $N$ experts.
+    
         $$P_{MoE} = (d_{model} \cdot N) + (N \cdot P_{FFN})$$
+    
         This is enormous. For a model with 64 experts, the FFN parameters are roughly 64 times larger than the baseline.
     * **Computational Complexity (FLOPs):** This is the magic of MoE. The computation is decoupled from the total number of experts, $N$.
         * Router FLOPs: $B \cdot L \cdot (2 \cdot d_{model} \cdot N)$
@@ -315,7 +333,9 @@ This architecture improves the effectiveness of the core FFN block itself, becom
 
 * **Complexity Analysis:**
     * **Parameter Count:** Sum of the three weight matrices (ignoring biases).
+      
         $$P_{SwiGLU} = (d_{model} \cdot d_{ff}) + (d_{model} \cdot d_{ff}) + (d_{ff} \cdot d_{model})$$
+
         To keep the parameter count comparable to a standard FFN's $2 \cdot d_{model} \cdot d_{ff}$, the intermediate dimension $d_{ff}$ is often set to about $\frac{2}{3}$ of its original size (e.g., $d_{ff} \approx \frac{2}{3} \cdot 4 \cdot d_{model}$).
     * **Computational Complexity (FLOPs):**
         * $W_1$ and $W_2$ projections: $B \cdot L \cdot (2 \cdot d_{model} \cdot d_{ff})$ each.
