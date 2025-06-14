@@ -203,11 +203,13 @@ By penalizing this specific condition, the loss function creates a gradient that
 
 Think of it as a "portfolio diversification" penalty. The loss is low if your investments are spread out. The loss is high if you put all your money (`f_i`) into a stock you are already overly confident in (`P_i`). To minimize risk (loss), you must diversify.
 #### Alternative solutions for load  balancing loss
+
 1- Maximize the entropy (minimize negative entropy)
 
 $$
 loss = \sum_i^N p_i \log p_i
 $$
+
 2- minimize variance
 
 $$
