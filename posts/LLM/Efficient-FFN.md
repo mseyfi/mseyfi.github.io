@@ -224,11 +224,7 @@ $$
         $$P_{MoE} = (d_{model} \cdot N) + (N \cdot P_{FFN})$$
     
         This is enormous. For a model with 64 experts, the FFN parameters are roughly 64 times larger than the baseline.
-    * **Computational Complexity (FLOPs):** This is the magic of MoE. The computation is decoupled from the total number of experts, $N$.
-        * Router FLOPs: $B \cdot L \cdot (2 \cdot d_{model} \cdot N)$
-        * Expert FLOPs: $B \cdot L \cdot k \cdot (4 \cdot d_{model} \cdot d_{ff})$  (Each token is processed by $k$ experts)
-        * **Total FLOPs:** $\approx B \cdot L \cdot (2 \cdot d_{model} \cdot N + 4 \cdot k \cdot d_{model} \cdot d_{ff})$. The expert computation dominates. Crucially, the FLOPs scale with $k$ (e.g., 2), not $N$ (e.g., 64).
-
+ 
 ### 5. Code Implementation
 
 This updated code snippet now calculates and returns the auxiliary load balancing loss.
