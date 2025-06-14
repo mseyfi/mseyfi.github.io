@@ -221,7 +221,9 @@ $$
 
 * **Parameter Count:** The parameters are the sum of the router and all $N$ experts.
     
-        $$P_{MoE} = (d_{model} \cdot N) + (N \cdot P_{FFN})$$
+  $$
+  P_{MoE} = (d_{model} \cdot N) + (N \cdot P_{FFN})
+  $$
     
 This is enormous. For a model with 64 experts, the FFN parameters are roughly 64 times larger than the baseline.
 * **Computational Complexity (FLOPs):** This is the magic of MoE. The computation is decoupled from the total number of experts, $N$.
