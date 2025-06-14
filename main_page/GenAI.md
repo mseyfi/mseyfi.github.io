@@ -90,17 +90,18 @@ Language models are evaluated across diverse tasks such as next-token prediction
   
 </div>
 
-## [![SwiGlu](https://img.shields.io/badge/SWiGLU-The_Modern_FFN_for_High_Performance_Transformers-blue?style=for-the-badge&logo=github)](../posts/LLM/Efficient-FFN)
+## [![MOE](https://img.shields.io/badge/MOE_Mixture_of_Experts:_FFN-Efficient_FFN_Structures-blue?style=for-the-badge&logo=github)](../posts/LLM/Efficient-FFN)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+While attention mechanisms get much of the spotlight, the Feed-Forward Network (FFN) is the computational workhorse of the Transformer. Typically comprising two-thirds of a model's parameters, the FFN block is a critical target for efficiency innovations. As of mid-2025, the strategies have evolved far beyond simply tweaking dimensions.
+</div>
+
+## [![SwiGlu](https://img.shields.io/badge/SWiGLU-The_Modern_FFN_for_High_Performance_Transformers-blue?style=for-the-badge&logo=github)](../posts/LLM/SWiGLU)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 While Mixture of Experts (MoE) offers a path to scale models to enormous parameter counts via sparsity, another critical innovation has optimized the performance of the core "dense" Transformer block itself. This is the <b>Gated Linear Unit (GLU)</b>, and specifically its most successful variant, <b>SwiGLU</b>.
 
 As of mid-2025, SwiGLU has replaced the traditional FFN in most state-of-the-art dense language models (like Meta's Llama series, Google's PaLM, and Mistral's dense models). This tutorial explores the intuition, mathematics, and implementation behind this powerful and efficient architecture.
 </div>
 
-## [![FFN](https://img.shields.io/badge/Efficient_FFN-Efficient_FFN_Structures-blue?style=for-the-badge&logo=github)](../posts/LLM/Efficient-FFN)
-<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-While attention mechanisms get much of the spotlight, the Feed-Forward Network (FFN) is the computational workhorse of the Transformer. Typically comprising two-thirds of a model's parameters, the FFN block is a critical target for efficiency innovations. As of mid-2025, the strategies have evolved far beyond simply tweaking dimensions.
-</div>
 
 ## [![KV](https://img.shields.io/badge/KV_Caching-How_to_optimize_the_inference_by_caching_key_value-blue?style=for-the-badge&logo=github)](../posts/LLM/KV-Caching)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
