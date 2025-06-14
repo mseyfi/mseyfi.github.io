@@ -231,8 +231,25 @@ This is enormous. For a model with 64 experts, the FFN parameters are roughly 64
 * Expert FLOPs: $B \cdot L \cdot k \cdot (4 \cdot d_{model} \cdot d_{ff})$  (Each token is processed by $k$ experts)
 * **Total FLOPs:** $\approx B \cdot L \cdot (2 \cdot d_{model} \cdot N + 4 \cdot k \cdot d_{model} \cdot d_{ff})$. The expert computation dominates. Crucially, the FLOPs scale with $k$ (e.g., 2), not $N$ (e.g., 64).
 
- 
-### 5. Code Implementation
+### 5. Why MOE is Superior to FFN?
+
+The advantage of MoE is **not** that it's cheaper than a vanilla FFN of the exact same size. Its advantage is that it allows a model to achieve the performance of a **vastly larger dense model** for the computational cost (FLOPs) of a **much smaller dense model**.
+
+Here’s the breakdown:
+
+* **The Core Principle: Decoupling Parameters from Computation.** In a standard FFN, performance is tied to active parameters—to make it smarter, you must make it computationally more expensive for every token. MoE breaks this link. It increases total parameters (knowledge) by adding more "expert" networks but keeps the computation low by only activating a small, fixed number of them for any given token.
+
+* **The Fair Comparison:** To see why MoE is better, don't compare a 200B parameter dense model to a 200B parameter MoE model. Instead, compare two models that achieve the same final quality score:
+    * A **Dense Model** might need 1.4 Trillion active parameters to reach that quality, making it incredibly expensive to run.
+    * An **MoE Model** can reach that same quality with 1.4 Trillion *total* parameters, but it only ever activates ~200 Billion parameters' worth of computation for any single token.
+
+* **The Result:** You get the performance and knowledge of the 1.4 Trillion parameter model for the FLOPs and inference speed of the much smaller 200 Billion parameter model.
+
+* **In short:** Using the previous analogy, you get the diagnostic quality of a world-class "super-doctor" who knows everything, but for the much lower price of consulting just two relevant specialists.
+
+Therefore, MoE is the superior architecture for building state-of-the-art models because it breaks the painful trade-off between model quality and computational cost.
+
+### 6. Code Implementation
 
 This updated code snippet now calculates and returns the auxiliary load balancing loss.
 
