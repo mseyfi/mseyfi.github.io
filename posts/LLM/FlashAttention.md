@@ -7,6 +7,14 @@ FlashAttention is a pivotal innovation that addresses one of the most fundamenta
 Here is a full, detailed tutorial on FlashAttention.
 
 ***
+[FA](../../images/FlashAttention.png)
+*Fig 1: Left: FlashAttention uses tiling to prevent materialization of the large $$𝑁 \times 𝑁$$ attention matrix
+(dotted box) on (relatively) slow GPU HBM. In the outer loop (red arrows), FlashAttention loops through
+blocks of the $K$ and $V$ matrices and loads them to fast on-chip SRAM. In each block, FlashAttention
+loops over blocks of $Q$ matrix (blue arrows), loading them to SRAM, and writing the output of the attention
+computation back to HBM. Right: Speedup over the PyTorch implementation of attention on GPT-2.
+FlashAttention does not read and write the large $$𝑁 \times 𝑁$$ attention matrix to HBM, resulting in an 7.6$\times$
+speedup on the attention computation.*
 
 ## A Deep Dive into FlashAttention: Fixing the Transformer's Memory Bottleneck
 
