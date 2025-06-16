@@ -89,7 +89,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for la
 Language models are evaluated across diverse tasks such as next-token prediction, text classification, summarization, translation, code generation, and question answering. Each task requires a suitable metric that reflects model performance both quantitatively and qualitatively.
 </div>
 
-## [![FlashAttention](https://img.shields.io/badge/FLASHATTENTION-Fast_and_Memory_Efficient_Exact_Attention_with_IO_Awareness-blue?style=for-the-badge&logo=github)](../posts/LLM/FLASHATTENTION)
+## [![FlashAttention](https://img.shields.io/badge/FLASHATTENTION-Fast_and_Memory_Efficient_Exact_Attention_with_IO_Awareness-blue?style=for-the-badge&logo=github)](../posts/LLM/FlashAttention)
 FlashAttention is a pivotal innovation that addresses one of the most fundamental bottlenecks in the Transformer architecture. Unlike architectural changes like MoE or GQA, FlashAttention is a groundbreaking implementation that doesn't change the mathematics of attention but radically alters how it's computed on the hardware.
 </div>
 
