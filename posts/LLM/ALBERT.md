@@ -1,4 +1,3 @@
-
 ## A Deep Dive into Cross-Layer Parameter Sharing: The ALBERT Approach
 
 While innovations like MoE and SwiGLU focus on redesigning the FFN block *within* a single Transformer layer, Cross-Layer Parameter Sharing tackles efficiency from a different angle: it re-evaluates the relationship *between* the layers themselves. It asks a simple but profound question: "Does every layer in a deep network truly need its own unique set of weights?"
