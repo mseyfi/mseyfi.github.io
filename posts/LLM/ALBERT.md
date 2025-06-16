@@ -12,13 +12,13 @@ This tutorial explores the intuition, mathematics, and trade-offs of this powerf
 
 To grasp the concept, it's helpful to contrast the standard Transformer architecture with a parameter-shared one.
 
-* **A Standard Transformer is an "Assembly Line" 🏭:** Think of a 24-layer Transformer as a 24-stage factory assembly line. Each station (`Layer_i`) has its own unique, highly specialized tools (`Weights_i`).
+* **A Standard Transformer is an "Assembly Line":** Think of a 24-layer Transformer as a 24-stage factory assembly line. Each station (`Layer_i`) has its own unique, highly specialized tools (`Weights_i`).
     * **Station 1** might perform a basic task like identifying parts of speech.
     * **Station 12** might have tools to understand semantic relationships.
     * **Station 24** might have sophisticated tools to resolve complex, long-range dependencies.
     Each layer is a specialist, and the token representation is passed from one specialist to the next, getting progressively built up.
 
-* **A Shared-Parameter Transformer is a "Master Craftsman" 👨‍🎨:** Now, imagine a master craftsman building a sculpture with a single, highly versatile set of tools. They don't have 24 different sets of tools. Instead, they apply the same set of tools **iteratively** to the raw block of marble (the input embedding).
+* **A Shared-Parameter Transformer is a "Master Craftsman":** Now, imagine a master craftsman building a sculpture with a single, highly versatile set of tools. They don't have 24 different sets of tools. Instead, they apply the same set of tools **iteratively** to the raw block of marble (the input embedding).
     * **Pass 1 (Layer 1):** The craftsman uses their tools to rough out the basic shape of the sculpture.
     * **Pass 2 (Layer 2):** They apply the *exact same tools* again to the roughed-out shape, this time adding finer details.
     * **Pass 12 (Layer 12):** After many passes, the same tools are used for the final polishing.
@@ -63,7 +63,7 @@ This is where the technique shines. Let's compare the total parameters for the F
 
 This is the crucial trade-off.
 
-* **FLOPs for one layer:** $\text{FLOPs}_{layer} \approx 4 \cdot B \cdot L \cdot d_{model} \cdot d_{ff}$ (for the FFN part).
+* **FLOPs for one layer:** $$\text{FLOPs}_{layer} \approx 4 \cdot B \cdot L \cdot d_{model} \cdot d_{ff}$$ (for the FFN part).
 * **Total FLOPs for a full forward pass:**
     $$\text{FLOPs}_{Total} \approx L \times \text{FLOPs}_{layer}$$
 
