@@ -71,7 +71,64 @@ SwiGLU's efficiency is not about having fewer FLOPs per se, but about achieving 
 
 **The Trade-off:** For the same intermediate dimension $d_{ff}$, SwiGLU requires ~1.5x the FLOPs of a standard FFN. However, its superior expressiveness and empirical performance mean that a model can achieve better results with a smaller `d_ff` or fewer total layers, often making it more computationally efficient overall for a target performance level.
 
-### 4. Code Implementation
+
+
+### 4. Why SWiGLU is better than FFN? Does not FFN lean to give less wight to less important tokens as does SWiGLU? What is the difference?
+
+The core difference is **static transformation vs. dynamic, input-dependent control.**
+
+Let's break this down.
+
+### Standard FFN: A Static Filter
+
+Think of the standard FFN block (e.g., `ReLU(xW1)W2`) as a **static filter**.
+
+* It learns two weight matrices, $W_1$ and $W_2$, during training.
+* Once trained, these matrices are **fixed**.
+* Every single token that passes through this FFN block is transformed by the *exact same* $W_1$ and $W_2$.
+
+You are right that the *output* is different for each token, but that's only because the *input* token ($x$) is different. The transformation itself is rigid.
+
+Imagine you have a single, sophisticated camera lens filter (e.g., one that sharpens blues and softens reds). You apply this *same filter* to every photo you take. A photo of the ocean and a photo of a rose will look different, but the way the filter *changes* the photo is identical in both cases. The FFN is this fixed filter. It learns a single, generalized way to process information.
+
+### SwiGLU: A Dynamic, Intelligent Gate
+
+SwiGLU (Swish-Gated Linear Unit) operates very differently. It creates a filter that is **dynamically generated based on the content of the token itself.**
+
+Let's look at the mechanics. A simplified GLU takes an input $x$ and passes it through two separate linear layers, $W$ and $V$:
+
+$$\text{GLU}(x, W, V) = (xW) \otimes \sigma(xV)$$
+
+* $xW$: This is the "content" or "value" path, similar to the first linear layer in a standard FFN. It proposes a possible set of features.
+* $xV$: This is the "gate" path. It's a *separate* linear layer whose sole purpose is to create a gate.
+* $\sigma(xV)$: An activation function (Sigmoid in the original GLU, Swish in SwiGLU) is applied to the gate path. This squashes the output to a range (mostly between 0 and 1), creating a set of values that act as switches.
+* $\otimes$: This is element-wise multiplication. The "content" ($xW$) is multiplied by the "gate" ($\sigma(xV)$).
+
+This is where the magic happens. The gate, $\sigma(xV)$, decides **which elements of the content, $xW$, should be passed through and which should be suppressed.**
+
+* If an element in the gate is close to 0, it "closes the gate" for the corresponding feature in the content, effectively zeroing it out.
+* If an element in the gate is close to 1, it "opens the gate," allowing the feature to pass through unchanged.
+
+This means the transformation is **no longer static**. It is conditioned on the input token itself.
+
+### So, What is the Real Benefit?
+
+Let's go back to your core question: "If a token is less important, its weight will be less important. This is what exactly SwiGLU is doing right?"
+
+Not quite. Here's the crucial distinction:
+
+* A **standard FFN** has to learn a single set of weights ($W_1, W_2$) that works, on average, for *all possible tokens*. It cannot dedicate parts of its learned function to specific contexts. It might learn that, in general, certain features are less important, but it can't decide that a feature is important for the token "queen" in "queen of England" but irrelevant for the token "queen" in "queen bee".
+* **SwiGLU** can make that distinction. The gate ($xV$) for the token "queen" in the first sentence will be different from the gate for "queen" in the second. It learns to recognize the context of the token and dynamically creates a gate that says, "Okay, for *this specific token in this context*, these potential features in $xW$ are highly relevant, so let's amplify them. And these other features are just noise, so let's suppress them entirely."
+
+**The benefits are profound:**
+
+1.  **Token-Specific Feature Selection:** SwiGLU doesn't just learn a general transformation; it learns a rule for *how to create a specific transformation for each token*. This is far more expressive.
+2.  **Noise Reduction:** FFNs can sometimes introduce noise. The expansion layer might create features that aren't useful for a particular token. SwiGLU's gate can learn to prune these irrelevant features on the fly, leading to a cleaner signal being passed to the next layer.
+3.  **Improved Training:** Gated mechanisms can lead to better gradient flow during backpropagation, making the network easier to train and allowing it to converge on better solutions. Empirical results consistently show that GLU variants like SwiGLU outperform standard FFNs for the same parameter count or computational budget.
+
+In short, a linear layer learns a fixed hammer. SwiGLU learns to build a specialized multi-tool for every job it encounters. This dynamic, content-aware filtering is a significant step up in modeling power and a key reason why architectures like Llama use it.
+
+### 5. Code Implementation
 
 This PyTorch module implements the SwiGLU FFN layer as described.
 
