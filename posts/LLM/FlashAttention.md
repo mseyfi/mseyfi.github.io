@@ -80,7 +80,76 @@ FlashAttention solves this with a clever numerical trick. As it iterates through
 
 This allows it to arrive at the **exact same final result** as a standard softmax, but without ever needing the full row to be materialized in memory at once. It effectively "recomputes" the normalization factor as it gets more information, saving a massive amount of memory access.
 
-### 3. Full Complexity Analysis
+Of course. Adding a mathematical deep dive into the core mechanics of FlashAttention is an excellent way to solidify the concepts. The algorithm's elegance is truly in these details.
+
+Here is the full tutorial, updated with a new, in-depth section on the mathematics of tiling and the online softmax.
+
+***
+
+## A Deep Dive into FlashAttention: Fixing the Transformer's Memory Bottleneck
+
+While architectural changes like MoE and GQA have reshaped Transformer blocks, **FlashAttention** stands as a fundamental *implementation* breakthrough. It doesn't change the mathematics of attention; it radically alters *how* it's computed on the hardware to overcome a critical performance bottleneck.
+
+This tutorial explores the problem FlashAttention solves, its core technical innovations—including a mathematical breakdown of its algorithm—and its impact on the modern LLM landscape as of mid-2025.
+
+### 1. The Bottleneck: Why Standard Attention is "Memory-Bound"
+
+To understand FlashAttention, we must first understand the "memory wall" that standard attention hits.
+
+#### The GPU Memory Hierarchy
+A modern GPU has two main types of memory:
+1.  **High-Bandwidth Memory (HBM):** This is the large, main memory of the GPU (e.g., 80GB). It's spacious but relatively slow to access.
+2.  **SRAM (Static Random-Access Memory):** This is an extremely fast, on-chip memory available in small amounts (e.g., a few dozen megabytes). It's blazing fast but very limited in size.
+
+High performance on a GPU is achieved by maximizing work done in SRAM and minimizing data transfer to and from HBM.
+
+#### The Inefficient Memory Pattern of Standard Attention
+The standard attention formula, $O = \text{softmax}(\frac{QK^T}{\sqrt{d_k}})V$, is typically executed in a way that constantly accesses slow HBM. The primary culprit is the materialization of the huge $N \times N$ attention score matrix ($S=QK^T$). For a sequence of length `N=64k`, this matrix alone is over 16GB, far too large for SRAM. This forces the GPU to write this massive matrix to HBM and then read it back, creating a severe bottleneck where the processor waits for data instead of computing.
+
+### 2. The FlashAttention Solution: Kernel Fusion and Hardware Awareness
+
+The core idea of FlashAttention is: **never write the full $N \times N$ attention matrix to HBM.** It achieves this by fusing the separate steps of attention into a single "kernel" that intelligently uses fast SRAM. This is made possible by two key algorithmic breakthroughs.
+
+1.  **Tiling:** The large `Q`, `K`, and `V` matrices are partitioned into smaller blocks. The algorithm loads these blocks into the fast SRAM, performs the attention calculation on them, and accumulates the result without ever storing the full matrix.
+2.  **Online Softmax:** A numerically stable algorithm is used to compute the correct softmax "on the fly" as new blocks are processed, avoiding the need to see the entire row of scores at once.
+
+### 3. The Mathematical Core of FlashAttention
+
+Let's dive into a simplified mathematical view of how tiling and the online softmax work together. The scaling factor $\frac{1}{\sqrt{d_k}}$ is omitted for clarity.
+
+#### A. Tiling and the Challenge of Softmax
+Let's partition our matrices `Q`, `K`, and `V` into blocks. `Q` is split into row-blocks $Q_1, Q_2, \dots$, while `K` and `V` are split into corresponding column-blocks $K_1, K_2, \dots$ and $V_1, V_2, \dots$.
+
+The final output block $O_i$ corresponding to the input block $Q_i$ is given by:
+$$O_i = P_i V = \text{softmax}(S_i)V$$
+where $S_i = Q_i K^T$ is the `i`-th block-row of the full score matrix. We can write $S_i$ as a sum of block-products: $S_i = [Q_i K_1^T, Q_i K_2^T, \dots, Q_i K_{T_r}^T]$. Let $S_{ij} = Q_i K_j^T$.
+
+The problem is that softmax is non-linear. You **cannot** compute it block by block:
+$$\text{softmax}([S_{i1}, S_{i2}]) V \neq [\text{softmax}(S_{i1})V_1 + \text{softmax}(S_{i2})V_2]$$
+This is because the denominator of the softmax for block `S_i1` depends on the values in block `S_i2`, and vice-versa. To compute the true softmax value for any element, you need the sum of exponentials over its *entire* row. This is what the online softmax algorithm solves.
+
+#### B. The Online Softmax Algorithm (Simplified)
+The key is to maintain running statistics for each row of the attention matrix as we iterate through the blocks. For any given row `r` within block `Q_i`, we keep track of three values as we process blocks $j=1, 2, \dots$:
+* $m_r$: The **maximum score value** seen so far for this row.
+* $l_r$: The **sum of the exponentials** of scores seen so far, scaled by the running maximum.
+* $O_r$: The **accumulated output vector** for this row so far.
+
+Let's trace the update for a single row `r` as we process a new block of keys, $K_j$.
+
+1.  **Load Current State:** Load the current running statistics $(m_r^{(old)}, l_r^{(old)}, O_r^{(old)})$ for row `r` from SRAM.
+2.  **Compute Block Scores:** Compute the scores for the current block: $S_{rj} = q_r K_j^T$. Load the corresponding value block $V_j$.
+3.  **Find New Local Maximum:** Find the maximum value within this new block of scores: $m_{rj} = \max(S_{rj})$.
+4.  **Compute Global Maximum:** Find the true maximum so far by comparing with the old one: $m_r^{(new)} = \max(m_r^{(old)}, m_{rj})$.
+5.  **Compute New Block Probabilities:** Compute the (un-normalized) probabilities for the current block, scaled by the new global maximum.
+    $$P_{rj} = \exp(S_{rj} - m_r^{(new)})$$
+6.  **Update Running Sum (`l`):** Rescale the *old* sum `l_r^{(old)}` with the new maximum and add the sum of the new probabilities.
+    $$l_r^{(new)} = l_r^{(old)} \cdot \exp(m_r^{(old)} - m_r^{(new)}) + \sum P_{rj}$$
+7.  **Update Output (`O`):** Rescale the *old* output vector $O_r^{(old)}$ and add the contribution from the current value block $V_j$.
+    $$O_r^{(new)} = \frac{l_r^{(old)}}{l_r^{(new)}} \cdot \exp(m_r^{(old)} - m_r^{(new)}) \cdot O_r^{(old)} + \frac{1}{l_r^{(new)}} \cdot (P_{rj} V_j)$$
+
+After iterating through all blocks $j=1, \dots, T_r$, the final $O_r^{(new)}$ is the exact, correct attention output for that row, computed without ever storing the full $N \times N$ matrix.
+
+### 4. Full Complexity Analysis
 
 FlashAttention's brilliance is that it reduces memory complexity without changing the total number of FLOPs.
 
