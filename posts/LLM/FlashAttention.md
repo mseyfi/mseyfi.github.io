@@ -57,6 +57,17 @@ FlashAttention breaks the large Q, K, and V matrices into smaller blocks, or "ti
 
 FlashAttention does exactly this. It loads blocks of `Q`, `K`, and `V` into SRAM, computes the attention output for just those blocks, and accumulates the result without ever storing the full attention matrix in HBM.
 
+![FlashAttention](../../images/FlashAttention.png)
+
+*Fig 1: Left: FlashAttention uses tiling to prevent materialization of the large $$𝑁 \times 𝑁$$ attention matrix
+(dotted box) on (relatively) slow GPU high bandwidth memory(HBM). In the outer loop (red arrows), FlashAttention loops through
+blocks of the $K$ and $V$ matrices and loads them to fast on-chip SRAM. In each block, FlashAttention
+loops over blocks of $Q$ matrix (blue arrows), loading them to SRAM, and writing the output of the attention
+computation back to HBM. Right: Speedup over the PyTorch implementation of attention on GPT-2.
+FlashAttention does not read and write the large $$𝑁 \times 𝑁$$ attention matrix to HBM, resulting in an 7.6$\times$
+speedup on the attention computation.*
+
+
 #### Technique 2: Online Softmax (Recomputation)
 The standard softmax function needs to see an entire row of the attention score matrix `S` to compute its normalization factor (the sum of all exponentials in that row). Tiling seems to break this, as we only have one block of a row in SRAM at a time.
 
@@ -68,16 +79,6 @@ FlashAttention solves this with a clever numerical trick. As it iterates through
 4.  It applies this rescaling factor to its running sum of exponentials and then adds the contribution from the current block.
 
 This allows it to arrive at the **exact same final result** as a standard softmax, but without ever needing the full row to be materialized in memory at once. It effectively "recomputes" the normalization factor as it gets more information, saving a massive amount of memory access.
-
-![FlashAttention](../../images/FlashAttention.png)
-
-*Fig 1: Left: FlashAttention uses tiling to prevent materialization of the large $$𝑁 \times 𝑁$$ attention matrix
-(dotted box) on (relatively) slow GPU high bandwidth memory(HBM). In the outer loop (red arrows), FlashAttention loops through
-blocks of the $K$ and $V$ matrices and loads them to fast on-chip SRAM. In each block, FlashAttention
-loops over blocks of $Q$ matrix (blue arrows), loading them to SRAM, and writing the output of the attention
-computation back to HBM. Right: Speedup over the PyTorch implementation of attention on GPT-2.
-FlashAttention does not read and write the large $$𝑁 \times 𝑁$$ attention matrix to HBM, resulting in an 7.6$\times$
-speedup on the attention computation.*
 
 ### 3. Full Complexity Analysis
 
