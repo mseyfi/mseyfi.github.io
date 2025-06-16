@@ -9,7 +9,7 @@
 
 
 # Efficient FFN
-## [![ALBERT](https://img.shields.io/badge/ALBERT_Cross-Layer Parameter Sharing:_FFN-Efficient_FFN_Structures-blue?style=for-the-badge&logo=github)](ALBERT)
+## [![ALBERT](https://img.shields.io/badge/ALBERT-Cross_Layer_Parameter_Sharing:_Efficient_FFN_Structures-blue?style=for-the-badge&logo=github)](../posts/LLM/ALBERT)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 While innovations like MoE and SwiGLU focus on redesigning the FFN block within a single Transformer layer, Cross-Layer Parameter Sharing tackles efficiency from a different angle: it re-evaluates the relationship between the layers themselves. It asks a simple but profound question: "Does every layer in a deep network truly need its own unique set of weights?"
 </div>
