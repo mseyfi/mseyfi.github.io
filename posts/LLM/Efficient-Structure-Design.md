@@ -9,6 +9,11 @@
 
 
 # Efficient FFN
+## [![ALBERT](https://img.shields.io/badge/ALBERT_Cross-Layer Parameter Sharing:_FFN-Efficient_FFN_Structures-blue?style=for-the-badge&logo=github)](ALBERT)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+While innovations like MoE and SwiGLU focus on redesigning the FFN block within a single Transformer layer, Cross-Layer Parameter Sharing tackles efficiency from a different angle: it re-evaluates the relationship between the layers themselves. It asks a simple but profound question: "Does every layer in a deep network truly need its own unique set of weights?"
+</div>
+
 ## [![MOE](https://img.shields.io/badge/MOE_Mixture_of_Experts:_FFN-Efficient_FFN_Structures-blue?style=for-the-badge&logo=github)](Efficient-FFN)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 While attention mechanisms get much of the spotlight, the Feed-Forward Network (FFN) is the computational workhorse of the Transformer. Typically comprising two-thirds of a model's parameters, the FFN block is a critical target for efficiency innovations. As of mid-2025, the strategies have evolved far beyond simply tweaking dimensions.
