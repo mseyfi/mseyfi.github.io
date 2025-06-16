@@ -7,7 +7,7 @@ FlashAttention is a pivotal innovation that addresses one of the most fundamenta
 Here is a full, detailed tutorial on FlashAttention.
 
 ***
-[FA](../../images/FlashAttention.png)
+![FlashAttention](../../images/FlashAttention.png)
 
 *Fig 1: Left: FlashAttention uses tiling to prevent materialization of the large $$𝑁 \times 𝑁$$ attention matrix
 (dotted box) on (relatively) slow GPU HBM. In the outer loop (red arrows), FlashAttention loops through
