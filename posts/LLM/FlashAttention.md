@@ -85,34 +85,6 @@ Of course. Adding a mathematical deep dive into the core mechanics of FlashAtten
 Here is the full tutorial, updated with a new, in-depth section on the mathematics of tiling and the online softmax.
 
 ***
-
-## A Deep Dive into FlashAttention: Fixing the Transformer's Memory Bottleneck
-
-While architectural changes like MoE and GQA have reshaped Transformer blocks, **FlashAttention** stands as a fundamental *implementation* breakthrough. It doesn't change the mathematics of attention; it radically alters *how* it's computed on the hardware to overcome a critical performance bottleneck.
-
-This tutorial explores the problem FlashAttention solves, its core technical innovations—including a mathematical breakdown of its algorithm—and its impact on the modern LLM landscape as of mid-2025.
-
-### 1. The Bottleneck: Why Standard Attention is "Memory-Bound"
-
-To understand FlashAttention, we must first understand the "memory wall" that standard attention hits.
-
-#### The GPU Memory Hierarchy
-A modern GPU has two main types of memory:
-1.  **High-Bandwidth Memory (HBM):** This is the large, main memory of the GPU (e.g., 80GB). It's spacious but relatively slow to access.
-2.  **SRAM (Static Random-Access Memory):** This is an extremely fast, on-chip memory available in small amounts (e.g., a few dozen megabytes). It's blazing fast but very limited in size.
-
-High performance on a GPU is achieved by maximizing work done in SRAM and minimizing data transfer to and from HBM.
-
-#### The Inefficient Memory Pattern of Standard Attention
-The standard attention formula, $O = \text{softmax}(\frac{QK^T}{\sqrt{d_k}})V$, is typically executed in a way that constantly accesses slow HBM. The primary culprit is the materialization of the huge $N \times N$ attention score matrix ($S=QK^T$). For a sequence of length `N=64k`, this matrix alone is over 16GB, far too large for SRAM. This forces the GPU to write this massive matrix to HBM and then read it back, creating a severe bottleneck where the processor waits for data instead of computing.
-
-### 2. The FlashAttention Solution: Kernel Fusion and Hardware Awareness
-
-The core idea of FlashAttention is: **never write the full $N \times N$ attention matrix to HBM.** It achieves this by fusing the separate steps of attention into a single "kernel" that intelligently uses fast SRAM. This is made possible by two key algorithmic breakthroughs.
-
-1.  **Tiling:** The large `Q`, `K`, and `V` matrices are partitioned into smaller blocks. The algorithm loads these blocks into the fast SRAM, performs the attention calculation on them, and accumulates the result without ever storing the full matrix.
-2.  **Online Softmax:** A numerically stable algorithm is used to compute the correct softmax "on the fly" as new blocks are processed, avoiding the need to see the entire row of scores at once.
-
 ### 3. The Mathematical Core of FlashAttention
 
 Let's dive into a simplified mathematical view of how tiling and the online softmax work together. The scaling factor $\frac{1}{\sqrt{d_k}}$ is omitted for clarity.
@@ -161,7 +133,7 @@ FlashAttention's brilliance is that it reduces memory complexity without changin
     * **Memory Complexity:** $O(Nd)$. The memory usage is **linear** with sequence length `N` because the $N \times N$ matrix is never created in HBM. The memory required is just for storing the inputs and outputs. This is a groundbreaking improvement.
     * **Time Complexity (FLOPs):** $O(N^2 d)$. The total number of mathematical operations is roughly the same. However, the **wall-clock runtime is much faster (2-4x or more)** because the operations are not bottlenecked by HBM reads/writes.
 
-### 4. Code Implementation: Usage, Not Source Code
+### 5. Code Implementation: Usage, Not Source Code
 
 FlashAttention is not a simple Python function; it is a highly optimized kernel written in low-level languages like CUDA and Triton to directly control the GPU's hardware. Therefore, you cannot implement it yourself in a few lines of PyTorch.
 
