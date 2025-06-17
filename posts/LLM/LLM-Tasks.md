@@ -358,8 +358,8 @@ The goal is to find and highlight a precise answer that already exists within a 
 
 * **A legal assistant is reviewing a contract:** The user asks, `"What is the termination clause notice period?"` The system scans the contract (`Context`) and extracts the exact phrase, like `"thirty (30) business days"`, highlighting it for the user.
 * **Corporate knowledge base:** An employee asks the HR portal, `"What is the maximum rollover for vacation days?"` The system finds the answer directly in the employee handbook.
+#
 
----
 #### **How It Works: A Mini-Tutorial (Encoder-Only)**
 This task is perfectly suited for Encoder-Only models like BERT because they can analyze the relationship between the question and the entire context simultaneously.
 
@@ -402,7 +402,7 @@ The goal is to generate a natural, human-like answer, either by synthesizing inf
 * **General knowledge queries:** A student uses Google or ChatGPT to ask, `"Explain the process of photosynthesis in simple terms."`
 * **Customer support chatbot:** A user asks, `"How do I reset my account password?"` The chatbot generates a step-by-step guide instead of just pointing to a paragraph in a manual.
 
----
+#
 #### **How It Works: A Mini-Tutorial (Decoder-Only or Encoder-Decoder)**
 This is a classic text generation task, perfectly suited for Decoder-Only models like GPT or Llama.
 
@@ -452,7 +452,7 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 * **How It Works:**
     * **Architecture:** A classic sequence-to-sequence task, perfectly suited for **Encoder-Decoder** models but also commonly handled by **Decoder-Only** models (see Section 2 for details).
 
-#
+---
 
 ## 8. Machine Translation
 
@@ -466,7 +466,7 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 * **How It Works:**
     * **Architecture:** The quintessential task for **Encoder-Decoder** models. The encoder gets a full understanding of the source sentence, and the decoder generates the target language.
 
-#
+---
 
 ## 9. Code-Related Tasks
 
@@ -491,7 +491,7 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 * **How It Works:**
     * **Architecture:** This is a specialized application of **Decoder-Only** models. They are pre-trained on massive corpora of publicly available code (e.g., from GitHub) in addition to natural language text. The fine-tuning process is identical to text generation (Category 1).
 
-#
+---
 
 ## 10. Reasoning Tasks
 
