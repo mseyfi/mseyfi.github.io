@@ -40,10 +40,10 @@ Stable Diffusion is a powerful generative model that synthesizes high-quality im
 A <b> Score-based Generative Model </b>  learns the gradient of the log-probability (the “score”) for a family of <b> noisy </b>  versions of data. Instead of directly learning a generative model $ p(x) $, we train a network $ s_\theta(x, \sigma) $ that approximates:
 
 $$
-\nabla_x \log p_\sigma(x) \quad \text{where} \quad p_\sigma(x)
+\nabla_x \log p_\sigma(x) 
 $$
 
-is the distribution of data  <b> corrupted </b>  by noise of scale $\sigma$. Once we learn a good approximation of the score $\nabla_x \log p_\sigma(x)$, we can sample from the (clean) distribution by <b> progressively denoising </b>  data using <b> Langevin dynamics </b>  (or an equivalent Stochastic Differential Equation).
+$\text{where} \quad p_\sigma(x)$ is the distribution of data  <b> corrupted </b>  by noise of scale $\sigma$. Once we learn a good approximation of the score $\nabla_x \log p_\sigma(x)$, we can sample from the (clean) distribution by <b> progressively denoising </b>  data using <b> Langevin dynamics </b>  (or an equivalent Stochastic Differential Equation).
 <p></p>
 </div>
 
@@ -79,7 +79,10 @@ notable text-to-image generation models along with their corresponding research 
  <p></p>
 </div>
 
-## [![LLM](https://img.shields.io/badge/LLM-Tutorials-purple?style=for-the-badge&logo=github)]
+## ![LLM](https://img.shields.io/badge/LLM-________________________________________LLM_Tutorials______________________________________-purple?style=for-the-badge&logo=github)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+</div>
+
 
 ## [![LORA](https://img.shields.io/badge/LORA-Low_Rank_Adaptation-blue?style=for-the-badge&logo=github)](../posts/LLM/LORA)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
