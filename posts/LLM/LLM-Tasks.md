@@ -8,7 +8,8 @@ A single, powerful pre-trained Large Language Model is a versatile foundation th
 
 This tutorial provides a detailed breakdown of the most common and important tasks an LLM can perform, explaining for each: its goal, the data format for fine-tuning, a practical example, and the underlying mechanics.
 
-***
+# ***
+### ***
 
 ## 1. Text Generation (and Completion)
 
