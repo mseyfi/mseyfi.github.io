@@ -39,7 +39,7 @@ For each pair, we perform these steps:
     * **Causal Masking** ensures the model can't "cheat" by looking ahead.
     * A **Masked Cross-Entropy Loss** is applied. We only calculate the model's error on the `completion` tokens. This forces the model to learn: "Given this *kind* of prompt, generate this *kind* of completion."
 
----
+#
 
 ### Part 2: The Generation Phase (Inference)
 
@@ -91,7 +91,7 @@ Text generation is a loop. Let's say we sampled the token for `"Your"`.
 
 This tutorial explains how to take a general-purpose LLM and fine-tune it to be an interactive, multi-turn conversational agent that can remember context and adopt a specific persona.
 
----
+#
 
 ### Part 1: The Training Phase (Fine-Tuning for Dialogue)
 
@@ -123,7 +123,7 @@ Let's look at the format from your example (`<s>` is start of sequence, `</s>` i
 Let's visualize the loss calculation for the first turn:
 
 | Input Context Seen by Model           | Next Token to Predict | Is Loss Calculated?                                        |
-| ------------------------------------- | --------------------- | ---------------------------------------------------------- |
+| ############- | ####### | ###################- |
 | `<s>[INST] What’s`                     | `the`                 | **NO** (This is the user's turn)                           |
 | `...capital of Germany?`              | `[/INST]`             | **NO** (This is the user's turn)                           |
 | `...Germany? [/INST]`                 | `The`                 | **YES!** (This is the start of the assistant's turn)       |
@@ -132,7 +132,7 @@ Let's visualize the loss calculation for the first turn:
 
 **Why this works:** You are not teaching the model how to *ask questions*; you are teaching it exclusively how to *answer* them, given the context of a user's question.
 
----
+#
 
 ### Part 2: The Generation Phase (Inference / Having a Conversation)
 
@@ -175,7 +175,7 @@ This is the most important part of a chatbot. The entire history is used to gene
 ## 3. Text Classification
 Use an LLM to perform text classification—the task of assigning a predefined category (like `Positive`, `Negative`, `Spam`, or `Legal`) to a piece of text. We will cover the two primary architectural approaches.
 
----
+#
 
 ### Approach 1: The Encoder-Only Model (e.g., BERT)
 
@@ -207,7 +207,7 @@ This is the traditional and highly efficient method, optimized specifically for 
 3.  **Final Label:** The label with the highest probability is chosen as the result.
     * **Result:** `Negative`
 
----
+#
 
 ### Approach 2: The Decoder-Only Model (e.g., GPT, Llama)
 
@@ -245,7 +245,7 @@ This modern approach cleverly reframes classification as a text generation task.
 ### 4. Natural Language Inference (NLI)
 Of course. Here is an expanded, in-depth tutorial on Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
 
----
+#
 
 ### Expanded Tutorial: Natural Language Inference (NLI)
 
@@ -269,7 +269,7 @@ NLI is a critical component for building more reliable and logical AI systems.
 * **Improving Search Engines:** NLI can help a search engine understand if a web page (`premise`) truly answers a user's query (`hypothesis`), going beyond simple keyword matching.
 * **Fact-Checking Systems:** In a news article, if the premise is `"The company's profits soared to a record high in Q4"`, NLI can flag a user comment saying `"The company lost money in Q4"` as a `Contradiction`.
 
----
+#
 
 ### Deep Dive: The Encoder-Only Architecture (The Gold Standard for NLI)
 
@@ -284,7 +284,7 @@ Imagine you're solving a logic puzzle with two pieces of text. You wouldn't just
 * **Bi-directional Attention:** Every token in the input can "see" and "attend to" every other token, regardless of position. This allows the model to create direct connections, for example, between the word `"horse"` in the premise and the word `"animal"` in the hypothesis.
 * **Holistic Understanding:** An encoder doesn't process text left-to-right. It builds a holistic representation of the *entire input sequence at once*. For a comparison task like NLI, this is a massive advantage over decoder models that are optimized for sequential, next-token prediction.
 
----
+#
 
 ### The Training Phase in Detail ⚙️
 
@@ -317,7 +317,7 @@ The input data is meticulously structured to be fed into the model.
     * `[CLS] vector (size 768) -> Classification Head -> Logits (size 3)`
 3.  **Loss Calculation:** To train the model, we use **Cross-Entropy Loss**. This function compares the logits (after a softmax is applied) to the correct "one-hot" label. If the correct label is `Contradiction` (e.g., index 1), the target is `[0, 1, 0]`. The loss function calculates a penalty based on how far the model's prediction is from this target. This penalty is then used to update the weights of the classification head and, typically, to fine-tune the weights of the entire encoder model as well.
 
----
+#
 
 ### The Inference Phase in Detail 💡
 
@@ -332,7 +332,7 @@ The input data is meticulously structured to be fed into the model.
 6.  **Interpret the Output:** The final prediction is the label corresponding to the highest probability.
     * **Result:** `{ "label": "Contradiction", "score": 0.998 }`
 
----
+#
 ### Alternative Architectures: The Decoder-Only Approach
 
 While encoders are the specialized tool, a powerful decoder-only model like GPT-4 can also perform NLI by framing it as a question-answering or completion task.
@@ -376,7 +376,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **How It Works:**
     * **Architecture:** A classic task for **Decoder-Only** or **Encoder-Decoder** models. The question (and context, if provided) is formatted into a prompt, and the model is fine-tuned to generate the answer. The loss is **Masked Cross-Entropy** on the answer tokens.
 
----
+#
 
 ### 6. Information Extraction
 
@@ -391,7 +391,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
     * **Architecture: Encoder-Only (e.g., BERT):** This is the ideal architecture due to its bidirectional context. A classification head is placed on top of **every token's** output vector to predict its entity label (e.g., `B-PER`, `I-PER`, `O`).
     * **Loss Function:** **Cross-Entropy Loss** is calculated across the entire sequence of token labels.
 
----
+#
 
 ### 7. Summarization
 
@@ -405,7 +405,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **How It Works:**
     * **Architecture:** A classic sequence-to-sequence task, perfectly suited for **Encoder-Decoder** models but also commonly handled by **Decoder-Only** models (see Section 2 for details).
 
----
+#
 
 ### 8. Machine Translation
 
@@ -419,7 +419,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **How It Works:**
     * **Architecture:** The quintessential task for **Encoder-Decoder** models. The encoder gets a full understanding of the source sentence, and the decoder generates the target language.
 
----
+#
 
 ### 9. Code-Related Tasks
 
@@ -444,7 +444,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **How It Works:**
     * **Architecture:** This is a specialized application of **Decoder-Only** models. They are pre-trained on massive corpora of publicly available code (e.g., from GitHub) in addition to natural language text. The fine-tuning process is identical to text generation (Category 1).
 
----
+#
 
 ### 10. Reasoning Tasks
 
@@ -457,7 +457,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
     * **LLM Output:** A step-by-step breakdown of the relative speed, the head start of the train, and the final calculation for the time taken.
 * **How It Works:** This is an **emergent capability** of very large models. It is significantly improved by fine-tuning on datasets that explicitly include a **Chain of Thought (CoT)**. By training the model to generate the reasoning steps *before* the final answer, it learns a more robust process for solving complex problems. The loss is calculated on the entire generated sequence (reasoning + answer).
 
----
+#
 
 ### 11. Retrieval-Augmented Generation (RAG)
 
@@ -472,7 +472,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
     * **LLM Output:** `"According to the keynote reports, the key features announced for the iPhone 16 include a new A19 Bionic chip, a periscope zoom lens for the standard model, and an always-on display with dynamic widgets."`
 * **How It Works:** RAG is a **system-level pattern** that combines a **retriever** (e.g., a search engine) with a standard **generative LLM**. The LLM's role is essentially to perform high-quality reading comprehension on the retrieved documents.
 
----
+#
 
 ### 12. Multimodal Tasks
 
