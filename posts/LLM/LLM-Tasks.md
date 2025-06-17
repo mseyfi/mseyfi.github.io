@@ -38,7 +38,6 @@ For each pair, we perform these steps:
     * The model processes the entire sequence, predicting the next token at every step.
     * **Causal Masking** ensures the model can't "cheat" by looking ahead.
     * A **Masked Cross-Entropy Loss** is applied. We only calculate the model's error on the `completion` tokens. This forces the model to learn: "Given this *kind* of prompt, generate this *kind* of completion."
-
 #
 
 ### Part 2: The Generation Phase (Inference)
@@ -87,7 +86,6 @@ Text generation is a loop. Let's say we sampled the token for `"Your"`.
 ## 2. Dialogue Generation (Chatbots)
 
 This tutorial explains how to take a general-purpose LLM and fine-tune it to be an interactive, multi-turn conversational agent that can remember context and adopt a specific persona.
-
 #
 
 ### Part 1: The Training Phase (Fine-Tuning for Dialogue)
@@ -128,7 +126,6 @@ Let's visualize the loss calculation for the first turn:
 | `...is Berlin.`                       | `</s>`                | **YES!** (This is the end of the assistant's turn)         |
 
 **Why this works:** You are not teaching the model how to *ask questions*; you are teaching it exclusively how to *answer* them, given the context of a user's question.
-
 #
 
 ### Part 2: The Generation Phase (Inference / Having a Conversation)
@@ -171,7 +168,6 @@ This is the most important part of a chatbot. The entire history is used to gene
 
 ## 3. Text Classification
 Use an LLM to perform text classification—the task of assigning a predefined category (like `Positive`, `Negative`, `Spam`, or `Legal`) to a piece of text. We will cover the two primary architectural approaches.
-
 #
 
 ### Approach 1: The Encoder-Only Model (e.g., BERT)
@@ -203,7 +199,6 @@ This is the traditional and highly efficient method, optimized specifically for 
 
 3.  **Final Label:** The label with the highest probability is chosen as the result.
     * **Result:** `Negative`
-
 #
 
 ### Approach 2: The Decoder-Only Model (e.g., GPT, Llama)
@@ -240,8 +235,7 @@ This modern approach cleverly reframes classification as a text generation task.
 ***
 
 ## 4. Natural Language Inference (NLI)
-Of course. Here is an expanded, in-depth tutorial on Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
-
+Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
 #
 
 Natural Language Inference is a fundamental reasoning task in AI. Think of the model as a "logic detective" tasked with examining two statements: a piece of evidence (**the Premise**) and a claim (**the Hypothesis**). The model's job isn't to determine if the hypothesis is true in the real world, but only if it's true, false, or unrelated *based on the evidence provided in the premise*.
