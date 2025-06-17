@@ -89,9 +89,9 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for la
 Language models are evaluated across diverse tasks such as next-token prediction, text classification, summarization, translation, code generation, and question answering. Each task requires a suitable metric that reflects model performance both quantitatively and qualitatively.
 </div>
 
-## [![Spec](https://img.shields.io/badge/Speculative_Decoding-Speculative_Decoding_For_Fast_Inference-blue?style=for-the-badge&logo=github)](../posts/LLM/EvaluationMetricsLLM)
+## [![Spec](https://img.shields.io/badge/Speculative_Decoding-Speculative_Decoding_For_Fast_Inference-blue?style=for-the-badge&logo=github)](../posts/LLM/Speculative-Decoding)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-Even with highly optimized systems, the process of generating text from Large Language Models (LLMs) faces a final, stubborn bottleneck: **sequential decoding**. Generating one token requires a full, time-consuming forward pass through the model. Because this must be done one token at a time, the overall speed is limited by memory latency.
+Even with highly optimized systems, the process of generating text from Large Language Models (LLMs) faces a final, stubborn bottleneck: <b>sequential decoding</b>. Generating one token requires a full, time-consuming forward pass through the model. Because this must be done one token at a time, the overall speed is limited by memory latency.
 </div>
 
 
