@@ -86,9 +86,6 @@ Text generation is a loop. Let's say we sampled the token for `"Your"`.
 
 ## 2. Dialogue Generation (Chatbots)
 
-
-### Mini-Tutorial: Training a Dialogue LLM (Chatbot)
-
 This tutorial explains how to take a general-purpose LLM and fine-tune it to be an interactive, multi-turn conversational agent that can remember context and adopt a specific persona.
 
 #
