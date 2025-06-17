@@ -79,7 +79,7 @@ notable text-to-image generation models along with their corresponding research 
  <p></p>
 </div>
 
-## ![LLM]([https://img.shields.io](https://img.shields.io/badge/LLM%20Tutorials-8A2BE2)
+## ![LLM](https://img.shields.io/badge/LLM%20Tutorials-8A2BE2?style=for-the-badge&logo=github)
  
 
 ## [![LORA](https://img.shields.io/badge/LORA-Low_Rank_Adaptation-blue?style=for-the-badge&logo=github)](../posts/LLM/LORA)
