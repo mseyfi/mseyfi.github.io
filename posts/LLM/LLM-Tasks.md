@@ -8,8 +8,7 @@ A single, powerful pre-trained Large Language Model is a versatile foundation th
 
 This tutorial provides a detailed breakdown of the most common and important tasks an LLM can perform, explaining for each: its goal, the data format for fine-tuning, a practical example, and the underlying mechanics.
 
-# ___
-### ___
+***
 
 ## 1. Text Generation (and Completion)
 
@@ -87,9 +86,6 @@ Text generation is a loop. Let's say we sampled the token for `"Your"`.
 
 ## 2. Dialogue Generation (Chatbots)
 
-Of course! Here is a mini-tutorial for Dialogue Generation, following the exact same structure as before. This explains how to fine-tune a model to become a conversational chatbot.
-
-***
 
 ### Mini-Tutorial: Training a Dialogue LLM (Chatbot)
 
@@ -244,12 +240,12 @@ This modern approach cleverly reframes classification as a text generation task.
 3.  **Final Label:** We select the valid label token with the highest probability. This method ensures the model gives a constrained and valid answer.
     * **Result:** `Negative`
 
----
+***
 
 ### 4. Natural Language Inference (NLI)
 Of course. Here is an expanded, in-depth tutorial on Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
 
-***
+---
 
 ### Expanded Tutorial: Natural Language Inference (NLI)
 
