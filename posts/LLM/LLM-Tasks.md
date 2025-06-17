@@ -301,7 +301,7 @@ The input data is meticulously structured to be fed into the model.
 
 #### **Step 3: The Classification Head & Loss Function**
 
-1.  **The "Head":** We take the single output vector of the `[CLS]` token from the final encoder layer. This vector is fed into a "classification head," which is typically a very simple neural network (often just one linear layer and a non-linear activation function like Tanh or ReLU) that is added on top of the pre-trained model.
+1.  **The "Head":** We take the single output vector of the `[CLS]` token from the final encoder layer. This vector is fed into a "classification head," which is typically a very simple neural network (often just one linear layer) that is added on top of the pre-trained model.
 2.  **Output Logits:** The head's job is to project the 768-dimensional `[CLS]` vector down to a vector with a size equal to the number of labels. For NLI, this is a vector of size 3. These raw output scores are called **logits**.
     * `[CLS] vector (size 768) -> Classification Head -> Logits (size 3)`
 3.  **Loss Calculation:** To train the model, we use **Cross-Entropy Loss**. This function compares the logits (after a softmax is applied) to the correct "one-hot" label. If the correct label is `Contradiction` (e.g., index 1), the target is `[0, 1, 0]`. The loss function calculates a penalty based on how far the model's prediction is from this target. This penalty is then used to update the weights of the classification head and, typically, to fine-tune the weights of the entire encoder model as well.
