@@ -239,7 +239,7 @@ This modern approach cleverly reframes classification as a text generation task.
 
 ***
 
-### 4. Natural Language Inference (NLI)
+## 4. Natural Language Inference (NLI)
 Of course. Here is an expanded, in-depth tutorial on Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
 
 #
@@ -348,7 +348,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **Cons:** The left-to-right nature is fundamentally less suited for direct comparison than an encoder's bi-directional view. It can be less efficient and potentially less robust than a fine-tuned encoder specifically optimized for the NLI task.
 
 ***
-### 5. Question Answering (QA)
+## 5. Question Answering (QA)
 
 * **The Goal:** To provide a precise answer to a user's question, either based on internal knowledge or a provided context.
 
@@ -373,7 +373,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 
 #
 
-### 6. Information Extraction
+## 6. Information Extraction
 
 * **The Goal:** To identify and pull structured data, like names, dates, or relationships, from unstructured text.
 * **Data Format (for Named Entity Recognition - NER):**
@@ -388,7 +388,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 
 #
 
-### 7. Summarization
+## 7. Summarization
 
 * **The Goal:** To generate a short, coherent, and accurate summary from a longer document.
 * **Data Format:** Pairs of long documents and their human-written summaries.
@@ -402,7 +402,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 
 #
 
-### 8. Machine Translation
+## 8. Machine Translation
 
 * **The Goal:** To translate a sequence of text from a source language to a target language.
 * **Data Format:** Parallel sentences or documents.
@@ -416,7 +416,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 
 #
 
-### 9. Code-Related Tasks
+## 9. Code-Related Tasks
 
 * **The Goal:** To generate, complete, document, or translate code.
 * **Data Format (for generation):** A natural language description paired with the corresponding code.
@@ -441,7 +441,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 
 #
 
-### 10. Reasoning Tasks
+## 10. Reasoning Tasks
 
 * **The Goal:** To solve problems that require logical, arithmetic, or commonsense steps.
 * **Data Format (for Chain-of-Thought fine-tuning):** The data includes the intermediate reasoning steps.
@@ -454,7 +454,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 
 #
 
-### 11. Retrieval-Augmented Generation (RAG)
+## 11. Retrieval-Augmented Generation (RAG)
 
 * **The Goal:** To ground the LLM's responses in external, verifiable knowledge, reducing hallucinations and allowing it to use up-to-date or private information.
 * **Data Format:** This is not a fine-tuning task but an **inference-time architecture**.
@@ -469,7 +469,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 
 #
 
-### 12. Multimodal Tasks
+## 12. Multimodal Tasks
 
 * **The Goal:** To understand and generate content that involves more than one modality, typically text and images.
 * **Data Format:** The data consists of pairs of images and corresponding text.
