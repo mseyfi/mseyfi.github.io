@@ -31,7 +31,11 @@ Speculative decoding requires two models that share the same tokenizer.
 2.  **Draft Model ($M_d$):** A much smaller, faster version of the same model.
 
 Both models end with an **LM Head**, a linear layer that projects the final hidden state $h \in \mathbb{R}^{d_{model}}$ to a vector of raw scores called **logits** ($z \in \mathbb{R}^{V}$), where `V` is the vocabulary size. These logits are converted into a **probability distribution** via the `softmax` function:
-$$p_j = P(\text{token}_j | \text{context}) = \text{softmax}(z)_j = \frac{\exp(z_j)}{\sum_{i=1}^{V} \exp(z_i)}$$
+
+$$
+p_j = P(\text{token}_j | \text{context}) = \text{softmax}(z)_j = \frac{\exp(z_j)}{\sum_{i=1}^{V} \exp(z_i)}
+$$
+
 We will denote the target model's distribution as $q(x)$ and the draft model's as $p(x)$.
 
 #### Choosing K: The Number of Draft Tokens
@@ -57,8 +61,12 @@ This is the core of the algorithm. We iterate from `i = 1 to K` and decide wheth
 For each position `i`, we look at the draft token $x'_i$ and the two distributions for that position, $p_i$ and $q_i$.
 
 1.  **Calculate Acceptance Probability ($\alpha_i$):** We compute the ratio of probabilities assigned to the *drafted token* by both models.
-    $$\alpha_i = \min\left(1, \frac{q_i(x'_i)}{p_i(x'_i)}\right)$$
-2.  **Perform Probabilistic Check:** We accept the token $x'_i$ with probability $\alpha_i$. This is done by drawing a random number $r$ from a uniform distribution between 0 and 1.
+
+    $$
+    \alpha_i = \min\left(1, \frac{q_i(x'_i)}{p_i(x'_i)}\right)
+    $$
+    
+3.  **Perform Probabilistic Check:** We accept the token $x'_i$ with probability $\alpha_i$. This is done by drawing a random number $r$ from a uniform distribution between 0 and 1.
     * If $r < \alpha_i$, the token is **accepted**. We continue to the next token.
     * If $r \ge \alpha_i$, the token is **rejected**. The loop terminates immediately.
 
@@ -72,22 +80,33 @@ The loop through the draft tokens can end in two ways:
     Let's say the check fails at token `i`. All previous `i-1` tokens have been accepted. The algorithm **must stop** here because all subsequent target distributions ($q_{i+1}, q_{i+2}, \dots$) were conditioned on the draft token $x'_i$ being correct. Since it was rejected, they are now invalid.
     * **The Replacement Token:** Instead of just restarting, we use the valid distribution $q_i$ that we already computed. However, we cannot simply sample from $q_i$, as this would bias the output. We must sample from a **corrected distribution** that accounts for the information gained during rejection.
     * **Mathematics of Correction:** The new distribution $p'_i$ is formed by taking the "leftover" probability mass where the target model was more confident than the draft model.
-        $$p'_i(x) = \text{Normalize}\left(\max(0, q_i(x) - p_i(x))\right)$$
+
+      $$
+      p'_i(x) = \text{Normalize}\left(\max(0, q_i(x) - p_i(x))\right)
+      $$
+
     * We perform one sample from this distribution $p'_i$ to get a single replacement token, $x_{new}$.
     * **Cycle Output:** The new tokens generated in this cycle are `[accepted_tokens] + [x_new]`.
 
-2.  **The Entire Draft is Accepted (The Bonus Token):**
+3.  **The Entire Draft is Accepted (The Bonus Token):**
     If the loop completes and all `K` draft tokens are accepted, we get a "bonus." The target model's forward pass also computed the distribution for the *next* token, $q_{K+1}$. We can perform one final sample from this distribution to get a `(K+1)`-th token for free, maximizing the output from a single target model call.
 
 ### 4. Performance Analysis: Acceptance Rate and Speedup
 
 * **Acceptance Rate ($r$):** The average probability that any given drafted token will be accepted. It can be proven that this rate is directly related to how similar the draft and target distributions are:
-    $$r = \sum_{x \in V} \min(p(x), q(x)) = 1 - \frac{1}{2} \|q - p\|_1$$
+  $$
+  r = \sum_{x \in V} \min(p(x), q(x)) = 1 - \frac{1}{2} \|q - p\|_1
+  $$
+  
     A better draft model leads to a higher acceptance rate.
 * **Rejection Rate:** The probability of rejection is simply $1-r = \frac{1}{2} \|q - p\|_1$.
 * **Speedup:** The practical speedup is approximately equal to the average number of tokens accepted per cycle, $n_{accepted}$.
-    $$\text{Speedup} \approx n_{accepted}$$
-    If, on average, 3 tokens are accepted per cycle, you achieve a nearly **3x speedup** in wall-clock latency. The small overhead from the draft model is usually negligible.
+
+  $$
+  \text{Speedup} \approx n_{accepted}
+  $$
+
+   If, on average, 3 tokens are accepted per cycle, you achieve a nearly **3x speedup** in wall-clock latency. The small overhead from the draft model is usually negligible.
 
 ### 5. Code Pseudocode
 
