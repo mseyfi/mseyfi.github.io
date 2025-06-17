@@ -12,7 +12,6 @@ ControlNet is an advanced extension of diffusion models that introduces addition
 
 
 ## [![CFG](https://img.shields.io/badge/CFD-Classifier_Free_Diffusion-blue?style=for-the-badge&logo=github)](../posts/CFG)
-
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Classifier-Free Diffusion is a powerful technique in generative modeling, particularly within diffusion models, that enhances the quality and controllability of generated outputs without relying on an external classifier. This comprehensive guide will delve into the intricacies of classifier-free diffusion, covering its principles, training and inference processes, intuitive explanations, and practical implementations in tasks like image inpainting, super-resolution, and text-to-image generation.
 <p></p>
@@ -79,7 +78,7 @@ notable text-to-image generation models along with their corresponding research 
  <p></p>
 </div>
 
-## ![LLM](https://img.shields.io/badge/%20%20%20%20%20%20%20%20%20%20LLM%20Tutorials%20%20%20%20%20%20%20%20%20%20-8A2BE2?style=for-the-badge&logo=github)
+## ![LLM](https://img.shields.io/badge/LLM%20Tutorials-8A2BE2?style=for-the-badge&logo=github)
  
 
 ## [![LORA](https://img.shields.io/badge/LORA-Low_Rank_Adaptation-blue?style=for-the-badge&logo=github)](../posts/LLM/LORA)
