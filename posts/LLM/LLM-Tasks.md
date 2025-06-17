@@ -244,8 +244,6 @@ Of course. Here is an expanded, in-depth tutorial on Natural Language Inference 
 
 #
 
-### Expanded Tutorial: Natural Language Inference (NLI)
-
 Natural Language Inference is a fundamental reasoning task in AI. Think of the model as a "logic detective" tasked with examining two statements: a piece of evidence (**the Premise**) and a claim (**the Hypothesis**). The model's job isn't to determine if the hypothesis is true in the real world, but only if it's true, false, or unrelated *based on the evidence provided in the premise*.
 
 There are three possible verdicts:
