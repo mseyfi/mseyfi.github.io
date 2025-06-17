@@ -123,11 +123,11 @@ Let's look at the format from your example (`<s>` is start of sequence, `</s>` i
 Let's visualize the loss calculation for the first turn:
 
 | Input Context Seen by Model           | Next Token to Predict | Is Loss Calculated?                                        |
-| ############- | ####### | ###################- |
-| `<s>[INST] What’s`                     | `the`                 | **NO** (This is the user's turn)                           |
+| ------------------------------------- | --------------------- | ---------------------------------------------------------- |
+| `<s>[INST] What’s`                     | `the`                 | **NO** (This is the user's turn)                          |
 | `...capital of Germany?`              | `[/INST]`             | **NO** (This is the user's turn)                           |
 | `...Germany? [/INST]`                 | `The`                 | **YES!** (This is the start of the assistant's turn)       |
-| `...Germany? [/INST] The`             | `capital`             | **YES!** (This is the assistant's turn)                      |
+| `...Germany? [/INST] The`             | `capital`             | **YES!** (This is the assistant's turn)                    |
 | `...is Berlin.`                       | `</s>`                | **YES!** (This is the end of the assistant's turn)         |
 
 **Why this works:** You are not teaching the model how to *ask questions*; you are teaching it exclusively how to *answer* them, given the context of a user's question.
