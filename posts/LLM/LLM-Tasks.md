@@ -275,7 +275,7 @@ Imagine you're solving a logic puzzle with two pieces of text. You wouldn't just
 
 #
 
-### The Training Phase in Detail ⚙️
+### The Training Phase in Detail 
 
 **Goal:** To fine-tune a pre-trained encoder model to specialize in comparing sentence pairs and predicting their logical relationship.
 
@@ -366,7 +366,7 @@ This task is perfectly suited for Encoder-Only models like BERT because they can
 ##### **Why Encoders Dominate Extractive QA**
 The model needs to understand which part of the `Context` is most relevant to the `Question`. A bi-directional encoder can create rich connections between words in the question (e.g., "Who") and words in the context (e.g., "Steve Jobs"), making it highly effective at identifying the precise answer span.
 
-##### **The Training Phase ⚙️**
+##### **The Training Phase **
 
 1.  **Input Formatting:** The question and context are combined into a single sequence for the model, separated by a special `[SEP]` token.
     `[CLS] Who introduced the first iPhone? [SEP] The first iPhone was introduced by Apple CEO Steve Jobs... [SEP]`
@@ -388,6 +388,63 @@ The model needs to understand which part of the `Context` is most relevant to th
 4.  **Extract Answer:** The tokens from the `best_start` index to the `best_end` index are selected from the original context and converted back to a string. This string is the final answer.
 #
 
+
+### 1. How do we ensure `end_token_index >= start_token_index`?
+
+You are absolutely right to ask this. If you simply take the `argmax` (the index with the highest score) of the start probabilities and the `argmax` of the end probabilities independently, you could easily end up with a `start_index` of 25 and an `end_index` of 10, which is nonsensical.
+
+This is handled during the **inference/post-processing stage**. Here are the common strategies, from simple to robust:
+
+#### Simple Approach: Check After Predicting
+1.  Find the index of the highest start probability, let's call it `best_start_idx`.
+2.  Find the index of the highest end probability, let's call it `best_end_idx`.
+3.  **Check the condition:** If `best_end_idx < best_start_idx`, you conclude that the model could not find a valid answer and return an empty string or a "no answer found" message.
+
+* **Drawback:** This is a bit naive. The model might have predicted a slightly lower-scoring but *valid* span (e.g., the second-best start and second-best end form a valid pair) that this approach would miss.
+
+#### Robust Approach: Find the Best *Valid* Span (Most Common)
+
+This is the standard and correct way to do it. Instead of finding the best start and end independently, you search for the **pair `(start, end)` that has the highest combined score, while respecting the constraint.**
+
+Here is the algorithm:
+
+1.  After the model's forward pass, you have two lists of scores (logits): `start_scores` and `end_scores`.
+2.  Initialize a `max_score = -infinity` and `best_span = (null, null)`.
+3.  Iterate through every possible start token index `i` in the sequence.
+4.  For each `i`, iterate through every possible end token index `j`, **starting from `i`** (`j >= i`).
+5.  You can also add another constraint to limit the maximum answer length, e.g., `if (j - i + 1 > max_answer_length): continue`.
+6.  Calculate the combined score for the span `(i, j)`. The simplest way is `score = start_scores[i] + end_scores[j]`.
+7.  If this `score` is greater than the current `max_score`, update:
+    * `max_score = score`
+    * `best_span = (i, j)`
+8.  After checking all possible valid pairs, `best_span` will hold the indices for the best possible valid answer according to the model.
+
+This search guarantees that your final `start_index` and `end_index` form a valid, logical span.
+
+***
+
+### 2. Do we take the softmax over the entire context length?
+
+**Yes, absolutely.** You take the softmax over the **entire input sequence length**.
+
+Let's clarify why.
+
+1.  **Input:** Your model receives a single, long sequence of tokens: `[CLS] question_tokens [SEP] context_tokens [SEP]`. Let's say the total length is 384 tokens.
+2.  **Output from Heads:** The model produces two vectors of raw scores (logits), each of length 384.
+    * `start_logits` = `[score_for_token_0, score_for_token_1, ..., score_for_token_383]`
+    * `end_logits` = `[score_for_token_0, score_for_token_1, ..., score_for_token_383]`
+3.  **Softmax Application:** The softmax function is applied independently to each of these full vectors.
+    * `start_probabilities = softmax(start_logits)`
+    * `end_probabilities = softmax(end_logits)`
+
+The result is two probability distributions, each of length 384, where the probabilities in each list sum to 1.
+
+**Why is this necessary?**
+
+The task is to find the single best start token **out of all possible tokens** in the context. The softmax function creates a "competition" among all the tokens. By applying it to the entire sequence, you are forcing the model to decide which token, from position 0 to 383, is the most likely start. The same logic applies to the end token.
+
+If you only applied it to a smaller chunk, the model wouldn't be able to compare a potential answer at the beginning of the context with one at the end. The full-sequence softmax is what allows the model to pinpoint the single most probable start and end point across the entire provided text.
+#
 ### 5b. Generative (Abstractive) Question Answering
 
 #### **Example Data**
