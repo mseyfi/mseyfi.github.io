@@ -1096,7 +1096,11 @@ Creating a VLM is not a single training run. It's a sequential process of teachi
     * **Text Tower:** `Text Caption -> Text Encoder (e.g., BERT) -> Pooling Layer -> Single Sentence Embedding`
     * **Note on Pooling:** In this stage, a **pooling layer** (often mean pooling) is used because the goal is to get one summary vector for the image and one for the text to compare them.
 * **Loss Function: Contrastive Loss (like InfoNCE).** The model is trained on millions of `(image, text)` pairs. The loss function's job is to pull the embeddings of correct pairs together and push all incorrect pairs apart. For a given image `i` and its positive text `t` in a batch of `N` pairs, the loss is:
-    $$L_{i} = -\log \frac{\exp(\text{sim}(i, t) / \tau)}{\sum_{j=1}^{N} \exp(\text{sim}(i, t_j) / \tau)}$$
+
+$$
+L_{i} = -\log \frac{\exp(\text{sim}(i, t) / \tau)}{\sum_{j=1}^{N} \exp(\text{sim}(i, t_j) / \tau)}
+$$
+
     This trains the weights of the ViT and the Text Encoder to become powerful, aligned feature extractors.
 
 **Stage 2: Generative Fine-tuning (Learning to Talk and Reason)**
