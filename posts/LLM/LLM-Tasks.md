@@ -483,6 +483,7 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 2.  **Generate Autoregressively:** The model begins generating the answer one token at a time.
 3.  **The Loop:** At each step, the model predicts the probabilities for the next token using its **linear layer** and a **softmax** function. A token is chosen via a **sampling strategy** (like Top-p). This new token is appended to the sequence, and the process repeats.
 4.  **Complete Answer:** The generation loop continues until the model produces a special end-of-sequence token or reaches a predefined length limit. The full sequence of generated tokens is the final answer.
+
 ---   
 
 ## ![GenAI](../../badges/ie.svg)
