@@ -4,7 +4,7 @@
 
 [![GenAI](https://img.shields.io/badge/LLM_TASKs-Selected_LLM_TASKs-orange?style=for-the-badge&logo=github)](../LLM-Tasks)
 
-# Semantic Embedding, Clustering ans Search
+# Semantic Embedding, Clustering and Search
 
 
 A standard transformer model like BERT is excellent at understanding words in context (token-level embeddings), but it is not inherently designed to create a single, meaningful vector for an entire sentence that can be easily compared with others. Sentence-Transformers solve this problem by fine-tuning these models to produce high-quality, sentence-level embeddings.
