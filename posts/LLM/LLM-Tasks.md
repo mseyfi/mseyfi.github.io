@@ -16,17 +16,17 @@ This tutorial provides a detailed breakdown of the most common and important tas
 * **Architecture:** The quintessential task for Decoder-Only models (like the GPT series, Llama).
 
 
-### Part 1: The Training Phase (Instruction Fine-Tuning)
+#### Part 1: The Training Phase (Instruction Fine-Tuning)
 
 **Goal:** To teach a pre-trained model to follow instructions by showing it high-quality `prompt` -> `completion` examples.
 
 
-#### **Step 1.1: Prepare the Data**
+##### **Step 1.1: Prepare the Data**
 You start with a dataset of prompt-completion pairs.
 * **Prompt:** `"Write a short, optimistic phrase about the future."`
 * **Completion:** `"The horizon ahead is bright and full of promise."`
 
-#### **Step 1.2: The Training Process**
+##### **Step 1.2: The Training Process**
 For each pair, we perform these steps:
 
 1.  **Combine & Tokenize:** The prompt and completion are merged into a single sequence and converted to tokens.
@@ -40,16 +40,16 @@ For each pair, we perform these steps:
     * A **Masked Cross-Entropy Loss** is applied. We only calculate the model's error on the `completion` tokens. This forces the model to learn: "Given this *kind* of prompt, generate this *kind* of completion."
 ---
 
-### Part 2: The Generation Phase (Inference)
+#### Part 2: The Generation Phase (Inference)
 
 **Goal:** Now that the model is fine-tuned, we use it to generate a new completion from a new prompt.
 
-#### **Step 2.1: Provide a Prompt**
+##### **Step 2.1: Provide a Prompt**
 We start with just a prompt and convert it to tokens.
 * **User Prompt:** `"Give me a tagline for a new coffee shop."`
 * **Input Tokens:** `[34, 25, 14, 982, 113, 21, 53, 642, 1099, 13]`
 
-#### **Step 2.2: The Prediction Step (Model Forward Pass)**
+##### **Step 2.2: The Prediction Step (Model Forward Pass)**
 The model processes the input tokens to predict the *very next token*. This involves two key final steps:
 
 1.  **The Linear Layer (Projecting to Vocabulary):** The model's final internal representation is passed to a linear layer. This layer's job is to produce a raw score (a logit) for every single token in the model's vocabulary.
@@ -61,14 +61,14 @@ The model processes the input tokens to predict the *very next token*. This invo
     `[0.001, 0.005, 0.002, 0.92, 0.000, ...]`
     * This tells us the model's confidence for each potential next token. In this example, the fourth token in the vocabulary is predicted with 92% probability.
 
-#### **Step 2.3: The Sampling Strategy (Choosing the Next Word)**
+##### **Step 2.3: The Sampling Strategy (Choosing the Next Word)**
 We have the probabilities, now we must choose one token. Instead of always picking the most likely one, we use a sampling strategy to encourage creativity and avoid repetitive text.
 
 * **Greedy Sampling (Not Recommended):** Always pick the token with the highest probability. **Result:** Safe but often boring and repetitive.
 * **Top-K Sampling:** Consider only the `k` most likely tokens. For example, if `k=50`, you ignore all but the top 50 tokens and then sample from that smaller group based on their probabilities. **Result:** Prevents truly weird tokens from being chosen while still allowing for variety.
 * **Nucleus (Top-p) Sampling (Most Common):** Consider the smallest set of tokens whose cumulative probability is greater than `p`. If `p=0.9`, you'd add up the probabilities of the most likely tokens until you hit 90%. This set might include 3 tokens if the model is very confident, or 50 tokens if it's uncertain. **Result:** An adaptive and robust strategy that produces high-quality, creative text.
 
-#### **Step 2.4: The Autoregressive Loop**
+##### **Step 2.4: The Autoregressive Loop**
 Text generation is a loop. Let's say we sampled the token for `"Your"`.
 
 1.  **Append:** Add the new token to our input sequence.
@@ -89,11 +89,11 @@ Text generation is a loop. Let's say we sampled the token for `"Your"`.
 This tutorial explains how to take a general-purpose LLM and fine-tune it to be an interactive, multi-turn conversational agent that can remember context and adopt a specific persona.
 ---
 
-### Part 1: The Training Phase (Fine-Tuning for Dialogue)
+#### Part 1: The Training Phase (Fine-Tuning for Dialogue)
 
 **Goal:** To teach a pre-trained model the structure, flow, and turn-taking nature of a human conversation. The model learns to act as a helpful assistant.
 
-#### **Step 1.1: Prepare the Data (The Conversational Script)**
+##### **Step 1.1: Prepare the Data (The Conversational Script)**
 
 You start with a dataset of multi-turn dialogues. These dialogues are formatted with **special tokens** to clearly define who is speaking. This structure is critical for the model to learn its role.
 
@@ -106,7 +106,7 @@ Let's look at the format from your example (`<s>` is start of sequence, `</s>` i
 
 * **Special Tokens:** `<s>`, `[INST]`, `[/INST]`, `</s>` are not words; they are structural signposts. They teach the model: "When you see text between `[INST]` and `[/INST]`, that's the user speaking. Your job is to provide the text that comes after `[/INST]`."
 
-#### **Step 1.2: The Training Process**
+##### **Step 1.2: The Training Process**
 
 1.  **Combine & Tokenize:** The entire conversation, including all turns and special tokens, is concatenated into one long sequence and converted into numerical tokens.
 
@@ -129,18 +129,18 @@ Let's visualize the loss calculation for the first turn:
 **Why this works:** You are not teaching the model how to *ask questions*; you are teaching it exclusively how to *answer* them, given the context of a user's question.
 ---
 
-### Part 2: The Generation Phase (Inference / Having a Conversation)
+#### Part 2: The Generation Phase (Inference / Having a Conversation)
 
 **Goal:** Now that the model is fine-tuned, we can have a live, multi-turn conversation with it.
 
-#### **Step 2.1: Start the Conversation (User's First Turn)**
+##### **Step 2.1: Start the Conversation (User's First Turn)**
 
 We take the user's input and format it precisely as the model was trained, including the special tokens.
 
 * **User Input:** `"What's the best way to get from San Jose to San Francisco?"`
 * **Formatted for Model:** `<s>[INST] What's the best way to get from San Jose to San Francisco? [/INST]`
 
-#### **Step 2.2: The Prediction Step (Model's First Response)**
+##### **Step 2.2: The Prediction Step (Model's First Response)**
 
 The model processes the formatted input to generate its response one token at a time.
 
@@ -150,7 +150,7 @@ The model processes the formatted input to generate its response one token at a 
 
 3.  **Sampling Strategy:** We use a sampling method like **Top-p (Nucleus) Sampling** to choose a token from the probability distribution. This allows for fluent and natural-sounding responses.
 
-#### **Step 2.3: The Conversational Loop (Maintaining Context)**
+##### **Step 2.3: The Conversational Loop (Maintaining Context)**
 
 This is the most important part of a chatbot. The entire history is used to generate the next response.
 
@@ -170,13 +170,14 @@ This is the most important part of a chatbot. The entire history is used to gene
 ## ![GenAI](https://img.shields.io/badge/LLM_Tasks-3._Text_Classification:-green?style=for-the-badge&logo=github)
 
 Use an LLM to perform text classification—the task of assigning a predefined category (like `Positive`, `Negative`, `Spam`, or `Legal`) to a piece of text. We will cover the two primary architectural approaches.
+
 ---
 
-### Approach 1: The Encoder-Only Model (e.g., BERT)
+#### Approach 1: The Encoder-Only Model (e.g., BERT)
 
 This is the traditional and highly efficient method, optimized specifically for classification and understanding tasks.
 
-#### **Part 1: The Training Phase** ⚙️
+##### **Part 1: The Training Phase** ⚙️
 
 **Goal:** To train a model to "read" an entire piece of text and map its meaning to a single categorical label.
 
@@ -191,7 +192,7 @@ This is the traditional and highly efficient method, optimized specifically for 
     * **Architecture & Masking:** The key is that encoder-only models are **bi-directional**. They use an **Attention Mask** to ignore padding tokens but do *not* use a causal mask. This allows every token to "see" every other token in the text, providing a holistic understanding.
     * **Loss Function:** The model processes the text. The final hidden state corresponding to the `[CLS]` token is used as a summary vector for the entire sequence. This vector is fed into a simple "classification head" (a linear layer) whose output size is the **number of classes**. If you have 3 labels (Positive, Negative, Neutral), the output size is 3. A standard **Cross-Entropy Loss** is calculated between the predicted class probabilities and the true label.
 
-#### **Part 2: The Inference Phase** 💡
+##### **Part 2: The Inference Phase** 💡
 
 1.  **Format the Input:** A new, unseen piece of text is formatted with `[CLS]` and `[SEP]`.
     `[CLS] The flight was delayed again, and the staff was unhelpful. [SEP]`
@@ -203,11 +204,11 @@ This is the traditional and highly efficient method, optimized specifically for 
     * **Result:** `Negative`
 ---
 
-### Approach 2: The Decoder-Only Model (e.g., GPT, Llama)
+#### Approach 2: The Decoder-Only Model (e.g., GPT, Llama)
 
 This modern approach cleverly reframes classification as a text generation task.
 
-#### **Part 1: The Training Phase** ✍️
+##### **Part 1: The Training Phase** ✍️
 
 **Goal:** To teach the model to complete a prompt with the correct label word.
 
@@ -222,7 +223,7 @@ This modern approach cleverly reframes classification as a text generation task.
     * **Architecture & Masking:** This is a standard **decoder-only** setup using **causal masking**. The model can only see past tokens when predicting the next one.
     * **Loss Function:** A **Masked Cross-Entropy Loss** is used. The loss is calculated **only on the token(s) for the target label**. For instance, the model is only graded on its ability to predict the token `Positive` after seeing `... Sentiment:`.
 
-#### **Part 2: The Inference Phase** 🔍
+##### **Part 2: The Inference Phase** 🔍
 
 1.  **Format the Input:** The new text is placed into the prompt template, leaving the answer blank for the model to fill in.
     `Review: The flight was delayed again, and the staff was unhelpful. Sentiment:`
@@ -239,6 +240,7 @@ This modern approach cleverly reframes classification as a text generation task.
 ## ![GenAI](https://img.shields.io/badge/LLM_Tasks-4._Natural_Language_Inference_(NLI):-green?style=for-the-badge&logo=github)
 
 Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
+
 ---
 
 
@@ -249,13 +251,13 @@ There are three possible verdicts:
 * **`Contradiction`**: The evidence refutes the claim. The hypothesis logically contradicts the premise.
 * **`Neutral`**: The evidence is irrelevant to the claim. The premise neither proves nor refutes the hypothesis.
 
-#### **Example Data**
+##### **Example Data**
 
 * **Premise:** `"A man in a blue shirt is riding a horse through a field."`
 * **Hypothesis:** `"A person is outdoors."`
 * **Target:** `Entailment` (Riding a horse through a field implies being outdoors).
 
-#### **Use Case Scenarios**
+##### **Use Case Scenarios**
 
 NLI is a critical component for building more reliable and logical AI systems.
 * **Validating AI-Generated Content:** If you ask an AI to summarize a legal document, you can use an NLI model to check if the summary's claims (`hypothesis`) are logically supported by the original text (`premise`). This helps prevent factual errors or "hallucinations."
@@ -263,11 +265,11 @@ NLI is a critical component for building more reliable and logical AI systems.
 * **Fact-Checking Systems:** In a news article, if the premise is `"The company's profits soared to a record high in Q4"`, NLI can flag a user comment saying `"The company lost money in Q4"` as a `Contradiction`.
 ---
 
-### Deep Dive: The Encoder-Only Architecture (The Gold Standard for NLI)
+#### Deep Dive: The Encoder-Only Architecture (The Gold Standard for NLI)
 
 While other architectures can perform NLI, Encoder-Only models like BERT, RoBERTa, and DeBERTa are purpose-built for this kind of task and consistently achieve the best performance.
 
-#### **Why Encoders Dominate NLI**
+##### **Why Encoders Dominate NLI**
 
 The key is **bi-directional context**.
 
@@ -277,11 +279,11 @@ Imagine you're solving a logic puzzle with two pieces of text. You wouldn't just
 * **Holistic Understanding:** An encoder doesn't process text left-to-right. It builds a holistic representation of the *entire input sequence at once*. For a comparison task like NLI, this is a massive advantage over decoder models that are optimized for sequential, next-token prediction.
 ---
 
-### The Training Phase in Detail 
+#### The Training Phase in Detail 
 
 **Goal:** To fine-tune a pre-trained encoder model to specialize in comparing sentence pairs and predicting their logical relationship.
 
-#### **Step 1: Data Preparation & Tokenization**
+##### **Step 1: Data Preparation & Tokenization**
 
 The input data is meticulously structured to be fed into the model.
 
@@ -295,13 +297,13 @@ The input data is meticulously structured to be fed into the model.
     `[CLS] The event is scheduled for Tuesday. [SEP] The event is on the weekend. [SEP]`
 4.  **Tokenization:** This string is converted into a sequence of numerical IDs by the model's tokenizer.
 
-#### **Step 2: The Forward Pass Through the Encoder**
+##### **Step 2: The Forward Pass Through the Encoder**
 
 1.  **Input Embeddings:** The numerical IDs are converted into vectors. Positional embeddings are added to give the model a sense of word order.
 2.  **Processing through Encoder Layers:** The sequence of vectors is passed through a stack of Transformer Encoder layers. In each layer, the embedding for every token is updated based on its relationship with all other tokens via self-attention.
 3.  **The `[CLS]` Token's Journey:** The `[CLS]` token is treated like any other token initially. However, because it can attend to every word in both the premise and the hypothesis, by the time it exits the final layer, its output vector (e.g., a 768-dimensional vector) has become a rich, aggregated representation of the *relationship between the two sentences*.
 
-#### **Step 3: The Classification Head & Loss Function**
+##### **Step 3: The Classification Head & Loss Function**
 
 1.  **The "Head":** We take the single output vector of the `[CLS]` token from the final encoder layer. This vector is fed into a "classification head," which is typically a very simple neural network (often just one linear layer) that is added on top of the pre-trained model.
 2.  **Output Logits:** The head's job is to project the 768-dimensional `[CLS]` vector down to a vector with a size equal to the number of labels. For NLI, this is a vector of size 3. These raw output scores are called **logits**.
@@ -310,7 +312,7 @@ The input data is meticulously structured to be fed into the model.
 
 ---
 
-### The Inference Phase in Detail 💡
+#### The Inference Phase in Detail 💡
 
 **Goal:** To use our fine-tuned NLI model to predict the relationship for a new, unseen pair of sentences.
 
@@ -324,7 +326,7 @@ The input data is meticulously structured to be fed into the model.
     * **Result:** `{ "label": "Contradiction", "score": 0.998 }`
 
 #
-### Alternative Architectures: The Decoder-Only Approach
+#### Alternative Architectures: The Decoder-Only Approach
 
 While encoders are the specialized tool, a powerful decoder-only model like GPT-4 can also perform NLI by framing it as a question-answering or completion task.
 
@@ -346,23 +348,23 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 ***
 ## ![GenAI](https://img.shields.io/badge/LLM_Tasks-5._Question_Answering_(Q&A):-green?style=for-the-badge&logo=github)
 
-### 5a. Extractive Question Answering
+#### 5a. Extractive Question Answering
 
-#### **Example Data**
+##### **Example Data**
 The data consists of a `Context` and a `Question`. The target is not a string of text, but rather the starting and ending positions (indices) of the answer within the context.
 
 * **Context:** `"The first iPhone was introduced by Apple CEO Steve Jobs on January 9, 2007, at the Macworld convention."`
 * **Question:** `"Who introduced the first iPhone?"`
 * **Target:** `start_token_index: 10`, `end_token_index: 11` (Assuming "Steve" is the 10th token and "Jobs" is the 11th).
 
-#### **Use Case Scenario**
+##### **Use Case Scenario**
 The goal is to find and highlight a precise answer that already exists within a provided document. This is ideal for systems that need to be factual and grounded in a specific text.
 
 * **A legal assistant is reviewing a contract:** The user asks, `"What is the termination clause notice period?"` The system scans the contract (`Context`) and extracts the exact phrase, like `"thirty (30) business days"`, highlighting it for the user.
 * **Corporate knowledge base:** An employee asks the HR portal, `"What is the maximum rollover for vacation days?"` The system finds the answer directly in the employee handbook.
 ---
 
-#### **How It Works: A Mini-Tutorial (Encoder-Only)**
+##### **How It Works: A Mini-Tutorial (Encoder-Only)**
 This task is perfectly suited for Encoder-Only models like BERT because they can analyze the relationship between the question and the entire context simultaneously.
 
 ##### **Why Encoders Dominate Extractive QA**
@@ -388,23 +390,24 @@ The model needs to understand which part of the `Context` is most relevant to th
 2.  **Find Best Span:** We find the token index with the highest start probability (`best_start`) and the token index with the highest end probability (`best_end`).
 3.  **Post-Process:** We check for valid spans (e.g., ensuring `best_end >= best_start`). More advanced methods find the span `(i, j)` that maximizes `P_start(i) * P_end(j)`.
 4.  **Extract Answer:** The tokens from the `best_start` index to the `best_end` index are selected from the original context and converted back to a string. This string is the final answer.
+
 ---
 
 
-### 1. How do we ensure `end_token_index >= start_token_index`?
+#### 1. How do we ensure `end_token_index >= start_token_index`?
 
 You are absolutely right to ask this. If you simply take the `argmax` (the index with the highest score) of the start probabilities and the `argmax` of the end probabilities independently, you could easily end up with a `start_index` of 25 and an `end_index` of 10, which is nonsensical.
 
 This is handled during the **inference/post-processing stage**. Here are the common strategies, from simple to robust:
 
-#### Simple Approach: Check After Predicting
+##### Simple Approach: Check After Predicting
 1.  Find the index of the highest start probability, let's call it `best_start_idx`.
 2.  Find the index of the highest end probability, let's call it `best_end_idx`.
 3.  **Check the condition:** If `best_end_idx < best_start_idx`, you conclude that the model could not find a valid answer and return an empty string or a "no answer found" message.
 
 * **Drawback:** This is a bit naive. The model might have predicted a slightly lower-scoring but *valid* span (e.g., the second-best start and second-best end form a valid pair) that this approach would miss.
 
-#### Robust Approach: Find the Best *Valid* Span (Most Common)
+##### Robust Approach: Find the Best *Valid* Span (Most Common)
 
 This is the standard and correct way to do it. Instead of finding the best start and end independently, you search for the **pair `(start, end)` that has the highest combined score, while respecting the constraint.**
 
@@ -425,7 +428,7 @@ This search guarantees that your final `start_index` and `end_index` form a vali
 
 ***
 
-### 2. Do we take the softmax over the entire context length?
+#### 2. Do we take the softmax over the entire context length?
 
 **Yes, absolutely.** You take the softmax over the **entire input sequence length**.
 
@@ -446,23 +449,24 @@ The result is two probability distributions, each of length 384, where the proba
 The task is to find the single best start token **out of all possible tokens** in the context. The softmax function creates a "competition" among all the tokens. By applying it to the entire sequence, you are forcing the model to decide which token, from position 0 to 383, is the most likely start. The same logic applies to the end token.
 
 If you only applied it to a smaller chunk, the model wouldn't be able to compare a potential answer at the beginning of the context with one at the end. The full-sequence softmax is what allows the model to pinpoint the single most probable start and end point across the entire provided text.
+
 ---
 
-### 5b. Generative (Abstractive) Question Answering
+#### 5b. Generative (Abstractive) Question Answering
 
-#### **Example Data**
+##### **Example Data**
 The data is typically a `Question` and a free-form `Answer`. The answer is not necessarily a direct quote from any text.
 
 * **Input (Question):** `"Why is the sky blue?"`
 * **Target (Answer):** `"The sky appears blue because of a phenomenon called Rayleigh scattering, where shorter-wavelength light, like blue and violet, is scattered more effectively by the tiny molecules of air in Earth's atmosphere."`
 
-#### **Use Case Scenario**
+##### **Use Case Scenario**
 The goal is to generate a natural, human-like answer, either by synthesizing information from a provided document (abstractive summarization) or by drawing from its own vast internal knowledge learned during pre-training. This is the foundation of modern conversational AI.
 
 * **General knowledge queries:** A student uses Google or ChatGPT to ask, `"Explain the process of photosynthesis in simple terms."`
 * **Customer support chatbot:** A user asks, `"How do I reset my account password?"` The chatbot generates a step-by-step guide instead of just pointing to a paragraph in a manual.
 ---
-#### **How It Works: A Mini-Tutorial (Decoder-Only or Encoder-Decoder)**
+##### **How It Works: A Mini-Tutorial (Decoder-Only or Encoder-Decoder)**
 This is a classic text generation task, perfectly suited for Decoder-Only models like GPT or Llama.
 
 ##### **Why Decoders Excel at Generative QA**
@@ -488,7 +492,7 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 
 ## ![GenAI](https://img.shields.io/badge/LLM_Tasks-6._Information_Extraction,_Named_Entity_Recognition_(NER):-green?style=for-the-badge&logo=github)
 
-#### **Example Data**
+##### **Example Data**
 
 The goal of NER is to assign a categorical label to each token (or word) in a sentence. The data format consists of a sentence and a corresponding sequence of labels.
 
@@ -501,7 +505,7 @@ A common labeling format is the **IOB2 scheme**:
 * **Tokenized Input:** `["Barack", "Obama", "was", "born", "in", "Hawaii", "."]`
 * **Target Labels:** `[B-PER, I-PER, O, O, O, B-LOC, O]`
 
-#### **Use Case Scenario**
+##### **Use Case Scenario**
 
 The goal is to identify and pull out structured data (entities like people, organizations, dates, etc.) from unstructured, plain text.
 
@@ -512,7 +516,7 @@ The goal is to identify and pull out structured data (entities like people, orga
 * **Medical records:** Automatically extracting patient names, prescribed medications, and diagnoses from a doctor's notes.
 * 
 ---
-#### **How It Works: A Mini-Tutorial (Encoder-Only)**
+##### **How It Works: A Mini-Tutorial (Encoder-Only)**
 NER is a quintessential task for Encoder-Only models like BERT. The model needs to understand the full context of a word before it can classify it.
 
 ##### **Why Encoders are Ideal for NER**
@@ -550,7 +554,7 @@ An encoder model sees the entire sentence at once, allowing it to use both past 
 
 ## ![GenAI](https://img.shields.io/badge/LLM_Tasks-7._Summarization:-green?style=for-the-badge&logo=github)
 
-#### **Example Data**
+##### **Example Data**
 The data consists of pairs of long documents and their corresponding shorter, human-written summaries.
 
 * **Input (Article Text):**
@@ -559,7 +563,7 @@ The data consists of pairs of long documents and their corresponding shorter, hu
 * **Target (Summary):**
     > "San Jose-based Innovate Inc. has unveiled its 'Quantum Leap' processor, which is reportedly twice as fast and more power-efficient, with products expected to ship by Q4."
 
-#### **Use Case Scenario**
+##### **Use Case Scenario**
 The goal is to generate a short, coherent, and accurate summary from a longer document, capturing the most important information.
 
 * **Executive Briefings:** A financial analyst feeds a 30-page quarterly earnings report into the system. The LLM outputs a one-paragraph executive summary highlighting key metrics like revenue, profit, and future outlook for a quick review by executives.
@@ -568,10 +572,10 @@ The goal is to generate a short, coherent, and accurate summary from a longer do
 * **Scientific Research:** Generating an abstract for a long scientific paper to help researchers quickly grasp its findings.
 
 ---
-#### **How It Works:**
+##### **How It Works:**
 Text summarization is a classic sequence-to-sequence (seq2seq) task. It can be tackled effectively by two main architectural approaches.
 
-### Approach 1: Encoder-Decoder Models (The Classic Approach)
+#### Approach 1: Encoder-Decoder Models (The Classic Approach)
 Models like BART, T5, and the original Transformer were purpose-built for tasks like summarization and translation.
 
 ##### **Why the Encoder-Decoder Architecture is a Natural Fit**
@@ -593,7 +597,7 @@ This architecture has a clear division of labor that mirrors the summarization t
 2.  The decoder begins with a start-of-sequence `[SOS]` token.
 3.  It generates the summary autoregressively (`predict -> sample -> append`), using cross-attention at each step to stay focused on the source article's main points. Generation stops when it produces an end-of-sequence `[EOS]` token.
 ---
-### Approach 2: Decoder-Only Models (The Modern Approach)
+#### Approach 2: Decoder-Only Models (The Modern Approach)
 Large models like GPT and Llama can perform summarization by framing it as a standard text completion task.
 
 ##### **Why This Works**
@@ -621,7 +625,7 @@ Through massive scale and instruction fine-tuning, these models learn to recogni
 3.  It begins generating the text that should follow, effectively writing the summary one token at a time using the standard autoregressive loop (`predict -> sample -> append`).
 
 ---
-### Handling Long Documents During Training
+#### Handling Long Documents During Training
 That is the million-dollar question in applying LLMs to real-world documents! You have hit upon the single most significant practical limitation of standard Transformer models: their **fixed and finite context window**.
 
 A model with a 4,000-token context window cannot "see" a 20,000-token document all at once. So, how do we train it on such data and use it to summarize long texts?
@@ -644,12 +648,13 @@ A much better approach involves creating focused training examples. The most eff
     * ...and so on.
 
 This method ensures that every training example is a high-quality, focused task where the input contains the necessary information to generate the target, and everything fits within the context window.
+
 ---
-### Handling Long Documents During Inference
+#### Handling Long Documents During Inference
 
 During inference, we only have the long document and need to generate a single, coherent summary. Since the model can't see the whole document, we use chunking-based strategies.
 
-#### Strategy 1: Map-Reduce (Chunk, Summarize, Summarize Again)
+##### Strategy 1: Map-Reduce (Chunk, Summarize, Summarize Again)
 
 This is the most common and intuitive approach. It's a two-step process:
 
@@ -667,7 +672,7 @@ This is the most common and intuitive approach. It's a two-step process:
 * **Pros:** Simple to implement, highly parallelizable (you can summarize all chunks at the same time).
 * **Cons:** Can lose important context that spans across two chunks. The quality of the final summary depends heavily on the quality of the intermediate summaries.
 
-#### Strategy 2: Iterative Refinement
+##### Strategy 2: Iterative Refinement
 
 This method attempts to maintain a running context as it moves through the document.
 
@@ -679,7 +684,7 @@ This method attempts to maintain a running context as it moves through the docum
 * **Pros:** Can capture cross-chunk relationships better than Map-Reduce.
 * **Cons:** It's a sequential process and therefore much slower. It can also suffer from "recency bias," where information from later chunks is weighted more heavily.
 
-### The Future: Native Long-Context Models
+#### The Future: Native Long-Context Models
 
 The strategies above are clever workarounds for a fundamental architectural limitation. The ultimate solution, which is rapidly becoming a reality, is to use models with much larger context windows.
 
@@ -691,7 +696,7 @@ For these models, you may not need a complex chunking strategy at all. You might
 
 ## ![GenAI](https://img.shields.io/badge/LLM_Tasks-8._Machine_Translation:-green?style=for-the-badge&logo=github)
 
-#### **Example Data**
+##### **Example Data**
 The data consists of parallel sentences: the same sentence in a source language and its human-written translation in a target language.
 
 * **Input (Source Language - English):**
@@ -700,7 +705,7 @@ The data consists of parallel sentences: the same sentence in a source language 
 * **Target (Target Language - French):**
     > "La gare Caltrain la plus proche est la gare Diridon."
 
-#### **Use Case Scenario**
+##### **Use Case Scenario**
 The goal is to automatically translate text from one language to another, breaking down language barriers for communication, business, and information access.
 
 * **Real-time Communication:** A tourist in San Jose uses Google Translate on their phone to ask for directions in English, and the app speaks the translated question in Spanish to a local resident.
@@ -708,10 +713,10 @@ The goal is to automatically translate text from one language to another, breaki
 * **Information Access:** A researcher translates a scientific paper from Chinese into English to stay current with global developments in their field.
 
 ---
-#### **How It Works: A Mini-Tutorial**
+##### **How It Works: A Mini-Tutorial**
 Machine Translation is the original, quintessential sequence-to-sequence (seq2seq) task that inspired the creation of the Transformer architecture.
 
-### Approach 1: Encoder-Decoder Models (The Classic & Gold Standard)
+#### Approach 1: Encoder-Decoder Models (The Classic & Gold Standard)
 Models like the original Transformer, MarianMT, and T5 are purpose-built for translation and are considered the gold standard for this task.
 
 ##### **Why the Encoder-Decoder Architecture is a Natural Fit**
@@ -730,7 +735,7 @@ The English sentence is encoded once. The decoder then starts with a `[START]` t
 
 ---
 
-### Approach 2: Decoder-Only Models (The Modern Generalist)
+#### Approach 2: Decoder-Only Models (The Modern Generalist)
 Large language models like GPT and Llama can perform translation by treating it as an instruction-following task.
 
 ##### **Why This Works**
@@ -768,9 +773,7 @@ Through extensive fine-tuning, these models learn the pattern of translation fro
 
 ## ![GenAI](https://img.shields.io/badge/LLM_Tasks-9._Code_Generation:-green?style=for-the-badge&logo=github)
 
-### Code Generation
-
-#### **Example Data**
+##### **Example Data**
 The data for fine-tuning a code generation model consists of pairs of natural language instructions (often in comments or docstrings) and their corresponding code implementations.
 
 * **Input (Natural Language Prompt):**
@@ -792,14 +795,14 @@ The data for fine-tuning a code generation model consists of pairs of natural la
         return even_numbers
     ```
 
-#### **Use Case Scenario**
+##### **Use Case Scenario**
 The goal is to automatically generate correct, efficient, and syntactically valid code from a natural language description or a partial code snippet. This significantly speeds up the software development process.
 
 * **AI Pair Programming (e.g., GitHub Copilot):** A developer is working in their code editor (like VS Code). They type a comment: `// Create a function to fetch user data from the API endpoint '/api/users'`. The AI assistant instantly generates the complete function with the correct syntax for making an HTTP request.
 * **Natural Language Data Analysis:** A data scientist in a Jupyter Notebook types: `"Plot the average house price by neighborhood from the 'san_jose_housing' dataframe."` The model generates the necessary Python code using libraries like `pandas` and `matplotlib` to perform the calculation and create the visualization.
 * **Automated Unit Testing:** A developer writes a function, and the AI can automatically generate a suite of unit tests to verify its correctness.
 ---
-#### **How It Works: A Mini-Tutorial**
+##### **How It Works: A Mini-Tutorial**
 The core insight behind code generation is that **code is just a highly structured form of text**. It has a strict grammar, syntax, and logical patterns. Therefore, LLMs, which are expert pattern recognizers, are exceptionally good at this task. The dominant architecture is the **Decoder-Only** model.
 
 ##### **The Training Phase ✍️**
@@ -837,7 +840,7 @@ The core insight behind code generation is that **code is just a highly structur
 
 ## ![GenAI](https://img.shields.io/badge/LLM_Tasks-10._Reasoning:-green?style=for-the-badge&logo=github)
 
-#### **Example Data**
+##### **Example Data**
 The key to teaching reasoning is the data format. Instead of just a question and a final answer, the target data includes the intermediate thinking steps. This is known as Chain of Thought (CoT).
 
 * **Input (Question):**
@@ -846,7 +849,7 @@ The key to teaching reasoning is the data format. Instead of just a question and
 * **Target (Chain of Thought + Answer):**
     > `"[REASONING] John starts with 5 apples. He gives away 2 apples. To find out how many are left, we need to subtract the number of apples given away from the starting amount. The calculation is 5 - 2. [REASONING] 5 - 2 = 3. [ANSWER] The final answer is 3."`
 
-#### **Use Case Scenario**
+##### **Use Case Scenario**
 The goal is to solve problems that cannot be answered with a simple fact, but require logical, arithmetic, or commonsense steps.
 
 * **Multi-step Math Problems:** A user prompts the model with a classic word problem from a local perspective:
@@ -855,7 +858,7 @@ The goal is to solve problems that cannot be answered with a simple fact, but re
 * **Other Uses:** Solving logic puzzles, debugging code by reasoning about the error, and planning complex strategies.
 
 ---
-#### **How It Works:**
+##### **How It Works:**
 Reasoning is not a feature that is explicitly programmed into LLMs. It is an **emergent capability** of very large models, significantly enhanced by a technique called Chain of Thought (CoT) fine-tuning.
 
 ##### **What is an "Emergent Capability"?**
@@ -907,7 +910,7 @@ Of course. Here is a comprehensive mini-tutorial on Sentence-Transformers that s
 
 A standard transformer model like BERT is excellent at understanding words in context (token-level embeddings), but it is not inherently designed to create a single, meaningful vector for an entire sentence that can be easily compared with others. Sentence-Transformers solve this problem by fine-tuning these models to produce high-quality, sentence-level embeddings.
 
-#### **Example Data**
+##### **Example Data**
 The training data format depends on the training objective.
 
 * **For Supervised Training (on similarity):**
@@ -920,7 +923,7 @@ The training data format depends on the training objective.
     * `Positive (Similar):` "Sacramento is the capital of California."
     * `Negative (Dissimilar):` "The Golden Gate Bridge is in San Francisco."
 
-#### **Use Case Scenario**
+##### **Use Case Scenario**
 The goal is to convert a sentence into a fixed-size numerical vector (an embedding) where sentences with similar meanings have vectors that are close together in a high-dimensional space. This enables powerful applications:
 
 * **Semantic Search:** A user on a support website asks, `"How do I reset my password if I lost my 2FA device?"` The system converts this query into an embedding and instantly finds the most semantically similar questions and answers in its knowledge base, providing the exact solution.
@@ -928,7 +931,7 @@ The goal is to convert a sentence into a fixed-size numerical vector (an embeddi
 * **Clustering:** Grouping thousands of news articles, user reviews, or documents by the topic or event they describe. This is a core component of modern RAG (Retrieval-Augmented Generation) systems.
 
 ---
-#### **How It Works: A Mini-Tutorial**
+##### **How It Works: A Mini-Tutorial**
 
 ##### **Architecture**
 The architecture is a two-stage process:
@@ -979,7 +982,7 @@ Once fine-tuned, using the model is simple and fast:
 
 The core idea behind RAG is to solve a major weakness of LLMs: they can only answer based on the data they were trained on, which might be outdated or not include private information. RAG gives the LLM an "open book" to use when answering a question, ensuring the response is timely, accurate, and grounded in specific facts. It transforms a "closed-book" memory test into an "open-book" reasoning test.
 
-#### **Example Data & Components**
+##### **Example Data & Components**
 RAG is a system composed of several parts, not a simple `Input -> Target` training pair.
 
 1.  **The Knowledge Base (The "Book"):** A collection of private or specific documents.
@@ -993,14 +996,14 @@ RAG is a system composed of several parts, not a simple `Input -> Target` traini
 3.  **The Final LLM Output (The "Answer"):** A synthesized answer based on the retrieved information.
     > "Based on the meeting minutes from June 10, 2025, the San Jose City Council approved the 'Urban Sky' zoning proposal with a 7-4 majority."
 
-#### **Use Case Scenario**
+##### **Use Case Scenario**
 The goal of RAG is to ground a powerful generative model in a specific, up-to-date, or private set of documents, making its answers more trustworthy and factual.
 
 * **Enterprise Chatbot:** An employee asks an internal chatbot, `"What is our corporate policy on work-from-home for 2025?"` The RAG system retrieves the latest HR document from the company's internal server and provides the current, correct answer.
 * **Up-to-Date Customer Support:** A customer asks a support bot, `"Is the new product compatible with my device?"` The RAG system pulls the latest product manuals to provide an accurate technical answer, even if the product was released after the LLM was trained.
 
 ---
-#### **How It Works: A Mini-Tutorial**
+##### **How It Works: A Mini-Tutorial**
 RAG is primarily an **inference-time** process that involves two main phases: preparing the knowledge base (Indexing) and answering the query (Retrieval & Generation).
 
 ##### **Phase 1: The Indexing Phase (Offline Preparation - "Building the Library")**
