@@ -2,7 +2,6 @@
 
 ## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](../../main_page/GenAI)
 
-[![License: MIT](https://cdn.prod.website-files.com/5e0f1144930a8bc8aace526c/65dd9eb5aaca434fac4f1c34_License-MIT-blue.svg)](/LICENSE)
 
 
 # A Comprehensive Guide to LLM Tasks: From Fine-Tuning to Advanced Applications
@@ -12,8 +11,7 @@ A single, powerful pre-trained Large Language Model is a versatile foundation th
 This tutorial provides a detailed breakdown of the most common and important tasks an LLM can perform, explaining for each: its goal, the data format for fine-tuning, a practical example, and the underlying mechanics.
 
 ***
-
-## 1. Text Generation (and Completion)
+## ![GenAI](https://img.shields.io/badge/1. Text Generation (and Completion)-green?style=for-the-badge&logo=github)
 
 * **The Goal:** To produce creative, coherent, and contextually relevant text that continues from a given prompt. This is the most fundamental autoregressive task and includes applications like story writing, paraphrasing, and email completion.
 * **Architecture:** The quintessential task for Decoder-Only models (like the GPT series, Llama).
