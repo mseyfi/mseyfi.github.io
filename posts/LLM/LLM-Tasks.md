@@ -11,7 +11,7 @@ A single, powerful pre-trained Large Language Model is a versatile foundation th
 This tutorial provides a detailed breakdown of the most common and important tasks an LLM can perform, explaining for each: its goal, the data format for fine-tuning, a practical example, and the underlying mechanics.
 
 ***
-## ![GenAI](https://img.shields.io/badge/1._Text_Generation_(and_Completion)-orange?style=for-the-badge&logo=github)
+## ![GenAI](https://img.shields.io/badge/1._Text_Generation_(and_Completion)-orange?style=for-the-badge)
 
 * **The Goal:** To produce creative, coherent, and contextually relevant text that continues from a given prompt. This is the most fundamental autoregressive task and includes applications like story writing, paraphrasing, and email completion.
 * **Architecture:** The quintessential task for Decoder-Only models (like the GPT series, Llama).
