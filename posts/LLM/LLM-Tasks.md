@@ -236,7 +236,7 @@ This modern approach cleverly reframes classification as a text generation task.
 
 ***
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-4._Natural_Language_Inference:-green?style=for-the-badge&logo=github)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-4._Natural_Language_Inference_(NLI):-green?style=for-the-badge&logo=github)
 
 Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
 #
@@ -345,7 +345,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **Cons:** The left-to-right nature is fundamentally less suited for direct comparison than an encoder's bi-directional view. It can be less efficient and potentially less robust than a fine-tuned encoder specifically optimized for the NLI task.
 
 ***
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-5._Question_Answering:-green?style=for-the-badge&logo=github)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-5._Question_Answering_(Q&A):-green?style=for-the-badge&logo=github)
 
 ### 5a. Extractive Question Answering
 
@@ -487,7 +487,7 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 
 ---   
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-6._Information_Extraction_(Named_Entity_Recognition_-_NER):-green?style=for-the-badge&logo=github)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-6._Information_Extraction,_Named_Entity_Recognition_(NER):-green?style=for-the-badge&logo=github)
 
 #### **Example Data**
 
