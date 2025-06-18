@@ -483,33 +483,142 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 4.  **Complete Answer:** The generation loop continues until the model produces a special end-of-sequence token or reaches a predefined length limit. The full sequence of generated tokens is the final answer.
 ---   
 
-## 6. Information Extraction
+## 6. Information Extraction (Named Entity Recognition - NER)
 
-* **The Goal:** To identify and pull structured data, like names, dates, or relationships, from unstructured text.
-* **Data Format (for Named Entity Recognition - NER):**
-    * **Input:** `"Barack Obama was born in Hawaii."`
-    * **Target:** A sequence of labels, one per token: `[B-PER, I-PER, O, O, O, B-LOC]`
-* **Example Use Case (NER):**
-    * **Input:** `"Tim Cook, the CEO of Apple, announced the new device from their headquarters in Cupertino."`
-    * **LLM Output:** `Person: "Tim Cook"`, `Organization: "Apple"`, `Location: "Cupertino"`
-* **How It Works:**
-    * **Architecture: Encoder-Only (e.g., BERT):** This is the ideal architecture due to its bidirectional context. A classification head is placed on top of **every token's** output vector to predict its entity label (e.g., `B-PER`, `I-PER`, `O`).
-    * **Loss Function:** **Cross-Entropy Loss** is calculated across the entire sequence of token labels.
+#### **Example Data**
+
+The goal of NER is to assign a categorical label to each token (or word) in a sentence. The data format consists of a sentence and a corresponding sequence of labels.
+
+A common labeling format is the **IOB2 scheme**:
+* **`B-TYPE`**: The **B**eginning of an entity of a certain TYPE (e.g., `B-PER` for Person).
+* **`I-TYPE`**: **I**nside an entity of a certain TYPE. Used for entities that span multiple tokens.
+* **`O`**: **O**utside of any entity.
+
+* **Input Text:** `"Barack Obama was born in Hawaii."`
+* **Tokenized Input:** `["Barack", "Obama", "was", "born", "in", "Hawaii", "."]`
+* **Target Labels:** `[B-PER, I-PER, O, O, O, B-LOC, O]`
+
+#### **Use Case Scenario**
+
+The goal is to identify and pull out structured data (entities like people, organizations, dates, etc.) from unstructured, plain text.
+
+* **An HR system processing a resume:**
+    * **Input:** `"Worked as a software engineer at Google from 2019 to 2022."`
+    * **System Extracts:** `{"Job Title": "software engineer", "Organization": "Google", "Start Date": "2019", "End Date": "2022"}`
+* **News analysis:** Scanning thousands of articles to identify which companies are mentioned in relation to which locations.
+* **Medical records:** Automatically extracting patient names, prescribed medications, and diagnoses from a doctor's notes.
+
+#
+#### **How It Works: A Mini-Tutorial (Encoder-Only)**
+NER is a quintessential task for Encoder-Only models like BERT. The model needs to understand the full context of a word before it can classify it.
+
+##### **Why Encoders are Ideal for NER**
+The key is **bi-directional context**. To know if the word "Washington" refers to a person (`B-PER`) or a location (`B-LOC`), you need to see the words that come *after* it.
+* "**Washington** spoke to Congress..." -> "Washington" is a person.
+* "I am flying to **Washington** D.C...." -> "Washington" is a location.
+An encoder model sees the entire sentence at once, allowing it to use both past and future context to make the most accurate decision for each word.
+
+##### **The Training Phase ⚙️**
+
+1.  **Input Formatting & Tokenization:** The input text is tokenized into a sequence of tokens (or more often, subwords). The target is a corresponding sequence of labels.
+    * **Handling Subwords:** A critical detail is how to handle words that are broken into subwords (e.g., "Cupertino" -> `["Cuper", "##tino"]`). The standard approach is to assign the full label to the first subword (`B-LOC` for `"Cuper"`) and a special label (often `X` or simply the corresponding `I-` tag) to subsequent subwords (`I-LOC` for `"##tino"`). These subsequent subword predictions are often ignored during the loss calculation.
+2.  **Architecture:** The model is a standard encoder. The unique part is the prediction head.
+    * A single **classification head** is placed on top of **every token's final output vector**.
+    * This head is a simple linear layer that projects the token's rich contextual embedding (e.g., a vector of size 768) to a vector of **logits**. The size of this logit vector is equal to the number of possible NER tags (e.g., 9 tags for `B-PER`, `I-PER`, `B-LOC`, `I-LOC`, `B-ORG`, `I-ORG`, `O`, etc.).
+3.  **Loss Function:**
+    * After the forward pass, you have a sequence of logit vectors—one for each input token.
+    * A **Cross-Entropy Loss** is calculated **at each token position**. The model's predicted probability distribution for a given token is compared against the true label for that token.
+    * The individual losses for all tokens in the sequence are then aggregated (usually by averaging) to get the final loss for the training step. The loss for padding tokens and subsequent subword tokens is ignored.
+
+##### **The Inference Phase 💡**
+
+1.  **Format and Predict:** A new sentence is tokenized and fed through the fine-tuned model. The model outputs a sequence of probability distributions, one for each input token.
+2.  **Label Assignment:** For each token in the sequence, we perform an `argmax` on its probability distribution to find the most likely NER tag.
+    * **Input:** `["Tim", "Cook", ",", "CEO", "of", "Apple"]`
+    * **Raw Output Tags:** `[B-PER, I-PER, O, O, O, B-ORG]`
+3.  **Post-Processing & Entity Extraction:** The raw sequence of tags is not the final output. A final, simple step is required to parse this sequence and group the tokens into structured entities.
+    * The code iterates through the list of `(token, tag)` pairs.
+    * When it sees a `B-PER` tag, it starts a new "Person" entity. It continues adding subsequent tokens with the `I-PER` tag to that same entity.
+    * When it sees a different tag (like `O` or `B-ORG`), the current entity is considered complete.
+    * This process converts the token-level predictions into the final, human-readable structured output.
+    * **Final Structured Output:** `{"Person": "Tim Cook", "Organization": "Apple"}`
+
 ***
 
-## 7. Summarization
+## 7. Text Summarization
 
-* **The Goal:** To generate a short, coherent, and accurate summary from a longer document.
-* **Data Format:** Pairs of long documents and their human-written summaries.
-    * **Input:** `"<text of a long news article>"`
-    * **Target:** `"<text of the short summary>"`
-* **Example Use Case:**
-    * **Input:** A 30-page quarterly financial report.
-    * **LLM Output:** A one-paragraph executive summary highlighting key metrics like revenue, profit, and future outlook.
-* **How It Works:**
-    * **Architecture:** A classic sequence-to-sequence task, perfectly suited for **Encoder-Decoder** models but also commonly handled by **Decoder-Only** models (see Section 2 for details).
+#### **Example Data**
+The data consists of pairs of long documents and their corresponding shorter, human-written summaries.
 
----
+* **Input (Article Text):**
+    > "SAN JOSE – Following months of speculation, local tech giant Innovate Inc. today announced the release of their flagship product, the 'Quantum Leap' processor. The company claims the new processor is twice as fast as its predecessor and consumes 30% less power, a significant step forward for mobile computing. CEO Jane Doe presented the chip at a press event, stating that devices featuring the Quantum Leap will be available to consumers by the fourth quarter of this year."
+
+* **Target (Summary):**
+    > "San Jose-based Innovate Inc. has unveiled its 'Quantum Leap' processor, which is reportedly twice as fast and more power-efficient, with products expected to ship by Q4."
+
+#### **Use Case Scenario**
+The goal is to generate a short, coherent, and accurate summary from a longer document, capturing the most important information.
+
+* **Executive Briefings:** A financial analyst feeds a 30-page quarterly earnings report into the system. The LLM outputs a one-paragraph executive summary highlighting key metrics like revenue, profit, and future outlook for a quick review by executives.
+* **News Aggregation:** Summarizing multiple news articles about the same event to provide a comprehensive overview.
+* **Meeting Productivity:** Condensing a one-hour meeting transcript into a short list of key decisions and action items.
+* **Scientific Research:** Generating an abstract for a long scientific paper to help researchers quickly grasp its findings.
+
+#
+#### **How It Works:**
+Text summarization is a classic sequence-to-sequence (seq2seq) task. It can be tackled effectively by two main architectural approaches.
+
+### Approach 1: Encoder-Decoder Models (The Classic Approach)
+Models like BART, T5, and the original Transformer were purpose-built for tasks like summarization and translation.
+
+##### **Why the Encoder-Decoder Architecture is a Natural Fit**
+This architecture has a clear division of labor that mirrors the summarization task itself:
+* **The Encoder's Job:** To read and "understand" the entire source document. It processes the text using **bi-directional attention**, creating a rich, contextualized representation of the input. Its goal is to compress the full meaning of the article into a set of hidden states.
+* **The Decoder's Job:** To generate a new, shorter text (the summary). It generates the summary one word at a time, but with a special power: **cross-attention**.
+
+##### **The Training Phase ⚙️**
+
+1.  **Encoding the Input:** The full text of the long article is fed into the Encoder. The encoder processes it and produces a set of output vectors (hidden states), one for each input token.
+2.  **Decoding the Output:** The Decoder is an autoregressive model that is fed the target summary (using a technique called "teacher forcing"). At each step of generating a token, the decoder does two things:
+    * It uses **causal self-attention** to look at the summary words it has already generated.
+    * It uses **cross-attention** to look back at the encoder's output vectors. This allows the decoder to "consult" the most relevant parts of the original article while writing the summary, ensuring the output is factually grounded.
+3.  **Loss Function:** A standard **Cross-Entropy Loss** is calculated by comparing the decoder's predicted tokens to the actual tokens in the human-written target summary.
+
+##### **The Inference Phase 💡**
+
+1.  The new, long document is fed into the encoder exactly once to get its representations.
+2.  The decoder begins with a start-of-sequence `[SOS]` token.
+3.  It generates the summary autoregressively (`predict -> sample -> append`), using cross-attention at each step to stay focused on the source article's main points. Generation stops when it produces an end-of-sequence `[EOS]` token.
+
+#
+
+### Approach 2: Decoder-Only Models (The Modern Approach)
+Large models like GPT and Llama can perform summarization by framing it as a standard text completion task.
+
+##### **Why This Works**
+Through massive scale and instruction fine-tuning, these models learn to recognize the task of summarization from a prompt. The model learns the pattern: "When given a long text and the instruction to summarize, produce a shorter version containing the key points."
+
+##### **The Training Phase ✍️**
+
+1.  **Input Formatting:** The article and summary are concatenated into a single sequence using a prompt template.
+    ```
+    Summarize the following article:
+
+    <text of the long news article>
+
+    Summary:
+    <text of the short summary>
+    ```
+2.  **Architecture & Loss:** The setup is identical to dialogue generation.
+    * The model is a standard **decoder-only** architecture using **causal masking**.
+    * The loss function is **Masked Cross-Entropy Loss**. The error is calculated **only on the tokens of the target summary**. This teaches the model to specifically generate the summary portion when prompted.
+
+##### **The Inference Phase 🗣️**
+
+1.  A new article is placed into the prompt template, stopping right after `Summary:`.
+2.  The model takes this entire text as its input prefix.
+3.  It begins generating the text that should follow, effectively writing the summary one token at a time using the standard autoregressive loop (`predict -> sample -> append`).
+***
 
 ## 8. Machine Translation
 
