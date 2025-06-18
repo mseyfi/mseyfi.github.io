@@ -620,6 +620,76 @@ Through massive scale and instruction fine-tuning, these models learn to recogni
 1.  A new article is placed into the prompt template, stopping right after `Summary:`.
 2.  The model takes this entire text as its input prefix.
 3.  It begins generating the text that should follow, effectively writing the summary one token at a time using the standard autoregressive loop (`predict -> sample -> append`).
+
+
+#
+### Handling Long Documents During Training
+That is the million-dollar question in applying LLMs to real-world documents! You have hit upon the single most significant practical limitation of standard Transformer models: their **fixed and finite context window**.
+
+A model with a 4,000-token context window cannot "see" a 20,000-token document all at once. So, how do we train it on such data and use it to summarize long texts?
+
+We use specialized strategies for both training and inference.
+
+During the training phase, we have the luxury of knowing both the long document (`D`) and the target human-written summary (`S`). The goal is to create smaller, focused `(input, target)` pairs that fit within the model's context window.
+
+The naive approach would be to simply truncate the document to the context window size. This is a terrible idea for summarization because the most important information might be at the end of the document.
+
+A much better approach involves creating focused training examples. The most effective method is a form of "oracle" chunking:
+
+1.  **Break down the Target Summary:** Take the human-written summary `S` and split it into individual sentences: `s_1, s_2, s_3, ...`
+2.  **Find the "Oracle" Context:** For each summary sentence `s_i`, use an algorithm (like sentence-embedding similarity or a lexical overlap metric like ROUGE) to find the most relevant sentences or paragraphs from the original long document `D`. This selection of text from `D` is the "oracle context" because it's the specific information needed to write that part of the summary.
+3.  **Create Training Pairs:** You can now create multiple high-quality training examples from one document-summary pair.
+    * **Input 1:** The oracle context for `s_1`.
+    * **Target 1:** The summary sentence `s_1`.
+    * **Input 2:** The oracle context for `s_2`.
+    * **Target 2:** The summary sentence `s_2`.
+    * ...and so on.
+
+This method ensures that every training example is a high-quality, focused task where the input contains the necessary information to generate the target, and everything fits within the context window.
+
+#
+### Handling Long Documents During Inference
+
+During inference, we only have the long document and need to generate a single, coherent summary. Since the model can't see the whole document, we use chunking-based strategies.
+
+#### Strategy 1: Map-Reduce (Chunk, Summarize, Summarize Again)
+
+This is the most common and intuitive approach. It's a two-step process:
+
+1.  **MAP Step:**
+    * Split the long document into smaller, manageable chunks that fit the context window. It's best to use overlapping chunks to ensure you don't cut off sentences in the middle.
+    * Send each chunk to the LLM *independently* with the prompt: `"Summarize the following text: <chunk_text>"`.
+    * You will end up with a list of partial summaries, one for each chunk.
+
+2.  **REDUCE Step:**
+    * Combine all the partial summaries into a single new document.
+    * Send this *combined summary document* to the LLM again with the same prompt: `"Summarize the following text: <combined_summaries_text>"`.
+    * The final output is the summary of the summaries.
+
+* **Analogy:** Several people each summarize one chapter of a book. Then, a final editor takes their chapter summaries and writes a single summary for the entire book.
+* **Pros:** Simple to implement, highly parallelizable (you can summarize all chunks at the same time).
+* **Cons:** Can lose important context that spans across two chunks. The quality of the final summary depends heavily on the quality of the intermediate summaries.
+
+#### Strategy 2: Iterative Refinement
+
+This method attempts to maintain a running context as it moves through the document.
+
+1.  Summarize the first chunk (`chunk_1`). Let's call the result `summary_1`.
+2.  Take `summary_1`, append the next chunk (`chunk_2`) to it, and feed it to the LLM with a prompt like: `"Given the following summary so far and the next part of the document, refine and update the summary: Summary: <summary_1> Next Part: <chunk_2>"`.
+3.  The model produces a new, updated summary (`summary_2`).
+4.  Repeat this process, feeding `summary_n` and `chunk_n+1` into the model until all chunks have been processed.
+
+* **Pros:** Can capture cross-chunk relationships better than Map-Reduce.
+* **Cons:** It's a sequential process and therefore much slower. It can also suffer from "recency bias," where information from later chunks is weighted more heavily.
+
+### The Future: Native Long-Context Models
+
+The strategies above are clever workarounds for a fundamental architectural limitation. The ultimate solution, which is rapidly becoming a reality, is to use models with much larger context windows.
+
+Models like **Google's Gemini 1.5 Pro (with up to 1 million tokens)**, Anthropic's Claude series (100k-200k tokens), and specialized research models (Longformer, BigBird) are designed to handle much longer sequences.
+
+For these models, you may not need a complex chunking strategy at all. You might be able to feed the entire document directly into the model's context window, allowing it to perform summarization with a full, holistic understanding of the text. This is the direction the field is moving.
+
 ***
 
 ## ![GenAI](../../badges/mt.svg)
