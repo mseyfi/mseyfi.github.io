@@ -4,7 +4,7 @@
 
 [![GenAI](https://img.shields.io/badge/LLM_TASKs-Selected_LLM_TASKs-orange?style=for-the-badge&logo=github)](../LLM-Tasks)
 
-#Natural Language Inference (NLI)
+# Natural Language Inference (NLI)
 
 Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
 
