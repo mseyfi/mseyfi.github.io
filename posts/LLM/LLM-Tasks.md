@@ -87,6 +87,7 @@ Text generation is a loop. Let's say we sampled the token for `"Your"`.
 
 
 This tutorial explains how to take a general-purpose LLM and fine-tune it to be an interactive, multi-turn conversational agent that can remember context and adopt a specific persona.
+
 ---
 
 #### Part 1: The Training Phase (Fine-Tuning for Dialogue)
@@ -126,7 +127,9 @@ Let's visualize the loss calculation for the first turn:
 | `...Germany? [/INST] The`             | `capital`             | **YES!** (This is the assistant's turn)                    |
 | `...is Berlin.`                       | `</s>`                | **YES!** (This is the end of the assistant's turn)         |
 
+
 **Why this works:** You are not teaching the model how to *ask questions*; you are teaching it exclusively how to *answer* them, given the context of a user's question.
+
 ---
 
 #### Part 2: The Generation Phase (Inference / Having a Conversation)
