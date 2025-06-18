@@ -10,8 +10,7 @@ A single, powerful pre-trained Large Language Model is a versatile foundation th
 This tutorial provides a detailed breakdown of the most common and important tasks an LLM can perform, explaining for each: its goal, the data format for fine-tuning, a practical example, and the underlying mechanics.
 
 ***
-## ![GenAI](../../badges/text_completion.svg?style=flat&logo=homeadvisor&logoColor=white)
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-Text_Generation_and_Completion:-green?style=for-the-badge&logo=github)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-1._Text_Generation_and_Completion:-green?style=for-the-badge&logo=github)
 
 * **The Goal:** To produce creative, coherent, and contextually relevant text that continues from a given prompt. This is the most fundamental autoregressive task and includes applications like story writing, paraphrasing, and email completion.
 * **Architecture:** The quintessential task for Decoder-Only models (like the GPT series, Llama).
@@ -84,7 +83,8 @@ Text generation is a loop. Let's say we sampled the token for `"Your"`.
 
 ***
 
-## ![GenAI](../../badges/dialogue_generation.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-2._Dialogue_Generation_(Chatbot):-green?style=for-the-badge&logo=github)
+
 
 This tutorial explains how to take a general-purpose LLM and fine-tune it to be an interactive, multi-turn conversational agent that can remember context and adopt a specific persona.
 #
