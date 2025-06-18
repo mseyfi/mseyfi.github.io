@@ -3,7 +3,6 @@
 ## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](../../main_page/GenAI)
 
 
-
 # A Comprehensive Guide to LLM Tasks: From Fine-Tuning to Advanced Applications
 
 A single, powerful pre-trained Large Language Model is a versatile foundation that can be adapted—or "fine-tuned"—to excel at a wide array of specific tasks. The key to this versatility lies in how we frame the task and format the data.
@@ -12,6 +11,7 @@ This tutorial provides a detailed breakdown of the most common and important tas
 
 ***
 ## ![GenAI](../../badges/text_completion.svg?style=flat&logo=homeadvisor&logoColor=white)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-Text_Generation_and_Completion:-green?style=for-the-badge&logo=github)
 
 * **The Goal:** To produce creative, coherent, and contextually relevant text that continues from a given prompt. This is the most fundamental autoregressive task and includes applications like story writing, paraphrasing, and email completion.
 * **Architecture:** The quintessential task for Decoder-Only models (like the GPT series, Llama).
