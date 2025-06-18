@@ -694,55 +694,214 @@ For these models, you may not need a complex chunking strategy at all. You might
 
 ## ![GenAI](../../badges/mt.svg)
 
-* **The Goal:** To translate a sequence of text from a source language to a target language.
-* **Data Format:** Parallel sentences or documents.
-    * **Input:** `"translate English to Spanish: The weather today is sunny and warm."`
-    * **Target:** `"El clima hoy está soleado y cálido."`
-* **Example Use Case:**
-    * **Input:** `"I would like to book a hotel room for two nights."` (English to Japanese)
-    * **LLM Output:** `"ホテルの部屋を二泊予約したいです。"`
-* **How It Works:**
-    * **Architecture:** The quintessential task for **Encoder-Decoder** models. The encoder gets a full understanding of the source sentence, and the decoder generates the target language.
+#### **Example Data**
+The data consists of parallel sentences: the same sentence in a source language and its human-written translation in a target language.
 
+* **Input (Source Language - English):**
+    > "The nearest Caltrain station is Diridon Station."
+
+* **Target (Target Language - French):**
+    > "La gare Caltrain la plus proche est la gare Diridon."
+
+#### **Use Case Scenario**
+The goal is to automatically translate text from one language to another, breaking down language barriers for communication, business, and information access.
+
+* **Real-time Communication:** A tourist in San Jose uses Google Translate on their phone to ask for directions in English, and the app speaks the translated question in Spanish to a local resident.
+* **Global Business:** A company translates its technical documentation and marketing materials from English into Japanese and German to reach international markets.
+* **Information Access:** A researcher translates a scientific paper from Chinese into English to stay current with global developments in their field.
+
+#
+#### **How It Works: A Mini-Tutorial**
+Machine Translation is the original, quintessential sequence-to-sequence (seq2seq) task that inspired the creation of the Transformer architecture.
+
+### Approach 1: Encoder-Decoder Models (The Classic & Gold Standard)
+Models like the original Transformer, MarianMT, and T5 are purpose-built for translation and are considered the gold standard for this task.
+
+##### **Why the Encoder-Decoder Architecture is a Natural Fit**
+This architecture's "read then write" division of labor is a perfect match for translation:
+* **The Encoder's Job:** To read the entire source sentence (e.g., in English) using **bi-directional attention**. Its goal is to create a rich, language-agnostic representation of the sentence's meaning, compressing it into a set of contextual vectors.
+* **The Decoder's Job:** To generate a new sentence in the target language (e.g., French). It does this autoregressively, using **cross-attention** to constantly refer back to the encoder's representation of the source sentence. This ensures the translation is faithful to the original meaning.
+
+##### **The Training Phase ⚙️**
+
+1.  **Encoding:** The source sentence (English) is tokenized and fed into the Encoder.
+2.  **Decoding:** The target sentence (French) is fed to the Decoder for teacher forcing. At each step, the decoder uses **cross-attention** to consult the encoder's output, allowing it to align words and concepts (e.g., aligning "station" with "gare").
+3.  **Loss Function:** A standard **Cross-Entropy Loss** is calculated between the decoder's predicted French tokens and the actual French tokens from the target sentence.
+
+##### **The Inference Phase 💡**
+The English sentence is encoded once. The decoder then starts with a `[START]` token and generates the French translation token by token until it produces an `[END]` token.
+
+#
+### Approach 2: Decoder-Only Models (The Modern Generalist)
+Large language models like GPT and Llama can perform translation by treating it as an instruction-following task.
+
+##### **Why This Works**
+Through extensive fine-tuning, these models learn the pattern of translation from prompts. They understand that when given text in one language and asked to translate it to another, their task is to generate the corresponding text in the target language.
+
+##### **The Training Phase ✍️**
+
+1.  **Input Formatting:** The source and target sentences are concatenated into a single sequence using a prompt template.
+    ```
+    Translate the following English text to French:
+
+    The nearest Caltrain station is Diridon Station.
+
+    French translation:
+    La gare Caltrain la plus proche est la gare Diridon.
+    ```
+2.  **Handling Unequal Lengths (Your Specific Question):**
+    This is the crucial part. The English input and French output have different token lengths. How does the model handle this during training? The answer lies in the **Masked Loss Function**.
+
+    * **Step 1: A Single Sequence:** The model doesn't see two separate sentences; it sees one long, continuous sequence of tokens: `[Prompt Tokens] + [Target Tokens]`.
+    * **Step 2: Causal Masking:** A standard causal mask is applied. When predicting any token, the model can only see the tokens that came before it in this long sequence.
+    * **Step 3: Intelligent Loss Calculation:** We use a "loss mask" to tell the model which predictions to learn from.
+        * For all the tokens that are part of the prompt and the source sentence (e.g., `"Translate...Diridon Station."`), their loss is ignored. We don't need to teach the model how to write the prompt.
+        * The Cross-Entropy Loss is **only calculated for the tokens in the target sentence** (e.g., `"La gare...gare Diridon."`).
+
+    **In short, the unequal length doesn't matter.** The model is simply performing next-token prediction on a long sequence, and the loss mask cleverly focuses the learning *only* on the part of the sequence we want it to generate (the translation).
+
+##### **The Inference Phase 🗣️**
+
+1.  The new English sentence is placed into the prompt template, stopping right after `"French translation:"`.
+2.  This entire text is fed to the model as a prefix.
+3.  The model generates the translation autoregressively, token by token, until it completes the sentence and outputs an end-of-sequence token.
+   
 ---
 
 ## ![GenAI](../../badges/code.svg)
 
-* **The Goal:** To generate, complete, document, or translate code.
-* **Data Format (for generation):** A natural language description paired with the corresponding code.
-    * **Input:** `"Python function to calculate the nth Fibonacci number"`
-    * **Target:** `"def fibonacci(n): ..."`
-* **Example Use Case:**
-    * **Prompt:** `"// A Javascript function that fetches data from a URL and logs it to the console"`
-    * **LLM Output (Code Completion):**
-        ```javascript
-        async function fetchData(url) {
-          try {
-            const response = await fetch(url);
-            const data = await response.json();
-            console.log(data);
-          } catch (error) {
-            console.error('Error fetching data:', error);
-          }
-        }
-        ```
-* **How It Works:**
-    * **Architecture:** This is a specialized application of **Decoder-Only** models. They are pre-trained on massive corpora of publicly available code (e.g., from GitHub) in addition to natural language text. The fine-tuning process is identical to text generation (Category 1).
+### Code Generation
+
+#### **Example Data**
+The data for fine-tuning a code generation model consists of pairs of natural language instructions (often in comments or docstrings) and their corresponding code implementations.
+
+* **Input (Natural Language Prompt):**
+    ```python
+    # Write a Python function that takes a list of numbers 
+    # and returns a new list with only the even numbers.
+    ```
+
+* **Target (Code Completion):**
+    ```python
+    def get_even_numbers(numbers):
+        """
+        Filters a list of numbers, returning only the even ones.
+        """
+        even_numbers = []
+        for number in numbers:
+            if number % 2 == 0:
+                even_numbers.append(number)
+        return even_numbers
+    ```
+
+#### **Use Case Scenario**
+The goal is to automatically generate correct, efficient, and syntactically valid code from a natural language description or a partial code snippet. This significantly speeds up the software development process.
+
+* **AI Pair Programming (e.g., GitHub Copilot):** A developer is working in their code editor (like VS Code). They type a comment: `// Create a function to fetch user data from the API endpoint '/api/users'`. The AI assistant instantly generates the complete function with the correct syntax for making an HTTP request.
+* **Natural Language Data Analysis:** A data scientist in a Jupyter Notebook types: `"Plot the average house price by neighborhood from the 'san_jose_housing' dataframe."` The model generates the necessary Python code using libraries like `pandas` and `matplotlib` to perform the calculation and create the visualization.
+* **Automated Unit Testing:** A developer writes a function, and the AI can automatically generate a suite of unit tests to verify its correctness.
+
+#
+#### **How It Works: A Mini-Tutorial**
+The core insight behind code generation is that **code is just a highly structured form of text**. It has a strict grammar, syntax, and logical patterns. Therefore, LLMs, which are expert pattern recognizers, are exceptionally good at this task. The dominant architecture is the **Decoder-Only** model.
+
+##### **The Training Phase ✍️**
+
+1.  **The Data:** Code models are pre-trained on a massive corpus of text and code. The data comes from two main sources:
+    * **Public Code Repositories:** Billions of lines of code from sources like GitHub are used. The model learns the syntax, structure, and common patterns of many programming languages (`code -> code` prediction).
+    * **Paired Data:** To learn how to follow instructions, models are specifically trained on pairs of natural language and code. This data is mined from docstrings, code comments, programming tutorials, and Q&A sites like Stack Overflow (`natural language -> code` prediction).
+
+2.  **Tokenization:** Code models often use a specialized **tokenizer**. Unlike a standard text tokenizer, a code tokenizer is optimized to handle programming constructs like indentation (which is critical in Python), brackets (`{}`, `[]`, `()`), operators (`++`, `->`, `:=`), and common variable names.
+
+3.  **Input Formatting:** The training data is formatted into a single continuous sequence, just like other generative tasks. For an instruction-following pair, it would look like:
+    `"<instruction_comment>" <separator> "<code_implementation>"`
+
+4.  **Architecture & Loss:** The setup is identical to other text generation tasks.
+    * The model is a standard **decoder-only** architecture (e.g., GPT, Llama, Codex).
+    * It uses **Causal Masking**, meaning when predicting the next token, it can only see the code and comments that came before it.
+    * The loss function is **Cross-Entropy Loss**, calculated on the model's predictions for the next token against the actual next token in the training data. For instruction-following pairs, the loss might be calculated only on the code tokens (the completion), not the instruction tokens (the prompt).
+
+##### **The Inference Phase (Writing Code) 👨‍💻**
+
+1.  **The Prompt:** The user provides a prompt. This can be a natural language comment, a function signature, or the beginning of a line of code.
+    * Example Prompt: `def send_email(recipient, subject, body):`
+
+2.  **The Generation Loop:** The model takes this prompt as its initial input and begins to generate the code autoregressively, one token at a time.
+
+3.  **The Autoregressive Process:** This is the same loop used in all generative tasks:
+    * **Predict:** The model uses its final **linear layer** and a **softmax** function to get a probability distribution over all possible next tokens in its vocabulary.
+    * **Sample:** A token is chosen from this distribution. For code generation, the sampling is often less random (using a lower "temperature") than for creative writing, because correctness and predictability are more important than creativity.
+    * **Append:** The newly chosen token is appended to the sequence, and this new, longer sequence becomes the input for the next step.
+    * The loop might generate: `"""Sends an email...` then `"""` then `import smtplib` and so on.
+
+4.  **Stopping Condition:** The generation continues until the model determines the code block is logically complete (e.g., it has closed all brackets and returned from the function) or it generates a special end-of-sequence token.
 
 ---
 
 ## ![GenAI](../../badges/reason.svg)
 
-* **The Goal:** To solve problems that require logical, arithmetic, or commonsense steps.
-* **Data Format (for Chain-of-Thought fine-tuning):** The data includes the intermediate reasoning steps.
-    * **Input:** `"If John has 5 apples and gives 2 to Mary, how many does he have left?"`
-    * **Target:** `"John starts with 5 apples. He gives away 2. So we need to subtract 2 from 5. 5 - 2 = 3. The answer is 3."`
-* **Example Use Case:**
-    * **Prompt:** `"If a train leaves San Jose at 10:00 AM traveling at 60 mph and a car leaves at 11:00 AM traveling at 70 mph on the same route, at what time will the car catch up to the train?"`
-    * **LLM Output:** A step-by-step breakdown of the relative speed, the head start of the train, and the final calculation for the time taken.
-* **How It Works:** This is an **emergent capability** of very large models. It is significantly improved by fine-tuning on datasets that explicitly include a **Chain of Thought (CoT)**. By training the model to generate the reasoning steps *before* the final answer, it learns a more robust process for solving complex problems. The loss is calculated on the entire generated sequence (reasoning + answer).
+#### **Example Data**
+The key to teaching reasoning is the data format. Instead of just a question and a final answer, the target data includes the intermediate thinking steps. This is known as Chain of Thought (CoT).
+
+* **Input (Question):**
+    > `"If John has 5 apples and gives 2 to Mary, how many does he have left?"`
+
+* **Target (Chain of Thought + Answer):**
+    > `"[REASONING] John starts with 5 apples. He gives away 2 apples. To find out how many are left, we need to subtract the number of apples given away from the starting amount. The calculation is 5 - 2. [REASONING] 5 - 2 = 3. [ANSWER] The final answer is 3."`
+
+#### **Use Case Scenario**
+The goal is to solve problems that cannot be answered with a simple fact, but require logical, arithmetic, or commonsense steps.
+
+* **Multi-step Math Problems:** A user prompts the model with a classic word problem from a local perspective:
+    > `"A Caltrain leaves the San Jose Diridon station at 10:00 AM traveling north at 60 mph. A car leaves the same station at 11:00 AM, following the same route at 70 mph. At what time will the car catch up to the train?"`
+* **The LLM provides a step-by-step breakdown:** It first calculates the train's one-hour head start (60 miles). Then it finds the relative speed of the car (10 mph). Finally, it divides the distance by the relative speed to find the time taken (6 hours) and calculates the final time (5:00 PM).
+* **Other Uses:** Solving logic puzzles, debugging code by reasoning about the error, and planning complex strategies.
 
 #
+#### **How It Works:**
+Reasoning is not a feature that is explicitly programmed into LLMs. It is an **emergent capability** of very large models, significantly enhanced by a technique called Chain of Thought (CoT) fine-tuning.
+
+##### **What is an "Emergent Capability"?**
+An emergent capability is a behavior that appears in large models that was not present in smaller models. It arises spontaneously from the sheer scale of the model's parameters and training data. The simple task of "predicting the next token," when performed over trillions of words, leads to the model learning complex underlying patterns of logic and reasoning.
+
+##### **The Key Technique: Chain of Thought (CoT)**
+The core idea behind CoT is simple but powerful: **forcing the model to "show its work."**
+
+When a model tries to jump directly to a final answer for a complex problem, it's more likely to make a mistake. By fine-tuning the model to first generate the step-by-step reasoning and *then* the final answer, we teach it a more robust and reliable problem-solving process.
+
+##### **Architecture**
+Reasoning is an advanced sequential generation task, making it the domain of large **Decoder-Only models** like Google's Gemini, GPT-4, and Llama.
+
+##### **The Training Phase (CoT Fine-Tuning) ✍️**
+
+1.  **The Data:** The training data consists of pairs of `(Question, Full_CoT_Answer)`. This data is often meticulously created by humans to teach the model high-quality reasoning patterns.
+2.  **Input Formatting:** The question and the full target (reasoning + answer) are formatted into a single continuous sequence.
+3.  **Architecture & Loss Function:**
+    * The model is a standard **decoder-only** architecture using **Causal Masking**.
+    * The loss function is **Cross-Entropy Loss**, and this is the crucial part: the loss is calculated over the **ENTIRE target sequence**.
+    * This means the model is penalized not just for getting the final answer `3` wrong, but for getting any token in the reasoning steps (e.g., `"subtract"`, `"-"`, `"="`) wrong. This forces the model to learn the *process* of logical deduction, not just to memorize final answers.
+
+##### **The Inference Phase (Solving a New Problem) 🧠**
+
+1.  **The Prompt:** The user provides only the question (e.g., the train problem).
+2.  **The Generation Loop:** The model takes the question as its initial prompt and begins to generate the solution autoregressively.
+3.  **The Autoregressive Process:**
+    * Because the model has been trained to output reasoning first, the highest probability next tokens will naturally form the step-by-step thinking process. It doesn't jump to the answer because that's not the pattern it learned.
+    * It generates token by token (`predict -> sample -> append`), laying out its entire chain of thought before concluding with the final answer.
+    * For reasoning tasks, the sampling "temperature" is often set very low (close to 0) to make the output more deterministic and logically consistent.
+
+##### **A Note on Few-Shot CoT Prompting**
+For the most powerful models, you may not even need to fine-tune them. You can elicit reasoning behavior directly in the prompt by providing an example. This is called **few-shot prompting**.
+
+**Example:**
+```
+Q: If John has 5 apples and gives 2 to Mary, how many does he have left?
+A: John starts with 5 apples. He gives away 2. 5 - 2 = 3. The final answer is 3.
+
+Q: If a train leaves San Jose at 10:00 AM traveling at 60 mph... at what time will the car catch up?
+A: [The model will now generate the step-by-step reasoning because it follows the format of the example provided.]
+```
+---
 
 ## ![GenAI](../../badges/rag.svg)
 
