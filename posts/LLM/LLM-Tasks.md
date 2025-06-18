@@ -485,7 +485,7 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 4.  **Complete Answer:** The generation loop continues until the model produces a special end-of-sequence token or reaches a predefined length limit. The full sequence of generated tokens is the final answer.
 ---   
 
-## ![GenAI](../../badges/ner.svg)
+## ![GenAI](../../badges/ie.svg)
 
 #### **Example Data**
 
