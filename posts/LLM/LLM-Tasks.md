@@ -10,7 +10,7 @@ A single, powerful pre-trained Large Language Model is a versatile foundation th
 This tutorial provides a detailed breakdown of the most common and important tasks an LLM can perform, explaining for each: its goal, the data format for fine-tuning, a practical example, and the underlying mechanics.
 
 ***
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-1._Text_Generation_and_Completion:-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-1._Text_Generation_and_Completion:-green?style=for-the-badge&logo=github)](LLM-Tasks/TG)
 
 * **The Goal:** To produce creative, coherent, and contextually relevant text that continues from a given prompt. This is the most fundamental autoregressive task and includes applications like story writing, paraphrasing, and email completion.
 * **Architecture:** The quintessential task for Decoder-Only models (like the GPT series, Llama).
@@ -83,7 +83,7 @@ Text generation is a loop. Let's say we sampled the token for `"Your"`.
 
 ***
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-2._Dialogue_Generation_(Chatbot):-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-2._Dialogue_Generation_(Chatbot):-green?style=for-the-badge&logo=github)](LLM-Tasks/DG)
 
 
 This tutorial explains how to take a general-purpose LLM and fine-tune it to be an interactive, multi-turn conversational agent that can remember context and adopt a specific persona.
@@ -170,7 +170,7 @@ This is the most important part of a chatbot. The entire history is used to gene
 
 ***
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-3._Text_Classification:-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-3._Text_Classification:-green?style=for-the-badge&logo=github)](LLM-Tasks/TextCls)
 
 Use an LLM to perform text classification—the task of assigning a predefined category (like `Positive`, `Negative`, `Spam`, or `Legal`) to a piece of text. We will cover the two primary architectural approaches.
 
@@ -240,7 +240,7 @@ This modern approach cleverly reframes classification as a text generation task.
 
 ***
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-4._Natural_Language_Inference_(NLI):-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-4._Natural_Language_Inference_(NLI):-green?style=for-the-badge&logo=github)](LLM-Tasks/NLI)
 
 Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
 
@@ -336,10 +336,10 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **Prompt Engineering:** You would need to create a detailed prompt that instructs the model on what to do.
     ```
     Based on the Premise, determine if the Hypothesis is an entailment, contradiction, or neutral.
-
+    
     Premise: A man in a blue shirt is riding a horse through a field.
     Hypothesis: A person is outdoors.
-
+    
     The logical relationship is:
     ```
 * **Inference:** The model would then generate the next token. A well-instructed model would produce the word "Entailment".
@@ -349,7 +349,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **Cons:** The left-to-right nature is fundamentally less suited for direct comparison than an encoder's bi-directional view. It can be less efficient and potentially less robust than a fine-tuned encoder specifically optimized for the NLI task.
 
 ***
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-5._Question_Answering_(Q&A):-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-5._Question_Answering_(Q&A):-green?style=for-the-badge&logo=github)](LLM-Tasks/QA)
 
 #### 5a. Extractive Question Answering
 
@@ -491,9 +491,9 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 3.  **The Loop:** At each step, the model predicts the probabilities for the next token using its **linear layer** and a **softmax** function. A token is chosen via a **sampling strategy** (like Top-p). This new token is appended to the sequence, and the process repeats.
 4.  **Complete Answer:** The generation loop continues until the model produces a special end-of-sequence token or reaches a predefined length limit. The full sequence of generated tokens is the final answer.
 
----   
+---
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-6._Information_Extraction,_Named_Entity_Recognition_(NER):-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-6._Information_Extraction,_Named_Entity_Recognition_(NER):-green?style=for-the-badge&logo=github)](LLM-Tasks/NER)
 
 ##### **Example Data**
 
@@ -555,7 +555,7 @@ An encoder model sees the entire sentence at once, allowing it to use both past 
 
 ***
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-7._Summarization:-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-7._Summarization:-green?style=for-the-badge&logo=github)](LLM-Tasks/Summarize)
 
 ##### **Example Data**
 The data consists of pairs of long documents and their corresponding shorter, human-written summaries.
@@ -611,9 +611,9 @@ Through massive scale and instruction fine-tuning, these models learn to recogni
 1.  **Input Formatting:** The article and summary are concatenated into a single sequence using a prompt template.
     ```
     Summarize the following article:
-
+    
     <text of the long news article>
-
+    
     Summary:
     <text of the short summary>
     ```
@@ -697,7 +697,7 @@ For these models, you may not need a complex chunking strategy at all. You might
 
 ***
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-8._Machine_Translation:-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-8._Machine_Translation:-green?style=for-the-badge&logo=github)](LLM-Tasks/MT)
 
 ##### **Example Data**
 The data consists of parallel sentences: the same sentence in a source language and its human-written translation in a target language.
@@ -749,9 +749,9 @@ Through extensive fine-tuning, these models learn the pattern of translation fro
 1.  **Input Formatting:** The source and target sentences are concatenated into a single sequence using a prompt template.
     ```
     Translate the following English text to French:
-
+    
     The nearest Caltrain station is Diridon Station.
-
+    
     French translation:
     La gare Caltrain la plus proche est la gare Diridon.
     ```
@@ -771,10 +771,10 @@ Through extensive fine-tuning, these models learn the pattern of translation fro
 1.  The new English sentence is placed into the prompt template, stopping right after `"French translation:"`.
 2.  This entire text is fed to the model as a prefix.
 3.  The model generates the translation autoregressively, token by token, until it completes the sentence and outputs an end-of-sequence token.
-   
+
 ---
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-9._Code_Generation:-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-9._Code_Generation:-green?style=for-the-badge&logo=github)](LLM-Tasks/CG)
 
 ##### **Example Data**
 The data for fine-tuning a code generation model consists of pairs of natural language instructions (often in comments or docstrings) and their corresponding code implementations.
@@ -841,7 +841,7 @@ The core insight behind code generation is that **code is just a highly structur
 
 ---
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-10._Reasoning:-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-10._Reasoning:-green?style=for-the-badge&logo=github)](LLM-Tasks/Reasoning)
 
 ##### **Example Data**
 The key to teaching reasoning is the data format. Instead of just a question and a final answer, the target data includes the intermediate thinking steps. This is known as Chain of Thought (CoT).
@@ -909,7 +909,7 @@ Of course. Here is a comprehensive mini-tutorial on Sentence-Transformers that s
 
 ***
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-11._Semantic_Embeddings_with_Sentence_Transformers-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-11._Semantic_Embeddings_with_Sentence_Transformers-green?style=for-the-badge&logo=github)](LLM-Tasks/SemanticEmbedding)
 
 A standard transformer model like BERT is excellent at understanding words in context (token-level embeddings), but it is not inherently designed to create a single, meaningful vector for an entire sentence that can be easily compared with others. Sentence-Transformers solve this problem by fine-tuning these models to produce high-quality, sentence-level embeddings.
 
@@ -981,7 +981,7 @@ Once fine-tuned, using the model is simple and fast:
 3.  **Output:** A single, fixed-size vector embedding that captures the sentence's meaning, ready to be used for search, clustering, or other downstream tasks.
 ***
 
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-12._Retrieval_Augmented_Generation_(Rag):-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-12._Retrieval_Augmented_Generation_(Rag):-green?style=for-the-badge&logo=github)](LLM-Tasks/RAG)
 
 The core idea behind RAG is to solve a major weakness of LLMs: they can only answer based on the data they were trained on, which might be outdated or not include private information. RAG gives the LLM an "open book" to use when answering a question, ensuring the response is timely, accurate, and grounded in specific facts. It transforms a "closed-book" memory test into an "open-book" reasoning test.
 
@@ -1035,19 +1035,19 @@ This happens every time a user asks a question.
 4.  **Augment the Prompt:** A new, detailed prompt is constructed for the generative LLM, combining the retrieved context with the original user question.
     ```bash
     Prompt Template:
-
+    
     "Using ONLY the following context, please answer the user's question. If the answer is not in the context, say you don't know.
-
+    
     Context:
     <Retrieved Chunk 1 text>
     <Retrieved Chunk 2 text>
-
+    
     Question:
     <Original User Question>"
     ```
-5.  **Generate the Answer:** This augmented prompt is sent to a powerful generative LLM (like Gemini). The LLM synthesizes a final answer based *only* on the provided information. This is the **GENERATION** step.#
+5.  **Generate the Answer:** This augmented prompt is sent to a powerful generative LLM (like Gemini). The LLM synthesizes a final answer based *only* on the provided information. This is the **GENERATION** step.
 ***
-## ![GenAI](https://img.shields.io/badge/LLM_Tasks-13._Vision_Language_Models_(VLM):-green?style=for-the-badge&logo=github)
+## [![GenAI](https://img.shields.io/badge/LLM_Tasks-13._Vision_Language_Models_(VLM):-green?style=for-the-badge&logo=github)](LLM-Tasks/VLM)
 
 Standard Large Language Models (LLMs) are masters of text, but they are blind. Vision-Language Models represent a major evolution, giving models the ability to "see" and reason about the world through images, combining sophisticated visual perception with advanced language understanding.
 
