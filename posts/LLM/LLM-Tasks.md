@@ -84,7 +84,7 @@ Text generation is a loop. Let's say we sampled the token for `"Your"`.
 
 ***
 
-## 2. Dialogue Generation (Chatbots)
+## ![GenAI](../../badges/dialogue_generation.svg)
 
 This tutorial explains how to take a general-purpose LLM and fine-tune it to be an interactive, multi-turn conversational agent that can remember context and adopt a specific persona.
 #
@@ -167,7 +167,8 @@ This is the most important part of a chatbot. The entire history is used to gene
 
 ***
 
-## 3. Text Classification
+## ![GenAI](../../badges/text_classification.svg)
+
 Use an LLM to perform text classification—the task of assigning a predefined category (like `Positive`, `Negative`, `Spam`, or `Legal`) to a piece of text. We will cover the two primary architectural approaches.
 #
 
@@ -235,7 +236,7 @@ This modern approach cleverly reframes classification as a text generation task.
 
 ***
 
-## 4. Natural Language Inference (NLI)
+## ![GenAI](../../badges/nli.svg)
 Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
 #
 
@@ -343,7 +344,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **Cons:** The left-to-right nature is fundamentally less suited for direct comparison than an encoder's bi-directional view. It can be less efficient and potentially less robust than a fine-tuned encoder specifically optimized for the NLI task.
 
 ***
-## 5. Question Answering (QA)
+## ![GenAI](../../badges/qa.svg)
 
 ### 5a. Extractive Question Answering
 
@@ -484,7 +485,7 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 4.  **Complete Answer:** The generation loop continues until the model produces a special end-of-sequence token or reaches a predefined length limit. The full sequence of generated tokens is the final answer.
 ---   
 
-## 6. Information Extraction (Named Entity Recognition - NER)
+## ![GenAI](../../badges/ner.svg)
 
 #### **Example Data**
 
@@ -546,7 +547,7 @@ An encoder model sees the entire sentence at once, allowing it to use both past 
 
 ***
 
-## 7. Text Summarization
+## ![GenAI](../../badges/sum.svg)
 
 #### **Example Data**
 The data consists of pairs of long documents and their corresponding shorter, human-written summaries.
@@ -621,7 +622,7 @@ Through massive scale and instruction fine-tuning, these models learn to recogni
 3.  It begins generating the text that should follow, effectively writing the summary one token at a time using the standard autoregressive loop (`predict -> sample -> append`).
 ***
 
-## 8. Machine Translation
+## ![GenAI](../../badges/mt.svg)
 
 * **The Goal:** To translate a sequence of text from a source language to a target language.
 * **Data Format:** Parallel sentences or documents.
@@ -635,7 +636,7 @@ Through massive scale and instruction fine-tuning, these models learn to recogni
 
 ---
 
-## 9. Code-Related Tasks
+## ![GenAI](../../badges/code.svg)
 
 * **The Goal:** To generate, complete, document, or translate code.
 * **Data Format (for generation):** A natural language description paired with the corresponding code.
@@ -660,7 +661,7 @@ Through massive scale and instruction fine-tuning, these models learn to recogni
 
 ---
 
-## 10. Reasoning Tasks
+## ![GenAI](../../badges/reason.svg)
 
 * **The Goal:** To solve problems that require logical, arithmetic, or commonsense steps.
 * **Data Format (for Chain-of-Thought fine-tuning):** The data includes the intermediate reasoning steps.
@@ -673,7 +674,7 @@ Through massive scale and instruction fine-tuning, these models learn to recogni
 
 #
 
-## 11. Retrieval-Augmented Generation (RAG)
+## ![GenAI](../../badges/rag.svg)
 
 * **The Goal:** To ground the LLM's responses in external, verifiable knowledge, reducing hallucinations and allowing it to use up-to-date or private information.
 * **Data Format:** This is not a fine-tuning task but an **inference-time architecture**.
@@ -688,7 +689,7 @@ Through massive scale and instruction fine-tuning, these models learn to recogni
 
 #
 
-## 12. Multimodal Tasks
+## ![GenAI](../../badges/multimodal.svg)
 
 * **The Goal:** To understand and generate content that involves more than one modality, typically text and images.
 * **Data Format:** The data consists of pairs of images and corresponding text.
