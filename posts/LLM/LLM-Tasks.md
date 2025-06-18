@@ -167,7 +167,7 @@ This is the most important part of a chatbot. The entire history is used to gene
 
 ***
 
-## ![GenAI](../../badges/text_classification.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-3._Text_Classification:-green?style=for-the-badge&logo=github)
 
 Use an LLM to perform text classification—the task of assigning a predefined category (like `Positive`, `Negative`, `Spam`, or `Legal`) to a piece of text. We will cover the two primary architectural approaches.
 #
@@ -236,7 +236,8 @@ This modern approach cleverly reframes classification as a text generation task.
 
 ***
 
-## ![GenAI](../../badges/nli.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-4._Natural_Language_Inference:-green?style=for-the-badge&logo=github)
+
 Natural Language Inference (NLI), breaking down the concepts, architecture, and processes in greater detail.
 #
 
@@ -344,7 +345,7 @@ While encoders are the specialized tool, a powerful decoder-only model like GPT-
 * **Cons:** The left-to-right nature is fundamentally less suited for direct comparison than an encoder's bi-directional view. It can be less efficient and potentially less robust than a fine-tuned encoder specifically optimized for the NLI task.
 
 ***
-## ![GenAI](../../badges/qa.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-5._Question_Answering:-green?style=for-the-badge&logo=github)
 
 ### 5a. Extractive Question Answering
 
@@ -486,7 +487,7 @@ The task is not to *find* an answer, but to *create* one. This requires generati
 
 ---   
 
-## ![GenAI](../../badges/ie.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-6._Information_Extraction_(Named_Entity_Recognition_-_NER):-green?style=for-the-badge&logo=github)
 
 #### **Example Data**
 
@@ -548,7 +549,7 @@ An encoder model sees the entire sentence at once, allowing it to use both past 
 
 ***
 
-## ![GenAI](../../badges/sum.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-7._Summarization:-green?style=for-the-badge&logo=github)
 
 #### **Example Data**
 The data consists of pairs of long documents and their corresponding shorter, human-written summaries.
@@ -693,7 +694,7 @@ For these models, you may not need a complex chunking strategy at all. You might
 
 ***
 
-## ![GenAI](../../badges/mt.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-8._Machine_Translation:-green?style=for-the-badge&logo=github)
 
 #### **Example Data**
 The data consists of parallel sentences: the same sentence in a source language and its human-written translation in a target language.
@@ -769,7 +770,7 @@ Through extensive fine-tuning, these models learn the pattern of translation fro
    
 ---
 
-## ![GenAI](../../badges/code.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-9._Code_Generation:-green?style=for-the-badge&logo=github)
 
 ### Code Generation
 
@@ -839,7 +840,7 @@ The core insight behind code generation is that **code is just a highly structur
 
 ---
 
-## ![GenAI](../../badges/reason.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-10._Reasoning:-green?style=for-the-badge&logo=github)
 
 #### **Example Data**
 The key to teaching reasoning is the data format. Instead of just a question and a final answer, the target data includes the intermediate thinking steps. This is known as Chain of Thought (CoT).
@@ -907,7 +908,7 @@ Of course. Here is a comprehensive mini-tutorial on Sentence-Transformers that s
 
 ***
 
-## ![GenAI](../../badges/embedding.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-11._Semantic_Embeddings_with_Sentence_Transformers-green?style=for-the-badge&logo=github)
 
 A standard transformer model like BERT is excellent at understanding words in context (token-level embeddings), but it is not inherently designed to create a single, meaningful vector for an entire sentence that can be easily compared with others. Sentence-Transformers solve this problem by fine-tuning these models to produce high-quality, sentence-level embeddings.
 
@@ -977,13 +978,7 @@ Once fine-tuned, using the model is simple and fast:
 3.  **Output:** A single, fixed-size vector embedding that captures the sentence's meaning, ready to be used for search, clustering, or other downstream tasks.
 ***
 
-## ![GenAI](../../badges/rag.svg)
-
-Of course. Here is an updated and expanded tutorial on Retrieval-Augmented Generation (RAG) that includes details on indexing/clustering systems like FAISS and clarifies how the original text is retrieved from embeddings.
-
-***
-
-### Retrieval-Augmented Generation (RAG)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-12._Retrieval_Augmented_Generation_(Rag):-green?style=for-the-badge&logo=github)
 
 The core idea behind RAG is to solve a major weakness of LLMs: they can only answer based on the data they were trained on, which might be outdated or not include private information. RAG gives the LLM an "open book" to use when answering a question, ensuring the response is timely, accurate, and grounded in specific facts. It transforms a "closed-book" memory test into an "open-book" reasoning test.
 
@@ -1049,7 +1044,7 @@ This happens every time a user asks a question.
     ```
 5.  **Generate the Answer:** This augmented prompt is sent to a powerful generative LLM (like Gemini). The LLM synthesizes a final answer based *only* on the provided information. This is the **GENERATION** step.#
 ***
-## ![GenAI](../../badges/multimodal.svg)
+## ![GenAI](https://img.shields.io/badge/LLM_Tasks-13._Multi_Modal_Task:-green?style=for-the-badge&logo=github)
 
 * **The Goal:** To understand and generate content that involves more than one modality, typically text and images.
 * **Data Format:** The data consists of pairs of images and corresponding text.
