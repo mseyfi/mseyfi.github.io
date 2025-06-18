@@ -78,8 +78,14 @@ notable text-to-image generation models along with their corresponding research 
  <p></p>
 </div>
 
-## ![LLM](https://img.shields.io/badge/LLM%20Tutorials-8A2BE2?style=for-the-badge&logo=github?logoSize=100)
- 
+
+## [![LLM](https://img.shields.io/badge/LLM%20Tutorials-Sample_LLM_Tasks-blue?style=for-the-badge&logo=github)](../posts/LLM/LLM-Tasks)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+A single, powerful pre-trained Large Language Model is a versatile foundation that can be adapted—or "fine-tuned"—to excel at a wide array of specific tasks. The key to this versatility lies in how we frame the task and format the data.
+
+This tutorial provides a detailed breakdown of the most common and important tasks an LLM can perform, explaining for each: its goal, the data format for fine-tuning, a practical example, and the underlying mechanics.
+<p></p>
+</div>
 
 ## [![LORA](https://img.shields.io/badge/LORA-Low_Rank_Adaptation-blue?style=for-the-badge&logo=github)](../posts/LLM/LORA)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
@@ -101,8 +107,6 @@ This tutorial provides a detailed breakdown of the most common and important tas
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Even with highly optimized systems, the process of generating text from Large Language Models (LLMs) faces a final, stubborn bottleneck: <b>sequential decoding</b>. Generating one token requires a full, time-consuming forward pass through the model. Because this must be done one token at a time, the overall speed is limited by memory latency.
 </div>
-
-
 
 ## [![FlashAttention](https://img.shields.io/badge/FLASHATTENTION-Fast_and_Memory_Efficient_Exact_Attention_with_IO_Awareness-blue?style=for-the-badge&logo=github)](../posts/LLM/FlashAttention)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
