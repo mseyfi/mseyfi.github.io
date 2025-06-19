@@ -1,9 +1,9 @@
-Of course. Fine-tuning is the process of taking a powerful, pre-trained Large Language Model (LLM) that has general knowledge about the world and adapting it to perform a specific task or to behave in a particular way.1
+[![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](../../../)
+
+## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](../../../main_page/GenAI)
 
 
-
-Here is a tutorial-style guide to the different ways LLMs are fine-tuned, from the most resource-intensive to the most efficient.
-
+# Fine-Tuning Large Language Models
 ------
 
 ### 1. Full Fine-Tuning
