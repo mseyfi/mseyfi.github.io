@@ -89,12 +89,16 @@ During training, the ground-truth `response_text` is appended to this template. 
     2.  At each position `t`, it outputs a vector of **logits**, representing a score for every possible token in the vocabulary.
     3.  A `softmax` function is applied to these logits to get a probability distribution, $P(x_t)$, over the vocabulary for the next token.
     4.  The standard **Cross-Entropy Loss** for a single token is the negative log-probability of the true next token, $y_t$.
-        $$L_t = -\log P(y_t)$$
+    
+    $$L_t = -\log P(y_t)$$
+    
     5.  **The Masking:** We create a "loss mask" — a list of 1s and 0s. The mask value is `0` for all tokens in the `Instruction` and prompt template sections, and `1` for all tokens in the `Response` section.
     6.  The final loss for the entire sequence is the sum of the per-token losses, multiplied by the mask. This effectively zeroes out the loss for the instruction part.
 
     Mathematically, for a single training sequence with `T` tokens and a loss mask `m`, the total loss `L` is:
-    $$L = \sum_{t=1}^{T} m_t \cdot (-\log P(y_t))$$
+
+  $$L = \sum_{t=1}^{T} m_t \cdot (-\log P(y_t))$$
+
     Where $m_t = 0$ if token `t` is part of the instruction, and $m_t = 1$ if it's part of the response. This forces the model to focus all of its learning "effort" on generating the correct response.
 
 #### 4. Sample Code (Conceptual Hugging Face TRL)
