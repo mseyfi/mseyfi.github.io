@@ -25,7 +25,7 @@ Fine-tuning Large Language Models (LLMs) can be approached in several ways, each
 
 Only a **small subset** of parameters are updated. Popular PEFT methods include:
 
-## [![adaptor](https://img.shields.io/badge/Adaptor_Tuning_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Adaptor-FineTuning)
+## [![adaptor](https://img.shields.io/badge/Adaptor_Tuning_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Adaptor-Finetuning)
 
 * Inject **adapter modules** (small bottleneck layers) between transformer layers.
 * Only adapters are trained.
