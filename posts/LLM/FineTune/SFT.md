@@ -4,7 +4,7 @@
 ## [![GenAI](https://img.shields.io/badge/FineTuning-Comprehensive_Tutorial_on_Finetuning_LLMs-orange?style=for-the-badge&logo=github)](../../FineTuning)
 
 # Instruction Tuning/ Supervised Fine-Tuning (SFT)
-Examples: FLAN-T5, Alpaca, OpenAssistant, etc.
+**Examples: FLAN-T5, Alpaca, OpenAssistant, etc.**
 
 
 A base Large Language Model (LLM), pre-trained on the vastness of the internet, is an incredible text completion engine. If you give it the prompt "The first person to walk on the moon was," it will expertly complete it with "Neil Armstrong."
