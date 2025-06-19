@@ -40,62 +40,15 @@ This is the original and most straightforward approach to fine-tuning. It's anal
 ------
 
 ## [![SFT](https://img.shields.io/badge/SFT-Instruction_Fine_Tuning(SFT)-blue?style=for-the-badge&logo=github)](FineTuning/SFT)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+This is a specific <b>application</b> of fine-tuning aimed at changing a model's behavior from simply completing text to following instructions and acting as a helpful assistant. This is the key process that turns a base model into a chatbot like ChatGPT or Gemini.
+<p></p>
+</div>
 
-This is a specific *application* of fine-tuning aimed at changing a model's behavior from simply completing text to following instructions and acting as a helpful assistant.7 This is the key process that turns a base model into a chatbot like ChatGPT or Gemini.
-
-
-
-- **The Goal:** To teach a model to be a conversational, instruction-following assistant.
-
-- How It Works:
-
-   The model is fine-tuned on a high-quality, curated dataset of 
-
-  ```
-  (instruction, response)
-  ```
-
-   pairs. 
-
-  The "instruction" can be a question, a command, or any prompt, and the "response" is the ideal answer a human would write.8
-
-  - Example Pair:
-
-    - **Instruction:** `"Explain the concept of photosynthesis in simple terms."`
-
-    - Response:
-
-       
-
-      ```
-      "Photosynthesis is the process plants use to turn sunlight, water, and carbon dioxide into their food (sugar), releasing oxygen as a byproduct..."
-      ```
-
-      9
-
-- What is Trained:
-
-  This can be done via 
-
-  Full Fine-Tuning
-
-   (updating all weights) or, more commonly now, with an efficient method like 
-
-  LoRA
-
-  .10
-
-- **Pros:** The essential step for creating useful, interactive AI assistants.
-
-- Cons:
-
-  Success is highly dependent on the quality and diversity of the instruction dataset, which can be expensive to create.11
-
-------
 
 ### 3. Parameter-Efficient Fine-Tuning (PEFT)
 
-PEFT is a family of techniques born from the question: "Why update billions of parameters when you can get almost the same result by updating just a tiny fraction?" The core idea is to **freeze the massive pre-trained model** and only train a small number of new, added parameters.12 This is like adding small, lightweight attachments to a large, powerful engine instead of rebuilding the engine itself.
+PEFT is a family of techniques born from the question: "Why update billions of parameters when you can get almost the same result by updating just a tiny fraction?" The core idea is to **freeze the massive pre-trained model** and only train a small number of new, added parameters. This is like adding small, lightweight attachments to a large, powerful engine instead of rebuilding the engine itself.
 
 
 
