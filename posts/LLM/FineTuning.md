@@ -39,7 +39,7 @@ This is the original and most straightforward approach to fine-tuning. It's anal
 
 ------
 
-### 2. Instruction Fine-Tuning (SFT)
+## [![SFT](https://img.shields.io/badge/SFT-Instruction_Fine_Tuning(SFT)-blue?style=for-the-badge&logo=github)](FineTuning/SFT)
 
 This is a specific *application* of fine-tuning aimed at changing a model's behavior from simply completing text to following instructions and acting as a helpful assistant.7 This is the key process that turns a base model into a chatbot like ChatGPT or Gemini.
 
@@ -99,7 +99,8 @@ PEFT is a family of techniques born from the question: "Why update billions of p
 
 
 
-#### a. LoRA (Low-Rank Adaptation)13
+## [![Lora](https://img.shields.io/badge/LORA-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/LORA)
+
 
 This is currently the most popular and widely used PEFT method. It's like adding tiny, editable "sticky notes" to the model's brain.
 
@@ -129,7 +130,7 @@ This is currently the most popular and widely used PEFT method. It's like adding
 
    May slightly underperform full fine-tuning on very complex, domain-shifting tasks.18
 
-#### b. Prompt Tuning / Prefix Tuning
+## [![prmt](https://img.shields.io/badge/Prompt_Tunint-Prompt_Tuning/Prefix_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/Prompt)
 
 This is another PEFT method that takes a different approach. Instead of modifying the model, it modifies the input.
 
@@ -151,7 +152,7 @@ This is another PEFT method that takes a different approach. Instead of modifyin
 
 ------
 
-### 4. Reinforcement Learning from Human Feedback (RLHF)
+## [![RLHF](https://img.shields.io/badge/RLHHF-Reinforcement_Learning_from_Human_Feedback-blue?style=for-the-badge&logo=github)](FineTuning/RLHF)
 
 RLHF is an advanced fine-tuning stage that comes *after* Instruction Fine-Tuning.20 Its goal is not to teach the model new knowledge, but to align its behavior with complex human values like helpfulness, harmlessness, and honesty.
 
