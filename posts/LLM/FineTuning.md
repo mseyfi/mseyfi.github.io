@@ -5,45 +5,133 @@
 # Fine-Tuning Large Language Models
 ------
 
-### 1. Full Fine-Tuning
 
-This is the original and most straightforward approach to fine-tuning. It's analogous to re-enrolling a brilliant PhD graduate in a new, specialized degree program to give them deep domain expertise.
 
-- The Goal:
+Fine-tuning Large Language Models (LLMs) can be approached in several ways, each balancing compute, memory, data efficiency, and performance. The major categories are:
 
-   To adapt all of the model's knowledge to a new, specific domain or task (e.g., training a general LLM purely on medical textbooks to create a medical expert model).2
+---
 
-- How It Works:
+## 🔧 **1. Full Fine-Tuning**
 
-   The process is a continuation of the original pre-training.3
+* **What it is**: Update **all parameters** of the model using backpropagation on task-specific data.
+* **Use case**: When you have **a lot of labeled data** and **enough compute** (e.g., cloud TPU/GPU clusters).
+* **Pros**: Best performance; full model adapts.
+* **Cons**: Extremely resource-intensive (memory, compute, storage).
+* **Example**: Fine-tuning GPT-2 or BERT on a specific domain corpus.
 
-  You take the entire pre-trained model and train it further on a new, specific dataset.4
+---
 
-   The backpropagation algorithm updates every single weight in the model based on the new data.
+## 🧠 **2. Parameter-Efficient Fine-Tuning (PEFT)**
 
-- **What is Trained:** 100% of the model's parameters.
+Only a **small subset** of parameters are updated. Popular PEFT methods include:
 
-- Pros:
+## [![adaptor](https://img.shields.io/badge/Adaptor_Tuning_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Adaptor)
 
-  - Can achieve the highest possible performance on the specific target task because the entire model is adapted.5
+* Inject **adapter modules** (small bottleneck layers) between transformer layers.
+* Only adapters are trained.
+* **Example**: [Houlsby et al. 2019 – "Parameter-efficient transfer learning for NLP"](https://arxiv.org/abs/1902.00751)
 
-- Cons:
+## [![Lora](https://img.shields.io/badge/LORA-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/LORA)
+This is currently the most popular and widely used PEFT method. It's like adding tiny, editable "sticky notes" to the model's brain.
+- **The Goal:** To achieve performance close to full fine-tuning while training less than 1% of the parameters.
 
-  - Extremely Expensive:
+* Decompose weight update into two low-rank matrices:
+  ΔW ≈ A·B where A ∈ ℝ^{d×r}, B ∈ ℝ^{r×k}, r ≪ d.
+* Inject into Q, K, V, or FFN layers.
+* **Minimal parameter update (\~0.1–1%)**, high performance.
+* **Widely used in open-source finetuning.**
+* **Example**: [LoRA (Hu et al. 2021)](https://arxiv.org/abs/2106.09685)
 
-     Requires a massive amount of memory (VRAM) and computational power, often needing multiple high-end GPUs.6
+---
 
-  - **Catastrophic Forgetting:** The model can forget some of its general capabilities from pre-training as it over-specializes on the new data.
+### c. **Prefix Tuning**
 
-  - **Storage Inefficient:** For every new task, you must store a complete, new copy of the multi-billion parameter model.
+* Prepend learnable "prefix vectors" to attention layers (not the input).
+* Doesn’t change model weights.
+* Efficient for long-context tasks.
 
-------
+### d. **P-Tuning v2**
+
+* Learn **soft prompt embeddings** (continuous vectors) fed into model’s input.
+* Can also involve updating a small MLP.
+
+---
+
+## 🧷 **3. Prompt Tuning / Soft Prompts**
+
+* Learn only a **small set of embedding vectors** (the "prompt") prepended to the input.
+* Can be:
+
+  * **Discrete** (crafted text)
+  * **Soft** (learned embeddings)
+* **No model weight change**, only optimize embeddings.
+* Good for low-resource tasks.
+* **Example**: [Lester et al. 2021 – "The Power of Scale for Parameter-Efficient Prompt Tuning"](https://arxiv.org/abs/2104.08691)
+
+---
 
 ## [![SFT](https://img.shields.io/badge/SFT-Instruction_Fine_Tuning(SFT)-blue?style=for-the-badge&logo=github)](FineTuning/SFT)
-<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-This is a specific <b>application</b> of fine-tuning aimed at changing a model's behavior from simply completing text to following instructions and acting as a helpful assistant. This is the key process that turns a base model into a chatbot like ChatGPT or Gemini.
-<p></p>
-</div>
+* Finetune on (instruction, response) pairs.
+* Trains LLMs to follow human-written instructions.
+* Often a precursor to RLHF.
+* **Example**: FLAN-T5, Alpaca, OpenAssistant, etc.  
+---
+
+## 🧑‍⚖️ **5. Reinforcement Learning with Human Feedback (RLHF)**
+
+* Three stages:
+
+  1. **SFT**: Train on instruction-following pairs.
+  2. **Reward model**: Trained to rank outputs.
+  3. **PPO**: Optimize model to maximize reward signal.
+* Used in **ChatGPT, Claude, Gemini, etc.**
+
+---
+
+## 💾 **6. Domain-Adaptive Pretraining (DAPT)**
+
+* Continue **unsupervised pretraining** on in-domain text.
+* No labels required.
+* Useful for **medical, legal, code** domains.
+
+---
+
+## 🌱 **7. Multi-Task Fine-Tuning**
+
+* Fine-tune on **multiple tasks simultaneously**.
+* Model generalizes better across domains and instructions.
+* Example: T5, FLAN.
+
+---
+
+## 🧬 **8. Quantized/Low-Precision Finetuning**
+
+* Combine LoRA or adapters with **quantized models** (e.g., 4-bit QLoRA).
+* Enables fine-tuning 65B+ models on consumer GPUs.
+* Example: **QLoRA**, **GPTQ + LoRA**.
+
+---
+
+## 🧱 Summary Table
+
+| Method                   | Params Updated   | Compute Cost | Memory   | Use Case                                |
+| ------------------------ | ---------------- | ------------ | -------- | --------------------------------------- |
+| Full Fine-Tuning         | All              | 🔥🔥🔥       | 🔥🔥🔥   | High-resource, high-accuracy            |
+| Adapter Tuning           | \~1–5%           | 🔥           | 🔥       | Modular fine-tuning                     |
+| LoRA                     | \~0.1–1%         | 💡           | 💡       | Most popular for cost-effective tuning  |
+| Prefix/Prompt Tuning     | \~0.01–1%        | 💡           | 💡       | Efficient for low-resource tasks        |
+| Instruction Tuning (SFT) | All or PEFT      | 🔥 or 💡     | 🔥 or 💡 | Aligns model to human instructions      |
+| RLHF                     | All (multi-step) | 🔥🔥🔥       | 🔥🔥🔥   | Chatbots, assistant models              |
+| DAPT                     | All              | 🔥           | 🔥       | In-domain generalization without labels |
+| Multi-task Finetuning    | All or PEFT      | 🔥 or 💡     | 🔥 or 💡 | Improves robustness across tasks        |
+| QLoRA                    | 0.1–1%, 4-bit    | 💡           | 💡       | Finetuning large models on single GPU   |
+
+
+
+
+
+
+
 
 
 ### 3. Parameter-Efficient Fine-Tuning (PEFT)
@@ -51,37 +139,6 @@ This is a specific <b>application</b> of fine-tuning aimed at changing a model's
 PEFT is a family of techniques born from the question: "Why update billions of parameters when you can get almost the same result by updating just a tiny fraction?" The core idea is to **freeze the massive pre-trained model** and only train a small number of new, added parameters. This is like adding small, lightweight attachments to a large, powerful engine instead of rebuilding the engine itself.
 
 
-
-## [![Lora](https://img.shields.io/badge/LORA-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/LORA)
-
-
-This is currently the most popular and widely used PEFT method. It's like adding tiny, editable "sticky notes" to the model's brain.
-
-- **The Goal:** To achieve performance close to full fine-tuning while training less than 1% of the parameters.
-
-- How It Works:
-
-   The Transformer architecture relies heavily on large matrix multiplications in its attention layers.14
-
-  LoRA hypothesizes that the "updates" to these matrices during fine-tuning have a low "intrinsic rank," meaning they can be represented by much smaller matrices.15
-
-  LoRA injects two small, trainable matrices into each attention layer.16
-
-   During training, only these tiny new matrices are updated, while the massive original weights remain frozen.
-
-- What is Trained:
-
-  Only the small adapter matrices (typically <1% of total parameters).17
-
-- Pros:
-
-  - Drastically reduces memory and compute requirements.
-  - Highly effective, often matching full fine-tuning performance.
-  - The result is a tiny "adapter" file (a few megabytes) instead of a full model copy, making it easy to have many task-specific adapters for one base model.
-
-- Cons:
-
-   May slightly underperform full fine-tuning on very complex, domain-shifting tasks.18
 
 ## [![prmt](https://img.shields.io/badge/Prompt_Tunint-Prompt_Tuning/Prefix_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/Prompt)
 
