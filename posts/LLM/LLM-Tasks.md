@@ -10,11 +10,11 @@ A single, powerful pre-trained Large Language Model is a versatile foundation th
 This tutorial provides a detailed breakdown of the most common and important tasks an LLM can perform, explaining for each: its goal, the data format for fine-tuning, a practical example, and the underlying mechanics.
 
 ***
-## [![GenAI](https://img.shields.io/badge/LLM_Tasks-1._Text_Generation_and_Completion-blue?style=for-the-badge&logo=github)](LLM-Tasks/TG)
-## [![GenAI](https://img.shields.io/badge/LLM_Tasks-2._Dialogue_Generation_(Chatbot)-blue?style=for-the-badge&logo=github)](LLM-Tasks/DG)
-## [![GenAI](https://img.shields.io/badge/LLM_Tasks-3._Text_Classification-blue?style=for-the-badge&logo=github)](LLM-Tasks/TextCls)
-## [![GenAI](https://img.shields.io/badge/LLM_Tasks-4._Natural_Language_Inference_(NLI)-blue?style=for-the-badge&logo=github)](LLM-Tasks/NLI)
-## [![GenAI](https://img.shields.io/badge/LLM_Tasks-5._Question_Answering_(Q&A)-blue?style=for-the-badge&logo=github)](LLM-Tasks/QA)
+[![GenAI](https://img.shields.io/badge/LLM_Tasks-1._Text_Generation_and_Completion-blue?style=for-the-badge&logo=github)](LLM-Tasks/TG)
+[![GenAI](https://img.shields.io/badge/LLM_Tasks-2._Dialogue_Generation_(Chatbot)-blue?style=for-the-badge&logo=github)](LLM-Tasks/DG)
+[![GenAI](https://img.shields.io/badge/LLM_Tasks-3._Text_Classification-blue?style=for-the-badge&logo=github)](LLM-Tasks/TextCls)
+[![GenAI](https://img.shields.io/badge/LLM_Tasks-4._Natural_Language_Inference_(NLI)-blue?style=for-the-badge&logo=github)](LLM-Tasks/NLI)
+[![GenAI](https://img.shields.io/badge/LLM_Tasks-5._Question_Answering_(Q&A)-blue?style=for-the-badge&logo=github)](LLM-Tasks/QA)
 ## [![GenAI](https://img.shields.io/badge/LLM_Tasks-6._Information_Extraction,_Named_Entity_Recognition_(NER)-blue?style=for-the-badge&logo=github)](LLM-Tasks/NER)
 ## [![GenAI](https://img.shields.io/badge/LLM_Tasks-7._Summarization-blue?style=for-the-badge&logo=github)](LLM-Tasks/Summarize)
 ## [![GenAI](https://img.shields.io/badge/LLM_Tasks-8._Machine_Translation-blue?style=for-the-badge&logo=github)](LLM-Tasks/MT)
