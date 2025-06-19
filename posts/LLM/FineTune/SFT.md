@@ -3,127 +3,120 @@
 ## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](../../../main_page/GenAI)
 ## [![GenAI](https://img.shields.io/badge/FineTuning-Comprehensive_Tutorial_on_Finetuning_LLMs-orange?style=for-the-badge&logo=github)](../../FineTuning)
 
-Instruction fine-tuning is the critical process that transforms a base Large Language Model (LLM)—a powerful but general text-completion engine—into a helpful, conversational AI assistant that can follow commands. It bridges the gap between the model's raw knowledge and the user's intent.
+# Instruction Tuning/ Supervised Fine-Tuning (SFT)
 
-Here is a full, detailed tutorial on the process.
+A base Large Language Model (LLM), pre-trained on the vastness of the internet, is an incredible text completion engine. If you give it the prompt "The first person to walk on the moon was," it will expertly complete it with "Neil Armstrong."
 
-***
+However, its core objective is just to predict the next logical word. If you ask it a direct question, `"Who was the first person to walk on the moon?"`, a base model might just continue the sentence with something like, `"and what did they say?"`. It doesn't inherently understand the *instructional intent* to have a question answered.
 
-### Full Tutorial: Instruction Fine-Tuning (SFT)
+**Instruction Fine-Tuning (SFT)** is the critical process that retrains a model on examples of commands and their desired responses. It teaches the model to shift its goal from simply "completing text" to "following instructions and being helpful," which is the key to creating modern AI assistants.
 
-A base LLM, pre-trained on terabytes of internet data, excels at pattern matching and completion. If you provide it the text "The capital of France is", it will almost certainly complete it with "Paris."
+#### **Example Data: The Foundation of SFT**
+The success of SFT depends on a high-quality, diverse dataset of instruction-response pairs that demonstrate the desired behaviors. The more varied the examples, the more versatile the resulting model will be.
 
-However, its core objective is just to predict the next logical word. If you ask it a direct question like, `"Please explain, what is the capital of France?"`, a base model might not understand the *instructional intent*. It might continue the sentence with another question, like `"and why is it famous?"`, because that's a plausible continuation of text it has seen online.
+* **Simple Q&A:**
+    * **Instruction:** `"What is the distance between the Earth and the Moon?"`
+    * **Response:** `"The average distance between the Earth and the Moon is about 238,855 miles (384,400 kilometers)."`
 
-**Instruction Fine-Tuning (SFT)** retrains the model on examples of instructions and their desired responses, teaching it to shift its goal from "completing text" to "following commands and being helpful."
+* **Summarization:**
+    * **Instruction:** `"Summarize this article: [long article text]"`
+    * **Response:** `"[short, coherent summary of the article]"`
+
+* **Creative Writing:**
+    * **Instruction:** `"Write a short poem about the city of San Jose from the perspective of a bird."`
+    * **Response:** `"From cypress spire, a grid below, where silicon valleys brightly glow..."`
+
+* **Code Generation:**
+    * **Instruction:** `"Write a Python function to calculate a factorial."`
+    * **Response:**
+        ```python
+        def factorial(n):
+            if n == 0:
+                return 1
+            else:
+                return n * factorial(n-1)
+        ```
+* **Information Extraction with Context:**
+    * **Instruction:** `"Based on the context provided, what are the main duties of a Data Scientist?"`
+    * **Context:** `"A Data Scientist analyzes complex data to help a company make better decisions. Key responsibilities include data mining, using machine learning to build predictive models, and visualizing data to communicate findings to stakeholders."`
+    * **Response:** `"A Data Scientist's main duties involve analyzing complex data, building predictive models using machine learning, and creating visualizations to present their findings."`
+
+#### **Use Case Scenario**
+The primary goal of SFT is to create a general-purpose, helpful assistant that can perform a wide variety of tasks based on user commands. The main application is in creating conversational AI and chatbots.
+
+* **A user wants to plan a trip:**
+    * **User Prompt:** `"Create a 3-day itinerary for a family trip to San Francisco, focusing on activities suitable for young children."`
+    * **Instruction-Tuned LLM Output:** The model understands the complex request (3-day plan, family focus, specific location) and generates a structured itinerary, perhaps including the Exploratorium, Golden Gate Park, and the California Academy of Sciences, complete with descriptions and logical flow.
 
 ---
 
-### 1. The Architecture
+### How It Works: A Detailed Breakdown
 
+#### 1. The Architecture
 The model at the heart of SFT is almost always a **Decoder-Only Transformer**. These models, like those in the GPT, Llama, and Gemini families, are inherently designed for sequential text generation, making them perfect for generating answers autoregressively.
 
 * **Core Mechanism:** The architecture consists of a stack of decoder blocks. Each block contains two primary sub-layers:
-    1.  **Masked Multi-Head Self-Attention:** This is the key. The "masked" or "causal" nature means that when predicting a token at a certain position, the model can only attend to (or "see") the tokens that came before it. This enforces a left-to-right generative process, which is exactly what we need to write out an answer.
+    1.  **Masked Multi-Head Self-Attention:** The "masked" or "causal" nature means that when predicting a token at a certain position, the model can only attend to (or "see") the tokens that came before it. This enforces a left-to-right generative process.
     2.  **Feed-Forward Neural Network:** A standard fully connected network that processes the output of the attention layer.
 
 SFT does not change this core architecture. Instead, it adapts the billions of numerical weights *within* these layers to favor generating helpful responses over generic text completions.
 
----
-
-### 2. The Data: The Foundation of SFT
-
-The success of instruction fine-tuning is almost entirely dependent on the quality, diversity, and scale of the fine-tuning dataset. The data consists of high-quality **instruction-response pairs**.
-
-#### Input-Output Training Pairs
-
-Each data point is a structured example demonstrating a desired behavior. While the content can be anything (code, poems, questions), it is typically formatted into a consistent template.
-
-**General Structure:**
-* **Instruction:** A clear, natural language command or question.
-* **Context (Optional):** Additional information the model might need to answer, such as a piece of text to summarize or a table to analyze.
-* **Response:** The ideal, high-quality answer that the model should learn to generate.
-
-**Example Data Point:**
-
-```json
-{
-  "instruction": "Based on the context provided, what are the main duties of a Data Scientist?",
-  "context": "A Data Scientist analyzes complex data to help a company make better decisions. Key responsibilities include data mining, using machine learning to build predictive models, and visualizing data to communicate findings to stakeholders.",
-  "response": "A Data Scientist's main duties involve analyzing complex data, building predictive models using machine learning, and creating visualizations to present their findings to business leaders."
-}
-```
-
-#### Data Preparation and Prompt Templates
-
-Before training, these structured data points are formatted into a single string using a **prompt template**. The model learns to recognize this template, which signals that it should behave in instruction-following mode.
+#### 2. The Data Preparation and Prompt Templates
+This is a critical step. Each `(instruction, response)` pair is formatted into a single string using a consistent **prompt template**. The model learns to recognize this template, which signals that it should behave in instruction-following mode.
 
 A popular template (used by models like Alpaca) looks like this:
 
 ```
-Below is an instruction that describes a task, paired with an input that provides further context. Write a response that appropriately completes the request.
+Below is an instruction that describes a task. Write a response that appropriately completes the request.
 
 ### Instruction:
-{instruction}
-
-### Input:
-{context}
+{instruction_text}
 
 ### Response:
-{response}
 ```
+During training, the ground-truth `response_text` is appended to this template. During inference, the template stops after `### Response:`, and the model generates the rest.
 
-The entire formatted string, including the labels like `### Instruction:`, becomes a single training example. This consistency is vital for the model to learn the pattern.
+#### 3. The Training Process
 
----
+* **Masking and Tokens:**
+    * **Special Tokens:** Modern models use special tokens to delineate roles, such as `<|user|>` and `<|assistant|>`, along with an end-of-sequence token (`<|eos|>`) to teach the model when to stop. These are built into the prompt template.
+    * **Causal Masking:** This is inherent to the decoder model and ensures it cannot "cheat" by looking ahead at the response tokens while predicting them.
 
-### 3. The Training Process
+* **The Loss Function (and its Mathematics):**
+    The goal is to teach the model to generate the `Response` *given* the `Instruction`. Therefore, we only care about the model's performance when it's generating the response part. This is achieved using a **Masked Cross-Entropy Loss**.
 
-#### Masking and Tokens
+    1.  The model processes the entire formatted sequence (`Instruction` + `Response`).
+    2.  At each position `t`, it outputs a vector of **logits**, representing a score for every possible token in the vocabulary.
+    3.  A `softmax` function is applied to these logits to get a probability distribution, $P(x_t)$, over the vocabulary for the next token.
+    4.  The standard **Cross-Entropy Loss** for a single token is the negative log-probability of the true next token, $y_t$.
+        $$L_t = -\log P(y_t)$$
+    5.  **The Masking:** We create a "loss mask" — a list of 1s and 0s. The mask value is `0` for all tokens in the `Instruction` and prompt template sections, and `1` for all tokens in the `Response` section.
+    6.  The final loss for the entire sequence is the sum of the per-token losses, multiplied by the mask. This effectively zeroes out the loss for the instruction part.
 
-* **Special Tokens:** Some models use special tokens to delineate parts of the prompt. For example, Llama 3 uses `"<|start_header_id|>user<|end_header_id|>"`, `"<|start_header_id|>assistant<|end_header_id|>"`. These are explicitly added to the template during data preparation. An `eos_token` (end-of-sequence) is also crucial to teach the model when to stop generating.
-* **Causal Masking:** As mentioned in the architecture, this is inherent to the decoder model. It ensures that the model cannot "cheat" by looking ahead at the response tokens when it is trying to predict them.
+    Mathematically, for a single training sequence with `T` tokens and a loss mask `m`, the total loss `L` is:
+    $$L = \sum_{t=1}^{T} m_t \cdot (-\log P(y_t))$$
+    Where $m_t = 0$ if token `t` is part of the instruction, and $m_t = 1$ if it's part of the response. This forces the model to focus all of its learning "effort" on generating the correct response.
 
-#### The Loss Function (and its Mathematics)
-
-The goal is to train the model to generate the `Response` part of the template. We do not need to train it to generate the `Instruction`, as that will be provided by the user during inference. This is achieved using a **Masked Cross-Entropy Loss**.
-
-Let's break it down:
-1.  The model processes the entire formatted sequence (`Instruction` + `Response`) token by token.
-2.  At each position `t`, it outputs a vector of **logits**, representing a score for every possible token in the vocabulary.
-3.  A `softmax` function is applied to these logits to get a probability distribution, $P(x_t)$, over the vocabulary for the next token.
-4.  The standard **Cross-Entropy Loss** for a single token is the negative log-probability of the true next token, $y_t$.
-    $$L_t = -\log P(y_t)$$
-5.  **The Masking:** We create a "loss mask" — a list of 1s and 0s. The mask value is `0` for all tokens in the `Instruction` and prompt template sections, and `1` for all tokens in the `Response` section.
-6.  The final loss for the entire sequence is the sum of the per-token losses, multiplied by the mask. This effectively zeroes out the loss for the instruction part.
-
-Mathematically, for a single training sequence with `T` tokens and a loss mask `m`, the total loss `L` is:
-$$L = \sum_{t=1}^{T} m_t \cdot (-\log P(y_t))$$
-Where $m_t = 0$ if token `t` is part of the instruction, and $m_t = 1$ if it's part of the response.
-
-This elegant technique forces the model to focus all of its learning "effort" on generating the correct response.
-
----
-
-### 4. Sample Code (Conceptual Hugging Face TRL)
-
-Training is often done with libraries like Hugging Face's `transformers` and `TRL` (Transformer Reinforcement Learning), using a `SFTTrainer`. The process is highly automated.
+#### 4. Sample Code (Conceptual Hugging Face TRL)
+Training is often done with libraries like Hugging Face's `transformers` and `TRL` (Transformer Reinforcement Learning), using a `SFTTrainer`.
 
 ```python
 # Conceptual Code for SFT
 from transformers import AutoTokenizer, AutoModelForCausalLM, TrainingArguments
 from peft import LoraConfig
 from trl import SFTTrainer
+from datasets import load_dataset
 
 # 1. Load a base model and tokenizer
 model_name = "meta-llama/Llama-3-8B"
 model = AutoModelForCausalLM.from_pretrained(model_name)
 tokenizer = AutoTokenizer.from_pretrained(model_name)
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
 
 # 2. Load and format the instruction dataset
-# dataset is a Hugging Face Dataset object with 'instruction', 'context', 'response' columns
-# formatting_function applies the prompt template to each example
-dataset = load_dataset("your_instruction_dataset.json")
+# This assumes your dataset has a 'text' column where each entry is a fully formatted prompt.
+dataset = load_dataset("your_instruction_dataset.json", split="train")
 
 # 3. Configure PEFT method (e.g., LoRA) for efficient training
 peft_config = LoraConfig(
@@ -145,16 +138,15 @@ training_args = TrainingArguments(
 )
 
 # 5. Initialize the Trainer
-# The SFTTrainer automatically handles data formatting and the masked loss function.
-# It masks out the instruction part of the prompt by default.
+# The SFTTrainer automatically handles the masked loss function for you.
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
     args=training_args,
     train_dataset=dataset,
     peft_config=peft_config,
-    max_seq_length=2048, # The length of the formatted prompt
-    # formatting_func=formatting_function # A function to apply the template
+    max_seq_length=2048,
+    dataset_text_field="text", # The column in your dataset with the formatted prompt
 )
 
 # 6. Start Training
@@ -164,19 +156,15 @@ trainer.train()
 trainer.save_model("./final_adapter")
 ```
 
----
-
-### 5. Inference
-
+#### 5. Inference
 After fine-tuning, you use the model by formatting your new instruction with the *exact same template*, leaving the response section empty.
 
 ```python
 from transformers import pipeline
 
 # Load the base model and merge the LoRA adapter
-# (Hugging Face handles this automatically when loading from a saved adapter)
 model_path = "./final_adapter"
-pipe = pipeline("text-generation", model=model_path)
+pipe = pipeline("text-generation", model=model_path, tokenizer=tokenizer)
 
 # Create the prompt using the template
 prompt_template = """Below is an instruction that describes a task. Write a response that appropriately completes the request.
@@ -191,7 +179,6 @@ What are the main attractions in downtown San Jose, California?
 result = pipe(prompt_template, max_new_tokens=250)
 print(result[0]['generated_text'])
 ```
-The model, recognizing the pattern, will then autoregressively generate a helpful response to complete the prompt.
 
 ---
 
