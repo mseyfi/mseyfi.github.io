@@ -25,11 +25,10 @@ Fine-tuning Large Language Models (LLMs) can be approached in several ways, each
 
 Only a **small subset** of parameters are updated. Popular PEFT methods include:
 
-## [![adaptor](https://img.shields.io/badge/Adaptor_Tuning_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Adaptor-Finetuning)
+## [![adaptor](https://img.shields.io/badge/Adaptor_Tuning-Adapter_based_Fine_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/Adaptor-Finetuning)
 
 * Inject **adapter modules** (small bottleneck layers) between transformer layers.
 * Only adapters are trained.
-* **Example**: [Houlsby et al. 2019 – "Parameter-efficient transfer learning for NLP"](https://arxiv.org/abs/1902.00751)
 
 ## [![Lora](https://img.shields.io/badge/LORA-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/LORA)
 This is currently the most popular and widely used PEFT method. It's like adding tiny, editable "sticky notes" to the model's brain.
