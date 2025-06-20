@@ -7,7 +7,7 @@
 
 Prefix-Tuning was a powerful idea: steer a frozen LLM by learning continuous "virtual tokens" that are prepended to the keys and values in every attention layer. However, it had some challenges. The training could sometimes be unstable, and its performance wasn't always as strong as full fine-tuning on harder, smaller-scale datasets.
 
-**Prompt Tuning** was developed to address these issues. It adopts the core concept of using continuous prompts at every layer but implements it in a more robust and "deeper" way.
+**Prompt Tuning** was developed to address these issues. It adopts the core concept of using continuous prompts at the input layer.
 
 #### **Example & Intuition**
 
