@@ -42,7 +42,7 @@ This is currently the most popular and widely used PEFT method. It's like adding
 
 ---
 
-## [![Lora](https://img.shields.io/badge/Prefix_Tuning-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Prefix-Finetuning)
+## [![Lora](https://img.shields.io/badge/Prefix_Tuning-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Prefix-Tuning)
 
 * Prepend learnable "prefix vectors" to attention layers (not the input).
 * Doesn’t change model weights.
