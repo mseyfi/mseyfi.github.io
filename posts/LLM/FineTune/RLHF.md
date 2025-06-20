@@ -1,8 +1,9 @@
-Of course. What follows is a long and comprehensive tutorial on Reinforcement Learning with Human Feedback (RLHF). We will journey from high-level intuition to the granular details of model architecture, backpropagation, and implementation, leaving no stone unturned. This is designed to be a definitive guide.
+[![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](../../../)
 
------
+## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](../../../main_page/GenAI)
+## [![GenAI](https://img.shields.io/badge/FineTuning-Comprehensive_Tutorial_on_Finetuning_LLMs-orange?style=for-the-badge&logo=github)](../../FineTuning)
 
-## The Definitive Guide to Reinforcement Learning with Human Feedback (RLHF)
+# The Definitive Guide to Reinforcement Learning with Human Feedback (RLHF)
 
 ### Abstract
 
