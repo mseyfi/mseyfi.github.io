@@ -91,82 +91,230 @@ At inference time, the frozen LLM is loaded along with the small, task-specific 
 ### Conceptual Code: From-Scratch Attention with Prefix-Tuning
 
 This Python code (using PyTorch) shows the core logic inside a Multi-Head Attention module, clarifying the projection and concatenation steps.
-
-```python
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
 
+print(f"Using PyTorch version: {torch.__version__}")
+
 class MultiHeadAttentionWithPrefix(nn.Module):
+    """
+    A from-scratch implementation of Multi-Head Self-Attention
+    that supports Prefix-Tuning by prepending learned keys and values.
+    """
     def __init__(self, d_model, num_heads):
         super().__init__()
-        assert d_model % num_heads == 0
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+
         self.d_model = d_model
         self.num_heads = num_heads
         self.d_head = d_model // num_heads
 
-        # These layers are part of the pre-trained, FROZEN LLM
+        # These linear layers would be pre-trained and frozen in a real scenario
         self.w_q = nn.Linear(d_model, d_model)
         self.w_k = nn.Linear(d_model, d_model)
         self.w_v = nn.Linear(d_model, d_model)
         self.w_o = nn.Linear(d_model, d_model)
 
-    def forward(self, x, p_theta_layer=None, attention_mask=None):
+    def forward(self, x, p_theta_for_layer, attention_mask):
         """
         x: input text embeddings, shape [batch_size, seq_len, d_model]
-        p_theta_layer: The raw prefix parameters for this layer, shape [prefix_len, d_model]
+        p_theta_for_layer: The raw prefix parameters for this layer, shape [prefix_len, d_model]
+        attention_mask: Causal mask for the text part.
         """
         batch_size, seq_len, _ = x.shape
 
-        # Project input text embeddings into Q, K, V
+        # 1. Project input text embeddings into Q, K, V
         Q_text = self.w_q(x)
         K_text = self.w_k(x)
         V_text = self.w_v(x)
 
-        # Reshape for Multi-Head Attention
+        # 2. Reshape for Multi-Head Attention to get [batch, heads, len, d_head]
         Q_text = Q_text.view(batch_size, seq_len, self.num_heads, self.d_head).transpose(1, 2)
         K_text = K_text.view(batch_size, seq_len, self.num_heads, self.d_head).transpose(1, 2)
         V_text = V_text.view(batch_size, seq_len, self.num_heads, self.d_head).transpose(1, 2)
 
         # === CORE PREFIX-TUNING LOGIC ===
-        if p_theta_layer is not None:
-            prefix_len = p_theta_layer.shape[0]
-            
-            # 1. Project P_theta using the frozen W_k and W_v matrices
-            with torch.no_grad(): # Ensure W_k/W_v are not updated
-                P_k_raw = self.w_k(p_theta_layer)
-                P_v_raw = self.w_v(p_theta_layer)
-
-            # 2. Reshape prefixes for multi-head attention and expand for batch
-            P_k = P_k_raw.view(1, prefix_len, self.num_heads, self.d_head).transpose(1, 2).expand(batch_size, -1, -1, -1)
-            P_v = P_v_raw.view(1, prefix_len, self.num_heads, self.d_head).transpose(1, 2).expand(batch_size, -1, -1, -1)
-            
-            # 3. Concatenate prefixes with the text's K and V
-            K = torch.cat([P_k, K_text], dim=2)
-            V = torch.cat([P_v, V_text], dim=2)
-        else:
-            K = K_text
-            V = V_text
+        prefix_len = p_theta_for_layer.shape[0]
         
-        # Standard attention calculation with the modified K and V
+        # 3. Project P_theta using the frozen W_k and W_v matrices.
+        # In a real implementation, we ensure w_k and w_v are not updated
+        # by not passing them to the optimizer.
+        P_k_raw = self.w_k(p_theta_for_layer)
+        P_v_raw = self.w_v(p_theta_for_layer)
+
+        # 4. Reshape prefixes for multi-head attention and expand for batch size
+        P_k = P_k_raw.view(1, prefix_len, self.num_heads, self.d_head).transpose(1, 2).expand(batch_size, -1, -1, -1)
+        P_v = P_v_raw.view(1, prefix_len, self.num_heads, self.d_head).transpose(1, 2).expand(batch_size, -1, -1, -1)
+        
+        # 5. Concatenate prefixes with the text's Keys and Values
+        K = torch.cat([P_k, K_text], dim=2)
+        V = torch.cat([P_v, V_text], dim=2)
+        
+        # 6. Calculate Scaled Dot-Product Attention
         attention_scores = (Q_text @ K.transpose(-2, -1)) / math.sqrt(self.d_head)
         
+        # 7. Apply the attention mask
+        # The mask needs to be adjusted for the prefix length.
+        # The prefix should be able to attend to everything, but the text is causal.
         if attention_mask is not None:
-            if p_theta_layer is not None:
-                 prefix_len = p_theta_layer.shape[0]
-                 attention_mask = F.pad(attention_mask, (prefix_len, 0), value=False)
-            attention_scores = attention_scores.masked_fill(attention_mask == 1, -1e9)
+             # Add padding for the prefix to the mask, so prefix tokens are not masked
+             full_mask = F.pad(attention_mask, (prefix_len, 0), value=False)
+             attention_scores = attention_scores.masked_fill(full_mask, -1e9)
             
         attention_probs = F.softmax(attention_scores, dim=-1)
+        
+        # 8. Get the weighted sum of Values
         output = attention_probs @ V
         
+        # 9. Reshape and final linear projection
         output = output.transpose(1, 2).contiguous().view(batch_size, seq_len, self.d_model)
         output = self.w_o(output)
         
         return output
-```
 
+class SimpleTransformerLayer(nn.Module):
+    """A single Transformer layer that uses our custom attention module."""
+    def __init__(self, d_model, num_heads, d_ff, dropout=0.1):
+        super().__init__()
+        self.attention = MultiHeadAttentionWithPrefix(d_model, num_heads)
+        self.ffn = nn.Sequential(
+            nn.Linear(d_model, d_ff),
+            nn.ReLU(),
+            nn.Linear(d_ff, d_model)
+        )
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x, p_theta_for_this_layer, mask):
+        # Pass the layer-specific prefix to the attention module
+        attn_output = self.attention(x, p_theta_for_this_layer, mask)
+        # First residual connection and layer norm
+        x = self.norm1(x + self.dropout(attn_output))
+        
+        # Feed-forward network
+        ffn_output = self.ffn(x)
+        # Second residual connection and layer norm
+        x = self.norm2(x + self.dropout(ffn_output))
+        return x
+
+class PrefixTunedModel(nn.Module):
+    """A full Transformer model that integrates prefix-tuning."""
+    def __init__(self, vocab_size, d_model, num_layers, num_heads, d_ff, prefix_len, seq_len):
+        super().__init__()
+        self.word_embeddings = nn.Embedding(vocab_size, d_model)
+        # Note: In a real LLM, positional embeddings would also be added here.
+        
+        # Create a list of Transformer layers
+        self.layers = nn.ModuleList([
+            SimpleTransformerLayer(d_model, num_heads, d_ff) for _ in range(num_layers)
+        ])
+        
+        # --- Create the learnable prefix parameters ---
+        # A separate P_theta matrix for each layer, stored in a ParameterList
+        self.prefix_params = nn.ParameterList([
+            nn.Parameter(torch.randn(prefix_len, d_model)) for _ in range(num_layers)
+        ])
+        
+        # Final layer to project back to vocabulary size
+        self.output_layer = nn.Linear(d_model, vocab_size)
+        
+        # Standard causal mask
+        self.register_buffer('causal_mask', torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool())
+
+    def forward(self, input_ids):
+        # 1. Get text embeddings
+        x = self.word_embeddings(input_ids)
+        
+        # 2. Loop through layers, passing the correct prefix to each one
+        for i, layer in enumerate(self.layers):
+            p_theta_for_this_layer = self.prefix_params[i]
+            x = layer(x, p_theta_for_this_layer, self.causal_mask)
+            
+        # 3. Get final logits
+        return self.output_layer(x)
+
+# --- Main Execution Block ---
+if __name__ == '__main__':
+    # 1. Model & Data Setup
+    # Hyperparameters
+    vocab_size = 50257 # e.g., GPT-2's vocab size
+    d_model = 768
+    num_layers = 12
+    num_heads = 12
+    d_ff = 3072
+    prefix_len = 20
+    seq_len = 100
+    batch_size = 4
+
+    # Instantiate the full model
+    model = PrefixTunedModel(vocab_size, d_model, num_layers, num_heads, d_ff, prefix_len, seq_len)
+    print(f"Model created. Total parameters: {sum(p.numel() for p in model.parameters())}")
+
+    # --- 2. Freeze the base model's parameters (THE EFFICIENCY & SAFETY STEP) ---
+    print("\nFreezing base model weights...")
+    # Freeze everything EXCEPT the prefix parameters by checking the parameter names
+    for name, param in model.named_parameters():
+        if 'prefix_params' not in name:
+            param.requires_grad = False
+
+    # Collect only the trainable parameters for the optimizer
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    num_trainable = sum(p.numel() for p in trainable_params)
+    print(f"Number of trainable parameters: {num_trainable}")
+    
+    # 3. Initialize the optimizer (THE CRITICAL STEP)
+    print("Initializing optimizer with prefix parameters ONLY...")
+    optimizer = torch.optim.AdamW(trainable_params, lr=5e-4)
+    loss_function = nn.CrossEntropyLoss() # In real SFT, use a masked version
+
+    # --- 4. The Training Loop ---
+    print("\nStarting conceptual training loop...")
+    for epoch in range(2): # Dummy loop for 2 steps
+        # Get a batch of data (dummy tensors for demonstration)
+        input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+        # The target is the input sequence shifted by one for next-token prediction
+        labels = input_ids.clone()
+        
+        optimizer.zero_grad()
+        
+        # --- Forward Pass ---
+        # The model internally handles passing the correct prefix to each layer
+        logits = model(input_ids)
+
+        # --- Loss Calculation ---
+        # Reshape for CrossEntropyLoss: [batch*seq_len, vocab_size]
+        loss = loss_function(logits.view(-1, vocab_size), labels.view(-1))
+        
+        # --- Backward Pass ---
+        # Gradients will only be computed for tensors where requires_grad=True,
+        # which is just our prefix_params.
+        loss.backward()
+
+        # --- Weight Update ---
+        # The optimizer's step() function will only update the prefix_params
+        # because those were the only parameters it was initialized with.
+        optimizer.step()
+
+        print(f"Epoch {epoch+1}, Loss: {loss.item():.4f}")
+
+    # Verify which parameters have gradients after a training step
+    print("\nVerifying gradients after training step:")
+    for name, param in model.named_parameters():
+        # Check if a parameter that should be trainable has a gradient
+        if 'prefix_params' in name:
+            if param.grad is not None:
+                print(f"  - OK: Gradients exist for trainable parameter: {name}")
+            else:
+                print(f"  - ERROR: No gradients for trainable parameter: {name}")
+        # Check if a parameter that should be frozen has no gradient
+        else:
+            if param.grad is None:
+                print(f"  - OK: Gradients are None for frozen parameter: {name}")
+            else:
+                print(f"  - ERROR: Gradients exist for frozen parameter: {name}")
 ---
 ### References
 
