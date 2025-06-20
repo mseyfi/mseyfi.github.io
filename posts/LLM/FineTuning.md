@@ -53,9 +53,9 @@ Prefix-Tuning was a powerful idea: steer a frozen LLM by learning continuous "vi
 
 ## [![ptunev2](https://img.shields.io/badge/P--Tuning--V2-Deep_Prompt_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/P-Tuning-V2)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-Prefix-Tuning was a powerful idea: steer a frozen LLM by learning continuous "virtual tokens" that are prepended to the keys and values in every attention layer. However, it had some challenges. The training could sometimes be unstable, and its performance wasn't always as strong as full fine-tuning on harder, smaller-scale datasets.
+<b>P-Tuning v2</b> introduces Deep Prompt Tuning. Instead of one instruction at the start, you place a small, expert guide on every single floor of the building. This guide provides continuous, layer-specific instructions to each department, ensuring the final output is exactly what you want. It's a continuous conversation with the model, not a single whisper at the start.
 
-<b>P-Tuning v2</b> was developed to address these issues. It adopts the core concept of using continuous prompts at every layer but implements it in a more robust and "deeper" way.<p></p>
+This deep guidance is why <b>P-Tuning v2<\b> is more powerful, stable across all model sizes, and excels at the complex tasks where shallow methods fail.<p></p>
 </div>
 
 
