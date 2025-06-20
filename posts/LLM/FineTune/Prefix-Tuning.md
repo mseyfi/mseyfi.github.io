@@ -91,6 +91,7 @@ At inference time, the frozen LLM is loaded along with the small, task-specific 
 ### Conceptual Code: From-Scratch Attention with Prefix-Tuning
 
 This Python code (using PyTorch) shows the core logic inside a Multi-Head Attention module, clarifying the projection and concatenation steps.
+```python
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -315,6 +316,7 @@ if __name__ == '__main__':
                 print(f"  - OK: Gradients are None for frozen parameter: {name}")
             else:
                 print(f"  - ERROR: Gradients exist for frozen parameter: {name}")
+'''
 ---
 ### References
 
