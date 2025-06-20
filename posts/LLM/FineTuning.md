@@ -54,13 +54,13 @@ Prefix-Tuning was a powerful idea: steer a frozen LLM by learning continuous "vi
 This deep guidance is why <b>P-Tuning v2</b> is more powerful, stable across all model sizes, and excels at the complex tasks where shallow methods fail.<p></p>
 </div>
 
-## 🧑‍⚖️ **3. Reinforcement Learning with Human Feedback (RLHF)**
+## **3. Reinforcement Learning with Human Feedback (RLHF)**
 
 ## [![RLHF](https://img.shields.io/badge/RLHHF-Reinforcement_Learning_from_Human_Feedback-blue?style=for-the-badge&logo=github)](FineTuning/RLHF)
 
 
 
-## 💾 **6. Domain-Adaptive Pretraining (DAPT)**
+## **4. Domain-Adaptive Pretraining (DAPT)**
 
 * Continue **unsupervised pretraining** on in-domain text.
 * No labels required.
@@ -68,7 +68,7 @@ This deep guidance is why <b>P-Tuning v2</b> is more powerful, stable across all
 
 ---
 
-## 🌱 **7. Multi-Task Fine-Tuning**
+## **5. Multi-Task Fine-Tuning**
 
 * Fine-tune on **multiple tasks simultaneously**.
 * Model generalizes better across domains and instructions.
@@ -76,7 +76,7 @@ This deep guidance is why <b>P-Tuning v2</b> is more powerful, stable across all
 
 ---
 
-## 🧬 **8. Quantized/Low-Precision Finetuning**
+## **6. Quantized/Low-Precision Finetuning**
 
 * Combine LoRA or adapters with **quantized models** (e.g., 4-bit QLoRA).
 * Enables fine-tuning 65B+ models on consumer GPUs.
@@ -84,7 +84,7 @@ This deep guidance is why <b>P-Tuning v2</b> is more powerful, stable across all
 
 ---
 
-## 🧱 Summary Table
+## Summary Table
 
 | Method                   | Params Updated   | Compute Cost | Memory   | Use Case                                |
 | ------------------------ | ---------------- | ------------ | -------- | --------------------------------------- |
