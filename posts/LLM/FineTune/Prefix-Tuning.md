@@ -316,7 +316,7 @@ if __name__ == '__main__':
                 print(f"  - OK: Gradients are None for frozen parameter: {name}")
             else:
                 print(f"  - ERROR: Gradients exist for frozen parameter: {name}")
-'''
+```
 ---
 ### References
 
