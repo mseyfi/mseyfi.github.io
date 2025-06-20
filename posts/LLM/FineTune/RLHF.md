@@ -75,10 +75,12 @@ where $(x, y)$ is a prompt-response pair from the dataset.
       * The Reward Model is typically the SFT model with its final vocabulary-prediction head removed and replaced with a single linear head that outputs one scalar value (the reward).
       * The RM takes a `(prompt, response)` pair and outputs a score, $r\_{\\phi}(x, y)$, where $\\phi$ are the RM's parameters.
       * **The Loss Function:** The goal is for the RM to give a higher score to the chosen response ($y\_w$) than the rejected one ($y\_l$). This is framed as a binary classification problem using the **Bradley-Terry model**, which states that the probability of preferring one over the other is the sigmoid of the difference in their scores. The loss is the negative log-likelihood of these human preferences:
-        $$
-        $$$$\\mathcal{L}*{RM}(\\phi) = - \\mathbb{E}*{(x, y\_w, y\_l) \\sim D} \\left[ \\log \\sigma \\left( r\_{\\phi}(x, y\_w) - r\_{\\phi}(x, y\_l) \\right) \\right]
-        $$
-        $$$$where $D$ is the dataset of preference pairs and $\\sigma$ is the sigmoid function. During training, we backpropagate this loss to update the RM's parameters, $\\phi$, teaching it to accurately mimic the human labeler's judgment.
+
+$$
+\mathcal{L}^{RM}(\phi) = - \mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma \left( r_{\phi}(x, y_w) - r_{\phi}(x, y_l) \right) \right]
+$$
+
+where $D$ is the dataset of preference pairs and $\sigma$ is the sigmoid function. During training, we backpropagate this loss to update the RM's parameters, $\phi$, teaching it to accurately mimic the human labeler's judgment.
 
 At the end of this stage, we have a frozen, reliable "sense of protocol"—a Reward Model that can score any response for its helpfulness and harmlessness.
 
