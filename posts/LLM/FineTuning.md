@@ -24,28 +24,33 @@ Fine-tuning Large Language Models (LLMs) can be approached in several ways, each
 Only a **small subset** of parameters are updated. Popular PEFT methods include:
 
 ## [![adaptor](https://img.shields.io/badge/Adaptor_Tuning-Adapter_based_Fine_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/Adaptor-Finetuning)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+As Large Language Models (LLMs) grew to billions of parameters, Full Fine-Tuning—updating every single weight for each new task—became prohibitively expensive. It required massive computational resources and resulted in a new, full-sized model copy for every task.
 
-* Inject **adapter modules** (small bottleneck layers) between transformer layers.
-* Only adapters are trained.
----
+Adapter Tuning was proposed as a solution. The core idea is simple yet profound: what if we could freeze the massive pre-trained LLM, which already contains vast general knowledge, and only train a handful of tiny, new parameters for each specific task? 
+<p></p>
+</div>
 
-## [![LORA](https://img.shields.io/badge/LORA-Low_Rank_Adaptation-blue?style=for-the-badge&logo=github)](../posts/LLM/FineTuning/LORA)
+
+## [![LORA](https://img.shields.io/badge/LORA-Low_Rank_Adaptation-blue?style=for-the-badge&logo=github)](../posts/LLM/FineTune/LORA)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for large-scale pre-trained models. It allows us to adapt a model by introducing low-rank trainable matrices into certain parts of the network while keeping the original pre-trained weights frozen. <p></p>
 </div>
 
 ## [![prefix](https://img.shields.io/badge/Prefix_Tuning-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Prefix-Tuning)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+In the landscape of Parameter-Efficient Fine-Tuning (PEFT), methods like Adapter Tuning modify the model's architecture by injecting new layers. Prefix-Tuning proposes an even less invasive idea: what if we could achieve specialized behavior without touching the model's architecture at all?
 
-* Prepend learnable "prefix vectors" to attention layers (not the input).
-* Doesn’t change model weights.
-* Efficient for long-context tasks.
----
+The core idea is to freeze the entire pre-trained LLM and learn a small sequence of special, continuous vectors—a "prefix"—that we prepend to the input. This learned prefix acts as an optimized set of instructions that steers the frozen LLM's attention and directs it to perform the desired task.<p></p>
+</div>
+
 ## [![ptune](https://img.shields.io/badge/P--Tuning--V2-Deep_Prompt_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/P-Tuning-V2)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+Prefix-Tuning was a powerful idea: steer a frozen LLM by learning continuous "virtual tokens" that are prepended to the keys and values in every attention layer. However, it had some challenges. The training could sometimes be unstable, and its performance wasn't always as strong as full fine-tuning on harder, smaller-scale datasets.
 
-* Learn **soft prompt embeddings** (continuous vectors) fed into model’s input.
-* Can also involve updating a small MLP.
+<b>P-Tuning v2</b> was developed to address these issues. It adopts the core concept of using continuous prompts at every layer but implements it in a more robust and "deeper" way.<p></p>
+</div>
 
----
 
 ## 🧷 **3. Prompt Tuning / Soft Prompts**
 
