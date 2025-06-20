@@ -1,8 +1,4 @@
-Of course. What follows is a new, long, and comprehensive tutorial on Reinforcement Learning with Human Feedback (RLHF) written from scratch. It incorporates detailed explanations of foundational RL concepts, deep dives into the mathematics and intuitions of PPO and DPO, and a clear guide to the entire training and inference pipeline, complete with corrected LaTeX and code snippets.
-
------
-
-### The Ultimate Guide to Reinforcement Learning with Human Feedback (RLHF)
+# The Ultimate Guide to Reinforcement Learning with Human Feedback (RLHF)
 
 #### **Abstract**
 
