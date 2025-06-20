@@ -29,7 +29,7 @@ Only a **small subset** of parameters are updated. Popular PEFT methods include:
 
 * Inject **adapter modules** (small bottleneck layers) between transformer layers.
 * Only adapters are trained.
-
+---
 ## [![Lora](https://img.shields.io/badge/LORA-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/LORA)
 This is currently the most popular and widely used PEFT method. It's like adding tiny, editable "sticky notes" to the model's brain.
 - **The Goal:** To achieve performance close to full fine-tuning while training less than 1% of the parameters.
@@ -42,13 +42,13 @@ This is currently the most popular and widely used PEFT method. It's like adding
 
 ---
 
-## [![Lora](https://img.shields.io/badge/Prefix_Tuning-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Prefix-Tuning)
+## [![prefix](https://img.shields.io/badge/Prefix_Tuning-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Prefix-Tuning)
 
 * Prepend learnable "prefix vectors" to attention layers (not the input).
 * Doesn’t change model weights.
 * Efficient for long-context tasks.
-
-### d. **P-Tuning v2**
+---
+## [![ptune](https://img.shields.io/badge/P--Tuning--V2-Deep_Prompt_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/P-Tuning-V2)
 
 * Learn **soft prompt embeddings** (continuous vectors) fed into model’s input.
 * Can also involve updating a small MLP.
