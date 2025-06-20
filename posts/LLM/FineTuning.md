@@ -10,7 +10,7 @@ Fine-tuning Large Language Models (LLMs) can be approached in several ways, each
 ---
 
 ## **1. General (All/PEFT) Fine-Tuning**
-## [![SFT](https://img.shields.io/badge/SFT-Instruction_Fine_Tuning(SFT)-blue?style=for-the-badge&logo=github)](FineTuning/SFT)
+## [![SFT](https://img.shields.io/badge/SFT-Instruction_Fine_Tuning(SFT)-blue?style=for-the-badge&logo=github)](FineTune/SFT)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Instruction Fine-Tuning/Supervised Fine-Tuning (SFT) is the critical process that retrains a model on examples of commands and their desired responses. It teaches the model to shift its goal from simply "completing text" to "following instructions and being helpful," which is the key to creating modern AI assistants.<p></p>
 </div>
@@ -19,7 +19,7 @@ Instruction Fine-Tuning/Supervised Fine-Tuning (SFT) is the critical process tha
 
 Only a **small subset** of parameters are updated. Popular PEFT methods include:
 
-## [![adaptor](https://img.shields.io/badge/Adaptor_Tuning-Adapter_based_Fine_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/Adaptor-Finetuning)
+## [![adaptor](https://img.shields.io/badge/Adaptor_Tuning-Adapter_based_Fine_Tuning-blue?style=for-the-badge&logo=github)](FineTune/Adaptor-Finetuning)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 As Large Language Models (LLMs) grew to billions of parameters, Full Fine-Tuning—updating every single weight for each new task—became prohibitively expensive. It required massive computational resources and resulted in a new, full-sized model copy for every task.
 
@@ -33,21 +33,21 @@ Adapter Tuning was proposed as a solution. The core idea is simple yet profound:
 LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for large-scale pre-trained models. It allows us to adapt a model by introducing low-rank trainable matrices into certain parts of the network while keeping the original pre-trained weights frozen. <p></p>
 </div>
 
-## [![prefix](https://img.shields.io/badge/Prefix_Tuning-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Prefix-Tuning)
+## [![prefix](https://img.shields.io/badge/Prefix_Tuning-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTune/Prefix-Tuning)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 In the landscape of Parameter-Efficient Fine-Tuning (PEFT), methods like Adapter Tuning modify the model's architecture by injecting new layers. Prefix-Tuning proposes an even less invasive idea: what if we could achieve specialized behavior without touching the model's architecture at all?
 
 The core idea is to freeze the entire pre-trained LLM and learn a small sequence of special, continuous vectors, a "prefix", that we prepend to the input. This learned prefix acts as an optimized set of instructions that steers the frozen LLM's attention and directs it to perform the desired task.<p></p>
 </div>
 
-## [![ptune](https://img.shields.io/badge/Prompt--Tuning-Prompt_Tuning/Soft_Prompts-blue?style=for-the-badge&logo=github)](FineTuning/Prompt-Tuning)
+## [![ptune](https://img.shields.io/badge/Prompt--Tuning-Prompt_Tuning/Soft_Prompts-blue?style=for-the-badge&logo=github)](FineTune/Prompt-Tuning)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Prefix-Tuning was a powerful idea: steer a frozen LLM by learning continuous "virtual tokens" that are prepended to the keys and values in every attention layer. However, it had some challenges. The training could sometimes be unstable, and its performance wasn't always as strong as full fine-tuning on harder, smaller-scale datasets.
 
 <b>Prompt-Tuning</b> was developed to address these issues. It adopts the core concept of using continuous prompts at the input layer.<p></p>
 </div>
 
-## [![ptunev2](https://img.shields.io/badge/P--Tuning--V2-Deep_Prompt_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/P-Tuning-V2)
+## [![ptunev2](https://img.shields.io/badge/P--Tuning--V2-Deep_Prompt_Tuning-blue?style=for-the-badge&logo=github)](FineTune/P-Tuning-V2)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 <b>P-Tuning v2</b> introduces Deep Prompt Tuning. Instead of one instruction at the start, you place a small, expert guide on every single floor of the building. This guide provides continuous, layer-specific instructions to each department, ensuring the final output is exactly what you want. It's a continuous conversation with the model, not a single whisper at the start.
 
@@ -56,7 +56,7 @@ This deep guidance is why <b>P-Tuning v2</b> is more powerful, stable across all
 
 ## **3. Reinforcement Learning with Human Feedback (RLHF)**
 
-## [![RLHF](https://img.shields.io/badge/RLHHF-Reinforcement_Learning_from_Human_Feedback-blue?style=for-the-badge&logo=github)](FineTuning/RLHF)
+## [![RLHF](https://img.shields.io/badge/RLHHF-Reinforcement_Learning_from_Human_Feedback-blue?style=for-the-badge&logo=github)](FineTune/RLHF)
 
 
 
