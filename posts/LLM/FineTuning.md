@@ -41,7 +41,7 @@ LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for la
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 In the landscape of Parameter-Efficient Fine-Tuning (PEFT), methods like Adapter Tuning modify the model's architecture by injecting new layers. Prefix-Tuning proposes an even less invasive idea: what if we could achieve specialized behavior without touching the model's architecture at all?
 
-The core idea is to freeze the entire pre-trained LLM and learn a small sequence of special, continuous vectors—a "prefix"—that we prepend to the input. This learned prefix acts as an optimized set of instructions that steers the frozen LLM's attention and directs it to perform the desired task.<p></p>
+The core idea is to freeze the entire pre-trained LLM and learn a small sequence of special, continuous vectors, a "prefix", that we prepend to the input. This learned prefix acts as an optimized set of instructions that steers the frozen LLM's attention and directs it to perform the desired task.<p></p>
 </div>
 
 ## [![ptune](https://img.shields.io/badge/Prompt--Tuning-Prompt_Tuning/Soft_Prompts-blue?style=for-the-badge&logo=github)](FineTuning/Prompt-Tuning)
