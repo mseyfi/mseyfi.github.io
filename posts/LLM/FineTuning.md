@@ -44,7 +44,14 @@ In the landscape of Parameter-Efficient Fine-Tuning (PEFT), methods like Adapter
 The core idea is to freeze the entire pre-trained LLM and learn a small sequence of special, continuous vectors—a "prefix"—that we prepend to the input. This learned prefix acts as an optimized set of instructions that steers the frozen LLM's attention and directs it to perform the desired task.<p></p>
 </div>
 
-## [![ptune](https://img.shields.io/badge/P--Tuning--V2-Deep_Prompt_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/P-Tuning-V2)
+## [![ptune](https://img.shields.io/badge/Prompt--Tuning-Prompt_Tuning/Soft_Prompts-blue?style=for-the-badge&logo=github)](FineTuning/Prompt-Tuning)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+Prefix-Tuning was a powerful idea: steer a frozen LLM by learning continuous "virtual tokens" that are prepended to the keys and values in every attention layer. However, it had some challenges. The training could sometimes be unstable, and its performance wasn't always as strong as full fine-tuning on harder, smaller-scale datasets.
+
+<b>Prompt-Tuning</b> was developed to address these issues. It adopts the core concept of using continuous prompts at the input layer.<p></p>
+</div>
+
+## [![ptunev2](https://img.shields.io/badge/P--Tuning--V2-Deep_Prompt_Tuning-blue?style=for-the-badge&logo=github)](FineTuning/P-Tuning-V2)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Prefix-Tuning was a powerful idea: steer a frozen LLM by learning continuous "virtual tokens" that are prepended to the keys and values in every attention layer. However, it had some challenges. The training could sometimes be unstable, and its performance wasn't always as strong as full fine-tuning on harder, smaller-scale datasets.
 
