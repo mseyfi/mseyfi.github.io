@@ -53,10 +53,12 @@ The RLHF curriculum has three stages.
   * **Intuition:** Before a diplomat is sent on a mission, they study briefing books containing examples of ideal diplomatic cables, speeches, and conversation transcripts. This teaches them the expected style, tone, and format.
   * **Process:** We take a pre-trained LLM and fine-tune it on a small, high-quality dataset of `(prompt, ideal_response)` pairs created by human labelers. The model learns to mimic the style of these ideal responses.
   * **Objective:** This is standard supervised learning. The model's policy, $\\pi^{SFT}$, is trained to maximize the probability of generating the human-written response. The loss function is the classic cross-entropy loss over the tokens in the ideal response:
-    $$
-    $$$$\\mathcal{L}*{SFT}(\\theta) = - \\sum*{i=1}^{T} \\log \\pi^{SFT}(y\_i | x, y\_{\<i}; \\theta)
-    $$
-    $$$$where $(x, y)$ is a prompt-response pair from the dataset.
+
+$$
+\mathcal{L}*{SFT}(\theta) = - \\sum*{i=1}^{T} \\log \\pi^{SFT}(y\_i | x, y\_{\<i}; \\theta)
+$$
+
+where $(x, y)$ is a prompt-response pair from the dataset.
 
 #### **Stage 2: Learning a "Sense of Protocol" - The Reward Model (RM)**
 
