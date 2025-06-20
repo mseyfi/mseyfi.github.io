@@ -5,8 +5,6 @@
 # Fine-Tuning Large Language Models
 ------
 
-
-
 Fine-tuning Large Language Models (LLMs) can be approached in several ways, each balancing compute, memory, data efficiency, and performance. The major categories are:
 
 ---
