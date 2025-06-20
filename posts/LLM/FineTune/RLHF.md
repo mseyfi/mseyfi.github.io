@@ -55,7 +55,7 @@ The RLHF curriculum has three stages.
   * **Objective:** This is standard supervised learning. The model's policy, $\\pi^{SFT}$, is trained to maximize the probability of generating the human-written response. The loss function is the classic cross-entropy loss over the tokens in the ideal response:
 
 $$
-\mathcal{L}*{SFT}(\theta) = - \\sum*{i=1}^{T} \\log \\pi^{SFT}(y\_i | x, y\_{\<i}; \\theta)
+\mathcal{L}^{SFT}(\theta) = - \sum{i=1}^{T} \log \pi^{SFT}(y_i | x, y_{<i}; \theta)
 $$
 
 where $(x, y)$ is a prompt-response pair from the dataset.
