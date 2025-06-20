@@ -11,7 +11,7 @@ Fine-tuning Large Language Models (LLMs) can be approached in several ways, each
 
 ---
 
-## 🔧 **1. Full Fine-Tuning**
+## **1. Full Fine-Tuning**
 
 * **What it is**: Update **all parameters** of the model using backpropagation on task-specific data.
 * **Use case**: When you have **a lot of labeled data** and **enough compute** (e.g., cloud TPU/GPU clusters).
@@ -21,7 +21,7 @@ Fine-tuning Large Language Models (LLMs) can be approached in several ways, each
 
 ---
 
-## 🧠 **2. Parameter-Efficient Fine-Tuning (PEFT)**
+##  **2. Parameter-Efficient Fine-Tuning (PEFT)**
 
 Only a **small subset** of parameters are updated. Popular PEFT methods include:
 
@@ -39,11 +39,10 @@ This is currently the most popular and widely used PEFT method. It's like adding
 * Inject into Q, K, V, or FFN layers.
 * **Minimal parameter update (\~0.1–1%)**, high performance.
 * **Widely used in open-source finetuning.**
-* **Example**: [LoRA (Hu et al. 2021)](https://arxiv.org/abs/2106.09685)
 
 ---
 
-### c. **Prefix Tuning**
+## [![Lora](https://img.shields.io/badge/Prefix_Tuning-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Prefix-Finetuning)
 
 * Prepend learnable "prefix vectors" to attention layers (not the input).
 * Doesn’t change model weights.
