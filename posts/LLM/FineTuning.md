@@ -55,7 +55,7 @@ Prefix-Tuning was a powerful idea: steer a frozen LLM by learning continuous "vi
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 <b>P-Tuning v2</b> introduces Deep Prompt Tuning. Instead of one instruction at the start, you place a small, expert guide on every single floor of the building. This guide provides continuous, layer-specific instructions to each department, ensuring the final output is exactly what you want. It's a continuous conversation with the model, not a single whisper at the start.
 
-This deep guidance is why <b>P-Tuning v2<\b> is more powerful, stable across all model sizes, and excels at the complex tasks where shallow methods fail.<p></p>
+This deep guidance is why <b>P-Tuning v2</b> is more powerful, stable across all model sizes, and excels at the complex tasks where shallow methods fail.<p></p>
 </div>
 
 
