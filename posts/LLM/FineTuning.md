@@ -30,17 +30,11 @@ Only a **small subset** of parameters are updated. Popular PEFT methods include:
 * Inject **adapter modules** (small bottleneck layers) between transformer layers.
 * Only adapters are trained.
 ---
-## [![Lora](https://img.shields.io/badge/LORA-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/LORA)
-This is currently the most popular and widely used PEFT method. It's like adding tiny, editable "sticky notes" to the model's brain.
-- **The Goal:** To achieve performance close to full fine-tuning while training less than 1% of the parameters.
 
-* Decompose weight update into two low-rank matrices:
-  ΔW ≈ A·B where A ∈ ℝ^{d×r}, B ∈ ℝ^{r×k}, r ≪ d.
-* Inject into Q, K, V, or FFN layers.
-* **Minimal parameter update (\~0.1–1%)**, high performance.
-* **Widely used in open-source finetuning.**
-
----
+## [![LORA](https://img.shields.io/badge/LORA-Low_Rank_Adaptation-blue?style=for-the-badge&logo=github)](../posts/LLM/FineTuning/LORA)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+LoRA (Low-Rank Adaptation) is a parameter-efficient fine-tuning technique for large-scale pre-trained models. It allows us to adapt a model by introducing low-rank trainable matrices into certain parts of the network while keeping the original pre-trained weights frozen. <p></p>
+</div>
 
 ## [![prefix](https://img.shields.io/badge/Prefix_Tuning-LOW_RANK_ADaptation-blue?style=for-the-badge&logo=github)](FineTuning/Prefix-Tuning)
 
