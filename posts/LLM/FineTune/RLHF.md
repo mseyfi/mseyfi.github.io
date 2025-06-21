@@ -313,9 +313,11 @@ The final loss for the entire sequence is an aggregation of the losses for each 
 - **Total Value Loss:** The total $\mathcal{L}_{VF}$ is the mean of the squared errors for each state: $\text{mean}((V(S_0)−R)^2,(V(S_1)−R)^2,...)$.
 
 The final loss for the backpropagation step is a weighted sum:
+
 $$
 \mathcal{L}_{total}=\mathcal{L}_{PPO}−c1\cdot \mathcal{L}_{VF}+c2\cdot\mathcal{L}_{\text{entropy}}
 $$
+
 where $\mathcal{L}_{\text{entropy} }$ is an optional term that encourages exploration).
 
 **How the Two Heads Are Updated**:
