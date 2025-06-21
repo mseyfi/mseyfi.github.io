@@ -106,6 +106,28 @@ Imagine our diplomat (the LLM) has two minds working together:
 
 So, when we perform a forward pass with the LLM during PPO training, we get two outputs simultaneously from the same underlying model representation: an **action probability distribution** from the policy head and an **expected future reward** from the value head. This shared structure is computationally efficient.
 
+#### **The True Reward Signal: Preventing "Reward Hacking" with the KL Penalty**
+
+Before we can even talk about the PPO loss function, we must understand the *actual* reward signal the RL algorithm uses. It is **not** just the score from the Reward Model. Using only the RM score would lead to a critical failure mode called **reward hacking**.
+
+- **The Intuition (Reward Hacking):** Imagine you train a Reward Model to give high scores for responses that include the word "helpful." An unconstrained Actor model might learn a simple, degenerate strategy: just output `"I am helpful. I am helpful. I am helpful..."` over and over. This response would get a very high score from the naive RM, but it's useless and incoherent. The Actor has "hacked" the reward system.
+- **The Solution (The KL Penalty):** To prevent this, we introduce a penalty that keeps the Actor's policy, πθ, from straying too far from the sensible, coherent language it learned during the initial SFT phase, represented by the frozen Reference Model, πref. This penalty is the **Kullback-Leibler (KL) Divergence**.
+- **What is KL Divergence?** Intuitively, KL divergence measures how "surprising" one probability distribution is relative to another. If the Actor model starts generating bizarre combinations of words that the original SFT model would have found extremely unlikely, the KL divergence will be high.
+
+The final reward signal for each token ($R_t$) is therefore a combination of the external score from the Reward Model and this internal, self-correcting penalty.
+
+**The Full Per-Token Reward Equation:**
+$$
+R_t=r_{RM}(S_t,a_t)−\beta\log\left(\frac{\pi_{ref}(a_t∣S_t)}{\pi_θ(a_t∣S_t)}\right)
+$$
+
+- $r_{RM}(S_t,a_t)$ is the score from our Reward Model. (Note: often, the RM scores the whole sequence, and this value is distributed to each token).
+- The second term is the per-token KL divergence between the Actor and the Reference policy.
+- $\beta$ is a hyperparameter that controls the strength of the KL penalty. A higher $\beta$ makes the model more conservative and less likely to stray from its SFT training.
+
+This comprehensive reward signal, $R_t$, is what we use to calculate the Advantage.
+
+
 #### **The Advantage Function ($A_t$): "Better or Worse Than Expected?"**
 
 Now we can finally understand the Advantage function. Its purpose is to provide a much more stable and effective learning signal than just using the raw reward.
