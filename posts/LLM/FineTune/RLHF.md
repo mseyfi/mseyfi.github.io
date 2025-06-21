@@ -102,7 +102,7 @@ Imagine our diplomat (the LLM) has two minds working together:
 **Yes, exactly.** In the PPO stage of RLHF, the model we are training is typically a single Large Language Model with a shared "body" (the main transformer blocks) and **two separate "heads"**:
 
 1. **The Policy Head (Actor Head):** This is the standard language model head. It takes the final hidden state of a token and outputs logits over the entire vocabulary, defining the probability distribution for the next token. This is what generates the text.
-2. **The Value Head (Critic Head):** This is a new head added to the model. It's usually a simple linear layer that takes the final hidden state of a token and outputs a **single scalar number**. This number is the value estimate, $V(S_t)$.
+2. **The Value Head (Critic Head):** This is a new head added to the model. It's usually a simple linear layer that takes the final hidden state of a token and outputs a **single scalar number**. This number is the value estimate, $V_\phi(S_t)$.
 
 So, when we perform a forward pass with the LLM during PPO training, we get two outputs simultaneously from the same underlying model representation: an **action probability distribution** from the policy head and an **expected future reward** from the value head. This shared structure is computationally efficient.
 
@@ -117,19 +117,19 @@ Now we can finally understand the Advantage function. Its purpose is to provide 
 The formula is:
 
 $$
-A_t=R_t−V(S_t)
+A_t=R_t−V_\phi(S_t)
 $$
 
 Let's break this down with our diplomat analogy:
 
 - $S_t$: The state is the current conversation. E.g., "The foreign minister just accused us of espionage."
 - $R_t$: The actual reward received after the diplomat says something. Let's say the Reward Model gives a score of `+5`.
-- $V(S_t)$: The Critic's prediction. Based on the tense situation, the Critic might have predicted a low expected future reward. It might have thought, "This is a tough spot. On average, we probably only get a reward of `-10` from here." So, $V(S_t)=−10$.
+- $V_\phi(S_t)$: The Critic's prediction. Based on the tense situation, the Critic might have predicted a low expected future reward. It might have thought, "This is a tough spot. On average, we probably only get a reward of `-10` from here." So, $V_\phi(S_t)=−10$.
 
 Now, let's calculate the advantage:
 
 $$
-A_t=R_t−V(S_t)=5−(−10)=+15.
+A_t=R_t−V_\phi(S_t)=5−(−10)=+15.
 $$
 
 The interpretation is profound:
@@ -140,7 +140,7 @@ Conversely, if the reward was `+2`, but the Critic expected `+20`, the advantage
 
 The Advantage function creates a **relative, zero-centered learning signal**, which is much more stable and informative for updating the policy than the raw reward alone.
 
-Another example is a teacher that predicts a not very strong student to do not so good in the exam based on the past achievements $V(s_t) = 60\%$, but the students gets a grade (reward) $R_t=75\%$, although this grade is not that good but it is a huge progress (15 marks above the expectation). This means whatever the student has done is in the right direction and has to be perused. 
+Another example is a teacher that predicts a not very strong student to do not so good in the exam based on the past achievements $V_\phi(S_t) = 60\%$, but the students gets a grade (reward) $R_t=75\%$, although this grade is not that good but it is a huge progress (15 marks above the expectation). This means whatever the student has done is in the right direction and has to be perused. 
 
 ------
 
@@ -192,8 +192,121 @@ The training loop for PPO is an active, "online" process:
 4.  **Backpropagation:** The gradient of this loss is computed with respect to the **Actor's** parameters ($\theta$). This gradient tells the LLM how to adjust its weights to make high-advantage actions more likely and low-advantage actions less likely, all while staying within the safe "clipped" region. The Critic is also updated simultaneously with a simpler mean-squared error loss.
 
 -----
+### **Part 5: The Walkthrough: One Full Outer Loop for Toxicity Reduction**
 
-### **Part 4: Field Practice, The Modern Way - DPO**
+Let's trace a single, complete learning cycle with our chatbot example.
+
+The Goal: Train `ChatBot-v1` to be less toxic.
+
+The Prompt (x): "Write a comeback to someone who called my code inefficient."
+
+#### **OUTER LOOP (Phase 1: Data Collection / "Rollout")**
+
+We begin with our current **Actor-Critic** model, whose policy is $\pi_{\theta_\text{old}}$. We use this policy to generate a response.
+
+**Step 1**: The Agent Acts (Token by Token)
+
+The Agent generates a toxic response:
+
+`y = "Tell them to learn to code."`
+
+This response consists of 6 actions (generating 6 tokens): $a_0,a_1,a_2,a_3,a_4,a_5$.
+
+**Step 2**: Record the Experience
+
+For this entire sequence, we record the key information at each timestep $t$:
+
+- **State ($S_t$):** The text generated so far.
+- **Action ($a_t$):** The token generated at this step.
+- **Log-Probability from $\pi_{\theta_{old}}$:** The log-probability of taking action a_t from state $S_t$.
+- **Critic's Value ($V_\phi(S_t)$):** The Critic's prediction of future reward, looking at state $S_t$.
+
+**Step 3**: Evaluate the Completed Response
+
+After the full response y is generated, we calculate a single, sequence-level reward.
+
+- **Reward Model Score:** The `ToxicityScorer` (our **RM**) evaluates the full sentence and, because it's toxic, gives a low score: $r(x,y)=−10.0$.
+
+- **KL Penalty**:
+
+   We calculate the divergence from the reference model. Let's say the penalty is $2.5$ With $\beta=0.1$
+
+  , the final reward is:
+
+  - **Final Sequence Reward (R):** $−10.0−(0.1\times2.5)=−10.25$.
+
+**Step 4**: Calculate the Advantage for Every Single Token
+
+Now, we walk back through our generated sequence and calculate the advantage for each step. The advantage tells us how good the action at that step was, given the final outcome. For simplicity here, we will use the same final reward R for every step's calculation.
+
+- **For $t=0$ (Action $a_0$ = "Tell"):**
+  - $S_0$: `"Write a comeback..."`
+  - The Critic looked at $S_0$ and predicted $V(S_0)=−3.0$.
+  - **Equation:** $A_0=R−V(S_0)$
+  - **Calculation:** $A_0=−10.25−(−3.0)=−7.25$
+- **For $t=1$ (Action $a_1$ = "them"):**
+  - $S_1$: `"Write a comeback..." Tell`
+  - The state has changed. The Critic now looks at this new state and makes a new prediction. Perhaps it thinks the situation is slightly worse now. Let's say it predicts $V(S_1)=−3.5.$
+  - **Equation:** $A_1=R−V(S_1)$
+  - **Calculation:** $A_1=−10.25−(−3.5)=−6.75$
+
+This process continues for all 6 tokens. We now have an advantage value $(A_0,A_1,...,A_5)$ for every action taken.
+
+**End of Outer Loop Phase 1.** We have a rich dataset of `(State, Action, LogProb_old, Value, Advantage)` for every token in our generated sequence.
+
+------
+
+#### **INNER LOOP (Phase 2: Optimization)**
+
+Now we learn from this collected data. We will perform multiple gradient updates using this *same* batch of experience. Let's focus on the first two tokens.
+
+The Loss Functions:
+
+We have two losses to calculate: one for the Policy (Actor) and one for the Value function (Critic).
+
+1. **Policy Loss ($\mathcal{L}_{PPO}$):** This is the clipped surrogate objective we've discussed.
+2. **Value Loss ($\mathcal{L}_{VF}$):** This is a simple Mean Squared Error that trains the Critic to be a better predictor. $\mathcal{L}_{VF} = (V({\phi_{new}}(S_t)) - R)^2 $. It compares the Critic's *new* prediction for a state to the *actual* reward we ended up getting, and tries to minimize the difference.
+
+**Inner Epoch 1**:
+
+Our goal is to update the model parameters from theta_old to theta_new.
+
+- **For $t=0$ (Action $a_0$ = "Tell"):**
+  1. **Old Probability:** We already stored this: $\pi_{\theta_{old}}(a_0∣S_0)=0.30$.
+  2. **New Probability:** before the the first gradient update, the new policy $\pi_{\theta_\text{new}} = \pi_{\theta_\text{old}}$ , should make this action less likely due to the negative advantage. Let's say its new probability is $\pi_{\theta_{\text{new}}}(a_0∣S_0)=0.25$.
+  3. **Probability Ratio (p_0(theta)):** $\frac{0.250}{.30}\approx0.833$.
+  4. **PPO Loss ($\mathcal{L_{PPO}}$ for $t=0$):** We use $p_0(\theta)=0.833$ and $A_0=−7.25$. As calculated before, the clipped loss value is $-6.04$.
+- **For $t=1$ (Action $a_1$ = "them"):**
+  1. **Old Probability:** Let's say we stored $\pi_{\theta_{old}}(a_1∣S_1)=0.50$.
+  2. **New Probability:** The update also affects this probability. Let's say $\pi_{\theta_{new}}(a_1∣S_1)=0.45$.
+  3. **Probability Ratio ($p_1(\theta)$):** $\frac{0.45}{0.50}=0.9$.
+  4. **PPO Loss ($\mathcal{L}_{PPO}$ for t=1):** We use $p_1(\theta)=0.9$ and $A_1=−6.75$. The clipped loss value is $\min(0.9 * -6.75, \text{clip}(0.9, 0.8, 1.2) * -6.75) = -6.075$.
+
+**Putting it all together: The Total Loss and the Update**
+
+The final loss for the entire sequence is an aggregation of the losses for each token.
+
+- **Total Policy Loss:** The total $\mathcal{L}_{PPO}$ is the mean of the individual token losses: $\text{mean}(−6.04,−6.075,...)$.
+- **Total Value Loss:** The total $\mathcal{L}_{VF}$ is the mean of the squared errors for each state: $\text{mean}((V(S_0)−R)^2,(V(S_1)−R)^2,...)$.
+
+The final loss for the backpropagation step is a weighted sum:
+$$
+\mathcal{L}_{total}=\mathcal{L}_{PPO}−c1\cdot \mathcal{L}_{VF}+c2\cdot\mathcal{L}_{\text{entropy}}
+$$
+where $\mathcal{L}_{\text{entropy} }$ is an optional term that encourages exploration).
+
+**How the Two Heads Are Updated**:
+
+When `loss.backward()` is called on $\mathcal{L}_{\text{total}}$, something elegant happens:
+
+1. The gradients from the **Policy Loss $(\mathcal{L}_{PPO})$** flow backward through the shared transformer body and are used to update **only the parameters of the Policy Head**.
+2. The gradients from the **Value Loss ($\mathcal{L}_{VF}$)** flow backward through the shared transformer body and are used to update **only the parameters of the Value Head**.
+3. The gradients from both losses combine to update the parameters of the **shared Transformer Body**.
+
+This allows the two heads to learn from different objectives while sharing the same powerful, underlying language representation. This process repeats for several inner epochs before we discard this batch of data and start a new "Outer Loop" with a fresh rollout.
+
+---
+### **Part 6: Field Practice, The Modern Way - DPO**
 
 PPO is powerful but notoriously complex, requiring four models and a slow sampling loop. Direct Preference Optimization (DPO) is a more recent breakthrough that achieves the same goal with stunning simplicity.
 
