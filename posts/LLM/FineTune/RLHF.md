@@ -344,11 +344,10 @@ DPO's brilliance is a mathematical insight that connects the reward function dir
 1.  **The Insight:** The optimal reward function that PPO tries to learn can be expressed analytically as the log-probability ratio between the optimal policy ($\\pi\_\\theta$) and the reference policy ($\\pi\_{ref}$), scaled by a constant $\\beta$.
 
     $$
-    $$$$r(x, y) = \\beta \\log \\left( \\frac{\\pi\_{\\theta}(y|x)}{\\pi\_{ref}(y|x)} \\right)
+    r(x, y) = \beta \log \left( \frac{\\pi\_{\theta}(y|x)}{\pi\_{ref}(y|x)} \right)
 
     $$
-    $$$$
-    $$
+    
 2.  **The Derivation:** By substituting this definition of reward back into the RM's loss function, the terms rearrange into a new loss function that depends *only* on the policy we are training and the frozen reference policy. The RM is eliminated entirely.
 
 The final **DPO Loss Function** is:
