@@ -156,25 +156,23 @@ With our understanding of the Actor, Critic, and Advantage, we can now fully des
 
 - **The Probability Ratio ($p_t(\theta)$): Quantifying the Policy Change**
 
-​  This is the second crucial component, and your question about it is key. The formula is:
-
-$$
-p_t(\theta)=\pi_{\theta_\text{old}}(y_t∣S_t)\pi_{\theta_\text{new}}(y_t∣S_t)
-$$
-
-  ​	**What is it, really?** The probability ratio, $p_t(\theta)$, is a direct measure of **how our strategy is changing**. It doesn't just look at the new probability of an action; it compares it to the old probability.	
+  ​This is the second crucial component, and your question about it is key. The formula is:
   
-  ​	**Intuition: The Baseball Manager.** Imagine you are a baseball manager, and your policy, pi, is your strategy for telling a player whether to swing at a pitch.
+  $$
+  p_t(\theta)=\pi_{\theta_\text{old}}(y_t∣S_t)\pi_{\theta_\text{new}}(y_t∣S_t)
+  $$
   
-  ​	**The "Old" Policy ($\pi_{\theta_old}$):** At the beginning of a training step, you collect data. Let's say your strategy tells the player to swing at a specific pitch with a 	50% probability. This "old" policy is now     fixed for the duration of this update step.
-
-​	  **The Update:** After analyzing the outcome, your optimizer suggests a new policy, pi_theta_new. This new policy now says to swing at that same pitch with a 75% probability.
-
-​	  **Calculating the Ratio:** The ratio is $p_t(\theta)=75$. This value of 1.5 tells you precisely that your new strategy is "1.5 times more aggressive" for this specific action. If the new probability was 25%, the ratio     would be 0.5, meaning "half as aggressive."
-
-​	  **Why is this Ratio so Important?** The goal of PPO is to control the *size* of the policy update. A raw probability doesn't tell you how big of a step you took, but the ratio does. PPO's loss function is designed to      directly constrain this ratio. It uses the ratio to ensure that even if an action has a massive advantage, the policy update doesn't become too extreme (e.g., the ratio is not allowed to become 100.0), which would         risk destabilizing the entire model.
-
-
+  ​**What is it, really?** The probability ratio, $p_t(\theta)$, is a direct measure of **how our strategy is changing**. It doesn't just look at the new probability of an action; it compares it to the old probability.	
+    
+  **Intuition: The Baseball Manager.** Imagine you are a baseball manager, and your policy, pi, is your strategy for telling a player whether to swing at a pitch.
+    
+  **The "Old" Policy ($\pi_{\theta_old}$):** At the beginning of a training step, you collect data. Let's say your strategy tells the player to swing at a specific pitch with a 	50% probability. This "old" policy is now fixed for the duration of this update step.
+  
+  ​**The Update:** After analyzing the outcome, your optimizer suggests a new policy, pi_theta_new. This new policy now says to swing at that same pitch with a 75% probability.
+  
+  ​**Calculating the Ratio:** The ratio is $p_t(\theta)=75$. This value of 1.5 tells you precisely that your new strategy is "1.5 times more aggressive" for this specific action. If the new probability was 25%, the ratio would be 0.5, meaning "half as aggressive."
+  
+  ​**Why is this Ratio so Important?** The goal of PPO is to control the *size* of the policy update. A raw probability doesn't tell you how big of a step you took, but the ratio does. PPO's loss function is designed to directly constrain this ratio. It uses the ratio to ensure that even if an action has a massive advantage, the policy update doesn't become too extreme (e.g., the ratio is not allowed to become 100.0), which would risk destabilizing the entire model.
 
 - **The PPO Loss Function:** The goal is to update the Actor's parameters theta using the Advantage signal, but in a safe way.
   
