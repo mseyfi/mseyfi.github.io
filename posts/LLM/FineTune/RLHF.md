@@ -159,7 +159,7 @@ With our understanding of the Actor, Critic, and Advantage, we can now fully des
   ​This is the second crucial component, and your question about it is key. The formula is:
   
   $$
-  p_t(\theta)=\pi_{\theta_\text{old}}(y_t∣S_t)\pi_{\theta_\text{new}}(y_t∣S_t)
+  p_t(\theta)=\frac{\pi_{\theta_\text{new}}(y_t∣S_t)}{\pi_{\theta_\text{old}}(y_t∣S_t)}
   $$
   
   ​**What is it, really?** The probability ratio, $p_t(\theta)$, is a direct measure of **how our strategy is changing**. It doesn't just look at the new probability of an action; it compares it to the old probability.	
