@@ -750,9 +750,9 @@ We perform one gradient update.
 **Step 1: The Forward Pass**
 We pass the states from our data buffer through the **current** Actor-Critic model to get **new** predictions. Let's say the update from $\theta_{old}$ to $\theta_{new}$ results in these new values for the first timestep ($t=0$):
 
-* **New Log-Prob:** $$\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$$ (The probability of saying `Your` decreased, as expected from the negative advantage).
-* **New Value Prediction:** $$V_{\theta_{new}}(S_0) = -7.5$$ (The Critic is getting more accurate, moving from `-1.0` towards the target of `-7.21`).
-* **New Entropy:** Let's say the entropy of the new policy distribution is $S=2.5$.
+- **New Log-Prob:** $$\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$$ (The probability of saying Your decreased, as expected from the negative advantage).
+- **New Value Prediction:** $$V_{\theta_{new}}(S_0) = -7.5$$ (The Critic is getting more accurate, moving from `-1.0` towards the target of $-7.21$).
+- **New Entropy:** Let's say the entropy of the new policy distribution is $S=2.5$.
 
 **Step 2: Calculate Each Loss Component (for $t=0$)**
 
@@ -764,7 +764,10 @@ We pass the states from our data buffer through the **current** Actor-Critic mod
       * $\mathcal{L}_0^\text{CLIP} = \min(-5.78, -6.57) = -6.57$.
 
 2.  **Value Function Loss ($\mathcal{L}^\text{VF}_0$):**
-    * $\mathcal{L}_0^\text{VF} = (V_{\theta_{new}}(S_0) - V_0^{\text{target}})^2 = (-7.5 - (-7.21))^2 = (-0.29)^2 = 0.0841$.
+   
+    $$
+    \mathcal{L}_0^\text{VF} = (V_{\theta_{new}}(S_0) - V_0^{\text{target}})^2 = (-7.5 - (-7.21))^2 = (-0.29)^2 = 0.0841
+    $$
 
 **Step 3: Calculate the Final Objective**
 We average the loss components over all 5 tokens in our sequence. Let's assume the averages are:
@@ -780,6 +783,7 @@ $$\mathcal{L}^{\text{PPO}} = \mathcal{L}^\text{CLIP} - c_1 \mathcal{L}^\text{VF}
 $\mathcal{L}^{\text{PPO}} = (-7.5) - (0.5 \times 0.55) + (0.01 \times 2.4)$$$
 
 $$\mathcal{L}^{\text{PPO}} = -7.5 - 0.275 + 0.024 = \mathbf{-7.751}$$
+
 
 **Step 4: Backpropagation and Update**
 This final objective value, `-7.751`, is what we maximize. The optimizer performs gradient ascent (or descent on the negative). The gradient of the $\mathcal{L}^\text{CLIP}$ and $S$ terms updates the **Actor Head and the shared body**. The gradient of the $\mathcal{L}^\text{VF}$ term updates the **Critic Head and the shared body**.
