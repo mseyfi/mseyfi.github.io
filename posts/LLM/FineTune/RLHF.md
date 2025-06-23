@@ -185,7 +185,7 @@ A_t=R_t−V(St)
 $$
 
 
-Where $R$ is the final reward for the whole episode and V(St) is the Critic's prediction at that step.
+Where $R$ is the final reward for the whole episode and $V(S_t)$ is the Critic's prediction at that step.
 
 - **What it does:** It compares the final outcome ($R_t$) to the expectation at that step $V(S_t)$.
 
@@ -251,7 +251,7 @@ We are now faced with a classic machine learning dilemma: **The Bias-Variance Tr
     - If we set $\lambda=1$, the formula becomes mathematically equivalent to using the full return minus the baseline, $A_t=R_t−V(S_t)$ (low bias, high variance).
     - By setting $\lambda$ to a value like **0.95**, we create a sophisticated blend that is mostly based on the immediate TD-error but still accounts for the long-term consequences of an action in a stable, variance-reduced way.
 
-We need Advantage Estimation to solve the credit assignment problem. The simple advantage function (R−V(s)) is too noisy and high-variance. Generalized Advantage Estimation (GAE) is the solution because it provides a stable, low-variance learning signal that still accounts for the long-term consequences of actions, leading to much more efficient and effective training. It has rightly become the standard for modern PPO implementations.
+We need Advantage Estimation to solve the credit assignment problem. The simple advantage function $R_t−V(S_t)$ is too noisy and high-variance. Generalized Advantage Estimation (GAE) is the solution because it provides a stable, low-variance learning signal that still accounts for the long-term consequences of actions, leading to much more efficient and effective training. It has rightly become the standard for modern PPO implementations.
 
 
 ------
