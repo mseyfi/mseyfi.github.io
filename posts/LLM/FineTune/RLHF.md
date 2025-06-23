@@ -197,14 +197,34 @@ With our understanding of the Actor, Critic, and Advantage, we can now fully des
   
   ​**Why is this Ratio so Important?** The goal of PPO is to control the *size* of the policy update. A raw probability doesn't tell you how big of a step you took, but the ratio does. PPO's loss function is designed to directly constrain this ratio. It uses the ratio to ensure that even if an action has a massive advantage, the policy update doesn't become too extreme (e.g., the ratio is not allowed to become 100.0), which would risk destabilizing the entire model.
 
-- **The PPO Loss Function:** The goal is to update the Actor's parameters theta using the Advantage signal, but in a safe way.
+- **The CLIP Loss Function:** The goal is to update the Actor's parameters theta using the Advantage signal, but in a safe way.
   
 $$
-\mathcal{L}_{PPO}(\theta) = \mathbb{E}_t \left[ \min \left( p_t(\theta) A_t, \quad \text{clip}(p_t(\theta), 1 - \epsilon, 1 + \epsilon) A_t \right) \right]
+\mathcal{L}_{CLIP}(\theta) = \mathbb{E}_t \left[ \min \left( p_t(\theta) A_t, \quad \text{clip}(p_t(\theta), 1 - \epsilon, 1 + \epsilon) A_t \right) \right]
 $$
-
 This objective uses the calculated Advantage ($A_t$) to scale the update, while the clip function ensures the policy doesn't change too drastically in a single step, maintaining stability.
 
+ 
+  **The Value Function Loss ($\mathcal{L}^{VF}(\theta)$)** This loss is purely for training the Critic. We need the Critic to be an accurate estimator of future rewards. This loss function simply compares the Critic's prediction to the actual reward received and updates the Critic to be more accurate. A better Critic leads to a better Advantage signal.
+  
+  $$
+  \mathcal{L}^{\text{VF}}(\theta) = \mathbb{E}_t \left[ (V_\theta(s_t) - V_t^{\text{target}})^2 \right]
+  $$
+  
+  **The Entropy Bonus ($S[\pi_\theta]$)** This encourages creativity and prevents the chatbot from becoming a boring, repetitive robot. It adds a small reward for being less certain and more "random" in its choice of words, ensuring it explores different ways of being polite.
+  
+  $$
+  S[\pi_\theta](s_t) = -\sum_{a} \pi_\theta(a|s_t) \log \pi_\theta(a|s_t)
+  $$
+  
+  **Combined Loss Function** The total loss incorporates all components:
+
+  $$
+  \mathcal{L}^{\text{PPO}}(\theta) = \mathbb{E}_t \left[ \mathcal{L}^{\text{CLIP}}(\theta) - c_1 \mathcal{L}^{\text{VF}}(\theta) + c_2 S[\pi_\theta](s_t) \right]
+  $$
+
+  where $c_1$ is the value loss coefficient (e.g., $0.5$) and  $c_2$ is the Entropy coefficient (e.g., $0.01$).
+  
 #### **How the Policy (LLM) is Trained with PPO**
 
 The training loop for PPO is an active, "online" process:
