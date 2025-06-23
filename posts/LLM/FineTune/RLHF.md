@@ -723,7 +723,10 @@ The full response is now generated. We can now calculate the rewards and advanta
 
    * $\hat{A}_4 = \delta_4 = -8.0$
    * $\hat{A}_3 = \delta_3 + (0.99 \times 0.95) \hat{A}_4 = -0.963 + (0.9405 \times -8.0) \approx -8.487$
-   * And so on. Finally, we calculate the Value Target: $V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)$.
+   * And so on. Finally, we calculate the Value Target:
+     $$
+     V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)
+     $$
 
    Let's put the final results in a table. This is the rich dataset we will use for learning.
 
