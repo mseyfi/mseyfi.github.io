@@ -232,7 +232,7 @@ The training loop for PPO is an active, "online" process:
 
 1.  **Rollout:** The current policy (the Actor LLM) generates a batch of responses to a set of prompts.
 2.  **Evaluation:** For each generated token, we calculate the advantage, $A_t$. This requires getting a score from the frozen **Reward Model** and a baseline from the **Critic** model. We also calculate a **KL-penalty** against the frozen SFT **Reference Model** to ensure the LLM doesn't forget its core language skills.
-3.  **Optimization:** We use the trajectories of states, actions, and advantages to compute the PPO loss, $\mathcal{L}_\text{PPO}$.
+3.  **Optimization:** We use the trajectories of states, actions, and advantages to compute the PPO loss, $\mathcal{L}^\text{PPO}$.
 4.  **Backpropagation:** The gradient of this loss is computed with respect to the **Actor's** parameters ($\theta$). This gradient tells the LLM how to adjust its weights to make high-advantage actions more likely and low-advantage actions less likely, all while staying within the safe "clipped" region. The Critic is also updated simultaneously with a simpler mean-squared error loss.
 
 -----
@@ -319,34 +319,34 @@ Our goal is to update the model parameters from theta_old to theta_new.
   1. **Old Probability:** We already stored this: $\pi_{\theta_{old}}(a_0∣S_0)=0.30$.
   2. **New Probability:** before the the first gradient update, the new policy $\pi_{\theta_\text{new}} = \pi_{\theta_\text{old}}$ , should make this action less likely due to the negative advantage. Let's say its new probability is $\pi_{\theta_{\text{new}}}(a_0∣S_0)=0.25$.
   3. **Probability Ratio (p_0(theta)):** $\frac{0.250}{.30}\approx0.833$.
-  4. **PPO Loss ($\mathcal{L_{PPO}}$ for $t=0$):** We use $p_0(\theta)=0.833$ and $A_0=−7.25$. As calculated before, the clipped loss value is $-6.04$.
+  4. **PPO Loss ($\mathcal{L}^{\text{PPO}}$ for $t=0$):** We use $p_0(\theta)=0.833$ and $A_0=−7.25$. As calculated before, the clipped loss value is $-6.04$.
 - **For $t=1$ (Action $a_1$ = "them"):**
   1. **Old Probability:** Let's say we stored $\pi_{\theta_{old}}(a_1∣S_1)=0.50$.
   2. **New Probability:** The update also affects this probability. Let's say $\pi_{\theta_{new}}(a_1∣S_1)=0.45$.
   3. **Probability Ratio ($p_1(\theta)$):** $\frac{0.45}{0.50}=0.9$.
-  4. **PPO Loss ($\mathcal{L}_{PPO}$ for t=1):** We use $p_1(\theta)=0.9$ and $A_1=−6.75$. The clipped loss value is $\min(0.9 * -6.75, \text{clip}(0.9, 0.8, 1.2) * -6.75) = -6.075$.
+  4. **PPO Loss ($\mathcal{L}^\text{PPO}$ for t=1):** We use $p_1(\theta)=0.9$ and $A_1=−6.75$. The clipped loss value is $\min(0.9 * -6.75, \text{clip}(0.9, 0.8, 1.2) * -6.75) = -6.075$.
 
 **Putting it all together: The Total Loss and the Update**
 
 The final loss for the entire sequence is an aggregation of the losses for each token.
 
-- **Total Policy Loss:** The total $\mathcal{L}_{PPO}$ is the mean of the individual token losses: $\text{mean}(−6.04,−6.075,...)$.
+- **Total Policy Loss:** The total $\mathcal{L}^\text{PPO}$ is the mean of the individual token losses: $\text{mean}(−6.04,−6.075,...)$.
 - **Total Value Loss:** The total $\mathcal{L}_{VF}$ is the mean of the squared errors for each state: $\text{mean}((V(S_0)−R)^2,(V(S_1)−R)^2,...)$.
 
 The final loss for the backpropagation step is a weighted sum:
 
 $$
-\mathcal{L}_{total}=\mathcal{L}_{PPO}−c1\cdot \mathcal{L}_{VF}+c2\cdot\mathcal{L}_{\text{entropy}}
+\mathcal{L}_{total}=\mathcal{L}^\text{PPO}−c1\cdot \mathcal{L}^\text{VF}+c2\cdot\mathcal{L}^{\text{entropy}}
 $$
 
-where $\mathcal{L}_{\text{entropy} }$ is an optional term that encourages exploration).
+where $\mathcal{L}^{\text{entropy} }$ is an optional term that encourages exploration).
 
 **How the Two Heads Are Updated**:
 
 When `loss.backward()` is called on $\mathcal{L}_{\text{total}}$, something elegant happens:
 
-1. The gradients from the **Policy Loss $(\mathcal{L}_{PPO})$** flow backward through the shared transformer body and are used to update **only the parameters of the Policy Head**.
-2. The gradients from the **Value Loss ($\mathcal{L}_{VF}$)** flow backward through the shared transformer body and are used to update **only the parameters of the Value Head**.
+1. The gradients from the **Policy Loss $(\mathcal{L}^\text{PPO})$** flow backward through the shared transformer body and are used to update **only the parameters of the Policy Head**.
+2. The gradients from the **Value Loss ($\mathcal{L}^\text{VF}$)** flow backward through the shared transformer body and are used to update **only the parameters of the Value Head**.
 3. The gradients from both losses combine to update the parameters of the **shared Transformer Body**.
 
 This allows the two heads to learn from different objectives while sharing the same powerful, underlying language representation. This process repeats for several inner epochs before we discard this batch of data and start a new "Outer Loop" with a fresh rollout.
