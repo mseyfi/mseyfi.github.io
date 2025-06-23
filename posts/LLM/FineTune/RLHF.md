@@ -750,8 +750,8 @@ We perform one gradient update.
 **Step 1: The Forward Pass**
 We pass the states from our data buffer through the **current** Actor-Critic model to get **new** predictions. Let's say the update from $\theta_{old}$ to $\theta_{new}$ results in these new values for the first timestep ($t=0$):
 
-* **New Log-Prob:** $\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$ (The probability of saying `Your` decreased, as expected from the negative advantage).
-* **New Value Prediction:** $V_{\theta_{new}}(S_0) = -7.5$ (The Critic is getting more accurate, moving from `-1.0` towards the target of `-7.21`).
+* **New Log-Prob:** $$\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$$ (The probability of saying `Your` decreased, as expected from the negative advantage).
+* **New Value Prediction:** $$V_{\theta_{new}}(S_0) = -7.5$$ (The Critic is getting more accurate, moving from `-1.0` towards the target of `-7.21`).
 * **New Entropy:** Let's say the entropy of the new policy distribution is $S=2.5$.
 
 **Step 2: Calculate Each Loss Component (for $t=0$)**
