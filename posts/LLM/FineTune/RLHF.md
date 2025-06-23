@@ -213,9 +213,9 @@ $$
 $$
  
 
-- **The Intuition:** This asks, "How surprising was this one step?" It compares the reward I got *right now* ($r_t$) plus the *predicted value of the next state* ($V(S_{t+1})$) to the *predicted value of my current state* ($V(S_t)$). It's a measure of the immediate "surprise."
+- **The Intuition:** This asks, "How surprising was this one step?" It compares the reward I got *right now* ($r_t$) plus the *predicted value of the next state* $V(S_{t+1})$ to the *predicted value of my current state* $V(S_t)$. It's a measure of the immediate "surprise."
 - **What's right with it? (Low Variance):** This signal is very stable. It's not affected by random, unlucky events that might happen far in the future. It's only concerned with the immediate consequence of an action.
-- **What's wrong with it? (High Bias):** This signal is too myopic. It completely ignores the real future rewards and puts all its trust in the Critic's one-step-ahead prediction ($V(S_{t+1})$). If the Critic is wrong (and early in training, it always is), the TD-error is systematically wrong, or **biased**. It might reward an action that feels good now but leads to a disaster later. It's like praising a player for making a risky pass that happens to be completed, without considering that it was a strategically terrible decision that will fail $99\%$ of the time.
+- **What's wrong with it? (High Bias):** This signal is too myopic. It completely ignores the real future rewards and puts all its trust in the Critic's one-step-ahead prediction $V(S_{t+1})$. If the Critic is wrong (and early in training, it always is), the TD-error is systematically wrong, or **biased**. It might reward an action that feels good now but leads to a disaster later. It's like praising a player for making a risky pass that happens to be completed, without considering that it was a strategically terrible decision that will fail $99\%$ of the time.
 
 **The Solution: Generalized Advantage Estimation (GAE)**
 
