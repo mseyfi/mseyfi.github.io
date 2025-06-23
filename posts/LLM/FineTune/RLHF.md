@@ -73,14 +73,14 @@ where $(x, y)$ is a prompt-response pair from the dataset.
   * **Model Structure and Loss Function:**
 
       * The Reward Model is typically the SFT model with its final vocabulary-prediction head removed and replaced with a single linear head that outputs one scalar value (the reward).
-      * The RM takes a `(prompt, response)` pair and outputs a score, $r\_{\	heta}(x, y)$, where $\	heta$ are the RM's parameters.
+      * The RM takes a `(prompt, response)` pair and outputs a score, $r\_{\theta}(x, y)$, where $\theta$ are the RM's parameters.
       * **The Loss Function:** The goal is for the RM to give a higher score to the chosen response ($y\_w$) than the rejected one ($y\_l$). This is framed as a binary classification problem using the **Bradley-Terry model**, which states that the probability of preferring one over the other is the sigmoid of the difference in their scores. The loss is the negative log-likelihood of these human preferences:
 
 $$
-\mathcal{L}^{RM}(	heta) = - \mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma \left( r_{	heta}(x, y_w) - r_{	heta}(x, y_l) \right) \right]
+\mathcal{L}^{RM}(\theta) = - \mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma \left( r_{\theta}(x, y_w) - r_{\theta}(x, y_l) \right) \right]
 $$
 
-where $D$ is the dataset of preference pairs and $\sigma$ is the sigmoid function. During training, we backpropagate this loss to update the RM's parameters, $	heta$, teaching it to accurately mimic the human labeler's judgment.
+where $D$ is the dataset of preference pairs and $\sigma$ is the sigmoid function. During training, we backpropagate this loss to update the RM's parameters, $\theta$, teaching it to accurately mimic the human labeler's judgment.
 
 At the end of this stage, we have a frozen, reliable "sense of protocol"—a Reward Model that can score any response for its helpfulness and harmlessness.
 
@@ -95,14 +95,14 @@ This is the heart of the PPO algorithm. Before diving into the full PPO process,
 Imagine our diplomat (the LLM) has two minds working together:
 
 1. **The Actor (The Policy, $\pi_\theta$):** This is the part of the brain that **decides what to do**. It looks at the current situation (the state, $S_t$) and chooses an action (generates the next token, $A_t$). The policy *is* the LLM's primary function. Its parameters, $\theta$, are what we want to improve.
-2. **The Critic (The Value Function, $V_	heta$):** This is the part of the brain that **evaluates the situation**. It doesn't decide what to do. Instead, it looks at the current state ($S_t$) and predicts the likely total future reward it can expect to get from this point onwards. It answers the question: "Given the conversation so far, how well are things likely to go from here?" Its parameters are $	heta$.
+2. **The Critic (The Value Function, $V_\theta$):** This is the part of the brain that **evaluates the situation**. It doesn't decide what to do. Instead, it looks at the current state ($S_t$) and predicts the likely total future reward it can expect to get from this point onwards. It answers the question: "Given the conversation so far, how well are things likely to go from here?" Its parameters are $\theta$.
 
 #### **What is the Structure of the LLM? Is it Multi-headed?**
 
 **Yes, exactly.** In the PPO stage of RLHF, the model we are training is typically a single Large Language Model with a shared "body" (the main transformer blocks) and **two separate "heads"**:
 
 1. **The Policy Head (Actor Head):** This is the standard language model head. It takes the final hidden state of a token and outputs logits over the entire vocabulary, defining the probability distribution for the next token. This is what generates the text.
-2. **The Value Head (Critic Head):** This is a new head added to the model. It's usually a simple linear layer that takes the final hidden state of a token and outputs a **single scalar number**. This number is the value estimate, $V_	heta(S_t)$.
+2. **The Value Head (Critic Head):** This is a new head added to the model. It's usually a simple linear layer that takes the final hidden state of a token and outputs a **single scalar number**. This number is the value estimate, $V_\theta(S_t)$.
 
 So, when we perform a forward pass with the LLM during PPO training, we get two outputs simultaneously from the same underlying model representation: an **action probability distribution** from the policy head and an **expected future reward** from the value head. This shared structure is computationally efficient.
 
@@ -140,19 +140,19 @@ Now we can finally understand the Advantage function. Its purpose is to provide 
 The formula is:
 
 $$
-A_t=R_t−V_	heta(S_t)
+A_t=R_t−V_\theta(S_t)
 $$
 
 Let's break this down with our diplomat analogy:
 
 - $S_t$: The state is the current conversation. E.g., "The foreign minister just accused us of espionage."
 - $R_t$: The actual reward received after the diplomat says something. Let's say the Reward Model gives a score of `+5`.
-- $V_	heta(S_t)$: The Critic's prediction. Based on the tense situation, the Critic might have predicted a low expected future reward. It might have thought, "This is a tough spot. On average, we probably only get a reward of `-10` from here." So, $V_	heta(S_t)=−10$.
+- $V_\theta(S_t)$: The Critic's prediction. Based on the tense situation, the Critic might have predicted a low expected future reward. It might have thought, "This is a tough spot. On average, we probably only get a reward of `-10` from here." So, $V_\theta(S_t)=−10$.
 
 Now, let's calculate the advantage:
 
 $$
-A_t=R_t−V_	heta(S_t)=5−(−10)=+15.
+A_t=R_t−V_\theta(S_t)=5−(−10)=+15.
 $$
 
 The interpretation is profound:
@@ -163,7 +163,7 @@ Conversely, if the reward was `+2`, but the Critic expected `+20`, the advantage
 
 The Advantage function creates a **relative, zero-centered learning signal**, which is much more stable and informative for updating the policy than the raw reward alone.
 
-Another example is a teacher that predicts a not very strong student to do not so good in the exam based on the past achievements $V_	heta(S_t) = 60\%$, but the students gets a grade (reward) $R_t=75\%$, although this grade is not that good but it is a huge progress (15 marks above the expectation). This means whatever the student has done is in the right direction and has to be perused. 
+Another example is a teacher that predicts a not very strong student to do not so good in the exam based on the past achievements $V_\theta(S_t) = 60\%$, but the students gets a grade (reward) $R_t=75\%$, although this grade is not that good but it is a huge progress (15 marks above the expectation). This means whatever the student has done is in the right direction and has to be perused. 
 
 ------
 
@@ -173,7 +173,7 @@ With our understanding of the Actor, Critic, and Advantage, we can now fully des
 
 - **The PPO Quartet:** PPO uses four models/components:
   1. **The Actor (Policy $\pi_{\theta}$):** This is the LLM we are actively training (including the first next-token prediction head). It looks at the state and decides on an action (generates the next token). Its parameters, $\theta$, are the only ones being updated by the PPO loss.
-  2. **The Critic (Value Function, $V_	heta$):** This component evaluates the state. As we detailed earlier, it's typically a second "head" on the Actor model. It looks at the current text and predicts the total future reward it expects to receive. It doesn't act; it only judges the situation.
+  2. **The Critic (Value Function, $V_\theta$):** This component evaluates the state. As we detailed earlier, it's typically a second "head" on the Actor model. It looks at the current text and predicts the total future reward it expects to receive. It doesn't act; it only judges the situation.
   3. **The Reward Model (RM):** This model is **frozen**. It was trained in Stage 2. Its only job is to provide the immediate reward signal, $R_t$, for the actions taken by the Actor.
   4. **The Reference Model ($\pi_\text{ref}$):** This is a **frozen** copy of the SFT model from Stage 1. Its purpose is to act as a safety rail. It provides a baseline distribution that we don't want the Actor to stray too far from, preventing it from forgetting its core language capabilities.
 
@@ -262,7 +262,7 @@ For this entire sequence, we record the key information at each timestep $t$:
 - **State ($S_t$):** The text generated so far.
 - **Action ($a_t$):** The token generated at this step.
 - **Log-Probability from $\pi_{\theta_{old}}$:** The log-probability of taking action a_t from state $S_t$.
-- **Critic's Value ($V_	heta(S_t)$):** The Critic's prediction of future reward, looking at state $S_t$.
+- **Critic's Value ($V_\theta(S_t)$):** The Critic's prediction of future reward, looking at state $S_t$.
 
 **Step 3**: Evaluate the Completed Response
 
@@ -308,7 +308,7 @@ The Loss Functions:
 We have two losses to calculate: one for the Policy (Actor) and one for the Value function (Critic).
 
 1. **Policy Loss ($\mathcal{L}_{PPO}$):** This is the clipped surrogate objective we've discussed.
-2. **Value Loss ($\mathcal{L}_{VF}$):** This is a simple Mean Squared Error that trains the Critic to be a better predictor. $\mathcal{L}_{VF} = (V({	heta_{new}}(S_t)) - R)^2 $. It compares the Critic's *new* prediction for a state to the *actual* reward we ended up getting, and tries to minimize the difference.
+2. **Value Loss ($\mathcal{L}_{VF}$):** This is a simple Mean Squared Error that trains the Critic to be a better predictor. $\mathcal{L}_{VF} = (V({\theta_{new}}(S_t)) - R)^2 $. It compares the Critic's *new* prediction for a state to the *actual* reward we ended up getting, and tries to minimize the difference.
 
 **Inner Epoch 1**:
 
