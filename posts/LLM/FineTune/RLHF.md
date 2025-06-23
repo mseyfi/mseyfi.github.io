@@ -289,7 +289,7 @@ With our understanding of the Actor, Critic, and Advantage, we can now fully des
 - **The CLIP Loss Function:** The goal is to update the Actor's parameters theta using the Advantage signal, but in a safe way.
   
   $$
-  \mathcal{L}_{CLIP}(\theta) = \mathbb{E}_t \left[ \min \left( p_t(\theta) A_t, \quad \text{clip}(p_t(\theta), 1 - \epsilon, 1 + \epsilon) A_t \right) \right]
+  \mathcal{L}^\text{CLIP}(\theta) = \mathbb{E}_t \left[ \min \left( p_t(\theta) A_t, \quad \text{clip}(p_t(\theta), 1 - \epsilon, 1 + \epsilon) A_t \right) \right]
   $$
 
 This objective uses the calculated Advantage ($A_t$) to scale the update, while the clip function ensures the policy doesn't change too drastically in a single step, maintaining stability.
