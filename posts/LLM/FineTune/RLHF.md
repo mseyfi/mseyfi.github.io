@@ -681,13 +681,7 @@ The Actor (`SupportBot-v1`) receives the prompt and generates a poor, unempathet
 **Step 2: Record On-the-Fly Data**
 For each token generated, we store the outputs from our models in a buffer.
 
-| t | Action ($a_t$) | State ($S_t$) | $$\log\pi_{\theta_{old}}(a_t|S_t)$$ | $$\log\pi_{ref}(a_t|S_t)$$ | $V_{\theta_{old}}(S_t)$ |
-|---|---|---|---|---|---|
-| 0 | `Your` | `"My order is late..."` | -1.10 | -1.15 | -1.0 |
-| 1 | `order` | `... Your` | -0.50 | -0.50 | -1.5 |
-| 2 | `is` | `... Your order` | -0.70 | -0.72 | -2.0 |
-| 3 | `delayed` | `... Your order is` | -1.40 | -1.55 | -3.0 |
-| 4 | `.` | `... is delayed` | -0.30 | -0.30 | -4.0 |
+![PPO](../../images/Sample_PPO.png)
 
 * **$V_{\theta_{old}}(S_t)$**: The Critic's prediction of future reward. It becomes more negative as the robotic response unfolds, correctly sensing this is not going well.
 
