@@ -309,7 +309,13 @@ The Loss Functions:
 We have two losses to calculate: one for the Policy (Actor) and one for the Value function (Critic).
 
 1. **Policy Loss** ($\mathcal{L}^{\text{CLIP}}$): This is the clipped surrogate objective we've discussed.
-2. **Value Loss** ($\mathcal{L}^{\text{VF}}$): This is a simple Mean Squared Error that trains the Critic to be a better predictor. $\mathcal{L}^{\text{VF}} = (V_{\theta_{new}}(S_t) - R)^2$. It compares the Critic's *new* prediction for a state to the *actual* reward we ended up getting, and tries to minimize the difference.
+2. **Value Loss** ($\mathcal{L}^{\text{VF}}$): This is a simple Mean Squared Error that trains the Critic to be a better predictor.
+
+   $$
+   \mathcal{L}^{\text{VF}} = (V_{\theta_{new}}(S_t) - R)^2
+   $$
+   
+ It compares the Critic's *new* prediction for a state to the *actual* reward we ended up getting, and tries to minimize the difference.
 
 **Inner Epoch 1**:
 
