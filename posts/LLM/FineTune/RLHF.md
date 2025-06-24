@@ -377,8 +377,8 @@ The Actor (`SupportBot-v1`) receives the prompt and generates a poor, unempathet
 For each token generated, we store the outputs from our models in a buffer.
 
 
-| t    | Action ($\small a_t$) | State ($\small S_t$)    | $$\small\log\pi_{\theta_{old}}(a_t|S_t)$$ | $$\small \log\pi_{ref}(a_t|S_t)$$ | $\small V_{\theta_{old}}(S_t)$ |
-| ---- | --------------------- | ----------------------- | ----------------------------------------- | --------------------------------- | ------------------------------ |
+| t    | Action ($\tiny a_t$) | State ($\tiny S_t$)    | $$\tiny\log\pi_{\theta_{old}}(a_t|S_t)$$ | $$\tiny \log\pi_{ref}(a_t|S_t)$$ | $\tiny V_{\theta_{old}}(S_t)$ |
+| ---- | --------------------- | ----------------------- | ------ |------ |------ |
 | 0    | `Your`                | `"My order is late..."` | -1.10                                     | -1.15                             | -1.0                           |
 | 1    | `order`               | `... Your`              | -0.50                                     | -0.50                             | -1.5                           |
 | 2    | `is`                  | `... Your order`        | -0.70                                     | -0.72                             | -2.0                           |
