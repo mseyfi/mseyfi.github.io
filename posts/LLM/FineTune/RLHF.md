@@ -505,6 +505,7 @@ We average the loss components over all 5 tokens in our sequence. Let's assume t
 * Average Entropy $S = 2.4$
 
 Now we plug these into the master equation:
+
 $$
 \small
 \begin{aligned}
@@ -514,6 +515,7 @@ $$
 \end{aligned}
 \normalsize
 $$
+
 **Step 4: Backpropagation and Update**
 This final objective value, `-7.751`, is what we maximize. The optimizer performs gradient ascent (or descent on the negative). The gradient of the $\mathcal{L}^\text{CLIP}$ and $S$ terms updates the **Actor Head and the shared body**. The gradient of the $\mathcal{L}^\text{VF}$ term updates the **Critic Head and the shared body**.
 
