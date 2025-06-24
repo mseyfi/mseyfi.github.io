@@ -380,6 +380,7 @@ For each token generated, we store the outputs from our models in a buffer.
 ![PPO](../../../images/Sample_PPO.png)
 
 
+
 * **$V_{\theta_{old}}(S_t)$**: The Critic's prediction of future reward. It becomes more negative as the robotic response unfolds, correctly sensing this is not going well.
 
 **Step 3: Post-Rollout Analysis - Crafting the Learning Signal**
