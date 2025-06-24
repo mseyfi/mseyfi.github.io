@@ -172,7 +172,7 @@ Conversely, if the reward was `+2`, but the Critic expected `+20`, the advantage
 
 The Advantage function creates a **relative, zero-centered learning signal**, which is much more stable and informative for updating the policy than the raw reward alone.
 
-Another example is a teacher that predicts a not very strong student to do not so good in the exam based on the past achievements $V_\theta(S_t) = 60\%$, but the students gets a grade (reward) $R_t=75\%$, although this grade is not that good but it is a huge progress (15 marks above the expectation). This means whatever the student has done is in the right direction and has to be perused. 
+***Another example is a teacher that predicts a not very strong student to do not so good in the exam based on the past achievements $V_\theta(S_t) = 60\%$, but the students gets a grade (reward) $R_t=75\%$, although this grade is not that good but it is a huge progress (15 marks above the expectation). This means whatever the student has done is in the right direction and has to be pursued.***
 
 ### **The Core Challenge: The Credit Assignment Problem**
 
