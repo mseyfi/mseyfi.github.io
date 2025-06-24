@@ -94,7 +94,8 @@ At the end of this stage, we have a frozen, reliable "sense of protocol"—a Rew
      4. This reward signal is used by an RL algorithm like **PPO (Proximal Policy Optimization)** or **DPO (Direct Preference Optimization)** to calculate a loss.
      5. The gradient of this loss is used to update the parameters, $\theta$, of our policy model.
 - **Objective:** The goal is to adjust the policy's parameters, $\theta$, to maximize the expected reward from the RM. This is almost always done with a regularization term (like a KL penalty) that prevents the policy from drifting too far from the coherent language it learned in the SFT stage, ensuring the diplomat doesn't start speaking gibberish just to get a high score.
-- **The Outcome:** The final, **aligned LLM**. This model has not only been taught *how* to respond but has *learned* what constitutes a *good* response through iterative practice and feedback. It is now the skilled diplomat we set out to train.  
+- **The Outcome:** The final, **aligned LLM**. This model has not only been taught *how* to respond but has *learned* what constitutes a *good* response through iterative practice and feedback. It is now the skilled diplomat we set out to train.
+  
 -----
 
 ### **Part 3: The Actor, the Critic, and the Advantage: A Deeper Look**
