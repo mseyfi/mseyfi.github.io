@@ -409,21 +409,25 @@ First, we calculate the TD-Error
 
 $$
 \begin{aligned}
-\delta_t = R_t + \gamma V(S_{t+1}) - V(S_t) ~~(\text{where}~V(S_5)=0)\\
-\delta_4 = R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0\\
-\delta_3 = R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963\\
-\delta_2 = R_2 + \gamma V(S_3) - V(S_2) = -0.0004 + (0.99 \times -3.0) - (-2.0) = -0.9704\\
-\delta_1 = R_1 + \gamma V(S_2) - V(S_1) = 0 + (0.99 \times -2.0) - (-1.5) = -0.48\\
-\delta_0 = R_0 + \gamma V(S_1) - V(S_0) = -0.001 + (0.99 \times -1.5) - (-1.0) = -0.486
+\delta_t &= R_t + \gamma V(S_{t+1}) - V(S_t) ~~(\text{where}~V(S_5)=0)\\
+\delta_4 &= R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0\\
+\delta_3 &= R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963\\
+\delta_2 &= R_2 + \gamma V(S_3) - V(S_2) = -0.0004 + (0.99 \times -3.0) - (-2.0) = -0.9704\\
+\delta_1 &= R_1 + \gamma V(S_2) - V(S_1) = 0 + (0.99 \times -2.0) - (-1.5) = -0.48\\
+\delta_0 &= R_0 + \gamma V(S_1) - V(S_0) = -0.001 + (0.99 \times -1.5) - (-1.0) = -0.486
 \end{aligned}
 $$
 
 
 Next, we calculate the advantage $$\hat{A}_t = \delta_t + (\gamma\lambda) \hat{A}_{t+1}$$.
-
-* $\hat{A}_4 = \delta_4 = -8.0$
-* $\hat{A}_3 = \delta_3 + (0.99 \times 0.95) \hat{A}_4 = -0.963 + (0.9405 \times -8.0) \approx -8.487$
-* And so on. Finally, we calculate the Value Target: $$V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)$$.
+$$
+\begin{aligned}
+\hat{A}_4 &= \delta_4 = -8.0
+\hat{A}_3 &= \delta_3 + (0.99 \times 0.95) \hat{A}_4 = -0.963 + (0.9405 \times -8.0) \approx -8.487
+\end{aligned}
+$$
+and so on. 
+Finally, we calculate the Value Target: $$V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)$$.
 
 Let's put the final results in a table. This is the rich dataset we will use for learning.
 
