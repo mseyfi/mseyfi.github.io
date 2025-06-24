@@ -427,7 +427,12 @@ $$
 \end{aligned}
 $$
 and so on. 
-Finally, we calculate the Value Target: $$V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)$$.
+
+Finally, we calculate the Value Target: 
+
+$$
+V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)
+$$
 
 Let's put the final results in a table. This is the rich dataset we will use for learning.
 
@@ -483,13 +488,13 @@ We average the loss components over all 5 tokens in our sequence. Let's assume t
 * Average Entropy $S = 2.4$
 
 Now we plug these into the master equation:
-
-$$\mathcal{L}^{\text{PPO}} = \mathcal{L}^\text{CLIP} - c_1 \mathcal{L}^\text{VF} + c_2 S$$
-
-$$\mathcal{L}^{\text{PPO}} = (-7.5) - (0.5 \times 0.55) + (0.01 \times 2.4)$$
-
-$$\mathcal{L}^{\text{PPO}} = -7.5 - 0.275 + 0.024 = \mathbf{-7.751}$$
-
+$$
+\beginh{aligned}
+\mathcal{L}^{\text{PPO}} &= \mathcal{L}^\text{CLIP} - c_1 \mathcal{L}^\text{VF} + c_2 S\\
+\mathcal{L}^{\text{PPO}} &= (-7.5) - (0.5 \times 0.55) + (0.01 \times 2.4)\\
+\mathcal{L}^{\text{PPO}} &= -7.5 - 0.275 + 0.024 = \mathbf{-7.751}
+\end{aligned}
+$$
 **Step 4: Backpropagation and Update**
 This final objective value, `-7.751`, is what we maximize. The optimizer performs gradient ascent (or descent on the negative). The gradient of the $\mathcal{L}^\text{CLIP}$ and $S$ terms updates the **Actor Head and the shared body**. The gradient of the $\mathcal{L}^\text{VF}$ term updates the **Critic Head and the shared body**.
 
@@ -498,6 +503,7 @@ This final objective value, `-7.751`, is what we maximize. The optimizer perform
 The process repeats. We use the **same data** (the same $\hat{A}_t$ and $V_t^{\text{target}}$ values), but our model parameters are now more refined. We do another forward pass, get even better predictions, calculate a new total loss, and update again. This iterative refinement over the same batch of data is what makes PPO stable and efficient.
 
 After a few inner epochs, this entire cycle is complete, and we return to the Outer Loop to generate a fresh batch of experience with our newly improved chatbot.
+
 ---
 ### **Part 6: Field Practice, The Modern Way - DPO**
 
