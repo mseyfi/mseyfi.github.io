@@ -146,9 +146,7 @@ Now we can finally understand the Advantage function. Its purpose is to provide 
 
 **The Problem with Raw Rewards:** Imagine playing a video game where every action gives you points. You end with a high score of 10,000. Does that mean every single action you took was good? Probably not. Some actions might have earned you 5 points when you could have taken a different action to earn 100 points. Just because the final outcome was good doesn't mean every intermediate step was optimal.
 
-**Advantage Provides a Better Signal:** The Advantage function solves this by normalizing the reward. It calculates how much better or worse an action was compared to the average or expected outcome for that situation.
-
-The formula is:
+**Advantage Provides a Better Signal:** The Advantage function solves this by normalizing the reward. It calculates how much better or worse an action was compared to the average or expected outcome for that situation. The formula is:
 
 $$
 A_t=R_t−V_\theta(S_t)
