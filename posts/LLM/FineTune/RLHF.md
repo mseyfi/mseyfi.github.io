@@ -409,6 +409,7 @@ First, we calculate the TD-Error
 
 $$
 \begin{aligned}
+\small
 \delta_t &= R_t + \gamma V(S_{t+1}) - V(S_t) ~~(\text{where}~V(S_5)=0)\\
 \delta_4 &= R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0\\
 \delta_3 &= R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963\\
