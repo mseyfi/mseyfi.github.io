@@ -324,127 +324,183 @@ The training loop for PPO is an active, "online" process:
 4.  **Backpropagation:** The gradient of this loss is computed with respect to the **Actor's** parameters ($\theta$). This gradient tells the LLM how to adjust its weights to make high-advantage actions more likely and low-advantage actions less likely, all while staying within the safe "clipped" region. The Critic is also updated simultaneously with a simpler mean-squared error loss.
 
 -----
-### **Part 5: The Walkthrough: One Full Outer Loop for Toxicity Reduction**
 
-Let's trace a single, complete learning cycle with our chatbot example.
+### **Part 5: The Definitive End-to-End RLHF Walkthrough: Training an Empathetic AI Assistant**
 
-The Goal: Train `ChatBot-v1` to be less toxic.
+#### **Introduction: Beyond Correctness, Towards Empathy**
 
-The Prompt (x): "Write a comeback to someone who called my code inefficient."
+Imagine a customer support chatbot, `SupportBot-v1`. After being fine-tuned on company manuals (`SFT stage`), it can answer factual questions correctly. However, when a user expresses frustration, it responds with cold, robotic, and unhelpful answers. Our goal is to use Reinforcement Learning with Human Feedback (RLHF) to transform it into `SupportBot-v2`, an AI that is not just correct, but also empathetic and genuinely helpful.
 
-#### **OUTER LOOP (Phase 1: Data Collection / "Rollout")**
+This tutorial will provide an exhaustive, step-by-step walkthrough of one complete PPO learning cycle. We will see how the bot handles a real user complaint, how its response is judged, how a learning signal is crafted, and how its neural network is updated.
 
-We begin with our current **Actor-Critic** model, whose policy is $\pi_{\theta_\text{old}}$. We use this policy to generate a response.
+We will follow the canonical PPO objective, which is designed to be **maximized**:
 
-**Step 1**: The Agent Acts (Token by Token)
-
-The Agent generates a toxic response:
-
-`y = "Tell them to learn to code."`
-
-This response consists of 6 actions (generating 6 tokens): $a_0,a_1,a_2,a_3,a_4,a_5$.
-
-**Step 2**: Record the Experience
-
-For this entire sequence, we record the key information at each timestep $t$:
-
-- **State ($S_t$):** The text generated so far.
-- **Action ($a_t$):** The token generated at this step.
-- **Log-Probability from $\pi_{\theta_{old}}$:** The log-probability of taking action a_t from state $S_t$.
-- **Critic's Value ($V_\theta(S_t)$):** The Critic's prediction of future reward, looking at state $S_t$.
-
-**Step 3**: Evaluate the Completed Response
-
-After the full response y is generated, we calculate a single, sequence-level reward.
-
-- **Reward Model Score:** The `ToxicityScorer` (our **RM**) evaluates the full sentence and, because it's toxic, gives a low score: $r(x,y)=−10.0$.
-
-- **KL Penalty**:
-
-   We calculate the divergence from the reference model. Let's say the penalty is $2.5$ With $\beta=0.1$
-
-  , the final reward is:
-
-  - **Final Sequence Reward (R):** $−10.0−(0.1\times2.5)=−10.25$.
-
-**Step 4**: Calculate the Advantage for Every Single Token
-
-Now, we walk back through our generated sequence and calculate the advantage for each step. The advantage tells us how good the action at that step was, given the final outcome. For simplicity here, we will use the same final reward R for every step's calculation.
-
-- **For $t=0$ (Action $a_0$ = "Tell"):**
-  - $S_0$: `"Write a comeback..."`
-  - The Critic looked at $S_0$ and predicted $V(S_0)=−3.0$.
-  - **Equation:** $A_0=R−V(S_0)$
-  - **Calculation:** $A_0=−10.25−(−3.0)=−7.25$
-- **For $t=1$ (Action $a_1$ = "them"):**
-  - $S_1$: `"Write a comeback..." Tell`
-  - The state has changed. The Critic now looks at this new state and makes a new prediction. Perhaps it thinks the situation is slightly worse now. Let's say it predicts $V(S_1)=−3.5.$
-  - **Equation:** $A_1=R−V(S_1)$
-  - **Calculation:** $A_1=−10.25−(−3.5)=−6.75$
-
-This process continues for all 6 tokens. We now have an advantage value $(A_0,A_1,...,A_5)$ for every action taken.
-
-**End of Outer Loop Phase 1.** We have a rich dataset of `(State, Action, LogProb_old, Value, Advantage)` for every token in our generated sequence.
-
-------
-
-#### **INNER LOOP (Phase 2: Optimization)**
-
-Now we learn from this collected data. We will perform multiple gradient updates using this *same* batch of experience. Let's focus on the first two tokens.
-
-The Loss Functions:
-
-We have two losses to calculate: one for the Policy (Actor) and one for the Value function (Critic).
-
-1. **Policy Loss** ($\mathcal{L}^{\text{CLIP}}$): This is the clipped surrogate objective we've discussed.
-2. **Value Loss** ($\mathcal{L}^{\text{VF}}$): This is a simple Mean Squared Error that trains the Critic to be a better predictor.
-
-   $$
-   \mathcal{L}^{\text{VF}} = (V_{\theta_{new}}(S_t) - R)^2
-   $$
-   
- It compares the Critic's *new* prediction for a state to the *actual* reward we ended up getting, and tries to minimize the difference.
-
-**Inner Epoch 1**:
-
-Our goal is to update the model parameters from theta_old to theta_new.
-
-- **For $t=0$ (Action $a_0$ = "Tell"):**
-  1. **Old Probability:** We already stored this: $\pi_{\theta_{old}}(a_0∣S_0)=0.30$.
-  2. **New Probability:** before the the first gradient update, the new policy $\pi_{\theta_\text{new}} = \pi_{\theta_\text{old}}$ , should make this action less likely due to the negative advantage. Let's say its new probability is $\pi_{\theta_{\text{new}}}(a_0∣S_0)=0.25$.
-  3. **Probability Ratio (p_0(theta)):** $\frac{0.250}{.30}\approx0.833$.
-  4. **PPO Loss ($\mathcal{L}^{\text{PPO}}$ for $t=0$):** We use $p_0(\theta)=0.833$ and $A_0=−7.25$. As calculated before, the clipped loss value is $-6.04$.
-- **For $t=1$ (Action $a_1$ = "them"):**
-  1. **Old Probability:** Let's say we stored $\pi_{\theta_{old}}(a_1∣S_1)=0.50$.
-  2. **New Probability:** The update also affects this probability. Let's say $\pi_{\theta_{new}}(a_1∣S_1)=0.45$.
-  3. **Probability Ratio ($p_1(\theta)$):** $\frac{0.45}{0.50}=0.9$.
-  4. **PPO Loss ($\mathcal{L}^\text{PPO}$ for t=1):** We use $p_1(\theta)=0.9$ and $A_1=−6.75$. The clipped loss value is $\min(0.9 * -6.75, \text{clip}(0.9, 0.8, 1.2) * -6.75) = -6.075$.
-
-**Putting it all together: The Total Loss and the Update**
-
-The final loss for the entire sequence is an aggregation of the losses for each token.
-
-- **Total Policy Loss:** The total $\mathcal{L}^\text{PPO}$ is the mean of the individual token losses: $\text{mean}(−6.04,−6.075,...)$.
-- **Total Value Loss:** The total $\mathcal{L}_{VF}$ is the mean of the squared errors for each state: $\text{mean}((V(S_0)−R)^2,(V(S_1)−R)^2,...)$.
-
-The final loss for the backpropagation step is a weighted sum:
 
 $$
-\mathcal{L}_{total}=\mathcal{L}^\text{PPO}−c1\cdot \mathcal{L}^\text{VF}+c2\cdot\mathcal{L}^{\text{entropy}}
+\mathcal{L}^{\text{PPO}}(\theta) = \hat{\mathbb{E}}_t \left[ \mathcal{L}^{\text{CLIP}}(\theta) - c_1 \mathcal{L}^{\text{VF}}(\theta) + c_2 S[\pi_\theta](s_t) \right]
 $$
 
-where $\mathcal{L}^{\text{entropy} }$ is an optional term that encourages exploration).
 
-**How the Two Heads Are Updated**:
+We will calculate each component—the policy loss ($\mathcal{L}^\text{CLIP}$), the value loss ($\mathcal{L}^\text{VF}$), and the entropy bonus ($S$)—numerically.
 
-When `loss.backward()` is called on $\mathcal{L}_{\text{total}}$, something elegant happens:
+---
 
-1. The gradients from the **Policy Loss $(\mathcal{L}^\text{PPO})$** flow backward through the shared transformer body and are used to update **only the parameters of the Policy Head**.
-2. The gradients from the **Value Loss ($\mathcal{L}^\text{VF}$)** flow backward through the shared transformer body and are used to update **only the parameters of the Value Head**.
-3. The gradients from both losses combine to update the parameters of the **shared Transformer Body**.
+### **Part A: The Setup - The Models and the Mission**
 
-This allows the two heads to learn from different objectives while sharing the same powerful, underlying language representation. This process repeats for several inner epochs before we discard this batch of data and start a new "Outer Loop" with a fresh rollout.
+#### **The Cast of Models**
 
+Our training process requires four key components:
+
+1.  **The Actor-Critic LLM ($\pi_{\theta}, V_{\theta}$):** This is our `SupportBot-v1`, the model we are actively training. It is a single transformer model with two output heads:
+    * **The Actor (Policy Head):** This is the standard language model head. It **acts** by producing a probability distribution over the vocabulary to generate the next token.
+    * **The Critic (Value Head):** This is a simple linear layer that **evaluates** by outputting a single number estimating the future rewards from the current state.
+2.  **The Reward Model (RM):** A frozen, pre-trained `EmpathyScorer`. It has been trained on human preference data to give high scores to empathetic and helpful responses and low (negative) scores to unhelpful ones.
+3.  **The Reference Model ($\pi_{ref}$):** A frozen, exact copy of the original SFT-trained `SupportBot-v1`. It acts as a guardrail to ensure the bot's grammar and coherence remain intact.
+
+#### **The Scenario and Hyperparameters**
+
+* **Prompt ($x$):** A frustrated user says, `"My order is late again! This is unacceptable."`
+* **Hyperparameters:**
+  * PPO Clip ($\epsilon$): `0.2`
+  * Value Loss Coefficient ($c_1$): `0.5`
+  * Entropy Coefficient ($c_2$): `0.01`
+  * KL Penalty Coefficient ($\beta$): `0.02`
+  * Discount Factor ($\gamma$): `0.99`
+  * GAE Lambda ($\lambda$): `0.95`
+
+---
+
+### **Part B: The Outer Loop - A Live Support Ticket (Data Collection)**
+
+The "Outer Loop" is one cycle of generating experience. Our current agent, $\pi_{\theta_{old}}$, interacts with the user and we record everything that happens.
+
+**Step 1: The Rollout**
+The Actor (`SupportBot-v1`) receives the prompt and generates a poor, unempathetic response:
+
+* **Response ($y$):** `"Your order is delayed."` (4 tokens)
+
+**Step 2: Record On-the-Fly Data**
+For each token generated, we store the outputs from our models in a buffer.
+
+![PPO](../../../images/Sample_PPO.png)
+
+* **$V_{\theta_{old}}(S_t)$**: The Critic's prediction of future reward. It becomes more negative as the robotic response unfolds, correctly sensing this is not going well.
+
+**Step 3: Post-Rollout Analysis - Crafting the Learning Signal**
+The full response is now generated. We can now calculate the rewards and advantages for our recorded experience.
+
+**Get Extrinsic Reward:** The `EmpathyScorer` (RM) evaluates the full response. It's unhelpful and lacks empathy.
+
+* We assign this reward to the final step: $r_4 = -12.0$. All other rewards $r_0, r_1, r_2, r_3 = 0$.
+
+**Calculate the Full Reward Signal ($R_t$):** The reward signal used for learning is the extrinsic reward from the RM minus the KL penalty at each step. 
+
+
+
+* $R_t = r_t - \beta(\log\pi_{\theta_{old}} - \log\pi_{ref})$.
+
+* $R_0 = 0 - (0.02 \times (-1.10 - (-1.15))) = 0 - (0.02 \times 0.05) = -0.001$
+
+* $R_1 = 0 - (0.02 \times (-0.50 - (-0.50))) = 0$
+
+* $R_2 = 0 - (0.02 \times (-0.70 - (-0.72))) = -0.0004$
+
+* $R_3 = 0 - (0.02 \times (-1.40 - (-1.55))) = -0.003$
+
+* $R_4 = -12.0 - (0.02 \times (-0.30 - (-0.30))) = -12.0$
+
+  
+
+**Calculate GAE Advantage ($\hat{A}_t$) and Value Targets ($V_t^{\text{target}}$):** We now work backward from the end to perform credit assignment.
+
+First, we calculate the TD-Error
+
+
+
+* $\delta_t = R_t + \gamma V(S_{t+1}) - V(S_t) ~~(\text{where}~V(S_5)=0)$
+* $\delta_4 = R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0$
+* $\delta_3 = R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963$
+* $\delta_2 = R_2 + \gamma V(S_3) - V(S_2) = -0.0004 + (0.99 \times -3.0) - (-2.0) = -0.9704$
+* $\delta_1 = R_1 + \gamma V(S_2) - V(S_1) = 0 + (0.99 \times -2.0) - (-1.5) = -0.48$
+* $\delta_0 = R_0 + \gamma V(S_1) - V(S_0) = -0.001 + (0.99 \times -1.5) - (-1.0) = -0.486$
+
+
+
+Next, we calculate the advantage $\hat{A}_t = \delta_t + (\gamma\lambda) \hat{A}_{t+1}$.
+
+* $\hat{A}_4 = \delta_4 = -8.0$
+* $\hat{A}_3 = \delta_3 + (0.99 \times 0.95) \hat{A}_4 = -0.963 + (0.9405 \times -8.0) \approx -8.487$
+* And so on. Finally, we calculate the Value Target: $$V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)$$.
+
+Let's put the final results in a table. This is the rich dataset we will use for learning.
+
+| t    | Action ($a_t$) | Advantage ($\hat{A}_t$) | Value Target ($V_t^{\text{target}}$) |
+| ---- | -------------- | ----------------------- | ------------------------------------ |
+| 0    | `Your`         | -8.21                   | -7.21                                |
+| 1    | `order`        | -7.70                   | -6.20                                |
+| 2    | `is`           | -8.05                   | -6.05                                |
+| 3    | `delayed`      | -8.49                   | -5.49                                |
+| 4    | `.`            | -8.00                   | -4.00                                |
+
+**The Outer Loop is complete.** We now enter the Inner Loop.
+
+---
+
+### **Part C: The Inner Loop - The Training Session**
+
+We now take our fully processed batch of data and learn from it for several epochs. The `old` policy ($\pi_{\theta_{old}}$) and the `Advantage` values are now fixed constants for this entire phase.
+
+#### **Inner Loop: Epoch 1**
+
+We perform one gradient update.
+
+**Step 1: The Forward Pass**
+We pass the states from our data buffer through the **current** Actor-Critic model to get **new** predictions. Let's say the update from $\theta_{old}$ to $\theta_{new}$ results in these new values for the first timestep ($t=0$):
+
+* **New Log-Prob:** $\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$ 
+(The probability of saying `Your` decreased, as expected from the negative advantage).
+
+* **New Value Prediction:** $V_{\theta_{new}}(S_0) = -7.5$ 
+(The Critic is getting more accurate, moving from $-1.0$ towards the target of $-7.21$).
+
+* **New Entropy:** Let's say the entropy of the new policy distribution is $S=2.5$.
+
+**Step 2: Calculate Each Loss Component (for $t=0$)**
+
+1.  **Policy Loss ($\mathcal{L}^\text{CLIP}_0$):**
+    * **Probability Ratio ($r_0(\theta)$):** $\exp(\text{new\_log\_prob} - \text{old\_log\_prob}) = \exp(-1.45 - (-1.10)) = \exp(-0.35) \approx 0.705$.
+    * **Clipped Objective:** The clipping range is $[0.8, 1.2]$. Our ratio `0.705` is outside this.
+      * Unclipped: $0.705 \times (-8.21) = -5.78$
+      * Clipped: The ratio is clipped to `0.8`. So, $0.8 \times (-8.21) = -6.57$
+      * $\mathcal{L}_0^\text{CLIP} = \min(-5.78, -6.57) = -6.57$.
+
+2.  **Value Function Loss ($\mathcal{L}^\text{VF}_0$):**
+
+$$\mathcal{L}_0^\text{VF} = (V_{\theta_{new}}(S_0) - V_0^{\text{target}})^2 = (-7.5 - (-7.21))^2 = (-0.29)^2 = 0.0841$$
+
+**Step 3: Calculate the Final Objective**
+We average the loss components over all 5 tokens in our sequence. Let's assume the averages are:
+
+* Average $\mathcal{L}^\text{CLIP} = -7.5$
+* Average $\mathcal{L}^\text{VF} = 0.55$
+* Average Entropy $S = 2.4$
+
+Now we plug these into the master equation:
+
+$$\mathcal{L}^{\text{PPO}} = \mathcal{L}^\text{CLIP} - c_1 \mathcal{L}^\text{VF} + c_2 S$$
+
+$$\mathcal{L}^{\text{PPO}} = (-7.5) - (0.5 \times 0.55) + (0.01 \times 2.4)$$
+
+$$\mathcal{L}^{\text{PPO}} = -7.5 - 0.275 + 0.024 = \mathbf{-7.751}$$
+
+**Step 4: Backpropagation and Update**
+This final objective value, `-7.751`, is what we maximize. The optimizer performs gradient ascent (or descent on the negative). The gradient of the $\mathcal{L}^\text{CLIP}$ and $S$ terms updates the **Actor Head and the shared body**. The gradient of the $\mathcal{L}^\text{VF}$ term updates the **Critic Head and the shared body**.
+
+#### **Inner Loop: Epoch 2**
+
+The process repeats. We use the **same data** (the same $\hat{A}_t$ and $V_t^{\text{target}}$ values), but our model parameters are now more refined. We do another forward pass, get even better predictions, calculate a new total loss, and update again. This iterative refinement over the same batch of data is what makes PPO stable and efficient.
+
+After a few inner epochs, this entire cycle is complete, and we return to the Outer Loop to generate a fresh batch of experience with our newly improved chatbot.
 ---
 ### **Part 6: Field Practice, The Modern Way - DPO**
 
@@ -481,7 +537,7 @@ DPO is faster, more stable, and requires only two models (the policy being train
 
 -----
 
-### **Part 5: Backpropagation - The Engine of Learning**
+### **Part 7: Backpropagation - The Engine of Learning**
 
 How does the model *actually* learn from these loss functions? The answer is backpropagation, driven by gradient descent.
 
@@ -495,7 +551,7 @@ How does the model *actually* learn from these loss functions? The answer is bac
 
 -----
 
-### **Part 6: The Complete Workflow and Code**
+### **Part 8: The Complete Workflow and Code**
 
 #### **Full Training Pipeline (DPO-centric)**
 
@@ -619,181 +675,4 @@ dpo_trainer.train()
 
 
 
-
-### **The Definitive End-to-End RLHF Walkthrough: Training an Empathetic AI Assistant**
-
-#### **Introduction: Beyond Correctness, Towards Empathy**
-
-Imagine a customer support chatbot, `SupportBot-v1`. After being fine-tuned on company manuals (`SFT stage`), it can answer factual questions correctly. However, when a user expresses frustration, it responds with cold, robotic, and unhelpful answers. Our goal is to use Reinforcement Learning with Human Feedback (RLHF) to transform it into `SupportBot-v2`, an AI that is not just correct, but also empathetic and genuinely helpful.
-
-This tutorial will provide an exhaustive, step-by-step walkthrough of one complete PPO learning cycle. We will see how the bot handles a real user complaint, how its response is judged, how a learning signal is crafted, and how its neural network is updated.
-
-We will follow the canonical PPO objective, which is designed to be **maximized**:
-
-
-$$
-\mathcal{L}^{\text{PPO}}(\theta) = \hat{\mathbb{E}}_t \left[ \mathcal{L}^{\text{CLIP}}(\theta) - c_1 \mathcal{L}^{\text{VF}}(\theta) + c_2 S[\pi_\theta](s_t) \right]
-$$
-
-
-We will calculate each component—the policy loss ($\mathcal{L}^\text{CLIP}$), the value loss ($\mathcal{L}^\text{VF}$), and the entropy bonus ($S$)—numerically.
-
----
-
-### **Part 1: The Setup - The Models and the Mission**
-
-#### **The Cast of Models**
-
-Our training process requires four key components:
-
-1.  **The Actor-Critic LLM ($\pi_{\theta}, V_{\theta}$):** This is our `SupportBot-v1`, the model we are actively training. It is a single transformer model with two output heads:
-    * **The Actor (Policy Head):** This is the standard language model head. It **acts** by producing a probability distribution over the vocabulary to generate the next token.
-    * **The Critic (Value Head):** This is a simple linear layer that **evaluates** by outputting a single number estimating the future rewards from the current state.
-2.  **The Reward Model (RM):** A frozen, pre-trained `EmpathyScorer`. It has been trained on human preference data to give high scores to empathetic and helpful responses and low (negative) scores to unhelpful ones.
-3.  **The Reference Model ($\pi_{ref}$):** A frozen, exact copy of the original SFT-trained `SupportBot-v1`. It acts as a guardrail to ensure the bot's grammar and coherence remain intact.
-
-#### **The Scenario and Hyperparameters**
-
-* **Prompt ($x$):** A frustrated user says, `"My order is late again! This is unacceptable."`
-* **Hyperparameters:**
-  * PPO Clip ($\epsilon$): `0.2`
-  * Value Loss Coefficient ($c_1$): `0.5`
-  * Entropy Coefficient ($c_2$): `0.01`
-  * KL Penalty Coefficient ($\beta$): `0.02`
-  * Discount Factor ($\gamma$): `0.99`
-  * GAE Lambda ($\lambda$): `0.95`
-
----
-
-### **Part 2: The Outer Loop - A Live Support Ticket (Data Collection)**
-
-The "Outer Loop" is one cycle of generating experience. Our current agent, $\pi_{\theta_{old}}$, interacts with the user and we record everything that happens.
-
-**Step 1: The Rollout**
-The Actor (`SupportBot-v1`) receives the prompt and generates a poor, unempathetic response:
-
-* **Response ($y$):** `"Your order is delayed."` (4 tokens)
-
-**Step 2: Record On-the-Fly Data**
-For each token generated, we store the outputs from our models in a buffer.
-
-![PPO](../../../images/Sample_PPO.png)
-
-* **$V_{\theta_{old}}(S_t)$**: The Critic's prediction of future reward. It becomes more negative as the robotic response unfolds, correctly sensing this is not going well.
-
-**Step 3: Post-Rollout Analysis - Crafting the Learning Signal**
-The full response is now generated. We can now calculate the rewards and advantages for our recorded experience.
-
-**Get Extrinsic Reward:** The `EmpathyScorer` (RM) evaluates the full response. It's unhelpful and lacks empathy.
-
-* We assign this reward to the final step: $r_4 = -12.0$. All other rewards $r_0, r_1, r_2, r_3 = 0$.
-
-**Calculate the Full Reward Signal ($R_t$):** The reward signal used for learning is the extrinsic reward from the RM minus the KL penalty at each step. 
-
-
-
-* $R_t = r_t - \beta(\log\pi_{\theta_{old}} - \log\pi_{ref})$.
-
-* $R_0 = 0 - (0.02 \times (-1.10 - (-1.15))) = 0 - (0.02 \times 0.05) = -0.001$
-
-* $R_1 = 0 - (0.02 \times (-0.50 - (-0.50))) = 0$
-
-* $R_2 = 0 - (0.02 \times (-0.70 - (-0.72))) = -0.0004$
-
-* $R_3 = 0 - (0.02 \times (-1.40 - (-1.55))) = -0.003$
-
-* $R_4 = -12.0 - (0.02 \times (-0.30 - (-0.30))) = -12.0$
-
-  
-
-**Calculate GAE Advantage ($\hat{A}_t$) and Value Targets ($V_t^{\text{target}}$):** We now work backward from the end to perform credit assignment.
-
-First, we calculate the TD-Error
-
-
-
-* $\delta_t = R_t + \gamma V(S_{t+1}) - V(S_t) ~~(\text{where}~V(S_5)=0)$
-* $\delta_4 = R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0$
-* $\delta_3 = R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963$
-* $\delta_2 = R_2 + \gamma V(S_3) - V(S_2) = -0.0004 + (0.99 \times -3.0) - (-2.0) = -0.9704$
-* $\delta_1 = R_1 + \gamma V(S_2) - V(S_1) = 0 + (0.99 \times -2.0) - (-1.5) = -0.48$
-* $\delta_0 = R_0 + \gamma V(S_1) - V(S_0) = -0.001 + (0.99 \times -1.5) - (-1.0) = -0.486$
-
-
-
-Next, we calculate the advantage $\hat{A}_t = \delta_t + (\gamma\lambda) \hat{A}_{t+1}$.
-
-* $\hat{A}_4 = \delta_4 = -8.0$
-* $\hat{A}_3 = \delta_3 + (0.99 \times 0.95) \hat{A}_4 = -0.963 + (0.9405 \times -8.0) \approx -8.487$
-* And so on. Finally, we calculate the Value Target: $V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)$.
-
-Let's put the final results in a table. This is the rich dataset we will use for learning.
-
-| t    | Action ($a_t$) | Advantage ($\hat{A}_t$) | Value Target ($V_t^{\text{target}}$) |
-| ---- | -------------- | ----------------------- | ------------------------------------ |
-| 0    | `Your`         | -8.21                   | -7.21                                |
-| 1    | `order`        | -7.70                   | -6.20                                |
-| 2    | `is`           | -8.05                   | -6.05                                |
-| 3    | `delayed`      | -8.49                   | -5.49                                |
-| 4    | `.`            | -8.00                   | -4.00                                |
-
-**The Outer Loop is complete.** We now enter the Inner Loop.
-
----
-
-### **Part 3: The Inner Loop - The Training Session**
-
-We now take our fully processed batch of data and learn from it for several epochs. The `old` policy ($\pi_{\theta_{old}}$) and the `Advantage` values are now fixed constants for this entire phase.
-
-#### **Inner Loop: Epoch 1**
-
-We perform one gradient update.
-
-**Step 1: The Forward Pass**
-We pass the states from our data buffer through the **current** Actor-Critic model to get **new** predictions. Let's say the update from $\theta_{old}$ to $\theta_{new}$ results in these new values for the first timestep ($t=0$):
-
-**New Log-Prob:** $\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$ 
-(The probability of saying `Your` decreased, as expected from the negative advantage).
-
-**New Value Prediction:** $V_{\theta_{new}}(S_0) = -7.5$ 
-(The Critic is getting more accurate, moving from $-1.0$ towards the target of $-7.21$).
-
-**New Entropy:** Let's say the entropy of the new policy distribution is $S=2.5$.
-
-**Step 2: Calculate Each Loss Component (for $t=0$)**
-
-1.  **Policy Loss ($\mathcal{L}^\text{CLIP}_0$):**
-    * **Probability Ratio ($r_0(\theta)$):** $\exp(\text{new\_log\_prob} - \text{old\_log\_prob}) = \exp(-1.45 - (-1.10)) = \exp(-0.35) \approx 0.705$.
-    * **Clipped Objective:** The clipping range is $[0.8, 1.2]$. Our ratio `0.705` is outside this.
-      * Unclipped: $0.705 \times (-8.21) = -5.78$
-      * Clipped: The ratio is clipped to `0.8`. So, $0.8 \times (-8.21) = -6.57$
-      * $\mathcal{L}_0^\text{CLIP} = \min(-5.78, -6.57) = -6.57$.
-
-2.  **Value Function Loss ($\mathcal{L}^\text{VF}_0$):**
-
-$$\mathcal{L}_0^\text{VF} = (V_{\theta_{new}}(S_0) - V_0^{\text{target}})^2 = (-7.5 - (-7.21))^2 = (-0.29)^2 = 0.0841$$
-
-**Step 3: Calculate the Final Objective**
-We average the loss components over all 5 tokens in our sequence. Let's assume the averages are:
-
-* Average $\mathcal{L}^\text{CLIP} = -7.5$
-* Average $\mathcal{L}^\text{VF} = 0.55$
-* Average Entropy $S = 2.4$
-
-Now we plug these into the master equation:
-
-$$\mathcal{L}^{\text{PPO}} = \mathcal{L}^\text{CLIP} - c_1 \mathcal{L}^\text{VF} + c_2 S$$
-
-$$\mathcal{L}^{\text{PPO}} = (-7.5) - (0.5 \times 0.55) + (0.01 \times 2.4)$$
-
-$$\mathcal{L}^{\text{PPO}} = -7.5 - 0.275 + 0.024 = \mathbf{-7.751}$$
-
-**Step 4: Backpropagation and Update**
-This final objective value, `-7.751`, is what we maximize. The optimizer performs gradient ascent (or descent on the negative). The gradient of the $\mathcal{L}^\text{CLIP}$ and $S$ terms updates the **Actor Head and the shared body**. The gradient of the $\mathcal{L}^\text{VF}$ term updates the **Critic Head and the shared body**.
-
-#### **Inner Loop: Epoch 2**
-
-The process repeats. We use the **same data** (the same $\hat{A}_t$ and $V_t^{\text{target}}$ values), but our model parameters are now more refined. We do another forward pass, get even better predictions, calculate a new total loss, and update again. This iterative refinement over the same batch of data is what makes PPO stable and efficient.
-
-After a few inner epochs, this entire cycle is complete, and we return to the Outer Loop to generate a fresh batch of experience with our newly improved chatbot.
 
