@@ -408,8 +408,8 @@ First, we calculate the TD-Error
 
 
 $$
-\begin{aligned}
 \small
+\begin{aligned}
 \delta_t &= R_t + \gamma V(S_{t+1}) - V(S_t) ~~(\text{where}~V(S_5)=0)\\
 \delta_4 &= R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0\\
 \delta_3 &= R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963\\
@@ -417,9 +417,10 @@ $$
 \delta_1 &= R_1 + \gamma V(S_2) - V(S_1) = 0 + (0.99 \times -2.0) - (-1.5) = -0.48\\
 \delta_0 &= R_0 + \gamma V(S_1) - V(S_0) = -0.001 + (0.99 \times -1.5) - (-1.0) = -0.486
 \end{aligned}
+\normalsize
 $$
 
-
+XXX
 Next, we calculate the advantage $$\hat{A}_t = \delta_t + (\gamma\lambda) \hat{A}_{t+1}$$.
 $$
 \begin{aligned}
