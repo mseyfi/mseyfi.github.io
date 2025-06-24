@@ -770,7 +770,8 @@ We pass the states from our data buffer through the **current** Actor-Critic mod
       * $\mathcal{L}_0^\text{CLIP} = \min(-5.78, -6.57) = -6.57$.
 
 2.  **Value Function Loss ($\mathcal{L}^\text{VF}_0$):**
-    * $\mathcal{L}_0^\text{VF} = (V_{\theta_{new}}(S_0) - V_0^{\text{target}})^2 = (-7.5 - (-7.21))^2 = (-0.29)^2 = 0.0841$.
+
+$$\mathcal{L}_0^\text{VF} = (V_{\theta_{new}}(S_0) - V_0^{\text{target}})^2 = (-7.5 - (-7.21))^2 = (-0.29)^2 = 0.0841$$
 
 **Step 3: Calculate the Final Objective**
 We average the loss components over all 5 tokens in our sequence. Let's assume the averages are:
@@ -783,7 +784,7 @@ Now we plug these into the master equation:
 
 $$\mathcal{L}^{\text{PPO}} = \mathcal{L}^\text{CLIP} - c_1 \mathcal{L}^\text{VF} + c_2 S$$
 
-$\mathcal{L}^{\text{PPO}} = (-7.5) - (0.5 \times 0.55) + (0.01 \times 2.4)$$$
+$$\mathcal{L}^{\text{PPO}} = (-7.5) - (0.5 \times 0.55) + (0.01 \times 2.4)$$
 
 $$\mathcal{L}^{\text{PPO}} = -7.5 - 0.275 + 0.024 = \mathbf{-7.751}$$
 
