@@ -712,7 +712,7 @@ First, we calculate the TD-Error
 
 
 
-* $$\delta_t = R_t + \gamma V(S_{t+1}) - V(S_t) \quad(\text{where}~V(S_5)=0)$$
+* $$\delta_t = R_t + \gamma V(S_{t+1}) - V(S_t) ~~(\text{where}~V(S_5)=0)$$
 * $\delta_4 = R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0$
 * $\delta_3 = R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963$
 * $\delta_2 = R_2 + \gamma V(S_3) - V(S_2) = -0.0004 + (0.99 \times -3.0) - (-2.0) = -0.9704$
@@ -750,11 +750,13 @@ We now take our fully processed batch of data and learn from it for several epoc
 We perform one gradient update.
 
 **Step 1: The Forward Pass**
-We pass the states from our data buffer through the **current** Actor-Critic model to get **new** predictions. Let's say the update from $\theta_{old}$ to $\theta_{new}$ results in these new values for the first timestep ($t=0$):.
+We pass the states from our data buffer through the **current** Actor-Critic model to get **new** predictions. Let's say the update from $\theta_{old}$ to $\theta_{new}$ results in these new values for the first timestep ($t=0$):
 
-- **New Log-Prob:** $\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$ (The probability of saying `Your` decreased, as expected from the negative advantage).
-- **New Value Prediction:** $V_{\theta_{new}}(S_0) = -7.5$ (The Critic is getting more accurate, moving from `-1.0` towards the target of $-7.21$).
-- **New Entropy:** Let's say the entropy of the new policy distribution is $S=2.5$.
+**New Log-Prob:** $\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$ (The probability of saying `Your` decreased, as expected from the negative advantage).
+
+**New Value Prediction:** $V_{\theta_{new}}(S_0) = -7.5$ (The Critic is getting more accurate, moving from `-1.0` towards the target of $-7.21$).
+
+**New Entropy:** Let's say the entropy of the new policy distribution is $S=2.5$.
 
 **Step 2: Calculate Each Loss Component (for $t=0$)**
 
