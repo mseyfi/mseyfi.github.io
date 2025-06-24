@@ -393,14 +393,15 @@ The full response is now generated. We can now calculate the rewards and advanta
 
 $$
 \begin{matrix}
-R_t &=& r_t - \beta(\log\pi_{\theta_{old}} - \log\pi_{ref})\\
-R_0 &=& 0 - (0.02 \times (-1.10 - (-1.15))) = 0 - (0.02 \times 0.05) = -0.001\\
-R_1 &=& 0 - (0.02 \times (-0.50 - (-0.50))) = 0\\
-R_2 &=& 0 - (0.02 \times (-0.70 - (-0.72))) = -0.0004\\
-R_3 &=& 0 - (0.02 \times (-1.40 - (-1.55))) = -0.003\\
-R_4 &=& -12.0 - (0.02 \times (-0.30 - (-0.30))) = -12.0
+R_t = r_t - \beta(\log\pi_{\theta_{old}} - \log\pi_{ref})\\
+R_0 = 0 - (0.02 \times (-1.10 - (-1.15))) = 0 - (0.02 \times 0.05) = -0.001\\
+R_1 = 0 - (0.02 \times (-0.50 - (-0.50))) = 0\\
+R_2 = 0 - (0.02 \times (-0.70 - (-0.72))) = -0.0004\\
+R_3 = 0 - (0.02 \times (-1.40 - (-1.55))) = -0.003\\
+R_4 = -12.0 - (0.02 \times (-0.30 - (-0.30))) = -12.0
 \end{matrix}
 $$
+
 **Calculate GAE Advantage ($\hat{A}_t$) and Value Targets ($V_t^{\text{target}}$):** We now work backward from the end to perform credit assignment.
 
 First, we calculate the TD-Error
