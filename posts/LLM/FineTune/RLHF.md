@@ -620,14 +620,6 @@ dpo_trainer.train()
 
 
 
-
-
-
-
-
-
-
-
 ### **The Definitive End-to-End RLHF Walkthrough: Training an Empathetic AI Assistant**
 
 #### **Introduction: Beyond Correctness, Towards Empathy**
@@ -662,7 +654,7 @@ Our training process requires four key components:
 
 #### **The Scenario and Hyperparameters**
 
-* **Prompt (`x`):** A frustrated user says, `"My order is late again! This is unacceptable."`
+* **Prompt ($x$):** A frustrated user says, `"My order is late again! This is unacceptable."`
 * **Hyperparameters:**
   * PPO Clip ($\epsilon$): `0.2`
   * Value Loss Coefficient ($c_1$): `0.5`
@@ -692,43 +684,51 @@ For each token generated, we store the outputs from our models in a buffer.
 **Step 3: Post-Rollout Analysis - Crafting the Learning Signal**
 The full response is now generated. We can now calculate the rewards and advantages for our recorded experience.
 
-1. **Get Extrinsic Reward:** The `EmpathyScorer` (RM) evaluates the full response. It's unhelpful and lacks empathy.
+**Get Extrinsic Reward:** The `EmpathyScorer` (RM) evaluates the full response. It's unhelpful and lacks empathy.
 
-   * We assign this reward to the final step: $r_4 = -12.0$. All other rewards $r_0, r_1, r_2, r_3 = 0$.
+* We assign this reward to the final step: $r_4 = -12.0$. All other rewards $r_0, r_1, r_2, r_3 = 0$.
 
-2. **Calculate the Full Reward Signal ($R_t$):** The reward signal used for learning is the extrinsic reward from the RM minus the KL penalty at each step. $R_t = r_t - \beta(\log\pi_{\theta_{old}} - \log\pi_{ref})$.
+**Calculate the Full Reward Signal ($R_t$):** The reward signal used for learning is the extrinsic reward from the RM minus the KL penalty at each step. 
 
-   * $R_0 = 0 - (0.02 \times (-1.10 - (-1.15))) = 0 - (0.02 \times 0.05) = -0.001$
-   * $R_1 = 0 - (0.02 \times (-0.50 - (-0.50))) = 0$
-   * $R_2 = 0 - (0.02 \times (-0.70 - (-0.72))) = -0.0004$
-   * $R_3 = 0 - (0.02 \times (-1.40 - (-1.55))) = -0.003$
-   * $R_4 = -12.0 - (0.02 \times (-0.30 - (-0.30))) = -12.0$
 
-3. **Calculate GAE Advantage ($\hat{A}_t$) and Value Targets ($V_t^{\text{target}}$):** We now work backward from the end to perform credit assignment.
 
-   First, we calculate the TD-Error 
+- $R_t = r_t - \beta(\log\pi_{\theta_{old}} - \log\pi_{ref})$.
 
-   
-   $$
-   \delta_t = R_t + \gamma V(S_{t+1}) - V(S_t) \quad(\text{where}~V(S_5)=0)
-   $$
+* $R_0 = 0 - (0.02 \times (-1.10 - (-1.15))) = 0 - (0.02 \times 0.05) = -0.001$
 
-   * $\delta_4 = R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0$
-   * $\delta_3 = R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963$
-   * $\delta_2 = R_2 + \gamma V(S_3) - V(S_2) = -0.0004 + (0.99 \times -3.0) - (-2.0) = -0.9704$
-   * $\delta_1 = R_1 + \gamma V(S_2) - V(S_1) = 0 + (0.99 \times -2.0) - (-1.5) = -0.48$
-   * $\delta_0 = R_0 + \gamma V(S_1) - V(S_0) = -0.001 + (0.99 \times -1.5) - (-1.0) = -0.486$
+* $R_1 = 0 - (0.02 \times (-0.50 - (-0.50))) = 0$
 
-   Next, we calculate the advantage $\hat{A}_t = \delta_t + (\gamma\lambda) \hat{A}_{t+1}$.
+* $R_2 = 0 - (0.02 \times (-0.70 - (-0.72))) = -0.0004$
 
-   * $\hat{A}_4 = \delta_4 = -8.0$
-   * $\hat{A}_3 = \delta_3 + (0.99 \times 0.95) \hat{A}_4 = -0.963 + (0.9405 \times -8.0) \approx -8.487$
-   * And so on. Finally, we calculate the Value Target:
-     $$
-     V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)
-     $$
+* $R_3 = 0 - (0.02 \times (-1.40 - (-1.55))) = -0.003$
 
-   Let's put the final results in a table. This is the rich dataset we will use for learning.
+* $R_4 = -12.0 - (0.02 \times (-0.30 - (-0.30))) = -12.0$
+
+  
+
+**Calculate GAE Advantage ($\hat{A}_t$) and Value Targets ($V_t^{\text{target}}$):** We now work backward from the end to perform credit assignment.
+
+First, we calculate the TD-Error
+
+
+
+-  $$\delta_t = R_t + \gamma V(S_{t+1}) - V(S_t) \quad(\text{where}~V(S_5)=0)$$
+
+* $\delta_4 = R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0$
+* $\delta_3 = R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963$
+* $\delta_2 = R_2 + \gamma V(S_3) - V(S_2) = -0.0004 + (0.99 \times -3.0) - (-2.0) = -0.9704$
+* $\delta_1 = R_1 + \gamma V(S_2) - V(S_1) = 0 + (0.99 \times -2.0) - (-1.5) = -0.48$
+* $\delta_0 = R_0 + \gamma V(S_1) - V(S_0) = -0.001 + (0.99 \times -1.5) - (-1.0) = -0.486$
+
+
+
+Next, we calculate the advantage $\hat{A}_t = \delta_t + (\gamma\lambda) \hat{A}_{t+1}$.
+
+* $\hat{A}_4 = \delta_4 = -8.0$
+* $\hat{A}_3 = \delta_3 + (0.99 \times 0.95) \hat{A}_4 = -0.963 + (0.9405 \times -8.0) \approx -8.487$
+* And so on. Finally, we calculate the Value Target: $V_t^{\text{target}} = \hat{A}_t + V_{\theta_{old}}(S_t)$.
+
+Let's put the final results in a table. This is the rich dataset we will use for learning.
 
 | t    | Action ($a_t$) | Advantage ($\hat{A}_t$) | Value Target ($V_t^{\text{target}}$) |
 | ---- | -------------- | ----------------------- | ------------------------------------ |
@@ -753,9 +753,9 @@ We perform one gradient update.
 **Step 1: The Forward Pass**
 We pass the states from our data buffer through the **current** Actor-Critic model to get **new** predictions. Let's say the update from $\theta_{old}$ to $\theta_{new}$ results in these new values for the first timestep ($t=0$):
 
-- **New Log-Prob:** $$\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$$ (The probability of saying Your decreased, as expected from the negative advantage).
-- **New Value Prediction:** $$V_{\theta_{new}}(S_0) = -7.5$$ (The Critic is getting more accurate, moving from `-1.0` towards the target of $-7.21$).
-- **New Entropy:** Let's say the entropy of the new policy distribution is $S=2.5$.
+* **New Log-Prob:** $\log\pi_{\theta_{new}}(a_0|S_0) = -1.45$ (The probability of saying `Your` decreased, as expected from the negative advantage).
+* **New Value Prediction:** $V_{\theta_{new}}(S_0) = -7.5$ (The Critic is getting more accurate, moving from `-1.0` towards the target of $-7.21$).
+* **New Entropy:** Let's say the entropy of the new policy distribution is $S=2.5$.
 
 **Step 2: Calculate Each Loss Component (for $t=0$)**
 
@@ -767,10 +767,7 @@ We pass the states from our data buffer through the **current** Actor-Critic mod
       * $\mathcal{L}_0^\text{CLIP} = \min(-5.78, -6.57) = -6.57$.
 
 2.  **Value Function Loss ($\mathcal{L}^\text{VF}_0$):**
-   
-    $$
-    \mathcal{L}_0^\text{VF} = (V_{\theta_{new}}(S_0) - V_0^{\text{target}})^2 = (-7.5 - (-7.21))^2 = (-0.29)^2 = 0.0841
-    $$
+    * $\mathcal{L}_0^\text{VF} = (V_{\theta_{new}}(S_0) - V_0^{\text{target}})^2 = (-7.5 - (-7.21))^2 = (-0.29)^2 = 0.0841$.
 
 **Step 3: Calculate the Final Objective**
 We average the loss components over all 5 tokens in our sequence. Let's assume the averages are:
@@ -787,7 +784,6 @@ $\mathcal{L}^{\text{PPO}} = (-7.5) - (0.5 \times 0.55) + (0.01 \times 2.4)$$$
 
 $$\mathcal{L}^{\text{PPO}} = -7.5 - 0.275 + 0.024 = \mathbf{-7.751}$$
 
-
 **Step 4: Backpropagation and Update**
 This final objective value, `-7.751`, is what we maximize. The optimizer performs gradient ascent (or descent on the negative). The gradient of the $\mathcal{L}^\text{CLIP}$ and $S$ terms updates the **Actor Head and the shared body**. The gradient of the $\mathcal{L}^\text{VF}$ term updates the **Critic Head and the shared body**.
 
@@ -796,12 +792,4 @@ This final objective value, `-7.751`, is what we maximize. The optimizer perform
 The process repeats. We use the **same data** (the same $\hat{A}_t$ and $V_t^{\text{target}}$ values), but our model parameters are now more refined. We do another forward pass, get even better predictions, calculate a new total loss, and update again. This iterative refinement over the same batch of data is what makes PPO stable and efficient.
 
 After a few inner epochs, this entire cycle is complete, and we return to the Outer Loop to generate a fresh batch of experience with our newly improved chatbot.
-
-| t    | Action ($a_t$) | State ($S_t$)           | $$\log\pi_{\theta_{old}}(a_t|S_t)$$ | $$\log\pi_{ref}(a_t|S_t)$$ | $V_{\theta_{old}}(S_t)$ |
-| ---- | -------------- | ----------------------- | ----------------------------------- | -------------------------- | ----------------------- |
-| 0    | `Your`         | `"My order is late..."` | -1.10                               | -1.15                      | -1.0                    |
-| 1    | `order`        | `... Your`              | -0.50                               | -0.50                      | -1.5                    |
-| 2    | `is`           | `... Your order`        | -0.70                               | -0.72                      | -2.0                    |
-| 3    | `delayed`      | `... Your order is`     | -1.40                               | -1.55                      | -3.0                    |
-| 4    | `.`            | `... is delayed`        | -0.30                               | -0.30                      | -4.0                    |
 
