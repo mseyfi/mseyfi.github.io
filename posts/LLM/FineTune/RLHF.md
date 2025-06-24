@@ -352,7 +352,7 @@ We will follow the canonical PPO objective, which is designed to be **maximized*
 
 
 $$
-\mathcal{L}^{\text{PPO}}(\theta) = \max_{\theta}\h\mathbb{E}}_t \left[ \mathcal{L}^{\text{CLIP}}(\theta) - c_1 \mathcal{L}^{\text{VF}}(\theta) + c_2 S[\pi_\theta](s_t) \right]
+\mathcal{L}^{\text{PPO}}(\theta) =\h\mathbb{E}}_t \left[ \mathcal{L}^{\text{CLIP}}(\theta) - c_1 \mathcal{L}^{\text{VF}}(\theta) + c_2 S[\pi_\theta](s_t) \right]
 $$
 
 
@@ -552,10 +552,10 @@ DPO's brilliance is a mathematical insight that connects the reward function dir
     
 2.  **The Derivation:** By substituting this definition of reward back into the RM's loss function, the terms rearrange into a new loss function that depends *only* on the policy we are training and the frozen reference policy. The RM is eliminated entirely.
 
-The final **DPO Loss Function** is:
+The final **DPO Loss Function** is optimal when **minimized**:
 
 $$
-\mathcal{L}^\text{DPO}(\theta; \pi_{ref}) = \min_{\theta}- \mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma \left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)} \right) \right]
+\mathcal{L}^\text{DPO}(\theta; \pi_{ref}) = - \mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma \left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)} \right) \right]
 $$
 
 #### **How the Policy (LLM) is Trained with DPO**
