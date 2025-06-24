@@ -174,7 +174,7 @@ The Advantage function creates a **relative, zero-centered learning signal**, wh
 
 *Another example is a teacher that predicts a not very strong student to do not so good in the exam based on the past achievements $V_\theta(S_t) = 60\%$, but the students gets a grade (reward) $R_t=75\%$, although this grade is not that good but it is a huge progress (15 marks above the expectation). This means whatever the student has done is in the right direction and has to be pursued.*
 
-### The Credit Assignment Problem
+### **The Credit Assignment Problem**
 
 Imagine you just won a 50-move chess game. The final result is clear, but the reason for the win is not. Was it the checkmating move on turn 50? Or was it a brilliant knight sacrifice on turn 22 that seemed risky at the time but created an unstoppable long-term attack? Or perhaps it was a quiet pawn move on turn 5 that created a subtle weakness your opponent couldn't resolve.
 
@@ -182,7 +182,7 @@ This is the **credit assignment problem**: the challenge of distributing the cre
 
 ------
 
-### Method 1: The Monte Carlo Approach (The "Final Exam")
+### **Method 1: The Monte Carlo Approach (The "Final Exam")**
 
 This method tries to solve the problem by looking at the final result of the entire game.
 
@@ -210,7 +210,7 @@ The formula calculates "what actually happened" ($R_t$) minus "what I thought wo
 
 ------
 
-### Method 2: The Temporal Difference (TD) Error (The "Pop Quiz")
+### **Method 2: The Temporal Difference (TD) Error (The "Pop Quiz")**
 
 This method takes a more immediate, one-step-ahead look.
 
@@ -239,7 +239,7 @@ The formula represents a reality check: `(Immediate Reward + New Prediction) - O
 
 ------
 
-### The Solution: Generalized Advantage Estimation (GAE)
+### **The Solution: Generalized Advantage Estimation (GAE)**
 
 GAE brilliantly combines the strengths of both Monte Carlo and TD methods.
 
