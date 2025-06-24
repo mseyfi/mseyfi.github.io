@@ -426,7 +426,7 @@ Next, we calculate the advantage $$\hat{A}_t = \delta_t + (\gamma\lambda) \hat{A
 $$
 \small
 \begin{aligned}
-\hat{A}_4 &= \delta_4 = -8.0
+\hat{A}_4 &= \delta_4 = -8.0\\
 \hat{A}_3 &= \delta_3 + (0.99 \times 0.95)\\
 \hat{A}_4 &= -0.963 + (0.9405 \times -8.0) \approx -8.487
 \end{aligned}
