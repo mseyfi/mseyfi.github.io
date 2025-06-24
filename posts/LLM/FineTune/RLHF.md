@@ -79,9 +79,9 @@ $$
 \mathcal{L}^{RM}(\theta) = - \mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma \left( r_{\theta}(x, y_w) - r_{\theta}(x, y_l) \right) \right]
 $$
 
-where $D$ is the dataset of preference pairs and $\sigma$ is the sigmoid function. During training, we backpropagate this loss to update the RM's parameters, $\theta$, teaching it to accurately mimic the human labeler's judgment.
-
-At the end of this stage, we have a frozen, reliable "sense of protocol"—a Reward Model that can score any response for its helpfulness and harmlessness.
+    where $D$ is the dataset of preference pairs and $\sigma$ is the sigmoid function. During training, we backpropagate this loss to update the RM's parameters, $\theta$, teaching it to accurately mimic the human labeler's judgment.
+    
+    At the end of this stage, we have a frozen, reliable "sense of protocol"—a Reward Model that can score any response for its helpfulness and harmlessness.
 
 #### **Stage 3: Field Practice - Reinforcement Learning (RL) Fine-Tuning**
 
