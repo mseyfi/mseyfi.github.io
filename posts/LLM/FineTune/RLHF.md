@@ -201,11 +201,7 @@ Where $R$ is the final reward for the whole episode and $V(S_t)$ is the Critic's
 
 - **The Intuition:** If the final score was higher than we expected at step $t$, then the actions we took from that point on must have been, on average, good.
 
-- What's wrong with it? (The High Variance Problem):
-
-   This signal is extremely noisy, or high-variance
-
-  . Imagine our AI chatbot has a conversation:
+- What's wrong with it? (The High Variance Problem): This signal is extremely noisy, or ***high-variance***, Imagine our AI chatbot has a conversation:
 
   1. Says a very helpful thing.
   2. Says another very helpful thing.
