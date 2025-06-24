@@ -341,7 +341,7 @@ $$
 $$
 
 
-We will calculate each component—the policy loss ($\mathcal{L}^\text{CLIP}$), the value loss ($\mathcal{L}^\text{VF}$), and the entropy bonus ($S$)—numerically.
+We will calculate each component, the policy loss ($\mathcal{L}^\text{CLIP}$), the value loss ($\mathcal{L}^\text{VF}$), and the entropy bonus ($\mathcal{L}^\text{entropy}$), numerically.
 
 ---
 
@@ -360,19 +360,13 @@ Our training process requires four key components:
 #### **The Scenario and Hyperparameters**
 
 * **Prompt ($x$):** A frustrated user says, `"My order is late again! This is unacceptable."`
-* **Hyperparameters:**
-  * PPO Clip ($\epsilon$): `0.2`
-  * Value Loss Coefficient ($c_1$): `0.5`
-  * Entropy Coefficient ($c_2$): `0.01`
-  * KL Penalty Coefficient ($\beta$): `0.02`
-  * Discount Factor ($\gamma$): `0.99`
-  * GAE Lambda ($\lambda$): `0.95`
+* **Hyperparameters:** $\epsilon=0.2$, $c_1= 0.5$, $c_2 = 0.01$ , $\beta = 0.02$, $\gamma = 0.99$, and $\lambda = 0.95$.
 
 ---
 
 ### **Part B: The Outer Loop - A Live Support Ticket (Data Collection)**
 
-The "Outer Loop" is one cycle of generating experience. Our current agent, $\pi_{\theta_{old}}$, interacts with the user and we record everything that happens.
+The **Outer Loop** is one cycle of generating experience. Our current agent, $\pi_{\theta_{old}}$, interacts with the user and we record everything that happens.
 
 **Step 1: The Rollout**
 The Actor (`SupportBot-v1`) receives the prompt and generates a poor, unempathetic response:
@@ -382,7 +376,9 @@ The Actor (`SupportBot-v1`) receives the prompt and generates a poor, unempathet
 **Step 2: Record On-the-Fly Data**
 For each token generated, we store the outputs from our models in a buffer.
 
+
 ![PPO](../../../images/Sample_PPO.png)
+
 
 * **$V_{\theta_{old}}(S_t)$**: The Critic's prediction of future reward. It becomes more negative as the robotic response unfolds, correctly sensing this is not going well.
 
@@ -395,19 +391,17 @@ The full response is now generated. We can now calculate the rewards and advanta
 
 **Calculate the Full Reward Signal ($R_t$):** The reward signal used for learning is the extrinsic reward from the RM minus the KL penalty at each step. 
 
+```latex
+\begin{eqnarray}
+R_t &=& r_t - \beta(\log\pi_{\theta_{old}} - \log\pi_{ref})\\
+R_0 &=& 0 - (0.02 \times (-1.10 - (-1.15))) = 0 - (0.02 \times 0.05) = -0.001\\
+R_1 &=& 0 - (0.02 \times (-0.50 - (-0.50))) = 0\\
+R_2 &=& 0 - (0.02 \times (-0.70 - (-0.72))) = -0.0004\\
+R_3 &=& 0 - (0.02 \times (-1.40 - (-1.55))) = -0.003\\
+R_4 &=& -12.0 - (0.02 \times (-0.30 - (-0.30))) = -12.0
+\end{eqnarray}
+```
 
-
-* $R_t = r_t - \beta(\log\pi_{\theta_{old}} - \log\pi_{ref})$.
-
-* $R_0 = 0 - (0.02 \times (-1.10 - (-1.15))) = 0 - (0.02 \times 0.05) = -0.001$
-
-* $R_1 = 0 - (0.02 \times (-0.50 - (-0.50))) = 0$
-
-* $R_2 = 0 - (0.02 \times (-0.70 - (-0.72))) = -0.0004$
-
-* $R_3 = 0 - (0.02 \times (-1.40 - (-1.55))) = -0.003$
-
-* $R_4 = -12.0 - (0.02 \times (-0.30 - (-0.30))) = -12.0$
 
   
 
