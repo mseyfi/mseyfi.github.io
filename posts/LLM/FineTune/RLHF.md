@@ -432,6 +432,7 @@ $$
 $$
 
 Next, we calculate the advantage $$\hat{A}_t = \delta_t + (\gamma\lambda) \hat{A}_{t+1}$$.
+
 $$
 \small
 \begin{aligned}
@@ -441,6 +442,7 @@ $$
 \end{aligned}
 \normalsize
 $$
+
 and so on. 
 
 Finally, we calculate the Value Target: 
