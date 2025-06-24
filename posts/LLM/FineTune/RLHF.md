@@ -37,7 +37,7 @@ Let's formalize this with the standard RL vocabulary:
 5.  **Reward ($R$):** The scalar feedback signal the agent receives after taking an action in a state. This is the most important—and most difficult—part of RLHF. A positive reward encourages the preceding actions; a negative reward discourages them.
 6.  **Policy ($\\pi$):** The agent's brain or strategy. It is a function that maps a state to an action. For an LLM, the policy **is the neural network itself**. Given the current state (text generated so far), the policy $\\pi$ outputs a probability distribution over all possible next tokens (actions). We train the model by adjusting the parameters of the policy.
 
-The goal of any RL algorithm is to find an optimal policy, $\\pi^\*$, that maximizes the cumulative reward over time.
+The goal of any RL algorithm is to find an optimal policy, $\pi^\*$, that maximizes the cumulative reward over time.
 
 -----
 
@@ -88,13 +88,13 @@ At the end of this stage, we have a frozen, reliable "sense of protocol"—a Rew
 - **The Process:**
   1. **Initialization:** We start with a fresh copy of our SFT model as our active policy, $\pi_\theta$.
   2. **The RL Loop:** The core of the process is a continuous loop:
-     * A prompt is sampled from a dataset.
-     * The policy model ($\pi_\theta$) generates a response token by token. Each token generation is an "action."
-     * The completed response is passed to the frozen Reward Model, which returns a scalar "reward" score. d. This reward signal is used by an RL algorithm like **PPO (Proximal Policy Optimization)** or **DPO (Direct Preference Optimization)** to calculate a loss.
-     * The gradient of this loss is used to update the parameters, $\theta$, of our policy model.
+     1. A prompt is sampled from a dataset.
+     2. The policy model ($\pi_\theta$) generates a response token by token. Each token generation is an "action."
+     3. The completed response is passed to the frozen Reward Model, which returns a scalar "reward" score.
+     4. This reward signal is used by an RL algorithm like **PPO (Proximal Policy Optimization)** or **DPO (Direct Preference Optimization)** to calculate a loss.
+     5. The gradient of this loss is used to update the parameters, $\theta$, of our policy model.
 - **Objective:** The goal is to adjust the policy's parameters, $\theta$, to maximize the expected reward from the RM. This is almost always done with a regularization term (like a KL penalty) that prevents the policy from drifting too far from the coherent language it learned in the SFT stage, ensuring the diplomat doesn't start speaking gibberish just to get a high score.
-- **The Outcome:** The final, **aligned LLM**. This model has not only been taught *how* to respond but has *learned* what constitutes a *good* response through iterative practice and feedback. It is now the skilled diplomat we set out to train.
-  
+- **The Outcome:** The final, **aligned LLM**. This model has not only been taught *how* to respond but has *learned* what constitutes a *good* response through iterative practice and feedback. It is now the skilled diplomat we set out to train.  
 -----
 
 ### **Part 3: The Actor, the Critic, and the Advantage: A Deeper Look**
