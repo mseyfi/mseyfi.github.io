@@ -528,26 +528,29 @@ PPO is powerful but notoriously complex, requiring four models and a slow sampli
 
 DPO's brilliance is a mathematical insight that connects the reward function directly to the policies.
 
-1.  **The Insight:** The optimal reward function that PPO tries to learn can be expressed analytically as the log-probability ratio between the optimal policy ($\\pi\_\\theta$) and the reference policy ($\\pi\_{ref}$), scaled by a constant $\\beta$.
+1.  **The Insight:** The optimal reward function that PPO tries to learn can be expressed analytically as the log-probability ratio between the optimal policy ($\pi_\theta$) and the reference policy ($\\pi\_{ref}$), scaled by a constant $\\beta$.
 
     $$
-    r(x, y) = \beta \log \left( \frac{\\pi\_{\theta}(y|x)}{\pi\_{ref}(y|x)} \right)
+    r(x, y) = \beta \log \left( \frac{\pi_{\theta}(y|x)}{\pi_{ref}(y|x)} \right)
 
     $$
     
 2.  **The Derivation:** By substituting this definition of reward back into the RM's loss function, the terms rearrange into a new loss function that depends *only* on the policy we are training and the frozen reference policy. The RM is eliminated entirely.
 
 The final **DPO Loss Function** is:
-$$\mathcal{L}_{DPO}(\theta; \pi_{ref}) = - \mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma \left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)} \right) \right]$$
+
+$$
+\mathcal{L}^\text{DPO}(\theta; \pi_{ref}) = - \mathbb{E}_{(x, y_w, y_l) \sim D} \left[ \log \sigma \left( \beta \log \frac{\pi_\theta(y_w|x)}{\pi_{ref}(y_w|x)} - \beta \log \frac{\pi_\theta(y_l|x)}{\pi_{ref}(y_l|x)} \right) \right]
+$$
 
 #### **How the Policy (LLM) is Trained with DPO**
 
 Despite looking complex, this is just a simple **binary classification loss**. Here's how it works:
 
-1.  Take a preference pair: a prompt $x$, a winning response $y\_w$, and a losing response $y\_l$.
-2.  Calculate how likely the current policy $\\pi\_\\theta$ is to generate the winner, and how likely it is to generate the loser. Do the same for the frozen reference model $\\pi\_{ref}$.
+1.  Take a preference pair: a prompt $x$, a winning response $y_w$, and a losing response $y_l$.
+2.  Calculate how likely the current policy $\\pi\_\\theta$ is to generate the winner, and how likely it is to generate the loser. Do the same for the frozen reference model $\pi_{ref}$.
 3.  The loss function's goal is to **maximize the gap** between the log-probability ratio of the winner and the log-probability ratio of the loser.
-4.  **Backpropagation:** The gradient of this loss is computed with respect to the policy's parameters ($\\theta$). This gradient directly updates the LLM's weights to increase the probability of generating `y_w` while decreasing the probability of generating `y_l`, all while being regularized by the reference model $\\pi\_{ref}$.
+4.  **Backpropagation:** The gradient of this loss is computed with respect to the policy's parameters ($\theta$). This gradient directly updates the LLM's weights to increase the probability of generating $y_w$ while decreasing the probability of generating $y_l$, all while being regularized by the reference model $\pi_{ref}$.
 
 DPO is faster, more stable, and requires only two models (the policy being trained and the frozen reference), making it the new standard for preference alignment.
 
@@ -563,7 +566,7 @@ How does the model *actually* learn from these loss functions? The answer is bac
 
   * **In PPO:** This is far more complex. The "error" (the PPO objective) is calculated from the outputs of four different models. The gradient must be backpropagated through the **Actor** model's generation process. It's an exercise in **credit assignment**: if the final reward was high, backpropagation figures out how to assign "credit" to each token-generation action along the way, strengthening the weights that led to good outcomes.
 
-  * **In DPO:** This is elegantly simple again. The loss is calculated after two forward passes (one for $y\_w$ and one for $y\_l$) through both the active policy and the frozen reference model. The gradient then flows back *only* through the active policy's computations, updating its weights to better classify the preference pair.
+  * **In DPO:** This is elegantly simple again. The loss is calculated after two forward passes (one for $y_w$ and one for $y_l$) through both the active policy and the frozen reference model. The gradient then flows back *only* through the active policy's computations, updating its weights to better classify the preference pair.
 
 -----
 
@@ -572,18 +575,18 @@ How does the model *actually* learn from these loss functions? The answer is bac
 #### **Full Training Pipeline (DPO-centric)**
 
 1.  **Prerequisites:** A large, pre-trained base LLM (e.g., Llama-2 7B).
-2.  **Stage 1 (SFT):** Fine-tune the base LLM on a high-quality dataset of `(prompt, response)` demonstrations. **Result: $\\pi\_{ref}$**.
+2.  **Stage 1 (SFT):** Fine-tune the base LLM on a high-quality dataset of `(prompt, response)` demonstrations. **Result: $\pi_{ref}$**.
 3.  **Stage 2 (DPO):**
-      * Initialize a new model, $\\pi\_{\\theta}$, with the weights from the SFT model.
+      * Initialize a new model, $\pi_{\theta}$, with the weights from the SFT model.
       * Use a human preference dataset of `(prompt, y_w, y_l)`.
-      * Train $\\pi\_{\\theta}$ using the DPO loss function, keeping $\\pi\_{ref}$ frozen.
-      * **Result: $\\pi\_{DPO}$**, the final aligned model.
+      * Train $\pi_{\theta}$ using the DPO loss function, keeping $\\pi\_{ref}$ frozen.
+      * **Result: $\pi^\text{DPO}$**, the final aligned model.
 
 #### **Inference**
 
 When training is done, you only need the final model.
 
-1.  Load the weights for $\\pi\_{DPO}$.
+1.  Load the weights for $\pi^\text{DPO}$.
 2.  Provide a user prompt.
 3.  Generate a response using a decoding method like nucleus sampling. The Critic, RM, and Reference models are no longer needed.
 
