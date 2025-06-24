@@ -501,7 +501,7 @@ Now we plug these into the master equation:
 $$
 \small
 \begin{aligned}
-\mathcal{L}^{\text{PPO}} &= \mathcal{L}^\text{CLIP} - c_1 \mathcal{L}^\text{VF} + c_2 $\mathcal{L}^\text{Entropy}\\
+\mathcal{L}^{\text{PPO}} &= \mathcal{L}^\text{CLIP} - c_1 \mathcal{L}^\text{VF} + c_2 \mathcal{L}^\text{Entropy}\\
 \mathcal{L}^{\text{PPO}} &= (-7.5) - (0.5 \times 0.55) + (0.01 \times 2.4)\\
 \mathcal{L}^{\text{PPO}} &= -7.5 - 0.275 + 0.024 = \mathbf{-7.751}
 \end{aligned}
