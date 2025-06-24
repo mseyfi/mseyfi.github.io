@@ -713,7 +713,6 @@ First, we calculate the TD-Error
 
 
 * $$\delta_t = R_t + \gamma V(S_{t+1}) - V(S_t) \quad(\text{where}~V(S_5)=0)$$
-
 * $\delta_4 = R_4 + 0 - V(S_4) = -12.0 - (-4.0) = -8.0$
 * $\delta_3 = R_3 + \gamma V(S_4) - V(S_3) = -0.003 + (0.99 \times -4.0) - (-3.0) = -0.963$
 * $\delta_2 = R_2 + \gamma V(S_3) - V(S_2) = -0.0004 + (0.99 \times -3.0) - (-2.0) = -0.9704$
