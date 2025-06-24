@@ -131,7 +131,7 @@ The final reward signal for each token ($R_t$) is therefore a combination of the
 **The Full Per-Token Reward Equation:**
 
 $$
-R_t=r_{RM}(S_t,a_t)−\beta\log\left(\frac{\pi_{ref}(a_t∣S_t)}{\pi_θ(a_t∣S_t)}\right)
+R_t=r_{RM}(S_t,a_t)−\beta\log\left(\frac{\pi_{\theta}(a_t∣S_t)}{\pi_{ref}(a_t∣S_t)}\right)
 $$
 
 - $r_{RM}(S_t,a_t)$ is the score from our Reward Model. (Note: often, the RM scores the whole sequence, and this value is distributed to each token).
