@@ -194,15 +194,16 @@ This is the "wait-and-see" approach. After you make a move at step t, you play t
 
 The primary flaw is high variance, making it very unreliable. It lumps all moves together. A brilliant move followed by a losing blunder will still be blamed for the loss. Conversely, a terrible move can get rewarded if your opponent makes an even worse mistake later, handing you a lucky win. You won't know which specific move was good or bad, only that the entire sequence led to a certain result.
 
-Math:
+**Math:**
 
 The advantage A is estimated by comparing the actual final outcome to what the critic expected to happen.
+
 $$
 A(S_t,a_t)≈R_t−V_\theta(S_t)
 $$
 
 
-- $A(S_t, a_t)$: The Advantage, or the "true" value of making move $a_t$` from board position $S_t$.
+- $A(S_t, a_t)$: The Advantage, or the "true" value of making move $a_t$ from board position $S_t$.
 - $R_t$: The **Monte Carlo Return**. This is the actual, final, discounted reward from step $t$ onward. In chess, this is effectively the final game score (+1 for a win, -1 for a loss), discounted by how far in the future it occurred.
 - $V_\theta(S_t)$: The **Critic's Prediction**. This is the output of your neural network critic, which looks at the board $S_t$ and predicts the expected outcome *before* the game is finished.
 
@@ -224,13 +225,14 @@ The primary flaw is bias and being short-sighted. The advantage estimate is bias
 
 **Math:**
 
-The TD method provides a one-step estimate of the advantage, known as the TD Error, denoted by $\delta_t$.
+The TD method provides a one-step estimate of the advantage, known as the TD Error, denoted by $\delta_t$:
+
 $$
 \delta_t=r_{t+1}+γVθ(S_{t+1})−V_\theta(S_t)
 $$
 
 - $\delta_t$: The **TD Error**, which serves as a one-step advantage estimate for the action taken at step $t$.
-- $r_{t+1}$: The immediate reward received after making the move. In chess, this is almost always `0` until the end of the game.
+- $r_{t+1}$: The immediate reward received after making the move. In chess, this is almost always $0$ until the end of the game. In LLMs it could be the output of the RM after each token genration.
 - $\gamma$: The discount factor (e.g., 0.99), which values immediate rewards more than future ones.
 - $V_\theta(S_{t+1})$: The critic's evaluation of the **next state**. This is the "new information."
 - $V_\theta(S_t)$: The critic's evaluation of the **current state**. This is the "old prediction."
@@ -250,6 +252,7 @@ GAE acts like a "Wise Coach" providing feedback. It doesn't just rely on the fin
 **Math:**
 
 GAE calculates the advantage by taking a weighted sum of all future TD errors.
+
 $$
 A^\text{GAE}(S_t,a_t)=\sum_{l=0}^\infty(\gamma\lambda)^l\delta_{t+l}
 $$
@@ -260,8 +263,8 @@ $$
 
 The $\lambda$  parameter acts as a "foresight knob":
 
-- **When $\lambda=0$ **: The formula collapses to just the first term, $A^\text{GAE}=\delta_t$. This is exactly the **TD method**: low variance (less noisy) but biased and short-sighted.
-- **When $\lambda=1$ **: The formula becomes the sum of all discounted future TD errors, which is mathematically equivalent to the **Monte Carlo method**: $$A^\text{GAE}≈R_t−V_\theta(S_t)$$. This is unbiased (it uses the true final outcome) but has high variance.
+- When $\lambda=0$: The formula collapses to just the first term, $A^\text{GAE}=\delta_t$. This is exactly the **TD method**: low variance (less noisy) but biased and short-sighted.
+- When $\lambda=1$: The formula becomes the sum of all discounted future TD errors, which is mathematically equivalent to the **Monte Carlo method**: $$A^\text{GAE}≈R_t−V_\theta(S_t)$$. This is unbiased (it uses the true final outcome) but has high variance.
 
 By choosing a $\lambda$  between 0 and 1 (e.g., $\lambda=0.95$ ), GAE creates a sophisticated advantage estimate that is more stable than pure Monte Carlo but more far-sighted than pure TD, providing a much better signal for solving the credit assignment problem.
 
