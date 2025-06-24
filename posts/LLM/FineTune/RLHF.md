@@ -478,7 +478,7 @@ We now take our fully processed batch of data and learn from it for several epoc
 
 #### **Inner Loop: Epoch 1**
 
-We perform one gradient update.
+We perform one gradient update. But note that before the first gradient update $\pi_{\theta_{new}}(a_0|S_0) = \pi_{\theta_{old}}(a_0|S_0)$ therefore $p_t(\theta)=1$. 
 
 **Step 1: The Forward Pass**
 We pass the states from our data buffer through the **current** Actor-Critic model to get **new** predictions. Let's say the update from $\theta_{old}$ to $\theta_{new}$ results in these new values for the first timestep ($t=0$):
