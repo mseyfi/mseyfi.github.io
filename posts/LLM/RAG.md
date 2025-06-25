@@ -170,15 +170,16 @@ The core promise of DPR is to retrieve documents based on their **semantic meani
       * **Process:** The query is fed into a *different* BERT model. While the architecture is often identical to the passage encoder, its weights are trained separately to specialize in understanding questions.
       * **Output:** A single, fixed-size dense vector $v_q$.
 
-* **The Similarity Score**
+3.  **The Similarity Score**
 
-Once we have the two vectors, how do we determine relevance? DPR calculates the similarity score as the **dot product** of the question vector and the passage vector. A higher dot product means higher relevance.
+    Once we have the two vectors, how do we determine relevance? DPR calculates the similarity score as the **dot product** of the question vector and the passage vector. A higher dot product means higher relevance.
 
-$$
-\text{score}(q, p) = v_q \cdot v_p = E_Q(q) \cdot E_P(p)
-$$
+    
+    $$
+    \text{score}(q, p) = v_q \cdot v_p = E_Q(q) \cdot E_P(p)
+    $$
 
-A high score indicates that the two vectors are pointing in a similar direction and have large magnitudes, meaning the model is confident in their semantic alignment.
+    A high score indicates that the two vectors are pointing in a similar direction and have large magnitudes, meaning the model is confident in their semantic alignment.
 
 **DPR in Practice: Inference and Training**: The dual-encoder architecture enables an extremely efficient workflow for RAG systems.
 
