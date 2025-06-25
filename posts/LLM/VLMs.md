@@ -121,9 +121,3 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-Let me know if you want:
-
-* A visual taxonomy diagram
-* Model architecture breakdowns by family
-* Code for retrieval, grounding, or captioning tasks
-* Pretraining objectives comparison (e.g., contrastive vs MLM vs prefix modeling)
