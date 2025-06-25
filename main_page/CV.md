@@ -4,7 +4,7 @@
 <br>
 <br>
 
-## [![VLM](https://img.shields.io/badge/VLM-Vision_Language_Models-pink?style=for-the-badge&logo=github)](../posts/VLM)
+## [![VLM](https://img.shields.io/badge/VLM-Vision_Language_Models-pink?style=for-the-badge&logo=github)](../posts/VLM/VLM)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Vision-Language Models (VLMs) represent a frontier in artificial intelligence, creating systems that can see and reason about the visual world in tandem with human language. The field is incredibly diverse, with models specializing in distinct but related tasks. This guide provides a structured overview of the most prominent VLMs, categorized by their primary function.
 <p></p>
