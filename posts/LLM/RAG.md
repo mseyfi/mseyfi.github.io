@@ -1,4 +1,4 @@
-## The Definitive Guide to Retrieval-Augmented Generation (RAG): From Theory to Practice
+## Retrieval-Augmented Generation (RAG): From Theory to Practice
 
 ### **Part 1: The Philosophical Foundation: The Two Minds of AI**
 
