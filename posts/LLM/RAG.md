@@ -1,4 +1,3 @@
-
 # The Definitive Guide to Retrieval-Augmented Generation (RAG): From Theory to Practice
 
 ### **Part 1: The Philosophical Foundation: The Two Minds of AI**
@@ -79,38 +78,39 @@ Let's walk through the two main phases of a RAG system's life.
 
 This is the preparatory, one-time process.
 
-1.  **Document Loading & Chunking (Index Granularity):** We load our source documents. Since LLMs have a limited context window, we must chunk the documents. This is one of the most critical design choices.
+1. **Document Loading & Chunking (Index Granularity):** We load our source documents. Since LLMs have a limited context window, we must chunk the documents. This is one of the most critical design choices.
 
-      * **Fixed-Size Chunking:** The simplest method. Chop the text every $N$ characters with some overlap. It's easy but can awkwardly split sentences or ideas.
-      * **Recursive Character Chunking:** A smarter method. It tries to split the text along a hierarchy of separators, like double newlines (`\n\n`), then single newlines (`\n`), then spaces (`     `). This tends to keep paragraphs and sentences intact.
-      * **Semantic Chunking:** The most advanced method. It uses an embedding model to find semantic breakpoints in the text, ensuring that each chunk is as thematically coherent as possible.
+     * **Fixed-Size Chunking:** The simplest method. Chop the text every $N$ characters with some overlap. It's easy but can awkwardly split sentences or ideas.
+     * **Recursive Character Chunking:** A smarter method. It tries to split the text along a hierarchy of separators, like double newlines (`\n\n`), then single newlines (`\n`), then spaces (`     `). This tends to keep paragraphs and sentences intact.
+     * **Semantic Chunking:** The most advanced method. It uses an embedding model to find semantic breakpoints in the text, ensuring that each chunk is as thematically coherent as possible.
 
-2.  **Embedding:** Each text chunk $c_i$ is fed through the embedding model to produce a vector $v_i$.
+2. **Embedding:** Each text chunk $c_i$ is fed through the embedding model to produce a vector $v_i$.
 
-    $$
-    v_i = \text{EmbeddingModel}(c_i)
-    $$
+   $$
+   v_i = \text{EmbeddingModel}(c_i)
+   $$
 
-4.  **Indexing:** The vectors $v_i$ (along with a reference to the original text of $c_i$) are loaded into a vector database or search library.
+3. **Indexing:** The vectors $v_i$ (along with a reference to the original text of $c_i$) are loaded into a vector database or search library.
 
 #### **The Retrieval & Generation Pipeline (Online - "Answering a Question")**
 
 This happens in real-time.
 
-1.  **Query Embedding:** The user's query $q$ is converted into a vector $v_q$ using the *same* embedding model.
+1. **Query Embedding:** The user's query $q$ is converted into a vector $v_q$ using the *same* embedding model.
 
-     $$
-    v_q = \text{EmbeddingModel}(q)
-    $$
-    
-3.  **Search:** The retriever sends $v_q$ to the index, which performs an **Approximate Nearest Neighbor (ANN)** search to find the $k$ document vectors that are most similar.
+   $$
+   v_q = \text{EmbeddingModel}(q)
+   $$
 
-    $$
-    \text{TopK_Indices} = \underset{i \in \{1..N\}}{\text{argmax}_k} \left( \text{CosineSimilarity}(v_q, v_i) \right)
-    $$
-    
-5.  **Fetch & Augment:** The system retrieves the text of the top $k$ chunks and constructs the final prompt for the LLM.
-6.  **Generate:** The LLM receives the augmented prompt and generates the grounded, source-based answer.
+2. **Search:** The retriever sends $v_q$ to the index, which performs an **Approximate Nearest Neighbor (ANN)** search to find the $k$ document vectors that are most similar.
+
+   $$
+   \text{TopK_Indices} = \underset{i \in \{1..N\}}{\text{argmax}_k} \left( \text{CosineSimilarity}(v_q, v_i) \right)
+   $$
+
+3. **Fetch & Augment:** The system retrieves the text of the top $k$ chunks and constructs the final prompt for the LLM.
+
+4. **Generate:** The LLM receives the augmented prompt and generates the grounded, source-based answer.
 
 #### **Advanced Topic: RAG-Sequence vs. RAG-Token**
 
@@ -120,9 +120,9 @@ This distinction gets to the heart of how the generator interacts with the retri
 
   * **RAG-Token (More Powerful RAG):** For each **new token** the generator is about to produce, it can pause and issue a new retrieval, potentially with a refined query based on the text generated so far.
 
-      * **Example - Multi-Hop Question:** "Who directed the movie that starred the actress who won an Oscar for her role in 'La La Land'?"
-      * A RAG-Sequence model would retrieve documents about Emma Stone, 'La La Land', and its director all at once, which might be noisy.
-      * A RAG-Token model could first generate "Emma Stone won an Oscar for 'La La Land'. She later starred in the movie 'Poor Things'...", then use "Poor Things" as a new retrieval query to find its director, Yorgos Lanthimos, leading to a more accurate final answer.
+    * **Example - Multi-Hop Question:** "Who directed the movie that starred the actress who won an Oscar for her role in 'La La Land'?"
+    * A RAG-Sequence model would retrieve documents about Emma Stone, 'La La Land', and its director all at once, which might be noisy.
+    * A RAG-Token model could first generate "Emma Stone won an Oscar for 'La La Land'. She later starred in the movie 'Poor Things'...", then use "Poor Things" as a new retrieval query to find its director, Yorgos Lanthimos, leading to a more accurate final answer.
 
 -----
 
@@ -147,13 +147,14 @@ This architecture provides higher accuracy at the cost of complexity.
 We train a dual encoder using **contrastive loss**, which teaches the model what "similarity" means.
 
   * **Intuition:** For a given query, we have one correct (positive) document and many incorrect (negative) documents. The training goal is to adjust the encoder weights so that the query's embedding moves closer to the positive document's embedding and farther away from all the negative documents' embeddings.
+
   * **Math (InfoNCE Loss):** The most common contrastive loss is InfoNCE (Noise-Contrastive Estimation). For a query $q$, a positive passage $d+$, and a set of $N$ negative passages ${d_i-}$, the loss is:
-    
+
     $$
     L(q, d^+, \{d_i^-\}) = -\log \frac{e^{\text{sim}(q, d^+)/\tau}}{e^{\text{sim}(q, d^+)/\tau} + \sum_{i=1}^{N} e^{\text{sim}(q, d_i^-)/\tau}}
     $$
-    
-      * $\text{sim}(q, d)$ is the dot product similarity: $v\_q \\cdot v\_d$.
+
+      * The dot product similarity is: $\text{sim}(q, d) = v\_q \cdot v\_d$.
       * The numerator represents the model's confidence in the correct pair.
       * The denominator normalizes this confidence over all pairs (the positive one and all the negative ones).
       * The goal is to make the numerator as large as possible relative to the denominator, driving the loss towards zero.
