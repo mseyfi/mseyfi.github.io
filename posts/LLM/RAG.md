@@ -361,9 +361,9 @@ if __name__ == '__main__':
 
 ### Part 10: Appendix: References
 
-1.  **Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (The original RAG paper):** Lewis, P., Perez, E., et al. (2020). [arXiV:2005.11401](https://arxiv.org/abs/2005.11401)
-2.  **Dense Passage Retrieval for Open-Domain Question Answering (DPR):** Karpukhin, V., Oguz, B., et al. (2020). [arXiv:2004.04906](https://arxiv.org/abs/2004.04906)
-3.  **ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT:** Khattab, O., & Zaharia, M. (2020). [arXiv:2004.12832](https://arxiv.org/abs/2004.12832)
-4.  **FAISS - Facebook AI Similarity Search:** Johnson, J., Douze, M., & Jégou, H. (2019). [GitHub Repository](https://github.com/facebookresearch/faiss)
-5.  **Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks:** Reimers, N., & Gurevych, I. (2019). [arXiv:1908.10084](https://arxiv.org/abs/1908.10084)
-6.  **Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs (HNSW):** Malkov, Y. A., & Yashunin, D. A. (2018). [arXiv:1603.09320](https://arxiv.org/abs/1603.09320)
+1.  **Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks (The original RAG paper):** Lewis, P., Perez, E., et al. (2020).
+2.  **Dense Passage Retrieval for Open-Domain Question Answering (DPR):** Karpukhin, V., Oguz, B., et al. (2020).
+3.  **ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT:** Khattab, O., & Zaharia, M. (2020).
+4.  **FAISS - Facebook AI Similarity Search:** Johnson, J., Douze, M., & Jégou, H. (2019).
+5.  **Sentence-BERT: Sentence Embeddings using Siamese BERT-Networks:** Reimers, N., & Gurevych, I. (2019).
+6.  **Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs (HNSW):** Malkov, Y. A., & Yashunin, D. A. (2018).
