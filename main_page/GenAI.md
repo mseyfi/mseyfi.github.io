@@ -88,7 +88,7 @@ To understand why Retrieval-Augmented Generation (RAG) is so revolutionary, we m
 Language models are evaluated across diverse tasks such as next-token prediction, text classification, summarization, translation, code generation, and question answering. Each task requires a suitable metric that reflects model performance both quantitatively and qualitatively.
 </div>
 
-## [![FineTune](https://img.shields.io/badge/FineTuning_LLMs-A_Comprehensive_Guide_to_FineTuning_LLMs-blue?style=for-the-badge&logo=github)](../posts/LLM/FineTuning)
+## [![FineTune](https://img.shields.io/badge/FineTuning_LLMs-A_Comprehensive_Guide_to_FineTuning_LLMs-violet?style=for-the-badge&logo=github)](../posts/LLM/FineTuning)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 This is a series of tutorials that include, 1. full finetuning, 2. Instruction Fine-Tuning (SFT), 3. Parameter-Efficient Fine-Tuning (PEFT), and 4. Reinforcement Learning from Human Feedback (RLHF)
 </div>
@@ -127,7 +127,6 @@ While Mixture of Experts (MoE) offers a path to scale models to enormous paramet
 
 As of mid-2025, SwiGLU has replaced the traditional FFN in most state-of-the-art dense language models (like Meta's Llama series, Google's PaLM, and Mistral's dense models). This tutorial explores the intuition, mathematics, and implementation behind this powerful and efficient architecture.
 </div>
-
 
 ## [![KV](https://img.shields.io/badge/KV_Caching-How_to_optimize_the_inference_by_caching_key_value-blue?style=for-the-badge&logo=github)](../posts/LLM/KV-Caching)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
