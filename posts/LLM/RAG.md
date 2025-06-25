@@ -289,7 +289,7 @@ $$
 \text{Score}(q,p)=\sum_{i=1}^N\max_{j=1, \ldots, L}(v_{q_i}\cdot v_{p_j})
 $$
 
-**Intuition:** The final score is not a measure of overall holistic similarity. Instead, it answers the question: **"How well is each individual concept in my query covered by \*some\* relevant concept within the passage?"** This allows for robust matching even if the passage is long and covers multiple topics, as long as it contains the specific pieces of information needed to answer the query.
+**Intuition:** The final score is not a measure of overall holistic similarity. Instead, it answers the question: **"How well is each individual concept in my query covered by *some* relevant concept within the passage?"** This allows for robust matching even if the passage is long and covers multiple topics, as long as it contains the specific pieces of information needed to answer the query.
 
 **ColBERT in Practice: Inference and Training**
 
