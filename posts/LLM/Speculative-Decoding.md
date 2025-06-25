@@ -94,6 +94,7 @@ The loop through the draft tokens can end in two ways:
 ### 4. Performance Analysis: Acceptance Rate and Speedup
 
 * **Acceptance Rate ($r$):** The average probability that any given drafted token will be accepted. It can be proven that this rate is directly related to how similar the draft and target distributions are:
+
   $$
   r = \sum_{x \in V} \min(p(x), q(x)) = 1 - \frac{1}{2} \|q - p\|_1
   $$
