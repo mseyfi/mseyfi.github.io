@@ -4,21 +4,21 @@
 <br>
 <br>
 
-[![VLM](https://img.shields.io/badge/VLM-Vision_Language_Models-pink?style=for-the-badge&logo=github)](../posts/VLM)
+##[![VLM](https://img.shields.io/badge/VLM-Vision_Language_Models-pink?style=for-the-badge&logo=github)](../posts/VLM)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Vision-Language Models (VLMs) represent a frontier in artificial intelligence, creating systems that can see and reason about the visual world in tandem with human language. The field is incredibly diverse, with models specializing in distinct but related tasks. This guide provides a structured overview of the most prominent VLMs, categorized by their primary function.
 <p></p>
 </div>
 
 
-[![Efficiency](https://img.shields.io/badge/Efficient_Transformers-Efficient_Techniques_in_Transformers-blue?style=for-the-badge&logo=github)](../posts/EfficientTransformers)
+##[![Efficiency](https://img.shields.io/badge/Efficient_Transformers-Efficient_Techniques_in_Transformers-blue?style=for-the-badge&logo=github)](../posts/EfficientTransformers)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 
 Vision Transformers (ViTs) have become a popular choice for image recognition and related tasks, but they can be computationally expensive and memory-heavy. Below is a list of common (and often complementary) techniques to optimize Transformers—including ViTs—for more efficient training and inference. Alongside each category, I’ve mentioned some influential or representative papers.
 
 </div>
 
-[![AxialAttention](https://img.shields.io/badge/Axial_Attention-Attentions_across_axes-blue?style=for-the-badge&logo=github)](../posts/AxialAttention)
+##[![AxialAttention](https://img.shields.io/badge/Axial_Attention-Attentions_across_axes-blue?style=for-the-badge&logo=github)](../posts/AxialAttention)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Key ideas:
   
@@ -30,7 +30,7 @@ Key ideas:
 </div>
 
 
-[![TrackFormer](https://img.shields.io/badge/TrackFormer-Multi_Object_Tracking_with_Transformer-blue?style=for-the-badge&logo=github)](../posts/TrackFormer)
+##[![TrackFormer](https://img.shields.io/badge/TrackFormer-Multi_Object_Tracking_with_Transformer-blue?style=for-the-badge&logo=github)](../posts/TrackFormer)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Traditional multi-object tracking (MOT) systems often follow a two-step pipeline:
   
@@ -39,7 +39,7 @@ Associate detections across frames to form trajectories.
 This separation can lead to suboptimal solutions since detection and association are treated as separate problems. TrackFormer merges these steps by extending a Transformer-based detection architecture (inspired by DETR) to simultaneously detect and track objects. It does this by introducing track queries that carry information about previously tracked objects forward in time, allowing the network to reason about detection and association in a unified end-to-end manner. <p></p>
 </div>
 
-[![DETR](https://img.shields.io/badge/DETR-Detection_Transformer-blue?style=for-the-badge&logo=github)](../posts/DETR)
+##[![DETR](https://img.shields.io/badge/DETR-Detection_Transformer-blue?style=for-the-badge&logo=github)](../posts/DETR)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 The Detection Transformer (DETR) is a novel approach to object detection that leverages Transformers, which were originally designed for sequence-to-sequence tasks like machine translation. Introduced by Carion et al. in 2020, DETR simplifies the object detection pipeline by eliminating the need for hand-crafted components like anchor generation and non-maximum suppression (NMS).
@@ -95,12 +95,12 @@ Generalization issue with Distillation
 </div>
 
 
-[![MaskRCNN](https://img.shields.io/badge/MaskRCNN-Instancce_Segmentation-blue?style=for-the-badge&logo=github)](../posts/MaskRCNN)
+##[![MaskRCNN](https://img.shields.io/badge/MaskRCNN-Instancce_Segmentation-blue?style=for-the-badge&logo=github)](../posts/MaskRCNN)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 This tutorial is written to provide an extensive understanding of the Mask R-CNN architecture by dissecting every individual component involved in its pipeline.
 </div>
 
-[![SSD](https://img.shields.io/badge/SSD-Single_Shot_Object_Detector-blue?style=for-the-badge&logo=github)](../posts/ssd)
+##[![SSD](https://img.shields.io/badge/SSD-Single_Shot_Object_Detector-blue?style=for-the-badge&logo=github)](../posts/ssd)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 
 Single shot object detector
