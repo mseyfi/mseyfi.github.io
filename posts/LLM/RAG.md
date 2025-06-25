@@ -247,10 +247,10 @@ Consider a query about a specific detail mentioned only once in a long Wikipedia
    - **Process:** The passage is fed through a BERT model.
 
    - **Output:** Instead of just one vector, it outputs a set of vectors,one for each token in the passage. After filtering out punctuation tokens, we get a "bag of embeddings" for the passage:
+
      $$
      Dp=\{v_{p_1},v_{p_2},…,v_{p_L}\}
      $$
-      
 
      where $L$ is the number of tokens in the passage, and each $v_p$ is a vector (e.g., 128 dimensions in some ColBERT versions).
 
@@ -261,11 +261,11 @@ Consider a query about a specific detail mentioned only once in a long Wikipedia
    - **Process:** The query is fed through its own BERT model.
 
    - **Output:** It also outputs a set of vectors, one for each token in the query:
-
       
      $$
      Qe=\left\{v_{q_1},v_{q_2},…,v_{q_N}\right\}
      $$
+     
       where $N$ is the number of tokens in the query.
 
 **How Passages are Converted to Embeddings:** A passage is not converted to a single embedding. It is converted into a set of embeddings, one for each of its tokens. This is the fundamental difference. The model preserves the token-level granularity, which is the key to its power.
