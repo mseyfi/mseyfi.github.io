@@ -217,7 +217,9 @@ $$
    2. **Weakness with Keywords:** Ironically, DPR can sometimes struggle where BM25 excels. If a query requires an exact match of a rare keyword, product ID, or error code (e.g., "troubleshoot error `0x80070057`"), DPR might fail to retrieve the correct document if the surrounding semantic context is weak. This is a key reason why **hybrid search** (combining DPR and BM25) is often the most robust solution.
    3. **High Upfront Cost:** The initial offline indexing of millions or billions of documents requires significant computational resources.
 
-In conclusion, Dense Passage Retrieval is a foundational pillar of modern RAG. It represents the successful application of deep learning to information retrieval, enabling a shift from lexical to semantic search. While more advanced models like ColBERT have since improved upon its weaknesses, DPR's dual-encoder architecture remains a highly effective, scalable, and widely used approach for the "first-stage" retrieval in countless RAG systems today.#### **Model Structure 2: Late Interaction (ColBERT)**
+In conclusion, Dense Passage Retrieval is a foundational pillar of modern RAG. It represents the successful application of deep learning to information retrieval, enabling a shift from lexical to semantic search. While more advanced models like ColBERT have since improved upon its weaknesses, DPR's dual-encoder architecture remains a highly effective, scalable, and widely used approach for the "first-stage" retrieval in countless RAG systems today.
+
+#### **Model Structure 2: Late Interaction (ColBERT)**
 
 This architecture provides higher accuracy at the cost of complexity.
 
