@@ -2,7 +2,7 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-## 🔍 **1. Image-Text Matching / Retrieval**
+##  **1. Image-Text Matching / Retrieval**
 
 > Match images with corresponding captions or vice versa
 
@@ -15,7 +15,7 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-## 🖼️ **2. Image Captioning**
+##  **2. Image Captioning**
 
 > Generate natural language captions for images
 
@@ -28,7 +28,7 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-## ❓ **3. Visual Question Answering (VQA)**
+##  **3. Visual Question Answering (VQA)**
 
 > Answer questions about an input image
 
@@ -41,7 +41,7 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-## 🤖 **4. Multimodal Large Language Models (VLM-based GPTs)**
+##  **4. Multimodal Large Language Models (VLM-based GPTs)**
 
 > General-purpose vision+language agents that "see and chat"
 
@@ -55,7 +55,7 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-## 🎨 **5. Multimodal Generation (Text → Image or vice versa)**
+##  **5. Multimodal Generation (Text → Image or vice versa)**
 
 > Generate images from text or text from image/text
 
@@ -68,7 +68,7 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-## 🎥 **6. Video Question Answering and Temporal Reasoning**
+##  **6. Video Question Answering and Temporal Reasoning**
 
 > Understand visual scenes over time, answer queries, or generate summaries
 
@@ -81,7 +81,7 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-## 📍 **7. Grounded Image Understanding / Referring Expressions**
+##  **7. Grounded Image Understanding / Referring Expressions**
 
 > Understand phrases like “the man in the red shirt” in an image
 
@@ -94,7 +94,7 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-## 🔎 **8. Document Understanding / OCR + QA**
+##  **8. Document Understanding / OCR + QA**
 
 > Understand scanned documents or forms (e.g., invoices, ID cards)
 
@@ -106,7 +106,7 @@ Here’s a structured overview of the **most famous Vision-Language Models (VLMs
 
 ---
 
-## 🧠 Summary Table
+##  Summary Table
 
 | Task Category                 | Famous Models                              |
 | ----------------------------- | ------------------------------------------ |
