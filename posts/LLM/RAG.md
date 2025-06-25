@@ -174,7 +174,6 @@ The core promise of DPR is to retrieve documents based on their **semantic meani
 
     Once we have the two vectors, how do we determine relevance? DPR calculates the similarity score as the **dot product** of the question vector and the passage vector. A higher dot product means higher relevance.
 
-    
     $$
     \text{score}(q, p) = v_q \cdot v_p = E_Q(q) \cdot E_P(p)
     $$
@@ -285,9 +284,11 @@ $$
 We repeat the MaxSim process for every token in our query and then simply add up the resulting scores.
 
 **The Final ColBERT Score:** The final relevance score between query q and passage p is the sum of these maximum similarities:
+
 $$
 \text{Score}(q,p)=\sum_{i=1}^N\max_{j=1, \ldots, L}(v_{q_i}\cdot v_{p_j})
 $$
+
 **Intuition:** The final score is not a measure of overall holistic similarity. Instead, it answers the question: **"How well is each individual concept in my query covered by \*some\* relevant concept within the passage?"** This allows for robust matching even if the passage is long and covers multiple topics, as long as it contains the specific pieces of information needed to answer the query.
 
 **ColBERT in Practice: Inference and Training**
@@ -308,11 +309,9 @@ $$
 
   - **The Loss Function:** The model is trained by minimizing a pairwise **log-likelihood loss**. For each query $q$, given a positive passage $p+$ and a hard negative passage $p-$, the loss aims to maximize the softmax output for the positive pair:
 
-    
     $$
     \mathcal{L}=−\log\frac{\exp\left(\text{Score}(q,p+)\right)}{\exp\left(\text{Score}(q,p+)\right)+\exp\left(\text{Score}(q,p−)\right)}
-    $$
-    
+    $$    
 
     This loss pushes the score of the positive pair up and the score of the negative pair down.
 
