@@ -137,7 +137,7 @@ The retriever is where the magic happens. A better retriever leads to better RAG
 
 Dense Passage Retrieval (DPR) is a model and a technique for finding relevant text passages for a given query from a massive collection of documents. It was introduced by Facebook AI researchers in 2020 and set a new state-of-the-art, fundamentally changing the approach to information retrieval in open-domain question answering systems like RAG.
 
-**The "Why" - The Problem with Traditional Keyword Search**
+- **The "Why" - The Problem with Traditional Keyword Search**
 
 Before DPR, the dominant method for information retrieval was based on **sparse retrieval** algorithms like **TF-IDF** and its powerful successor, **Okapi BM25**.
 
@@ -153,7 +153,7 @@ Before DPR, the dominant method for information retrieval was based on **sparse 
     > "The current President of the USA is Joe Biden."
     > ...might score poorly in a BM25 system because it doesn't contain the exact keyword "leader". The system has no understanding that "leader" and "President" are semantically related. It's matching words, not meaning.
 
-**Part 2: The DPR Solution - Searching by Semantic Meaning**
+- **The DPR Solution - Searching by Semantic Meaning**
 
 DPR was designed to solve this exact problem.
 
@@ -179,7 +179,7 @@ The genius of DPR lies in its efficient architecture, known as the **Dual Encode
       * **Process:** The query is fed into a *different* BERT model. While the architecture is often identical to the passage encoder, its weights are trained separately to specialize in understanding questions.
       * **Output:** A single, fixed-size dense vector $v_q$.
 
-**The Similarity Score**
+- **The Similarity Score**
 
 Once we have the two vectors, how do we determine relevance? DPR calculates the similarity score as the **dot product** of the question vector and the passage vector. A higher dot product means higher relevance.
 
@@ -189,11 +189,11 @@ $$
 
 A high score indicates that the two vectors are pointing in a similar direction and have large magnitudes, meaning the model is confident in their semantic alignment.
 
-**DPR in Practice: Inference and Training**
+- **DPR in Practice: Inference and Training**
 
 The dual-encoder architecture enables an extremely efficient workflow for RAG systems.
 
-**Inference (How it Works at Query Time)**
+- **Inference (How it Works at Query Time)**
 
 The key is to do the heavy computation offline.
 
@@ -205,7 +205,7 @@ The key is to do the heavy computation offline.
 
 This separation of computation is what allows DPR to be practical for real-world, large-scale systems.
 
-**Training (How it Learns to Match Meaning)**
+- **Training (How it Learns to Match Meaning)**
 
 DPR is trained using **contrastive learning**. The goal is to teach the two encoders to produce vectors that result in a high similarity score for relevant pairs and a low score for irrelevant pairs.
 
@@ -221,7 +221,7 @@ $$
 
   * **Hard Negatives:** The original DPR paper showed that the choice of negatives is crucial. In addition to random passages, they used **hard negatives**: passages retrieved by a BM25 system that share keywords with the query but are not the correct answer. Training on these "confusing" examples forces the model to learn deeper semantic understanding beyond simple word overlap.
 
-**Strengths and Weaknesses of DPR**
+- **Strengths and Weaknesses of DPR**
 
 **Strengths:**
 
@@ -229,7 +229,7 @@ $$
 2.  **High Retrieval Speed:** The dual-encoder architecture is highly scalable because the expensive document encoding is done offline.
 3.  **State-of-the-Art Performance:** At the time of its release, DPR significantly outperformed BM25 and other sparse retrieval methods on many open-domain question-answering benchmarks.
 
-**Weaknesses:**
+- **Weaknesses:**
 
 1.  **The Single Vector Bottleneck:** Compressing an entire passage of text into a single 768-dimensional vector is inherently lossy. Fine-grained details or multiple sub-topics within a passage can be washed out. This makes it difficult for DPR to answer questions that rely on very specific, non-dominant phrases within a long passage.
 2.  **Weakness with Keywords:** Ironically, DPR can sometimes struggle where BM25 excels. If a query requires an exact match of a rare keyword, product ID, or error code (e.g., "troubleshoot error `0x80070057`"), DPR might fail to retrieve the correct document if the surrounding semantic context is weak. This is a key reason why **hybrid search** (combining DPR and BM25) is often the most robust solution.
