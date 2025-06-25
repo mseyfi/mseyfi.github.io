@@ -151,7 +151,7 @@ We train a dual encoder using **contrastive loss**, which teaches the model what
   * **Math (InfoNCE Loss):** The most common contrastive loss is InfoNCE (Noise-Contrastive Estimation). For a query $q$, a positive passage $d+$, and a set of $N$ negative passages ${d_i-}$, the loss is:
 
     $$
-    \mathcal{L}(q, d^+, \{d_i^-\}) = -\log \frac{e\left(\text{sim}(q, d^+)/\tau\right)}{\exp\left(\text{sim}(q, d^+)/\tau\right) + \sum_{i=1}^{N} \exp\left(\text{sim}(q, d_i^-)/\tau\right)}
+    \mathcal{L}(q, d^+, \{d_i^-\}) = -\log \frac{\exp\left(\frac{\text{sim}(q, d^+)}{\tau}\right)}{\exp\left(\frac{\text{sim}(q, d^+)}{\tau}\right) + \sum_{i=1}^{N} \exp\left(\frac{\text{sim}(q, d_i^-)}{\tau}\right)}
     $$
 
       * The dot product similarity is: $\text{sim}(q, d) = v\_q \cdot v\_d$.
