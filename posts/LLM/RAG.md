@@ -305,7 +305,7 @@ $$
 
   ColBERT is trained using a similar contrastive learning approach to DPR, but with a focus on pairwise comparisons.
 
-  - **The Goal:** The training objective is to make the score of a $(query, positive_passage)$ pair significantly larger than the score of a $(query, negative_passage)$ pair.
+  - **The Goal:** The training objective is to make the score of a `(query, positive_passage)` pair significantly larger than the score of a `(query, negative_passage)` pair.
 
   - **The Loss Function:** The model is trained by minimizing a pairwise **log-likelihood loss**. For each query $q$, given a positive passage $p+$ and a hard negative passage $p-$, the loss aims to maximize the softmax output for the positive pair:
 
