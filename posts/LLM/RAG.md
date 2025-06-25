@@ -105,7 +105,7 @@ This happens in real-time.
 2. **Search:** The retriever sends $v_q$ to the index, which performs an **Approximate Nearest Neighbor (ANN)** search to find the $k$ document vectors that are most similar.
 
    $$
-   \text{TopK_Indices} = \underset{i \in \{1..N\}}{\text{argmax}_k} \left( \text{CosineSimilarity}(v_q, v_i) \right)
+   \text{Top}K\text{Indices} = \underset{i \in \{1..N\}}{\text{argmax}_k} \left( \text{sim}(v_q, v_i) \right)
    $$
 
 3. **Fetch & Augment:** The system retrieves the text of the top $k$ chunks and constructs the final prompt for the LLM.
@@ -151,7 +151,7 @@ We train a dual encoder using **contrastive loss**, which teaches the model what
   * **Math (InfoNCE Loss):** The most common contrastive loss is InfoNCE (Noise-Contrastive Estimation). For a query $q$, a positive passage $d+$, and a set of $N$ negative passages ${d_i-}$, the loss is:
 
     $$
-    L(q, d^+, \{d_i^-\}) = -\log \frac{e^{\text{sim}(q, d^+)/\tau}}{e^{\text{sim}(q, d^+)/\tau} + \sum_{i=1}^{N} e^{\text{sim}(q, d_i^-)/\tau}}
+    \mathcal{L}(q, d^+, \{d_i^-\}) = -\log \frac{e\left(\text{sim}(q, d^+)/\tau\right)}{\exp\left(\text{sim}(q, d^+)/\tau\right) + \sum_{i=1}^{N} \exp\left(\text{sim}(q, d_i^-)/\tau\right)}
     $$
 
       * The dot product similarity is: $\text{sim}(q, d) = v\_q \cdot v\_d$.
@@ -162,7 +162,7 @@ We train a dual encoder using **contrastive loss**, which teaches the model what
 
 #### **The Power of Hard Negatives**
 
-Randomly chosen negative documents are usually easy for the model to dismiss. A **hard negative** is a document that is "confusingly similar" to the query but factually wrong. For example, for the query "What is the function of the 'clip' loss in PPO?", a hard negative might be a document describing the `huber` loss in reinforcement learning. Training with these forces the model to move beyond simple keyword matching and learn true semantic understanding.
+Randomly chosen negative documents are usually easy for the model to dismiss. A **hard negative** is a document that is "confusingly similar" to the query but factually wrong. For example, for the query "What is the function of the `clip` loss in PPO?", a hard negative might be a document describing the `huber` loss in reinforcement learning. Training with these forces the model to move beyond simple keyword matching and learn true semantic understanding.
 
 **Methods for Mining Hard Negatives:**
 
@@ -224,7 +224,7 @@ The training data simply consists of `(question, known_answer)` pairs.
 We treat the retrieved document $z$ as a hidden **latent variable**. The model's loss is based on its ability to produce the correct final answer, $Y$, by marginalizing (summing) over the probabilities of having chosen each document in the Top-K retrieved set.
 
 $$
-L(q, Y) = -\log p(Y|q) = -\log \left( \sum_{z \in \text{Top}K(q)} p_\eta(z|q) \cdot p_\theta(Y|q, z) \right)
+\mathcal{L}(q, Y) = -\log p(Y|q) = -\log \left( \sum_{z \in \text{Top}K(q)} p_\eta(z|q) \cdot p_\theta(Y|q, z) \right)
 $$
 
 where $p_\eta(z|q)$ is the retriever's probability of choosing doc $z$, and $p_\theta(Y|q,z)$ is the generator's probability of producing answer $Y$ given doc $z$.
