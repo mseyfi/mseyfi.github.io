@@ -77,7 +77,7 @@ The reason for this probabilistic check (instead of a simple threshold) is that 
 The loop through the draft tokens can end in two ways:
 
 1.  **A Mismatch Occurs (Rejection):**
-    Let's say the check fails at token `i`. All previous `i-1` tokens have been accepted. The algorithm **must stop** here because all subsequent target distributions ($q_{i+1}, q_{i+2}, \dots$) were conditioned on the draft token $x'_i$ being correct. Since it was rejected, they are now invalid.
+    Let's say the check fails at token $i$. All previous $i-1$ tokens have been accepted. The algorithm **must stop** here because all subsequent target distributions ($q_{i+1}, q_{i+2}, \dots$) were conditioned on the draft token $x'_i$ being correct. Since it was rejected, they are now invalid.
     * **The Replacement Token:** Instead of just restarting, we use the valid distribution $q_i$ that we already computed. However, we cannot simply sample from $q_i$, as this would bias the output. We must sample from a **corrected distribution** that accounts for the information gained during rejection.
     * **Mathematics of Correction:** The new distribution $p'_i$ is formed by taking the "leftover" probability mass where the target model was more confident than the draft model.
 
@@ -89,7 +89,7 @@ The loop through the draft tokens can end in two ways:
     * **Cycle Output:** The new tokens generated in this cycle are `[accepted_tokens] + [x_new]`.
 
 3.  **The Entire Draft is Accepted (The Bonus Token):**
-    If the loop completes and all `K` draft tokens are accepted, we get a "bonus." The target model's forward pass also computed the distribution for the *next* token, $q_{K+1}$. We can perform one final sample from this distribution to get a `(K+1)`-th token for free, maximizing the output from a single target model call.
+    If the loop completes and all `K` draft tokens are accepted, we get a "bonus." The target model's forward pass also computed the distribution for the *next* token, $q_{K+1}$. We can perform one final sample from this distribution to get a $(K+1)-th$ token for free, maximizing the output from a single target model call.
 
 ### 4. Performance Analysis: Acceptance Rate and Speedup
 
