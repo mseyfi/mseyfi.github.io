@@ -4,7 +4,7 @@
 ## Retrieval-Augmented Generation (RAG): From Theory to Practice
 
 ### **Part 1: The Philosophical Foundation: The Two Minds of AI**
-
+  
 To understand why Retrieval-Augmented Generation (RAG) is so revolutionary, we must first understand the two forms of "memory" an AI can possess. This conceptual split is the philosophical bedrock upon which RAG is built.
 
 #### **The First Mind: Parametric Memory**
@@ -141,9 +141,9 @@ Dense Passage Retrieval (DPR) is a model and a technique for finding relevant te
 
 Before DPR, the dominant method for information retrieval was based on **sparse retrieval** algorithms like **TF-IDF** and its powerful successor, **Okapi BM25**.
 
-  * **Core Idea of Sparse Retrieval:** These methods work on the principle of **lexical overlap** or keyword matching. They represent documents and queries as very large (sparse) vectors where each dimension corresponds to a word in the vocabulary. The value in a dimension is typically zero unless that specific word appears in the text. The system finds relevant documents by counting how many important keywords the query and the document share.
+    * **Core Idea of Sparse Retrieval:** These methods work on the principle of **lexical overlap** or keyword matching. They represent documents and queries as very large (sparse) vectors where each dimension corresponds to a word in the vocabulary. The value in a dimension is typically zero unless that specific word appears in the text. The system finds relevant documents by counting how many important keywords the query and the document share.
 
-  * **The Critical Limitation: The Vocabulary Mismatch Problem**
+    * **The Critical Limitation: The Vocabulary Mismatch Problem**
     Sparse retrieval fails when the query and the answer document use different words to express the same concept. Consider this query:
 
     > "Who is the leader of the United States?"
@@ -157,13 +157,13 @@ Before DPR, the dominant method for information retrieval was based on **sparse 
 
 DPR was designed to solve this exact problem.
 
-  * **Core Intuition:** Instead of matching keywords, DPR learns to map questions and document passages into a shared, continuous **embedding space**—a high-dimensional "meaning space." In this space, the distance and angle between vectors represent semantic relatedness. The query "US leader" and the passage "The President of the USA..." would be mapped to vectors that are very close together.
+    * **Core Intuition:** Instead of matching keywords, DPR learns to map questions and document passages into a shared, continuous **embedding space**—a high-dimensional "meaning space." In this space, the distance and angle between vectors represent semantic relatedness. The query "US leader" and the passage "The President of the USA..." would be mapped to vectors that are very close together.
 
-  * **Why "Dense"?** The name comes from the fact that it operates on **dense vectors**. These are relatively low-dimensional (e.g., 768 dimensions) embeddings where most or all of the values are non-zero. Each dimension represents a learned feature of the text's meaning, not a specific word. This is in contrast to the high-dimensional, mostly-zero "sparse" vectors of TF-IDF.
+    * **Why "Dense"?** The name comes from the fact that it operates on **dense vectors**. These are relatively low-dimensional (e.g., 768 dimensions) embeddings where most or all of the values are non-zero. Each dimension represents a learned feature of the text's meaning, not a specific word. This is in contrast to the high-dimensional, mostly-zero "sparse" vectors of TF-IDF.
 
 The core promise of DPR is to retrieve documents based on their **semantic meaning**, not just their surface-level keywords.
 
-**The DPR Architecture - The Dual Encoder ("Two-Tower Model")**
+- **The DPR Architecture - The Dual Encoder ("Two-Tower Model")**
 
 The genius of DPR lies in its efficient architecture, known as the **Dual Encoder**. It consists of two separate, independent Transformer-based encoders (typically BERT models).
 
@@ -193,7 +193,7 @@ A high score indicates that the two vectors are pointing in a similar direction 
 
 The dual-encoder architecture enables an extremely efficient workflow for RAG systems.
 
-- **Inference (How it Works at Query Time)**
+  - **Inference (How it Works at Query Time)**
 
 The key is to do the heavy computation offline.
 
@@ -205,7 +205,7 @@ The key is to do the heavy computation offline.
 
 This separation of computation is what allows DPR to be practical for real-world, large-scale systems.
 
-- **Training (How it Learns to Match Meaning)**
+  - **Training (How it Learns to Match Meaning)**
 
 DPR is trained using **contrastive learning**. The goal is to teach the two encoders to produce vectors that result in a high similarity score for relevant pairs and a low score for irrelevant pairs.
 
@@ -223,13 +223,13 @@ $$
 
 - **Strengths and Weaknesses of DPR**
 
-**Strengths:**
+  - **Strengths:**
 
 1.  **Semantic Understanding:** Its primary strength. It effectively solves the vocabulary mismatch problem by operating on meaning.
 2.  **High Retrieval Speed:** The dual-encoder architecture is highly scalable because the expensive document encoding is done offline.
 3.  **State-of-the-Art Performance:** At the time of its release, DPR significantly outperformed BM25 and other sparse retrieval methods on many open-domain question-answering benchmarks.
 
-- **Weaknesses:**
+  - **Weaknesses:**
 
 1.  **The Single Vector Bottleneck:** Compressing an entire passage of text into a single 768-dimensional vector is inherently lossy. Fine-grained details or multiple sub-topics within a passage can be washed out. This makes it difficult for DPR to answer questions that rely on very specific, non-dominant phrases within a long passage.
 2.  **Weakness with Keywords:** Ironically, DPR can sometimes struggle where BM25 excels. If a query requires an exact match of a rare keyword, product ID, or error code (e.g., "troubleshoot error `0x80070057`"), DPR might fail to retrieve the correct document if the surrounding semantic context is weak. This is a key reason why **hybrid search** (combining DPR and BM25) is often the most robust solution.
