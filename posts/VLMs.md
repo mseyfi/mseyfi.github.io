@@ -5,7 +5,7 @@ Vision-Language Models (VLMs) represent a frontier in artificial intelligence, c
 
 ##  **1. Image-Text Matching / Retrieval**
 
-## [![CLIP](https://img.shields.io/badge/CLIP-Learning_Transferable_Visual_Models_From_Natural_Language_Supervision-blue?style=for-the-badge&logo=github)](VLM/CLIP)
+## [![CLIP](https://img.shields.io/badge/CLIP-Learning_Transferable_Visual_Models_From_Natural_Language_Supervision-blue?style=for-the-badge&logo=github)](CLIP)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 Learning Transferable Visual Models From Natural Language Supervision" is a groundbreaking paper by OpenAI that introduces CLIP (Contrastive Language-Image Pre-training). CLIP learns visual concepts from natural language supervision by jointly training an image encoder and a text encoder to predict the correct pairings of images and texts.
@@ -13,7 +13,7 @@ Learning Transferable Visual Models From Natural Language Supervision" is a grou
 </div>
 
 
-## [![texttoimage](https://img.shields.io/badge/Text_to_Image-grey?style=for-the-badge&logo=github)](VLM/TextToImage)
+## [![texttoimage](https://img.shields.io/badge/Text_to_Image-grey?style=for-the-badge&logo=github)](TextToImage)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 notable text-to-image generation models along with their corresponding research papers, sorted by the year they were published:
@@ -100,7 +100,7 @@ notable text-to-image generation models along with their corresponding research 
 
 ##  **7. Grounded Image Understanding / Referring Expressions**
 
-## [![GLIP](https://img.shields.io/badge/GLIP-Grounded_Language_Image_Pre_training-blue?style=for-the-badge&logo=github)](VLM/GLIP)
+## [![GLIP](https://img.shields.io/badge/GLIP-Grounded_Language_Image_Pre_training-blue?style=for-the-badge&logo=github)](GLIP)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 GLIP (Grounded Language-Image Pre-training) is a unified model architecture that bridges the gap between vision and language by integrating object detection and phrase grounding tasks. It leverages both visual and textual data to perform object detection conditioned on textual descriptions, enabling the model to recognize objects based on their semantic meanings.
