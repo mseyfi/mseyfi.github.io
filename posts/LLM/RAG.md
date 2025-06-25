@@ -270,16 +270,16 @@ Consider a query about a specific detail mentioned only once in a long Wikipedia
 
 **How Passages are Converted to Embeddings:** A passage is not converted to a single embedding. It is converted into a set of embeddings, one for each of its tokens. This is the fundamental difference. The model preserves the token-level granularity, which is the key to its power.
 
-**The ColBERT Similarity Score: Math and Intuition:** This is where the "late interaction" happens. The similarity check is a two-step process called **MaxSim** (Maximum Similarity).
+**The ColBERT Similarity Score:** This is where the "late interaction" happens. The similarity check is a two-step process called **MaxSim** (Maximum Similarity).
 
 **Step 1**: For each query token, find its best match in the passage.
 
 Take the first query token's embedding, $v_{q_1}$. We calculate its similarity (using dot product) with every single token embedding in the passage $D_p$. Then, we find the maximum of these scores. This tells us how well the "best" part of the passage matches our first query token.
 
-
 $$
 \text{MaxSim}(vq_1,Dp)=\max_{j=1,\ldots, L}(v_{q_1}\cdot v_{p_j})
 $$
+
 **Step 2:** Sum the scores for all query tokens.
 
 We repeat the MaxSim process for every token in our query and then simply add up the resulting scores.
