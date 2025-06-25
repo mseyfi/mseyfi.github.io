@@ -81,11 +81,11 @@ The loop through the draft tokens can end in two ways:
     * **The Replacement Token:** Instead of just restarting, we use the valid distribution $q_i$ that we already computed. However, we cannot simply sample from $q_i$, as this would bias the output. We must sample from a **corrected distribution** that accounts for the information gained during rejection.
     * **Mathematics of Correction:** The new distribution $p'_i$ is formed by taking the "leftover" probability mass where the target model was more confident than the draft model.
 
-      $$
-      p'_i(x) = \text{Normalize}\left(\max(0, q_i(x) - p_i(x))\right)
-      $$
+$$
+p'_i(x) = \text{Normalize}\left(\max(0, q_i(x) - p_i(x))\right)
+$$
 
-    * We perform one sample from this distribution $p'_i$ to get a single replacement token, $x_{new}$.
+    * We perform one sample from this distribution $p'_i$ to get a single replacement toke, $x_{new}$.
     * **Cycle Output:** The new tokens generated in this cycle are `[accepted_tokens] + [x_new]`.
 
 3.  **The Entire Draft is Accepted (The Bonus Token):**
