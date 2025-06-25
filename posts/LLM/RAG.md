@@ -33,6 +33,10 @@ RAG is the architectural pattern that gives the brilliant parametric mind of an 
 
 The LLM is no longer forced to be an all-knowing oracle. Instead, it becomes a brilliant synthesizer of information, taking factual context provided by the retrieval system and weaving it into a precise, reliable, and verifiable answer. This hybrid approach mitigates the flaws of purely parametric models, paving the way for AI systems that are both intelligent and trustworthy.
 
+![RAG](../../images/RAG.png)
+*Fig.1 Anatomy of a sample RAG system.*
+
+
 ### Part 2: The Anatomy of a RAG System: Core Components
 
 A RAG system is an assembly line for knowledge. Let's break down each station.
