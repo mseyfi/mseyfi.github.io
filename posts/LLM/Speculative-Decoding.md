@@ -15,6 +15,10 @@ To build a strong mental model, imagine a high-stakes law firm.
 * **The Target LLM ($M_t$) is the "Senior Partner" 👩‍⚖️:** A world-class, extremely knowledgeable, and highly accurate lawyer. Their time is valuable, and a consultation (a forward pass) is slow. They are always right.
 * **The Draft Model ($M_d$) is the "Junior Intern" 👨‍🎓:** A fast, eager intern who is much cheaper to consult (a smaller model with lower latency) but might make occasional mistakes.
 
+![spec](../../images/Speculative.png)
+
+*Fig.~1 Speculative decoding architecture, the draft model generates the completion token by token and the target model does a one-shot parallel prediction for all the tokens.*
+
 **The Process:**
 1.  **Drafting:** Instead of waiting for the partner, you give the current document to the **Intern**, who quickly writes a draft of the next `K` words.
 2.  **Parallel Verification:** You give this `K`-word draft to the **Senior Partner** all at once. Because they can read the full draft in parallel (like a Transformer processing a sequence), they verify it in a single, slow consultation.
