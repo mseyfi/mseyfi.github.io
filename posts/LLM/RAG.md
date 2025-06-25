@@ -276,7 +276,7 @@ Consider a query about a specific detail mentioned only once in a long Wikipedia
 Take the first query token's embedding, $v_{q_1}$. We calculate its similarity (using dot product) with every single token embedding in the passage $D_p$. Then, we find the maximum of these scores. This tells us how well the "best" part of the passage matches our first query token.
 
 $$
-\text{MaxSim}(vq_1,Dp)=\max_{j=1,\ldots, L}(v_{q_1}\cdot v_{p_j})
+\text{MaxSim}(v_{q_1},Dp)=\max_{j=1,\ldots, L}(v_{q_1}\cdot v_{p_j})
 $$
 
 **Step 2:** Sum the scores for all query tokens.
