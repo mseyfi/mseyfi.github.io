@@ -8,13 +8,13 @@ Vision-Language Models (VLMs) represent a frontier in artificial intelligence, c
 This is a foundational task in vision-language understanding. The goal is to create a model that understands the semantic relationship between an image and a piece of text so well that it can match them in a vast collection. Given an image, it can retrieve the correct caption (image-to-text retrieval), and given a caption, it can retrieve the correct image (text-to-image retrieval).
 
 ## [![CLIP](https://img.shields.io/badge/CLIP-Learning_Transferable_Visual_Models_From_Natural_Language_Supervision-blue?style=for-the-badge&logo=github)](CLIP)
-
-  * **What it does:** CLIP learns a shared embedding space where images and text with similar meanings are located close together. It is the bedrock technology for many modern VLMs.
-  * **How it works:** It uses a **contrastive loss** function. During training on 400 million image-text pairs from the web, the model is given a batch of images and a batch of texts. For each image, it must predict which text is its true partner. The model learns by pulling the vector representations of correct pairs together while pushing all incorrect pairs apart.
-  * **Key Contribution:** Revolutionized the field by enabling robust **zero-shot image classification**. Without any specific training, you can classify an image by comparing its embedding similarity to the embeddings of text prompts like "a photo of a dog" or "a photo of a cat."
-  * **Reference Paper:** Radford, A., Kim, J. W., et al. (2021). *Learning Transferable Visual Models From Natural Language Supervision*. [arXiv:2103.00020](https://arxiv.org/abs/2103.00020)
----
-
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+  <b>What it does:</b> CLIP learns a shared embedding space where images and text with similar meanings are located close together. It is the bedrock technology for many modern VLMs.
+  * <b>How it works:</b> It uses a **contrastive loss** function. During training on 400 million image-text pairs from the web, the model is given a batch of images and a batch of texts. For each image, it must predict which text is its true partner. The model learns by pulling the vector representations of correct pairs together while pushing all incorrect pairs apart.
+  * <b>Key Contribution:</b> Revolutionized the field by enabling robust **zero-shot image classification**. Without any specific training, you can classify an image by comparing its embedding similarity to the embeddings of text prompts like "a photo of a dog" or "a photo of a cat."
+  * <b>Reference Paper:</b> Radford, A., Kim, J. W., et al. (2021). *Learning Transferable Visual Models From Natural Language Supervision*. [arXiv:2103.00020](https://arxiv.org/abs/2103.00020)
+  <p></p>
+</div>
 
 #### **ALIGN (A Large-scale johNson et al.)**
 
