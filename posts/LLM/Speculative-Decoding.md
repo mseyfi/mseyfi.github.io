@@ -85,7 +85,7 @@ $$
 p'_i(x) = \text{Normalize}\left(\max(0, q_i(x) - p_i(x))\right)
 $$
 
-We perform one sample from this distribution $p'_i$ to get a single replacement toke, $x_{new}$. **Cycle Output:** The new tokens generated in this cycle are `[accepted_tokens] + [x_new]`.
+We perform one sample from this distribution $p'_i$ to get a single replacement token, $x_{new}$. **Cycle Output:** The new tokens generated in this cycle are `[accepted_tokens] + [x_new]`.
 
 3.  **The Entire Draft is Accepted (The Bonus Token):**
     If the loop completes and all `K` draft tokens are accepted, we get a "bonus." The target model's forward pass also computed the distribution for the *next* token, $q_{K+1}$. We can perform one final sample from this distribution to get a $(K+1)-th$ token for free, maximizing the output from a single target model call.
