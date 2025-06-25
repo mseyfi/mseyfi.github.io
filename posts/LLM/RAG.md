@@ -227,10 +227,9 @@ $$
 L(q, Y) = -\log p(Y|q) = -\log \left( \sum_{z \in \text{TopK}(q)} p_\eta(z|q) \cdot p_\theta(Y|q, z) \right)
 $$
 
+* $p_\eta(z|q)$ is the retriever's probability of choosing doc $z$
+* $p_\theta(Y|q,z)$ is the generator's probability of producing answer $Y$ given doc $z$.
 
-$p_\eta(z|q)$ is the retriever's probability of choosing doc $z$, and $p_\theta(Y|q,z)$ is the generator's probability of producing answer $Y$ given doc $z$.
-
-$p_\eta(z|q)$ is the retriever's probability of choosing doc $z$, and $p_\theta(Y|q,z)$ is the generator's probability of producing answer $Y$ given doc $z$.
 When we backpropagate the loss, the gradients flow "through" this sum to update both the generator $\theta$ and the retriever $\eta$. The generator learns what makes a good answer, and the retriever learns what makes a useful document for the generator. They learn to cooperate.
 
 -----
