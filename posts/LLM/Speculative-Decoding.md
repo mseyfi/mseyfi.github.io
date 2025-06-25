@@ -17,7 +17,7 @@ To build a strong mental model, imagine a high-stakes law firm.
 
 ![spec](../../images/Speculative.png)
 
-*Fig.~1 Speculative decoding architecture, the draft model generates the completion token by token and the target model does a one-shot parallel prediction for all the tokens.*
+*Fig.1 Speculative decoding architecture, the draft model generates the completion token by token and the target model does a one-shot parallel prediction for all the tokens.*
 
 **The Process:**
 1.  **Drafting:** Instead of waiting for the partner, you give the current document to the **Intern**, who quickly writes a draft of the next `K` words.
