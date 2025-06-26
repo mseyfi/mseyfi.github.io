@@ -128,22 +128,20 @@ VideoBERT is pre-trained on large-scale instructional video datasets from source
      * Is_Aligned` (Label = 1): The text and video are a correct, temporally aligned pair.` 
      * `Is_Not_Aligned` (Label = 0): The text and video are a mismatched pair.
 
-  	* **Constructing the Training Data: Positive and Negative Pairs**
-
-​		The model learns to perform this classification task by being trained on a large dataset of both correct and incorrect pairings. This data is 		generated automatically from the timestamped ASR transcripts and video clips.
+  	  **Constructing the Training Data: Positive and Negative Pairs:** The model learns to perform this classification task by being trained on a large dataset of both correct and incorrect pairings. This data is generated automatically from the timestamped ASR transcripts and video clips.
 
     * **Positive Pairs (Aligned - Label 1):**
     
-    *   A sentence is extracted from the ASR transcript (e.g., "now put the chicken in the oven").
-    *   The ASR provides timestamps for this sentence.
-    *   The sequence of visual tokens corresponding to that *exact same time window* is extracted from the video.
-    *   These two sequences—the text and the correctly corresponding video—form a **positive pair**. The model is taught that for this input, the correct output is `1`.
+    * A sentence is extracted from the ASR transcript (e.g., "now put the chicken in the oven").
+    * The ASR provides timestamps for this sentence.
+    * The sequence of visual tokens corresponding to that *exact same time window* is extracted from the video.
+    * These two sequences—the text and the correctly corresponding video—form a **positive pair**. The model is taught that for this input, the correct output is `1`.
     
     *  **Negative Pairs (Misaligned - Label 0):**
     
-    *   The same sentence of text is taken (e.g., "now put the chicken in the oven").
-    *   However, it is paired with a sequence of visual tokens from a **randomly selected, different segment** of the video. For instance, the video clip might show someone chopping carrots.
-    *   This mismatched pair of text and video forms a **negative pair**. The model is taught that for this input, the correct output is `0`.
+    * The same sentence of text is taken (e.g., "now put the chicken in the oven").
+    * However, it is paired with a sequence of visual tokens from a **randomly selected, different segment** of the video. For instance, the video clip might show someone chopping carrots.
+    * This mismatched pair of text and video forms a **negative pair**. The model is taught that for this input, the correct output is `0`.
 
     **The Model Architecture for Prediction**
     
