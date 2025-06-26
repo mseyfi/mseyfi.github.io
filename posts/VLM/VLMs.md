@@ -129,7 +129,9 @@ This advanced category deals with models that can process and reason about seque
 
 ## [![VIDEOBERT](https://img.shields.io/badge/VideoBERT-Joint_Model_for_Video_and_Language_Representation_Learning-blue?style=for-the-badge&logo=github)](VIDEOBERT)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-<p><b>What it does:</b> An early model that learns joint representations for video and text</p>.<p><b>How it works:</b> It converts video into a sequence of visual tokens (by clustering frame features) and aligns them with text tokens (from ASR or subtitles). It then uses a standard BERT model to learn representations on this combined sequence using a masked language modeling objective</p>.<p><b>Key Contribution:</b> Pioneered the application of the BERT framework to the self-supervised learning of video-text representations</p>.<p><b>Reference Paper:</b> Sun, C., Myers, A., Vondrick, C., et al. (2019). *VideoBERT: A Joint Model for Video and Language Representation Learning*. [arXiv:1904.01766](https://arxiv.org/abs/1904.01766)</p>
+<b>What it does:</b> An early model that learns joint representations for video and text.
+<b>How it works:</b> It converts video into a sequence of visual tokens (by clustering frame features) and aligns them with text tokens (from ASR or subtitles). It then uses a standard BERT model to learn representations on this combined sequence using a masked language modeling objective</p>.<p><b>Key Contribution:</b> Pioneered the application of the BERT framework to the self-supervised learning of video-text representations.
+<b>Reference Paper:</b> Sun, C., Myers, A., Vondrick, C., et al. (2019). VideoBERT: A Joint Model for Video and Language Representation Learning. [arXiv:1904.01766](https://arxiv.org/abs/1904.01766)
 </div>
 
 #### **MERLOT (Multimedia Event Representation Learning over Time)**
