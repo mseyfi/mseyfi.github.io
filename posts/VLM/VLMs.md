@@ -11,9 +11,9 @@ This is a foundational task in vision-language understanding. The goal is to cre
 
 ## [![CLIP](https://img.shields.io/badge/CLIP-Learning_Transferable_Visual_Models_From_Natural_Language_Supervision-blue?style=for-the-badge&logo=github)](CLIP)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-<b>What it does:</b> CLIP learns a shared embedding space where images and text with similar meanings are located close together. It is the bedrock technology for many modern VLMs.
-<b>How it works:</b> It uses a <b>contrastive loss</b> function. During training on 400 million image-text pairs from the web, the model is given a batch of images and a batch of texts. For each image, it must predict which text is its true partner. The model learns by pulling the vector representations of correct pairs together while pushing all incorrect pairs apart.
-<b>Key Contribution:</b> Revolutionized the field by enabling robust <b>zero-shot image classification</b>. Without any specific training, you can classify an image by comparing its embedding similarity to the embeddings of text prompts like "a photo of a dog" or "a photo of a cat."
+<b>What it does:</b> CLIP learns a shared embedding space where images and text with similar meanings are located close together. It is the bedrock technology for many modern VLMs.<p></p>
+<b>How it works:</b> It uses a <b>contrastive loss</b> function. During training on 400 million image-text pairs from the web, the model is given a batch of images and a batch of texts. For each image, it must predict which text is its true partner. The model learns by pulling the vector representations of correct pairs together while pushing all incorrect pairs apart.<p></p>
+<b>Key Contribution:</b> Revolutionized the field by enabling robust <b>zero-shot image classification</b>. Without any specific training, you can classify an image by comparing its embedding similarity to the embeddings of text prompts like "a photo of a dog" or "a photo of a cat."<p></p>
 <b>Reference Paper:</b> Radford, A., Kim, J. W., et al. (2021). <b>Learning Transferable Visual Models From Natural Language Supervision</b>.
 </div>
 
@@ -129,8 +129,9 @@ This advanced category deals with models that can process and reason about seque
 
 ## [![VIDEOBERT](https://img.shields.io/badge/VideoBERT-Joint_Model_for_Video_and_Language_Representation_Learning-blue?style=for-the-badge&logo=github)](VIDEOBERT)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-<b>What it does:</b> An early model that learns joint representations for video and text.
-<b>How it works:</b> It converts video into a sequence of visual tokens (by clustering frame features) and aligns them with text tokens (from ASR or subtitles). It then uses a standard BERT model to learn representations on this combined sequence using a masked language modeling objective</p>.<p><b>Key Contribution:</b> Pioneered the application of the BERT framework to the self-supervised learning of video-text representations.
+<b>What it does:</b> An early model that learns joint representations for video and text.<p></p>
+<b>How it works:</b> It converts video into a sequence of visual tokens (by clustering frame features) and aligns them with text tokens (from ASR or subtitles). It then uses a standard BERT model to learn representations on this combined sequence using a masked language modeling objective.<p></p>
+<b>Key Contribution:</b> Pioneered the application of the BERT framework to the self-supervised learning of video-text representations.<p></p>
 <b>Reference Paper:</b> Sun, C., Myers, A., Vondrick, C., et al. (2019). VideoBERT: A Joint Model for Video and Language Representation Learning. [arXiv:1904.01766](https://arxiv.org/abs/1904.01766)
 </div>
 
