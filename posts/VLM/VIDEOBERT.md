@@ -1,5 +1,7 @@
 ## [![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](/)
+
 ## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](/main_page/CV)
+
 ## [![CV](https://img.shields.io/badge/VLMs-Selected_Topics_in_Vision_Language_Models-orange?style=for-the-badge&logo=github)](VLMs)
 
 ### **A Deep Dive into VideoBERT: Learning Joint Representations with Masked Modeling**
@@ -137,23 +139,32 @@ VideoBERT is pre-trained on large-scale instructional video datasets from source
    **Positive Pairs (Aligned - Label 1):**
 
    - A sentence is extracted from the ASR transcript (e.g., "now put the chicken in the oven").
+
    - The ASR provides timestamps for this sentence.
+
    - The sequence of visual tokens corresponding to that *exact same time window* is extracted from the video.
+
    - These two sequences—the text and the correctly corresponding video—form a **positive pair**. The model is taught that for this input, the correct output is `1`.
+
+     
 
    **Negative Pairs (Misaligned - Label 0):**
 
    - The same sentence of text is taken (e.g., "now put the chicken in the oven").
+
    - However, it is paired with a sequence of visual tokens from a **randomly selected, different segment** of the video. For instance, the video clip might show someone chopping carrots.
+
    - This mismatched pair of text and video forms a **negative pair**. The model is taught that for this input, the correct output is `0`.
+
+     
 
    **The Model Architecture for Prediction**
    The model uses the special `[CLS]` token to make its prediction. Here's how the input flows through the transformer to get the alignment prediction:
 
-   1. **Combined Input Sequence:** The text and video tokens are concatenated into a single input sequence for the transformer: `[CLS] <text_tokens> [>] <video_tokens> [SEP]`
-   2. **Deep Bidirectional Processing:** The entire sequence is processed by the multi-layer transformer. Because of the self-attention mechanism, the model can look at all tokens (both text and video) simultaneously to build a rich, contextualized representation for every token.
-   3. **The Role of the `[CLS]` Token:** The `[CLS]` token is special. By design, its final hidden state (the output vector from the last transformer layer) is used as an **aggregate representation of the entire sequence**. It is intended to capture the overall meaning and relationship of the text and video combined.
-   4. **Final Classification:** This final `[CLS]` vector is fed into a simple, single-layer neural network (a linear classifier) which outputs a probability for the `Is_Aligned` class.
+      1. **Combined Input Sequence:** The text and video tokens are concatenated into a single input sequence for the transformer: `[CLS] <text_tokens> [>] <video_tokens> [SEP]`
+      2. **Deep Bidirectional Processing:** The entire sequence is processed by the multi-layer transformer. Because of the self-attention mechanism, the model can look at all tokens (both text and video) simultaneously to build a rich, contextualized representation for every token.
+      3. **The Role of the `[CLS]` Token:** The `[CLS]` token is special. By design, its final hidden state (the output vector from the last transformer layer) is used as an **aggregate representation of the entire sequence**. It is intended to capture the overall meaning and relationship of the text and video combined.
+      4. **Final Classification:** This final `[CLS]` vector is fed into a simple, single-layer neural network (a linear classifier) which outputs a probability for the `Is_Aligned` class.
 
 $$
 \mathcal{L}_{LVA} = -y_i\log(\hat{y}_i)-(1 - y_i)\log(1 - \hat{y}_i)
