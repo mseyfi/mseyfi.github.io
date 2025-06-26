@@ -221,20 +221,87 @@ In short, the model is architecturally and mathematically cornered. The path of 
 
 ### **Inference - How to Use a Trained VideoBERT**
 
-After pre-training, VideoBERT is a powerful feature extractor that can be fine-tuned for various downstream tasks.
+Flexibility of VideoBERT during inference is one of its most powerful features. The pre-trained model acts as a probabilistic "fill-in-the-blank" engine that can be cleverly prompted to perform various tasks, sometimes with no extra training at all.
 
-  * **Task 1: Action Classification:** To classify the action in a video, you can feed the video tokens into the model, take the final hidden state of the `[CLS]` token as a representation of the whole video, and add a simple linear classification layer on top to predict a specific action label.
-  * **Task 2: Zero-Shot Action Recognition:** This is a clever application of the pre-training task. To see if a video contains the action "swimming," you can feed the model the video tokens along with the text prompt "A person is `[MASK]`ing." You then ask the model to predict the distribution for the `[MASK]` token. If words like "swimming," "diving," etc., have a high probability, you can classify the action as swimming.
-  * **Task 3: Video Captioning:** The model can be fine-tuned to generate captions. You input the video tokens and a `[START]` token, and the model auto-regressively predicts the next text token until it generates an `[END]` token, forming a complete sentence.
+Here is a summary of the main inference tasks, whether they require extra training, and the exact input format for the VideoBERT model for each one.
 
-### **Practical Use Cases and Example Scenarios for VideoBERT**
+---
 
-Here are some real-world scenarios where a model like VideoBERT could be deployed:
+#### **1. Zero-Shot Action Classification**
 
-  * **Use Case: Automated Content Moderation and Safety**
+This task involves identifying the action in a video clip (e.g., "baking a cake") without having been trained on a specific action classification dataset.
 
-    * **Scenario:** A large video-sharing platform like YouTube or TikTok needs to automatically flag content that violates its policies on violence, hate speech, or dangerous acts. Manual review is too slow for the volume of uploads.
-    * **How VideoBERT Helps:** A VideoBERT model can be fine-tuned on a dataset of labeled videos. When a new video is uploaded, its visual tokens and ASR-generated text tokens are fed into the model. The output from the `[CLS]` token can be passed to a classifier head to predict categories like "Safe," "Graphic Violence," "Hate Speech," etc. Because the model understands the *joint* context (e.g., it knows that the visual of a weapon combined with aggressive language is a stronger signal than either one alone), it can be far more accurate than separate systems.
+* **Extra Training Required?:** **No.** This is a "zero-shot" task that uses the pre-trained VideoBERT model directly.
+
+* **Exact Input Construction:**
+  The model is given the video and prompted with a text template containing masked slots for a verb and a noun.
+
+  1.  The video clip is converted into a sequence of visual tokens (`v1, v2, ...`).
+  2.  A fixed text template is created: `"now let me show you how to [MASK] the [MASK]."`
+  3.  These are combined into a single sequence for the model.
+
+  **Input to VideoBERT:**
+  `[CLS] v1 v2 v3 ... vN [>] now let me show you how to [MASK] the [MASK] . [SEP]`
+
+* **How it Works:** The model performs a forward pass and predicts the most likely words to fill the `[MASK]` tokens. The prediction for the first `[MASK]` is treated as the **action verb**, and the prediction for the second is the **action object/noun**.
+
+---
+
+#### **2. Video Captioning (as a Feature Extractor)**
+
+This task involves generating a full sentence describing the content of a video clip. This is the one case where VideoBERT is not used end-to-end.
+
+* **Extra Training Required?:** **Yes.** VideoBERT is used as a powerful, frozen **feature extractor**. These features are then used to train a separate, smaller, supervised model (like a standard transformer encoder-decoder) on a captioning dataset (e.g., YouCook2).
+
+* **Exact Input Construction (to get the features from VideoBERT):**
+  To get a rich feature vector for a video clip, the model is prompted with a generic fill-in-the-blank sentence.
+
+  1.  The video clip is converted into its sequence of visual tokens (`v1, v2, ...`).
+  2.  A fixed text template is used, such as: `"now let's [MASK] the [MASK] to the [MASK], and then [MASK] the [MASK]."`
+
+  **Input to VideoBERT:**
+  `[CLS] v1 v2 v3 ... vN [>] now let's [MASK] the [MASK] ... [MASK] . [SEP]`
+
+* **How it Works:** After the forward pass, the model's internal representations (the output vectors) for the video tokens are extracted. The paper states they **average the output vectors of the video tokens and the output vectors of the masked text tokens, and then concatenate them** to form a single feature vector. This vector is the final representation of the video, which is then used as the input to the separate captioning model that will be trained.
+
+---
+
+#### **3. Text-to-Video Generation**
+
+This task involves generating a sequence of visual events based on a descriptive input sentence.
+
+* **Extra Training Required?:** **No.** This uses the pre-trained model directly.
+
+* **Exact Input Construction:**
+  The model is given the text and asked to fill in the "blanks" for the entire visual sequence.
+
+  1.  The input text sentence is tokenized (`t1, t2, ...`).
+  2.  The visual part of the sequence is filled with a series of `[MASK]` tokens, one for each future video clip you want to generate.
+
+  **Input to VideoBERT:**
+  `[CLS] t1 t2 t3 ... tM [>] [MASK] [MASK] [MASK] ... [MASK] [SEP]`
+
+* **How it Works:** The model predicts the most probable visual token for each `[MASK]` position based on the input text. By taking the top prediction for each slot, you generate a sequence of visual tokens. These can then be visualized by finding the original video frames from the training set that are closest to those token centroids.
+
+---
+
+#### **4. Future Forecasting (Video-to-Video Prediction)**
+
+This task involves predicting what will happen next in a video, given an initial sequence of events.
+
+* **Extra Training Required?:** **No.** This leverages the model's learned "visual grammar."
+
+* **Exact Input Construction:**
+  The model is given the starting visual tokens and asked to predict the future ones.
+
+  1.  The initial video clip is converted into a sequence of visual tokens (`v1, v2, ...`).
+  2.  The future part of the sequence is filled with `[MASK]` tokens.
+  3.  A generic text prompt can be used, or it can be left empty, but the `[>]` separator must be present.
+
+  **Input to VideoBERT:**
+  `[CLS] v1 v2 v3 ... vN [>] [MASK] [MASK] [MASK] ... [MASK] [SEP]`
+
+* **How it Works:** The model uses the context of the initial visual tokens to predict the most likely sequence of future visual tokens to fill the `[MASK]` slots. As shown in the paper, it can output multiple high-probability futures, reflecting the inherent uncertainty of what might happen next.
 
   * **Use Case: Semantic Search for Media Archives**
 
