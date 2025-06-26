@@ -36,16 +36,23 @@ CLIP uses a **Dual Encoder** architecture. It has two distinct models, or "tower
       * **Input:** A raw image (e.g., 224x224 pixels).
       * **Output:** A single feature vector (an image embedding).
         
-2.  **The Language Model (Text Encoder)**
+2. **The Language Model (Text Encoder)**
 
-    * **Purpose:** To take a string of text as input and distill its semantic meaning into a single vector.
-    * **Structure:** A standard, multi-layered Transformer model. It processes text tokens and uses self-attention to build a contextual understanding of the input sentence.
-    * **Input:** A sequence of text tokens.
-    * **Output:** A single feature vector (a text embedding), typically derived from the final state of the `[EOS]` (End of Sequence) token.
-      * **Why not the `[CLS]` token or Pooling?**
-        * **`[CLS]` Token:** The `[CLS]` token is a convention made famous by **BERT**. In BERT-style models, a `[CLS]` token is placed at the *beginning* of the sequence, and its final hidden state is typically used for classification tasks. CLIP's text encoder, while being a Transformer, follows a different design choice more akin to the GPT family, which focuses on sequence completion and uses an end token.
-        * **Pooling:** Another common strategy is to take the final hidden states of *all* tokens in the sequence and average them (mean pooling) or take the maximum value across each dimension (max pooling). This can sometimes create a more holistic representation. However, the CLIP authors found that simply using the `[EOS]` token's output was effective and sufficient for their contrastive learning objective.
-        * So, to summarize: **CLIP uses the `[EOS]` token's output vector** as the final text embedding before it is passed to the projection head.
+   * **Purpose:** To take a string of text as input and distill its semantic meaning into a single vector.
+
+   * **Structure:** A standard, multi-layered Transformer model. It processes text tokens and uses self-attention to build a contextual understanding of the input sentence.
+
+   * **Input:** A sequence of text tokens.
+
+   * **Output:** A single feature vector (a text embedding), typically derived from the final state of the `[EOS]` (End of Sequence) token.
+
+     **Why not the `[CLS]` token or Pooling?**
+
+     **`[CLS]` Token:** The `[CLS]` token is a convention made famous by **BERT**. In BERT-style models, a `[CLS]` token is placed at the *beginning* of the sequence, and its final hidden state is typically used for classification tasks. CLIP's text encoder, while being a Transformer, follows a different design choice more akin to the GPT family, which focuses on sequence completion and uses an end token.
+
+     **Pooling:** Another common strategy is to take the final hidden states of *all* tokens in the sequence and average them (mean pooling) or take the maximum value across each dimension (max pooling). This can sometimes create a more holistic representation. However, the CLIP authors found that simply using the `[EOS]` token's output was effective and sufficient for their contrastive learning objective.
+
+     So, to summarize: **CLIP uses the `[EOS]` token's output vector** as the final text embedding before it is passed to the projection head.
 
 
 3.  **The Projection Head**
