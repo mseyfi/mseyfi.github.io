@@ -1,3 +1,6 @@
+## [![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](../)
+
+## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](../main_page/CV)
 
 ### A Complete Guide to VideoCLIP: Contrastive Pre-training for Zero-shot Video Understanding
 
