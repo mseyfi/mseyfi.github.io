@@ -79,7 +79,7 @@ This is a primary application. You can classify a video's content without having
 * **Process:**
     1.  Take an input video clip and pass it through the **Video Encoder** to get its embedding $v_v$.
     2.  Create a set of text prompts describing your target classes (e.g., "playing the piano," "riding a bike," "peeling a potato").
-    3.  Pass each prompt through the **Text Encoder** to get text embeddings $v_{t1}, v_{t2}, ...$.
+    3.  Pass each prompt through the **Text Encoder** to get text embeddings $v_{t1}, v_{t2}, \ldots$.
     4.  Calculate the dot product similarity between the video embedding and each text embedding. The text prompt with the highest similarity score is the predicted class.
 
 **Application 2: Text-to-Video Retrieval**
