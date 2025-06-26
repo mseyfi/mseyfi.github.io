@@ -4,7 +4,7 @@
 
 ### A Complete Guide to CLIP: Bridging Vision and Language with Contrastive Learning
 
-#### Part 1: The Core Idea - What is CLIP?
+#### **The Core Idea - What is CLIP?**
 
 Before CLIP (Contrastive Language-Image Pre-training), the dominant approach to computer vision was supervised learning on massive, manually labeled datasets like ImageNet. A model would be trained to classify an image into one of a *fixed* set of predefined categories (e.g., 1000 classes like "golden retriever," "toaster," "container ship"). This approach had two major weaknesses:
 
@@ -23,7 +23,7 @@ some label, CLIP jointly trains an image encoder and a text encoder to predict t
 examples. At test time the learned text encoder synthesizes a zero-shot linear classifier by embedding the names or descriptions of the
 target dataset’s classes.*
 
-#### Part 2: The CLIP Architecture - A Tale of Two Towers
+#### **The CLIP Architecture - A Tale of Two Towers**
 
 CLIP uses a **Dual Encoder** architecture. It has two distinct models, or "towers," that process their respective modalities independently.
 
@@ -46,7 +46,7 @@ CLIP uses a **Dual Encoder** architecture. It has two distinct models, or "tower
 3.  **The Projection Head**
     This is a crucial but often overlooked component. The raw output vectors from the image and text encoders are not directly compared. Instead, they are first passed through a small **projection head** (a simple multi-layer perceptron or MLP). This head projects the features from each modality into a shared, lower-dimensional embedding space where the contrastive loss is calculated.
 
-#### Part 3: The Mathematics of Alignment
+#### **The Mathematics of Alignment**
 
 **Embeddings and Normalization**
 
@@ -107,7 +107,7 @@ The core of CLIP's training is a contrastive loss function, specifically a symme
     \mathcal{L}_{\text{CLIP}} = \frac{L_{\text{image}} + L_{\text{text}}}{2}
     $$
 
-#### Part 4: The Training Process
+#### **The Training Process**
 
   * **Dataset:** CLIP was trained on a massive, custom dataset of **400 million (image, text) pairs** scraped from the public internet. The key insight was that this data, while noisy, was diverse and plentiful enough to learn robust representations.
   * **Input-Output Pairs:** The training input is simply an `(image, text)` pair. There are no explicit class labels. The text itself serves as the "label" for the image. The training output is the optimized weights for the image encoder, text encoder, and their projection heads.
@@ -186,7 +186,7 @@ print(f"Conceptual CLIP Loss for one batch: {loss:.4f}")
 
 ```
 
-#### Part 5: Inference - Putting CLIP to Work
+#### **Inference - Putting CLIP to Work**
 
 Once trained, CLIP's encoders are incredibly versatile.
 
@@ -272,7 +272,7 @@ def search_images(text_query, image_db_embeddings, image_db_filenames, top_k=5):
 # print("Search results:", results)
 ```
 
-#### Part 6: Reference
+#### **Reference**
 
 CLIP's impact on the field cannot be overstated. It demonstrated a new, scalable paradigm for training flexible vision models that understand language on a deep, semantic level.
 
