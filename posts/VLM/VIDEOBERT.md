@@ -89,6 +89,10 @@ This carefully constructed sequence allows the VideoBERT model to learn deep, bi
 
 **The Transformer:** This single, deep BERT model processes the entire concatenated sequence. The self-attention mechanism allows every token (whether visual or textual) to attend to every other token. This enables the model to learn complex cross-modal relationships, such as how the verb "pour" relates to the visual sequence of a hand tipping a container.
 
+![vbert](/images/VIDEOBERT.png)
+
+*Fig. 1 Illustration of VideoBERT in the context of a video and text masked token prediction, or cloze, task. This task also allows for training with text-only and video-only data, and VideoBERT can furthermore be trained using a linguistic-visual alignment classification objective (not shown here, see text for details).*
+
 ### **The Training Process - Learning by "Filling in the Blanks"**
 
 VideoBERT is pre-trained on large-scale instructional video datasets from sources like YouTube, using the ASR transcripts as the text modality.
@@ -245,6 +249,10 @@ This task involves identifying the action in a video clip (e.g., "baking a cake"
 
 * **How it Works:** The model performs a forward pass and predicts the most likely words to fill the `[MASK]` tokens. The prediction for the first `[MASK]` is treated as the **action verb**, and the prediction for the second is the **action object/noun**.
 
+![vbert](/images/BERT-SEARCH.png)
+
+*Fig.2 Using VideoBERT to predict nouns and verbs given a video clip. See text for details. The video clip is first converted into video tokens (two are shown here for each example), and then visualized using their centroids.*
+
 ---
 
 #### **2. Video Captioning (as a Feature Extractor)**
@@ -303,6 +311,12 @@ This task involves predicting what will happen next in a video, given an initial
 
 * **How it Works:** The model uses the context of the initial visual tokens to predict the most likely sequence of future visual tokens to fill the `[MASK]` slots. As shown in the paper, it can output multiple high-probability futures, reflecting the inherent uncertainty of what might happen next.
 
+![fforcast](/images/FUTURE-FORECASTING.png)
+
+*Fig. 3 VideoBERT text-to-video generation and future forecasting. (Above) Given some recipe text divided into
+sentences, $y = y_{1:T}$ , we generate a sequence of video tokens $x = x_{1:T}$ by computing $x^\star_t= \arg \max_k p(x_t = k|y)$ using VideoBERT. (Below) Given a video token, we show the top three future tokens forecasted by VideoBERT at different time scales. In this case, VideoBERT predicts that a bowl of flour and cocoa powder may be baked in an oven, and may become a brownie or cupcake. We visualize video tokens using the images from the training set closest to centroids in feature space.*
+
+---
 
 ### **Code Snippet (Conceptual)**
 
