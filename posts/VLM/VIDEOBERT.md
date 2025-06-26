@@ -2,11 +2,11 @@
 ## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](../../main_page/CV)
 ## [![CV](https://img.shields.io/badge/VLMs-Selected_Topics_in_Vision_Language_Models-orange?style=for-the-badge&logo=github)](VLMs)
 
-### A Deep Dive into VideoBERT: Learning Joint Representations with Masked Modeling
+### ** A Deep Dive into VideoBERT: Learning Joint Representations with Masked Modeling**
 
 VideoBERT, introduced by Google researchers in 2019, was a groundbreaking model that asked a simple yet powerful question: "Can we apply the same self-supervised, 'fill-in-the-blanks' magic that made BERT so successful in NLP to the much more complex world of video and language?" The answer was a resounding yes, and it paved the way for a new class of generative vision-language models.
 
-### The "Why" - The Quest for a "BERT for Video"
+### ** The "Why" - The Quest for a "BERT for Video"**
 
 The revolution sparked by **BERT (Bidirectional Encoder Representations from Transformers)** was its ability to learn deep contextual understanding of language from raw text alone. It achieved this through a simple but brilliant pre-training task: **Masked Language Modeling (MLM)**. By hiding words in a sentence and forcing the model to predict them from the surrounding context, BERT learned nuanced relationships between words.
 
@@ -18,7 +18,7 @@ It's crucial to understand the conceptual difference:
   * **CLIP (Contrastive):** Learns by *discriminating*. Its goal is to tell which text out of many corresponds to a given image. It learns a global similarity score.
   * **VideoBERT (Generative/Reconstructive):** Learns by *reconstructing*. Its goal is to fill in missing visual or textual information from the available context. It learns a deep, fused, token-level understanding.
 
-### The Core Idea - A Unified Vocabulary for Vision and Language
+### ** The Core Idea - A Unified Vocabulary for Vision and Language**
 
 To make a BERT-style model work with video, the authors had to solve a fundamental problem: How do you turn a piece of video into a "word" or a discrete "token" that a Transformer can process just like a text token?
 
@@ -26,14 +26,18 @@ Their solution was **Visual Tokenization**, a clever process to create a finite 
 
   * **Intuition:** Imagine you want to describe every possible human action. You could create a dictionary of "action words" like `walking`, `running`, `jumping`, `eating`. VideoBERT does this automatically for visual data.
   * **The Process:**
-    1.  **Feature Extraction:** First, they took a massive dataset of videos and broke them down into short, 1.5-second clips. For each short clip, they used a pre-trained **3D Convolutional Neural Network (S3D)** to extract a single feature vector that captured the spatio-temporal information within that clip.
-    2.  **Clustering:** They then ran the **k-means clustering algorithm** on these millions of feature vectors. This algorithm groups similar vectors together and finds the center point (centroid) for each group. They created a "vocabulary" of a few hundred thousand of these centroids.
+    1.  **Feature Extraction:** First, the input video is sampled at 20 frames per second.
+This sequence of frames is then divided into non-overlapping 1.5-second clips (30 frames each).
+Each of these 1.5-second clips is passed through a pretrained convolutional neural network (ConvNet) called S3D to extract a feature vector. The S3D model, pretrained on the Kinetics dataset, is effective at capturing spatio-temporal features related to actions.
+From the S3D network, they take the feature activations from just before the final classification layer and apply 3D average pooling. This results in a single 1024-dimensional feature vector for each 1.5-second clip.
+    2.  **Clustering:** At this point, each clip is represented by a dense, 1024-dimensional vector. To create discrete "visual words," the authors use hierarchical k-means clustering on these vectors.
+They use a hierarchy of 4 levels with 12 clusters at each level. This creates a total vocabulary of $12^4=20736$ unique visual tokens. Each 1.5-second video clip is then assigned the single token corresponding to the cluster centroid it is closest to.
     3.  **Creating the Visual Vocabulary:** This set of learned centroids **is the visual vocabulary**. Each centroid acts as a "visual word" representing a common visual concept or action (e.g., one centroid might represent the general concept of "a hand picking something up," another might represent "a car turning a corner").
     4.  **Tokenization:** With this vocabulary, any new video clip can now be "tokenized" by passing it through the S3D feature extractor and then finding the ID of the closest visual word in this vocabulary.
 
 This process turns a continuous, complex video stream into a discrete sequence of visual tokens, making it suitable for a BERT-style architecture.
 
-### The VideoBERT Architecture - A Single, Unified Transformer
+### ** The VideoBERT Architecture - A Single, Unified Transformer**
 
 Unlike the two-tower approach of CLIP, VideoBERT uses a single, **unified Transformer encoder** to process both modalities simultaneously. This allows for deep, layer-by-layer fusion of information.
 
@@ -49,7 +53,7 @@ Unlike the two-tower approach of CLIP, VideoBERT uses a single, **unified Transf
 
   * **The Transformer:** This single, deep BERT model processes the entire concatenated sequence. The self-attention mechanism allows every token (whether visual or textual) to attend to every other token. This enables the model to learn complex cross-modal relationships, such as how the verb "pour" relates to the visual sequence of a hand tipping a container.
 
-### The Training Process - Learning by "Filling in the Blanks"
+### ** The Training Process - Learning by "Filling in the Blanks"**
 
 VideoBERT is pre-trained on large-scale instructional video datasets from sources like YouTube, using the ASR transcripts as the text modality.
 
@@ -79,7 +83,7 @@ VideoBERT is pre-trained on large-scale instructional video datasets from source
 
     **Implicit Alignment:** By training with these two objectives simultaneously, the model is forced to learn the alignment between modalities implicitly. There is no separate "matching" loss. To succeed, the model *must* learn the correspondence between words and visual concepts.
 
-### Inference - How to Use a Trained VideoBERT
+### ** Inference - How to Use a Trained VideoBERT**
 
 After pre-training, VideoBERT is a powerful feature extractor that can be fine-tuned for various downstream tasks.
 
@@ -87,7 +91,7 @@ After pre-training, VideoBERT is a powerful feature extractor that can be fine-t
   * **Task 2: Zero-Shot Action Recognition:** This is a clever application of the pre-training task. To see if a video contains the action "swimming," you can feed the model the video tokens along with the text prompt "A person is `[MASK]`ing." You then ask the model to predict the distribution for the `[MASK]` token. If words like "swimming," "diving," etc., have a high probability, you can classify the action as swimming.
   * **Task 3: Video Captioning:** The model can be fine-tuned to generate captions. You input the video tokens and a `[START]` token, and the model auto-regressively predicts the next text token until it generates an `[END]` token, forming a complete sentence.
 
-### Practical Use Cases and Example Scenarios for VideoBERT
+### ** Practical Use Cases and Example Scenarios for VideoBERT**
 
 Here are some real-world scenarios where a model like VideoBERT could be deployed:
 
@@ -111,13 +115,13 @@ Here are some real-world scenarios where a model like VideoBERT could be deploye
       * **Scenario:** A DIY website hosts thousands of "how-to" videos. They want to make them easier to follow by automatically generating a list of required tools and a step-by-step summary.
       * **How VideoBERT Helps:** By training on instructional videos, VideoBERT learns the relationship between spoken steps and visual actions. It can be fine-tuned to listen for phrases like "Now, you'll need a..." and correlate them with the visual objects appearing on screen to generate a tool list. It can also use its captioning ability to summarize key steps, such as "Step 1: Sand the wood," "Step 2: Apply the first coat of paint."
 
-### VideoBERT's Contribution and Significance
+### ** VideoBERT's Contribution and Significance**
 
   * **Pioneering Work:** It was one of the first and most influential models to successfully apply the BERT-style "masked modeling" paradigm to the video-language domain.
   * **Visual Tokenization:** The concept of creating a discrete visual vocabulary via clustering was a novel and effective way to make continuous video data compatible with the BERT architecture.
   * **Foundation for Generative V-L Models:** It laid the groundwork for a whole class of video-language models that learn multimodal representations through reconstruction and generation, offering a powerful alternative to the purely contrastive approaches.
 
-### Code Snippet (Conceptual)
+### ** Code Snippet (Conceptual)**
 
 This code illustrates the unique **visual tokenization** and **input sequence construction** steps of VideoBERT.
 
@@ -216,6 +220,6 @@ if __name__ == "__main__":
     print(f"\nGround truth for masked positions: Text ID={original_tokens[0]}, Visual ID={original_tokens[1]}")
 ```
 
-### Reference
+### ** Reference**
 
   * **Official Paper:** Sun, C., Myers, A., Vondrick, C., Murphy, K., & Schmid, C. (2019). *VideoBERT: A Joint Model for Video and Language Representation Learning*. [arXiv:1904.01766](https://arxiv.org/abs/1904.01766)
