@@ -24,7 +24,7 @@ To make a BERT-style model work with video, the authors had to solve a fundament
 
 Their solution was **Visual Tokenization**, a clever process to create a finite dictionary of visual "words."
 
-  * **Intuition:** Imagine you want to describe every possible human action. You could create a dictionary of "action words" like $walking$, `running`, `jumping`, `eating`. VideoBERT does this automatically for visual data.
+  * **Intuition:** Imagine you want to describe every possible human action. You could create a dictionary of "action words" like `walking`, `running`, `jumping`, `eating`. VideoBERT does this automatically for visual data.
   * **The Process:**
     1.  **Feature Extraction:** First, the input video is sampled at 20 frames per second.
 This sequence of frames is then divided into non-overlapping 1.5-second clips (30 frames each).
@@ -85,15 +85,14 @@ So, for every token in the sequence, its input to the transformer is:
 This carefully constructed sequence allows the VideoBERT model to learn deep, bidirectional relationships both within each modality (text-to-text and video-to-video) and, crucially, across them (text-to-video).
 
 **The Transformer:** This single, deep BERT model processes the entire concatenated sequence. The self-attention mechanism allows every token (whether visual or textual) to attend to every other token. This enables the model to learn complex cross-modal relationships, such as how the verb "pour" relates to the visual sequence of a hand tipping a container.
-
 ### **The Training Process - Learning by "Filling in the Blanks"**
 
 VideoBERT is pre-trained on large-scale instructional video datasets from sources like YouTube, using the ASR transcripts as the text modality.
 
   * **Input-Output Training Pair:**
 
-      * **Input:** A `(video token sequence, text token sequence)` pair. A certain percentage (e.g., 15%) of tokens in **both** sequences are randomly replaced with a special `[MASK]` token.
-      * **Output:** The model's objective is to predict the original IDs of these masked tokens.
+    * **Input:** A `(video token sequence, text token sequence)` pair. A certain percentage (e.g., 15%) of tokens in **both** sequences are randomly replaced with a special `[MASK]` token.
+    * **Output:** The model's objective is to predict the original IDs of these masked tokens.
 
   * **The Loss Functions and Mathematics:**
     The total training loss is the sum of two parallel objectives:
@@ -102,25 +101,68 @@ VideoBERT is pre-trained on large-scale instructional video datasets from source
     This task teaches the model to understand language in the context of video.
 
       * **Process:** A text token $t_i$ from the input caption is randomly selected and replaced with `[MASK]`. The entire multimodal sequence is passed through the Transformer. The model must then use the surrounding text *and* the visual context to predict the original masked word.
-      * **Mathematics:** At the output, the vector corresponding to the masked position is fed into a linear layer followed by a softmax function. This produces a probability distribution $P$ over the entire text vocabulary $V_\text{text}$. The loss is the negative log-likelihood, or **Cross-Entropy Loss**, between this distribution and the true one-hot encoded token $y_i$.
 
+      * **Mathematics:** At the output, the vector corresponding to the masked position is fed into a linear layer followed by a softmax function. This produces a probability distribution $p$ over the entire text vocabulary $V_\text{text}$. The loss is the negative log-likelihood, or **Cross-Entropy Loss**, between this distribution and the true one-hot encoded token $y_i$.
         $$
-        L_{MLM} = -\sum_{i \in M_\text{text}} y_i \log(P(t_i | T_\text{masked}, V))
+        \mathcal{L}_{MLM} = -\sum_{i \in M_\text{text}} y_i \log(p(t_i | T_\text{masked}, V))
         $$
-        
+
         where $M_\text{text}$ is the set of masked text indices, $T_\text{masked}$ is the masked text sequence, and $V$ is the video sequence. This loss penalizes the model when it fails to predict the correct word.
 
     **2. Masked Visual Modeling (MVM)**
     This is the novel visual equivalent of MLM, teaching the model to understand visual concepts in the context of language.
 
       * **Process:** A visual token $v_j$ is randomly selected and replaced with `[MASK]`. The model must use the surrounding visual tokens (e.g., the frames before and after) *and* the entire text caption to predict the original masked visual token.
-      * **Mathematics:** The process is identical to MLM, but the prediction is over the *visual vocabulary*. The output vector at the masked position is passed through a classifier to produce a probability distribution $P$ over all $V_\text{visual}$ cluster centroids. The loss is the Cross-Entropy Loss against the true visual token ID $z_j$.
+
+      * **Mathematics:** The process is identical to MLM, but the prediction is over the *visual vocabulary*. The output vector at the masked position is passed through a classifier to produce a probability distribution $p$ over all $V_\text{visual}$ cluster centroids. The loss is the Cross-Entropy Loss against the true visual token ID $z_j$.
 
         $$
-        L_{MVM} = -\sum_{j \in M_\text{video}} z_j \log(P(v_j | V_\text{masked}, T))
+        \mathcal{L}_{MVM} = -\sum_{j \in M_\text{video}} z_j \log(p(v_j | V_\text{masked}, T))
         $$
-        
-        where $M_\text{video}$ is the set of masked visual indices. This loss forces the model to learn, for example, that if the text says "stir the soup," the masked visual token is likely to be one representing a spoon moving in a bowl.
+
+        where $M_\text{video}$ is the set of masked visual indices. This loss forces the model to learn, for example, that if the text says "stir the soup," the masked visual token is likely to be one representing a spoon moving in a bowl**.**
+
+    3.  **Linguistic-Visual Alignment (LVA) Loss**
+
+       At its core, the alignment task is a **binary classification problem**. The model is given a pair of a text sequence and a video sequence and must predict one of two labels:
+
+       * Is_Aligned` (Label = 1): The text and video are a correct, temporally aligned pair.` 
+       * `Is_Not_Aligned` (Label = 0): The text and video are a mismatched pair.
+
+  		**Constructing the Training Data: Positive and Negative Pairs**
+
+​		The model learns to perform this classification task by being trained on a large dataset of both correct and incorrect pairings. This data is 		generated automatically from the timestamped ASR transcripts and video clips.
+
+    **Positive Pairs (Aligned - Label 1):**
+    
+    *   A sentence is extracted from the ASR transcript (e.g., "now put the chicken in the oven").
+    *   The ASR provides timestamps for this sentence.
+    *   The sequence of visual tokens corresponding to that *exact same time window* is extracted from the video.
+    *   These two sequences—the text and the correctly corresponding video—form a **positive pair**. The model is taught that for this input, the correct output is `1`.
+    
+    **Negative Pairs (Misaligned - Label 0):**
+    
+    *   The same sentence of text is taken (e.g., "now put the chicken in the oven").
+    *   However, it is paired with a sequence of visual tokens from a **randomly selected, different segment** of the video. For instance, the video clip might show someone chopping carrots.
+    *   This mismatched pair of text and video forms a **negative pair**. The model is taught that for this input, the correct output is `0`.
+
+    **The Model Architecture for Prediction**
+    
+    The model uses the special `[CLS]` token to make its prediction. Here's how the input flows through the transformer to get the alignment prediction:
+    
+    1.  **Combined Input Sequence:** The text and video tokens are concatenated into a single input sequence for the transformer:
+        `[CLS] <text_tokens> [>] <video_tokens> [SEP]`
+    
+    2.  **Deep Bidirectional Processing:** The entire sequence is processed by the multi-layer transformer. Because of the self-attention mechanism, the model can look at all tokens (both text and video) simultaneously to build a rich, contextualized representation for every token.
+    
+    3.  **The Role of the `[CLS]` Token:** The `[CLS]` token is special. By design, its final hidden state (the output vector from the last transformer layer) is used as an **aggregate representation of the entire sequence**. It is intended to capture the overall meaning and relationship of the text and video combined.
+    
+    4.  **Final Classification:** This final `[CLS]` vector is fed into a simple, single-layer neural network (a linear classifier) which outputs a probability for the `Is_Aligned` class.
+    
+    $$
+    \mathcal{L}_\text{cls} = -y_i\log(\hat{y}_i)-(1 - y_i)\log(1 - \hat{y}_i) 
+    $$
+    
 
     **Implicit Alignment:** By training with these two objectives simultaneously, the model is forced to learn the alignment between modalities implicitly. There is no separate "matching" loss. To succeed, the model *must* learn the correspondence between words and visual concepts.
 
