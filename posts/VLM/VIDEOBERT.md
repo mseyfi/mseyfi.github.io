@@ -205,7 +205,7 @@ The model is rewarded (with a lower loss) for making the correct prediction. By 
 When you combine these in the total loss 
 
 $$
-\mathcal{L}_total = \alpha~\mathcal{L}_{MLM} + \beta~\mathcal{L}_{MVM} + \gamma~\mathcal{L}_{LVA}
+\mathcal{L}_{total} = \alpha~\mathcal{L}_{MLM} + \beta~\mathcal{L}_{MVM} + \gamma~\mathcal{L}_{LVA}
 $$
 
 you create a system where:
