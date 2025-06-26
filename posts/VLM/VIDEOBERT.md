@@ -303,26 +303,6 @@ This task involves predicting what will happen next in a video, given an initial
 
 * **How it Works:** The model uses the context of the initial visual tokens to predict the most likely sequence of future visual tokens to fill the `[MASK]` slots. As shown in the paper, it can output multiple high-probability futures, reflecting the inherent uncertainty of what might happen next.
 
-  * **Use Case: Semantic Search for Media Archives**
-
-    * **Scenario:** A major news corporation like the BBC or CNN has millions of hours of broadcast footage in its archives. A documentary producer is looking for clips of "politicians visiting flood-damaged areas." A simple keyword search on the transcripts might miss footage where the specific word "flood" isn't used, but a disaster zone is clearly visible.
-    * **How VideoBERT Helps:** The entire archive can be processed offline to generate VideoBERT embeddings for short clips. The producer's query "politicians visiting flood-damaged areas" is also embedded. The system then performs a similarity search. Because VideoBERT learns from both modalities, it will retrieve clips where the ASR contains "senator" or "governor" and the visuals show scenes of high water, damaged buildings, and emergency crews, even if the exact keywords don't match.
-
-  * **Use Case: Generating Textual Aids for Accessibility**
-
-    * **Scenario:** A company wants to make its video content more accessible to visually impaired users. Manually writing detailed audio descriptions for thousands of videos is not feasible.
-    * **How VideoBERT Helps:** The model can be fine-tuned for video captioning. For a given video clip, it can be prompted to generate a descriptive sentence. Unlike simple ASR which only transcribes speech, VideoBERT can generate descriptions of the visual action, such as "[A person in a white lab coat pours a blue liquid into a beaker]," providing crucial context that would otherwise be missed.
-
-  * **Use Case: Instructional Video Analysis**
-
-    * **Scenario:** A DIY website hosts thousands of "how-to" videos. They want to make them easier to follow by automatically generating a list of required tools and a step-by-step summary.
-    * **How VideoBERT Helps:** By training on instructional videos, VideoBERT learns the relationship between spoken steps and visual actions. It can be fine-tuned to listen for phrases like "Now, you'll need a..." and correlate them with the visual objects appearing on screen to generate a tool list. It can also use its captioning ability to summarize key steps, such as "Step 1: Sand the wood," "Step 2: Apply the first coat of paint."
-
-### **VideoBERT's Contribution and Significance**
-
-  * **Pioneering Work:** It was one of the first and most influential models to successfully apply the BERT-style "masked modeling" paradigm to the video-language domain.
-  * **Visual Tokenization:** The concept of creating a discrete visual vocabulary via clustering was a novel and effective way to make continuous video data compatible with the BERT architecture.
-  * **Foundation for Generative V-L Models:** It laid the groundwork for a whole class of video-language models that learn multimodal representations through reconstruction and generation, offering a powerful alternative to the purely contrastive approaches.
 
 ### **Code Snippet (Conceptual)**
 
