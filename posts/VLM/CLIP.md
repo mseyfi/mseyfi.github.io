@@ -87,7 +87,7 @@ The core of CLIP's training is a contrastive loss function, specifically a symme
   * **The Similarity Matrix:** After getting the $N$ image embeddings and $N$ text embeddings, we compute the dot product between every image and every text. This gives us an $N \times N$ matrix of similarity scores.
 
     ```
-         T_1    T_2    ...   T_N
+         T_1   T_2   ...  T_N
     I_1 [s_11, s_12, ..., s_1N]
     I_2 [s_21, s_22, ..., s_2N]
     ...
