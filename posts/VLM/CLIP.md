@@ -199,13 +199,11 @@ This is CLIP's most famous capability. You can classify images into categories t
     1.  Take an image you want to classify (e.g., a picture of a cat).
     2.  Encode it using the `image_encoder` to get its embedding, $I_e$.
     3.  Define your candidate classes as text prompts. It's crucial to provide some context, so instead of `["dog", "cat"]`, use `["a photo of a dog", "a photo of a cat"]`.
-    4.  Encode each text prompt using the `text_encoder` to get a set of text embeddings, $T_e_1, T_e_2, \ldots$.
-    5.  Calculate the cosine similarity between the image embedding `I_e` and each text embedding.
+    4.  Encode each text prompt using the `text_encoder` to get a set of text embeddings, $T_{e_1}, T_{e_2}, \ldots$.
+    5.  Calculate the cosine similarity between the image embedding $I_e$ and each text embedding.
     6.  The text prompt with the highest similarity score is the predicted label for the image.
 
   * **Example Code:**
-
-<!-- end list -->
 
 ```python
 def zero_shot_classify(image, text_labels):
