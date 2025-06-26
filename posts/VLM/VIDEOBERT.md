@@ -28,7 +28,7 @@ Their solution was **Visual Tokenization**, a clever process to create a finite 
   * **The Process:**
     1.  **Feature Extraction:**First, the input video is sampled at 20 frames per second.
 This sequence of frames is then divided into non-overlapping 1.5-second clips (30 frames each).
-Each of these 1.5-second clips is passed through a pretrained convolutional neural network (ConvNet) called S3D to extract a feature vector. The S3D model, pretrained on the Kinetics dataset, is effective at capturing spatio-temporal features related to actions.
+Each of these 1.5-second clips is passed through a pretrained convolutional neural network (ConvNet) called S3D to extract a feature vector. The S3D model, pretrained on the Kinetics dataset(for action classification), is effective at capturing spatio-temporal features related to actions.
 From the S3D network, they take the feature activations from just before the final classification layer and apply 3D average pooling. This results in a single 1024-dimensional feature vector for each 1.5-second clip.
     2.  **Clustering:**At this point, each clip is represented by a dense, 1024-dimensional vector. To create discrete "visual words," the authors use hierarchical k-means clustering on these vectors.
 They use a hierarchy of 4 levels with 12 clusters at each level. This creates a total vocabulary of $12^4=20736$ unique visual tokens. Each 1.5-second video clip is then assigned the single token corresponding to the cluster centroid it is closest to.
