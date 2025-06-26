@@ -1,3 +1,6 @@
+## [![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](../)
+
+## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](../main_page/CV)
 
 ### A Definitive Guide to the Modern Vision-Language Model Landscape
 
