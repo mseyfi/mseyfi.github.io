@@ -40,18 +40,51 @@ This process turns a continuous, complex video stream into a discrete sequence o
 ### **The VideoBERT Architecture - A Single, Unified Transformer**
 
 Unlike the two-tower approach of CLIP, VideoBERT uses a single, **unified Transformer encoder** to process both modalities simultaneously. This allows for deep, layer-by-layer fusion of information.
+Of course. The construction of the input sequence for the transformer in VideoBERT is a critical step, as it's how the model fuses information from two different modalities (language and video) into a single format that the BERT architecture can understand.
 
-  * **Input Sequence Construction:**
-    The model's input is a carefully constructed sequence of both text and visual tokens:
+The process is detailed in **Section 3.2 (The VideoBERT model)** of the paper. The core idea is to create a single, combined sequence of discrete tokens, analogous to a pair of sentences in the original BERT model. This input sequence is then converted into a sequence of vectors by summing three distinct embeddings for each token.
 
-    1.  **`[CLS]`:** A special token at the beginning, whose final output representation can be used for sentence-level (or video-level) classification tasks.
-    2.  **Text Tokens:** The text caption (often from Automatic Speech Recognition - ASR) is tokenized into standard sub-word units (e.g., using WordPiece).
-    3.  **`[SEP]`:** A separator token to mark the boundary between text and video.
-    4.  **Visual Tokens:** The sequence of discrete visual token IDs derived from the clustering process described above.
+Here is a breakdown of how the complete input sequence is constructed for the primary **video-text training regime**:
 
-  * **Embedding Layer:** Before entering the Transformer, both the text token IDs and the discrete visual tokens are mapped to dense embedding vectors from their respective embedding matrices. A special "modality embedding" is also added to each token's embedding to tell the model which parts are text and which are video.
+**1. The Components of the Sequence (The Tokens)**
 
-  * **The Transformer:** This single, deep BERT model processes the entire concatenated sequence. The self-attention mechanism allows every token (whether visual or textual) to attend to every other token. This enables the model to learn complex cross-modal relationships, such as how the verb "pour" relates to the visual sequence of a hand tipping a container.
+The sequence is built from three types of tokens:
+
+*   **Linguistic Tokens:** These are "WordPieces" derived from the text sentences obtained via Automatic Speech Recognition (ASR) on the video's audio. This is the standard way text is tokenized for BERT.
+*   **Visual Tokens:** These are the discrete "visual words" generated from the video stream using the S3D feature extractor followed by hierarchical k-means clustering, as we discussed. Each token represents a 1.5-second video clip.
+*   **Special Tokens:** These are crucial for structure and for the model's training objectives:
+    *   `[CLS]`: A classification token placed at the very beginning of the sequence. Its final hidden state is used to represent the entire sequence for classification tasks, such as predicting if the text and video are temporally aligned.
+    *   `[>]`: A special separator token introduced by the authors to explicitly mark the boundary between the linguistic tokens and the visual tokens.
+    *   `[SEP]`: Placed at the very end of the combined sequence to mark its termination.
+    *   `[MASK]`: Used during training to randomly hide some tokens (both linguistic and visual). The model's primary task (the "cloze" task) is to predict these masked tokens.
+
+**2. Assembling the Token Sequence**
+
+The tokens are concatenated in a specific order to form one long sequence. The paper provides a clear example:
+
+`[CLS] orange chicken with [MASK] sauce [>] v01 [MASK] v08 v72 [SEP]`
+
+Let's break this example down:
+*   `[CLS]`: The sequence starts here.
+*   `orange chicken with [MASK] sauce`: The linguistic sentence from ASR, with one word masked for the prediction task.
+*   `[>]`: The special token separating the text from the video.
+*   `v01 [MASK] v08 v72`: The sequence of visual tokens, with one token masked for prediction.
+*   `[SEP]`: The sequence ends here.
+
+**3. Creating the Final Input Vectors (The Embeddings)**
+
+Just like in the original BERT, the final input vector for each token in the sequence is the sum of three separate embeddings:
+
+1.  **Token Embeddings:** Each token (whether it's a WordPiece, a visual token, or a special token) is mapped to a dense vector from an embedding table. The vocabulary includes all WordPieces, all 20,736 visual tokens, and the special tokens.
+2.  **Segment Embeddings:** This embedding tells the model which "modality" a token belongs to. For example, all linguistic tokens would get Segment Embedding A, and all visual tokens would get Segment Embedding B. This helps the model differentiate between the two parts of the sequence.
+3.  **Positional Embeddings:** Since transformers don't have a built-in sense of order, this embedding is added to give the model information about the position of each token in the overall sequence (e.g., this is the 1st token, this is the 2nd, etc.).
+
+So, for every token in the sequence, its input to the transformer is:
+`Input Vector = Token Embedding + Segment Embedding + Positional Embedding`
+
+This carefully constructed sequence allows the VideoBERT model to learn deep, bidirectional relationships both within each modality (text-to-text and video-to-video) and, crucially, across them (text-to-video).
+
+**The Transformer:** This single, deep BERT model processes the entire concatenated sequence. The self-attention mechanism allows every token (whether visual or textual) to attend to every other token. This enables the model to learn complex cross-modal relationships, such as how the verb "pour" relates to the visual sequence of a hand tipping a container.
 
 ### **The Training Process - Learning by "Filling in the Blanks"**
 
