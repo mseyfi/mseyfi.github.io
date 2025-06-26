@@ -131,7 +131,8 @@ VideoBERT is pre-trained on large-scale instructional video datasets from source
     * `Is_Aligned` (Label = 1): The text and video are a correct, temporally aligned pair.
     * `Is_Not_Aligned` (Label = 0): The text and video are a mismatched pair.
 
-   **Constructing the Training Data: Positive and Negative Pairs:** The model learns to perform this classification task by being trained on a large 	dataset of both correct and incorrect pairings. This data is generated automatically from the timestamped ASR transcripts and video clips.
+
+   **Constructing the Training Data: Positive and Negative Pairs:** The model learns to perform this classification task by being trained on a large dataset of both correct and incorrect pairings. This data is generated automatically from the timestamped ASR transcripts and video clips.
 
    **Positive Pairs (Aligned - Label 1):**
 
