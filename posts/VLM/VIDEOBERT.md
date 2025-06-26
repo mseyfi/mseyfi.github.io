@@ -155,7 +155,7 @@ VideoBERT is pre-trained on large-scale instructional video datasets from source
    4. **Final Classification:** This final `[CLS]` vector is fed into a simple, single-layer neural network (a linear classifier) which outputs a probability for the `Is_Aligned` class.
 
 $$
-\mathcal{L}_\text{LVA} = -y_i\log(\hat{y}_i)-(1 - y_i)\log(1 - \hat{y}_i)
+\mathcal{L}_{LVA} = -y_i\log(\hat{y}_i)-(1 - y_i)\log(1 - \hat{y}_i)
 $$
 
 #### **The Direct Hammer: The Linguistic-Visual Alignment (LVA) Loss**
@@ -191,10 +191,11 @@ The model is rewarded (with a lower loss) for making the correct prediction. By 
 #### **The Unified Result**
 
 When you combine these in the total loss 
+
 $$
-\mathcal{L}_total = \alpha~\mathcal{L}_\text{MLM} + \beta~\mathcal{L}_\text{MVM} + \gamma~\mathcal{L}_\text{LVA}
- 
+\mathcal{L}_total = \alpha~\mathcal{L}_{MLM} + \beta~\mathcal{L}_{MVM} + \gamma~\mathcal{L}_{LVA}
 $$
+
 you create a system where:
 
 1.  The model is **punished directly** by the LVA loss if it fails to align the two modalities.
