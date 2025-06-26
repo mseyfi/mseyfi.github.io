@@ -132,6 +132,7 @@ This advanced category deals with models that can process and reason about seque
   <p><b>Key Contribution:</b> Pioneered the application of the BERT framework to the self-supervised learning of video-text representations</p>.
   <p><b>Reference Paper:</b> Sun, C., Myers, A., Vondrick, C., et al. (2019). *VideoBERT: A Joint Model for Video and Language Representation Learning*. [arXiv:1904.01766](https://arxiv.org/abs/1904.01766)</p>
 </div>
+
 #### **MERLOT (Multimedia Event Representation Learning over Time)**
 
   * **What it does:** Learns multimodal representations by observing how visual and textual elements change and co-occur over time in videos.
