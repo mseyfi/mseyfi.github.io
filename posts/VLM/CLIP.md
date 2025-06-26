@@ -35,13 +35,18 @@ CLIP uses a **Dual Encoder** architecture. It has two distinct models, or "tower
           * **Vision Transformer (ViT):** A more modern architecture that divides an image into patches and uses the Transformer's self-attention mechanism to process them. The ViT-based CLIP models are generally the most powerful.
       * **Input:** A raw image (e.g., 224x224 pixels).
       * **Output:** A single feature vector (an image embedding).
-
+        
 2.  **The Language Model (Text Encoder)**
 
-      * **Purpose:** To take a string of text as input and distill its semantic meaning into a single vector.
-      * **Structure:** A standard, multi-layered Transformer model. It processes text tokens and uses self-attention to build a contextual understanding of the input sentence.
-      * **Input:** A sequence of text tokens.
-      * **Output:** A single feature vector (a text embedding), typically derived from the final state of the `[EOS]` (End of Sequence) token.
+    * **Purpose:** To take a string of text as input and distill its semantic meaning into a single vector.
+    * **Structure:** A standard, multi-layered Transformer model. It processes text tokens and uses self-attention to build a contextual understanding of the input sentence.
+    * **Input:** A sequence of text tokens.
+    * **Output:** A single feature vector (a text embedding), typically derived from the final state of the `[EOS]` (End of Sequence) token.
+      * **Why not the `[CLS]` token or Pooling?**
+        * **`[CLS]` Token:** The `[CLS]` token is a convention made famous by **BERT**. In BERT-style models, a `[CLS]` token is placed at the *beginning* of the sequence, and its final hidden state is typically used for classification tasks. CLIP's text encoder, while being a Transformer, follows a different design choice more akin to the GPT family, which focuses on sequence completion and uses an end token.
+        * **Pooling:** Another common strategy is to take the final hidden states of *all* tokens in the sequence and average them (mean pooling) or take the maximum value across each dimension (max pooling). This can sometimes create a more holistic representation. However, the CLIP authors found that simply using the `[EOS]` token's output was effective and sufficient for their contrastive learning objective.
+        * So, to summarize: **CLIP uses the `[EOS]` token's output vector** as the final text embedding before it is passed to the projection head.
+
 
 3.  **The Projection Head**
     This is a crucial but often overlooked component. The raw output vectors from the image and text encoders are not directly compared. Instead, they are first passed through a small **projection head** (a simple multi-layer perceptron or MLP). This head projects the features from each modality into a shared, lower-dimensional embedding space where the contrastive loss is calculated.
@@ -60,9 +65,9 @@ $$
 
   * **Why is this important?** When two vectors are L2-normalized, their **dot product** is mathematically identical to their **cosine similarity**.
 
-    
+    $$
     \text{similarity} = \cos(\theta) = \frac{I_e \cdot T_e}{\|I_e\| \|T_e\|} = \frac{I_e \cdot T_e}{1 \cdot 1} = I_e \cdot T_e
-    
+    $$
 
     This simplifies the math and makes the dot product a clean measure of similarity, bounded between -1 (opposite meaning) and +1 (identical meaning).
 
