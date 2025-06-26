@@ -15,7 +15,9 @@ Before CLIP (Contrastive Language-Image Pre-training), the dominant approach to 
 Instead of learning from a fixed set of labels, CLIP learns from the vast, messy, and abundant data available on the internet. It leverages the fact that millions of images online already have associated text—alt-text, captions, surrounding paragraphs, etc.
 
 The goal of CLIP is not to predict a specific class label, but to learn the direct **relationship between an image and the text that describes it**. It learns to create a shared "map of meaning" where a picture of a puppy and the sentence "a photo of a cute puppy" are placed very close together. This flexible, semantic understanding is what gives CLIP its remarkable capabilities.
+
 ![CLIP](../../images/CLIP.png)
+
 *Fig 1. While standard image models jointly train an image feature extractor and a linear classifier to predict
 some label, CLIP jointly trains an image encoder and a text encoder to predict the correct pairings of a batch of (image, text) training
 examples. At test time the learned text encoder synthesizes a zero-shot linear classifier by embedding the names or descriptions of the
