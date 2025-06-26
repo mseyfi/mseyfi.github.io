@@ -135,13 +135,13 @@ This advanced category deals with models that can process and reason about seque
 <b>Reference Paper:</b> Sun, C., Myers, A., Vondrick, C., et al. (2019). VideoBERT: A Joint Model for Video and Language Representation Learning. [arXiv:1904.01766](https://arxiv.org/abs/1904.01766)
 </div>
 
-#### **MERLOT (Multimedia Event Representation Learning over Time)**
-
-  * **What it does:** Learns multimodal representations by observing how visual and textual elements change and co-occur over time in videos.
-  * **How it works:** It is trained on a massive dataset of YouTube videos with the objective of predicting masked-out video frames and text tokens. It learns a strong sense of temporal ordering and event causality.
-  * **Key Contribution:** Showcased a scalable method for learning temporal and multimodal event representations from untrimmed, unstructured web videos.
-  * **Reference Paper:** Zellers, R., Lu, X., et al. (2021). *MERLOT: Multimodal Neural Script Knowledge Models*. [arXiv:2106.02636](https://arxiv.org/abs/2106.02636)
-
+## [![MERLOT](https://img.shields.io/badge/MERLOT-Multimedia_Event_Representation_Learning_over_Time-blue?style=for-the-badge&logo=github)](MERLOT)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+<b>What it does:</b> Learns multimodal representations by observing how visual and textual elements change and co-occur over time in videos.<p></p>
+<b>How it works:</b> It is trained on a massive dataset of YouTube videos with the objective of predicting masked-out video frames and text tokens. It learns a strong sense of temporal ordering and event causality.<p></p>
+<b>Key Contribution:</b> Showcased a scalable method for learning temporal and multimodal event representations from untrimmed, unstructured web videos.<p></p>
+<b>Reference Paper:</b> Zellers, R., Lu, X., et al. (2021). *MERLOT: Multimodal Neural Script Knowledge Models*. [arXiv:2106.02636](https://arxiv.org/abs/2106.02636)
+</div>
 ### Category 7: Grounded Image Understanding / Referring Expressions
 
 These models focus on "grounding" language by localizing specific objects mentioned in text within an image.
