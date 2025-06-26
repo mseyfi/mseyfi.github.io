@@ -39,7 +39,7 @@ This process turns a continuous, complex video stream into a discrete sequence o
 
 ### **The VideoBERT Architecture - A Single, Unified Transformer**
 
-Unlike the two-tower approach of CLIP, VideoBERT uses a single, **unified Transformer encoder**to process both modalities simultaneously. This allows for deep, layer-by-layer fusion of information.
+Unlike the two-tower approach of CLIP, VideoBERT uses a single, **unified Transformer encoder** to process both modalities simultaneously. This allows for deep, layer-by-layer fusion of information.
 
   * **Input Sequence Construction:**
     The model's input is a carefully constructed sequence of both text and visual tokens:
