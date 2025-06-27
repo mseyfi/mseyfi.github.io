@@ -276,13 +276,12 @@ $$
 This combined loss is what is used to update all the weights in the entire MERLOT model via backpropagation.
 
 
-
-#### **Inference - Putting Script Knowledge to the Test**
-
 ![story](/images/MERLOT-STORY.png)
 
 *Fig. 3 Zero-shot story ordering (same setup as Table 2). MERLOT performs temporal commonsense reasoning across frames. In the first row, it uses ‘the old man’ mentioned to identify the ‘kids’
 as parent-aged; in the second, it identifies riding a merry-go-round as an activity that takes a while.*
+
+#### **Inference - Putting Script Knowledge to the Test**
 
 The pre-trained MERLOT model, with its deep understanding of temporal progression, excels at tasks that require reasoning about sequences of events.
 
