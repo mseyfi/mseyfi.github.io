@@ -1,10 +1,8 @@
 ## [![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](/)
-
 ## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](/main_page/CV)
-
 ## [![CV](https://img.shields.io/badge/VLMs-Selected_Topics_in_Vision_Language_Models-orange?style=for-the-badge&logo=github)](VLMs)
 
-### A Deep Dive into MERLOT: Learning Temporal and Script Knowledge from Video
+## A Deep Dive into MERLOT: Learning Temporal and Script Knowledge from Video
 
 MERLOT, which stands for **M**ultimodal **E**vent **R**epresentation **L**earning **o**ver **T**ime, is a model from the Allen Institute for AI and the University of Washington. It was designed to address a key weakness in many prior video-language models: their inability to understand long-range temporal structure and causality.
 
@@ -19,6 +17,11 @@ Many successful video-language models, including VideoBERT and VideoCLIP, are ex
 #### **The Core Idea - Learning the "Script" through Multimodal Prediction**
 
 MERLOT's core intuition is that one can learn this deep temporal understanding by watching millions of unlabeled YouTube videos and learning to **anticipate what happens next**. The model is trained to predict missing or future information across multiple modalities (vision, audio, and text) simultaneously.
+
+![MERLOT](/images/MERLOT.png)
+
+*Fig.1 Multimodal Event Representation Learning Over Time. We learn representations of multimodal script knowledge from 6 million YouTube videos. These representations can then be
+applied to a variety of downstream tasks that require commonsense or temporal visual reasoning.*
 
 **A Hybrid Learning Approach:**
 To achieve this, MERLOT uniquely combines two powerful self-supervised learning paradigms:
@@ -43,6 +46,11 @@ The foundation of the input data is the "video segment." The model processes a s
 Let's break down the entire input construction process for MERLOT, from the raw data to the final sequence fed into the main transformer.
 
 The process is designed to take video—a medium of images and spoken words over time—and structure it into a format a Transformer can understand. The model processes a sequence of "video segments." For each segment, it gets a visual part (`It`) and a textual part (`wt`).
+
+![model](/images/MERLOT-MODEL.png)
+
+*Fig.2 Left: MERLOT learns to match contextualized captions with their corresponding video frames. Right: the same image encoding is provided, along with (masked) word embeddings, into a
+joint vision-language Transformer model; it then unmasks ground words (like ‘saw’ in this example) and puts scrambled video frames into the correct order.*
 
 #### **The Textual Input ($w_t$)**
 
@@ -270,6 +278,11 @@ This combined loss is what is used to update all the weights in the entire MERLO
 
 
 #### **Inference - Putting Script Knowledge to the Test**
+
+![story](/images/MERLOT-STORY.png)
+
+*Fig. 3 Zero-shot story ordering (same setup as Table 2). MERLOT performs temporal commonsense reasoning across frames. In the first row, it uses ‘the old man’ mentioned to identify the ‘kids’
+as parent-aged; in the second, it identifies riding a merry-go-round as an activity that takes a while.*
 
 The pre-trained MERLOT model, with its deep understanding of temporal progression, excels at tasks that require reasoning about sequences of events.
 
