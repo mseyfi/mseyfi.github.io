@@ -132,6 +132,7 @@ This process results in a sequence of vectors of shape `(Number of Regions, 1024
 ---
 
 ![attention](/images/VILBERT-ATTENTION.png)
+
 *Fig. 2 Co-attention mechanism: By exchanging key-value pairs in multi-headed attention, this structure enables vision-attended language
 features to be incorporated into visual representations (and vice versa).*
 
@@ -486,7 +487,7 @@ This is different because the goal is to score *regions*, not the whole image.
 
 ![task2](images/VILBERT-TASK2.png)
 
-*Fig. 4 Examples for each vision-and-language task ViLBERT is  transferred to in experiments.*
+*Fig. 5 Examples for each vision-and-language task ViLBERT is  transferred to in experiments.*
 
 ---
 
@@ -522,9 +523,9 @@ This is almost identical to the **multi-modal alignment** pre-training task.
 4.  The final output is the top-ranked image (or top-k images).
 
 
-![task4](images/VILBERT-TASK4.png)
+![task3](images/VILBERT-TASK3.png)
 
-*Fig. 5 Qualitative examples of sampled image descriptions from a ViLBERT model after our pretraining tasks, but before task-specific fine-tuning.*
+*Fig. 6 Qualitative examples of sampled image descriptions from a ViLBERT model after our pretraining tasks, but before task-specific fine-tuning.*
 
 ### **6\. Sample Code Snippet**
 
