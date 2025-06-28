@@ -336,7 +336,7 @@ The goal of this objective is to teach the model to use context from *both* the 
   \mathcal{L}_{MRM} = D_{KL}(P_{detector} || P_{model})
   $$
 
-  Where $$D_{KL}(p || q) = \sum_{i=1}^{C} p(i) \log\left(\frac{p(i)}{q(i)}\right)$$ and :
+  Where $D \left( \frac{\|P\|}{2} \middle\| Q \right)= \sum_{i=1}^{C} p(i) \log\left(\frac{p(i)}{q(i)}\right)$ and :
 
   *   $C$ is the number of possible object classes.
   *   $p(i)$ is the ground truth probability for class `i` (from the object detector).
