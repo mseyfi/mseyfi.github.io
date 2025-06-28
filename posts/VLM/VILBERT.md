@@ -485,7 +485,7 @@ This is different because the goal is to score *regions*, not the whole image.
 2.  Calculate the matching score for every proposed region.
 3.  The final output is the bounding box of the region that received the highest score.
 
-![task2](images/VILBERT-TASK2.png)
+![task2](/images/VILBERT-TASK2.png)
 
 *Fig. 5 Examples for each vision-and-language task ViLBERT is  transferred to in experiments.*
 
@@ -523,7 +523,7 @@ This is almost identical to the **multi-modal alignment** pre-training task.
 4.  The final output is the top-ranked image (or top-k images).
 
 
-![task3](images/VILBERT-TASK3.png)
+![task3](/images/VILBERT-TASK3.png)
 
 *Fig. 6 Qualitative examples of sampled image descriptions from a ViLBERT model after our pretraining tasks, but before task-specific fine-tuning.*
 
