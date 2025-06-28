@@ -253,12 +253,12 @@ Each stream maintains its own "native" dimensionality (768 for text, 1024 for vi
 
 ### **4\. Pre-training Tasks and Loss Functions**
 
-Of course. ViLBERT's pre-training is driven by two main objectives, which break down into three distinct loss functions. These losses are designed to work together to teach the model a fundamental and general-purpose understanding of how vision and language connect.
+ViLBERT's pre-training is driven by two main objectives, which break down into three distinct loss functions. These losses are designed to work together to teach the model a fundamental and general-purpose understanding of how vision and language connect.
 
 The total pre-training loss is a simple sum of these three individual loss components:
 
 $$
-\mathcal{L}_{PRETRAIN} = \mathcal{L}_{MLM} + \mathcal{L}_{MRM} + \mathcal{L}_{ALIGN}
+\mathcal{L}_{Pre} = \mathcal{L}_{MLM} + \mathcal{L}_{MRM} + \mathcal{L}_{ALIGN}
 $$
 
 Let's break down each one in detail.
@@ -317,7 +317,7 @@ The goal of this objective is to teach the model to use context from *both* the 
   \mathcal{L}_{MRM} = D_{KL}(P_{detector} || P_{model})
   $$
   
-  Where $D_{KL}(p || q) = \sum_{i=1}^{C} p(i) \log\left(\frac{p(i)}{q(i)}\right)$ and :
+  Where $$D_{KL}(p || q) = \sum_{i=1}^{C} p(i) \log\left(\frac{p(i)}{q(i)}\right)$$ and :
 
   *   $C$ is the number of possible object classes.
   *   $p(i)$ is the ground truth probability for class `i` (from the object detector).
