@@ -5,7 +5,7 @@ This tutorial breaks down the ViLBERT model, a seminal work in vision-and-langua
 
 -----
 
-### 1\. The Intuition: What Problem Does ViLBERT Solve?
+### **1\. The Intuition: What Problem Does ViLBERT Solve?**
 
 Before ViLBERT, models for tasks like Visual Question Answering (VQA) or Image Captioning were often trained from scratch for that specific task. This required large, task-specific labeled datasets and didn't leverage knowledge from other related tasks.
 
@@ -17,7 +17,7 @@ The key innovation is how it processes both modalities. Instead of just mushing 
 
 -----
 
-### 2\. Model Architecture
+### **2\. Model Architecture**
 
 ViLBERT consists of two parallel BERT-style Transformer networks—one for processing text (the linguistic stream) and one for processing regions in an image (the visual stream). These streams interact through a series of novel "co-attentional transformer layers."
 
@@ -48,7 +48,7 @@ A single training instance for ViLBERT is an (image, text) pair.
 
 So, the input to the visual stream is a sequence of region features, and the input to the linguistic stream is a sequence of word embeddings.
 
-#### **c. Co-Attentional Transformer Layer**
+#### ****c. Co-Attentional Transformer Layer**
 
 This is the core of ViLBERT. A standard Transformer layer consists of a Multi-Head Self-Attention module followed by a Feed-Forward Network. In ViLBERT's **co-attentional** layers, the attention mechanism is modified to allow one stream to attend to the other.
 
@@ -67,7 +67,7 @@ This block is stacked multiple times, allowing for deep and iterative fusion of 
 
 -----
 
-### 3\. Mathematics of Co-Attention
+### **3\. Mathematics of Co-Attention**
 
 The fundamental building block is Scaled Dot-Product Attention:
 
@@ -79,7 +79,7 @@ where $Q$ is the query, $K$ is the key, $V$ is the value, and $d\_k$ is the dime
 
 In a **Co-Attentional Layer**, let $H\_L^{(i-1)}$ and $H\_V^{(i-1)}$ be the outputs of the previous layer for the linguistic and visual streams, respectively.
 
-The new intermediate hidden states ($H'*{L}$ and $H'*{V}$) are calculated via multi-head co-attention:
+The new intermediate hidden states ($H\prime^\start_{L}$ and $H\prime^\start_{V}$) are calculated via multi-head co-attention:
 
 $$
 H'_{L} = \text{Co-Attention}(Q=H_L^{(i-1)}, K=H_V^{(i-1)}, V=H_V^{(i-1)})
@@ -101,7 +101,7 @@ $$
 
 -----
 
-### 4\. Pre-training Tasks and Loss Functions
+### **4\. Pre-training Tasks and Loss Functions**
 
 ViLBERT is pre-trained on the large Conceptual Captions dataset using two main tasks. The goal is to force the model to learn a strong alignment between vision and language.
 
@@ -159,7 +159,7 @@ $$
 
 -----
 
-### 5\. Fine-Tuning and Inference
+### **5\. Fine-Tuning and Inference**
 
 After pre-training, the model has learned powerful, generic visiolinguistic representations. To solve a specific task, we adapt it.
 
@@ -187,7 +187,7 @@ After pre-training, the model has learned powerful, generic visiolinguistic repr
 
 -----
 
-### 6\. Sample Code Snippet (without `torch.nn.Transformer`)
+### **6\. Sample Code Snippet**
 
 Here is a simplified PyTorch implementation of the core **Co-Attentional Transformer Layer** to illustrate the mechanics.
 
@@ -328,7 +328,7 @@ if __name__ == '__main__':
 
 -----
 
-### 7\. Reference
+### **7\. Reference
 
 The original paper provides all the in-depth details of the model, experiments, and results.
 
