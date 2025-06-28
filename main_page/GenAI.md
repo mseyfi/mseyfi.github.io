@@ -64,14 +64,14 @@ To understand why Retrieval-Augmented Generation (RAG) is so revolutionary, we m
 Language models are evaluated across diverse tasks such as next-token prediction, text classification, summarization, translation, code generation, and question answering. Each task requires a suitable metric that reflects model performance both quantitatively and qualitatively.
 </div>
 
-## [![FineTune](https://img.shields.io/badge/FineTuning_LLMs-A_Comprehensive_Guide_to_FineTuning_LLMs-green?style=for-the-badge&logo=github)](../posts/LLM/FineTuning)
+## [![FineTune](https://img.shields.io/badge/FineTuning_LLMs-A_Comprehensive_Guide_to_FineTuning_LLMs-g?style=for-the-badge&logo=github)](../posts/LLM/FineTuning)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-This is a series of tutorials that include, 1. full finetuning, 2. Instruction Fine-Tuning (SFT), 3. Parameter-Efficient Fine-Tuning (PEFT), and 4. Reinforcement Learning from Human Feedback (RLHF)
+This is a series of tutorials that include 1. full finetuning, 2. Instruction Fine-Tuning (SFT), 3. Parameter-Efficient Fine-Tuning (PEFT), and 4. Reinforcement Learning from Human Feedback (RLHF)
 </div>
 
 
 
-## [![Taks](https://img.shields.io/badge/LLM_TASKS-A_Comprehensive_Guide_to_LLM_Tasks:_From_Fine_Tuning_to_Advanced_Applications-green?style=for-the-badge&logo=github)](../posts/LLM/LLM-Tasks)
+## [![Taks](https://img.shields.io/badge/LLM_TASKS-A_Comprehensive_Guide_to_LLM_Tasks:_From_Fine_Tuning_to_Advanced_Applications-g?style=for-the-badge&logo=github)](../posts/LLM/LLM-Tasks)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 A single, powerful pre-trained Large Language Model is a versatile foundation that can be adapted—or "fine-tuned"—to excel at a wide array of specific tasks. The key to this versatility lies in how we frame the task and format the data.
 
