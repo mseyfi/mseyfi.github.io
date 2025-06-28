@@ -30,6 +30,7 @@ For each pair, we perform these steps:
     * The model processes the entire sequence, predicting the next token at every step.
     * **Causal Masking** ensures the model can't "cheat" by looking ahead.
     * A **Masked Cross-Entropy Loss** is applied. We only calculate the model's error on the `completion` tokens. This forces the model to learn: "Given this *kind* of prompt, generate this *kind* of completion."
+
 ---
 
 #### Part 2: The Generation Phase (Inference)
