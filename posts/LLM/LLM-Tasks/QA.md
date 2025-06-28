@@ -20,6 +20,7 @@ The goal is to find and highlight a precise answer that already exists within a 
 
 * **A legal assistant is reviewing a contract:** The user asks, `"What is the termination clause notice period?"` The system scans the contract (`Context`) and extracts the exact phrase, like `"thirty (30) business days"`, highlighting it for the user.
 * **Corporate knowledge base:** An employee asks the HR portal, `"What is the maximum rollover for vacation days?"` The system finds the answer directly in the employee handbook.
+  
 ---
 
 ##### **How It Works: A Mini-Tutorial (Encoder-Only)**
@@ -123,6 +124,7 @@ The goal is to generate a natural, human-like answer, either by synthesizing inf
 
 * **General knowledge queries:** A student uses Google or ChatGPT to ask, `"Explain the process of photosynthesis in simple terms."`
 * **Customer support chatbot:** A user asks, `"How do I reset my account password?"` The chatbot generates a step-by-step guide instead of just pointing to a paragraph in a manual.
+  
 ---
 ##### **How It Works: A Mini-Tutorial (Decoder-Only or Encoder-Decoder)**
 This is a classic text generation task, perfectly suited for Decoder-Only models like GPT or Llama.
