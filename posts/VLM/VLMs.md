@@ -60,12 +60,13 @@ In VQA, the model receives an image and a question about that image (e.g., "What
   * **Key Contribution:** Its two-stream architecture with a dedicated cross-modal module became a standard pattern for many subsequent VQA models.
   * **Reference Paper:** Tan, H., & Bansal, M. (2019). *LXMERT: Learning Cross-Modality Encoder Representations from Transformers*. [arXiv:1908.07490](https://arxiv.org/abs/1908.07490)
 
-#### **VilBERT**
-
-  * **What it does:** A contemporary of LXMERT, VilBERT also extends the BERT architecture for vision-language tasks.
-  * **How it works:** Similar to LXMERT, it consists of two parallel streams for vision and language. The streams interact through co-attentional Transformer layers, allowing information to flow between modalities at multiple points in the network.
-  * **Key Contribution:** Along with LXMERT, it pioneered the use of multi-stream Transformers for deep vision-language fusion.
-  * **Reference Paper:** Lu, J., Batra, D., Parikh, D., & Lee, S. (2019). *VilBERT: Pretraining for Grounded Vision-and-Language Tasks*. [arXiv:1908.02265](https://arxiv.org/abs/1908.02265)
+## [![VILBERT](https://img.shields.io/badge/VILBERT-Vision_and_Language_BERT-blue?style=for-the-badge&logo=github)](VILBERT)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+  <b>What it does:</b> A contemporary of LXMERT, VilBERT also extends the BERT architecture for vision-language tasks.<p></p>
+  <b>How it works:</b> Similar to LXMERT, it consists of two parallel streams for vision and language. The streams interact through co-attentional Transformer layers, allowing information to flow between modalities at multiple points in the network.<p></p>
+  <b>Key Contribution:</b> Along with LXMERT, it pioneered the use of multi-stream Transformers for deep vision-language fusion.<p></p>
+  <b>Reference Paper:</b> Lu, J., Batra, D., Parikh, D., & Lee, S. (2019). VilBERT: Pretraining for Grounded Vision-and-Language Tasks. [arXiv:1908.02265](https://arxiv.org/abs/1908.02265)
+</div>
 
 ### Category 4: Multimodal Large Language Models (MLLMs)
 
