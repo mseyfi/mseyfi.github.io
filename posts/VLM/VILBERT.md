@@ -18,6 +18,13 @@ ViLBERT extends this "pre-train and fine-tune" paradigm to vision-and-language. 
 
 The key innovation is how it processes both modalities. Instead of just mushing the image and text information together from the start, ViLBERT uses a **two-stream architecture**. Imagine two separate "experts": one that reads text and one that looks at images. They first process their own input independently and then communicate back and forth to build a joint understanding.
 
+![model](/images/VILBERT-MODEL.png)
+
+*Fig.1 ViLBERT model consists of two parallel streams for visual (green) and linguistic
+(purple) processing that interact through novel co-attentional transformer layers. This structure allows
+for variable depths for each modality and enables sparse interaction through co-attention. Dashed
+boxes with multiplier subscripts denote repeated blocks of layers.*
+
 -----
 
 ### **2\. Model Architecture**
@@ -124,7 +131,9 @@ This process results in a sequence of vectors of shape `(Number of Regions, 1024
 
 ---
 
-
+![attention](/images/VILBERT-ATTENTION.png)
+*Fig. 2 Co-attention mechanism: By exchanging key-value pairs in multi-headed attention, this structure enables vision-attended language
+features to be incorporated into visual representations (and vice versa).*
 
 So, the input to the visual stream is a sequence of region features, and the input to the linguistic stream is a sequence of word embeddings.
 
@@ -265,9 +274,14 @@ $$
 \mathcal{L}_{Pre} = \mathcal{L}_{MLM} + \mathcal{L}_{MRM} + \mathcal{L}_{ALIGN}
 $$
 
-Let's break down each one in detail.
 
----
+
+![PRe](/images/VILBERT-TRAIN.png)
+
+*Fig. 3 ViLBERT is trained on the Conceptual Captions [24 ] dataset under two training tasks to learn visual grounding. In masked multi-modal learning, the model must reconstruct image region
+categories or words for masked inputs given the observed inputs. In multi-modal alignment prediction, the model must predict whether or not the caption describes the image content.*
+
+Let's break down each one in detail.
 
 #### **Objective 1: Masked Multi-modal Modeling**
 
@@ -396,6 +410,10 @@ Given an image and a question about that image, the model must provide an accura
 3.  Apply a `softmax` function to these scores to turn them into a probability distribution.
 4.  The final answer is the one with the highest probability.
 
+![task1](/images/VILBERT-TASK1.png)
+
+*Fig. 4 Examples for each vision-and-language task ViLBERT is transferred to in experiments.*
+
 ---
 
 #### **2. Visual Commonsense Reasoning (VCR)**
@@ -466,6 +484,10 @@ This is different because the goal is to score *regions*, not the whole image.
 2.  Calculate the matching score for every proposed region.
 3.  The final output is the bounding box of the region that received the highest score.
 
+![task2](images/VILBERT-TASK2.png)
+
+*Fig. 4 Examples for each vision-and-language task ViLBERT is  transferred to in experiments.*
+
 ---
 
 #### **4. Caption-Based Image Retrieval**
@@ -500,18 +522,9 @@ This is almost identical to the **multi-modal alignment** pre-training task.
 4.  The final output is the top-ranked image (or top-k images).
 
 
+![task4](images/VILBERT-TASK4.png)
 
-
-
-
-
-
-
-
-
-
-
-
+*Fig. 5 Qualitative examples of sampled image descriptions from a ViLBERT model after our pretraining tasks, but before task-specific fine-tuning.*
 
 ### **6\. Sample Code Snippet**
 
