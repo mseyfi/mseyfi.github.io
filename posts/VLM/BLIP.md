@@ -193,7 +193,7 @@ The pre-trained BLIP model is a powerful foundation. To adapt it for specific ta
 #### a) Image-Text Retrieval
 
 * **Task:** Given one image, find the most relevant texts from a large corpus (or vice-versa).
-* **Fine-Tuning:** The model is fine-tuned on the task dataset (e.g., COCO) using the **$\mathcal{L}_{itc}$** and **$\mathcal{L}_{itm}$** objectives. This further aligns the representations for the specific domain.
+* **Fine-Tuning:** The model is fine-tuned on the task dataset (e.g., COCO) using the $\mathcal{L}_{itc}$ and $\mathcal{L}_{itm}$ objectives. This further aligns the representations for the specific domain.
 * **Inference (Two-Step Process):**
   1.  **Candidate Selection:** For a given query (e.g., an image), quickly compute the ITC similarity scores against all items in the database (e.g., all texts). Retrieve the top-k candidates. This is very fast as it's just a dot product of pre-computed embeddings.
   2.  **Re-ranking:** For these top-k candidates, compute the much more accurate (but slower) ITM score using the Image-Grounded Encoder. The item with the highest ITM score is the final result.
@@ -212,5 +212,5 @@ The pre-trained BLIP model is a powerful foundation. To adapt it for specific ta
 * **Fine-Tuning:** VQA is ingeniously framed as a generation task.
   * **Input:** The model receives the Image $I$ and a formatted text prompt: `Question: [question text] Answer:`.
   * **Output:** The model is trained to generate the answer text sequence.
-  * **Loss Function:** The fine-tuning uses the **Language Modeling loss ($\mathcal{L}_{lm}$)** to train the model to complete the prompt with the correct answer.
+  * **Loss Function:** The fine-tuning uses the **Language Modeling loss** ($\mathcal{L}_{lm}$) to train the model to complete the prompt with the correct answer.
 * This approach is powerful because it can generate open-ended, free-form answers instead of just picking from a pre-defined set of choices.
