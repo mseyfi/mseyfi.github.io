@@ -42,6 +42,7 @@ This is a classic generative task where the model's goal is to produce a concise
   <b>Key Contribution:</b> Developed a powerful data bootstrapping technique to improve learning from noisy web data.<p></p>
   <b>Reference Paper:</b> Li, J., Li, D., Xiong, C., & Hoi, S. (2022). BLIP: Bootstrapping Language-Image Pre-training for Unified Vision-Language Understanding and Generation. [arXiv:2201.12086](https://arxiv.org/abs/2201.12086)
 </div>
+
 #### **GIT (Generative Image-to-Text Transformer)**
 
   * **What it does:** A simple, powerful Transformer-based model designed purely for generative vision-language tasks like captioning and VQA.
