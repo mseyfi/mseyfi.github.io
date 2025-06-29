@@ -267,7 +267,7 @@ Now we can see how the pre-training objectives power the CapFilt mechanism.
 3.  **Filter Noisy Pairs (Filter):**
     * **For each image** $I_{web}$: We now have two captions: the original $$T_{web}$$ and the synthetic $$T_{synth}$$.
     * Use the trained **Image-Grounded Encoder** ($\mathcal{L}_{itm}$) to compute two matching scores:
-      * $$\text{score}_{web} = p^{itm}(I_{web}, T_{web}) ~\text{and}~\text{score}_{synth} = p^{itm}(I_{web}, T_{synth})$$
+      * $$\text{score}_{web} = p^{itm}(I_{web}, T_{web}) \qquad\text{and}\qquad\text{score}_{synth} = p^{itm}(I_{web}, T_{synth})$$
     * The model also has the high-level ITC scores available. The filtering logic uses a combination of these to decide which text to keep. Essentially, if the synthetic text is a much better match for the image than the noisy web text, the web text is discarded.
 
 4.  **Create Final Dataset and Re-train:**
