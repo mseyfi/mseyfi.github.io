@@ -37,8 +37,8 @@ This is a classic generative task where the model's goal is to produce a concise
 
 ## [![BLIP](https://img.shields.io/badge/BLIP-Bootstrapping_Language--Image_Pre--training_for_Unified_Vision--Language_Understanding_and_Generation-blue?style=for-the-badge&logo=github)](BLIP)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
-  <b>What it does:</b> The predecessor to BLIP-2, BLIP is a unified model that can be used for both understanding (retrieval) and generation (captioning).<p></p>
-  <b>How it works:</b> It introduced a novel method called **CapFilt** (Captioning and Filtering). BLIP first generates synthetic captions for web images and then uses a filter to remove noisy or inaccurate ones. This cleaned dataset is then used to train the final model, improving the quality of its learned representations.<p></p>
+  <b>What it does:</b> BLIP is a unified model that can be used for both understanding (retrieval) and generation (captioning).<p></p>
+  <b>How it works:</b> It introduced a novel method called <b>CapFilt</b> (Captioning and Filtering). BLIP first generates synthetic captions for web images and then uses a filter to remove noisy or inaccurate ones. This cleaned dataset is then used to train the final model, improving the quality of its learned representations.<p></p>
   <b>Key Contribution:</b> Developed a powerful data bootstrapping technique to improve learning from noisy web data.<p></p>
   <b>Reference Paper:</b> Li, J., Li, D., Xiong, C., & Hoi, S. (2022). BLIP: Bootstrapping Language-Image Pre-training for Unified Vision-Language Understanding and Generation. [arXiv:2201.12086](https://arxiv.org/abs/2201.12086)
 </div>
@@ -189,9 +189,9 @@ This specialized task involves models that can "read" visual documents like PDFs
 
 | Task Category                 | Famous Models                              |
 | ----------------------------- | ------------------------------------------ |
-| Image-Text Retrieval          | CLIP, ALIGN, BLIP-2, GIT                   |
-| Image Captioning              | BLIP, GIT, SimVLM, OFASys                  |
-| Visual Question Answering     | LXMERT, VilBERT, UNITER, BLIP-2            |
+| Image-Text Retrieval          | CLIP, ALIGN, -2, GIT                   |
+| Image Captioning              | , GIT, SimVLM, OFASys                  |
+| Visual Question Answering     | LXMERT, VilBERT, UNITER, -2            |
 | Multimodal Chat               | GPT-4V, Claude 3, Gemini, LLaVA, MiniGPT-4 |
 | Text-to-Image                 | DALL·E, Imagen, Stable Diffusion, Kosmos   |
 | Video QA / Temporal Reasoning | VideoBERT, MERLOT, GPT-4V, VIOLET          |
