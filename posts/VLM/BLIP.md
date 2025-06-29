@@ -6,20 +6,13 @@
 
 ### A Deep Dive into BLIP: The Full Tutorial on Bootstrapping Language-Image Pre-training
 
-This tutorial breaks down the BLIP framework from the ground up. We will explore not just *what* BLIP does, but *how* it does it, with a focus on the mathematical and architectural details.
+The core idea behind BLIP, as presented in the paper,  is to address two major limitations in vision-language pre-training (VLP) models. First, existing models were often specialized, excelling at either understanding-based tasks (like image-text retrieval) or generation-based tasks (like image captioning), but not both. Second, these models were typically trained on massive datasets of image-text pairs scraped from the web, which are often noisy and contain irrelevant or inaccurate text descriptions for the corresponding images. The authors of BLIP argue that this "noisy web text is suboptimal for vision-language learning."
 
-**Table of Contents:**
+To overcome these issues, BLIP introduces two key innovations:
 
-1.  **Core Intuition:** The "Why" Behind BLIP's Design
-2.  **Model Architecture:** Deconstructing the Vision Transformer and MED
-3.  **Pre-training In-Depth:** Objectives, Mathematics, and Data Flow
-    * Image-Text Contrastive Loss ($\mathcal{L}_{itc}$)
-    * Image-Text Matching Loss ($\mathcal{L}_{itm}$)
-    * Language Modeling Loss ($\mathcal{L}_{lm}$)
-4.  **The Bootstrapping Engine (CapFilt):** A Technical Look
-5.  **Fine-Tuning on Downstream Tasks:** Adapting BLIP for Practical Use
+1. **A Unified Model Architecture:** A flexible model called the **Multimodal Mixture of Encoder-Decoder (MED)** that can be adapted for both understanding and generation tasks.
+2. **A Data Bootstrapping Method:** A technique named **Captioning and Filtering (CapFilt)** that cleans up and improves the quality of web-scraped datasets. In essence, CapFilt generates new, synthetic captions for images and then filters out the noisy ones, creating a higher-quality dataset for pre-training.
 
----
 
 ### **1. Core Intuition: Solving the Noisy Correspondence Problem**
 
@@ -27,10 +20,15 @@ The fundamental challenge BLIP addresses is the **noisy correspondence** in web-
 
 **BLIP's Core Idea:** A model that is already somewhat proficient at vision-language tasks should be able to identify and correct these noisy pairs. This creates a powerful feedback loop:
 
-1.  **Start with a base model:** Pre-train a model on the full, noisy dataset to get a baseline capability.
-2.  **Generate:** Use the model's generative part (the "Captioner") to create a new, clean, synthetic caption for each image.
-3.  **Filter:** Use the model's understanding part (the "Filter") to assess both the original web text and the new synthetic caption. It keeps whichever text is a better fit for the image. In many cases, the synthetic caption is better.
-4.  **Re-train:** A new, much cleaner dataset is formed from this process. The model is then re-trained on this high-quality data to achieve superior performance.
+- **Captioner:** The researchers take a pre-trained model and fine-tune it to become a **Captioner**. This fine-tuning is done on a relatively small, human-annotated dataset. As mentioned in Section 4 of the paper, they use the **COCO dataset** for this purpose. The goal is to teach the model how to generate high-quality, descriptive captions by showing it examples of them.
+
+  Once the Captioner is trained, it is then applied to the massive collection of *images* from the noisy web datasets (which, in their experiments, contain up to 129 million images). The Captioner generates a new, synthetic caption for each of these web images.
+
+- **Filter:** A filter is also fine-tuned on the same high-quality dataset (COCO). Its job is to go through both the original web-scraped captions and the newly generated synthetic captions by the captioner and remove any that are a poor match for the image.
+
+The result is a new, "bootstrapped" dataset that contains a mix of human-annotated pairs and cleaner, more reliable image-text pairs from the web. This higher-quality dataset is then used to pre-train a new BLIP model from scratch, leading to significant performance improvements on a variety of downstream tasks. The paper shows that this process is more effective than simply training for more epochs on the noisy data.
+
+In summary, BLIP^\primes innovation lies in its unified model architecture that can handle diverse tasks and its data-centric approach of cleaning and augmenting noisy web data to create a more effective pre-training dataset.
 
 This self-supervision process is called **bootstrapping**, and the mechanism is **CapFilt** (Captioning and Filtering).
 
@@ -38,129 +36,222 @@ This self-supervision process is called **bootstrapping**, and the mechanism is 
 
 ### **2. Model Architecture: A Trifecta of Functionality**
 
-BLIP's power comes from a flexible architecture that can be reconfigured for different tasks.
+Of course. Let^\primes break down the BLIP model architecture in detail, referencing the components shown in Figure 2 of the paper.
 
-#### a) Image Encoder
+The architecture is designed around a core principle: unifying vision-language understanding and generation within a single, flexible model. It achieves this through a **Multimodal Mixture of Encoder-Decoder (MED)**, which is not a static structure but a single model that can operate in three different ways depending on the task.
 
-This is a standard **Vision Transformer (ViT)**.
+The two main building blocks are:
 
-* **Input:** An image $I$.
-* **Process:** The image is split into a grid of fixed-size patches. Each patch is linearly projected into an embedding vector. A special `[CLS]` token embedding is prepended to the sequence of patch embeddings. Positional embeddings are added.
-* **Output:** A sequence of image embeddings $E_{img} = \{v_{cls}, v_1, v_2, ..., v_N\}$, where $v_i$ is the feature vector for the $i$-th patch.
+1.  **Image Encoder:** A Vision Transformer (ViT).
+2.  **Text Transformer:** A transformer that is adapted to form the MED.
 
-#### b) Multimodal Mixture of Encoder-Decoder (MED)
+Here’s a full breakdown of the components and how they work together.
 
-This is the core of BLIP. It's a single Transformer model but can act in three different ways by changing the self-attention masks. This avoids the need for three separate models.
+#### **1. Image Encoder**
 
-* **Unimodal Text Encoder:** Processes text only. It uses a **bi-directional self-attention mask**, where each token can attend to all other tokens in the sequence. This is identical to how BERT works and is used for understanding text in isolation.
+The image encoder^\primes job is to convert an image into a sequence of numerical representations (embeddings) that the rest of the model can understand.
 
-* **Image-Grounded Encoder (for Understanding):** This fuses visual and textual information.
-  * **Self-Attention:** Bi-directional. Text tokens can attend to each other freely.
-  * **Cross-Attention:** After the self-attention layer in each block, a cross-attention layer is inserted. Here, the text embeddings act as the queries, and the image embeddings ($E_{img}$) from the ViT act as the keys and values. This allows each text token to "look at" the image patches to ground its meaning.
-  * **Use Case:** Image-Text Matching ($\mathcal{L}_{itm}$).
+*   **Model Used:** BLIP uses a **Vision Transformer (ViT)**, which was pre-trained on ImageNet.
+*   **Process:**
+    1.  The input image is divided into a grid of fixed-size patches (e.g., 16x16 pixels).
+    2.  Each patch is flattened and linearly projected into an embedding.
+    3.  A special `[CLS]` token is added to the beginning of this sequence of patch embeddings. The final embedding corresponding to this `[CLS]` token is trained to represent the entire image as a single global feature.
+    4.  This sequence of embeddings (the `[CLS]` token embedding + all patch embeddings) is then processed by the standard Transformer blocks of the ViT.
 
-* **Image-Grounded Decoder (for Generation):** This generates text based on an image.
-  * **Self-Attention:** **Causal (or auto-regressive) mask.** Each token can only attend to itself and the tokens that came before it. This prevents it from "seeing the future" when generating text word-by-word.
-  * **Cross-Attention:** Same as the encoder; the text tokens being generated can cross-attend to the image embeddings.
-  * **Use Case:** Language Modeling ($\mathcal{L}_{lm}$) for captioning and VQA.
-    
+The output is a set of feature vectors: one global feature (`[CLS]`) and one feature for each image patch:  $E_{img} = \{v_{cls}, v_1, v_2, ..., v_N\}$, where $v_i$ is the feature vector for the $i$-th patch.
 
- Function                    Self-Attention Mask  Cross-Attention with Image  Primary Use Case    
- :-------------------------  :------------------  :-------------------------  :------------------ 
-| **Unimodal Encoder**       | Bi-directional      | No                         | Text tasks          |
-| **Image-Grounded Encoder** | Bi-directional      | Yes                        | Understanding (ITM) |
-| **Image-Grounded Decoder** | Causal              | Yes                        | Generation (LM)     |
+#### **2. Multimodal Mixture of Encoder-Decoder (MED)**
 
----
+This is the core innovation of BLIP. It^\primes a single text transformer model based on BERT that has been modified to operate in three distinct "functionalities" by sharing most of its parameters.
+
+##### **Functionality 1: Unimodal Text Encoder**
+
+*   **Purpose:** To encode text separately from the image.
+*   **Architecture:** This is essentially a standard **BERT** model. It takes a text input, adds a `[CLS]` token at the beginning, and processes it through its transformer layers to produce contextualized word embeddings.
+*   **How it^\primes Used:** This functionality is activated for the **Image-Text Contrastive (ITC) loss**. The model encodes the text and the ViT encodes the image independently. The resulting `[CLS]` embeddings for the image and text are then compared to see how well they align, pushing positive pairs closer in the feature space. This is shown on the left side of Figure 2.
+
+##### **Functionality 2: Image-Grounded Text Encoder**
+
+*   **Purpose:** To create a rich, joint representation of an image and a text for understanding tasks, like judging if a caption matches an image.
+*   **Architecture:** This mode modifies the text encoder by injecting visual information. In each of the transformer blocks, an extra **cross-attention layer** is inserted between the self-attention layer and the feed-forward network.
+    *   **Cross-Attention Mechanism:** In this layer, the text embeddings act as the *query*, while the image patch embeddings from the ViT act as the *key* and *value*. This forces the text representations to "attend to" and incorporate information from the visual features.
+*   **How it's Used:** This is activated for the **Image-Text Matching (ITM) loss** ($\mathcal{L}_{itm}$). The model is given an image-text pair and predicts whether it's a "match" or "mismatch". The final hidden state of a special `[Encode]` token is used to make this binary classification. 
+
+##### **Functionality 3: Image-Grounded Text Decoder**
+
+*   **Purpose:** To generate text based on an image, for tasks like image captioning.
+*   **Architecture:** This mode is similar to the Image-Grounded Text Encoder (it also uses cross-attention to see the image), but with one critical difference:
+    *   The standard bi-directional self-attention layers are replaced with **causal self-attention layers**. This is the defining feature of a decoder (like in GPT). Causal self-attention ensures that when predicting the next word, the model can only look at the words that came before it, not at future words. This is essential for autoregressive text generation.
+*   **How it's Used:** This is activated for the **Language Modeling (LM) loss** ($\mathcal{L}_{lm}$) . Given an image, the model is trained to predict the next word in the caption. A special `[Decode]` token signals the beginning of the text generation process.
+
+#### **Parameter Sharing: The Key to Efficiency and Flexibility**
+
+A crucial design choice in BLIP is the parameter sharing strategy within the MED.
+
+*   **What is shared?** The text embedding layer, the cross-attention layers, and the feed-forward networks are **all shared** across the text encoder and text decoder.
+*   **What is NOT shared?** The **self-attention layers** are unique to the encoder (bi-directional) and the decoder (causal).
+
+The authors argue that the fundamental difference between encoding and decoding lies in the self-attention mechanism, so these are kept separate. Sharing all other parameters makes the model highly efficient, reduces the total parameter count, and allows for effective multi-task learning, as the knowledge gained from one task (e.g., matching) can benefit another (e.g., captioning). Table 3 in the paper shows that this specific sharing strategy yields the best results.
+
+In summary, BLIP's architecture is a unified framework that uses a ViT for vision and a cleverly designed text transformer (MED) that can flexibly switch between three modes—a standalone text encoder, an image-grounded encoder, and an image-grounded decoder—by leveraging parameter sharing and specialized attention mechanisms. This allows it to be pre-trained on and excel at a wide range of both understanding and generation tasks.
+
+
+
+| Function               | self-attention Mask | Cross Attention with Image | Use Case            |
+| ---------------------- | ------------------- | -------------------------- | ------------------- |
+| Unimodal Encoder       | Bi-Directional      | No                         | Text Embedding      |
+| Image-Grounded Encoder | Bi-Directional      | Yes                        | Understanding (ITM) |
+| Image-Grounded Decoder | Causal              | Yes                        | Generation (LM)     |
+
+
 
 ### **3. Pre-training In-Depth: Objectives, Mathematics, and Data Flow**
 
-BLIP is trained with a joint loss function: 
+Of course. Let's dive deep into the training mechanics of BLIP, covering the loss functions, their mathematical basis, the hierarchy of training, and the specific inputs and outputs for each objective.
 
-$$
-L = \mathcal{L}_{itc} + \mathcal{L}_{itm} + \mathcal{L}_{lm}.
-$$
+### High-Level Training Objective
 
-#### a) Image-Text Contrastive Loss ($\mathcal{L}_{itc}$)
+The main goal of BLIP's pre-training is to create a single model that is proficient at three distinct but related vision-language tasks:
 
-* **Intuition:** To learn a shared embedding space where matching image-text pairs are close together and non-matching pairs are far apart. It's a high-level alignment task.
+1.  **Image-Text Retrieval:** Aligning images and texts in a shared feature space.
+2.  **Image-Text Matching:** Understanding the fine-grained relationship between a specific image and text.
+3.  **Image Captioning:** Generating relevant text for a given image.
 
-* **Model Components:** ViT and a unimodal Text Encoder.
+To achieve this, BLIP is trained in a multi-task learning framework where three loss functions, corresponding to these three objectives, are optimized jointly. For each image-text pair in a training batch, the model performs one forward pass through the heavy image encoder (ViT) and three forward passes through the different functionalities of the lighter text transformer (MED), calculating one loss for each.
 
-* **Input-Output:**
+---
 
-  * **Input:** A batch of $B$ images $\{I_1, ..., I_B\}$ and $B$ corresponding texts $\{T_1, ..., T_B\}$.
-  * **Process:**
-    1.  The image $I_i$ is passed through the ViT to get the `[CLS]` embedding, $v_{cls}(I_i)$. This is projected into a multimodal space by a linear layer to get $g_v(I_i)$.
-    2.  The text $T_j$ is passed through the Text Encoder to get its `[CLS]` embedding, which is similarly projected to get $g_w(T_j)$.
-    3.  Calculate the similarity (dot product) for all $B \times B$ possible pairs: $s(I_i, T_j) = g_v(I_i)^T g_w(T_j)$.
-  * **Output:** A $B \times B$ similarity matrix. The diagonal elements should be maximized.
+### The Three Pre-training Loss Functions
 
-* **Mathematics:**
-  The core is a softmax-normalized similarity score. The probability of text $T_j$ matching image $I_i$ is:
-  
-  $$
-  p^{i2t}_j(I_i) = \frac{\exp(s(I_i, T_j) / \tau)}{\sum_{k=1}^{B} \exp(s(I_i, T_k) / \tau)}
-  $$
-  
-  where $\tau$ is a learnable temperature parameter. A similar probability $p^{t2i}$ is calculated for text-to-image matching.
-  The loss is the cross-entropy between these predicted probabilities and the ground-truth labels (a one-hot vector $y$ where $y_j=1$ if $i=j$ and 0 otherwise).
+Here is a detailed breakdown of each loss function, including the math behind it.
 
-  $$
-  \mathcal{L}_{itc} = \frac{1}{2} \left( H(y^{i2t}, p^{i2t}) + H(y^{t2i}, p^{t2i}) \right)
-  $$
-  
-  **Momentum Encoder:** To stabilize training, the text features used as keys ($g_w(T_j)$) are from a momentum-updated version of the text encoder, a technique from MoCo.
+#### 1. Image-Text Contrastive (ITC) Loss
 
-#### b) Image-Text Matching Loss ($\mathcal{L}_{itm}$)
+* **Objective:** To learn a global alignment between image and text features. This loss encourages the embeddings of a matched image-text pair to be closer to each other in the feature space than the embeddings of mismatched pairs.
 
-* **Intuition:** A fine-grained classification task to determine if a given image-text pair is a true match (`positive`) or a non-match (`negative`).
+* **Model Functionality:** Unimodal Encoders (Image Encoder and Text Encoder).
 
-* **Model Component:** Image-Grounded Encoder.
+* **Input-Output Pairs:**
 
-* **Input-Output:**
+  *   **Input:** An image $I$ and a text $T$ from a matched pair.
+  *   **Model Output:** A normalized image embedding $v(I)$ and a normalized text embedding $t(T)$.
+  *   **Target:** A "soft" probability distribution created from a momentum encoder, which provides a more stable training signal.
 
-  * **Input:** An image $I$ and a text $T$.
-  * **Process:**
-    1.  The text is tokenized and fed into the Image-Grounded Encoder. A `[CLS]` token is prepended.
-    2.  The model performs self-attention on the text and cross-attention with the image patches from the ViT.
-    3.  The final output embedding of the `[CLS]` token is taken as a fused representation of the (image, text) pair.
-    4.  This `[CLS]` embedding is passed through a linear layer with a softmax to produce a probability distribution over two classes: {match, not match}.
-  * **Output:** A probability $p^{itm}$.
+* **The Math Explained:**
+  BLIP follows the approach from ALBEF, which uses a momentum encoder and soft-labels for more stable and effective training.
 
-* **Mathematics:**
-  The loss is a standard binary cross-entropy:
+  1. **Momentum Encoders:** There are two sets of encoders. The main encoders (ViT and text encoder) are updated via backpropagation. A second set, the *momentum encoders*, are not trained directly. Instead, their weights are an exponential moving average of the main encoders' weights. They provide more stable feature representations ($v^\prime$ and $t^\prime$).
 
-  $$
-  \mathcal{L}_{itm} = H(y^{itm}, p^{itm})
-  $$
+  2. **Similarity Score:** For a batch of N image-text pairs, the similarity between the *i*-th image and the *j*-th text is the dot product of their normalized embeddings: $s(I_i, T_j) = v(I_i)^T t(T_j)$.
 
-  where $y^{itm}$ is the ground truth label (1 for match, 0 for not match).
-  **Hard Negative Mining:** Instead of using random non-matching pairs (which are too easy), BLIP uses the ITC scores to find "hard negatives." For a given image, a hard negative text is one that the ITC model found most similar, even though it's incorrect. This forces the ITM head to learn more subtle differences.
+  3. **Soft Targets (q):** Instead of using a hard "one-hot" label (where only the true pair is a 1), BLIP creates soft target labels using the similarity scores from the more stable *momentum encoders*. The target probability distribution for the *i*-th image over all texts in the batch is:
 
-#### c) Language Modeling Loss ($\mathcal{L}_{lm}$)
+     $$
+     q^{i2t}(T_j) = \frac{\exp(s(I_i, T_j)^\prime / \tau)}{\sum_{k=1}^{N} \exp(s(I_i, T_k)^\prime / \tau)}
+     $$
+     
+     Here, $\tau$ is a learnable temperature parameter. $s^\prime$ denotes similarity calculated with momentum features.
 
-* **Intuition:** To teach the model how to generate text that is relevant to an image.
+  4. **Model Prediction (p):** The model's predicted probability distribution is calculated similarly, but using the primary encoders:
+          
+     $$
+     p^{i2t}(T_j) = \frac{\exp(s(I_i, T_j) / \tau)}{\sum_{k=1}^{N} \exp(s(I_i, T_k) / \tau)}
+     $$
 
-* **Model Component:** Image-Grounded Decoder.
+  5. **The Loss:** The ITC loss is the cross-entropy between the soft target $q$ and the model's prediction $p$. This is done for both image-to-text ($i2t$) and text-to-image ($t2i$) directions.
 
-* **Input-Output:**
+     $$
+     L_{ITC} = \frac{1}{2} \mathbb{E}_{(I,T)} [H(q^{i2t}, p^{i2t}) + H(q^{t2i}, p^{t2i})]
+     $$
 
-  * **Input:** An image $I$ and its corresponding caption $T$.
-  * **Process:**
-    1.  The model receives the image embeddings from the ViT for cross-attention.
-    2.  It receives the text $T$ with a causal attention mask. This means when predicting the $k$-th word, it can only see words $1, ..., k-1$.
-    3.  At each position, the model must predict the next token in the sequence, conditioned on both the previous tokens and the entire image.
-  * **Output:** A probability distribution over the entire vocabulary for the next token.
+#### 2. Image-Text Matching (ITM) Loss
 
-* **Mathematics:**
-  This is the standard auto-regressive language modeling loss, which is a cross-entropy loss. We want to maximize the log-likelihood of the text given the image.
-  
-  $$
-  \mathcal{L}_{lm} = \sum_{i=1}^{|T|} -\log P(T_i | T_{<i}, I)
-  $$
-  
-  where $P$ is the model's predicted probability for the token $T_i$.
+* **Objective:** To learn a fine-grained, multimodal representation that captures the detailed alignment between an image and a text. It's a binary classification task: does this text truly describe this image?
+
+* **Model Functionality:** Image-Grounded Text Encoder.
+
+* **Input-Output Pairs:**
+
+  *   **Input:** An image $I$ and a text $T$. This can be a positive (matched) or negative (mismatched) pair.
+  *   **Model Output:** A single probability score $p_{itm}$ indicating the likelihood that the pair is a match.
+  *   **Target:** A binary label $y_{itm}$ (1 for a match, 0 for a mismatch).
+
+* **The Math Explained:**
+
+  1. **Hard Negative Mining:** Creating effective negative pairs is crucial. Instead of using random negatives, BLIP employs hard negative mining. For a given image, it selects a text that the *ITC loss* found to be a false negative (i.e., a text from a different image that the model thought was a good match). This forces the ITM objective to learn the subtler differences that the ITC objective might miss.
+
+  2. **Model Prediction:** The image-grounded text encoder produces a multimodal embedding for the `[Encode]` token. This embedding is fed into a simple linear layer (the "ITM head") followed by a softmax to produce a probability for the "match" and "mismatch" classes.
+
+  3. **The Loss:** The ITM loss is the standard binary cross-entropy loss between the model's prediction $p_{itm}$ and the ground-truth label $y_{itm}$.
+     
+     $$
+     L_{ITM} = \mathbb{E}_{(I,T)} [H(y_{itm}, p_{itm})]
+     $$
+
+#### 3. Language Modeling (LM) Loss
+
+* **Objective:** To enable the model to generate coherent and contextually relevant text given an image.
+
+* **Model Functionality:** Image-Grounded Text Decoder.
+
+* **Input-Output Pairs:**
+
+  *   **Input:** An image $I$ and its corresponding caption $T$.
+  *   **Model Output:** A probability distribution over the vocabulary for the next token in the sequence.
+  *   **Target:** The actual next token in the caption $T$.
+
+* **The Math Explained:**
+
+  1. **Autoregressive Generation:** This objective trains the model to predict the next word in a sequence given the image and the preceding words. This is achieved by using a **causal self-attention mask** in the decoder, which prevents the model from "cheating" by looking at future tokens.
+
+  2. **The Loss:** The LM loss aims to maximize the likelihood of the text caption $T$ given the image $I$. It is a standard cross-entropy loss calculated for each token in the sequence.
+
+     $$
+     L_{LM} = \mathbb{E}_{(I,T)} [-\sum_{i=1}^{|T|} \log p(T_i | T_{<i}, I; \theta)]
+     $$
+     
+     where $T_i$ is the *i*-th token of the text, $T_{<i}$ are the preceding tokens, and $θ$ represents the model parameters. The paper also mentions using label smoothing with a rate of 0.1, a common regularization technique.
+
+---
+
+### Hierarchy and Overall Training Process
+
+The training process has two main stages:
+
+**Stage 1: Dataset Bootstrapping (CapFilt)**
+
+This is a preparatory stage to create a high-quality dataset. It is not part of the final model's training loop but is essential to its success.
+
+1.  **Fine-tune Captioner & Filter:** A pre-trained MED model is fine-tuned *twice* on the small, high-quality COCO dataset:
+    *   Once as a **Captioner** using the LM objective.
+    *   Once as a **Filter** using the ITC and ITM objectives.
+2.  **Generate & Clean Data:**
+    *   The fine-tuned **Captioner** is used to generate a new synthetic caption for every image in the large, noisy web dataset.
+    *   The fine-tuned **Filter** then examines both the original web caption and the new synthetic caption for each image. It discards any caption that it scores as a mismatch.
+3.  **Final Dataset:** The resulting bootstrapped dataset consists of the clean human-annotated pairs (from COCO, etc.) plus the filtered web image-text pairs.
+
+**Stage 2: Main Pre-training**
+
+A **new, randomly initialized BLIP model** is pre-trained from scratch on the bootstrapped dataset created in Stage 1.
+
+1. **Batch Processing:** For each image-text pair $(I, T)$ in a batch:
+
+   *   The image $I$ is passed through the ViT encoder once.
+   *   The text $T$ is passed through the MED three times, activating each of the three functionalities (unimodal encoder, image-grounded encoder, image-grounded decoder).
+
+2. **Loss Calculation:** The three losses ($L_ITC$, $L_{itm}$, and $L_LM$) are computed as described above.
+
+3. **Joint Optimization:** The total loss for the model is simply the sum of the three individual losses.
+
+   
+   $$
+   L_{Total} = L_{ITC} + L_{ITM} + L_{LM}
+   $$
+   
+
+4. **Backpropagation:** The gradients from this total loss are used to update the weights of the ViT and the MED model.
+
+This joint optimization trains all three capabilities of the model simultaneously, resulting in a single, powerful, and flexible vision-language model.
 
 ---
 
