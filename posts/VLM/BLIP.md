@@ -171,11 +171,11 @@ Now we can see how the pre-training objectives power the CapFilt mechanism.
 1.  **Train Initial Model:** Train a BLIP model on 14M noisy web images with the combined loss $$\mathcal{L} = \mathcal{L}_{itc} + \mathcal{L}_{itm} + \mathcal{L}_{lm}$$. This model is now the "Captioner" and "Filter".
 
 2.  **Generate Synthetic Captions (Captioner):**
-    * **For each image $I_{web}$ in the dataset:** Use the trained **Image-Grounded Decoder** ($\mathcal{L}_{lm}$) to generate a synthetic caption $T_{synth}$.
+    * **For each image $I_{web}$ in the dataset:** Use the trained **Image-Grounded Decoder** ($$\mathcal{L}_{lm}$$) to generate a synthetic caption $$T_{synth}$$.
     * This is a standard beam search decoding process.
 
 3.  **Filter Noisy Pairs (Filter):**
-    * **For each image** $I_{web}$: We now have two captions: the original $T_{web}$ and the synthetic $T_{synth}$.
+    * **For each image** $I_{web}$: We now have two captions: the original $$T_{web}$$ and the synthetic $$T_{synth}$$.
     * Use the trained **Image-Grounded Encoder** ($\mathcal{L}_{itm}$) to compute two matching scores:
       * $score_{web} = p^{itm}(I_{web}, T_{web})$
       * $score_{synth} = p^{itm}(I_{web}, T_{synth})$
@@ -205,7 +205,7 @@ The pre-trained BLIP model is a powerful foundation. To adapt it for specific ta
 * **Fine-Tuning:** The model is fine-tuned on a captioning dataset (e.g., NoCaps, COCO). The only loss function used is the **Language Modeling loss ($\mathcal{L}_{lm}$)**.
 * **Input:** Image $I$.
 * **Output:** A generated text sequence $T$.
-* **Mathematics:** The fine-tuning objective is identical to the pre-training $\mathcal{L}_{lm}$: maximize $P(T | I)$.
+* **Mathematics:** The fine-tuning objective is identical to the pre-training $$\mathcal{L}_{lm}$$: maximize $P(T | I)$.
 
 #### c) Visual Question Answering (VQA)
 
