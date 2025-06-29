@@ -239,7 +239,7 @@ A **new, randomly initialized BLIP model** is pre-trained from scratch on the bo
    *   The image $I$ is passed through the ViT encoder once.
    *   The text $T$ is passed through the MED three times, activating each of the three functionalities (unimodal encoder, image-grounded encoder, image-grounded decoder).
 
-2. **Loss Calculation:** The three losses ($\mathcal{L}_{ITC}$, $\mathcal{L}_{itm}$, and $\mathcal{L}_{LM}$) are computed as described above.
+2. **Loss Calculation:** The three losses ($$\mathcal{L}_{ITC}$$, $$\mathcal{L}_{itm}$$, and $$\mathcal{L}_{LM}$$) are computed as described above.
 
 3. **Joint Optimization:** The total loss for the model is simply the sum of the three individual losses.
 
