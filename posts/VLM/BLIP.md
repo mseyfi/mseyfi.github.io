@@ -34,7 +34,7 @@ This self-supervision process is called **bootstrapping**, and the mechanism is 
 
 ---
 
-![model structure](/imges/BLIP-MODEL.png)
+![model structure](/images/BLIP-MODEL.png)
 
 *Fig.1 Pre-training model architecture and objectives of BLIP (same parameters have the same color). We propose multimodal mixture
 of encoder-decoder, a unified vision-language model which can operate in one of the three functionalities: (1) Unimodal encoder is
