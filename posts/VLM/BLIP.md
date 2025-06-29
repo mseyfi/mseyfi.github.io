@@ -13,9 +13,9 @@ This tutorial breaks down the BLIP framework from the ground up. We will explore
 1.  **Core Intuition:** The "Why" Behind BLIP's Design
 2.  **Model Architecture:** Deconstructing the Vision Transformer and MED
 3.  **Pre-training In-Depth:** Objectives, Mathematics, and Data Flow
-    * Image-Text Contrastive Loss ($L_{itc}$)
-    * Image-Text Matching Loss ($L_{itm}$)
-    * Language Modeling Loss ($L_{lm}$)
+    * Image-Text Contrastive Loss ($\mathcal{L}_{itc}$)
+    * Image-Text Matching Loss ($\mathcal{L}_{itm}$)
+    * Language Modeling Loss ($\mathcal{L}_{lm}$)
 4.  **The Bootstrapping Engine (CapFilt):** A Technical Look
 5.  **Fine-Tuning on Downstream Tasks:** Adapting BLIP for Practical Use
 
@@ -57,12 +57,12 @@ This is the core of BLIP. It's a single Transformer model but can act in three d
 * **Image-Grounded Encoder (for Understanding):** This fuses visual and textual information.
   * **Self-Attention:** Bi-directional. Text tokens can attend to each other freely.
   * **Cross-Attention:** After the self-attention layer in each block, a cross-attention layer is inserted. Here, the text embeddings act as the queries, and the image embeddings ($E_{img}$) from the ViT act as the keys and values. This allows each text token to "look at" the image patches to ground its meaning.
-  * **Use Case:** Image-Text Matching ($L_{itm}$).
+  * **Use Case:** Image-Text Matching ($\mathcal{L}_{itm}$).
 
 * **Image-Grounded Decoder (for Generation):** This generates text based on an image.
   * **Self-Attention:** **Causal (or auto-regressive) mask.** Each token can only attend to itself and the tokens that came before it. This prevents it from "seeing the future" when generating text word-by-word.
   * **Cross-Attention:** Same as the encoder; the text tokens being generated can cross-attend to the image embeddings.
-  * **Use Case:** Language Modeling ($L_{lm}$) for captioning and VQA.
+  * **Use Case:** Language Modeling ($\mathcal{L}_{lm}$) for captioning and VQA.
 
 | Function                   | Self-Attention Mask | Cross-Attention with Image | Primary Use Case    |
 | :------------------------- | :------------------ | :------------------------- | :------------------ |
@@ -75,12 +75,12 @@ This is the core of BLIP. It's a single Transformer model but can act in three d
 ### **3. Pre-training In-Depth: Objectives, Mathematics, and Data Flow**
 
 BLIP is trained with a joint loss function: 
+
 $$
-L = L_{itc} + L_{itm} + L_{lm}.
+L = \mathcal{L}_{itc} + \mathcal{L}_{itm} + \mathcal{L}_{lm}.
 $$
 
-
-#### a) Image-Text Contrastive Loss ($L_{itc}$)
+#### a) Image-Text Contrastive Loss ($\mathcal{L}_{itc}$)
 
 * **Intuition:** To learn a shared embedding space where matching image-text pairs are close together and non-matching pairs are far apart. It's a high-level alignment task.
 
@@ -97,23 +97,21 @@ $$
 
 * **Mathematics:**
   The core is a softmax-normalized similarity score. The probability of text $T_j$ matching image $I_i$ is:
-
   
   $$
-  $$p^{i2t}_j(I_i) = \frac{\exp(s(I_i, T_j) / \tau)}{\sum_{k=1}^{B} \exp(s(I_i, T_k) / \tau)}
+  p^{i2t}_j(I_i) = \frac{\exp(s(I_i, T_j) / \tau)}{\sum_{k=1}^{B} \exp(s(I_i, T_k) / \tau)}
   $$
   
-
   where $\tau$ is a learnable temperature parameter. A similar probability $p^{t2i}$ is calculated for text-to-image matching.
   The loss is the cross-entropy between these predicted probabilities and the ground-truth labels (a one-hot vector $y$ where $y_j=1$ if $i=j$ and 0 otherwise).
+
   $$
-  L_{itc} = \frac{1}{2} \left( H(y^{i2t}, p^{i2t}) + H(y^{t2i}, p^{t2i}) \right)
+  \mathcal{L}_{itc} = \frac{1}{2} \left( H(y^{i2t}, p^{i2t}) + H(y^{t2i}, p^{t2i}) \right)
   $$
   
-
   **Momentum Encoder:** To stabilize training, the text features used as keys ($g_w(T_j)$) are from a momentum-updated version of the text encoder, a technique from MoCo.
 
-#### b) Image-Text Matching Loss ($L_{itm}$)
+#### b) Image-Text Matching Loss ($\mathcal{L}_{itm}$)
 
 * **Intuition:** A fine-grained classification task to determine if a given image-text pair is a true match (`positive`) or a non-match (`negative`).
 
@@ -132,14 +130,14 @@ $$
 * **Mathematics:**
   The loss is a standard binary cross-entropy:
 
-  
   $$
-  L_{itm} = H(y^{itm}, p^{itm})
+  \mathcal{L}_{itm} = H(y^{itm}, p^{itm})
   $$
+
   where $y^{itm}$ is the ground truth label (1 for match, 0 for not match).
   **Hard Negative Mining:** Instead of using random non-matching pairs (which are too easy), BLIP uses the ITC scores to find "hard negatives." For a given image, a hard negative text is one that the ITC model found most similar, even though it's incorrect. This forces the ITM head to learn more subtle differences.
 
-#### c) Language Modeling Loss ($L_{lm}$)
+#### c) Language Modeling Loss ($\mathcal{L}_{lm}$)
 
 * **Intuition:** To teach the model how to generate text that is relevant to an image.
 
@@ -156,13 +154,11 @@ $$
 
 * **Mathematics:**
   This is the standard auto-regressive language modeling loss, which is a cross-entropy loss. We want to maximize the log-likelihood of the text given the image.
-
   
   $$
-  L_{lm} = \sum_{i=1}^{|T|} -\log P(T_i | T_{<i}, I)
+  \mathcal{L}_{lm} = \sum_{i=1}^{|T|} -\log P(T_i | T_{<i}, I)
   $$
   
-
   where $P$ is the model's predicted probability for the token $T_i$.
 
 ---
@@ -171,15 +167,15 @@ $$
 
 Now we can see how the pre-training objectives power the CapFilt mechanism.
 
-1.  **Train Initial Model:** Train a BLIP model on 14M noisy web images with the combined loss $L = L_{itc} + L_{itm} + L_{lm}$. This model is now the "Captioner" and "Filter".
+1.  **Train Initial Model:** Train a BLIP model on 14M noisy web images with the combined loss $L = \mathcal{L}_{itc} + \mathcal{L}_{itm} + \mathcal{L}_{lm}$. This model is now the "Captioner" and "Filter".
 
 2.  **Generate Synthetic Captions (Captioner):**
-    * **For each image $I_{web}$ in the dataset:** Use the trained **Image-Grounded Decoder** ($L_{lm}$) to generate a synthetic caption $T_{synth}$.
+    * **For each image $I_{web}$ in the dataset:** Use the trained **Image-Grounded Decoder** ($\mathcal{L}_{lm}$) to generate a synthetic caption $T_{synth}$.
     * This is a standard beam search decoding process.
 
 3.  **Filter Noisy Pairs (Filter):**
     * **For each image $I_{web}$:** We now have two captions: the original $T_{web}$ and the synthetic $T_{synth}$.
-    * Use the trained **Image-Grounded Encoder** ($L_{itm}$) to compute two matching scores:
+    * Use the trained **Image-Grounded Encoder** ($\mathcal{L}_{itm}$) to compute two matching scores:
       * $score_{web} = p^{itm}(I_{web}, T_{web})$
       * $score_{synth} = p^{itm}(I_{web}, T_{synth})$
     * The model also has the high-level ITC scores available. The filtering logic uses a combination of these to decide which text to keep. Essentially, if the synthetic text is a much better match for the image than the noisy web text, the web text is discarded.
@@ -197,7 +193,7 @@ The pre-trained BLIP model is a powerful foundation. To adapt it for specific ta
 #### a) Image-Text Retrieval
 
 * **Task:** Given one image, find the most relevant texts from a large corpus (or vice-versa).
-* **Fine-Tuning:** The model is fine-tuned on the task dataset (e.g., COCO) using the **$L_{itc}$** and **$L_{itm}$** objectives. This further aligns the representations for the specific domain.
+* **Fine-Tuning:** The model is fine-tuned on the task dataset (e.g., COCO) using the **$\mathcal{L}_{itc}$** and **$\mathcal{L}_{itm}$** objectives. This further aligns the representations for the specific domain.
 * **Inference (Two-Step Process):**
   1.  **Candidate Selection:** For a given query (e.g., an image), quickly compute the ITC similarity scores against all items in the database (e.g., all texts). Retrieve the top-k candidates. This is very fast as it's just a dot product of pre-computed embeddings.
   2.  **Re-ranking:** For these top-k candidates, compute the much more accurate (but slower) ITM score using the Image-Grounded Encoder. The item with the highest ITM score is the final result.
@@ -205,10 +201,10 @@ The pre-trained BLIP model is a powerful foundation. To adapt it for specific ta
 #### b) Image Captioning
 
 * **Task:** Generate a descriptive sentence for an image.
-* **Fine-Tuning:** The model is fine-tuned on a captioning dataset (e.g., NoCaps, COCO). The only loss function used is the **Language Modeling loss ($L_{lm}$)**.
+* **Fine-Tuning:** The model is fine-tuned on a captioning dataset (e.g., NoCaps, COCO). The only loss function used is the **Language Modeling loss ($\mathcal{L}_{lm}$)**.
 * **Input:** Image $I$.
 * **Output:** A generated text sequence $T$.
-* **Mathematics:** The fine-tuning objective is identical to the pre-training $L_{lm}$: maximize $P(T | I)$.
+* **Mathematics:** The fine-tuning objective is identical to the pre-training $\mathcal{L}_{lm}$: maximize $P(T | I)$.
 
 #### c) Visual Question Answering (VQA)
 
@@ -216,5 +212,5 @@ The pre-trained BLIP model is a powerful foundation. To adapt it for specific ta
 * **Fine-Tuning:** VQA is ingeniously framed as a generation task.
   * **Input:** The model receives the Image $I$ and a formatted text prompt: `Question: [question text] Answer:`.
   * **Output:** The model is trained to generate the answer text sequence.
-  * **Loss Function:** The fine-tuning uses the **Language Modeling loss ($L_{lm}$)** to train the model to complete the prompt with the correct answer.
+  * **Loss Function:** The fine-tuning uses the **Language Modeling loss ($\mathcal{L}_{lm}$)** to train the model to complete the prompt with the correct answer.
 * This approach is powerful because it can generate open-ended, free-form answers instead of just picking from a pre-defined set of choices.
