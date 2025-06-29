@@ -28,7 +28,7 @@ The fundamental challenge BLIP addresses is the **noisy correspondence** in web-
 
 The result is a new, "bootstrapped" dataset that contains a mix of human-annotated pairs and cleaner, more reliable image-text pairs from the web. This higher-quality dataset is then used to pre-train a new BLIP model from scratch, leading to significant performance improvements on a variety of downstream tasks. The paper shows that this process is more effective than simply training for more epochs on the noisy data.
 
-In summary, BLIP^\primes innovation lies in its unified model architecture that can handle diverse tasks and its data-centric approach of cleaning and augmenting noisy web data to create a more effective pre-training dataset.
+In summary, BLIP's innovation lies in its unified model architecture that can handle diverse tasks and its data-centric approach of cleaning and augmenting noisy web data to create a more effective pre-training dataset.
 
 This self-supervision process is called **bootstrapping**, and the mechanism is **CapFilt** (Captioning and Filtering).
 
@@ -36,7 +36,7 @@ This self-supervision process is called **bootstrapping**, and the mechanism is 
 
 ### **2. Model Architecture: A Trifecta of Functionality**
 
-Of course. Let^\primes break down the BLIP model architecture in detail, referencing the components shown in Figure 2 of the paper.
+Of course. Let's break down the BLIP model architecture in detail, referencing the components shown in Figure 2 of the paper.
 
 The architecture is designed around a core principle: unifying vision-language understanding and generation within a single, flexible model. It achieves this through a **Multimodal Mixture of Encoder-Decoder (MED)**, which is not a static structure but a single model that can operate in three different ways depending on the task.
 
@@ -49,7 +49,7 @@ Here’s a full breakdown of the components and how they work together.
 
 #### **1. Image Encoder**
 
-The image encoder^\primes job is to convert an image into a sequence of numerical representations (embeddings) that the rest of the model can understand.
+The image encoder's job is to convert an image into a sequence of numerical representations (embeddings) that the rest of the model can understand.
 
 *   **Model Used:** BLIP uses a **Vision Transformer (ViT)**, which was pre-trained on ImageNet.
 *   **Process:**
@@ -62,13 +62,13 @@ The output is a set of feature vectors: one global feature (`[CLS]`) and one fea
 
 #### **2. Multimodal Mixture of Encoder-Decoder (MED)**
 
-This is the core innovation of BLIP. It^\primes a single text transformer model based on BERT that has been modified to operate in three distinct "functionalities" by sharing most of its parameters.
+This is the core innovation of BLIP. It's a single text transformer model based on BERT that has been modified to operate in three distinct "functionalities" by sharing most of its parameters.
 
 ##### **Functionality 1: Unimodal Text Encoder**
 
 *   **Purpose:** To encode text separately from the image.
 *   **Architecture:** This is essentially a standard **BERT** model. It takes a text input, adds a `[CLS]` token at the beginning, and processes it through its transformer layers to produce contextualized word embeddings.
-*   **How it^\primes Used:** This functionality is activated for the **Image-Text Contrastive (ITC) loss**. The model encodes the text and the ViT encodes the image independently. The resulting `[CLS]` embeddings for the image and text are then compared to see how well they align, pushing positive pairs closer in the feature space. This is shown on the left side of Figure 2.
+*   **How it's Used:** This functionality is activated for the **Image-Text Contrastive (ITC) loss**. The model encodes the text and the ViT encodes the image independently. The resulting `[CLS]` embeddings for the image and text are then compared to see how well they align, pushing positive pairs closer in the feature space. This is shown on the left side of Figure 2.
 
 ##### **Functionality 2: Image-Grounded Text Encoder**
 
