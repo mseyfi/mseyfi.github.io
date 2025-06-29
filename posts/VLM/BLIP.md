@@ -147,7 +147,7 @@ Here is a detailed breakdown of each loss function, including the math behind it
   3. **Soft Targets (q):** Instead of using a hard "one-hot" label (where only the true pair is a 1), BLIP creates soft target labels using the similarity scores from the more stable *momentum encoders*. The target probability distribution for the *i*-th image over all texts in the batch is:
 
      $$
-     q^{i2t}(T_j) = \frac{\exp(s(I_i, T_j)^\prime / \tau)}{\sum_{k=1}^{N} \exp(s(I_i, T_k)^\prime / \tau)}
+     q^{i2t}(T_j) = \frac{\exp(s^\prime(I_i, T_j) / \tau)}{\sum_{k=1}^{N} \exp(s^\prime(I_i, T_k) / \tau)}
      $$
 
      Here, $\tau$ is a learnable temperature parameter. $s^\prime$ denotes similarity calculated with momentum features.
@@ -158,7 +158,7 @@ Here is a detailed breakdown of each loss function, including the math behind it
      p^{i2t}(T_j) = \frac{\exp(s(I_i, T_j) / \tau)}{\sum_{k=1}^{N} \exp(s(I_i, T_k) / \tau)}
      $$
 
-  5. **The Loss:** The ITC loss is the cross-entropy between the soft target $q$ and the model's prediction $p$. This is done for both image-to-text ($i2t$) and text-to-image ($t2i$) directions.
+  5. **The Loss:** The ITC loss is the cross-entropy (H) between the soft target $q$ and the model's prediction $p$. This is done for both image-to-text ($i2t$) and text-to-image ($t2i$) directions.
 
      $$
      \mathcal{L}_{ITC} = \frac{1}{2} \mathbb{E}_{(I,T)} [H(q^{i2t}, p^{i2t}) + H(q^{t2i}, p^{t2i})]
