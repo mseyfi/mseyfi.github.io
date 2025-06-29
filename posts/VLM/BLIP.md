@@ -149,7 +149,7 @@ Here is a detailed breakdown of each loss function, including the math behind it
      $$
      q^{i2t}(T_j) = \frac{\exp(s(I_i, T_j)^\prime / \tau)}{\sum_{k=1}^{N} \exp(s(I_i, T_k)^\prime / \tau)}
      $$
-     
+
      Here, $\tau$ is a learnable temperature parameter. $s^\prime$ denotes similarity calculated with momentum features.
 
   4. **Model Prediction (p):** The model's predicted probability distribution is calculated similarly, but using the primary encoders:
@@ -161,7 +161,7 @@ Here is a detailed breakdown of each loss function, including the math behind it
   5. **The Loss:** The ITC loss is the cross-entropy between the soft target $q$ and the model's prediction $p$. This is done for both image-to-text ($i2t$) and text-to-image ($t2i$) directions.
 
      $$
-     L_{ITC} = \frac{1}{2} \mathbb{E}_{(I,T)} [H(q^{i2t}, p^{i2t}) + H(q^{t2i}, p^{t2i})]
+     \mathcal{L}_{ITC} = \frac{1}{2} \mathbb{E}_{(I,T)} [H(q^{i2t}, p^{i2t}) + H(q^{t2i}, p^{t2i})]
      $$
 
 #### 2. Image-Text Matching (ITM) Loss
@@ -183,9 +183,9 @@ Here is a detailed breakdown of each loss function, including the math behind it
   2. **Model Prediction:** The image-grounded text encoder produces a multimodal embedding for the `[Encode]` token. This embedding is fed into a simple linear layer (the "ITM head") followed by a softmax to produce a probability for the "match" and "mismatch" classes.
 
   3. **The Loss:** The ITM loss is the standard binary cross-entropy loss between the model's prediction $p_{itm}$ and the ground-truth label $y_{itm}$.
-     
+
      $$
-     L_{ITM} = \mathbb{E}_{(I,T)} [H(y_{itm}, p_{itm})]
+     \mathcal{L}_{ITM} = \mathbb{E}_{(I,T)} [H(y_{itm}, p_{itm})]
      $$
 
 #### 3. Language Modeling (LM) Loss
@@ -207,9 +207,9 @@ Here is a detailed breakdown of each loss function, including the math behind it
   2. **The Loss:** The LM loss aims to maximize the likelihood of the text caption $T$ given the image $I$. It is a standard cross-entropy loss calculated for each token in the sequence.
 
      $$
-     L_{LM} = \mathbb{E}_{(I,T)} [-\sum_{i=1}^{|T|} \log p(T_i | T_{<i}, I; \theta)]
+     \mathcal{L}_{LM} = \mathbb{E}_{(I,T)} [-\sum_{i=1}^{|T|} \log p(T_i | T_{<i}, I; \theta)]
      $$
-     
+
      where $T_i$ is the *i*-th token of the text, $T_{<i}$ are the preceding tokens, and $\theta$ represents the model parameters. The paper also mentions using label smoothing with a rate of 0.1, a common regularization technique.
 
 ---
@@ -239,15 +239,14 @@ A **new, randomly initialized BLIP model** is pre-trained from scratch on the bo
    *   The image $I$ is passed through the ViT encoder once.
    *   The text $T$ is passed through the MED three times, activating each of the three functionalities (unimodal encoder, image-grounded encoder, image-grounded decoder).
 
-2. **Loss Calculation:** The three losses ($L_ITC$, $L_{itm}$, and $L_LM$) are computed as described above.
+2. **Loss Calculation:** The three losses ($\mathcal{L}_{ITC}$, $\mathcal{L}_{itm}$, and $\mathcal{L}_{LM}$) are computed as described above.
 
 3. **Joint Optimization:** The total loss for the model is simply the sum of the three individual losses.
 
-   
+
    $$
-   L_{Total} = L_{ITC} + L_{ITM} + L_{LM}
+   \mathcal{L}_{Total} = \mathcal{L}_{ITC} + \mathcal{L}_{ITM} + \mathcal{L}_{LM}
    $$
-   
 
 4. **Backpropagation:** The gradients from this total loss are used to update the weights of the ViT and the MED model.
 
@@ -268,8 +267,8 @@ Now we can see how the pre-training objectives power the CapFilt mechanism.
 3.  **Filter Noisy Pairs (Filter):**
     * **For each image** $I_{web}$: We now have two captions: the original $$T_{web}$$ and the synthetic $$T_{synth}$$.
     * Use the trained **Image-Grounded Encoder** ($\mathcal{L}_{itm}$) to compute two matching scores:
-      * $score_{web} = p^{itm}(I_{web}, T_{web})$
-      * $score_{synth} = p^{itm}(I_{web}, T_{synth})$
+      * $\text{score}_{web} = p^{itm}(I_{web}, T_{web})$
+      * $\text{score}_{synth} = p^{itm}(I_{web}, T_{synth})$
     * The model also has the high-level ITC scores available. The filtering logic uses a combination of these to decide which text to keep. Essentially, if the synthetic text is a much better match for the image than the noisy web text, the web text is discarded.
 
 4.  **Create Final Dataset and Re-train:**
@@ -296,7 +295,7 @@ The pre-trained BLIP model is a powerful foundation. To adapt it for specific ta
 * **Fine-Tuning:** The model is fine-tuned on a captioning dataset (e.g., NoCaps, COCO). The only loss function used is the **Language Modeling loss ($\mathcal{L}_{lm}$)**.
 * **Input:** Image $I$.
 * **Output:** A generated text sequence $T$.
-* **Mathematics:** The fine-tuning objective is identical to the pre-training $$\mathcal{L}_{lm}$$: maximize $$P(T \left\|\right. I)$$.
+* **Mathematics:** The fine-tuning objective is identical to the pre-training $$\mathcal{L}_{lm}$$: maximize $$P(T \mid I)$$.
 
 #### c) Visual Question Answering (VQA)
 
