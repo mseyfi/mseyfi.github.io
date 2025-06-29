@@ -258,7 +258,7 @@ This joint optimization trains all three capabilities of the model simultaneousl
 
 Now we can see how the pre-training objectives power the CapFilt mechanism.
 
-1.  **Train Initial Model:** Train a BLIP model on 14M noisy web images with the combined loss $$\mathcal{L} = \mathcal{L}_{itc} + \mathcal{L}_{itm} + \mathcal{L}_{lm}$$. This model is now the "Captioner" and "Filter".
+1.  **Train Initial Model:** Train a BLIP model on 14M noisy web images with the combined loss $$\mathcal{L} = \mathcal{L}_{itc} + \mathcal{L}_{itm} + \mathcal{L}_{lm}$$. This model is now the "Captioner" and "Filter". Note that this dataset is noisy but the matching score is human-annotated. So if an image and caption do not match, the model knows.
 
 2.  **Generate Synthetic Captions (Captioner):**
     * **For each image $I_{web}$ in the dataset:** Use the trained **Image-Grounded Decoder** ($$\mathcal{L}_{lm}$$) to generate a synthetic caption $$T_{synth}$$.
