@@ -205,7 +205,7 @@ The pre-trained BLIP model is a powerful foundation. To adapt it for specific ta
 * **Fine-Tuning:** The model is fine-tuned on a captioning dataset (e.g., NoCaps, COCO). The only loss function used is the **Language Modeling loss ($\mathcal{L}_{lm}$)**.
 * **Input:** Image $I$.
 * **Output:** A generated text sequence $T$.
-* **Mathematics:** The fine-tuning objective is identical to the pre-training $$\mathcal{L}_{lm}$$: maximize $P(T | I)$.
+* **Mathematics:** The fine-tuning objective is identical to the pre-training $$\mathcal{L}_{lm}$$: maximize $$P(T \| I)$$.
 
 #### c) Visual Question Answering (VQA)
 
