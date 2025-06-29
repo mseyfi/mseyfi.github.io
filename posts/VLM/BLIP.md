@@ -63,6 +63,7 @@ This is the core of BLIP. It's a single Transformer model but can act in three d
   * **Self-Attention:** **Causal (or auto-regressive) mask.** Each token can only attend to itself and the tokens that came before it. This prevents it from "seeing the future" when generating text word-by-word.
   * **Cross-Attention:** Same as the encoder; the text tokens being generated can cross-attend to the image embeddings.
   * **Use Case:** Language Modeling ($\mathcal{L}_{lm}$) for captioning and VQA.
+    
 
 | Function                   | Self-Attention Mask | Cross-Attention with Image | Primary Use Case    |
 | :------------------------- | :------------------ | :------------------------- | :------------------ |
@@ -167,7 +168,7 @@ $$
 
 Now we can see how the pre-training objectives power the CapFilt mechanism.
 
-1.  **Train Initial Model:** Train a BLIP model on 14M noisy web images with the combined loss $L = \mathcal{L}_{itc} + \mathcal{L}_{itm} + \mathcal{L}_{lm}$. This model is now the "Captioner" and "Filter".
+1.  **Train Initial Model:** Train a BLIP model on 14M noisy web images with the combined loss $$\mathcal{L} = \mathcal{L}_{itc} + \mathcal{L}_{itm} + \mathcal{L}_{lm}$$. This model is now the "Captioner" and "Filter".
 
 2.  **Generate Synthetic Captions (Captioner):**
     * **For each image $I_{web}$ in the dataset:** Use the trained **Image-Grounded Decoder** ($\mathcal{L}_{lm}$) to generate a synthetic caption $T_{synth}$.
