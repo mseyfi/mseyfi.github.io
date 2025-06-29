@@ -4,7 +4,7 @@
 
 ## [![CV](https://img.shields.io/badge/VLMs-Selected_Topics_in_Vision_Language_Models-orange?style=for-the-badge&logo=github)](VLMs)
 
-### A Deep Dive into BLIP: The Full Tutorial on Bootstrapping Language-Image Pre-training
+## A Deep Dive into BLIP: The Full Tutorial on Bootstrapping Language-Image Pre-training
 
 The core idea behind BLIP, as presented in the paper,  is to address two major limitations in vision-language pre-training (VLP) models. First, existing models were often specialized, excelling at either understanding-based tasks (like image-text retrieval) or generation-based tasks (like image captioning), but not both. Second, these models were typically trained on massive datasets of image-text pairs scraped from the web, which are often noisy and contain irrelevant or inaccurate text descriptions for the corresponding images. The authors of BLIP argue that this "noisy web text is suboptimal for vision-language learning."
 
