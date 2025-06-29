@@ -340,6 +340,7 @@ The core idea is that BLIP's flexible **Multimodal Mixture of Encoder-Decoder (M
 
 
 ![BLIPt](/images/BLIP-MODEL-1.png)
+
 *Fig.3 Model architecture for the downstream tasks. Q: question; C: caption; QA: question-answer pair.*
 
 #### **3. Visual Question Answering (VQA)**
