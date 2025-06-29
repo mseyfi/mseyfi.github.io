@@ -174,7 +174,7 @@ Now we can see how the pre-training objectives power the CapFilt mechanism.
     * This is a standard beam search decoding process.
 
 3.  **Filter Noisy Pairs (Filter):**
-    * **For each image $I_{web}$:** We now have two captions: the original $T_{web}$ and the synthetic $T_{synth}$.
+    * **For each image** $I_{web}$: We now have two captions: the original $T_{web}$ and the synthetic $T_{synth}$.
     * Use the trained **Image-Grounded Encoder** ($\mathcal{L}_{itm}$) to compute two matching scores:
       * $score_{web} = p^{itm}(I_{web}, T_{web})$
       * $score_{synth} = p^{itm}(I_{web}, T_{synth})$
