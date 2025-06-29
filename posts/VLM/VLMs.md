@@ -35,13 +35,13 @@ This is a foundational task in vision-language understanding. The goal is to cre
 
 This is a classic generative task where the model's goal is to produce a concise, human-like textual description of an input image.
 
-#### **BLIP**
-
-  * **What it does:** The predecessor to BLIP-2, BLIP is a unified model that can be used for both understanding (retrieval) and generation (captioning).
-  * **How it works:** It introduced a novel method called **CapFilt** (Captioning and Filtering). BLIP first generates synthetic captions for web images and then uses a filter to remove noisy or inaccurate ones. This cleaned dataset is then used to train the final model, improving the quality of its learned representations.
-  * **Key Contribution:** Developed a powerful data bootstrapping technique to improve learning from noisy web data.
-  * **Reference Paper:** Li, J., Li, D., Xiong, C., & Hoi, S. (2022). *BLIP: Bootstrapping Language-Image Pre-training for Unified Vision-Language Understanding and Generation*. [arXiv:2201.12086](https://arxiv.org/abs/2201.12086)
-
+## [![BLIP](https://img.shields.io/badge/BLIP-Bootstrapping_Language--Image_Pre--training_for_Unified_Vision--Language_Understanding_and_Generation-blue?style=for-the-badge&logo=github)](BLIP)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+  <b>What it does:</b> The predecessor to BLIP-2, BLIP is a unified model that can be used for both understanding (retrieval) and generation (captioning).<p></p>
+  <b>How it works:</b> It introduced a novel method called **CapFilt** (Captioning and Filtering). BLIP first generates synthetic captions for web images and then uses a filter to remove noisy or inaccurate ones. This cleaned dataset is then used to train the final model, improving the quality of its learned representations.<p></p>
+  <b>Key Contribution:</b> Developed a powerful data bootstrapping technique to improve learning from noisy web data.<p></p>
+  <b>Reference Paper:</b> Li, J., Li, D., Xiong, C., & Hoi, S. (2022). BLIP: Bootstrapping Language-Image Pre-training for Unified Vision-Language Understanding and Generation. [arXiv:2201.12086](https://arxiv.org/abs/2201.12086)
+</div>
 #### **GIT (Generative Image-to-Text Transformer)**
 
   * **What it does:** A simple, powerful Transformer-based model designed purely for generative vision-language tasks like captioning and VQA.
