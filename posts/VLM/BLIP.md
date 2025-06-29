@@ -157,7 +157,7 @@ $$
   This is the standard auto-regressive language modeling loss, which is a cross-entropy loss. We want to maximize the log-likelihood of the text given the image.
   
   $$
-  \mathcal{L}_{lm} = \sum_{i=1}^{|T|} -\log P(T_i \| T_{<i}, I)
+  \mathcal{L}_{lm} = \sum_{i=1}^{|T|} -\log P(T_i | T_{<i}, I)
   $$
   
   where $P$ is the model's predicted probability for the token $T_i$.
@@ -205,7 +205,7 @@ The pre-trained BLIP model is a powerful foundation. To adapt it for specific ta
 * **Fine-Tuning:** The model is fine-tuned on a captioning dataset (e.g., NoCaps, COCO). The only loss function used is the **Language Modeling loss ($\mathcal{L}_{lm}$)**.
 * **Input:** Image $I$.
 * **Output:** A generated text sequence $T$.
-* **Mathematics:** The fine-tuning objective is identical to the pre-training $$\mathcal{L}_{lm}$$: maximize $$P(T \| I)$$.
+* **Mathematics:** The fine-tuning objective is identical to the pre-training $$\mathcal{L}_{lm}$$: maximize $$P(T | I)$$.
 
 #### c) Visual Question Answering (VQA)
 
