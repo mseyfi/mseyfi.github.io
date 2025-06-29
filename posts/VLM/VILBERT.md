@@ -483,7 +483,8 @@ This is different because the goal is to score *regions*, not the whole image.
 
 1.  Pass the new image and text description through the fine-tuned model.
 2.  Calculate the matching score for every proposed region.
-3.  The final output is the bounding box of the region that received the highest score.
+3.  We can simply take the maximum score on the output.
+4.  The final output is the bounding box of the region that received the highest score. The bounding box is retrieved from the output of the initial Region Proposal Network( we created positional embeddings from).
 
 ![task2](/images/VILBERT-TASK2.png)
 
