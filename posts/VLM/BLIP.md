@@ -65,8 +65,8 @@ This is the core of BLIP. It's a single Transformer model but can act in three d
   * **Use Case:** Language Modeling ($\mathcal{L}_{lm}$) for captioning and VQA.
     
 
-| Function                   | Self-Attention Mask | Cross-Attention with Image | Primary Use Case    |
-| :------------------------- | :------------------ | :------------------------- | :------------------ |
+ Function                    Self-Attention Mask  Cross-Attention with Image  Primary Use Case    
+ :-------------------------  :------------------  :-------------------------  :------------------ 
 | **Unimodal Encoder**       | Bi-directional      | No                         | Text tasks          |
 | **Image-Grounded Encoder** | Bi-directional      | Yes                        | Understanding (ITM) |
 | **Image-Grounded Decoder** | Causal              | Yes                        | Generation (LM)     |
@@ -157,7 +157,7 @@ $$
   This is the standard auto-regressive language modeling loss, which is a cross-entropy loss. We want to maximize the log-likelihood of the text given the image.
   
   $$
-  \mathcal{L}_{lm} = \sum_{i=1}^{|T|} -\log P(T_i | T_{<i}, I)
+  \mathcal{L}_{lm} = \sum_{i=1}^{|T|} -\log P(T_i \| T_{<i}, I)
   $$
   
   where $P$ is the model's predicted probability for the token $T_i$.
