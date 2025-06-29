@@ -210,7 +210,7 @@ Here is a detailed breakdown of each loss function, including the math behind it
      L_{LM} = \mathbb{E}_{(I,T)} [-\sum_{i=1}^{|T|} \log p(T_i | T_{<i}, I; \theta)]
      $$
      
-     where $T_i$ is the *i*-th token of the text, $T_{<i}$ are the preceding tokens, and $θ$ represents the model parameters. The paper also mentions using label smoothing with a rate of 0.1, a common regularization technique.
+     where $T_i$ is the *i*-th token of the text, $T_{<i}$ are the preceding tokens, and $\theta$ represents the model parameters. The paper also mentions using label smoothing with a rate of 0.1, a common regularization technique.
 
 ---
 
