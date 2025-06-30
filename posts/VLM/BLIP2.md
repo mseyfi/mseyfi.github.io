@@ -67,12 +67,12 @@ Let's define the inputs and their dimensions, following the paper's examples.
     *   $D_\text{img}$ = Dimension of image features (e.g., 1024)
 
 *   **Learnable Queries ($Q_\text{learn}$):** A set of trainable embeddings that are part of the Q-Former's parameters.
-    *   $$Q_\text{learn} \in \mathbb{R}^{N_q \times D_q}$$
+    *   $Q_\text{learn} \in \mathbb{R}^{N_q \times D_q}$
     *   $N_q$ = Number of queries (e.g., 32)
     *   $D_q$ = Hidden dimension of the Q-Former (e.g., 768, for BERT-base)
 
 *   **Input Text Embeddings ($T$):** The standard token embeddings of the input text.
-    *   $$T \in \mathbb{R}^{B \times N_t \times D_q}$$
+    *   $T \in \mathbb{R}^{B \times N_t \times D_q}$
     *   $N_t$ = Number of text tokens
     *   $D_q$ = Hidden dimension (must match queries, e.g., 768)
 
