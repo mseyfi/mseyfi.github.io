@@ -1,10 +1,12 @@
 ## [![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](/)
+
 ## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](/main_page/CV)
+
 ## [![CV](https://img.shields.io/badge/VLMs-Selected_Topics_in_Vision_Language_Models-orange?style=for-the-badge&logo=github)](VLMs)
 
 ## BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models
 
-### The Intuition: Why We Need BLIP-2
+### **The Intuition: Why We Need BLIP-2**
 
 The world of AI in the early 2020s was marked by a significant trend: the meteoric rise of **Large Language Models (LLMs)** like GPT-3, PaLM, and LLaMA. These models, trained on vast text corpora, demonstrated astonishing capabilities in understanding, reasoning, and generating human-like text. Concurrently, vision-language (VL) models like the original BLIP, while powerful, faced a critical challenge: **prohibitive training costs**.
 
@@ -23,7 +25,7 @@ BLIP-2 proposes to act as a "smart translator" or "bridge" between a powerful, o
 
 This "bridging" component is the heart of BLIP-2: the **Querying Transformer (Q-Former)**.
 
-### The BLIP-2 Model Structure: A Symphony of Three Components
+### **The BLIP-2 Model Structure: A Symphony of Three Components**
 
 The BLIP-2 architecture is a masterclass in modularity, composed of three main parts:
 
@@ -50,7 +52,7 @@ It is not a Siamese network with two parallel streams. Instead, think of it as a
 
 Because they are processed as one long sequence in the self-attention layers, they can interact. The degree and direction of this interaction are precisely controlled by the attention masks.
 
-### Mathematical and Algorithmic Explanation
+### **Mathematical and Algorithmic Explanation**
 
 Let's define the inputs and their dimensions, following the paper's examples.
 
@@ -78,7 +80,7 @@ Let's define the inputs and their dimensions, following the paper's examples.
 optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
 text. (Right) The self-attention masking strategy for each objective to control query-text interaction.*
 
-#### Inside a Q-Former Block
+#### **Inside a Q-Former Block**
 
 A Q-Former block consists of a **Self-Attention** layer, a **Cross-Attention** layer (which is only applied to the queries), and a **Feed-Forward Network (FFN)**. Let $H_q$ and $H_t$ be the query and text representations entering the block.
 
@@ -116,17 +118,17 @@ The text representations bypass this step entirely. This is crucial: **only the 
 
 The final step in a block is a standard FFN applied to all representations. The output of cross-attention for queries and the output of self-attention for text are passed through the FFN.
 
-### Tokens and Embeddings: The Building Blocks
+### **Tokens and Embeddings: The Building Blocks**
 
   * **Image Tokens:** The frozen ViT takes an image, divides it into a grid of patches (e.g., 14x14 pixels), and linearly projects each patch into a vector. These vectors are the image tokens. Positional embeddings are added to retain spatial information.
   * **Text Tokens:** Text is processed using a standard LLM tokenizer (like BPE or WordPiece) into a sequence of sub-word tokens. These are then converted into text embeddings.
   * **Learnable Query Embeddings:** These are the key to the Q-Former. They are a set of $N$ vectors (e.g., $N=32$), each with a dimension $d$ (e.g., $d=768$). They are initialized randomly and are learned during the pre-training process. They are not input-dependent; they are model parameters. Their purpose is to act as a summary or a set of "experts" that learn to extract specific types of visual information (e.g., one query might learn to focus on objects, another on colors, another on textures).
 
-### The Two-Stage Pre-training Strategy
+### **The Two-Stage Pre-training Strategy**
 
 BLIP-2's training is elegantly divided into two stages to first teach the Q-Former how to "see" and then how to "talk" to the LLM.
 
-#### Stage 1: Vision-Language Representation Learning
+#### **Stage 1: Vision-Language Representation Learning**
 
 **Goal:** Train the Q-Former to extract visual representations that are aligned with text. In this stage, the **frozen LLM is not used**. We only use the frozen Image Encoder and the Q-Former.
 
@@ -193,7 +195,7 @@ $$
 
 After Stage 1, the Q-Former has learned to convert an image into a small set of "soft instruction" vectors that encapsulate the visual content.
 
-#### Stage 2: Vision-to-Language Generative Learning
+#### **Stage 2: Vision-to-Language Generative Learning**
 
 **Goal:** Connect the trained Q-Former to the frozen LLM, teaching the LLM to understand the Q-Former's output.
 
