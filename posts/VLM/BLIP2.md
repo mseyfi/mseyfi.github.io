@@ -50,12 +50,6 @@ It is not a Siamese network with two parallel streams. Instead, think of it as a
 
 Because they are processed as one long sequence in the self-attention layers, they can interact. The degree and direction of this interaction are precisely controlled by the attention masks.
 
-![im2](/images/BLIP2-Fig2.png)
-
-*Fig.2 (Left) Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
-optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
-text. (Right) The self-attention masking strategy for each objective to control query-text interaction.*
-
 ### Mathematical and Algorithmic Explanation
 
 Let's define the inputs and their dimensions, following the paper's examples.
@@ -77,6 +71,12 @@ Let's define the inputs and their dimensions, following the paper's examples.
     *   $D_q$ = Hidden dimension (must match queries, e.g., 768)
 
 ---
+
+![im2](/images/BLIP2-Fig2.png)
+
+*Fig.2 (Left) Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
+optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
+text. (Right) The self-attention masking strategy for each objective to control query-text interaction.*
 
 #### Inside a Q-Former Block
 
