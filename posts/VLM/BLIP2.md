@@ -74,11 +74,11 @@ Let's define the inputs and their dimensions, following the paper's examples.
 
 ---
 
-![im2](/images/BLIP2-Fig2.png)
+![im2](/images/BLIP2-Fig21.png)
 
-*Fig.2 (Left) Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
+*Fig.2 (Top) Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
 optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
-text. (Right) The self-attention masking strategy for each objective to control query-text interaction.*
+text. (Bottom) The self-attention masking strategy for each objective to control query-text interaction.*
 
 #### **Inside a Q-Former Block**
 
