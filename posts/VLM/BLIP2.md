@@ -65,13 +65,13 @@ The BLIP-2 architecture is a masterclass in modularity, composed of three main p
 
 3.  **The Querying Transformer (Q-Former):** This is the lightweight, trainable module that connects the two frozen giants. The Q-Former is a cleverly designed transformer model tasked with a single, critical job: to extract visual features from the frozen image encoder that are most relevant to the text. It acts as an information bottleneck, distilling the rich, high-dimensional visual information into a few concise feature vectors that the LLM can understand.
 
-Let's look closer at the Q-Former. It contains two main sub-modules that share the same self-attention layers:
+    Let's look closer at the Q-Former. It contains two main sub-modules that share the same self-attention layers:
 
-  * **Learnable Query Embeddings:** The Q-Former introduces a fixed number (e.g., 32) of learnable embedding vectors. These queries are persistent and are not tied to any specific input. Think of them as a set of "questions" the model learns to ask about the image.
-  * **Image Transformer:** This module interacts with the frozen image encoder. Its learnable queries interact with the image patch embeddings via **cross-attention** to extract visual features.
-  * **Text Transformer:** This is a standard BERT-style text encoder-decoder. It can function as both a text encoder (understanding) and a text decoder (generation).
+    - **Learnable Query Embeddings:** The Q-Former introduces a fixed number (e.g., 32) of learnable embedding vectors. These queries are persistent and are not tied to any specific input. Think of them as a set of "questions" the model learns to ask about the image.
+    - **Image Transformer:** This module interacts with the frozen image encoder. Its learnable queries interact with the image patch embeddings via **cross-attention** to extract visual features.
+    - **Text Transformer:** This is a standard BERT-style text encoder-decoder. It can function as both a text encoder (understanding) and a text decoder (generation).
 
-The brilliance of the Q-Former lies in its attention mechanisms. The learnable queries can attend to the image patches (via cross-attention), they can attend to each other (via self-attention), and they can attend to input text (via the same cross-attention layers). This allows them to become a flexible representation of the visual scene, conditioned by text when available.
+    The brilliance of the Q-Former lies in its attention mechanisms. The learnable queries can attend to the image patches (via cross-attention), they can attend to each other (via self-attention), and they can attend to input text (via the same cross-attention layers). This allows them to become a flexible representation of the visual scene, conditioned by text when available.
 
 ### Tokens and Embeddings: The Building Blocks
 
