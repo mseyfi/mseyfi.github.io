@@ -61,7 +61,7 @@ text. (Right) The self-attention masking strategy for each objective to control 
 Let's define the inputs and their dimensions, following the paper's examples.
 
 *   **Frozen Image Features ($I$):** The output of the frozen image encoder (e.g., ViT-L/14).
-    *   $$I \in \mathbb{R}^{B \times N_p \times D_\text{img}}$$
+    *   $I \in \mathbb{R}^{B \times N_p \times D_\text{img}}$
     *   $B$ = Batch size
     *   $N_p$ = Number of image patches (e.g., 257)
     *   $D_\text{img}$ = Dimension of image features (e.g., 1024)
