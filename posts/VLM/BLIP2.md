@@ -25,7 +25,7 @@ lightweight Querying Transformer following a two-stage strategy to bridge the mo
 
 
 
-![im2](/images/BLIP2-Fig2-a.png)
+![im2](/images/BLIP2-Fig2.png)
 
 *Fig.2 (Left) Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
 optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
