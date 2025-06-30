@@ -61,18 +61,18 @@ text. (Right) The self-attention masking strategy for each objective to control 
 Let's define the inputs and their dimensions, following the paper's examples.
 
 *   **Frozen Image Features ($I$):** The output of the frozen image encoder (e.g., ViT-L/14).
-    *   $I \in $\mathbb{R}$^{B \times N_p \times D_\text{img}}$
+    *   $I \in $\!R$^{B \times N_p \times D_\text{img}}$
     *   $B$ = Batch size
     *   $N_p$ = Number of image patches (e.g., 257)
     *   $D_\text{img}$ = Dimension of image features (e.g., 1024)
 
 *   **Learnable Queries ($Q_\text{learn}$):** A set of trainable embeddings that are part of the Q-Former's parameters.
-    *   $Q_\text{learn} \in \mathbb{R}^{N_q \times D_q}
+    *   $Q_\text{learn} \in \!R^{N_q \times D_q}
     *   $N_q$ = Number of queries (e.g., 32)
     *   $D_q$ = Hidden dimension of the Q-Former (e.g., 768, for BERT-base)
 
 *   **Input Text Embeddings ($T$):** The standard token embeddings of the input text.
-    *   $T \in \mathbb{R}^{B \times N_t \times D_q}
+    *   $T \in \!R^{B \times N_t \times D_q}
     *   $N_t$ = Number of text tokens
     *   $D_q$ = Hidden dimension (must match queries, e.g., 768)
 
@@ -87,7 +87,7 @@ A Q-Former block consists of a **Self-Attention** layer, a **Cross-Attention** l
 The queries and text are concatenated into a single sequence.
 
 $$
-X = \text{concat}(H_q, H_t) \text{where} X \in \mathbb{R}^{B \times (N_q + N_t) \times D_q}
+X = \text{concat}(H_q, H_t) \text{where} X \in \!R^{B \times (N_q + N_t) \times D_q}
 $$
 
 This combined sequence is fed into a standard multi-head self-attention layer. The key is the **attention mask (SMS)**, which controls which tokens can attend to which other tokens.
