@@ -74,7 +74,7 @@ Let's define the inputs and their dimensions, following the paper's examples.
 
 ---
 
-![im2](/images/BLIP2-Fig2-1.png)
+![im2](/images/BLIP2-Fig2-1.png){style="display: block; margin: 0 auto" }
 
 *Fig.2 (Top) Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
 optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
