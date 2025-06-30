@@ -93,7 +93,7 @@ $$
 This combined sequence is fed into a standard multi-head self-attention layer. The key is the **attention mask (SMS)**, which controls which tokens can attend to which other tokens.
 
 $$
-\text{SelfAttn}_text{output} = \text{MultiHeadSelfAttention}(Q=X, K=X, V=X, \text{Mask}=M)
+\text{SelfAttn}_\text{output} = \text{MultiHeadSelfAttention}(Q=X, K=X, V=X, \text{Mask}=M)
 $$
 
 The mask $M$ changes depending on the pre-training objective (as seen in Figure 2):
