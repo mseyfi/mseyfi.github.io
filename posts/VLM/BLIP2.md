@@ -12,48 +12,16 @@ The standard paradigm for VL models was end-to-end pre-training of the entire ar
 
 This is the problem BLIP-2 was designed to solve. The core intuition is both simple and profound:
 
-**Instead of building a massive, monolithic vision-language model from scratch, can we leverage the power of existing, pre-trained, *frozen* models and teach them to work together?**
-
-BLIP-2 proposes to act as a "smart translator" or "bridge" between a powerful, off-the-shelf **frozen image encoder** and a powerful, off-the-shelf **frozen LLM**. The key insight is that the most expensive components (the vision backbone and the LLM) already contain immense knowledge. The challenge is not to re-learn this knowledge, but to bridge the "modality gap" between them. By training only a small, lightweight bridging module, BLIP-2 drastically reduces the number of trainable parameters and the overall pre-training cost, making state-of-the-art vision-language modeling more accessible and efficient.
-
-This "bridging" component is the heart of BLIP-2: the **Querying Transformer (Q-Former)**.
-
 ![im1](/images/BLIP2-Fig1.png)
 
 *Fig.1  Overview of BLIP-2’s framework. We pre-train a
 lightweight Querying Transformer following a two-stage strategy to bridge the modality gap. The first stage bootstraps visionlanguage representation learning from a frozen image encoder. The second stage bootstraps vision-to-language generative learning from a frozen LLM, which enables zero-shot instructed image-totext generation (see Figure 4 for more examples).*
 
+**Instead of building a massive, monolithic vision-language model from scratch, can we leverage the power of existing, pre-trained, *frozen* models and teach them to work together?**
 
+BLIP-2 proposes to act as a "smart translator" or "bridge" between a powerful, off-the-shelf **frozen image encoder** and a powerful, off-the-shelf **frozen LLM**. The key insight is that the most expensive components (the vision backbone and the LLM) already contain immense knowledge. The challenge is not to re-learn this knowledge, but to bridge the "modality gap" between them. By training only a small, lightweight bridging module, BLIP-2 drastically reduces the number of trainable parameters and the overall pre-training cost, making state-of-the-art vision-language modeling more accessible and efficient.
 
-![im2](/images/BLIP2-Fig2.png)
-
-*Fig.2 (Left) Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
-optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
-text. (Right) The self-attention masking strategy for each objective to control query-text interaction.*
-
-
-
-![im3](/images/BLIP2-Fig3.png)
-
-*Fig.3 BLIP-2’s second-stage vision-to-language generative pre-training, which bootstraps from frozen large language models (LLMs).
-(Top) Bootstrapping a decoder-based LLM (e.g. OPT). (Bottom) Bootstrapping an encoder-decoder-based LLM (e.g. FlanT5). The
-fully-connected layer adapts from the output dimension of the Q-Former to the input dimension of the chosen LLM.*
-
-
-
-![im4](/images/BLIP2-Fig4.png)
-
-*Fig.4 Selected examples of instructed zero-shot image-to-text generation using a BLIP-2 model w/ ViT-g and FlanT5XXL, where it
-shows a wide range of capabilities including visual conversation, visual knowledge reasoning, visual commonsense reasoning, storytelling,
-personalized image-to-text generation, etc.*
-
-
-
-![im5](/images/BLIP2-Fig5.png)
-
-*Fig.5 Model architecture for VQA finetuning, where the LLM receives Q-Former’s output and the question as input, then predicts answers. We also provide the question as a condition to Q-Former, such that the extracted image features are more relevant to the question.*
-
-
+This "bridging" component is the heart of BLIP-2: the **Querying Transformer (Q-Former)**.
 
 ### The BLIP-2 Model Structure: A Symphony of Three Components
 
@@ -73,10 +41,6 @@ The BLIP-2 architecture is a masterclass in modularity, composed of three main p
 
    The brilliance of the Q-Former lies in its attention mechanisms. The learnable queries can attend to the image patches (via cross-attention), they can attend to each other (via self-attention), and they can attend to input text (via the same cross-attention layers). This allows them to become a flexible representation of the visual scene, conditioned by text when available.
 
-
-
-Excellent question. This gets to the heart of the Q-Former's design. You are right to question this, as the phrasing "two transformer submodules that share the same self-attention layers" can be confusing.
-
 Let's clarify: **The Q-Former is a single, unified transformer.**
 
 It is not a Siamese network with two parallel streams. Instead, think of it as a single transformer that processes a *concatenated sequence* of two different types of tokens: the learnable **queries** and the input **text tokens**. The "submodule" concept refers to the different operations that are applied to these two types of tokens as they pass through the single transformer architecture.
@@ -85,6 +49,12 @@ It is not a Siamese network with two parallel streams. Instead, think of it as a
 *   The **"text transformer" submodule** refers to the operations involving the text tokens.
 
 Because they are processed as one long sequence in the self-attention layers, they can interact. The degree and direction of this interaction are precisely controlled by the attention masks.
+
+![im2](/images/BLIP2-Fig2.png)
+
+*Fig.2 (Left) Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
+optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
+text. (Right) The self-attention masking strategy for each objective to control query-text interaction.*
 
 ### Mathematical and Algorithmic Explanation
 
@@ -244,6 +214,28 @@ $$
 $$
 
 -----
+
+
+![im3](/images/BLIP2-Fig3.png)
+
+*Fig.3 BLIP-2’s second-stage vision-to-language generative pre-training, which bootstraps from frozen large language models (LLMs).
+(Top) Bootstrapping a decoder-based LLM (e.g. OPT). (Bottom) Bootstrapping an encoder-decoder-based LLM (e.g. FlanT5). The
+fully-connected layer adapts from the output dimension of the Q-Former to the input dimension of the chosen LLM.*
+
+
+
+![im4](/images/BLIP2-Fig4.png)
+
+*Fig.4 Selected examples of instructed zero-shot image-to-text generation using a BLIP-2 model w/ ViT-g and FlanT5XXL, where it
+shows a wide range of capabilities including visual conversation, visual knowledge reasoning, visual commonsense reasoning, storytelling,
+personalized image-to-text generation, etc.*
+
+
+
+![im5](/images/BLIP2-Fig5.png)
+
+*Fig.5 Model architecture for VQA finetuning, where the LLM receives Q-Former’s output and the question as input, then predicts answers. We also provide the question as a condition to Q-Former, such that the extracted image features are more relevant to the question.*
+
 
 ### Pseudo-Code for Training
 
