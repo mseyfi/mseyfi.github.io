@@ -93,8 +93,9 @@ $$
 This combined sequence is fed into a standard multi-head self-attention layer. The key is the **attention mask (SMS)**, which controls which tokens can attend to which other tokens.
 
 $$
-\text{SelfAttn}_text{output} = MultiHeadSelfAttention(Q=X, K=X, V=X, Mask=M)
+\text{SelfAttn}_text{output} = \text{MultiHeadSelfAttention}(Q=X, K=X, V=X, \text{Mask}=M)
 $$
+
 The mask $M$ changes depending on the pre-training objective (as seen in Figure 2):
 
 *   **For ITM (bi-directional):** $M$ allows all tokens to attend to all other tokens.
@@ -106,7 +107,7 @@ The mask $M$ changes depending on the pre-training objective (as seen in Figure 
 This step **only applies to the query representations**. The output from the self-attention layer is split back into query and text representations. Let's call the query part $\text{SelfAttn}_q$.
 
 $$
-\text{CrossAttn}_q = \text{MultiHeadCrossAttention}(\text{Query=SelfAttn}_q, \text{Key}=I, \text{Value}=I)
+\text{CrossAttn}_q = \text{MultiHeadCrossAttention}(Q=\text{SelfAttn}_q, K=I, V=I)
 $$
 
 The text representations bypass this step entirely. This is crucial: **only the queries "see" the image.** They act as a bottleneck, summarizing the visual information. The paper notes this happens in every other transformer block.
