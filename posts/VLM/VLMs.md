@@ -24,12 +24,13 @@ This is a foundational task in vision-language understanding. The goal is to cre
   * **Key Contribution:** Proved the effectiveness and scalability of the contrastive learning approach on web-scale, noisy datasets, reinforcing the principles behind CLIP.
   * **Reference Paper:** Jia, C., Yang, Y., Xia, Y., et al. (2021). *Scaling Up Visual and Vision-Language Representation Learning With Noisy Text Supervision*. [arXiv:2102.05918](https://arxiv.org/abs/2102.05918)
 
-#### **BLIP-2 (Bootstrapping Language-Image Pre-training 2)**
-
-  * **What it does:** A highly efficient VLM that achieves state-of-the-art performance by intelligently connecting pre-trained, frozen models.
-  * **How it works:** BLIP-2 introduces a lightweight module called the **Q-Former (Querying Transformer)**. The Q-Former acts as a bridge between a frozen, pre-trained vision encoder and a frozen, pre-trained LLM. It extracts a fixed number of visual features from the vision encoder and feeds them in a way the LLM can understand, avoiding the need to fine-tune the massive underlying models.
-  * **Key Contribution:** Showcased a resource-efficient method for building powerful VLMs, paving the way for models like LLaVA.
-  * **Reference Paper:** Li, J., Li, D., Savarese, S., & Hoi, S. (2023). *BLIP-2: Bootstrapping Language-Image Pre-training with a Frozen Image Encoder and a Frozen Large Language Model*. [arXiv:2301.12597](https://arxiv.org/abs/2301.12597)
+## [![BLIP2](https://img.shields.io/badge/BLIP2-Bootstrapping_Language--Image_Pre--training_with_Frozen_Image_Encoders_&_LLMs-blue?style=for-the-badge&logo=github)](BLIP2)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+  <b>What it does:</b> A highly efficient VLM that achieves state-of-the-art performance by intelligently connecting pre-trained, frozen models.<p></p>
+  <b>How it works:</b> BLIP-2 introduces a lightweight module called the <b>Q-Former (Querying Transformer)</b>. The Q-Former acts as a bridge between a frozen, pre-trained vision encoder and a frozen, pre-trained LLM. It extracts a fixed number of visual features from the vision encoder and feeds them in a way the LLM can understand, avoiding the need to fine-tune the massive underlying models.<p></p>
+  <b>Key Contribution:</b> Showcased a resource-efficient method for building powerful VLMs, paving the way for models like LLaVA.<p></p>
+  <b>Reference Paper:</b> Li, J., Li, D., Savarese, S., & Hoi, S. (2023). BLIP-2: Bootstrapping Language-Image Pre-training with a Frozen Image Encoder and a Frozen Large Language Model. [arXiv:2301.12597](https://arxiv.org/abs/2301.12597)
+</div>
 
 ### Category 2: Image Captioning
 
