@@ -57,30 +57,36 @@ This stage uses three interconnected loss functions, computed simultaneously, to
 **1. Image-Text Contrastive Loss ($$\mathcal{L}_{itc}$$):**
 
   * **Intuition:** To make the model understand which images and texts belong together on a high level. It aligns the visual and text representations in a shared embedding space.
+
   * **Process:**
+
     1.  The image passes through the frozen ViT to get patch embeddings.
     2.  The Q-Former's learnable queries interact with the image patches via cross-attention. The output embedding of one of the queries (which is now visually-grounded) is chosen as the visual representation, $$q_{img}$$.
     3.  The text passes through the Q-Former's text encoder to get a text representation, $$t_{text}$$.
     4.  Similarity scores are calculated between $$q_{img}$$ and $$t_{text}$$ for all pairs in a batch. The model is trained to maximize the similarity for matched pairs and minimize it for mismatched pairs.
+
   * **Mathematics:** For a batch of N pairs, the similarity is $$s(I_i, T_j) = q_{img}(I_i)^T \\cdot t_{text}(T_j)$$. The loss is a standard contrastive cross-entropy loss over these similarities, computed for both image-to-text and text-to-image directions.
 
-    $$
-    p^{i2t}_j = \frac{\exp(s(I_i, T_j))}{\sum_{k=1}^{N} \exp(s(I_i, T_k))}
-    $$
+$$
+p^{i2t}_j = \frac{\exp(s(I_i, T_j))}{\sum_{k=1}^{N} \exp(s(I_i, T_k))}
+$$
 
 and
 
-    $$
-    \mathcal{L}_{itc} = - \frac{1}{2N} \sum_{i=1}^{N} (\log p^{i2t}_i + \log p^{t2i}_i)
-    $$
+$$
+\mathcal{L}_{itc} = - \frac{1}{2N} \sum_{i=1}^{N} (\log p^{i2t}_i + \log p^{t2i}_i)
+$$
 
 **2. Image-Text Matching Loss ($$\mathcal{L}_{itm}$$):**
 
   * **Intuition:** To teach the model a fine-grained understanding of whether a specific text accurately describes an image. This is a binary classification task.
+
   * **Process:**
+
     1.  The output of the visually-grounded queries (which have "seen" the image) are fed as input to the Q-Former's text transformer, along with the text embeddings.
     2.  A special `[CLS]` token is used, and its final output embedding serves as a fused representation of the image and text.
     3.  A linear classifier on top of this `[CLS]` embedding predicts a logit for `match` vs. `not-match`.
+
   * **Mathematics:** This is a standard binary cross-entropy loss. Hard negatives (pairs that are semantically similar but incorrect, found using the ITC loss) are used to make the task more challenging.
 
     $$
@@ -92,10 +98,13 @@ and
 **3. Image-grounded Text Generation Loss ($$\mathcal{L}_{itg}$$):**
 
   * **Intuition:** This is the most crucial loss. It forces the learnable queries to extract *all* the visual information necessary to completely reconstruct the accompanying text.
+
   * **Process:**
+
     1.  The learnable queries interact with the frozen image encoder's outputs.
     2.  These visually-grounded queries are then fed into the Q-Former's text decoder.
     3.  The text decoder must then generate the original caption, conditioned *only* on the information provided by the queries. A causal self-attention mask is used for the text tokens.
+
   * **Mathematics:** This is a standard auto-regressive language modeling loss (cross-entropy). The model predicts the next token in the caption given the previous tokens and the visual information distilled into the queries.
 
     $$
@@ -193,19 +202,15 @@ Once pre-training is complete, BLIP-2 is a powerful zero-shot vision-language mo
 2.  These embeddings are prepended to your tokenized text prompt.
 3.  The combined sequence is fed to the frozen LLM, which generates the text completion.
 
-<!-- end list -->
-
   * **For Image Captioning:**
-
-      * Image: A picture of a dog playing fetch.
-      * Prompt: "a photo of"
-      * Generated Output: "... a golden retriever catching a frisbee in a park."
+    * Image: A picture of a dog playing fetch.
+    * Prompt: "a photo of"
+    * Generated Output: "... a golden retriever catching a frisbee in a park."
 
   * **For Visual Question Answering (VQA):**
-
-      * Image: Same picture.
-      * Prompt: "Question: What is the dog playing with? Answer:"
-      * Generated Output: "a frisbee."
+    * Image: Same picture.
+    * Prompt: "Question: What is the dog playing with? Answer:"
+    * Generated Output: "a frisbee."
 
 **Fine-Tuning:** The beauty of BLIP-2 is its parameter-efficient fine-tuning. For a downstream task like medical VQA, you don't need to update the ViT or the LLM. You simply continue the Stage 2 training process on your specific dataset, fine-tuning only the Q-Former to adapt its visual extraction capabilities to the nuances of your domain (e.g., learning to recognize X-ray features). This makes adapting BLIP-2 to new tasks incredibly efficient.
 
