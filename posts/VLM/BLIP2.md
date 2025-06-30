@@ -144,7 +144,7 @@ This stage uses three interconnected loss functions, computed simultaneously, to
 
     1.  The image passes through the frozen ViT to get patch embeddings.
     2.  The Q-Former's learnable queries interact with the image patches via cross-attention. The output embedding of one of the queries (which is now visually-grounded) is chosen as the visual representation, $$q_{img}$$.
-    3.  The text passes through the Q-Former's text encoder to get a text representation, $$t_{text}$$.
+    3.  The text `[cls]` token passes through the Q-Former's text encoder to get a text representation, $$t_{text}$$.
     4.  Similarity scores are calculated between $$q_{img}$$ and $$t_{text}$$ for all pairs in a batch. The model is trained to maximize the similarity for matched pairs and minimize it for mismatched pairs.
 
   * **Mathematics:** For a batch of $N$ pairs, the similarity is $$s(I_i, T_j) = q_{img}(I_i)^T \cdot t_{text}(T_j)$$. The loss is a standard contrastive cross-entropy loss over these similarities, computed for both image-to-text and text-to-image directions.
