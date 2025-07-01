@@ -403,7 +403,6 @@ Fine-tuning adapts the pre-trained model to excel at a single, specific task. In
   4. The LLM generates the answer.
 
      
-
      ![im5](/images/BLIP2-Fig5.png)
 
      *Fig.6 Model architecture for VQA finetuning, where the LLM receives Q-Former’s output and the question as input, then predicts answers. We also provide the question as a condition to Q-Former, such that the extracted image features are more relevant to the question.*
@@ -425,84 +424,6 @@ Fine-tuning adapts the pre-trained model to excel at a single, specific task. In
         *   For each of the top-k candidates, the model performs the more computationally intensive **ITM** task. This involves deeply fusing the query and candidate image representations to get a highly accurate match score.
         *   The image with the highest ITM score is returned as the final answer.
 
-
-### Pseudo-Code for Training
-
-```python
-# --- Setup ---
-frozen_image_encoder = load_frozen_vit()
-frozen_llm = load_frozen_llm()
-q_former = initialize_q_former() # This is trainable
-# Other components like linear layers, etc.
-
-# --- Stage 1: Representation Learning ---
-for image, text in dataloader:
-    image_embeds = frozen_image_encoder(image) # Shape: [B, N_patches, D_img]
-    
-    # Forward pass through Q-Former for all three losses
-    # query_output shape: [B, N_queries, D_qformer]
-    # text_output shape: [B, N_tokens, D_qformer]
-    query_output, text_output, itm_logit = q_former(image_embeds, text)
-
-    # Loss 1: ITC
-    loss_itc = calculate_contrastive_loss(query_output, text_output)
-    
-    # Loss 2: ITM
-    loss_{itm} = calculate_matching_loss(itm_logit, ground_truth_match_label)
-    
-    # Loss 3: ITG
-    # This involves using Q-Former's decoder part
-    loss_itg = calculate_generation_loss(query_output, text)
-
-    # Total loss for Stage 1
-    tota\mathcal{L}_loss = loss_itc + loss_{itm} + loss_itg
-    tota\mathcal{L}_loss.backward()
-    optimizer.step() # Updates only Q-Former parameters
-
-# --- Stage 2: Generative Learning ---
-# After Stage 1 is complete, we use the trained Q-Former
-for image, text in dataloader:
-    with torch.no_grad(): # Ensure image encoder is not updated
-        image_embeds = frozen_image_encoder(image)
-
-    # Get visual features from the trained Q-Former
-    query_output = q_former.extract_visua\mathcal{L}_features(image_embeds)
-    
-    # Prepare input for the frozen LLM
-    llm_input_embeds = prepare_llm_input(query_output, text)
-    
-    # The LLM is frozen, but we need its output for the loss
-    llm_output_logits = frozen_llm(inputs_embeds=llm_input_embeds)
-    
-    # Loss is calculated only on the text part of the prediction
-    loss_gen = calculate_llm_generation_loss(llm_output_logits, text)
-
-    # Gradients flow back to update Q-Former and projection layers
-    loss_gen.backward()
-    optimizer.step()
-```
-
-### Inference and Fine-Tuning
-
-Once pre-training is complete, BLIP-2 is a powerful zero-shot vision-language model.
-
-**Inference:** To use the model, you provide it with an image and a text prompt.
-
-1.  The image is processed by the frozen ViT and the trained Q-Former to produce the 32 query embeddings.
-2.  These embeddings are prepended to your tokenized text prompt.
-3.  The combined sequence is fed to the frozen LLM, which generates the text completion.
-
-  * **For Image Captioning:**
-    * Image: A picture of a dog playing fetch.
-    * Prompt: "a photo of"
-    * Generated Output: "... a golden retriever catching a frisbee in a park."
-
-  * **For Visual Question Answering (VQA):**
-    * Image: Same picture.
-    * Prompt: "Question: What is the dog playing with? Answer:"
-    * Generated Output: "a frisbee."
-
-**Fine-Tuning:** The beauty of BLIP-2 is its parameter-efficient fine-tuning. For a downstream task like medical VQA, you don't need to update the ViT or the LLM. You simply continue the Stage 2 training process on your specific dataset, fine-tuning only the Q-Former to adapt its visual extraction capabilities to the nuances of your domain (e.g., learning to recognize X-ray features). This makes adapting BLIP-2 to new tasks incredibly efficient.
 
 ### Reference
 
