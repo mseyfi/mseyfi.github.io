@@ -1,5 +1,7 @@
 ## [![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](/)
+
 ## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](/main_page/CV)
+
 ## [![CV](https://img.shields.io/badge/VLMs-Selected_Topics_in_Vision_Language_Models-orange?style=for-the-badge&logo=github)](VLMs)
 
 ## BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models
@@ -124,119 +126,128 @@ The final step in a block is a standard FFN applied to all representations. The 
 
 Of course. Let's break down Stage 1 of the Q-Former's training in full detail, covering each of the three jointly-optimized tasks with the specifics you requested.
 
-### Stage 1 Overview: Vision-Language Representation Learning
+### **Stage 1 Overview: Vision-Language Representation Learning**
 
 The central goal of this stage is to train the **Q-Former** so that its 32 learnable queries become expert extractors of language-relevant visual information from a **frozen image encoder**. All three tasks described below are trained **simultaneously** in a single forward pass, and their losses are summed up to update the Q-Former's weights.
 
 ---
 
-### 1. Image-Text Contrastive Learning (ITC)
+### **1. Image-Text Contrastive Learning (ITC)**
 
 #### Mechanics
+
 The goal of ITC is coarse-grained alignment. It teaches the model to recognize which images and texts belong together in a batch, pushing the representations of matching (positive) pairs closer while pushing non-matching (negative) pairs apart in a shared embedding space.
 
-#### Input-Output Pairs
-*   **Input:** A batch of $B$ image-text pairs $\left{(I_1, T_1), (I_2, T_2), ..., (I_B, T_B)\right}$.
-*   **Output:** A $B x B$ similarity matrix, where the diagonal represents positive pair similarities and off-diagonal elements represent negative pair similarities.
+#### **Input-Output Pairs**
 
-#### Attention Mechanism
+*   **Input:** A batch of $B$ image-text pairs $\left\{(I_1, T_1), (I_2, T_2), ..., (I_B, T_B)\right\}$.
+*   **Output:** A $B \times B$ similarity matrix, where the diagonal represents positive pair similarities and off-diagonal elements represent negative pair similarities.
+
+#### **Attention Mechanism**
+
 *   **Self-Attention:** A **unimodal self-attention mask** is used. This is critical. The 32 queries and the text tokens are processed in the same transformer, but this mask prevents them from attending to each other. Queries only attend to other queries, and text tokens only attend to other text tokens. This enforces the independent creation of a pure visual representation and a pure textual representation.
 *   **Cross-Attention:** Cross-attention happens **only for the 32 queries**, which attend to the output features from the frozen image encoder. This is how visual information is injected into the queries. The text tokens do not participate in this step.
 *   **Interacting Tokens:** Queries interact with image features. Text tokens interact with other text tokens. There is no direct query-text interaction.
 
-#### Loss Function (with Math)
+#### **Loss Function (with Math)**
+
 The loss is the InfoNCE (Noise-Contrastive Estimation) loss, calculated for both image-to-text and text-to-image directions.
 
-1.  **Representations:**
-    *   From the text transformer, we get the `[CLS]` token embedding, $t\in \mathbb{R}^{D_q}$.
-    *   From the image transformer, we get the 32 output query embeddings, $Z \in \mathbb{R}^{N_q \times D_q}$.
+1. **Representations:**
 
-2.  **Similarity Score $s(I, T)$:** The similarity between an image $I$ and text $T$ is defined as the maximum similarity between the text's `[CLS]` vector and any of the 32 query vectors.
-    $s(I, T) = \max_{q \in Z} (\text{sim}(q, t))$
-    where `sim` is the dot product.
+   *   From the text transformer, we get the `[CLS]` token embedding, $t\in \mathbb{R}^{D_q}$.
+   *   From the image transformer, we get the 32 output query embeddings, $Z \in \mathbb{R}^{N_q \times D_q}$.
 
-3.  **Image-to-Text Loss $L_i2t$:** For each image $I_i$, we want to maximize its similarity with the correct text $T_i$ over all other texts $T_j$ in the batch.
+2. **Similarity Score $s(I, T)$:** The similarity between an image $I$ and text $T$ is defined as the maximum similarity between the text's `[CLS]` vector and any of the 32 query vectors.
+   $s(I, T) = \max_{q \in Z} (\text{sim}(q, t))$
+   where `sim` is the dot product.
 
-    $$
-    L_{i2t} = - \frac{1}{B} \sum_{i=1}^{B} \log \frac{\exp(s(I_i, T_i) / \tau)}{\sum_{j=1}^{B} \exp(s(I_i, T_j) / \tau)}
-    $$
+3. **Image-to-Text Loss $\mathcal{L}_{i2t}$:** For each image $I_i$, we want to maximize its similarity with the correct text $T_i$ over all other texts $T_j$ in the batch.
 
-5.  **Text-to-Image Loss $L_t2i$:** Symmetrically, for each text $T_i$, we want to maximize its similarity with the correct image $I_i$.
+   $$
+   \mathcal{L}_{i2t} = - \frac{1}{B} \sum_{i=1}^{B} \log \frac{\exp(s(I_i, T_i) / \tau)}{\sum_{j=1}^{B} \exp(s(I_i, T_j) / \tau)}
+   $$
 
-    $$
-    L_{t2i} = - \frac{1}{B} \sum_{i=1}^{B} \log \frac{\exp(s(I_i, T_i) / \tau)}{\sum_{j=1}^{B} \exp(s(I_j, T_i) / \tau)}
-    $$
+4. **Text-to-Image Loss $\mathcal{L}_{t2i}$:** Symmetrically, for each text $T_i$, we want to maximize its similarity with the correct image $I_i$.
 
-    where $	au$ is a learnable temperature parameter.
+   $$
+   \mathcal{L}_{t2i} = - \frac{1}{B} \sum_{i=1}^{B} \log \frac{\exp(s(I_i, T_i) / \tau)}{\sum_{j=1}^{B} \exp(s(I_j, T_i) / \tau)}
+   $$
 
-6.  **Total ITC Loss:** $L_ITC = (L_i2t + L_t2i) / 2$
+   where $	au$ is a learnable temperature parameter.
 
-#### Hard Negative Mining
-**No.** For ITC, the negatives are simply all other non-matching ("in-batch") samples from the current training batch.
+5. **Total ITC Loss:** $\mathcal{L}_ITC = (\mathcal{L}_{i2t} + \mathcal{L}_{t2i}) / 2$
 
 ---
 
-### 2. Image-Text Matching (ITM)
+### **2. Image-Text Matching (ITM)**
 
-#### Mechanics
+#### **Mechanics**
+
 The goal of ITM is fine-grained alignment. It's a binary classification task where the model must determine if a given text *truly* and *accurately* describes an image. This forces the model to learn the subtle details connecting visual concepts and words.
 
-#### Input-Output Pairs
+#### **Input-Output Pairs**
+
 *   **Input:** An image $I$, a text $T$, and a ground-truth label $y \in {0, 1}$. $y=1$ for a positive pair, $y=0$ for a negative pair.
 *   **Output:** A single probability $p_{itm} \in [0, 1]$ indicating the likelihood of the pair being a match.
 
-#### Attention Mechanism
+#### **Attention Mechanism**
+
 *   **Self-Attention:** A **bi-directional self-attention mask** is used. This allows for a deep fusion of modalities. Every one of the 32 queries can attend to every text token, and every text token can attend to every query.
 *   **Cross-Attention:** Same as ITC: only the 32 queries cross-attend to the frozen image encoder's features to get infused with visual information.
 *   **Interacting Tokens:** Queries interact with image features *and* with all text tokens. Text tokens interact with other text tokens *and* with all queries.
 
-#### Loss Function (with Math)
+#### **Loss Function (with Math)**
+
 The loss is a standard Binary Cross-Entropy (BCE) loss.
 
-1.  **Prediction Score:** The 32 output query vectors $Z$, now containing fused multimodal information, are each passed through a linear classifier to produce a logit. These 32 logits are then **averaged** to get a single final logit $l_{itm}$. This is converted to a probability $p_{itm}$ via a sigmoid function: $p_{itm} = \sigma(l_{itm})$.
+1. **Prediction Score:** The 32 output query vectors $Z$, now containing fused multimodal information, are each passed through a linear classifier to produce a logit. These 32 logits are then **averaged** to get a single final logit $\mathcal{L}_{itm}$. This is converted to a probability $p_{itm}$ via a sigmoid function: $p_{itm} = \sigma(\mathcal{L}_{itm})$.
 
-2.  **BCE Loss $L_{itm}$:**
-    $$
-    L_{ITM} = - \frac{1}{B} \sum_{i=1}^{B} [y_i \log(p_{itm,i}) + (1 - y_i) \log(1 - p_{itm,i})]
-    $$
-    where $y_i$ is the label for the i-th pair.
+2. **BCE Loss $\mathcal{L}_{itm}$:**
+   $$
+   \mathcal{L}_{ITM} = - \frac{1}{B} \sum_{i=1}^{B} [y_i \log(p_{itm,i}) + (1 - y_i) \log(1 - p_{itm,i})]
+   $$
+   where $y_i$ is the label for the i-th pair.
 
-#### Hard Negative Mining
-**Yes, absolutely.** The paper explicitly states it uses the hard negative mining strategy from previous work. For each positive image-text pair, a "hard negative" text is selected from the batch. This is the text that the model *thinks* is most similar to the image, but is actually incorrect. This forces the model to learn the difficult, fine-grained distinctions.
+#### **Hard Negative Mining**
+
+The paper explicitly states it uses the hard negative mining strategy from previous work. For each positive image-text pair, a "hard negative" text is selected from the batch. This is the text that the model *thinks* is most similar to the image, but is actually incorrect. This forces the model to learn the difficult, fine-grained distinctions.
 
 ---
 
-### 3. Image-Grounded Text Generation (ITG)
+### **3. Image-Grounded Text Generation (ITG)**
 
-#### Mechanics
+#### **Mechanics**
+
 The goal of ITG is to ensure the visual representation learned by the queries is comprehensive enough to be generative. It frames the task as language modeling: predict the text caption, conditioned on the image. This forces the queries to extract all information necessary for description.
 
-#### Input-Output Pairs
+#### **Input-Output Pairs**
+
 *   **Input:** An image $I$ and its corresponding ground-truth text $T$.
 *   **Output:** A generated sequence of text that should match $T$.
 
-#### Attention Mechanism
+#### **Attention Mechanism**
+
 *   **Self-Attention:** A **multimodal causal self-attention mask** is used. This is designed for autoregressive generation.
     *   Text tokens can attend to **all 32 query tokens** to get the visual context.
     *   Text tokens can only attend to **previous text tokens and themselves**, preventing them from seeing the future words they need to predict.
 *   **Cross-Attention:** Same as before: only the queries cross-attend to the image features.
 *   **Interacting Tokens:** Text tokens interact with all queries and with preceding text tokens. Queries interact with image features and all other queries.
 
-#### Loss Function (with Math)
+#### **Loss Function (with Math)**
+
 The loss is a standard autoregressive language modeling loss, which is a Cross-Entropy loss summed over the sequence.
 
-1.  **Model Probability:** The model predicts the next token $T_k$ given the image $I$ (represented by the queries) and the previous ground-truth tokens $T_{<k}$. Let this be $P(T_k \mid I, T_{<k}; \theta)$.
+1. **Model Probability:** The model predicts the next token $T_k$ given the image $I$ (represented by the queries) and the previous ground-truth tokens $T_{<k}$. Let this be $P(T_k \mid I, T_{<k}; \theta)$.
 
-2.  **Cross-Entropy Loss $L_ITG$:**
+2. **Cross-Entropy Loss $\mathcal{L}_ITG$:**
+   $$
+   \mathcal{L}_{ITG} = - \frac{1}{B} \sum_{i=1}^{B} \sum_{k=1}^{N_t} \log P(T_{i,k} | I_i, T_{i,<k}; \theta)
+   $$
 
-    $$
-    L_{ITG} = - \frac{1}{B} \sum_{i=1}^{B} \sum_{k=1}^{N_t} \log P(T_{i,k} | I_i, T_{i,<k}; \theta)
-    $$
+   where $N_t$ is the length of the text sequence.
 
-    where $N_t$ is the length of the text sequence.
-
-#### Hard Negative Mining
-**No.** This is a generative task that always learns to produce the correct (positive) caption. There are no "negatives" in this context.
+   
 
 -----
 
@@ -291,8 +302,8 @@ for image, text in dataloader:
     loss_itg = calculate_generation_loss(query_output, text)
 
     # Total loss for Stage 1
-    total_loss = loss_itc + loss_{itm} + loss_itg
-    total_loss.backward()
+    tota\mathcal{L}_loss = loss_itc + loss_{itm} + loss_itg
+    tota\mathcal{L}_loss.backward()
     optimizer.step() # Updates only Q-Former parameters
 
 # --- Stage 2: Generative Learning ---
