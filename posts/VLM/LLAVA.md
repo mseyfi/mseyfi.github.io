@@ -2,7 +2,7 @@
 ## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](/main_page/CV)
 ## [![CV](https://img.shields.io/badge/VLMs-Selected_Topics_in_Vision_Language_Models-orange?style=for-the-badge&logo=github)](VLMs)
 
-## Introduction and Motivation: Why Visual Instruction Tuning?
+## **Introduction and Motivation: Why Visual Instruction Tuning?**
 
 For years, the fields of Natural Language Processing (NLP) and Computer Vision have largely advanced in parallel. On one hand, Large Language Models (LLMs) like GPT-4 have become incredibly proficient at understanding and following complex textual instructions, acting as general-purpose assistants for a wide range of language tasks. On the other hand, vision models have excelled at specific, predefined tasks such as image classification, object detection, or captioning. However, a critical piece has been missing: a unified model that can act as a **general-purpose assistant for both visual and language-based instructions**.
 
@@ -12,8 +12,7 @@ The primary challenge in building such a model was the lack of suitable data. Tr
 
 This is the core problem that the paper "Visual Instruction Tuning" brilliantly solves. The authors' central insight was to leverage the advanced reasoning capabilities of a language-only LLM (GPT-4) to *generate* a high-quality, large-scale dataset for multimodal instruction following. By feeding textual descriptions of images (like captions and object locations) into GPT-4, they prompted it to create diverse conversations, detailed descriptions, and complex reasoning questions about the visual scene. This generated data was then used to teach a multimodal model, LLaVA, how to follow visual instructions, paving the way for powerful, general-purpose vision-language assistants.
 
-### The LLaVA Model Architecture
-
+### **The LLaVA Model Architecture**
 The primary goal of the LLaVA architecture is to effectively combine the capabilities of a pre-trained vision model and a pre-trained language model. The design is simple yet powerful, connecting these two components with a single, lightweight, trainable bridge.
 
 The architecture consists of three main parts:
@@ -36,7 +35,7 @@ The complete data flow for an input image $X_v$ and a language instruction $X_q$
 
 This architecture is highly efficient because it leverages powerful pre-trained models and only requires training the small projection matrix $W$ and fine-tuning the LLM $f_\phi$.
 
-### GPT-Assisted Data Generation
+### **GPT-Assisted Data Generation**
 
 The most significant contribution of this work is the novel pipeline for generating multimodal instruction-following data. The authors used the text-only GPT-4 to create data involving visual content. To do this, they needed a way to represent an image textually. They used two types of information:
 
@@ -55,7 +54,7 @@ For a given image from the COCO dataset, these textual representations were fed 
 
 This process yielded a dataset of **158,000 unique language-image instruction-following samples**, covering a diverse range of interactions. This innovative approach effectively turned a powerful language model into a scalable and affordable data-generation engine for a multimodal task.
 
-### The Two-Stage Training Procedure
+### **The Two-Stage Training Procedure**
 
 LLaVA's training is strategically divided into two stages to ensure both modality alignment and instruction-following capability.
 
@@ -81,13 +80,14 @@ Once the modalities are aligned, the second stage teaches the model to follow co
 
 This end-to-end fine-tuning allows the LLM to learn how to use the aligned visual information to generate helpful and accurate responses to user instructions.
 
-### Mathematical Foundations
+### **Mathematical Foundations**
 
 Let's look at the mathematics behind the training process.
 
 **Input-Output Training Pairs**
 
 A training sample consists of an image $X_v$ and a multi-turn conversation. For the $t$-th turn of the conversation, the instruction is $X_{instruct}^t$ and the desired response is $X_a^t$. The instruction is structured as:
+
 $$
 X_{instruct}^t = \begin{cases}
 \text{Randomly chosen prompt like "Describe the image."} & \text{for } t=1 \\
@@ -102,6 +102,7 @@ The image $X_v$ and the full instruction sequence $X_{instruct}$ are given to th
 $$
 p(X_a | X_v, X_{instruct}) = \prod_{i=1}^{L} p_{\theta}(x_i | X_v, X_{instruct}, X_{a,<i})
 $$
+
 Here:
 
 *   $L$ is the length of the answer sequence.
