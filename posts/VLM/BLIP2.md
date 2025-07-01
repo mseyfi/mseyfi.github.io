@@ -225,8 +225,11 @@ The goal of ITG is to ensure the visual representation learned by the queries is
 
 #### **Input-Output Pairs**
 
-*   **Input:** An image $I$ and its corresponding ground-truth text $T$.
-*   **Output:** A generated sequence of text that should match $T$.
+**Input**: This is the sequence the model receives as context (along with the visual information $I$). It starts with the beginning-of-sequence token ([`DEC]`) and ends just before the final token.
+
+Input = `[DEC], a, black, cat, sits, on, a, red, sofa`
+**output**: This is the sequence the model must predict. It starts with the first actual word and ends with the end-of-sequence token ([SEP]).
+`Target = a, black, cat, sits, on, a, red, sofa, [SEP]`
 
 #### **Attention Mechanism**
 
@@ -243,6 +246,7 @@ The loss is a standard autoregressive language modeling loss, which is a Cross-E
 1. **Model Probability:** The model predicts the next token $T_k$ given the image $I$ (represented by the queries) and the previous ground-truth tokens $T_{<k}$. Let this be $P(T_k \mid I, T_{<k}; \theta)$.
 
 2. **Cross-Entropy Loss $\mathcal{L}_ITG$:**
+
    $$
    \mathcal{L}_{ITG} = - \frac{1}{B} \sum_{i=1}^{B} \sum_{k=1}^{N_t} \log P(T_{i,k} | I_i, T_{i,<k}; \theta)
    $$
