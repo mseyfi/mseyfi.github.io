@@ -204,9 +204,11 @@ The loss is a standard Binary Cross-Entropy (BCE) loss.
 1. **Prediction Score:** The 32 output query vectors $Z$, now containing fused multimodal information, are each passed through a linear classifier to produce a logit. These 32 logits are then **averaged** to get a single final logit $$\mathcal{L}_{itm}$$. This is converted to a probability $p_{itm}$ via a sigmoid function: $$p_{itm} = \sigma(\mathcal{L}_{itm})$$.
 
 2. **BCE Loss $\mathcal{L}_{itm}$:**
+
    $$
    \mathcal{L}_{ITM} = - \frac{1}{B} \sum_{i=1}^{B} [y_i \log(p_{itm,i}) + (1 - y_i) \log(1 - p_{itm,i})]
    $$
+   
    where $y_i$ is the label for the i-th pair.
 
 #### **Hard Negative Mining**
