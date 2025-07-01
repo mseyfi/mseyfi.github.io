@@ -74,7 +74,7 @@ Let's define the inputs and their dimensions, following the paper's examples.
 
 ---
 
-![im2](/images/BLIP2-Fig2-1.png){style="display: block; margin: 0 auto" }
+![im2](/images/BLIP2-Fig2-1.png)
 
 *Fig.2 Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
 optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
@@ -105,7 +105,7 @@ The mask $M$ changes depending on the pre-training objective (as seen in Figure 
 *   **For ITG (multimodal causal):** $M$ allows $H_q$ to attend to all $H_q$. It allows $H_t$ to attend to all $H_q$ but only to *previous* tokens within $H_t$.
 
 
-![im2-2](/images/BLIP2-Fig2-2.png){style="display: block; margin: 0 auto" }
+![im2-2](/images/BLIP2-Fig2-2.png)
 
 *Fig.3 The self-attention masking strategy for each objective to control query-text interaction.*
 
