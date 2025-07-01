@@ -317,6 +317,14 @@ There is only one task in this stage: **conditioned language modeling**. The mod
 
 By the end of Stage 2, the Q-Former has learned to effectively "talk" to the frozen LLM, translating images into soft prompts that the LLM can interpret to perform a wide range of instructed, zero-shot, vision-language tasks, as shown in the impressive examples in Figure 5 of the paper.
 
+
+The **goal** of this part is to teach the Q-Former to generate a general-purpose visual prompt that an LLM can understand. The task is simple image captioning (e.g., given an image, generate the text "a cat wearing sunglasses").
+
+**Q-Former Input: Image only.**
+
+**Why?** In this phase, the Q-Former doesn't need any text guidance. Its job is to learn how to summarize an entire image into a soft prompt that the LLM can then use to generate a generic caption. It's learning the general skill of `Image -> Language-aligned Representation`.
+
+
 ![im4](/images/BLIP2-Fig4.png)
 
 *Fig.5 Selected examples of instructed zero-shot image-to-text generation using a BLIP-2 model w/ ViT-g and FlanT5XXL, where it
