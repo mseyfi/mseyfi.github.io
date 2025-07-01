@@ -12,6 +12,10 @@ The primary challenge in building such a model was the lack of suitable data. Tr
 
 This is the core problem that the paper "Visual Instruction Tuning" brilliantly solves. The authors' central insight was to leverage the advanced reasoning capabilities of a language-only LLM (GPT-4) to *generate* a high-quality, large-scale dataset for multimodal instruction following. By feeding textual descriptions of images (like captions and object locations) into GPT-4, they prompted it to create diverse conversations, detailed descriptions, and complex reasoning questions about the visual scene. This generated data was then used to teach a multimodal model, LLaVA, how to follow visual instructions, paving the way for powerful, general-purpose vision-language assistants.
 
+![im1](/images/LLAVA-MODEL.png)
+
+*Fig. 1: LLAVA model Structure*
+
 ### **The LLaVA Model Architecture**
 
 The primary goal of the LLaVA architecture is to effectively combine the capabilities of a pre-trained vision model and a pre-trained language model. The design is simple yet powerful, connecting these two components with a single, lightweight, trainable bridge.
@@ -70,6 +74,11 @@ LLaVA uses two types of textual information to represent an image:
     *   **Value:** Bounding boxes tell GPT-4 exactly *where* objects are located. This allows it to answer questions about spatial relationships ("Is the backpack next to the car?"), counts ("How many people are there?"), and object attributes.
 
 By combining captions and bounding boxes, you create a comprehensive textual proxy for the image. The captions provide the narrative, and the bounding boxes provide the specific, grounded facts.
+
+![im2](/images/LLAVA-INSTRUCTIONS.png)
+*Fig.2 One example to illustrate the instruction-following data. The top block shows the contexts
+such as captions and boxes used to prompt GPT, and the bottom block shows the three types of
+responses. Note that the visual image is not used to prompt GPT, we only show it here as a reference.*
 
 #### **The Data Generation Pipeline in Detail**
 
@@ -152,6 +161,14 @@ X_{instruct}^t = \begin{cases}
 X_q^t,  &\text{The remaining turns}~ \text{for}~t > 1
 \end{cases}
 $$
+
+![im3](/images/LLAVA-TRAINING.png)
+
+*Fig. 3: The input sequence used to train the model. Only two conversation turns are illustrated here; in practice, the number of turns varies based on the instruction-following data. In our current
+implementation, we follow Vicuna to set the system message `X_system-message` and we set
+`<STOP> = ###`. The model is trained to predict the assistant answers and where to stop, and thus
+only green sequence/tokens are used to compute the loss in the auto-regressive model.*
+
 
 **Unified Input Sequence and Loss Function**
 
@@ -260,6 +277,13 @@ The visual instruction tuning on the generated dataset gives LLaVA several key c
     *   **Explaining Memes:** It can understand the cultural context and humor in a meme by combining the text and the image.
     *   **Optical Character Recognition (OCR):** It can often read and understand text within an image.
     *   **Code Generation:** Given a hand-drawn sketch of a website, it can generate the corresponding HTML/CSS code.
+
+
+![im4](/images/LLAVA-TASK.png)
+
+*Fig.4 Challenging examples from LLaVA-Bench (In-the-Wild), we provide extremely-detailed
+annotation for each image for an accurate evaluation. Some questions require the model to extract
+details from high resolution image and to have a broad knowledge coverage.*
 
 ---
 
