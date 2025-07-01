@@ -283,7 +283,7 @@ The core idea is to teach the Q-Former to produce visual representations that th
 
 2.  **Information Flow:**
     *   An image is passed through the frozen image encoder.
-    *   The Q-Former takes the image features and produces its 32 output query vectors (`Z`). These vectors are a compact, language-aligned summary of the image's content.
+    *   The Q-Former takes the image features and produces its 32 output query vectors ($Z$). These vectors are a compact, language-aligned summary of the image's content. The -Former at this stage does not receive any textual tokens, since it has already learn the correlation to the textual data in the first stage of training.
     *   These 32 vectors are passed through the trainable FC layer.
     *   The resulting vectors are then **prepended** to the input text embeddings. They now act as **soft visual prompts** that provide the visual context to the LLM.
 
