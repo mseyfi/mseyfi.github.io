@@ -342,7 +342,48 @@ This loop continues, with the model extending its own answer one token at a time
 **Step 5: Final Output**
 The sequence of generated tokens is decoded from their token IDs back into human-readable text, which is then presented to the user as the final answer.
 
-### Reference
+
+### **Limitations**
+The limitations can be grouped into several key areas:
+
+### **1. Vision-Related Limitations**
+
+These issues stem from the "eyes" of the model—the CLIP Vision Encoder—and how it processes images.
+
+*   **Difficulty with High Resolution and Fine Details:** The Vision Transformer (ViT) in CLIP processes images by breaking them down into a grid of fixed-size patches (e.g., 16x16 pixels). This means extremely small objects, fine print, or intricate details can be lost or averaged out within a patch. The paper explicitly points this out with its **"ramen" example**. The model can describe the ramen bowl but cannot read the name of the restaurant on the sign because the text is too fine-grained. Similarly, in the **"fridge" example**, it struggles to identify the specific brand of a yogurt container.
+
+*   **Imperfect Optical Character Recognition (OCR):** While LLaVA shows a surprising *emergent* ability to read text in images, it was never explicitly trained for OCR. Its performance is therefore unreliable. It can fail on stylized fonts, blurry text, or text at unusual angles. It is not a replacement for a dedicated OCR system.
+
+*   **Struggles with Precise Counting and Spatial Relationships:** Large language models are notoriously bad at precise counting, and LLaVA inherits this weakness. It might correctly identify that there are "several cars" in an image but fail if asked to count exactly "how many cars" there are, especially if the number is greater than 3 or 4. Similarly, while it can handle simple spatial queries ("Is the cat on the mat?"), its understanding of complex spatial arrangements can be brittle.
+
+### **2. Reasoning and Knowledge Limitations**
+
+These limitations are inherited from the "brain" of the model—the Vicuna LLM.
+
+*   **Visual Hallucination and Compositional Errors:** This is one of the most significant limitations. Just as LLMs can "hallucinate" facts in text, LLaVA can hallucinate objects or relationships in images. A classic example from the paper is the **strawberry yogurt** problem. The image contains strawberries and plain yogurt in separate containers. When asked if there is "strawberry-flavored yogurt," the model answers "yes." It correctly identifies the "strawberry" patches and the "yogurt" patches but incorrectly **composes** them into a single concept that doesn't exist in the image. This reveals a failure to grasp the holistic scene.
+
+*   **Lack of Domain-Specific Knowledge:** The model's knowledge is limited to the general information contained in Vicuna's pre-training data (mostly the web). It will not understand highly specialized content, such as:
+    *   **Medical Images:** It cannot interpret an X-ray or an MRI scan.
+    *   **Technical Schematics:** It would fail to understand a complex engineering diagram or an electrical circuit.
+    *   **Niche Cultural Context:** It might not understand a meme or symbol specific to a small community.
+
+*   **Brittleness in Logical Reasoning:** While capable of impressive reasoning, the model can still make simple logical errors or be easily misled by a cleverly phrased prompt. Its reasoning is probabilistic and associative, not formally logical.
+
+### **3. Architectural and Data-Induced Limitations**
+
+These are deeper issues related to how LLaVA is built and trained.
+
+*   **The "Bag of Patches" Problem:** This is related to the vision limitations but is more fundamental. Because the ViT first converts the image into a set of patch embeddings, the model can sometimes perceive the image as a "bag of features" rather than a coherent, structured scene. The self-attention mechanism works to overcome this, but it doesn't always succeed, leading to compositional errors like the strawberry yogurt example.
+
+*   **Simplicity of the Projection Layer:** LLaVA uses a simple linear projection matrix to connect the vision and language models. This is computationally efficient but may be a bottleneck for information flow. More advanced models that came after LLaVA (like Flamingo or BLIP-2) use more complex mechanisms like cross-attention or dedicated "Q-Former" modules to more intelligently query the visual features and extract the most relevant information for a given text prompt.
+
+*   **Limitations of the Generated Data:** The model is only as good as its training data.
+    *   **Source Bias:** The instruction data was generated using images from the COCO dataset, which mostly contains common, everyday objects and scenes. The model is therefore less capable when dealing with abstract art, scientific charts, or other out-of-distribution visual content.
+    *   **Quality Ceiling:** The quality of the instruction-following data is capped by the ability of GPT-4 to generate it from text-only descriptions. Any nuances lost in the text-to-image translation (e.g., subtle emotional expressions, complex textures) will not be present in the training data.
+
+In conclusion, LLaVA was a seminal work that demonstrated the viability and power of visual instruction tuning. Its limitations—in fine-grained perception, logical consistency, and its architectural simplicity—were not so much failures as they were crucial signposts that highlighted the key challenges for the field to solve next.
+
+### **Reference**
 
 The work described here was introduced in the following paper:
 
