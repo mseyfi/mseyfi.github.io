@@ -251,7 +251,7 @@ The loss is a standard autoregressive language modeling loss, which is a Cross-E
 1. **Model Probability:** The model predicts the next token $T_k$ given the image $I$ (represented by the queries) and the previous ground-truth tokens $T_{<k}$. Let this be $P(T_k \mid I, T_{<k}; \theta)$.
 
 2. **Cross-Entropy Loss $\mathcal{L}_{ITG}$:**
-   
+
    $$
    \mathcal{L}_{ITG} = - \frac{1}{B} \sum_{i=1}^{B} \sum_{k=1}^{N_t} \log P(T_{i,k} | I_i, T_{i,<k}; \theta)
    $$
@@ -306,7 +306,7 @@ There is only one task in this stage: **conditioned language modeling**. The mod
   $$
   \mathcal{L} = - \sum_{k=1}^{N_t} \log P(T_k | Z_{proj}, T_{<k}; \theta_{LLM})
   $$
-  
+
   where $Z_{proj}$ represents the projected query vectors (the soft visual prompt).
 
 #### **For Encoder-Decoder-Based LLMs (e.g., FlanT5)**
@@ -325,6 +325,32 @@ The **goal** of this part is to teach the Q-Former to generate a general-purpose
 **Why?** In this phase, the Q-Former doesn't need any text guidance. Its job is to learn how to summarize an entire image into a soft prompt that the LLM can then use to generate a generic caption. It's learning the general skill of `Image -> Language-aligned Representation`.
 
 
+
+### **Down-stream Tasks**
+
+Let's break down how the pre-trained BLIP-2 model is adapted for specific downstream tasks through fine-tuning, and how it's used for inference in both zero-shot and fine-tuned scenarios.
+
+### **A. Inference without Fine-tuning (Zero-Shot)**
+
+Before diving into fine-tuning, it's important to understand BLIP-2's primary strength: **instructed zero-shot image-to-text generation**. This is the model's ability to perform novel tasks guided purely by a text prompt, without any further training.
+
+*   **Mechanics:**
+    1.  A user provides an **image** and a **text prompt** (an instruction).
+    2.  The image is processed by the frozen image encoder and the **pre-trained Q-Former** (from Stage 2) to generate a soft visual prompt.
+    3.  This visual prompt is prepended to the user's text prompt.
+    4.  The combined sequence is fed to the **frozen LLM** (e.g., FlanT5), which then generates the answer autoregressively.
+
+*   **Example (from Figure 4):**
+    *   **User Input Image:** A photo of a pizza that looks like a cat.
+    *   **User Input Prompt:** "What is in the photo?"
+    *   **LLM Input:** `[soft visual prompt from Q-Former]` + `"What is in the photo?"`
+    *   **Model Output:** "A pizza that looks like a cat."
+
+This zero-shot capability is powerful but can be improved for specific, well-defined tasks through fine-tuning.
+
+
+
+
 ![im4](/images/BLIP2-Fig4.png)
 
 *Fig.5 Selected examples of instructed zero-shot image-to-text generation using a BLIP-2 model w/ ViT-g and FlanT5XXL, where it
@@ -333,9 +359,71 @@ personalized image-to-text generation, etc.*
 
 
 
-![im5](/images/BLIP2-Fig5.png)
+---
 
-*Fig.6 Model architecture for VQA finetuning, where the LLM receives Q-Former’s output and the question as input, then predicts answers. We also provide the question as a condition to Q-Former, such that the extracted image features are more relevant to the question.*
+### **B. Fine-tuning on Specific Downstream Tasks**
+
+Fine-tuning adapts the pre-trained model to excel at a single, specific task. In all generative fine-tuning tasks below, the core principle is the same: the **LLM remains frozen**, while other parts of the model are updated.
+
+#### **1. Image Captioning**
+
+*   **Goal:** To generate a high-quality, descriptive sentence for an image.
+
+*   **Fine-tuning Mechanics:**
+    *   **What is Trained:** The **Q-Former** and the **Image Encoder** are fine-tuned. The FC layer connecting them to the LLM is also trained.
+    *   **What is Frozen:** The LLM.
+    *   **Inputs:** The Q-Former receives the **image only**. A generic prompt like `"a photo of"` is used as a fixed starting point for the LLM's text input.
+    *   **Loss:** A standard language modeling loss (cross-entropy) on the ground-truth caption.
+
+*   **Inference Mechanics:**
+    1.  The user provides an image.
+    2.  The fine-tuned Image Encoder and Q-Former create a visual prompt.
+    3.  This prompt is prepended to `"a photo of"` and fed to the frozen LLM.
+    4.  The LLM generates the caption.
+
+#### **2. Visual Question Answering (VQA)**
+
+* **Goal:** To provide a short, accurate answer to a specific question about an image.
+
+* **Fine-tuning Mechanics:**
+
+  *   **What is Trained:** The **Q-Former** and the **Image Encoder**.
+  *   **What is Frozen:** The LLM.
+  *   **Inputs:** This is the key difference. The Q-Former receives **both the image AND the text of the question**. This allows it to perform *question-guided* feature extraction, focusing only on the visual information needed to answer the question.
+  *   **Loss:** A language modeling loss on the ground-truth answer.
+
+* **Inference Mechanics:**
+
+  1. The user provides an image and a question.
+
+  2. Both are fed into the fine-tuned Q-Former, which produces a highly relevant, question-specific visual prompt.
+
+  3. This prompt and the question are fed to the frozen LLM.
+
+  4. The LLM generates the answer.
+
+     
+
+     ![im5](/images/BLIP2-Fig5.png)
+
+     *Fig.6 Model architecture for VQA finetuning, where the LLM receives Q-Former’s output and the question as input, then predicts answers. We also provide the question as a condition to Q-Former, such that the extracted image features are more relevant to the question.*
+
+#### **3. Image-Text Retrieval**
+
+*   **Goal:** Given a query (one image or one text), find the best match from a large collection of candidates (texts or images).
+*   **Fine-tuning Mechanics:**
+    *   **What is Trained:** This task **does not use the LLM at all**. It fine-tunes the **first-stage-pretrained model**, meaning the **Image Encoder** and the **Q-Former**.
+    *   **What is Frozen:** The LLM is completely absent.
+    *   **Inputs:** Image-text pairs from a specific retrieval dataset (e.g., COCO).
+    *   **Loss:** The same three losses from Stage 1 are used together: **Image-Text Contrastive (ITC)**, **Image-Text Matching (ITM)**, and **Image-Grounded Text Generation (ITG)**. This further optimizes the model's alignment capabilities.
+*   **Inference Mechanics (Two-Step Process):**
+    This process is designed to be both fast and accurate.
+    1.  **Step 1: Candidate Selection (Fast):**
+        *   Given a text query, the model quickly computes a coarse similarity score between the query and all candidate images using the efficient **ITC embeddings**.
+        *   It selects the top-k most similar images (e.g., k=128) and discards the rest.
+    2.  **Step 2: Re-ranking (Accurate):**
+        *   For each of the top-k candidates, the model performs the more computationally intensive **ITM** task. This involves deeply fusing the query and candidate image representations to get a highly accurate match score.
+        *   The image with the highest ITM score is returned as the final answer.
 
 
 ### Pseudo-Code for Training
