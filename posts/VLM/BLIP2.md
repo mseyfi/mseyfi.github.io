@@ -134,7 +134,7 @@ The central goal of this stage is to train the **Q-Former** so that its 32 learn
 
 ### **1. Image-Text Contrastive Learning (ITC)**
 
-#### Mechanics
+#### **Mechanics**
 
 The goal of ITC is coarse-grained alignment. It teaches the model to recognize which images and texts belong together in a batch, pushing the representations of matching (positive) pairs closer while pushing non-matching (negative) pairs apart in a shared embedding space.
 
