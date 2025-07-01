@@ -75,7 +75,7 @@ LLaVA uses two types of textual information to represent an image:
 
 By combining captions and bounding boxes, you create a comprehensive textual proxy for the image. The captions provide the narrative, and the bounding boxes provide the specific, grounded facts.
 
-![im2](/images/LLAVA-Instructions.png)
+![im2](/images/LLAVA-Instruction.png)
 
 *Fig.2 One example to illustrate the instruction-following data. The top block shows the contexts
 such as captions and boxes used to prompt GPT, and the bottom block shows the three types of
