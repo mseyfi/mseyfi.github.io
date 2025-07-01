@@ -2,7 +2,8 @@
 ## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](/main_page/CV)
 ## [![CV](https://img.shields.io/badge/VLMs-Selected_Topics_in_Vision_Language_Models-orange?style=for-the-badge&logo=github)](VLMs)
 
-## **Introduction and Motivation: Why Visual Instruction Tuning?**
+
+## **Visual Instruction Tuning?**
 
 For years, the fields of Natural Language Processing (NLP) and Computer Vision have largely advanced in parallel. On one hand, Large Language Models (LLMs) like GPT-4 have become incredibly proficient at understanding and following complex textual instructions, acting as general-purpose assistants for a wide range of language tasks. On the other hand, vision models have excelled at specific, predefined tasks such as image classification, object detection, or captioning. However, a critical piece has been missing: a unified model that can act as a **general-purpose assistant for both visual and language-based instructions**.
 
