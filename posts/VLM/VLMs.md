@@ -94,13 +94,14 @@ This is the current state-of-the-art category, representing the fusion of powerf
   * **Key Contribution:** Provided a powerful, commercially available alternative to GPT-4V and Gemini, with a strong focus on document understanding and enterprise use cases.
   * **Reference Paper:** No formal paper; details are from product announcements.
 
-#### **LLaVA (Large Language and Vision Assistant)**
-
-  * **What it does:** A pioneering open-source MLLM that can follow instructions and hold conversations about images.
-  * **How it works:** LLaVA connects a pre-trained vision encoder (from CLIP) to a pre-trained LLM (like Vicuna) with a simple, trainable projection matrix. By fine-tuning this lightweight connector on a small dataset of visual instructions, it unlocks powerful conversational abilities.
-  * **Key Contribution:** Demonstrated a resource-efficient and highly effective open-source recipe for creating MLLMs, sparking a wave of further research.
-  * **Reference Paper:** Liu, H., Li, C., Wu, Q., & Lee, Y. J. (2023). *Visual Instruction Tuning*. [arXiv:2304.08485](https://arxiv.org/abs/2304.08485)
-
+## [![llava](https://img.shields.io/badge/LLaVA-Visual_Instruction_Tuning-blue?style=for-the-badge&logo=github)](LLAVA)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+  <b>What it does:</b> A pioneering open-source MLLM that can follow instructions and hold conversations about images.<p></p>
+<b>How it works:</b> LLaVA connects a pre-trained vision encoder (from CLIP) to a pre-trained LLM (like Vicuna) with a simple, trainable projection matrix. By fine-tuning this lightweight connector on a small dataset of visual instructions, it unlocks powerful conversational abilities.<p></p>
+  <b>Key Contribution:</b> Demonstrated a resource-efficient and highly effective open-source recipe for creating MLLMs, sparking a wave of further research.<p></p>
+  <b>Reference Paper:</b> Liu, H., Li, C., Wu, Q., & Lee, Y. J. (2023). Visual Instruction Tuning. [arXiv:2304.08485](https://arxiv.org/abs/2304.08485)
+</div>
+  
 ### Category 5: Multimodal Generation (Text ↔ Image)
 
 These models focus on synthesizing new content in one modality based on another. The most prominent sub-task is text-to-image generation.
