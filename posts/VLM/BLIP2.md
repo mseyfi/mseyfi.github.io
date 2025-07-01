@@ -17,7 +17,7 @@ This is the problem BLIP-2 was designed to solve. The core intuition is both sim
 ![im1](/images/BLIP2-Fig1.png)
 
 *Fig.1  Overview of BLIP-2’s framework. We pre-train a
-lightweight Querying Transformer following a two-stage strategy to bridge the modality gap. The first stage bootstraps visionlanguage representation learning from a frozen image encoder. The second stage bootstraps vision-to-language generative learning from a frozen LLM, which enables zero-shot instructed image-totext generation (see Figure 4 for more examples).*
+lightweight Querying Transformer following a two-stage strategy to bridge the modality gap. The first stage bootstraps vision-language representation learning from a frozen image encoder. The second stage bootstraps vision-to-language generative learning from a frozen LLM, which enables zero-shot instructed image-to-text generation (see Figure 4 for more examples).*
 
 **Instead of building a massive, monolithic vision-language model from scratch, can we leverage the power of existing, pre-trained, *frozen* models and teach them to work together?**
 
@@ -140,7 +140,7 @@ The goal of ITC is coarse-grained alignment. It teaches the model to recognize w
 
 #### **Input-Output Pairs**
 
-*   **Input:** A batch of $B$ image-text pairs $\{(I_1, T_1), (I_2, T_2), ..., (I_B, T_B)\}$.
+*   **Input:** A batch of $B$ image-text pairs $$\left\{(I_1, T_1), (I_2, T_2), ..., (I_B, T_B)\right\}$$.
 *   **Output:** A $B \times B$ similarity matrix, where the diagonal represents positive pair similarities and off-diagonal elements represent negative pair similarities.
 
 #### **Attention Mechanism**
