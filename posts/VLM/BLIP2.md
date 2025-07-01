@@ -17,7 +17,7 @@ This is the problem BLIP-2 was designed to solve. The core intuition is both sim
 ![im1](/images/BLIP2-Fig1.png)
 
 *Fig.1  Overview of BLIP-2’s framework. We pre-train a
-lightweight Querying Transformer following a two-stage strategy to bridge the modality gap. The first stage bootstraps vision-language representation learning from a frozen image encoder. The second stage bootstraps vision-to-language generative learning from a frozen LLM, which enables zero-shot instructed image-to-text generation (see Figure 4 for more examples).*
+lightweight Querying Transformer following a two-stage strategy to bridge the modality gap. The first stage bootstraps vision-language representation learning from a frozen image encoder. The second stage bootstraps vision-to-language generative learning from a frozen LLM, which enables zero-shot instructed image-to-text generation (see Figure 5 for more examples).*
 
 **Instead of building a massive, monolithic vision-language model from scratch, can we leverage the power of existing, pre-trained, *frozen* models and teach them to work together?**
 
@@ -76,9 +76,9 @@ Let's define the inputs and their dimensions, following the paper's examples.
 
 ![im2](/images/BLIP2-Fig2-1.png){style="display: block; margin: 0 auto" }
 
-*Fig.2 (Top) Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
+*Fig.2 Model architecture of Q-Former and BLIP-2’s first-stage vision-language representation learning objectives. We jointly
 optimize three objectives which enforce the queries (a set of learnable embeddings) to extract visual representation most relevant to the
-text. (Bottom) The self-attention masking strategy for each objective to control query-text interaction.*
+text.*
 
 #### **Inside a Q-Former Block**
 
@@ -98,11 +98,16 @@ $$
 \text{SelfAttn}_\text{output} = \text{MultiHeadSelfAttention}(Q=X, K=X, V=X, \text{Mask}=M)
 $$
 
-The mask $M$ changes depending on the pre-training objective (as seen in Figure 2):
+The mask $M$ changes depending on the pre-training objective (as seen in Figure 3):
 
 *   **For ITM (bi-directional):** $M$ allows all tokens to attend to all other tokens.
 *   **For ITC (unimodal):** $M$ is block-diagonal. $H_q$ can only attend to $H_q$, and $H_t$ can only attend to $H_t$.
 *   **For ITG (multimodal causal):** $M$ allows $H_q$ to attend to all $H_q$. It allows $H_t$ to attend to all $H_q$ but only to *previous* tokens within $H_t$.
+
+
+![im2-2](/images/BLIP2-Fig2-2.png){style="display: block; margin: 0 auto" }
+
+*Fig.3 The self-attention masking strategy for each objective to control query-text interaction.*
 
 **2. Cross-Attention (Injecting Visual Information):**
 
@@ -246,6 +251,7 @@ The loss is a standard autoregressive language modeling loss, which is a Cross-E
 1. **Model Probability:** The model predicts the next token $T_k$ given the image $I$ (represented by the queries) and the previous ground-truth tokens $T_{<k}$. Let this be $P(T_k \mid I, T_{<k}; \theta)$.
 
 2. **Cross-Entropy Loss $\mathcal{L}_{ITG}$:**
+   
    $$
    \mathcal{L}_{ITG} = - \frac{1}{B} \sum_{i=1}^{B} \sum_{k=1}^{N_t} \log P(T_{i,k} | I_i, T_{i,<k}; \theta)
    $$
@@ -254,11 +260,17 @@ The loss is a standard autoregressive language modeling loss, which is a Cross-E
 
 -----
 
+![im3](/images/BLIP2-Fig3.png)
+
+*Fig.4 BLIP-2’s second-stage vision-to-language generative pre-training, which bootstraps from frozen large language models (LLMs).
+(Top) Bootstrapping a decoder-based LLM (e.g. OPT). (Bottom) Bootstrapping an encoder-decoder-based LLM (e.g. FlanT5). The
+fully-connected layer adapts from the output dimension of the Q-Former to the input dimension of the chosen LLM.*
+
 ### **Stage 2: Bootstrap Vision-to-Language Generative Learning from a Frozen LLM**.
 
 The goal of this second stage is to connect the vision-aware Q-Former (trained in Stage 1) to a large, powerful, but **frozen** Large Language Model (LLM). This allows the system to leverage the LLM's vast knowledge and sophisticated text generation abilities, conditioned on visual input.
 
-Here is the detailed breakdown of Stage 2, based on Section 3.3 and Figure 3 of the paper.
+Here is the detailed breakdown of Stage 2, based on Section 3.3 and Figure 4 of the paper.
 
 ### **Mechanics**
 
@@ -291,13 +303,11 @@ There is only one task in this stage: **conditioned language modeling**. The mod
 
 * **Loss Function:** A standard autoregressive language modeling loss (Cross-Entropy).
 
-  
   $$
   \mathcal{L} = - \sum_{k=1}^{N_t} \log P(T_k | Z_{proj}, T_{<k}; \theta_{LLM})
   $$
   
-
-  where `Z_proj` represents the projected query vectors (the soft visual prompt).
+  where $Z_{proj}$ represents the projected query vectors (the soft visual prompt).
 
 #### **For Encoder-Decoder-Based LLMs (e.g., FlanT5)**
 
@@ -305,23 +315,11 @@ There is only one task in this stage: **conditioned language modeling**. The mod
 *   **Mechanics:** The visual prompts ($Z_{proj}$) are concatenated with the `Prefix Text` and fed into the LLM's **encoder**. The LLM's **decoder** is then tasked with generating the `Suffix Text`.
 *   **Loss Function:** A prefix language modeling loss (also Cross-Entropy). The loss is calculated only on the generation of the `Suffix Text`.
 
-By the end of Stage 2, the Q-Former has learned to effectively "talk" to the frozen LLM, translating images into soft prompts that the LLM can interpret to perform a wide range of instructed, zero-shot, vision-language tasks, as shown in the impressive examples in Figure 4 of the paper.
-
-
-
-
-
-![im3](/images/BLIP2-Fig3.png)
-
-*Fig.3 BLIP-2’s second-stage vision-to-language generative pre-training, which bootstraps from frozen large language models (LLMs).
-(Top) Bootstrapping a decoder-based LLM (e.g. OPT). (Bottom) Bootstrapping an encoder-decoder-based LLM (e.g. FlanT5). The
-fully-connected layer adapts from the output dimension of the Q-Former to the input dimension of the chosen LLM.*
-
-
+By the end of Stage 2, the Q-Former has learned to effectively "talk" to the frozen LLM, translating images into soft prompts that the LLM can interpret to perform a wide range of instructed, zero-shot, vision-language tasks, as shown in the impressive examples in Figure 5 of the paper.
 
 ![im4](/images/BLIP2-Fig4.png)
 
-*Fig.4 Selected examples of instructed zero-shot image-to-text generation using a BLIP-2 model w/ ViT-g and FlanT5XXL, where it
+*Fig.5 Selected examples of instructed zero-shot image-to-text generation using a BLIP-2 model w/ ViT-g and FlanT5XXL, where it
 shows a wide range of capabilities including visual conversation, visual knowledge reasoning, visual commonsense reasoning, storytelling,
 personalized image-to-text generation, etc.*
 
@@ -329,7 +327,7 @@ personalized image-to-text generation, etc.*
 
 ![im5](/images/BLIP2-Fig5.png)
 
-*Fig.5 Model architecture for VQA finetuning, where the LLM receives Q-Former’s output and the question as input, then predicts answers. We also provide the question as a condition to Q-Former, such that the extracted image features are more relevant to the question.*
+*Fig.6 Model architecture for VQA finetuning, where the LLM receives Q-Former’s output and the question as input, then predicts answers. We also provide the question as a condition to Q-Former, such that the extracted image features are more relevant to the question.*
 
 
 ### Pseudo-Code for Training
