@@ -75,7 +75,8 @@ LLaVA uses two types of textual information to represent an image:
 
 By combining captions and bounding boxes, you create a comprehensive textual proxy for the image. The captions provide the narrative, and the bounding boxes provide the specific, grounded facts.
 
-![im2](/images/LLAVA-INSTRUCTIONS.png)
+![im2](/images/LLAVA-Instructions.png)
+
 *Fig.2 One example to illustrate the instruction-following data. The top block shows the contexts
 such as captions and boxes used to prompt GPT, and the bottom block shows the three types of
 responses. Note that the visual image is not used to prompt GPT, we only show it here as a reference.*
@@ -162,7 +163,7 @@ X_q^t,  &\text{The remaining turns}~ \text{for}~t > 1
 \end{cases}
 $$
 
-![im3](/images/LLAVA-TRAINING.png)
+![im3](/images/LLAVA-Training.png)
 
 *Fig. 3: The input sequence used to train the model. Only two conversation turns are illustrated here; in practice, the number of turns varies based on the instruction-following data. In our current
 implementation, we follow Vicuna to set the system message `X_system-message` and we set
