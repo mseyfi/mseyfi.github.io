@@ -140,7 +140,7 @@ The goal of ITC is coarse-grained alignment. It teaches the model to recognize w
 
 #### **Input-Output Pairs**
 
-*   **Input:** A batch of $B$ image-text pairs $\left\{(I_1, T_1), (I_2, T_2), ..., (I_B, T_B)\right\}$.
+*   **Input:** A batch of $B$ image-text pairs $\{(I_1, T_1), (I_2, T_2), ..., (I_B, T_B)\}$.
 *   **Output:** A $B \times B$ similarity matrix, where the diagonal represents positive pair similarities and off-diagonal elements represent negative pair similarities.
 
 #### **Attention Mechanism**
