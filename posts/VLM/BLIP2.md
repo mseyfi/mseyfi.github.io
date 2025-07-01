@@ -176,7 +176,7 @@ The loss is the InfoNCE (Noise-Contrastive Estimation) loss, calculated for both
 
    where $	au$ is a learnable temperature parameter.
 
-5. **Total ITC Loss:** $\mathcal{L}_ITC = (\mathcal{L}_{i2t} + \mathcal{L}_{t2i}) / 2$
+5. **Total ITC Loss:** $$\mathcal{L}_{ITC} = (\mathcal{L}_{i2t} + \mathcal{L}_{t2i}) / 2$$
 
 ---
 
