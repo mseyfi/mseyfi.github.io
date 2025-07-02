@@ -24,9 +24,9 @@ in the input text.*
 
 To understand YOLO-World, we must first appreciate its fundamental shift in how it formulates the object detection problem.
 
-*   **Traditional Approach:** A standard detector is trained on annotations like $\Omega = \left\{B_i, c_i\right\}$, where $B_i$ is a bounding box and $c_i$ is a fixed integer category ID (e.g., $1$ for "person," $2$ for "bicycle," etc.). The model's job is to classify a box into one of these fixed numerical categories.
+*   **Traditional Approach:** A standard detector is trained on annotations like $$\Omega = \left\{B_i, c_i\right\}$, where $B_i$$ is a bounding box and $c_i$ is a fixed integer category ID (e.g., $1$ for "person," $2$ for "bicycle," etc.). The model's job is to classify a box into one of these fixed numerical categories.
 
-*   **YOLO-World's Approach:** The paper reformulates the problem. Training annotations are now treated as **region-text pairs**: $\Omega = \left\{B_i, t_i\right\}$. Here, $B_i$ is still the bounding box, but $t_i$ is the actual **text string** that describes the object (e.g., "person," "a red bicycle," "dog").
+*   **YOLO-World's Approach:** The paper reformulates the problem. Training annotations are now treated as **region-text pairs**: $$\Omega = \left\{B_i, t_i\right\}$$. Here, $B_i$ is still the bounding box, but $t_i$ is the actual **text string** that describes the object (e.g., "person," "a red bicycle," "dog").
 
 This seemingly simple change is profound. The task is no longer "classify this box as category #2." It becomes "find the text description that best matches the visual content of this box." This reframing makes the problem a direct fit for a vision-language model and is the conceptual key to open-vocabulary detection.
 
