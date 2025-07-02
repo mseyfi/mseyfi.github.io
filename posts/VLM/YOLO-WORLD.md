@@ -1,5 +1,7 @@
 ## [![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](/)
+
 ## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Computer_Vision-green?style=for-the-badge&logo=github)](/main_page/CV)
+
 ## [![CV](https://img.shields.io/badge/VLMs-Selected_Topics_in_Vision_Language_Models-orange?style=for-the-badge&logo=github)](VLMs)
 
 ## A Deep Dive into YOLO-World: A Tutorial on Open-Vocabulary Object Detection
@@ -16,9 +18,9 @@ The core idea is to fuse the lightning-fast, single-shot architecture of YOLO wi
 
 To understand YOLO-World, we must first appreciate its fundamental shift in how it formulates the object detection problem.
 
-*   **Traditional Approach:** A standard detector is trained on annotations like $\Omega = {B_i, c_i}$, where $B_i$ is a bounding box and $c_i$ is a fixed integer category ID (e.g., $1$ for "person," $2$ for "bicycle," etc.). The model's job is to classify a box into one of these fixed numerical categories.
+*   **Traditional Approach:** A standard detector is trained on annotations like $\Omega = \left\{B_i, c_i\right\}$, where $B_i$ is a bounding box and $c_i$ is a fixed integer category ID (e.g., $1$ for "person," $2$ for "bicycle," etc.). The model's job is to classify a box into one of these fixed numerical categories.
 
-*   **YOLO-World's Approach:** The paper reformulates the problem. Training annotations are now treated as **region-text pairs**: $\Omega = {B_i, t_i}$. Here, $B_i$ is still the bounding box, but $t_i$ is the actual **text string** that describes the object (e.g., "person," "a red bicycle," "dog").
+*   **YOLO-World's Approach:** The paper reformulates the problem. Training annotations are now treated as **region-text pairs**: $\Omega = \left\{B_i, t_i\right\}$. Here, $B_i$ is still the bounding box, but $t_i$ is the actual **text string** that describes the object (e.g., "person," "a red bicycle," "dog").
 
 This seemingly simple change is profound. The task is no longer "classify this box as category #2." It becomes "find the text description that best matches the visual content of this box." This reframing makes the problem a direct fit for a vision-language model and is the conceptual key to open-vocabulary detection.
 
@@ -42,7 +44,7 @@ Let's define the dimensions of the feature maps involved, assuming a standard `6
 | :------------- | :----------------------------------------------------------- | :-------- | :------------------------- | :---------------------------- |
 | **C3, C4, C5** | Initial visual features from the backbone.                   | 8, 16, 32 | `80x80`, `40x40`, `20x20`  | Varies (e.g., 256, 512, 1024) |
 | **X_l**        | Fused visual features *inside* the PAN, before text guidance. | 8, 16, 32 | `80x80`, `40x40`, `20x20`  | **512 (Constant)**            |
-| **P_l**        | Final text-guided features from RepVL-PAN, sent to the head. | 8, 16, 32 | `80x80`, `40x40`, `20x20`  | **512 (Constant)**            |
+| **P5, P4, P3** | Final text-guided features from RepVL-PAN, sent to the head. | 8, 16, 32 | `80x80`, `40x40`, `20x20`  | **512 (Constant)**            |
 
 The critical design choice is that the channel dimension `D` is kept constant (`D=512`) across all levels of the PAN. This allows a single set of text embeddings to interact consistently with visual features at every scale.
 
