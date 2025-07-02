@@ -146,18 +146,18 @@ This advanced category deals with models that can process and reason about seque
 <b>Key Contribution:</b> Showcased a scalable method for learning temporal and multimodal event representations from untrimmed, unstructured web videos.<p></p>
 <b>Reference Paper:</b> Zellers, R., Lu, X., et al. (2021). *MERLOT: Multimodal Neural Script Knowledge Models*. [arXiv:2106.02636](https://arxiv.org/abs/2106.02636)
 </div>
+
 ### Category 7: Grounded Image Understanding / Referring Expressions
 
 These models focus on "grounding" language by localizing specific objects mentioned in text within an image.
 
 ## [![GLIP](https://img.shields.io/badge/GLIP-Grounded_Language_Image_Pre_training-blue?style=for-the-badge&logo=github)](GLIP)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+  <b>What it does:</b> A model that unifies object detection and phrase grounding.<p></p>
+  <b>How it works:</b> It trains a model to find bounding boxes in an image that correspond to phrases in a paired text caption (e.g., "the man in the red shirt"). By doing this on a massive scale, it learns to perform <b>zero-shot object detection</b>: detecting objects described in text even if it has never seen a bounding box for that object class before.<p></p>
+  <b>Key Contribution:</b> Bridged the gap between language understanding and object detection, creating a powerful open-vocabulary detector.<p></p>
+  <b>Reference Paper:</b> Li, R., Duan, H., et al. (2021). *Grounded Language-Image Pre-training*. [arXiv:2112.03857](https://arxiv.org/abs/2112.03857)
 
-  * **What it does:** A model that unifies object detection and phrase grounding.
-  * **How it works:** It trains a model to find bounding boxes in an image that correspond to phrases in a paired text caption (e.g., "the man in the red shirt"). By doing this on a massive scale, it learns to perform **zero-shot object detection**: detecting objects described in text even if it has never seen a bounding box for that object class before.
-  * **Key Contribution:** Bridged the gap between language understanding and object detection, creating a powerful open-vocabulary detector.
-  * **Reference Paper:** Li, R., Duan, H., et al. (2021). *Grounded Language-Image Pre-training*. [arXiv:2112.03857](https://arxiv.org/abs/2112.03857)
-
----
 
 ## [![YOLO](https://img.shields.io/badge/YOLO--WORLD-Real--Time_Open--Vocabulary_Object_Detection-blue?style=for-the-badge&logo=github)](YOLOWORLD)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
@@ -166,7 +166,8 @@ These models focus on "grounding" language by localizing specific objects mentio
 <b>Key Contribution:</b> It successfully bridged the gap between the high speed of traditional YOLO detectors and the flexibility of open-vocabulary models. This made prompt-driven, zero-shot object detection practical for real-time applications, eliminating the need to collect data and retrain for new object categories.<p></p>
 <b>Reference Paper:</b> Cheng, T., et al. (2024). YOLO-World: Real-Time Open-Vocabulary Object Detection. arXiv preprint arXiv:2401.17270.
 </div>
----
+
+-----
 
 #### **OWL-ViT (Object-Wise Learning with Vision Transformers)**
 
