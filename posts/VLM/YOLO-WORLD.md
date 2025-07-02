@@ -12,7 +12,7 @@ YOLO-World shatters this limitation. It introduces an **open-vocabulary** approa
 
 The core idea is to fuse the lightning-fast, single-shot architecture of YOLO with the profound semantic understanding of a large-scale Vision-Language Model (VLM) like CLIP. This tutorial will explore exactly how it achieves this remarkable feat, from its core architecture to the mathematics of its loss functions.
 
-![img1](/images/YOLOW-fig1)
+![img1](/images/YOLOW-fig1.png)
 
 *Fig. 1 Overall Architecture of YOLO-World. Compared to traditional YOLO detectors, YOLO-World as an open-vocabulary detector
 adopts text as input. The Text Encoder first encodes the input text input text embeddings. Then the Image Encoder encodes the input image
@@ -62,7 +62,7 @@ Let's define the dimensions of the feature maps involved, assuming a standard `6
 The critical design choice is that the channel dimension `D` is kept constant (`D=512`) across all levels of the PAN. This allows a single set of text embeddings to interact consistently with visual features at every scale.
 
 
-![img2](/images/YOLOW-fig2)
+![img2](/images/YOLOW-fig2.png)
 
 *Fig. 2 Illustration of the RepVL-PAN. The proposed RepVLPAN adopts the Text-guided CSPLayer (T-CSPLayer) for injecting
 language information into image features and the Image Pooling
@@ -219,7 +219,7 @@ After this rigorous, multi-stage pipeline, the output is a **high-quality, clean
 
 By repeating this process for hundreds of thousands of image-caption pairs, the authors automatically create a massive and reliable dataset. It is this dataset, with its diverse vocabulary and accurate bounding boxes, that is used to train YOLO-World and grant it the ability to understand and detect a wide array of objects in the wild.
 
-![img3](/images/YOLOW-fig3)
+![img3](/images/YOLOW-fig3.png)
 
 *Fig.3 Labeling Pipeline for Image-Text Data We first leverage the simple n-gram to extract object nouns from the captions. We adopt
 a pre-trained open-vocabulary detector to generate pseudo boxes given the object nouns, which forms the coarse region-text proposals.
@@ -305,7 +305,7 @@ The next day, a new shipment of **"ball-peen hammers"** arrives.
 
 This use case demonstrates how YOLO-World moves object detection from a rigid, pre-programmed task to a dynamic, flexible, and interactive process.
 
-![img4](/images/YOLOW-fig4)
+![img4](/images/YOLOW-fig4.png)
 
 *Fig. 4 Visualization Results on Referring Object Detection. We explore the capability of the pre-trained YOLO-World to detect
 objects with descriptive noun phrases. Images are obtained from COCO val2017.*
