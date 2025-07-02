@@ -159,6 +159,15 @@ These models focus on "grounding" language by localizing specific objects mentio
 
 ---
 
+## [![YOLO](https://img.shields.io/badge/YOLO--WORLD-Real--Time_Open--Vocabulary_Object_Detection-blue?style=for-the-badge&logo=github)](YOLOWORLD)
+<div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
+<b>What it does:</b> A highly efficient open-vocabulary object detector that achieves real-time performance, allowing it to identify any object from a text prompt without a predefined class list.<p></p>
+<b>How it works:</b> YOLO-World enhances the standard YOLOv8 architecture by replacing its fixed-class detector head with a novel **Text-Contrastive Head**. It uses a frozen text encoder (from CLIP) to convert user-defined text prompts (e.g., "a person on a bike") into text embeddings on-the-fly. The model then classifies objects by computing the similarity between the visual features of a detected object and these prompt-based text embeddings, effectively making its vocabulary dynamic and limitless.<p></p>
+<b>Key Contribution:</b> It successfully bridged the gap between the high speed of traditional YOLO detectors and the flexibility of open-vocabulary models. This made prompt-driven, zero-shot object detection practical for real-time applications, eliminating the need to collect data and retrain for new object categories.<p></p>
+<b>Reference Paper:</b> Cheng, T., et al. (2024). YOLO-World: Real-Time Open-Vocabulary Object Detection. arXiv preprint arXiv:2401.17270.
+</div>
+---
+
 #### **OWL-ViT (Object-Wise Learning with Vision Transformers)**
 
   * **What it does:** An open-vocabulary object detector that leverages a pre-trained Vision Transformer (ViT) and CLIP's contrastive training.
@@ -183,6 +192,8 @@ This specialized task involves models that can "read" visual documents like PDFs
   * **How it works:** It pre-trains a single Transformer model on three types of inputs: text embeddings, image embeddings (from the document image itself), and layout embeddings (the 2D position/bounding box of words). This allows it to learn a holistic understanding of a document's structure and content.
   * **Key Contribution:** Achieved state-of-the-art results on a wide range of document AI tasks by effectively unifying text, image, and layout modalities in a single model.
   * **Reference Paper:** Huang, Y., Lv, T., et al. (2022). *LayoutLMv3: Pre-training for Document AI with Unified Text and Image Masking*. [arXiv:2204.08387](https://arxiv.org/abs/2204.08387)
+
+
 
 -----
 
