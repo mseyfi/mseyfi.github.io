@@ -159,7 +159,7 @@ These models focus on "grounding" language by localizing specific objects mentio
   <b>Reference Paper:</b> Li, R., Duan, H., et al. (2021). *Grounded Language-Image Pre-training*. [arXiv:2112.03857](https://arxiv.org/abs/2112.03857)
 
 
-## [![YOLO](https://img.shields.io/badge/YOLO--WORLD-Real--Time_Open--Vocabulary_Object_Detection-blue?style=for-the-badge&logo=github)](YOLOWORLD)
+## [![YOLO](https://img.shields.io/badge/YOLO--WORLD-Real--Time_Open--Vocabulary_Object_Detection-blue?style=for-the-badge&logo=github)](YOLO-WORLD)
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 <b>What it does:</b> A highly efficient open-vocabulary object detector that achieves real-time performance, allowing it to identify any object from a text prompt without a predefined class list.<p></p>
 <b>How it works:</b> YOLO-World enhances the standard YOLOv8 architecture by replacing its fixed-class detector head with a novel **Text-Contrastive Head**. It uses a frozen text encoder (from CLIP) to convert user-defined text prompts (e.g., "a person on a bike") into text embeddings on-the-fly. The model then classifies objects by computing the similarity between the visual features of a detected object and these prompt-based text embeddings, effectively making its vocabulary dynamic and limitless.<p></p>
