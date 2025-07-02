@@ -157,6 +157,7 @@ These models focus on "grounding" language by localizing specific objects mentio
   <b>How it works:</b> It trains a model to find bounding boxes in an image that correspond to phrases in a paired text caption (e.g., "the man in the red shirt"). By doing this on a massive scale, it learns to perform <b>zero-shot object detection</b>: detecting objects described in text even if it has never seen a bounding box for that object class before.<p></p>
   <b>Key Contribution:</b> Bridged the gap between language understanding and object detection, creating a powerful open-vocabulary detector.<p></p>
   <b>Reference Paper:</b> Li, R., Duan, H., et al. (2021). *Grounded Language-Image Pre-training*. [arXiv:2112.03857](https://arxiv.org/abs/2112.03857)
+</div>
 
 
 ## [![YOLO](https://img.shields.io/badge/YOLO--WORLD-Real--Time_Open--Vocabulary_Object_Detection-blue?style=for-the-badge&logo=github)](YOLO-WORLD)
