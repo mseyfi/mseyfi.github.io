@@ -241,6 +241,32 @@ A cycle is detected when our DFS traversal encounters a node that is currently i
     c. Remove `node` from `visiting` (backtrack).
     d. Return `False` (no cycle found from this path).
 
+```python
+def has_cycle_directed(graph, n):
+    visited = [False] * n
+    recStack = [False] * n
+
+    def dfs(u):
+        visited[u] = True
+        recStack[u] = True
+
+        for v in graph[u]:
+            if not visited[v]:
+                if dfs(v):
+                    return True
+            elif recStack[v]:  # back edge detected
+                return True
+
+        recStack[u] = False
+        return False
+
+    for node in range(n):
+        if not visited[node]:
+            if dfs(node):
+                return True
+    return False
+```
+
 -----
 
 ### Sample LeetCode Problems
