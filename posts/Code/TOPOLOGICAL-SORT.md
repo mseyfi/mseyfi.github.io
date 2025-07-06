@@ -38,7 +38,7 @@ We can achieve this by performing a post-order traversal. When a DFS call for a 
 ```python
 from collections import defaultdict
 
-def topological_sort_dfs(graph):
+def topological_sort_dfs(graph, n):
     """
     Performs topological sort on a directed acyclic graph (DAG) using DFS.
     
@@ -50,34 +50,33 @@ def topological_sort_dfs(graph):
         A list representing the topologically sorted order of nodes.
         Returns an empty list if the graph is empty.
     """
-    # Using a list as a stack for the result
-    topological_order = [] 
-    # Set to keep track of visited nodes
-    visited = set()
-    
-    # Get all nodes in the graph
-    all_nodes = list(graph.keys())
+    visited = [False] * n
+    visiting = [False] * n
+    sorted_graph = []
 
     def dfs(node):
-        # Mark the current node as visited
-        visited.add(node)
-        
-        # Recur for all adjacent vertices
-        for neighbor in graph.get(node, []):
-            if neighbor not in visited:
-                dfs(neighbor)
-        
-        # Push current vertex to the front of the result list
-        # This is the crucial step of post-order traversal
-        topological_order.insert(0, node)
+        visited[node] = True
+        visiting[node] = True
 
-    # Call the recursive helper function to store Topological Sort
-    # starting from all vertices one by one
-    for node in all_nodes:
-        if node not in visited:
-            dfs(node)
-            
-    return topological_order
+        for neighbor in graph[node]:
+
+            if visiting[neighbor]:
+                return True
+
+            if not visited[neighbor]:
+                if dfs(neighbor):
+                    return True
+
+        visiting[node] = False
+        sorted_graph.inser(0, node)
+        return False
+
+    for node in range(n):
+        if not visited[node]:
+            if dfs(node):
+                return []
+    return sorted_graph
+
 
 # Example Usage:
 # A -> B, C
