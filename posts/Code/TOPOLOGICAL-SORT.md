@@ -50,33 +50,32 @@ def topological_sort_dfs(graph, n):
         A list representing the topologically sorted order of nodes.
         Returns an empty list if the graph is empty.
     """
-    visited = [False] * n
-    visiting = [False] * n
-    sorted_graph = []
+    
+    visit = [0] * n  # 0 = unvisited, 1 = visiting, 2 = visited
+    topo = []
 
     def dfs(node):
-        visited[node] = True
-        visiting[node] = True
+        if visit[node] == 1:
+            return False  # cycle detected
+        if visit[node] == 2:
+            return True   # already visited
 
+        visit[node] = 1  # mark as visiting
         for neighbor in graph[node]:
+            if not dfs(neighbor):
+                return False
 
-            if visiting[neighbor]:
-                return True
-
-            if not visited[neighbor]:
-                if dfs(neighbor):
-                    return True
-
-        visiting[node] = False
-        sorted_graph.inser(0, node)
-        return False
+        visit[node] = 2  # mark as visited
+        topo.append(node)
+        return True
 
     for node in range(n):
-        if not visited[node]:
-            if dfs(node):
-                return []
-    return sorted_graph
+        if visit[node] == 0:
+            if not dfs(node):
+                return []  # return early on cycle
 
+    topo.reverse()
+    return topo
 
 # Example Usage:
 # A -> B, C
