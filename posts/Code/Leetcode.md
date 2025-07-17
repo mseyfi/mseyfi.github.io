@@ -628,7 +628,7 @@ class Solution:
         backtrack([], 1)
         return ans
 ```
-## temlate 3: combination of non repetitious numbers: if you incorporated a node, then put that node aside and don't work with it anymore.
+## temlate 3: combination of repetitious numbers: if you incorporated a node, then put that node aside and don't work with it anymore.
 Given an array of distinct positive integers candidates and a target integer target, return a list of all unique combinations of candidates where the chosen numbers sum to target. The same number may be chosen from candidates an unlimited number of times. Two combinations are unique if the frequency of at least one of the chosen numbers is different.
 
 ***We use this template if we don't want to use the pre-used members e.g. [(1,1,6), (1, 6, 1), (6, 1, 1)] are all the same, therefore we put `i` in the arguments so that when transitioning to a new parent children we do not use the previous members***
@@ -658,7 +658,7 @@ class Solution:
 ```
 
 ## Note to remember: 
-Try to create a tree. Look at curr after each backtrack return. When a backtrack hits return that means it has hit a node leaf. Look at curr at that moment. Right after the return we have this tem `curr.pop()` try to imaging if curr pops the next item is  the item in  `for ... in ...` if we are done with all the children of the first child, that means we are at the end of the for loop and a new number will be chosen from scratch. That means `for i in range(start, end)` now what should this `start` be?  Also a very important thing you should do is to create a tree and beside each node write the status of the variables so you can track them.
+Try to create a tree. Look at curr after each backtrack return. When a backtrack hits return that means it has hit a **node leaf**. Look at curr at that moment. Sometimes our tree do not append on leaf nodes, but they append on nodes  themeselves. At this time you should not return anything in your backtracking (look at subset example). Right after the return we have this tem `curr.pop()` try to imaging if curr pops the next item is  the item in  `for ... in ...` if we are done with all the children of the first child, that means we are at the end of the for loop and a new number will be chosen from scratch. That means `for i in range(start, end)` now what should this `start` be?  Also a very important thing you should do is to create a tree and beside each node write the status of the variables so you can track them.
 
 # 7. Heap
 in heap the first element to pop in the minimum element in the heap. If we push tuples in the heap the fitst element to pop is the tuple with minimum first element. If two tuples have same first element then the tuple with the second element being minimum is poped.
