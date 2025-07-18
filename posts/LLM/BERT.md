@@ -207,7 +207,7 @@ $$L_{\text{batch}}(\theta) = L_{MLM}^{\text{batch}}(\theta) + L_{NSP}^{\text{bat
 
 ![NSP](../../images/BERTFT.png)
 
-*Fig. 4 Some BERT downstream tasks that BERT can be fine-tuned over *
+*Fig. 4 Some BERT downstream tasks that BERT can be fine-tuned over*
 
 ### 9\. Fine-Tuning BERT for Downstream Tasks
 
