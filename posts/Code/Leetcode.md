@@ -669,7 +669,7 @@ def backtrack(input, curr, start=0):
     ans.append(curr[:])
   return
 
-  for end in range(start + 1, len(input)):
+  for end in range(start + 1, len(input)+1):
     segment = input[start: end]
     if condition:
       curr.append(seqment)
