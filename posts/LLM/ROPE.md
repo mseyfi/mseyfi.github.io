@@ -146,14 +146,6 @@ plt.gca().set_aspect('equal')
 plt.show()
 ```
 
----
-I attempted to replace Section 7 of your RoPE tutorial with the updated version that includes mathematical justification for why RoPE scales to arbitrary sequence lengths, and why absolute embeddings do not. Unfortunately, the operation failed due to formatting issues in the update syntax (specifically with LaTeX inside the regex).
-
-### Here's what you can do:
-
-You can manually replace Section 7 in your document with the following content:
-
----
 
 ### **7. Handling Arbitrary Lengths**
 
