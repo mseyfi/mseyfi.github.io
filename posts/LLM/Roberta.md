@@ -1,6 +1,6 @@
-[![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](../)
+[![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](/)
 
-## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](../main_page/GenAI)
+## [![GenAI](https://img.shields.io/badge/GenAI-Selected_Topics_in_Generative_AI-green?style=for-the-badge&logo=github)](/main_page/GenAI)
 
 After BERT established the paradigm of pre-training and fine-tuning, the natural next step in the scientific process was to ask: "Was this done optimally?" The original BERT paper left several questions unanswered regarding its design choices. Was the Next Sentence Prediction task truly necessary? How much did the data size and other hyperparameters matter?
 
