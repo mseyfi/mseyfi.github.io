@@ -188,7 +188,7 @@ $$L_{\text{batch}}(\theta) = L_{MLM}^{\text{batch}}(\theta) + L_{NSP}^{\text{bat
 
     **How `log p_i(x_i)` is Calculated:**
 
-    1.  The final hidden state for a masked token, $h_i \in \mathbb{R}^{H}$, is passed through the MLM head to produce a logit vector $\text{logits}_i \in \mathbb{R}^{|V|}$.
+    1.  The final hidden state for a masked token, $h_i \in \mathbb{R}^{H}$, is passed through the MLM head to produce a logit vector $\text{logits}_i \in \mathbb{R}^{\mid V\mid}$.
     2.  A softmax function is applied to the logits to get a probability distribution: $P_i = \text{softmax}(\text{logits}_i)$.
     3.  $p_i(x_i)$ is the probability value in the vector $P_i$ at the index corresponding to the true token $x_i$.
     4.  The natural logarithm of this probability is taken for the loss calculation.
