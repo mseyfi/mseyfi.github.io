@@ -660,6 +660,34 @@ class Solution:
 ## Note to remember: 
 Try to create a tree. Look at curr after each backtrack return. When a backtrack hits return that means it has hit a **node leaf**. Look at curr at that moment. Sometimes our tree do not append on leaf nodes, but they append on nodes  themeselves. At this time you should not return anything in your backtracking (look at subset example). Right after the return we have this tem `curr.pop()` try to imaging if curr pops the next item is  the item in  `for ... in ...` if we are done with all the children of the first child, that means we are at the end of the for loop and a new number will be chosen from scratch. That means `for i in range(start, end)` now what should this `start` be?  Also a very important thing you should do is to create a tree and beside each node write the status of the variables so you can track them.
 
+# Template 4 Partitioning.
+In many questions you are asked to partition the input based on a criteria the best way is to create segments like th code below
+
+```python
+def backtrack(input, curr, start=0):
+  if condition:
+    ans.append(curr[:])
+  return
+
+  for end in range(start + 1, len(input)):
+    segment = input[start: end]
+    if condition:
+      curr.append(seqment)
+      backtrack(input, curr, end)
+      curr.pop()
+```
+
+
+# Sample Questions
+
+
+[Word Search](https://leetcode.com/problems/word-search/?envType=problem-list-v2&envId=backtracking)
+
+**partitioning**
+[Valid IP ADDRESS](https://leetcode.com/problems/restore-ip-addresses/description/?envType=problem-list-v2&envId=backtracking)
+[Punishment Number](https://leetcode.com/problems/find-the-punishment-number-of-an-integer/description/?envType=problem-list-v2&envId=backtracking)
+
+
 # 7. Heap
 in heap the first element to pop in the minimum element in the heap. If we push tuples in the heap the fitst element to pop is the tuple with minimum first element. If two tuples have same first element then the tuple with the second element being minimum is poped.
 
