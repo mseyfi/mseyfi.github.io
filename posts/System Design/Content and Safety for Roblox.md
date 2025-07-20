@@ -443,7 +443,7 @@ A **load balancer** is a traffic manager that distributes incoming requests acro
 $$
 \begin{align}
 \text{Apeals} &=& \frac{\text{Number of reversed apeals}}{Number of harmful posts detected by the system}\\
-\text{Proactive Rate}&=&\frac{Number of harmful posts detected by the system}{Number of harmful posts detected by the system + reposted by users}
+\text{Proactive Rate}&=&\frac{\text{Number of harmful posts detected by the system}}{\text{Number of harmful posts detected by the system + reposted by users}}
 \end{align}
 $$
 
