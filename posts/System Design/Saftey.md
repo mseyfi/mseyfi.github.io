@@ -60,4 +60,4 @@ $$
 5- if a post has a low confidence for harmful then we send it to manual review.
 6- We evaluate the system performance using the KPIs. If a post is reported as harmful but we missed detecting it or if a post was flagged harmful but was apealed and passed we add the to our hard dataset for future retraining.
 
-
+load balancer can route the job to the clusters that are getting their batch full. So we can do batch processing for budget saving. If a user is with violence history we can immediately process the post.
