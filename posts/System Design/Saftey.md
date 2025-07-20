@@ -42,7 +42,9 @@ We use Binary cross entropy for each task. We can handle class imbalance using f
 
 ## **Evaluation**
 **offline:** PR-AUC or ROC-AUc are best, because precision or recall by itself cant be reliable because of the long tail characteristic of profanity and violence.
-**online:** $$
+**online:** 
+
+$$
 \begin{align}
 \text{Apeals} &=& \frac{\text{Number of reversed apeals}}{\text{Number of harmful posts detected by the system}}\\
 \text{Proactive Rate}&=&\frac{\text{Number of harmful posts detected by the system}}{\text{Number of harmful posts detected by the system + reposted by users}}
