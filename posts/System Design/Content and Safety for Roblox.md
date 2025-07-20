@@ -379,7 +379,7 @@ A **load balancer** is a traffic manager that distributes incoming requests acro
 
 ### 8. Evaluation Metrics
 
-#### What is ROC-AUC?
+#### What is ROC-AUC-Off-line?
 
 **ROC-AUC** stands for **Receiver Operating Characteristic - Area Under the Curve**. It is a performance measurement for classification problems at various threshold settings.
 
@@ -438,6 +438,14 @@ A **load balancer** is a traffic manager that distributes incoming requests acro
 | Inference Latency    | Stay within real-time constraints |
 | Model Size           | Supports scaling cost estimation  |
 
+### Online KPIs:
+
+$$
+\begin{align}
+\text{Apeals} &=& \frac{\text{Number of reversed apeals}}{Number of harmful posts detected by the system}
+\text{Proactive Rate}&=&\frac{Number of harmful posts detected by the system}{Number of harmful posts detected by the system + reposted by users}
+\end{align}
+$$
 ---
 
 ### 8.5 Handling Class Imbalance in Training
