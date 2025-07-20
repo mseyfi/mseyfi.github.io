@@ -3,6 +3,10 @@
 ## **Objective**
 We want to design a harmful contentdetectionsystem which identifies harmful posts, then deletes or demotes them and informs user why the post was identified as harmful. A post content might be text, image, video or any combination of these, and content can be in different languages. Users can report harmful posts.
 
+
+![img1](/images/harmful_sys_dsgn.png)
+
+
 ### Late Fusion: 
 is not good because each modality might not be harmful by its own but the combination may be harmful. So using different models for each modality and then combine the results would not perform as well.
 
@@ -38,5 +42,20 @@ We use Binary cross entropy for each task. We can handle class imbalance using f
 
 ## **Evaluation**
 **offline:** PR-AUC or ROC-AUc are best, because precision or recall by itself cant be reliable because of the long tail characteristic of profanity and violence.
-**online:** $$$$ 
+**online:** $$
+\begin{align}
+\text{Apeals} &=& \frac{\text{Number of reversed apeals}}{\text{Number of harmful posts detected by the system}}\\
+\text{Proactive Rate}&=&\frac{\text{Number of harmful posts detected by the system}}{\text{Number of harmful posts detected by the system + reposted by users}}
+\end{align}
+$$
+
+
+## **Serving:** 
+1- **Harmful detection service** is called and it has two parts (hash tables for images/text-data if we find specific words in the text, or image DNA(finger print) we can immediately report it without using the model.
+2- If a user with harmfull content history posts something, we reroute it to a heavier AI model.
+3- We use a load balancer for the traffic, the model is loaded to Kubernetes, for processing the data. 
+4- if a post is flagged as harmful, a notification is sent to the user accordingly by the **Violation enforcement service** and the post will be eliminated. The user will also be added to the hash table of harmful users.
+5- if a post has a low confidence for harmful then we send it to manual review.
+6- We evaluate the system performance using the KPIs. If a post is reported as harmful but we missed detecting it or if a post was flagged harmful but was apealed and passed we add the to our hard dataset for future retraining.
+
 
