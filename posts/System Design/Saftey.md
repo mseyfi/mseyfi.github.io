@@ -1,0 +1,42 @@
+# Multimodal Harmful posts
+
+## **Objective**
+We want to design a harmful contentdetectionsystem which identifies harmful posts, then deletes or demotes them and informs user why the post was identified as harmful. A post content might be text, image, video or any combination of these, and content can be in different languages. Users can report harmful posts.
+
+### Late Fusion: 
+is not good because each modality might not be harmful by its own but the combination may be harmful. So using different models for each modality and then combine the results would not perform as well.
+
+### Early fusion: 
+1. Extract features for each modality
+2. fuse them
+3. pass them trough a shared backbone
+4. get a single fused transformed feature
+5. pass them through multi task classification heads. (binary classification for each label)
+  5.1- Single Binay head: Doenst work because we a would not know what was harmful (nudity, gore, violence)
+  5.2- One binary classifiedr per harmful class: Its not ideal because different labels might need different proccessign and we need expert heads for each label.
+  5.3- Multi-task classifier: one head per llabel.
+
+## **Data Engineering**:
+1- Post(text, video, image)
+2- Reactions(likes, reposts, reposrts, comments)
+3- User(username, id, location, age, gender, followers, violence history, report history)
+
+
+## **models**
+Text: BERT or DistilmBERT, get the text and take a CLS tike in the output as it semantics.
+Image: ViT or ClIP based transformers, same we can the CLS token as the embedding.
+User reactions= [no. likes, no. reposts, no. reposrts] normalize and get the embedding
+Comments: use DistilBERT to get the embedding for each and then concatenate all
+get the feature from each model and fuse them.
+
+## **Dataset Preparation**:
+We can use the human annotators for posts to create validation set, thi sis time consuming. So we can have smaller dataset.
+We can use the user's reports for labeling
+
+## **loss function**
+We use Binary cross entropy for each task. We can handle class imbalance using focal loss, resampling or weighted loss funcction.
+
+## **Evaluation**
+**offline:** PR-AUC or ROC-AUc are best, because precision or recall by itself cant be reliable because of the long tail characteristic of profanity and violence.
+**online:** $$$$ 
+
