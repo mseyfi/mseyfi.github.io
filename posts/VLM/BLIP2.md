@@ -179,7 +179,7 @@ The loss is the InfoNCE (Noise-Contrastive Estimation) loss, calculated for both
    \mathcal{L}_{t2i} = - \frac{1}{B} \sum_{i=1}^{B} \log \frac{\exp(s(I_i, T_i) / \tau)}{\sum_{j=1}^{B} \exp(s(I_j, T_i) / \tau)}
    $$
 
-   where $	au$ is a learnable temperature parameter.
+   where $\tau$ is a learnable temperature parameter.
 
 5. **Total ITC Loss:** $$\mathcal{L}_{ITC} = (\mathcal{L}_{i2t} + \mathcal{L}_{t2i}) / 2$$
 
