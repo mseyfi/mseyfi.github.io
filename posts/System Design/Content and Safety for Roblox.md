@@ -446,6 +446,7 @@ $$
 \text{Proactive Rate}&=&\frac{Number of harmful posts detected by the system}{Number of harmful posts detected by the system + reposted by users}
 \end{align}
 $$
+
 ---
 
 ### 8.5 Handling Class Imbalance in Training
