@@ -43,8 +43,9 @@ output: ranked videos
 3-User interaction Data
 
 ## Videos
+-----------------------------------------------------------------------
 |ID|Tags|length|Language|number of likes|comments|views|rating(pg,pg13|
-
+-----------------------------------------------------------------------
 
 
 
