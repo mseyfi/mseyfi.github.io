@@ -44,9 +44,25 @@ output: ranked videos
 
 ## Videos
 
-| ID  | Tags  | Length | Language | Number of Likes | Comments | Views | Rating (PG, PG-13) |
-------|-------|--------|----------|------------------|----------|--------|---------------------|
+| ID  | Tags  | Title  | Length | Language | Number of Likes | Comments | Views | Rating (PG, PG-13) |
+------|-------|--------|--------|----------|-----------------|----------|-------|--------------------|
+Embedding| CBOW|BERT | Bucketize + Embedding|Bucketize + Embedding|Bert|Bucketize + Embedding|Embedding
 
+
+## User 
+
+| Age | Gender | Location | Username | ID  | Language | Time Zone |
+|-----|--------|----------|----------|-----|----------|-----------|
+|     |        |          |          |     |          |           |
+
+## User-Video Interactions
+
+| User ID | Video ID | Interaction Type | Interaction Value      | Location     | Time Stamp  |
+|---------|----------|------------------|-------------------------|--------------|-------------|
+| 4       | 18       | like             |                         | 38.89-077.1  | 128648624   |
+| 15      | 6        | watch            | 88mins                  | 38.9-23.2    | 12872496    |
+| 9       | -        | search           | basics of clustering    | 22.3-54.2    | 3864123     |
+| 8       | comment  | amazing          |                         | 37.23-12293  | 125143653   |
 
 
 
