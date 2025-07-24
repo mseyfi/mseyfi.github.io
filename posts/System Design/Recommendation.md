@@ -46,7 +46,7 @@ output: ranked videos
 
 | ID  | Tags  | Title  | Length | Language | Number of Likes | Comments | Views | Rating (PG, PG-13) |
 ------|-------|--------|--------|----------|-----------------|----------|-------|--------------------|
-Embedding| CBOW|BERT | Bucketize + Embedding|Bucketize + Embedding|Bert|Bucketize + Embedding|Embedding
+Embedding| CBOW|BERT | log++normalize|Embedding|log+normalize|Bert|log+normalzie|Embedding
 
 
 ## User 
