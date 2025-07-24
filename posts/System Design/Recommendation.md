@@ -49,11 +49,6 @@ output: ranked videos
 Embedding| CBOW|BERT | log+normalize|Embedding|log+normalize|BERT|log+normalzie|Embedding
 
 
-## User 
-
-| Age | Gender | Location | Username | ID  | Language | Time Zone |
-|-----|--------|----------|----------|-----|----------|-----------|
-| bucke+Embedding|Embedding|Clustered+embedding|BERT|Embedding|Embedding|Embedding|
 
 ## User-Video Interactions
 
@@ -62,7 +57,32 @@ Embedding| CBOW|BERT | log+normalize|Embedding|log+normalize|BERT|log+normalzie|
 | 4       | 18       | like             |                         | 38.89-077.1  | 128648624   |
 | 15      | 6        | watch            | 88mins                  | 38.9-23.2    | 12872496    |
 | 9       | -        | search           | basics of clustering    | 22.3-54.2    | 3864123     |
-| 8       | comment  | amazing          |                         | 37.23-12293  | 125143653   |
+| 8       | 12       | comment          | amazing job             | 37.23-12293  | 125143653   |
+|---------|----------|------------------|-------------------------|--------------|-------------|
+|Embedding|Embedding |
+
+
+
+
+## User 
+
+### Demographics
+
+| Age | Gender | Location | Username | ID  | Language | Time Zone |
+|-----|--------|----------|----------|-----|----------|-----------|
+| bucke+Embedding|Embedding|Clustered+embedding|BERT|Embedding|Embedding|Embedding|
+
+
+### Contextual Information
+|Time of Day | Device | Day of Week|
+-------------|--------|------------|
+bucket+embedding|embedding|embedding|
+
+
+User:  | Demographics | Contextual | Historical Interactions |
+       |--------------|------------|-------------------------| 
+
+
 
 
 
