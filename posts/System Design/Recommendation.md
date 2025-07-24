@@ -46,14 +46,14 @@ output: ranked videos
 
 | ID  | Tags  | Title  | Length | Language | Number of Likes | Comments | Views | Rating (PG, PG-13) |
 ------|-------|--------|--------|----------|-----------------|----------|-------|--------------------|
-Embedding| CBOW|BERT | log++normalize|Embedding|log+normalize|Bert|log+normalzie|Embedding
+Embedding| CBOW|BERT | log+normalize|Embedding|log+normalize|BERT|log+normalzie|Embedding
 
 
 ## User 
 
 | Age | Gender | Location | Username | ID  | Language | Time Zone |
 |-----|--------|----------|----------|-----|----------|-----------|
-|     |        |          |          |     |          |           |
+| bucke+Embedding|Embedding|Clustered+embedding|BERT|Embedding|Embedding|Embedding|
 
 ## User-Video Interactions
 
