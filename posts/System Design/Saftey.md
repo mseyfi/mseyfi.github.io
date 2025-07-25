@@ -21,9 +21,11 @@ is not good because each modality might not be harmful by its own but the combin
   5.3- Multi-task classifier: one head per llabel.
 
 ## **Data Engineering**:
-1- Post(text, video, image)
-2- Reactions(likes, reposts, reposrts, comments)
-3- User(username, id, location, age, gender, followers, violence history, report history)
+1- Post(text, video, image, links, time-stamp, location, ID, authors ID, authors IP)
+
+2- Useer-Post Interactions(User ID, post ID, reaction type, reaction value, timestamps)     reaction types (like, repost, report, comment) reaction values(-, binary, binary, text)
+
+3- User(username, id, location, age, gender, followers, violence history, report history, time of day, day of week, device)
 
 
 ![img](/images/Safety_Feature.png)
