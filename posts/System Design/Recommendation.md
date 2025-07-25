@@ -59,9 +59,10 @@ Embedding| CBOW|BERT | log+normalize|Embedding|log+normalize|BERT|log+normalzie|
 | 9       | -        | search           | basics of clustering    | 22.3-54.2    | 3864123     |
 | 8       | 12       | comment          | amazing job             | 37.23-12293  | 125143653   |
 |---------|----------|------------------|-------------------------|--------------|-------------|
-|Embedding|Embedding |
+|Embedding|Embedding | Embedding |  BERT or log + normalization| cluster + embedding| Bucket + embedding|
 
-
+For video Interaction history we create a feature for each user. For each video id we create interaction feature for the specific user and then aggregate all of them.
+We can alternatively create features for searched videos and videos with comments, and liked videos, each separately and then concatenate the result.
 
 
 ## User 
@@ -83,6 +84,52 @@ User:  | Demographics | Contextual | Historical Interactions |
        |--------------|------------|-------------------------| 
 
 
+## Model development
+For each user, we craft user features and concatenate them with their video-interaction history. For each user, we have a specific feature. For each video, we also have a feature
 
+## Matrix Factorization: Collaborative Filtering
+If observation is the feedback a user give to a video, we create a feedback matrix and try to optimize the loss below using gradient descent
+
+$$
+\sum_{(i,j) \in obs} (1 - \lambda) (A_{ij} - U_i^T V_j)^2 + \lambda \sum_{(i,j) \notin obs} (A_{ij} - U_i^T V_j)^2
+$$
+
+user i1 likes video j
+
+user i2 also likes video j
+
+Look for other videos that user i2 likes and multiply those video features by user i2 features and get the top k.
+
+## Two Towers
+
+User features and their interactions with tower 1 and video features to tower 2, both create embedding. 
+
+we can train them using contrastive learning or BCE
+
+positive videos: those who the user liked, or watched at least half
+Negative Videos: those who the user disliked and randomly select from the one the user did not watch.
+
+Inference:
+if its not cold start we start with collaborative filtering to narrow down some videos. Then select from those
+
+ANN and FAISS is used to search for video embeddings in the system,
+
+## Evaluation:
+
+**off line**
+precision@k: Proportion of number of relevant videos among the top k videos for multiple k values
+mAP: 
+Diversity: How much the videos are diverse. for this we can average the 1-1 similarity scores betweenthe videos and they should be close to zero
+
+**online**
+Click Through Rate = number of clicked videos / number of recommended videos
+
+Number of completed videos
+
+Total watch time
+
+Explicit User feedback
+
+## Serving
 
 
