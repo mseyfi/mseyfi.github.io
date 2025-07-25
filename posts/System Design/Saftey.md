@@ -26,7 +26,7 @@ is not good because each modality might not be harmful by its own but the combin
 3- User(username, id, location, age, gender, followers, violence history, report history)
 
 
-![img](/images/saftey_feature.png)
+![img](/images/Safety_Feature.png)
 
 ## **models**
 Text: BERT or DistilmBERT, get the text and take a CLS tike in the output as it semantics.
@@ -53,7 +53,7 @@ $$
 \end{align}
 $$
 
-![img](/images/saftey_system.png)
+![img](/images/Safety_System.png)
 ## **Serving:** 
 1- **Harmful detection service** is called and it has two parts (hash tables for images/text-data if we find specific words in the text, or image DNA(finger print) we can immediately report it without using the model.
 2- If a user with harmfull content history posts something, we reroute it to a heavier AI model.
