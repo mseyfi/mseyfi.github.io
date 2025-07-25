@@ -34,7 +34,7 @@ Comments: use DistilBERT to get the embedding for each and then concatenate all
 get the feature from each model and fuse them.
 
 ## **Dataset Preparation**:
-We can use the human annotators for posts to create validation set, thi sis time consuming. So we can have smaller dataset.
+We can use the human annotators for posts to create validation set, this is time consuming. So we can have smaller dataset.
 We can use the user's reports for labeling
 
 ## **loss function**
@@ -47,7 +47,7 @@ We use Binary cross entropy for each task. We can handle class imbalance using f
 $$
 \begin{align}
 \text{Apeals} &=& \frac{\text{Number of reversed apeals}}{\text{Number of harmful posts detected by the system}}\\
-\text{Proactive Rate}&=&\frac{\text{Number of harmful posts detected by the system}}{\text{Number of harmful posts detected by the system + reposted by users}}
+\text{Proactive Rate}&=&\frac{\text{Number of harmful posts detected by the system}}{\text{Number of harmful posts detected by the system + reported by users}}
 \end{align}
 $$
 
