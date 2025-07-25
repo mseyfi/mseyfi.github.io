@@ -58,7 +58,6 @@ Embedding| CBOW|BERT | log+normalize|Embedding|log+normalize|BERT|log+normalzie|
 | 15      | 6        | watch            | 88mins                  | 38.9-23.2    | 12872496    |
 | 9       | -        | search           | basics of clustering    | 22.3-54.2    | 3864123     |
 | 8       | 12       | comment          | amazing job             | 37.23-12293  | 125143653   |
-|---------|----------|------------------|-------------------------|--------------|-------------|
 |Embedding|Embedding | Embedding |  BERT or log + normalization| cluster + embedding| Bucket + embedding|
 |---------|----------|------------------|-------------------------|--------------|-------------|
 
