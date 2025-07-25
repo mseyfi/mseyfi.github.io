@@ -60,6 +60,7 @@ Embedding| CBOW|BERT | log+normalize|Embedding|log+normalize|BERT|log+normalzie|
 | 8       | 12       | comment          | amazing job             | 37.23-12293  | 125143653   |
 |---------|----------|------------------|-------------------------|--------------|-------------|
 |Embedding|Embedding | Embedding |  BERT or log + normalization| cluster + embedding| Bucket + embedding|
+|---------|----------|------------------|-------------------------|--------------|-------------|
 
 For video Interaction history we create a feature for each user. For each video id we create interaction feature for the specific user and then aggregate all of them.
 We can alternatively create features for searched videos and videos with comments, and liked videos, each separately and then concatenate the result.
