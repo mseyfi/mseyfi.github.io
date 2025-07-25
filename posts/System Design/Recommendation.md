@@ -118,7 +118,7 @@ ANN and FAISS is used to search for video embeddings in the system,
 **offline**
 precision@k: Proportion of number of relevant videos among the top k videos for multiple k values
 mAP: 
-$mAp = \frac{\sum_i^k \text{Precision@i if i's video is relevant to the user}}{total relevant items}$
+$mAp = \frac{\sum_i^k \text{Precision@i if i's video is relevant to the user}}{\text{total relevant items}}$
 
 Diversity: How much the videos are diverse. for this we can average the 1-1 similarity scores betweenthe videos and they should be close to zero
 
@@ -133,4 +133,4 @@ Explicit User feedback
 
 ## Serving
 
-
+![img](/images/video_recom.png)
