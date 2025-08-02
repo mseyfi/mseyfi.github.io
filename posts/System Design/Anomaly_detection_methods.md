@@ -354,3 +354,51 @@ Say you extract `2 million` patch features from the training set.
 
 ---
 
+Here's a comprehensive table of **vision-language (VL) based anomaly detection methods**, focusing on **CLIP-based** and other **VL model approaches**. The table includes:
+
+* Model name
+* Whether it supports localization
+* Zero-shot capability
+* Key pros and cons
+* Inference speed estimate
+* Paper link
+
+---
+
+### 🔍 **Vision-Language Models for Anomaly Detection**
+
+| Model                    | Localization       | Zero-Shot | Pros                                                                | Cons                                                         | Inference Time (4K image) | Paper / Link                              |
+| ------------------------ | ------------------ | --------- | ------------------------------------------------------------------- | ------------------------------------------------------------ | ------------------------- | ----------------------------------------- |
+| **AnomalyCLIP** (2023)   | ✅ Patch-level      | ✅         | No training needed, open-vocabulary, good localization              | Sensitive to background clutter, weaker on texture anomalies | 50–80 ms                  | [Paper](https://arxiv.org/abs/2303.15156) |
+| **WinCLIP** (2023)       | ✅ (Window-level)   | ✅         | Robust to image size, good tradeoff between speed and accuracy      | Less sensitive to small defects                              | 50–90 ms                  | [Paper](https://arxiv.org/abs/2306.04151) |
+| **MICLe-AD** (2023)      | ✅                  | ❌         | Learns better domain-specific embeddings; handles texture anomalies | Requires fine-tuning; reduced generalization                 | 80–120 ms                 | [Paper](https://arxiv.org/abs/2303.14721) |
+| **ViT-AD (CLIP)** (2023) | ✅ Patch-level      | ✅         | Uses CLIP-ViT to extract high-quality patch features                | Slower, large memory usage for ViT on high-res images        | 60–100 ms                 | [Paper](https://arxiv.org/abs/2303.09226) |
+| **MaskCLIP-AD** (2023)   | ✅ (via CAM + mask) | ✅         | Strong semantic region localization with zero-shot CLIP + CAM masks | Relies on CAM approximations, not pixel-precise              | 70–110 ms                 | [Paper](https://arxiv.org/abs/2309.00662) |
+| **LLR-AD** (2023)        | ❌                  | ✅         | Extremely lightweight, global anomaly detection, simple pipeline    | No localization; can miss subtle patch-level anomalies       | 20–30 ms                  | [Paper](https://arxiv.org/abs/2304.11869) |
+| **PromptAD** (2024)      | ✅                  | ✅         | Learns adaptive text prompts for improved alignment                 | Requires some domain adaptation (semi-supervised)            | \~60–90 ms                | [Paper](https://arxiv.org/abs/2402.01825) |
+| **SEMA-AD** (2024)       | ✅                  | ✅         | Semantic + visual memory fusion; handles structure and texture well | High memory footprint, heavy ViT backbone                    | 70–100 ms                 | [Paper](https://arxiv.org/abs/2402.15330) |
+
+---
+
+### 📝 Notes
+
+* **Inference time** is estimated for **A100** with **ViT-B/16** backbone at **4K resolution**.
+* Most methods leverage **CLIP ViT-B/16** or **ResNet50** as the image encoder.
+* Zero-shot models require **no retraining or fine-tuning**; they rely on prompt engineering or pretrained semantics.
+* Localization quality varies from **coarse CAMs** to **fine patch-wise heatmaps**.
+
+---
+
+### ✅ Recommendations by Use Case
+
+| Use Case                                | Recommended Method            |
+| --------------------------------------- | ----------------------------- |
+| Fast global anomaly detection           | **LLR-AD**                    |
+| Semantic anomalies (e.g., wrong object) | **AnomalyCLIP**, **WinCLIP**  |
+| Texture or low-level defects            | **MICLe-AD**, **SEMA-AD**     |
+| Lightweight deployment                  | **LLR-AD**, **PromptAD**      |
+| Open-set, unseen anomaly classes        | **AnomalyCLIP**, **PromptAD** |
+
+---
+
+Let me know if you want code or comparisons against PatchCore/PaDiM in an industrial context, or if you want this exported to CSV or markdown.
