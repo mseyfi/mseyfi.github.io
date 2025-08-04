@@ -136,9 +136,9 @@ You have:
 
 Both domains have **different distributions**:
 
-$$
+$
 P_S(x, y) \ne P_T(x, y)
-$$
+$
 
 But your goal is to train a model that performs **well on the target domain**, even though you don’t have target labels.
 
@@ -179,9 +179,9 @@ Image -> Feature Extractor -> (1) Classifier
 * Use **gradient reversal layer (GRL)** to reverse gradients from the domain discriminator.
 * Objective:
 
-  $$
+  $
   \min_{F,C} \max_D \left[ L_{\text{cls}}(C(F(x^S)), y^S) - \lambda L_{\text{dom}}(D(F(x)), d) \right]
-  $$
+  $
 
   where $d=0$ for source, $d=1$ for target.
 
@@ -191,9 +191,9 @@ This forces the feature extractor $F$ to learn **domain-invariant** representati
 
 Match **second-order statistics** (covariances) between source and target:
 
-$$
+$
 \text{CORAL loss} = \| \text{Cov}(F(x^S)) - \text{Cov}(F(x^T)) \|_F^2
-$$
+$
 
 It's simple and effective for aligning distributions.
 
@@ -201,9 +201,9 @@ It's simple and effective for aligning distributions.
 
 Minimize the **distance between distributions** in RKHS:
 
-$$
+$
 \text{MMD}^2 = \| \mu_S - \mu_T \|_{\mathcal{H}}^2
-$$
+$
 
 Where $\mu_S = \mathbb{E}[F(x^S)]$, $\mu_T = \mathbb{E}[F(x^T)]$.
 
