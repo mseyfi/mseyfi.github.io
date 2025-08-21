@@ -37,11 +37,12 @@ Here are the formal steps:
 2.  **Main Loop:**
 
       * While the priority queue is not empty:
+        
         a. Pop the element with the smallest distance (priority) from the queue. Let's call it `(current_distance, current_node)`.
         
         b. If `current_distance` is greater than the distance we already have recorded for `current_node` in our `distances` dictionary, it means we've found a shorter path to this node already. So, we skip it and
 
-    continue to the next iteration.
+      * continue to the next iteration.
 
         c. For each `neighbor` of the `current_node`:
 
