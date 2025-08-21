@@ -38,13 +38,20 @@ Here are the formal steps:
 
       * While the priority queue is not empty:
         a. Pop the element with the smallest distance (priority) from the queue. Let's call it `(current_distance, current_node)`.
-        b. If `current_distance` is greater than the distance we already have recorded for `current_node` in our `distances` dictionary, it means we've found a shorter path to this node already. So, we skip it and continue to the next iteration.
-        c. For each `neighbor` of the `current_node`:
-        i. Calculate the distance to this neighbor through the `current_node`: `distance = current_distance + weight_of_edge`.
-        ii. **Relaxation Step:** If this new `distance` is smaller than the known distance to the `neighbor` (stored in the `distances` dictionary), it means we have found a new shorter path.
-        iii. Update the `distances` dictionary with this new shorter distance and push `(new_distance, neighbor)` to the priority queue.
+        
+        b. If `current_distance` is greater than the distance we already have recorded for `current_node` in our `distances` dictionary, it means we've found a shorter path to this node already. So, we skip it and
 
-3.  **Termination:**
+    continue to the next iteration.
+
+        c. For each `neighbor` of the `current_node`:
+
+          i. Calculate the distance to this neighbor through the `current_node`: `distance = current_distance + weight_of_edge`.
+
+          ii. **Relaxation Step:** If this new `distance` is smaller than the known distance to the `neighbor` (stored in the `distances` dictionary), it means we have found a new shorter path.
+
+          iii. Update the `distances` dictionary with this new shorter distance and push `(new_distance, neighbor)` to the priority queue.
+
+4.  **Termination:**
 
       * When the loop finishes, the `distances` dictionary will contain the shortest path distances from the source node to all other reachable nodes.
 
