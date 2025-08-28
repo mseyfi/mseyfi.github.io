@@ -34,7 +34,7 @@ Your intuition probably screams **7/10 or 0.7**. This intuitive answer is precis
 
 Let's formalize this.
 
-1.  **Define the Likelihood Function:** Let our dataset be $D = \{x_1, x_2, ..., x_N\}$ and our model parameters be $\theta$. The likelihood function $L(\theta | D)$ is defined as the probability of observing the data $D$ given the parameters $\theta$.
+1.  **Define the Likelihood Function:** Let our dataset be $D = \{x_1, x_2, ..., x_N\}$ and our model parameters be $\theta$. The likelihood function $L(\theta \mid D)$ is defined as the probability of observing the data $D$ given the parameters $\theta$.
 
     $$
     L(\theta \mid  D) = P(D \mid \theta)
