@@ -3,7 +3,7 @@
 
 <br>
 
-## [![MLE](https://img.shields.io/badge/MLE_MAP-Maximum_Likelihood_and_Maximum_Aposteriori_Estimation-blue?style=for-the-badge&logo=github)](../posts/MLE)
+## [![MLE](https://img.shields.io/badge/MLE/MAP-Maximum_Likelihood_and_Maximum_Aposteriori_Estimation-blue?style=for-the-badge&logo=github)](../posts/MLE)
 
 <div style="background-color: #f0f8ff; color: #555;font-weight: 485; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
 We talk about Maximum Likelihood Estimation (MLE) and Maximum a Posteriori (MAP) with clear intuitions, mathematical derivations, and concrete examples from neural networks and computer vision.
