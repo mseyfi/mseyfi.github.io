@@ -37,25 +37,25 @@ Let's formalize this.
 1.  **Define the Likelihood Function:** Let our dataset be $D = \{x_1, x_2, ..., x_N\}$ and our model parameters be $\theta$. The likelihood function $L(\theta | D)$ is defined as the probability of observing the data $D$ given the parameters $\theta$.
 
     $$
-    L(\theta \middle  D) = P(D \middle \theta)
+    L(\theta \mid  D) = P(D \mid \theta)
     $$
 
     If we assume our data points are independent and identically distributed (i.i.d.), we can write this as a product:
 
     $$
-    L(\theta \middle  D) = \prod_{i=1}^{N} P(x_i \middle  \theta)
+    L(\theta \mid  D) = \prod_{i=1}^{N} P(x_i \mid  \theta)
     $$
 
 2.  **Maximize the Likelihood:** The goal of MLE is to find the parameters $\hat{\theta}_{MLE}$ that maximize this function.
 
     $$
-    \hat{\theta}_{MLE} = \arg\max_{\theta} L(\theta \middle D)
+    \hat{\theta}_{MLE} = \arg\max_{\theta} L(\theta \mid D)
     $$
 
 3.  **Use the Log-Likelihood:** Products are mathematically cumbersome to differentiate. Since the logarithm is a monotonically increasing function, maximizing a function is the same as maximizing its logarithm. This turns our product into a much friendlier sum.
 
     $$
-    \hat{\theta}_{MLE} = \arg\max_{\theta} \log \left( \prod_{i=1}^{N} P(x_i \middle \theta) \right) = \arg\max_{\theta} \sum_{i=1}^{N} \log P(x_i \middle \theta)
+    \hat{\theta}_{MLE} = \arg\max_{\theta} \log \left( \prod_{i=1}^{N} P(x_i \mid \theta) \right) = \arg\max_{\theta} \sum_{i=1}^{N} \log P(x_i \mid \theta)
     $$
     This is called the **log-likelihood**.
 
@@ -72,14 +72,14 @@ Let's say we're training a neural network for a regression task (e.g., predictin
 * **Likelihood:** The probability density of observing a single data point $y_i$ is given by the Gaussian PDF:
 
     $$
-    P(y_i \middle x_i; \theta) = \frac{1}{\sqrt{2\pi\sigma^2}} \exp\left(-\frac{(y_i - f(x_i; \theta))^2}{2\sigma^2}\right)
+    P(y_i \mid x_i; \theta) = \frac{1}{\sqrt{2\pi\sigma^2}} \exp\left(-\frac{(y_i - f(x_i; \theta))^2}{2\sigma^2}\right)
     $$
 
 * **Negative Log-Likelihood:** Let's find the total negative log-likelihood for our dataset $D = \{(x_1, y_1), ..., (x_N, y_N)\}$.
 
     $$
     \begin{aligned}
-    -\log L(\theta\middle D) &=& -\log \prod_{i=1}^{N} P(y_i \middle x_i; \theta) = -\sum_{i=1}^{N} \log P(y_i \middle x_i; \theta)
+    -\log L(\theta\mid D) &=& -\log \prod_{i=1}^{N} P(y_i \mid x_i; \theta) = -\sum_{i=1}^{N} \log P(y_i \mid x_i; \theta)
     &=& -\sum_{i=1}^{N} \log \left( \frac{1}{\sqrt{2\pi\sigma^2}} \exp\left(-\frac{(y_i - f(x_i; \theta))^2}{2\sigma^2}\right) \right)
     &=& -\sum_{i=1}^{N} \left( \log\left(\frac{1}{\sqrt{2\pi\sigma^2}}\right) - \frac{(y_i - f(x_i; \theta))^2}{2\sigma^2} \right)
     &=& \sum_{i=1}^{N} \frac{(y_i - f(x_i; \theta))^2}{2\sigma^2} + \sum_{i=1}^{N} \log(\sqrt{2\pi\sigma^2})
@@ -106,14 +106,14 @@ Let's consider a multi-class classification problem (e.g., ImageNet). Our networ
 * **Likelihood:** Let the true label $y_i$ be a one-hot encoded vector (e.g., `[0, 0, 1, 0]` for class 3). The probability of observing this true label is simply the probability our model assigned to that class.
 
     $$
-    P(y_i \middle x_i; \theta) = \prod_{c=1}^{C} p_{i,c}^{y_{i,c}}
+    P(y_i \mid x_i; \theta) = \prod_{c=1}^{C} p_{i,c}^{y_{i,c}}
     $$
   
     Since $y_{i,c}$ is 1 for the correct class and 0 for all others, this product just picks out the single correct probability.
 
 * **Negative Log-Likelihood:**
     $$
-    -\log L(\theta\middle D) = -\sum_{i=1}^{N} \log P(y_i \middle  x_i; \theta)
+    -\log L(\theta\mid D) = -\sum_{i=1}^{N} \log P(y_i \mid  x_i; \theta)
     $$
 
      $$
@@ -149,25 +149,25 @@ MAP uses Bayes' theorem to update our beliefs.
 1.  **Bayes' Theorem:** It connects the posterior probability (what we want) to the likelihood and the prior.
 
     $$
-    \underbrace{P(\theta \middle  D)}_{\text{Posterior}} = \frac{\overbrace{P(D \middle  \theta)}^{\text{Likelihood}} \overbrace{P(\theta)}^{\text{Prior}}}{\underbrace{P(D)}_{\text{Evidence}}}
+    \underbrace{P(\theta \mid  D)}_{\text{Posterior}} = \frac{\overbrace{P(D \mid  \theta)}^{\text{Likelihood}} \overbrace{P(\theta)}^{\text{Prior}}}{\underbrace{P(D)}_{\text{Evidence}}}
     $$
 
 2.  **Maximize the Posterior:** The goal of MAP is to find the parameters that maximize the posterior probability.
 
     $$
-    \hat{\theta}_{MAP} = \arg\max_{\theta} P(\theta \middle  D) = \arg\max_{\theta} \frac{P(D \middle  \theta) P(\theta)}{P(D)}
+    \hat{\theta}_{MAP} = \arg\max_{\theta} P(\theta \mid  D) = \arg\max_{\theta} \frac{P(D \mid  \theta) P(\theta)}{P(D)}
     $$
 
     Since the evidence $P(D)$ doesn't depend on $\theta$, we can drop it from the maximization:
 
     $$
-    \hat{\theta}_{MAP} = \arg\max_{\theta} P(D \middle  \theta) P(\theta)
+    \hat{\theta}_{MAP} = \arg\max_{\theta} P(D \mid  \theta) P(\theta)
     $$
 
 3.  **Use the Log-Posterior:** Again, we use logs to make the math easier.
 
     $$
-    \hat{\theta}_{MAP} = \arg\max_{\theta} [\log P(D \middle  \theta) + \log P(\theta)]
+    \hat{\theta}_{MAP} = \arg\max_{\theta} [\log P(D \mid  \theta) + \log P(\theta)]
     $$
 
 Notice the formula! The MAP estimate maximizes the **log-likelihood (the MLE term) PLUS the log of the prior**.
@@ -183,18 +183,18 @@ Let's revisit our regression problem.
 * **Prior Belief:** We'll now add a prior on the network weights $\theta$. A very common choice is a **Gaussian prior**, centered at zero: $\theta \sim \mathcal{N}(0, \beta^2 I)$. This expresses a belief that most weights should be small and close to zero. This is a great way to encourage a "simpler" model.
     
 
-* **Log-Prior:** The PDF for this prior is $P(\theta) \propto \exp\left(-\frac{\middle \theta\middle ^2_2}{2\beta^2}\right)$, where $\middle \theta\middle ^2_2 = \sum_j \theta_j^2$ is the squared L2-norm. The log of the prior is:
+* **Log-Prior:** The PDF for this prior is $P(\theta) \propto \exp\left(-\frac{\mid \theta\mid ^2_2}{2\beta^2}\right)$, where $\mid \theta\mid ^2_2 = \sum_j \theta_j^2$ is the squared L2-norm. The log of the prior is:
 
     $$
-    \log P(\theta) = -\frac{\middle \theta\middle ^2_2}{2\beta^2} + \text{constant}
+    \log P(\theta) = -\frac{\mid \theta\mid ^2_2}{2\beta^2} + \text{constant}
     $$
 
 * **The Loss Function:** To get our final MAP objective, we minimize the negative log-posterior.
 
     $$
   \begin{aligned}
-    \text{Loss}(\theta) &=& -\log P(D \middle  \theta) - \log P(\theta)
-    &\propto& \left[ \sum_{i=1}^{N} (y_i - f(x_i; \theta))^2 \right] + \left[ \frac{\sigma^2}{\beta^2} \middle \theta\middle ^2_2 \right]
+    \text{Loss}(\theta) &=& -\log P(D \mid  \theta) - \log P(\theta)
+    &\propto& \left[ \sum_{i=1}^{N} (y_i - f(x_i; \theta))^2 \right] + \left[ \frac{\sigma^2}{\beta^2} \mid \theta\mid ^2_2 \right]
   \end{aligned}
     $$
   
@@ -202,7 +202,7 @@ Let's revisit our regression problem.
     If we define a regularization strength $\lambda = \frac{\sigma^2}{\beta^2}$, we get:
 
     $$
-    \text{Loss}(\theta) = \underbrace{\sum_{i=1}^{N} (y_i - f(x_i; \theta))^2}_{\text{MSE (from Likelihood)}} + \underbrace{\lambda \middle \theta\middle ^2_2}_{\text{L2 Regularization (from Prior)}}
+    \text{Loss}(\theta) = \underbrace{\sum_{i=1}^{N} (y_i - f(x_i; \theta))^2}_{\text{MSE (from Likelihood)}} + \underbrace{\lambda \mid \theta\mid ^2_2}_{\text{L2 Regularization (from Prior)}}
     $$
 
   This is the classic loss function for **Ridge Regression** or a neural network trained with **L2 Regularization** (also called weight decay).
