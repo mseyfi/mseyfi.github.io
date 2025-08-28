@@ -57,6 +57,7 @@ Let's formalize this.
     $$
     \hat{\theta}_{MLE} = \arg\max_{\theta} \log \left( \prod_{i=1}^{N} P(x_i \mid \theta) \right) = \arg\max_{\theta} \sum_{i=1}^{N} \log P(x_i \mid \theta)
     $$
+    
     This is called the **log-likelihood**.
 
 ### MLE and Neural Network Loss Functions
@@ -79,9 +80,9 @@ Let's say we're training a neural network for a regression task (e.g., predictin
 
     $$
     \begin{aligned}
-    -\log L(\theta\mid D) &=& -\log \prod_{i=1}^{N} P(y_i \mid x_i; \theta) = -\sum_{i=1}^{N} \log P(y_i \mid x_i; \theta)
-    &=& -\sum_{i=1}^{N} \log \left( \frac{1}{\sqrt{2\pi\sigma^2}} \exp\left(-\frac{(y_i - f(x_i; \theta))^2}{2\sigma^2}\right) \right)
-    &=& -\sum_{i=1}^{N} \left( \log\left(\frac{1}{\sqrt{2\pi\sigma^2}}\right) - \frac{(y_i - f(x_i; \theta))^2}{2\sigma^2} \right)
+    -\log L(\theta\mid D) &=& -\log \prod_{i=1}^{N} P(y_i \mid x_i; \theta) = -\sum_{i=1}^{N} \log P(y_i \mid x_i; \theta)\\
+    &=& -\sum_{i=1}^{N} \log \left( \frac{1}{\sqrt{2\pi\sigma^2}} \exp\left(-\frac{(y_i - f(x_i; \theta))^2}{2\sigma^2}\right) \right)\\
+    &=& -\sum_{i=1}^{N} \left( \log\left(\frac{1}{\sqrt{2\pi\sigma^2}}\right) - \frac{(y_i - f(x_i; \theta))^2}{2\sigma^2} \right)\\
     &=& \sum_{i=1}^{N} \frac{(y_i - f(x_i; \theta))^2}{2\sigma^2} + \sum_{i=1}^{N} \log(\sqrt{2\pi\sigma^2})
   \end{aligned}
   $$
@@ -113,16 +114,14 @@ Let's consider a multi-class classification problem (e.g., ImageNet). Our networ
 
 * **Negative Log-Likelihood:**
     $$
-    -\log L(\theta\mid D) = -\sum_{i=1}^{N} \log P(y_i \mid  x_i; \theta)
-    $$
+  \begin{aligned}
+    -\log L(\theta\mid D) &=& -\sum_{i=1}^{N} \log P(y_i \mid  x_i; \theta)\\
+  
+    &=& -\sum_{i=1}^{N} \log \left( \prod_{c=1}^{C} p_{i,c}^{y_{i,c}} \right)\\
 
-     $$
-    = -\sum_{i=1}^{N} \log \left( \prod_{c=1}^{C} p_{i,c}^{y_{i,c}} \right)
-    $$
-
-     $$
-    = -\sum_{i=1}^{N} \sum_{c=1}^{C} y_{i,c} \log(p_{i,c})
-    $$
+    &=& -\sum_{i=1}^{N} \sum_{c=1}^{C} y_{i,c} \log(p_{i,c})\\
+\end{aligned}
+  $$
 
 * **The Loss Function:** This final expression is exactly the definition of the **Cross-Entropy Loss** used in classification!
 
@@ -193,7 +192,7 @@ Let's revisit our regression problem.
 
     $$
   \begin{aligned}
-    \text{Loss}(\theta) &=& -\log P(D \mid  \theta) - \log P(\theta)
+    \text{Loss}(\theta) &=& -\log P(D \mid  \theta) - \log P(\theta)\\
     &\propto& \left[ \sum_{i=1}^{N} (y_i - f(x_i; \theta))^2 \right] + \left[ \frac{\sigma^2}{\beta^2} \mid \theta\mid ^2_2 \right]
   \end{aligned}
     $$
