@@ -290,7 +290,7 @@ R_\alpha(T) = R(T) + \alpha |T|
 $$
 
 * $R(T)$: empirical error (e.g. misclassification rate, Gini, entropy) of tree $T$
-* $|T|$: number of terminal (leaf) nodes
+* $\mid T\mid$: number of terminal (leaf) nodes
 * $\alpha$: regularization parameter controlling the trade-off between accuracy and simplicity
 
 We prune the tree by selecting subtrees that minimize $R_\alpha(T)$. Larger $\alpha$ encourages simpler trees. CCP is used in many implementations such as `scikit-learn`’s `DecisionTreeClassifier`.
