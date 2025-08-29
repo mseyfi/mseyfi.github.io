@@ -6,7 +6,7 @@ A Decision Tree is a recursive, rule-based model that partitions the feature spa
 
 ---
 
-### ** Part 2: Splits and Split Criteria **
+### **Part 2: Splits and Split Criteria **
 
 A **split** is a binary partition of your dataset using a feature $x_j$ and a threshold $t$:
 
@@ -27,7 +27,7 @@ Where:
 
 ---
 
-### ** Part 3: Classification Losses**
+### **Part 3: Classification Losses**
 
 #### Gini Impurity:
 
@@ -90,7 +90,7 @@ This is the **mean squared error (MSE)**, and it's used to quantify how well a n
 
 ---
 
-### ** Part 5: Greedy Training Strategy**
+### **Part 5: Greedy Training Strategy**
 
 At each node:
 
@@ -165,7 +165,7 @@ This path-based traversal makes decision trees highly interpretable and efficien
 
 ---
 
-### ** Part 6A: Classification Example**
+### **Part 6A: Classification Example**
 
 #### Dataset:
 
@@ -211,7 +211,7 @@ Tree growth terminates as all leaves are pure or max depth is reached.
 
 
 
-### ** Part 6B: Regression Example **
+### **Part 6B: Regression Example **
 
 #### Dataset:
 
