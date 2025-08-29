@@ -80,7 +80,8 @@ Let's say we're training a neural network for a regression task (e.g., predictin
 
     $$
     \begin{aligned}
-    -\log L(\theta\mid D) &=& -\log \prod_{i=1}^{N} P(y_i \mid x_i; \theta) = -\sum_{i=1}^{N} \log P(y_i \mid x_i; \theta)\\
+    -\log L(\theta\mid D) &=& -\log \prod_{i=1}^{N} P(y_i \mid x_i; \theta)\\
+  &=& -\sum_{i=1}^{N} \log P(y_i \mid x_i; \theta)\\
     &=& -\sum_{i=1}^{N} \log \left( \frac{1}{\sqrt{2\pi\sigma^2}} \exp\left(-\frac{(y_i - f(x_i; \theta))^2}{2\sigma^2}\right) \right)\\
     &=& -\sum_{i=1}^{N} \left( \log\left(\frac{1}{\sqrt{2\pi\sigma^2}}\right) - \frac{(y_i - f(x_i; \theta))^2}{2\sigma^2} \right)\\
     &=& \sum_{i=1}^{N} \frac{(y_i - f(x_i; \theta))^2}{2\sigma^2} + \sum_{i=1}^{N} \log(\sqrt{2\pi\sigma^2})
@@ -116,13 +117,11 @@ Let's consider a multi-class classification problem (e.g., ImageNet). Our networ
   
     $$
   \begin{aligned}
-    -\log L(\theta\mid D) &=& -\sum_{i=1}^{N} \log P(y_i \mid  x_i; \theta)\\
-  
+  -\log L(\theta\mid D) &=& -\sum_{i=1}^{N} \log P(y_i \mid  x_i; \theta)\\ 
     &=& -\sum_{i=1}^{N} \log \left( \prod_{c=1}^{C} p_{i,c}^{y_{i,c}} \right)\\
-
     &=& -\sum_{i=1}^{N} \sum_{c=1}^{C} y_{i,c} \log(p_{i,c})\\
-\end{aligned}
-  $$
+  \end{aligned}
+    $$
 
 * **The Loss Function:** This final expression is exactly the definition of the **Cross-Entropy Loss** used in classification!
 
