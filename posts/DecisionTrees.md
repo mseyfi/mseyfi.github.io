@@ -370,7 +370,10 @@ Dataset, eight points
 |  7 |    5 |      4 | C     |
 |  8 |    5 |      2 | B     |
 
-![tree](/images/decisionTree.png)
+![tree](/images/decisionTree1.png)
+![tree](/images/decisionTree2.png)
+![tree](/images/decisionTree3.png)
+
 
 This example shows exactly how you compute candidate thresholds, child impurities, weighted impurities, and information gain at each step, until either purity is reached or stopping rules say to create a leaf.
 
