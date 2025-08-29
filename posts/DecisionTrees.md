@@ -1,12 +1,12 @@
-## 🌳 Decision Tree Tutorial
+## Decision Tree Tutorial
 
-### Part 1: What Is a Decision Tree?
+### **Part 1: What Is a Decision Tree?**
 
 A Decision Tree is a recursive, rule-based model that partitions the feature space $\mathbb{R}^n$ into disjoint regions and assigns a prediction to each region. It works by splitting the dataset at each node based on feature values to reduce some measure of impurity or error.
 
 ---
 
-### Part 2: Splits and Split Criteria
+### ** Part 2: Splits and Split Criteria **
 
 A **split** is a binary partition of your dataset using a feature $x_j$ and a threshold $t$:
 
@@ -27,7 +27,7 @@ Where:
 
 ---
 
-### Part 3: Classification Losses
+### ** Part 3: Classification Losses**
 
 #### Gini Impurity:
 
@@ -74,7 +74,7 @@ $$
 
 ---
 
-### Part 4: Regression Loss
+### **Part 4: Regression Loss**
 
 #### Mean Squared Error (MSE):
 
@@ -90,7 +90,7 @@ This is the **mean squared error (MSE)**, and it's used to quantify how well a n
 
 ---
 
-### Part 5: Greedy Training Strategy
+### ** Part 5: Greedy Training Strategy**
 
 At each node:
 
@@ -165,7 +165,7 @@ This path-based traversal makes decision trees highly interpretable and efficien
 
 ---
 
-### Part 6A: Classification Example
+### ** Part 6A: Classification Example**
 
 #### Dataset:
 
@@ -211,7 +211,7 @@ Tree growth terminates as all leaves are pure or max depth is reached.
 
 
 
-### Part 6B: Regression Example
+### ** Part 6B: Regression Example **
 
 #### Dataset:
 
@@ -253,7 +253,7 @@ Tree growth terminates as all leaves are pure or max depth is reached.
 
 ---
 
-### Part 7: Tree Pruning
+### **Part 7: Tree Pruning**
 
 Decision trees can easily overfit the training data by creating very specific branches for rare patterns. To prevent this, we apply **pruning**, which simplifies the tree structure.
 
@@ -297,7 +297,7 @@ We prune the tree by selecting subtrees that minimize $R_\alpha(T)$. Larger $\al
 
 Decision trees can easily overfit the training data by creating very specific branches for rare patterns. To prevent this, we apply **pruning**, which simplifies the tree structure.
 
-### Part 8: Pros and Cons of Decision Trees
+### **Part 8: Pros and Cons of Decision Trees**
 #### ✅ Advantages:
 
 * **Interpretability**: Easy to visualize and explain. You can follow a decision path.
@@ -316,7 +316,7 @@ Decision trees can easily overfit the training data by creating very specific br
 
 ---
 
-### Part 9: Summary Table
+### **Part 9: Summary Table**
 
 | Task           | Loss Function  | Leaf Output    |
 | -------------- | -------------- | -------------- |
