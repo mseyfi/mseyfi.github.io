@@ -1,4 +1,7 @@
-## 📚 Ensemble Learning: Bagging, Boosting, and Bootstrap Sampling
+[![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](/)
+## [![ML](https://img.shields.io/badge/CV-Selected_Topics_in_Machine_Learning-green?style=for-the-badge&logo=github)](/main_page/ML)
+
+## Ensemble Learning: Bagging, Boosting, and Bootstrap Sampling
 
 ## part 1: What is Bootstrapping in Ensembling?
 
@@ -619,7 +622,7 @@ In classification (e.g., using logistic loss), the residuals $r_i^{(t)}$ are not
 For example, with logistic loss:
 
 $$
-r_i^{(t)} = \frac{-2y_i}{1 + e^{2y_i F(x_i)}}{1 + e^{2y_i F(x_i)}}
+r_i^{(t)} = \frac{-2y_i}{1 + e^{2y_i F(x_i)}}{1 + e^{2y_i F(x_i)}}
 $$
 
 This means:
