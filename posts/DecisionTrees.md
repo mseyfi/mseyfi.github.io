@@ -181,20 +181,20 @@ This path-based traversal makes decision trees highly interpretable and efficien
 
 Try split at threshold = 165:
 
-* Left: \[150, 160] → Class = 0 → $G_L = 0$
-* Right: \[170, 180, 200] → Classes = \[0, 1, 1] → $p(0) = \frac{1}{3}, p(1) = \frac{2}{3}$ → $G_R = \frac{4}{9}$
+* Left: $$150, 160] → Class = 0 → $G_L = 0$
+* Right: $$170, 180, 200] → Classes = $$0, 1, 1] → $p(0) = \frac{1}{3}, p(1) = \frac{2}{3}$ → $G_R = \frac{4}{9}$
 * Weighted Gini: $\frac{2}{5} \cdot 0 + \frac{3}{5} \cdot \frac{4}{9} = \frac{4}{15} \approx 0.266$
 
 #### Depth 1:
 
-**Left child** (\[150, 160]) → Pure → Leaf = 0
+**Left child** ($$150, 160]) → Pure → Leaf = 0
 
-**Right child** (\[170, 180, 200])
+**Right child** ($$170, 180, 200])
 
 * Try threshold = 175:
 
-  * Left: \[170] → Class = 0 → $G = 0$
-  * Right: \[180, 200] → Class = 1 → $G = 0$
+  * Left: $$170] → Class = 0 → $G = 0$
+  * Right: $$180, 200] → Class = 1 → $G = 0$
   * Weighted Gini: $\frac{1}{3} \cdot 0 + \frac{2}{3} \cdot 0 = 0$
 
 Perfect split → Both children are pure.
@@ -353,6 +353,110 @@ In a decision tree, **each split decision compares *a single feature* against a 
    * These are computationally more complex and less interpretable.
 
 ---
+
+## **Two Feature Decision Tre Example**
+Here is a compact worked example, two numerical features, three classes, Gini impurity, greedy CART splits.
+
+Dataset, eight points
+
+| id | size | weight | class |
+| -: | ---: | -----: | :---- |
+|  1 |    1 |      1 | A     |
+|  2 |    2 |      1 | A     |
+|  3 |    2 |      2 | B     |
+|  4 |    3 |      1 | A     |
+|  5 |    3 |      3 | B     |
+|  6 |    4 |      3 | C     |
+|  7 |    5 |      4 | C     |
+|  8 |    5 |      2 | B     |
+
+Parent impurity
+
+\textbf{Parent impurity}
+
+Counts: $A=3$, $B=3$, $C=2$, total $=8$.
+
+$$
+p_A = \tfrac{3}{8}, \quad p_B = \tfrac{3}{8}, \quad p_C = \tfrac{2}{8}
+$$
+
+$$
+\text{Gini} = 1 - \sum p_c^2 
+= 1 - \left( \left(\tfrac{3}{8}\right)^2 + \left(\tfrac{3}{8}\right)^2 + \left(\tfrac{2}{8}\right)^2 \right)
+= 1 - 0.34375 = 0.65625
+$$
+
+---
+
+\textbf{Try splits on weight}
+
+Unique weights: $1,2,3,4$ \\
+Candidate thresholds: $1.5, 2.5, 3.5$
+
+\begin{enumerate}
+\item $\text{weight} \leq 1.5$
+
+Left (ids 1,2,4): all A $\Rightarrow$ $\text{Gini}_L = 0$
+
+Right (ids 3,5,6,7,8): counts $B=3$, $C=2$  
+$$
+\text{Gini}_R = 1 - \left( \left(\tfrac{3}{5}\right)^2 + \left(\tfrac{2}{5}\right)^2 \right) 
+= \tfrac{12}{25} = 0.48
+$$
+
+Weighted impurity:
+$$
+\frac{3}{8}\cdot 0 + \frac{5}{8}\cdot 0.48 = 0.3
+$$
+
+Gain:
+$$
+0.65625 - 0.3 = 0.35625
+$$
+
+\item $\text{weight} \leq 2.5$
+
+Left (ids 1,2,3,4,8): $A=3, B=2$  
+$$
+\text{Gini}_L = 1 - \left(\left(\tfrac{3}{5}\right)^2 + \left(\tfrac{2}{5}\right)^2\right) = 0.48
+$$
+
+Right (ids 5,6,7): $C=2, B=1$  
+$$
+\text{Gini}_R = 1 - \left(\left(\tfrac{2}{3}\right)^2 + \left(\tfrac{1}{3}\right)^2\right) = \tfrac{4}{9}=0.4444
+$$
+
+Weighted impurity:
+$$
+\frac{5}{8}\cdot 0.48 + \frac{3}{8}\cdot 0.4444 = 0.4667
+$$
+
+Gain:
+$$
+0.65625 - 0.4667 = 0.1896
+$$
+
+\item $\text{weight} \leq 3.5$
+
+Left (ids 1,2,3,4,5,6,8): $A=3, B=3, C=1$  
+$$
+\text{Gini}_L = 1 - \left(\left(\tfrac{3}{7}\right)^2 + \left(\tfrac{3}{7}\right)^2 + \left(\tfrac{1}{7}\right)^2\right) = \tfrac{30}{49}=0.6122
+$$
+
+Right (id 7): pure $C$, $\text{Gini}_R=0$
+
+Weighted impurity:
+$$
+\frac{7}{8}\cdot 0.6122 = 0.5357
+$$
+
+Gain:
+$$
+0.65625 - 0.
+$$
+This example shows exactly how you compute candidate thresholds, child impurities, weighted impurities, and information gain at each step, until either purity is reached or stopping rules say to create a leaf.
+
+
 
 ### Summary:
 
