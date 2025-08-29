@@ -113,6 +113,7 @@ Let's consider a multi-class classification problem (e.g., ImageNet). Our networ
     Since $y_{i,c}$ is 1 for the correct class and 0 for all others, this product just picks out the single correct probability.
 
 * **Negative Log-Likelihood:**
+  
     $$
   \begin{aligned}
     -\log L(\theta\mid D) &=& -\sum_{i=1}^{N} \log P(y_i \mid  x_i; \theta)\\
