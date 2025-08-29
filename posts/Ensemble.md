@@ -335,7 +335,7 @@ $w_i = \frac{1}{4}$
 ---
 
 ### AdaBoost Algorithm (Binary Classification)
-
+In boosting at each node we split for the best feature, however, the impurity or loss at each node is calculated based on the weights we have from the previous round. 
 1. For $t = 1$ to $T$:
 
    * Fit a weak learner $h_t(x)$ to the weighted data.
@@ -481,7 +481,7 @@ $$
 
 This gives us a **direction** to update the model even when no intuitive “residual” exists.
 
-📌 **Conclusion:** Gradient boosting is a flexible framework that applies gradient descent to any differentiable loss function.
+**Conclusion:** Gradient boosting is a flexible framework that applies gradient descent to any differentiable loss function.
 
 ---
 
