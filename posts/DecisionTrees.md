@@ -1,5 +1,5 @@
 [![Home](https://img.shields.io/badge/Home-Click%20Here-blue?style=flat&logo=homeadvisor&logoColor=white)](/)
-## [![CV](https://img.shields.io/badge/CV-Selected_Topics_in_Machine_Learning-green?style=for-the-badge&logo=github)](/main_page/ML)
+## [![ML](https://img.shields.io/badge/CV-Selected_Topics_in_Machine_Learning-green?style=for-the-badge&logo=github)](/main_page/ML)
 
 ## Decision Tree Tutorial
 
