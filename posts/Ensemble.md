@@ -418,13 +418,17 @@ $$
 2. For $t = 1$ to $T$:
 
    * Compute residuals:
-     $r_i^{(t)} = - \left. \frac{\partial L(y_i, F(x_i))}{\partial F(x_i)} \right|_{F=F_{t-1}} = y_i - F_{t-1}(x_i)$
+
+     $$
+     r_i^{(t)} = - \left. \frac{\partial L(y_i, F(x_i))}{\partial F(x_i)} \right|_{F=F_{t-1}} = y_i - F_{t-1}(x_i)
+     $$
+
    * Fit a weak learner $h_t(x)$ to $\{(x_i, r_i^{(t)})\}$.
    * Update model:
      $F_t(x) = F_{t-1}(x) + \eta h_t(x)$
      where $\eta$ is the learning rate.
 
-3. Final prediction:
+4. Final prediction:
    $F_T(x)$
 
 #### More Intuition (Why This Works):
