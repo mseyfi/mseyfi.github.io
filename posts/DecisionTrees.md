@@ -370,9 +370,8 @@ Dataset, eight points
 |  7 |    5 |      4 | C     |
 |  8 |    5 |      2 | B     |
 
-Parent impurity
 
-\textbf{Parent impurity}
+$\textbf{Parent impurity}$
 
 Counts: $A=3$, $B=3$, $C=2$, total $=8$.
 
@@ -388,7 +387,7 @@ $$
 
 ---
 
-\textbf{Try splits on weight}
+$\textbf{Try splits on weight}$
 
 Unique weights: $1,2,3,4$ \\
 Candidate thresholds: $1.5, 2.5, 3.5$
