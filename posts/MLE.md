@@ -226,7 +226,7 @@ Imagine you're training a Convolutional Neural Network (CNN) to classify dogs vs
 | Feature | Maximum Likelihood Estimation (MLE) | Maximum a Posteriori (MAP) |
 | :--- | :--- | :--- |
 | **Philosophy** | Frequentist. Finds parameters that make the data most likely. | Bayesian. Finds the most probable parameters given the data and a prior belief. |
-| **Formula** | $\arg\max_{\theta} P(D | \theta)$ | $\arg\max_{\theta} P(D | \theta) P(\theta)$ |
+| **Formula** | $\arg\max_{\theta} P(D \mid \theta)$ | $\arg\max_{\theta} P(D \mid \theta) P(\theta)$ |
 | **Neural Networks** | Corresponds to standard loss functions like **MSE** and **Cross-Entropy**. | Corresponds to loss functions with **regularization** (e.g., L2, L1). |
 | **Overfitting** | More prone to overfitting, especially with small datasets. | Less prone to overfitting, as the prior "regularizes" the solution. |
 | **Data Size** | **As data size → ∞, the MAP estimate converges to the MLE estimate.** The influence of the prior gets washed out by the overwhelming evidence from the data. | The prior has the strongest influence when the dataset is small. |
