@@ -377,6 +377,26 @@ Dataset, eight points
 
 This example shows exactly how you compute candidate thresholds, child impurities, weighted impurities, and information gain at each step, until either purity is reached or stopping rules say to create a leaf.
 
+## Core Algorithm
+
+Exactly — that’s the core idea of how a **standard decision tree** is trained.
+
+At each node during training:
+
+1. **Take the subset of data** that reaches this node.
+2. **For every feature** (or a random subset if you are training a random forest):
+
+   * Try possible split points (thresholds for numerical features, category partitions for categorical features).
+   * Compute the impurity reduction (information gain, Gini reduction, variance reduction, etc.).
+3. **Pick the feature and split point with the largest impurity reduction**.
+   That feature is used at this node, and the data is divided accordingly.
+4. **Repeat** the process separately for the left and right subsets (recursion).
+
+So yes — you don’t pre-decide an order of features. At each node, the tree *re-evaluates all candidate features again* and “switches” to whichever one is most useful at that point in the data.
+
+Would you like me to also explain how **feature subsampling** changes this (like in Random Forests where you don’t look at all features each time)?
+
+
 
 
 ### Summary:
