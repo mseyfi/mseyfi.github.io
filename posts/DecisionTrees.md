@@ -379,7 +379,7 @@ This example shows exactly how you compute candidate thresholds, child impuritie
 
 ## Core Algorithm
 
-Exactly — that’s the core idea of how a **standard decision tree** is trained.
+Core idea of how a **standard decision tree** is trained:
 
 At each node during training:
 
@@ -392,9 +392,8 @@ At each node during training:
    That feature is used at this node, and the data is divided accordingly.
 4. **Repeat** the process separately for the left and right subsets (recursion).
 
-So yes — you don’t pre-decide an order of features. At each node, the tree *re-evaluates all candidate features again* and “switches” to whichever one is most useful at that point in the data.
+So we don’t pre-decide an order of features. At each node, the tree *re-evaluates all candidate features again* and “switches” to whichever one is most useful at that point in the data.
 
-Would you like me to also explain how **feature subsampling** changes this (like in Random Forests where you don’t look at all features each time)?
 
 
 
