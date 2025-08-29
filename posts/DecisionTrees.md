@@ -6,7 +6,7 @@ A Decision Tree is a recursive, rule-based model that partitions the feature spa
 
 ---
 
-### **Part 2: Splits and Split Criteria **
+### **Part 2: Splits and Split Criteria**
 
 A **split** is a binary partition of your dataset using a feature $x_j$ and a threshold $t$:
 
@@ -211,7 +211,7 @@ Tree growth terminates as all leaves are pure or max depth is reached.
 
 
 
-### **Part 6B: Regression Example **
+### **Part 6B: Regression Example**
 
 #### Dataset:
 
