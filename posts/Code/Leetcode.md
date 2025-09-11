@@ -656,6 +656,57 @@ class Solution:
         backtrack([], 0, 0)
         return and
 ```
+# termplate 4: powerset
+
+``` python
+from typing import List
+
+def powerset(nums: List[int]) -> List[List[int]]:
+    """
+    Backtracking powerset.
+    Returns all 2^n subsets of nums, preserving element order within each subset.
+    """
+    res: List[List[int]] = []
+    path: List[int] = []
+
+    def backtrack(start: int) -> None:
+        # record current subset
+        res.append(path.copy())
+        # try adding each remaining element
+        for i in range(start, len(nums)):
+            path.append(nums[i])
+            backtrack(i + 1)
+            path.pop()  # undo the choice
+
+    backtrack(0)
+    return res
+
+
+def powerset_unique(nums: List[int]) -> List[List[int]]:
+    """
+    Backtracking powerset that avoids duplicate subsets when nums contains duplicates.
+    """
+    nums.sort()
+    res: List[List[int]] = []
+    path: List[int] = []
+
+    def backtrack(start: int) -> None:
+        res.append(path.copy())
+        for i in range(start, len(nums)):
+            if i > start and nums[i] == nums[i - 1]:
+                continue  # skip duplicates at this tree level
+            path.append(nums[i])
+            backtrack(i + 1)
+            path.pop()
+
+    backtrack(0)
+    return res
+```
+
+# examples
+if __name__ == "__main__":
+    print(powerset([1, 2, 3]))
+    print(powerset_unique([1, 2, 2]))
 
 ## Note to remember: 
 Try to create a tree. Look at curr after each backtrack return. When a backtrack hits return that means it has hit a **node leaf**. Look at curr at that moment. Sometimes our tree do not append on leaf nodes, but they append on nodes  themeselves. At this time you should not return anything in your backtracking (look at subset example). Right after the return we have this tem `curr.pop()` try to imaging if curr pops the next item is  the item in  `for ... in ...` if we are done with all the children of the first child, that means we are at the end of the for loop and a new number will be chosen from scratch. That means `for i in range(start, end)` now what should this `start` be?  Also a very important thing you should do is to create a tree and beside each node write the status of the variables so you can track them.
