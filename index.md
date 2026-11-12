@@ -1,3 +1,35 @@
+---
+layout: home
+title: Home
+---
+
+<style>
+.course-hero{background:linear-gradient(125deg,#370d26,#6f163c 65%,#9b3b61);color:#fff;padding:38px 30px;border-radius:20px;margin:14px 0 26px;box-shadow:0 12px 32px #35102125;font-family:system-ui,-apple-system,Segoe UI,sans-serif}
+.course-hero h1{font-size:clamp(27px,4vw,43px);line-height:1.12;color:white;margin:10px 0}
+.course-hero p{max-width:720px;color:#f6dce8;font-size:16px}
+.course-hero .eyebrow{text-transform:uppercase;letter-spacing:.18em;color:#f1bdd4;font-size:12px}
+.course-hero .course-btn{display:inline-block;background:white;color:#65133a!important;padding:13px 22px;text-decoration:none;border-radius:11px;font-weight:750;margin:12px 10px 6px 0}
+.course-hero .course-btn:hover{background:#ffe7f0}
+.course-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:12px;margin:20px 0}
+.course-cards a{border:1px solid #e4c2d0;border-radius:12px;background:#fff8fb;padding:15px;color:#5b1638!important;text-decoration:none;display:block}
+.course-cards a:hover{background:#f7e5ed}
+.course-cards strong{display:block;font-size:15px}.course-cards small{display:block;color:#7a586a;margin-top:4px}
+</style>
+<div class="course-hero">
+ <div class="eyebrow">Interactive research curriculum · 2026</div>
+ <h1>LLM &amp; VLM Research Learning Lab</h1>
+ <p>46 interactive sessions on Transformers, distributed training, fine-tuning, vision-language models, video understanding, retrieval and diffusion. Visual diagrams, mathematics, PyTorch examples, and self-paced progress tracking.</p>
+ <a class="course-btn" href="{{ '/courses/llm-vlm-research-lab/index.html' | relative_url }}">Explore all 46 lessons →</a>
+</div>
+<div class="course-cards">
+ <a href="{{ '/courses/llm-vlm-research-lab/index.html' | relative_url }}"><strong>📚 All sessions</strong><small>Browse the complete curriculum</small></a>
+ <a href="{{ '/courses/llm-vlm-research-lab/session-03-decoder-only-transformer-anatomy.html' | relative_url }}"><strong>🧠 Transformer anatomy</strong><small>Interactive architecture exploration</small></a>
+ <a href="{{ '/courses/llm-vlm-research-lab/session-26-vlm-architecture-encoder-projector-decoder.html' | relative_url }}"><strong>👁️ Vision-language models</strong><small>Encoder · projector · decoder</small></a>
+ <a href="{{ '/courses/llm-vlm-research-lab/session-34-text-to-video-retrieval-and-video-embeddings.html' | relative_url }}"><strong>🎞️ Video retrieval</strong><small>Search video using embeddings</small></a>
+</div>
+<hr>
+<h2>Learning Muse · Previous Articles</h2>
+
 
 <div style="background-color: #f3f3f3; color: #512; font-weight: 500; padding: 20px; margin: 20px 0; border-radius: 8px; border: 1px solid #ccc;">
   <h2>Preface:</h2>
