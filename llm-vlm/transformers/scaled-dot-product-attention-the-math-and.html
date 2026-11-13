@@ -1,0 +1,451 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Scaled dot-product attention: the math and the shapes · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../transformers/index.html">Attention and transformers</a><span class="sep">/</span><span>Session 17</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="scaled-dot-product-attention-the-math-and">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="scaled-dot-product-attention-the-math-and" data-session="scaled-dot-product-attention-the-math-and" style="--tc:var(--t2)"><header class="chap-head"><div class="chap-kicker"><span class="num">17</span><span>Track 2: Attention and transformers · session 2 of 15</span></div><h1 class="chap-title">Scaled dot-product attention: the math and the shapes</h1><p class="chap-sub">The previous session gave the idea of attention: a query looks for matching keys and collects their values. This session writes it as one exact formula, softmax(QKᵀ/√d_k)V, follows the shape of every tensor through it, shows why the division by √d_k is needed, and counts what attention costs in compute and memory as the sequence gets longer.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 2, 4 and 16 (dot products and softmax, backpropagation, the query-key-value idea)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How the three projections Q = XW_Q, K = XW_K, V = XW_V are computed, and the shape of every tensor, with and without batch and heads</li><li>The four steps of attention: scores QKᵀ, scaling by √d_k, softmax over the keys, weighted sum of the values, done by hand on a 3-token example</li><li>Why √d_k: the variance of a dot product of random vectors grows like d_k, which saturates the softmax and kills its gradient</li><li>The stable softmax trick and the backward pass of attention, checked against PyTorch autograd</li><li>The cost: O(T²·d) compute and O(T²) memory for the score matrix, with real numbers for GPT-2 and Llama 3.1 8B</li><li>Where the T² wall appears in practice (long documents, high-resolution images, video) and what FlashAttention changes and does not change</li></ul></div></header><style>
+.sd-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.sd-grid input[type=range]{width:100%}
+.sd-grid output{font:600 14px var(--mono);min-width:3.5em;text-align:right}
+.sd-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.sd-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.sd-svg text{font-family:var(--sans)}
+.sd-svg .mono{font-family:var(--mono)}
+.sd-cell{cursor:pointer}
+.sd-qsel{display:inline-flex;gap:6px;flex-wrap:wrap}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../transformers/attention-intuition-query-key-value.html">session 16</a> we described attention in words: every token sends out a <b>query</b> (“what am I looking for?”), every token shows a <b>key</b> (“what do I contain?”), and each token collects the <b>values</b> of the tokens whose keys match its query best. This session turns those words into one line of math and follows every number through it.</p>
+<p>That line is the most important formula of this course. It was written down in the transformer paper (Vaswani et al., 2017) and every LLM and VLM since then runs it, in every layer, for every token: [Certain]</p>
+<div class="eq">\[ \operatorname{Attention}(Q, K, V) = \softmax\!\left( \frac{Q K^\top}{\sqrt{d_k}} \right) V \tag{17.1} \]</div>
+<p>It looks short, but it hides four separate steps, three design decisions and one big cost:</p>
+<ul><li><b>Shapes.</b> Which tensor is \(T \times d_k\), which is \(T \times T\), and along which axis the softmax runs. Getting an axis wrong gives no error message, just a model that does not learn.</li>
+<li><b>The division by \(\sqrt{d_k}\).</b> Without it, large models train badly. The reason is a simple variance argument, and interviewers ask for it very often.</li>
+<li><b>Numerical safety.</b> A softmax over raw scores overflows in 16-bit floats. Every real implementation subtracts the row maximum first.</li>
+<li><b>Cost.</b> The score matrix \(QK^\top\) has \(T \times T\) entries. Double the context, and this part costs four times as much. This one fact explains FlashAttention, the KV cache, sliding windows and most of the work on long context and long video.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>Classic questions: “Write attention in NumPy or PyTorch.” “Why divide by \(\sqrt{d_k}\) and not by \(d_k\)?” “What are the shapes of Q, K, V and the attention matrix with batch and heads?” “What is the complexity of attention in time and memory?” All four are answered below, with numbers you can check.</aside>
+<p>We will build formula (17.1) step by step, do it by hand on three tokens, derive the \(\sqrt{d_k}\), write the backward pass, and then count FLOPs and bytes for GPT-2 and Llama 3.1 8B.</p>
+
+<h2>The inputs: X and three projections</h2>
+<p>Attention works on a sequence of \(T\) vectors, one per token. After the embedding layer (<a href="../foundations/embeddings-turning-token-ids-into-vectors.html">session 11</a>) and earlier transformer layers, we stack them as the rows of a matrix \(X\). Row \(t\) is the current vector of token \(t\) (its <b>hidden state</b>). Its length \(d\) is the model width (also written \(d_{\text{model}}\)).</p>
+<p>From \(X\), attention makes three new matrices with three learned weight matrices. This is the first step of formula (17.1):</p>
+<div class="eq">\[ Q = X W_Q, \qquad K = X W_K, \qquad V = X W_V \tag{17.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(X \in \R^{T \times d}\)</dt><dd>the input: \(T\) tokens, each a row of \(d\) numbers</dd>
+<dt>\(W_Q, W_K \in \R^{d \times d_k}\)</dt><dd>learned matrices that turn each token vector into a query and a key of length \(d_k\)</dd>
+<dt>\(W_V \in \R^{d \times d_v}\)</dt><dd>learned matrix that turns each token vector into a value of length \(d_v\)</dd>
+<dt>\(Q, K \in \R^{T \times d_k}\)</dt><dd>row \(i\) of \(Q\) is the query \(\mathbf{q}_i\) of token \(i\); row \(j\) of \(K\) is the key \(\mathbf{k}_j\) of token \(j\)</dd>
+<dt>\(V \in \R^{T \times d_v}\)</dt><dd>row \(j\) is the value \(\mathbf{v}_j\): what token \(j\) gives to anyone who attends to it</dd>
+<dt>\(d_k, d_v\)</dt><dd>the head size. Queries and keys must have the <b>same</b> length \(d_k\), because we take their dot product. \(d_v\) can be different, but in practice \(d_v = d_k\)</dd></dl>
+<p>Each projection is applied to every row separately: \(\mathbf{q}_i = \mathbf{x}_i W_Q\). So the same token vector \(\mathbf{x}_i\) plays three roles through three different “lenses”. Why three different matrices and not one? Because “what I look for” and “what I contain” are different things. A pronoun looks for a noun, but it does not contain a noun. If \(W_Q = W_K\), the score of token \(i\) with itself, \(\mathbf{q}_i \cdot \mathbf{q}_i = \lVert \mathbf{q}_i \rVert^2\), would always be large and positive, and the score matrix would be symmetric: \(i\) would like \(j\) exactly as much as \(j\) likes \(i\). Separate matrices remove both limits.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A job fair. Every person writes three cards. The <b>query</b> card says what they are looking for (“a Python job”). The <b>key</b> card is the sign on their booth (“we hire Python developers”). The <b>value</b> card is what they hand over if you stop at their booth (a brochure). You compare your query card with every booth sign, spend more time at the booths that match, and leave with a mix of their brochures.</aside>
+<p>In a real model, attention is split into \(H\) <b>heads</b> (<a href="../transformers/multi-head-attention.html">session 19</a>). Each head has its own small \(W_Q, W_K, W_V\) with \(d_k = d / H\). For Llama 3.1 8B: \(d = 4096\), \(H = 32\), so \(d_k = 128\) [Certain, from its config.json]. For the original transformer base model: \(d = 512\), \(H = 8\), \(d_k = 64\) [Certain]. In this session we study <b>one head</b>; everything is done \(H\) times in parallel.</p>
+<p>Figure 1 shows every shape in the computation. Change \(T\), \(d\) and \(d_k\) and watch which matrices grow.</p>
+<figure class="fig" id="sd-shape"><div class="fig-body">
+<div class="sd-grid">
+<label for="sd-shape-t">Sequence length \(T\)</label><input type="range" id="sd-shape-t" min="2" max="12" step="1" value="6"><output id="sd-shape-tv"></output>
+<label for="sd-shape-d">Model width \(d\)</label><input type="range" id="sd-shape-d" min="4" max="16" step="1" value="10"><output id="sd-shape-dv"></output>
+<label for="sd-shape-k">Head size \(d_k = d_v\)</label><input type="range" id="sd-shape-k" min="1" max="8" step="1" value="4"><output id="sd-shape-kv"></output></div>
+<div class="scroll-x"><svg class="sd-svg" id="sd-shape-svg" viewBox="0 0 760 350" role="img" aria-label="Block diagram of the matrices in attention, drawn to scale"></svg></div>
+<div class="sd-leg"><span style="--c:var(--q)">query side</span><span style="--c:var(--k)">key side</span><span style="--c:var(--v)">value side</span><span style="--c:var(--muted)">scores and weights (T × T)</span></div>
+<div class="readout" id="sd-shape-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The shapes of attention, drawn to scale (one small square is one number). Top: the three projections of formula (17.2). Bottom: scores, softmax and the weighted sum of formula (17.1). The readout counts numbers and multiply-adds.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Increase \(d\): only \(X\) and the three weight matrices grow; the score matrix does not change. Increase \(d_k\): \(Q\), \(K\), \(V\) and the output grow in one direction. Increase \(T\): almost everything grows in one direction, but the two grey \(T \times T\) squares grow in <b>both</b> directions. That square is the source of the \(T^2\) cost in the last part of this session. Notice also that the output has \(T\) rows, one per query: attention gives every token a new vector.</p></details></figure>
+
+<h2>Step 1: scores are dot products</h2>
+<p>Next, each query is compared with each key. The comparison is the <b>dot product</b> (<a href="../foundations/math-vectors-matrices-softmax.html">session 2</a>): large when the two vectors point the same way, near zero when they are unrelated, negative when they point in opposite directions. All \(T \times T\) comparisons together are one matrix product:</p>
+<div class="eq">\[ S = Q K^\top \in \R^{T \times T}, \qquad S_{ij} = \mathbf{q}_i \cdot \mathbf{k}_j = \sum_{l=1}^{d_k} Q_{il} K_{jl} \tag{17.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(S_{ij}\)</dt><dd>the <b>score</b> (also called logit): how much query \(i\) matches key \(j\). Row \(i\) belongs to one query; column \(j\) to one key.</dd>
+<dt>\(K^\top\)</dt><dd>the transpose of \(K\), shape \(d_k \times T\). Shapes: \((T \times d_k)(d_k \times T) = T \times T\).</dd></dl>
+<p>Why the dot product and not another similarity? Bahdanau et al. (2014) used <b>additive</b> attention, a small neural network \(\mathbf{w}^\top \tanh(W_1 \mathbf{q} + W_2 \mathbf{k})\) for each pair (<a href="../foundations/before-transformers-rnn-lstm-seq2seq-and-the.html">session 7</a>). The transformer paper chose the dot product because it is one big matrix multiplication, which GPUs do extremely fast [Certain]. The price is the scale problem we fix in step 2.</p>
+
+<h2>Step 2: divide by the square root of d_k</h2>
+<p>Before the softmax, every score is divided by \(\sqrt{d_k}\). To see why, ask: how big is a typical score at the start of training?</p>
+<h3>The variance of a dot product</h3>
+<p>Assume, as the transformer paper does, that the \(d_k\) components of \(\mathbf{q}\) and \(\mathbf{k}\) are independent random numbers with mean 0 and variance 1. This is roughly true at initialization, when weights are random and inputs are normalized. Each product \(q_l k_l\) has mean \(\E[q_l]\E[k_l] = 0\) and variance \(\E[q_l^2]\E[k_l^2] = 1 \cdot 1 = 1\). A sum of \(d_k\) independent terms has the sum of their variances:</p>
+<div class="eq">\[ \E[\mathbf{q}\cdot\mathbf{k}] = 0, \qquad \operatorname{Var}(\mathbf{q}\cdot\mathbf{k}) = \sum_{l=1}^{d_k} \operatorname{Var}(q_l k_l) = d_k, \qquad \operatorname{Var}\!\left(\frac{\mathbf{q}\cdot\mathbf{k}}{\sqrt{d_k}}\right) = 1 \tag{17.4} \]</div>
+<p>So the typical size (standard deviation) of a raw score is \(\sqrt{d_k}\). With \(d_k = 64\) it is 8; with \(d_k = 128\) it is about 11.3. Dividing by \(\sqrt{d_k}\) brings it back to 1, <b>for every head size</b>. In a simulation with 10,000 random pairs (the code below), the measured standard deviations were 3.95, 7.98, 16.17 and 32.06 for \(d_k = 16, 64, 256, 1024\), against \(\sqrt{d_k} = 4, 8, 16, 32\).</p>
+<h3>Why large scores are bad: the softmax saturates</h3>
+<p>The softmax turns scores into weights: \(a_j = e^{z_j} / \sum_l e^{z_l}\). Only the <b>differences</b> between scores matter. If scores differ by 1 or 2, the weights are spread over several keys. If they differ by 20, \(e^{20} \approx 5 \times 10^8\), and the top key gets almost all the weight: the softmax becomes a hard “argmax”. We say it is <b>saturated</b>.</p>
+<p>A saturated softmax is not only “too sharp”. It also stops learning, because its gradient goes to zero. The derivative of the softmax is</p>
+<div class="eq">\[ \frac{\partial a_i}{\partial z_j} = a_i\,(\delta_{ij} - a_j), \qquad J = \operatorname{diag}(\mathbf{a}) - \mathbf{a}\mathbf{a}^\top \tag{17.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\delta_{ij}\)</dt><dd>1 if \(i = j\), else 0</dd>
+<dt>\(J\)</dt><dd>the Jacobian: the table of all \(\partial a_i / \partial z_j\). It tells the backward pass how a change in the scores changes the weights.</dd></dl>
+<p>If \(\mathbf{a}\) is one-hot (one weight 1, the rest 0), every entry is 0: for \(i = j\) at the winner, \(1 \cdot (1 - 1) = 0\); everywhere else one of the factors is 0. No gradient flows back to \(Q\) and \(K\), so the model cannot learn which tokens to look at. For 4 keys, the Frobenius norm (the size) of \(J\) is 0.433 for the uniform weights \((0.25, 0.25, 0.25, 0.25)\) and only 0.041 for \((0.97, 0.01, 0.01, 0.01)\): ten times smaller.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A microphone and an amplifier. If you add more and more microphones (larger \(d_k\)) into one amplifier, the signal clips: every loud sound becomes the same flat maximum and you cannot hear differences any more. Dividing by \(\sqrt{d_k}\) turns the volume down by exactly the amount the extra microphones added.</aside>
+<p>Figure 2 shows this. Eight random keys compete for one random query. Raise \(d_k\) with and without the scale.</p>
+<figure class="fig" id="sd-scale"><div class="fig-body">
+<div class="sd-grid">
+<label for="sd-scale-d">Head size \(d_k = 2^n\)</label><input type="range" id="sd-scale-d" min="1" max="10" step="1" value="6"><output id="sd-scale-dv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="sd-scale-on" checked> Divide scores by \(\sqrt{d_k}\)</label></div>
+<svg class="sd-svg" id="sd-scale-svg" viewBox="0 0 640 270" role="img" aria-label="Softmax weights of eight keys for one query, and average largest weight against head size"></svg>
+<div class="sd-leg"><span style="--c:var(--k)">softmax weight of each key (one example)</span><span style="--c:var(--tc)">average largest weight, unscaled</span><span style="--c:var(--q)">average largest weight, scaled</span></div>
+<div class="readout" id="sd-scale-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Why \(\sqrt{d_k}\). Left: the softmax weights that one random query gives to 8 random keys (all components drawn from a standard normal, fixed seed). Right: averages over 400 random queries, against \(d_k\) on a log scale. The readout gives the measured spread of the scores, the average largest weight, the average entropy and the average size of the softmax gradient.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With the scale on, the picture hardly changes as \(d_k\) grows: score spread stays near 1, the largest weight stays near 0.36, and the gradient size stays near 0.37. With the scale off, the spread grows like \(\sqrt{d_k}\), the largest weight climbs toward 1 (one key takes everything), the entropy falls toward 0 (its maximum for 8 keys is \(\ln 8 = 2.079\)), and the gradient shrinks several times. That is the regime where attention stops learning. Real queries and keys are not random after training; the point is the starting state, from which learning must begin.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: the scale in numbers</div>
+<p>Simulate 4,000 random queries, each with 8 random keys (the same experiment as Figure 2, with PyTorch’s random numbers). Without the scale, the average largest weight is 0.52 for \(d_k = 4\), 0.87 for \(d_k = 64\), 0.92 for \(d_k = 128\) and 0.95 for \(d_k = 512\). The average size of the softmax Jacobian falls from 0.34 to 0.15, 0.11 and 0.06. With the scale, the average largest weight is 0.34 to 0.36 and the Jacobian size is 0.36 to 0.37 for every \(d_k\). At \(d_k = 128\) (Llama 3.1 8B), leaving out the scale makes the starting gradient through the softmax more than three times smaller.</p></div>
+<h3>Why the square root, and not d_k?</h3>
+<p>We want the scores to have variance 1, not some other size. Variance scales with the square of a factor: \(\operatorname{Var}(c\,s) = c^2 \operatorname{Var}(s)\). To turn variance \(d_k\) into 1, we need \(c^2 = 1/d_k\), so \(c = 1/\sqrt{d_k}\). Dividing by \(d_k\) would give variance \(1/d_k\): for \(d_k = 128\), scores with a spread of about 0.09, and an almost uniform softmax that cannot pick anything at the start. Both directions are bad; \(\sqrt{d_k}\) is the one that keeps the scale fixed.</p>
+<p>Two refinements you may meet. You can read \(\sqrt{d_k}\) as a <b>temperature</b>: \(\softmax(\mathbf{z}/\tau)\) with \(\tau = \sqrt{d_k}\). And the \(1/\sqrt{d_k}\) argument holds at initialization, when \(\mathbf{q}\) and \(\mathbf{k}\) are uncorrelated. μP (Yang et al., 2022) argues that after training \(\mathbf{q}\) and \(\mathbf{k}\) become correlated, so the score grows like \(d_k\), and uses \(1/d_k\) instead to transfer hyper-parameters across widths [Likely]. Some large models also normalize \(\mathbf{q}\) and \(\mathbf{k}\) (“QK-norm”) because their scores kept growing during training and the softmax saturated anyway; ViT-22B is a well-known example [Likely].</p>
+
+<h2>Step 3: softmax over the keys</h2>
+<p>Now each row of scaled scores becomes a probability distribution:</p>
+<div class="eq">\[ A = \softmax\!\left(\frac{S}{\sqrt{d_k}}\right), \qquad A_{ij} = \frac{\exp\!\big(S_{ij}/\sqrt{d_k}\big)}{\sum_{l=1}^{T} \exp\!\big(S_{il}/\sqrt{d_k}\big)} \tag{17.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(A \in \R^{T \times T}\)</dt><dd>the <b>attention matrix</b> (attention weights, or attention probabilities)</dd>
+<dt>\(A_{ij}\)</dt><dd>how much query \(i\) attends to key \(j\). Every entry is between 0 and 1.</dd>
+<dt>\(\sum_l\)</dt><dd>the sum runs over the <b>keys</b> \(l\), with the query \(i\) fixed. So each <b>row</b> of \(A\) sums to 1. Columns do not.</dd></dl>
+<p>The axis matters. In code, scores have shape <code>(..., T_q, T_k)</code> and the softmax is over the last axis, <code>dim=-1</code>. A softmax over <code>dim=-2</code> runs without error but means “each key spreads itself over the queries”, which is a different and wrong model.</p>
+<h3>The stable softmax</h3>
+<p>Raw \(e^{z}\) overflows quickly: in FP16 the largest number is 65,504, so \(e^{z}\) is infinite once \(z \gt 11.09\); in FP32 once \(z \gt 88.7\). Then \(\infty / \infty\) gives NaN. The fix uses the fact that adding the same constant to every score of a row does not change the softmax:</p>
+<div class="eq">\[ \frac{e^{z_j}}{\sum_l e^{z_l}} = \frac{e^{z_j - m}}{\sum_l e^{z_l - m}}, \qquad m = \max_l z_l \tag{17.7} \]</div>
+<p>After subtracting the row maximum \(m\), the largest exponent is \(e^0 = 1\) and nothing overflows. Every serious implementation does this. FlashAttention goes one step further and computes the maximum and the sum <b>block by block</b> (the “online softmax”), so it never needs the whole row at once (<a href="../inference/index.html#row-attention-operator-1-flashattention-1-2-and" title="Attention operator 1: FlashAttention 1, 2 and 3 (planned)">session 124</a>).</p>
+
+<h2>Step 4: a weighted sum of the values</h2>
+<p>Finally, each query collects the values, weighted by its row of \(A\):</p>
+<div class="eq">\[ O = A V \in \R^{T \times d_v}, \qquad \mathbf{o}_i = \sum_{j=1}^{T} A_{ij}\, \mathbf{v}_j \tag{17.8} \]</div>
+<p>Because the weights in a row are non-negative and sum to 1, \(\mathbf{o}_i\) is an <b>average</b> of the value vectors (a convex combination). It always lies “between” the values. If one weight is 1, the output is a copy of one value; if all weights are \(1/T\), it is the plain mean. Shapes: \((T \times T)(T \times d_v) = T \times d_v\). In a real layer the outputs of all heads are joined and multiplied by an output matrix \(W_O \in \R^{d \times d}\) to get back to width \(d\) (<a href="../transformers/multi-head-attention.html">session 19</a>).</p>
+<p>Putting steps 1 to 4 together gives exactly formula (17.1). Now do it by hand.</p>
+<div class="worked"><div class="wt">Worked example: three tokens, by hand</div>
+<p>Take \(T = 3\), \(d = 4\), \(d_k = d_v = 2\), and</p>
+<div class="eq">\[ X = \begin{pmatrix} 1&amp;0&amp;1&amp;0 \\ 0&amp;1&amp;0&amp;1 \\ 1&amp;1&amp;0&amp;0 \end{pmatrix},\ W_Q = \begin{pmatrix} 1&amp;0 \\ 0&amp;1 \\ 1&amp;0 \\ 0&amp;1 \end{pmatrix},\ W_K = \begin{pmatrix} 1&amp;0 \\ 1&amp;1 \\ 0&amp;1 \\ 0&amp;-1 \end{pmatrix},\ W_V = \begin{pmatrix} 2&amp;0 \\ 0&amp;1 \\ 1&amp;0 \\ 0&amp;1 \end{pmatrix} \]</div>
+<p><b>Projections.</b> Each row of \(X\) picks and adds rows of \(W\). Token 1 is \((1,0,1,0)\), so \(\mathbf{q}_1 = (1,0) + (1,0) = (2, 0)\). In full: \(Q = \begin{pmatrix} 2&amp;0 \\ 0&amp;2 \\ 1&amp;1 \end{pmatrix}\), \(K = \begin{pmatrix} 1&amp;1 \\ 1&amp;0 \\ 2&amp;1 \end{pmatrix}\), \(V = \begin{pmatrix} 3&amp;0 \\ 0&amp;2 \\ 2&amp;1 \end{pmatrix}\).</p>
+<p><b>Scores.</b> \(S_{13} = \mathbf{q}_1 \cdot \mathbf{k}_3 = 2 \cdot 2 + 0 \cdot 1 = 4\). All of them: rows \((2, 2, 4)\), \((2, 0, 2)\), \((2, 1, 3)\).</p>
+<p><b>Scale.</b> Divide by \(\sqrt{2} = 1.414\): row 1 becomes \((1.414, 1.414, 2.828)\).</p>
+<p><b>Softmax, row 1.</b> Subtract the maximum: \((-1.414, -1.414, 0)\). Exponentials: \((0.243, 0.243, 1)\), sum 1.486. Weights: \((0.164, 0.164, 0.673)\). Rows 2 and 3 give \((0.446, 0.108, 0.446)\) and \((0.284, 0.140, 0.576)\).</p>
+<p><b>Output, row 1.</b> \(\mathbf{o}_1 = 0.164\,(3, 0) + 0.164\,(0, 2) + 0.673\,(2, 1) = (1.836, 1.000)\). Rows 2 and 3: \((2.229, 0.663)\) and \((2.004, 0.856)\).</p>
+<p>Without the scale, row 1 would be \(\softmax(2, 2, 4) = (0.107, 0.107, 0.787)\): already sharper, with only \(d_k = 2\).</p></div>
+<p>Figure 3 runs the same example step by step. Pick a query to follow its row through the computation; in the score step, click any cell to see its dot product.</p>
+<figure class="fig wide" id="sd-walk"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="sd-walk-prev">Back</button><button type="button" class="btn primary" id="sd-walk-play">Play</button><button type="button" class="btn" id="sd-walk-next">Next</button><span id="sd-walk-lab" style="font:500 14px var(--sans);color:var(--muted)"></span>
+<span class="seg sd-qsel" id="sd-walk-q" role="group" aria-label="Choose the query to follow"><button type="button" data-q="0" aria-pressed="true">Query 1</button><button type="button" data-q="1" aria-pressed="false">Query 2</button><button type="button" data-q="2" aria-pressed="false">Query 3</button></span></div>
+<div class="scroll-x"><svg class="sd-svg" id="sd-walk-svg" viewBox="0 0 780 250" role="img" aria-label="Step-by-step computation of attention on three tokens"></svg></div>
+<div class="readout" id="sd-walk-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Scaled dot-product attention on the worked example, in six steps: input, projections, scores, scaled scores, softmax, output. The selected query’s row is outlined in every matrix.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Blue matrices are on the query side, orange on the key side, green on the value side. In the score step, click a cell \((i, j)\): the readout writes \(\mathbf{q}_i \cdot \mathbf{k}_j\) in full. In the softmax step, check that each row adds up to 1. In the output step, the readout writes the selected output row as a weighted sum of the three value rows. Query 2 is a good test: keys 1 and 3 both score 2, so they get equal weight, and key 2 (score 0) gets the least.</p></details></figure>
+
+<h2>Shapes with batch, heads and two sequences</h2>
+<p>Real code adds two leading axes: a batch of \(B\) sequences and \(H\) heads. Nothing in the math changes; the matrix products just run over the last two axes, for every \((b, h)\) pair at once.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Tensor</th><th>Shape, one head</th><th>Shape in code</th><th>Llama 3.1 8B, one layer, \(T = 8192\)</th></tr></thead><tbody>
+<tr><td>Input \(X\)</td><td>\(T \times d\)</td><td><code>(B, T, d)</code></td><td><code>(B, 8192, 4096)</code></td></tr>
+<tr><td>\(Q\)</td><td>\(T \times d_k\)</td><td><code>(B, H, T, d_k)</code></td><td><code>(B, 32, 8192, 128)</code></td></tr>
+<tr><td>\(K\), \(V\)</td><td>\(T \times d_k\)</td><td><code>(B, H_kv, T, d_k)</code></td><td><code>(B, 8, 8192, 128)</code>, shared by groups of 4 query heads (GQA)</td></tr>
+<tr><td>Scores \(S\), weights \(A\)</td><td>\(T \times T\)</td><td><code>(B, H, T, T)</code></td><td><code>(B, 32, 8192, 8192)</code></td></tr>
+<tr><td>Output \(O\)</td><td>\(T \times d_v\)</td><td><code>(B, H, T, d_v)</code>, then <code>(B, T, d)</code></td><td><code>(B, 8192, 4096)</code> after joining heads</td></tr></tbody></table></div>
+<p>Llama 3.1 8B uses <b>grouped-query attention</b>: 32 query heads but only 8 key and value heads [Certain, config.json]. Each key-value head serves 4 query heads; the math per query head is still formula (17.1) (<a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>).</p>
+<p>The queries and the keys do not have to come from the same sequence. If \(Q\) comes from \(T_q\) tokens and \(K, V\) from \(T_k\) other tokens (for example text queries attending to image patches), the shapes become</p>
+<div class="eq">\[ Q \in \R^{T_q \times d_k},\quad K \in \R^{T_k \times d_k},\quad V \in \R^{T_k \times d_v} \ \Rightarrow\ A \in \R^{T_q \times T_k},\quad O \in \R^{T_q \times d_v} \tag{17.9} \]</div>
+<p>The output always has one row per <b>query</b>. When \(Q\), \(K\), \(V\) all come from the same \(X\), it is <b>self-attention</b>; otherwise it is <b>cross-attention</b> (<a href="../transformers/self-attention-vs-cross-attention.html">session 20</a>). During generation with a KV cache, \(T_q = 1\) (the new token) and \(T_k\) is the whole past, so the score matrix is a single row (<a href="../inference/index.html#row-the-kv-cache" title="The KV cache (planned)">session 80</a>).</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Attention by itself has no idea of order. If you shuffle the rows of \(X\), the rows of \(O\) are shuffled the same way and nothing else changes (the operation is <b>permutation-equivariant</b>). Word order enters only through positions (RoPE, <a href="../foundations/position-part-2-rope-in-depth-and.html">session 14</a>) and masks. Masks are added to \(S\) before the softmax, as \(-\infty\) where a query must not look; that is the next session, <a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">Session 18</a>.</aside>
+
+<h2>The algorithm, and a memory-saving version</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: scaled dot-product attention (one head)</div><ol>
+<li><b>input:</b> \(X \in \R^{T \times d}\), weights \(W_Q, W_K \in \R^{d \times d_k}\), \(W_V \in \R^{d \times d_v}\)</li>
+<li>\(Q \leftarrow X W_Q\); \(K \leftarrow X W_K\); \(V \leftarrow X W_V\) <span class="c">// formula (17.2), each \(T \times d_k\)</span></li>
+<li>\(S \leftarrow Q K^\top / \sqrt{d_k}\) <span class="c">// formulas (17.3), (17.4): \(T \times T\)</span></li>
+<li><b>for</b> each row \(i\): \(m_i \leftarrow \max_j S_{ij}\); \(P_{ij} \leftarrow \exp(S_{ij} - m_i)\) <span class="c">// stable, formula (17.7)</span></li>
+<li>\(A_{ij} \leftarrow P_{ij} / \sum_l P_{il}\) <span class="c">// formula (17.6): each row sums to 1</span></li>
+<li>\(O \leftarrow A V\) <span class="c">// formula (17.8): \(T \times d_v\)</span></li>
+<li><b>return</b> \(O\) (and keep \(A\) if a backward pass will follow)</li></ol></div>
+<p>Algorithm 1 builds the full \(T \times T\) matrix. But row \(i\) of the output only needs row \(i\) of \(A\). So we can process the queries in blocks of \(b\) rows and throw each block of scores away after use. The result is <b>exactly</b> the same, and peak memory for scores drops from \(T^2\) to \(b \cdot T\):</p>
+<div class="algo"><div class="algo-h">Algorithm 2: attention in query blocks (exact, less memory)</div><ol>
+<li><b>input:</b> \(Q, K \in \R^{T \times d_k}\), \(V \in \R^{T \times d_v}\), block size \(b\)</li>
+<li><b>for</b> \(r = 0, b, 2b, \dots\) <b>while</b> \(r \lt T\):</li>
+<li>&nbsp;&nbsp;\(Q_r \leftarrow\) rows \(r\) to \(r + b - 1\) of \(Q\) <span class="c">// \(b \times d_k\)</span></li>
+<li>&nbsp;&nbsp;\(S_r \leftarrow Q_r K^\top / \sqrt{d_k}\) <span class="c">// only \(b \times T\) scores in memory</span></li>
+<li>&nbsp;&nbsp;\(A_r \leftarrow \softmax(S_r)\) row by row, with the max trick</li>
+<li>&nbsp;&nbsp;rows \(r\) to \(r + b - 1\) of \(O\) \(\leftarrow A_r V\); free \(S_r\) and \(A_r\)</li>
+<li><b>return</b> \(O\)</li></ol></div>
+<p>The compute is unchanged: still \(T^2\) dot products. FlashAttention also splits the <b>keys</b> into blocks, using the online softmax so that one row never has to be complete, and it recomputes the blocks in the backward pass instead of storing \(A\). Memory then grows only like \(T\), and the result is still exact [Certain] (<a href="../inference/index.html#row-attention-operator-1-flashattention-1-2-and" title="Attention operator 1: FlashAttention 1, 2 and 3 (planned)">session 124</a>).</p>
+
+<h2>The backward pass</h2>
+<p>Training needs gradients for \(Q\), \(K\) and \(V\). Let \(dO = \partial \mathcal{L}/\partial O\) be the gradient that arrives from the layer above (same shape as \(O\)), and write \(\tilde S = S / \sqrt{d_k}\) for the scaled scores. Apply the linear-layer rule (4.4) from <a href="../foundations/optimization-backprop-adamw.html">session 4</a> to \(O = AV\), then the softmax Jacobian (17.5) row by row:</p>
+<div class="eq">\[ \begin{aligned} dV &amp;= A^\top dO, \qquad dA = dO\, V^\top \\ d\tilde S_{ij} &amp;= A_{ij}\Big(dA_{ij} - \textstyle\sum_{l} A_{il}\, dA_{il}\Big) \\ dQ &amp;= \frac{d\tilde S\, K}{\sqrt{d_k}}, \qquad dK = \frac{d\tilde S^\top Q}{\sqrt{d_k}} \end{aligned} \tag{17.10} \]</div>
+<p>Three observations. First, \(dV\), \(dA\), \(dQ\) and \(dK\) are four more matrix products of the same size as the forward ones, so the backward pass costs about twice the forward pass, as for any layer. Second, the backward pass needs \(A\): either we store the \(T \times T\) matrix from the forward pass, or we recompute it (FlashAttention’s choice). Third, the factor \(A_{ij}\) in \(d\tilde S\) is where saturation hurts: if a row of \(A\) is one-hot, \(d\tilde S\) for that row is zero, and \(Q\) and \(K\) get no signal. The code below checks (17.10) against autograd.</p>
+
+<h2>In PyTorch</h2>
+<p>The code reproduces the worked example, writes batched multi-head attention from scratch and compares it with PyTorch’s fused <code>F.scaled_dot_product_attention</code>, measures the \(\sqrt{d_k}\) effect, and checks the backward formulas. It is deterministic (fixed seed) and runs on a CPU in about a second.</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+<span class="kw2">import</span> torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="cm"># 1) the worked example of this session: T = 3 tokens, d = 4, d_k = d_v = 2</span>
+X  = torch.tensor([[1., 0, 1, 0], [0, 1, 0, 1], [1, 1, 0, 0]])
+WQ = torch.tensor([[1., 0], [0, 1], [1, 0], [0, 1]])
+WK = torch.tensor([[1., 0], [1, 1], [0, 1], [0, -1]])
+WV = torch.tensor([[2., 0], [0, 1], [1, 0], [0, 1]])
+Q, K, V = X @ WQ, X @ WK, X @ WV            <span class="cm"># each (T, d_k) = (3, 2), formula (17.2)</span>
+S = Q @ K.T / math.sqrt(Q.shape[-1])        <span class="cm"># (T, T) scaled scores, (17.3) and (17.4)</span>
+A = torch.softmax(S, dim=-1)                <span class="cm"># softmax over keys: each row sums to 1, (17.6)</span>
+O = A @ V                                   <span class="cm"># (T, d_v), (17.8)</span>
+print(A.round(decimals=4)); print(O.round(decimals=4))
+<span class="cm"># A rows: [0.1636 0.1636 0.6728] [0.4458 0.1084 0.4458] [0.2840 0.1400 0.5760]</span>
+<span class="cm"># O rows: [1.8364 1.0000] [2.2290 0.6626] [2.0039 0.8560]</span>
+
+<span class="cm"># 2) attention from scratch for any batch and heads: shapes (B, H, T, d_k)</span>
+<span class="kw2">def</span> sdpa(q, k, v):
+    d_k = q.shape[-1]
+    s = q @ k.transpose(-2, -1) / math.sqrt(d_k)        <span class="cm"># (B, H, T_q, T_k)</span>
+    s = s - s.amax(dim=-1, keepdim=True)                <span class="cm"># stable softmax, (17.7)</span>
+    a = s.exp(); a = a / a.sum(dim=-1, keepdim=True)
+    <span class="kw2">return</span> a @ v                                        <span class="cm"># (B, H, T_q, d_v)</span>
+
+B, H, T, d_k = 2, 4, 16, 32
+q, k, v = (torch.randn(B, H, T, d_k) <span class="kw2">for</span> _ <span class="kw2">in</span> range(3))
+mine = sdpa(q, k, v)
+ref = F.scaled_dot_product_attention(q, k, v)            <span class="cm"># PyTorch's fused version</span>
+print(mine.shape, (mine - ref).abs().max().item())       <span class="cm"># (2, 4, 16, 32), about 5e-7</span>
+
+<span class="cm"># 3) why sqrt(d_k): the spread of q.k grows like sqrt(d_k), formula (17.4)</span>
+<span class="kw2">for</span> d <span class="kw2">in</span> [16, 64, 256, 1024]:
+    qq, kk = torch.randn(10000, d), torch.randn(10000, d)
+    dots = (qq * kk).sum(-1)
+    print(d, round(dots.std().item(), 2), round(math.sqrt(d), 2))   <span class="cm"># 3.95 7.98 16.17 32.06</span>
+
+<span class="cm"># 4) without the scale, softmax saturates and its gradient vanishes</span>
+s = torch.randn(8, 512)                                  <span class="cm"># 8 keys, d_k = 512</span>
+qk = (torch.randn(512) * s).sum(-1)                      <span class="cm"># 8 raw scores, spread about 22</span>
+<span class="kw2">for</span> name, z <span class="kw2">in</span> [("raw", qk), ("scaled", qk / math.sqrt(512))]:
+    z = z.clone().requires_grad_(True)
+    a = torch.softmax(z, -1); a[0].backward()
+    print(name, round(a.max().item(), 3), round(z.grad.norm().item(), 4))
+<span class="cm"># raw: largest weight 1.0, gradient 0.0  |  scaled: largest weight 0.37, gradient 0.0257</span>
+
+<span class="cm"># 5) the backward pass by hand, formula (17.10), matches autograd</span>
+q = torch.randn(5, 8, requires_grad=True); k = torch.randn(7, 8, requires_grad=True)
+v = torch.randn(7, 3, requires_grad=True); dO = torch.randn(5, 3)
+A = torch.softmax(q @ k.T / math.sqrt(8), -1); (A @ v).backward(dO)
+<span class="kw2">with</span> torch.no_grad():
+    dV = A.T @ dO
+    dA = dO @ v.T
+    dS = A * (dA - (dA * A).sum(-1, keepdim=True))
+    dQ = dS @ k / math.sqrt(8); dK = dS.T @ q / math.sqrt(8)
+print(max((x - y).abs().max().item() <span class="kw2">for</span> x, y <span class="kw2">in</span> [(dQ, q.grad), (dK, k.grad), (dV, v.grad)]))   <span class="cm"># about 3e-8</span></pre>
+<p>On a GPU, <code>F.scaled_dot_product_attention</code> picks a fused kernel (such as FlashAttention) when the inputs allow it, so it never builds the \(T \times T\) matrix. Use it in real code; write your own only to learn or to test.</p>
+
+<h2>The cost: T² compute and T² memory</h2>
+<p>Count the work for one head. \(QK^\top\) is \(T \times T\) dot products of length \(d_k\): \(T^2 d_k\) multiply-adds, which is \(2 T^2 d_k\) FLOPs (one multiply and one add each). \(AV\) costs \(2 T^2 d_v\). The softmax adds a few operations per score, small next to these. The score matrix itself holds \(T^2\) numbers:</p>
+<div class="eq">\[ \text{FLOPs}_{\text{head}} \approx 2T^2 d_k + 2T^2 d_v = 4 T^2 d_k, \qquad \text{memory}_{\text{head}} = T^2 \text{ numbers} \tag{17.11} \]</div>
+<p>For a whole layer with \(H\) heads and \(H d_k = d\), the attention core costs \(4 T^2 d\) FLOPs. Compare it with the four projections \(Q, K, V\) and the output \(W_O\): each is a \((T \times d)(d \times d)\) product, \(2 T d^2\) FLOPs, so \(8 T d^2\) in total for standard multi-head attention. The ratio is</p>
+<div class="eq">\[ \frac{\text{attention core}}{\text{projections}} = \frac{4 T^2 d}{8 T d^2} = \frac{T}{2d} \tag{17.12} \]</div>
+<p>So for short sequences (\(T \lt 2d\)) the projections dominate and attention looks cheap. For long sequences the \(T^2\) part wins and keeps growing: doubling \(T\) doubles the projection cost but quadruples the attention core. With grouped-query attention (smaller \(W_K, W_V\)), projections are cheaper and the crossover comes earlier: for Llama 3.1 8B the projections cost \(5 T d^2\), so the crossover is at \(T = 1.25\,d = 5{,}120\) tokens.</p>
+<div class="worked"><div class="wt">Worked example: the T² wall in Llama 3.1 8B</div>
+<p>Per layer: \(d = 4096\), \(H = 32\) query heads [Certain, config.json]. Scores in BF16 take 2 bytes each.</p>
+<p>At \(T = 1{,}024\): score memory \(32 \times 1024^2 \times 2\) bytes \(= 64\) MiB per layer, per sequence. Attention core \(4 \times 1024^2 \times 4096 = 1.7 \times 10^{10}\) FLOPs, only 1/8 of the MHA-style projection cost.</p>
+<p>At \(T = 8{,}192\) (8 times longer): score memory \(32 \times 8192^2 \times 2 = 4\) GiB per layer, 64 times more. If a naive implementation stores \(A\) for the backward pass in all 32 layers, that is 128 GiB for <b>one</b> sequence, more than an 80 GB GPU. Attention core \(1.1 \times 10^{12}\) FLOPs per layer.</p>
+<p>At \(T = 131{,}072\) (the model’s maximum context): one layer’s scores would need \(32 \times 131072^2 \times 2\) bytes \(= 1\) TiB. This is why long-context models cannot run attention naively, and why FlashAttention, which never stores the scores, is not optional.</p></div>
+<p>Figure 4 lets you move \(T\) and compare two real models.</p>
+<figure class="fig" id="sd-cost"><div class="fig-body">
+<div class="controls"><span class="seg" id="sd-cost-m"><button type="button" data-m="gpt2" aria-pressed="false">GPT-2 small</button><button type="button" data-m="llama" aria-pressed="true">Llama 3.1 8B</button></span></div>
+<div class="sd-grid">
+<label for="sd-cost-t">Sequence length \(T = 2^n\)</label><input type="range" id="sd-cost-t" min="7" max="17" step="1" value="13"><output id="sd-cost-tv"></output></div>
+<svg class="sd-svg" id="sd-cost-svg" viewBox="0 0 640 270" role="img" aria-label="FLOPs of projections and of the attention core per layer against sequence length, log scale"></svg>
+<div class="sd-leg"><span style="--c:var(--q)">projections \(W_Q, W_K, W_V, W_O\)</span><span style="--c:var(--k)">attention core \(QK^\top\) and \(AV\)</span></div>
+<div class="readout" id="sd-cost-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Compute per layer and per sequence (log-log). The projection line has slope 1 (cost \(\propto T\)); the attention-core line has slope 2 (cost \(\propto T^2\)). The dot marks where they cross. The readout also gives the memory a naive implementation needs for the score matrix of one layer, in BF16.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Each step of the slider doubles \(T\). Watch the readout: projection FLOPs double, attention-core FLOPs and score memory grow 4 times. GPT-2 small (\(d = 768\), 12 heads, full multi-head attention) crosses at \(T = 2d = 1{,}536\), just above its 1,024-token context. Llama 3.1 8B (\(d = 4096\), GQA with 8 key-value heads) crosses at \(T = 5{,}120\). This chart counts only the attention block; the feed-forward network adds another cost that grows like \(T\) (<a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a>).</p></details></figure>
+<p>Memory is often the harder limit. FLOPs can be spread over time, but a tensor that does not fit does not run. That is why the first fix was to stop storing the score matrix (FlashAttention: exact, memory \(O(T)\), compute still \(O(T^2)\)), and why approaches that reduce the compute itself change the model: sliding windows, sparse patterns, linear attention, state-space models (<a href="../transformers/attention-variants-2-a-first-look-at.html">session 27</a>).</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What \(Q\), \(K\), \(V\) are</th><th>Typical \(T\), and what the \(T^2\) means</th></tr></thead><tbody>
+<tr><td>LLM pretraining (Llama, Qwen, GPT)</td><td>All from the same text tokens (self-attention, causal mask)</td><td>4k to 8k tokens in most pretraining, longer in a final long-context stage [Likely]; fused kernels are required</td></tr>
+<tr><td>LLM generation with a KV cache</td><td>\(Q\): the 1 new token; \(K, V\): all cached past tokens</td><td>\(T_q = 1\), so each step costs \(O(T_k\, d)\); the problem moves from compute to reading the cache from memory (<a href="../inference/index.html#row-the-kv-cache" title="The KV cache (planned)">session 80</a>)</td></tr>
+<tr><td>Vision Transformer on one image</td><td>Image patches (plus a class token)</td><td>ViT-B/16 at 224 × 224: 196 patches + 1 = 197 tokens, 38,809 scores per head; cheap [Certain]</td></tr>
+<tr><td>VLM reading an image and a question</td><td>Image tokens and text tokens in one sequence, or text queries over image keys (cross-attention)</td><td>High-resolution images give thousands of image tokens, so the \(T^2\) cost appears quickly (<a href="../vision/index.html#row-the-vision-transformer-vit" title="The Vision Transformer (ViT) (planned)">session 164</a>)</td></tr>
+<tr><td>Video classification and action recognition</td><td>Patches from many frames</td><td>16 frames × 196 patches = 3,136 tokens: 9.8 million scores per head, 253 times more than one image. This is why video transformers such as ViViT also offer variants that factorize attention into space and time [Certain]</td></tr>
+<tr><td>Video retrieval, key-moment detection, Video-RAG</td><td>A text query attends over frame or clip features (cross-attention, \(T_q \ll T_k\))</td><td>\(T_q \times T_k\) scores (formula 17.9); the attention weights over time can be read as a rough “where in the video” signal [Likely]</td></tr>
+<tr><td>Retrieval and fingerprinting encoders</td><td>Self-attention inside a text or video encoder that outputs one vector</td><td>Attention runs once per item at indexing time; at query time only vectors are compared</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Softmax over the wrong axis.</b> Scores are <code>(..., T_q, T_k)</code>; the softmax goes over keys, <code>dim=-1</code>. A wrong axis gives no error and a model that trains poorly.</li>
+<li><b>Forgetting the scale, or using the wrong \(d\).</b> Divide by \(\sqrt{d_k}\), the <b>head</b> size (for example 128), not by \(\sqrt{d}\) of the whole model (4096) and not by \(d_k\).</li>
+<li><b>Transposing the wrong tensor.</b> It is \(QK^\top\), with \(K\) transposed on its last two axes: <code>k.transpose(-2, -1)</code>. Using <code>k.T</code> on a 4-D tensor reverses all four axes.</li>
+<li><b>Mixing up \(T\) and \(d_k\) when reshaping heads.</b> Go from <code>(B, T, d)</code> to <code>(B, T, H, d_k)</code> with <code>view</code>, <b>then</b> <code>transpose(1, 2)</code> to <code>(B, H, T, d_k)</code>. Calling <code>view(B, H, T, d_k)</code> directly runs but mixes tokens and heads.</li>
+<li><b>A naive softmax in FP16.</b> Scores above about 11 overflow. Subtract the row maximum (17.7), or use the fused function.</li>
+<li><b>Masking after the softmax.</b> Setting weights to 0 after the softmax leaves rows that no longer sum to 1. Add \(-\infty\) (or a large negative number) to the scores before the softmax (<a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">Session 18</a>).</li>
+<li><b>Thinking attention knows order.</b> Without positions or masks it is permutation-equivariant: “dog bites man” and “man bites dog” give the same set of output vectors.</li>
+<li><b>Estimating memory with weights only.</b> At long context, the \(B \cdot H \cdot T^2\) score tensor (if materialized) can be larger than the whole model.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Write scaled dot-product attention and give the shape of every tensor.<span class="lvl">basic</span></summary><div class="ans">\(\operatorname{Attention}(Q, K, V) = \softmax(QK^\top/\sqrt{d_k})\,V\). With \(X \in \R^{T \times d}\): \(Q = XW_Q\), \(K = XW_K \in \R^{T \times d_k}\), \(V = XW_V \in \R^{T \times d_v}\). Scores and weights are \(T \times T\), softmax over the last (key) axis, output \(T \times d_v\). With batch and heads: \(Q, K, V\) are <code>(B, H, T, d_k)</code>, scores <code>(B, H, T, T)</code>, output <code>(B, H, T, d_v)</code>, then heads are joined to <code>(B, T, d)</code> and multiplied by \(W_O\).</div></details>
+<details class="qa"><summary>Why do we divide by \(\sqrt{d_k}\)?<span class="lvl">core</span></summary><div class="ans">If the components of \(\mathbf{q}\) and \(\mathbf{k}\) are independent with mean 0 and variance 1, then \(\mathbf{q}\cdot\mathbf{k}\) is a sum of \(d_k\) terms of variance 1, so its variance is \(d_k\) and its standard deviation \(\sqrt{d_k}\). Large score differences push the softmax toward one-hot, where its Jacobian \(\operatorname{diag}(\mathbf{a}) - \mathbf{a}\mathbf{a}^\top\) is nearly zero, so gradients to \(Q\) and \(K\) vanish. Dividing by \(\sqrt{d_k}\) brings the variance back to 1 for every head size.</div></details>
+<details class="qa"><summary>Why \(\sqrt{d_k}\) and not \(d_k\)?<span class="lvl">core</span></summary><div class="ans">Variance scales with the square of a constant: \(\operatorname{Var}(cs) = c^2 \operatorname{Var}(s)\). To map variance \(d_k\) to 1 we need \(c = 1/\sqrt{d_k}\). Dividing by \(d_k\) gives variance \(1/d_k\), so scores near 0 and an almost uniform softmax at initialization. (μP argues for \(1/d_k\) for a different reason: after training, \(\mathbf{q}\) and \(\mathbf{k}\) are correlated and the score grows like \(d_k\), which matters when transferring hyper-parameters across widths.)</div></details>
+<details class="qa"><summary>What is the time and memory complexity of self-attention?<span class="lvl">core</span></summary><div class="ans">Per layer, the attention core costs \(O(T^2 d)\): \(2T^2 d_k\) FLOPs for \(QK^\top\) and \(2T^2 d_v\) for \(AV\) per head, \(4T^2 d\) in total. The projections cost \(O(T d^2)\), \(8Td^2\) for standard MHA, so attention dominates once \(T \gt 2d\). A naive implementation stores \(B \cdot H \cdot T^2\) scores. FlashAttention reduces memory to \(O(T)\) by tiling and recomputation, but compute stays \(O(T^2 d)\).</div></details>
+<details class="qa"><summary>Why subtract the maximum before the softmax? Does it change the result?<span class="lvl">basic</span></summary><div class="ans">The softmax is invariant to adding a constant to all inputs of a row, so subtracting the row maximum gives the same output. It prevents overflow: in FP16, \(e^z\) is infinite for \(z \gt 11.09\) and the ratio becomes NaN. After subtraction the largest exponent is \(e^0 = 1\). FlashAttention keeps a running maximum and rescales partial sums (online softmax) so it can do this block by block.</div></details>
+<details class="qa"><summary>Why use separate \(W_Q\) and \(W_K\)? What happens if they are the same matrix?<span class="lvl">core</span></summary><div class="ans">With one matrix, \(S = XWW^\top X^\top\) is symmetric (token \(i\) scores \(j\) exactly as \(j\) scores \(i\)) and positive semi-definite, so the diagonal \(\lVert\mathbf{q}_i\rVert^2\) tends to be large and tokens favor themselves. Many relations are asymmetric (a pronoun looks for its noun, not the reverse). Separate matrices give a general bilinear form \(\mathbf{x}_i W_Q W_K^\top \mathbf{x}_j^\top\) of rank at most \(d_k\).</div></details>
+<details class="qa"><summary>Dot-product vs additive attention?<span class="lvl">core</span></summary><div class="ans">Additive (Bahdanau) attention scores each pair with a small network \(\mathbf{w}^\top\tanh(W_1\mathbf{q} + W_2\mathbf{k})\); dot-product attention uses \(\mathbf{q}\cdot\mathbf{k}\). Both have similar theoretical cost, but dot-product attention is a single large matrix multiplication, which is much faster and more memory-efficient on GPUs. The transformer paper notes that without scaling, additive attention did better for large \(d_k\), which they attribute to softmax saturation; the \(1/\sqrt{d_k}\) factor fixes it.</div></details>
+<details class="qa"><summary>Is attention permutation-invariant or equivariant? Why does that matter?<span class="lvl">core</span></summary><div class="ans">Equivariant: if \(P\) permutes the rows of \(X\), then \(\operatorname{Attn}(PX) = P\,\operatorname{Attn}(X)\). Each token gets the same output vector regardless of where it sits. So the model cannot use word order unless we add positional information (absolute embeddings, RoPE) or masks (causal). For images and video, the same is true for patch order, which is why ViTs add position embeddings.</div></details>
+<details class="qa"><summary>Derive the gradient of attention with respect to the scores.<span class="lvl">advanced</span></summary><div class="ans">With \(O = AV\) and upstream \(dO\): \(dV = A^\top dO\) and \(dA = dO\,V^\top\). For each row, the softmax Jacobian gives \(d\tilde S_{ij} = A_{ij}(dA_{ij} - \sum_l A_{il} dA_{il})\). Then \(dQ = d\tilde S\,K/\sqrt{d_k}\) and \(dK = d\tilde S^\top Q/\sqrt{d_k}\). Note the backward needs \(A\) (stored or recomputed), the row sum \(\sum_l A_{il} dA_{il}\) equals \(\mathbf{o}_i \cdot d\mathbf{o}_i\) (FlashAttention uses this to avoid storing \(A\)), and a one-hot row of \(A\) makes \(d\tilde S\) zero.</div></details>
+<details class="qa"><summary>Llama 3.1 8B at 8k context: how much memory would naive attention scores take?<span class="lvl">advanced</span></summary><div class="ans">32 query heads, \(T = 8192\), BF16: \(32 \times 8192^2 \times 2\) bytes \(= 4\) GiB per layer per sequence. Stored for backward in all 32 layers: 128 GiB, more than one 80 GB GPU, for a single sequence. With FlashAttention the scores are never stored; only the output and one number per row (the log-sum-exp) are kept for the backward pass.</div></details>
+<details class="qa"><summary>During decoding with a KV cache, what are the shapes and the cost of one attention step?<span class="lvl">advanced</span></summary><div class="ans">The new token gives \(Q\) with \(T_q = 1\): <code>(B, H, 1, d_k)</code>. The cache holds \(K, V\) of shape <code>(B, H_kv, T_k, d_k)</code>. Scores are <code>(B, H, 1, T_k)</code>, a single row. Compute is \(O(T_k d)\) per token, but every step must read the whole cache from GPU memory, so decoding is limited by memory bandwidth, not FLOPs. That is why MQA and GQA (fewer K/V heads) speed up generation.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>In the worked example, compute row 2 of \(A\) and \(\mathbf{o}_2\) by hand. Check with Figure 3.</li>
+<li>\(Q\) has shape <code>(4, 16, 512, 64)</code>. What are \(B\), \(H\), \(T\), \(d_k\)? What is the shape of the scores, and by what number do you divide them?</li>
+<li>Show that \(\softmax(\mathbf{z} + c\mathbf{1}) = \softmax(\mathbf{z})\) for any constant \(c\).</li>
+<li>Components of \(\mathbf{q}, \mathbf{k}\) have variance \(\sigma^2 = 4\) (not 1) and \(d_k = 64\). What is the standard deviation of \(\mathbf{q}\cdot\mathbf{k}\), and of the scaled score?</li>
+<li>For GPT-2 small (\(d = 768\), 12 heads, \(T = 1024\)), compute the attention-core FLOPs and the projection FLOPs per layer, and the score memory per layer in FP32.</li>
+<li>A video model attends jointly over 32 frames of 196 patches each. How many scores per head is that, compared with one frame?</li>
+<li>Explain why Algorithm 2 gives exactly the same output as Algorithm 1, and what it does not save.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Scores \((2, 0, 2)\), scaled \((1.414, 0, 1.414)\). Exponentials after subtracting 1.414: \((1, 0.243, 1)\), sum 2.243, so \(A_2 = (0.446, 0.108, 0.446)\). \(\mathbf{o}_2 = 0.446(3,0) + 0.108(0,2) + 0.446(2,1) = (2.229, 0.663)\). 2. \(B = 4\), \(H = 16\), \(T = 512\), \(d_k = 64\). Scores <code>(4, 16, 512, 512)</code>, divided by \(\sqrt{64} = 8\). 3. \(e^{z_j + c} / \sum_l e^{z_l + c} = e^c e^{z_j} / (e^c \sum_l e^{z_l})\); the \(e^c\) cancels. 4. Each product \(q_l k_l\) has variance \(\sigma^2 \cdot \sigma^2 = 16\), so \(\operatorname{Var} = 64 \times 16 = 1024\) and the standard deviation is 32. Scaled by \(1/8\): standard deviation 4. The \(\sqrt{d_k}\) fixes the growth with \(d_k\), not the size of the inputs; that is the job of normalization layers (or QK-norm). 5. Attention core \(4 \times 1024^2 \times 768 = 3.22 \times 10^9\) FLOPs; projections \(8 \times 1024 \times 768^2 = 4.83 \times 10^9\) (ratio \(T/2d = 0.667\)). Score memory \(12 \times 1024^2 \times 4\) bytes \(= 48\) MiB (50.3 MB). 6. \(T = 32 \times 196 = 6{,}272\); \(6272^2 = 39{,}337{,}984\) scores per head, \(32^2 = 1{,}024\) times one frame’s \(196^2 = 38{,}416\). 7. Each output row \(\mathbf{o}_i\) depends only on \(\mathbf{q}_i\) and all of \(K, V\), so rows can be computed in any grouping. It saves memory (\(bT\) instead of \(T^2\) scores at a time) but not compute: all \(T^2\) dot products are still done.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Attention is \(\softmax(QK^\top/\sqrt{d_k})V\) (17.1), with \(Q = XW_Q\), \(K = XW_K\), \(V = XW_V\) (17.2), each \(T \times d_k\) for one head.</li>
+<li>Four steps: dot-product scores \(T \times T\) (17.3), divide by \(\sqrt{d_k}\) (17.4), softmax over keys so each row sums to 1 (17.6), and a weighted average of the values (17.8).</li>
+<li>A dot product of random vectors has variance \(d_k\) (17.4). Without the scale, softmax saturates, its Jacobian (17.5) goes to zero, and \(Q\), \(K\) stop learning. \(\sqrt{d_k}\), not \(d_k\), restores variance 1.</li>
+<li>Subtract the row maximum before exponentiating (17.7). The backward pass (17.10) needs \(A\), stored or recomputed.</li>
+<li>Cost per layer: \(4T^2 d\) FLOPs and \(H T^2\) stored scores (17.11), against \(8Td^2\) for the projections (17.12). For Llama 3.1 8B at 8k tokens, naive scores take 4 GiB per layer; FlashAttention removes the memory, not the \(T^2\) compute.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \operatorname{Attention}(Q,K,V) = \softmax\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V, \qquad \operatorname{Var}(\mathbf{q}\cdot\mathbf{k}) = d_k, \qquad \frac{\partial a_i}{\partial z_j} = a_i(\delta_{ij} - a_j) \]</div>
+<div class="eq">\[ \text{FLOPs}_{\text{layer}} \approx 4T^2 d \ (\text{core}) + 8Td^2 \ (\text{projections}), \qquad \text{score memory} = B \cdot H \cdot T^2 \]</div>
+<h2 class="plain" id="scaled-dot-product-attention-the-math-and-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Vaswani et al. (2017). <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a></li><li>Jurafsky &amp; Martin, <a href="https://web.stanford.edu/~jurafsky/slp3/" target="_blank" rel="noopener"><i>Speech and Language Processing, 3rd ed. draft</i></a>, chapter 7: Transformers and Pretraining</li><li>Xiao &amp; Zhu, <a href="https://github.com/NiuTrans/NLPBook" target="_blank" rel="noopener"><i>NLP: Neural Networks and Large Language Models</i></a>, chapter 6: Transformers</li><li>Vaswani et al. (2017). <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a></li><li>Jurafsky &amp; Martin, <a href="https://web.stanford.edu/~jurafsky/slp3/" target="_blank" rel="noopener"><i>Speech and Language Processing, 3rd ed. draft</i></a>, chapter 7: Transformers and Pretraining</li><li>Xiao &amp; Zhu, <a href="https://github.com/NiuTrans/NLPBook" target="_blank" rel="noopener"><i>NLP: Neural Networks and Large Language Models</i></a>, chapter 6: Transformers</li><li>Raschka, <a href="https://github.com/rasbt/LLMs-from-scratch" target="_blank" rel="noopener"><i>Build a Large Language Model (From Scratch)</i></a>, chapter 3: Coding attention mechanisms</li><li>Bahdanau et al. (2014). <a href="https://arxiv.org/abs/1409.0473" target="_blank" rel="noopener">Neural Machine Translation by Jointly Learning to Align and Translate</a></li><li>Luong et al. (2015). <a href="https://arxiv.org/abs/1508.04025" target="_blank" rel="noopener">Effective Approaches to Attention-based Neural Machine Translation</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>Milakov &amp; Gimelshein (2018). <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noopener">Online normalizer calculation for softmax</a></li><li>Yang et al. (2022). <a href="https://arxiv.org/abs/2203.03466" target="_blank" rel="noopener">Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer</a></li><li>Dehghani et al. (2023). <a href="https://arxiv.org/abs/2302.05442" target="_blank" rel="noopener">Scaling Vision Transformers to 22 Billion Parameters</a></li><li>Dosovitskiy et al. (2020). <a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener">An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale</a></li><li>Arnab et al. (2021). <a href="https://arxiv.org/abs/2103.15691" target="_blank" rel="noopener">ViViT: A Video Vision Transformer</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../transformers/attention-intuition-query-key-value.html"><small>Previous · session 16</small>Attention intuition: query, key, value</a><a class="next" href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html"><small>Next · session 18</small>Masks: causal, padding, bidirectional, prefix and packing masks</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="scaled-dot-product-attention-the-math-and"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const mns=s=>String(s).replace(/-/g,"−");
+const f3=v=>mns((Math.abs(v)<5e-4?0:v).toFixed(3));
+const fmtInt=n=>Math.round(n).toLocaleString("en-US");
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+function softmaxStats(z){const m=Math.max(...z);const e=z.map(v=>Math.exp(v-m));const s=e.reduce((a,b)=>a+b,0);const a=e.map(v=>v/s);
+ let s2=0,s3=0,H=0,mx=0;a.forEach(p=>{s2+=p*p;s3+=p*p*p;if(p>0)H-=p*Math.log(p);if(p>mx)mx=p;});
+ return {a,max:mx,ent:H,jac:Math.sqrt(Math.max(0,s2*s2-2*s3+s2))};}
+
+/* ---------- Figure 1: shapes ---------- */
+(function(){
+ const svg=$("#sd-shape-svg");if(!svg)return;const Ti=$("#sd-shape-t"),Di=$("#sd-shape-d"),Ki=$("#sd-shape-k"),info=$("#sd-shape-info");const u=9;
+ function mat(x,y,rows,cols,col,fill,name,shape){let g="";
+  for(let r=0;r<rows;r++)for(let c=0;c<cols;c++)g+=`<rect x="${x+c*u}" y="${y+r*u}" width="${u}" height="${u}" fill="${fill}" stroke="${col}" stroke-width=".7"/>`;
+  g+=`<rect x="${x}" y="${y}" width="${cols*u}" height="${rows*u}" fill="none" stroke="${col}" stroke-width="1.8" rx="1"/>`;
+  const cx=x+cols*u/2;g+=`<text x="${cx}" y="${y-7}" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">${name}</text><text x="${cx}" y="${y+rows*u+15}" text-anchor="middle" font-size="11.5" class="mono" fill="var(--muted)">${shape}</text>`;return g;}
+ const op=(x,y,t)=>`<text x="${x}" y="${y}" text-anchor="middle" font-size="18" font-weight="700" fill="var(--muted)">${t}</text>`;
+ function draw(){const T=+Ti.value,d=+Di.value,k=+Ki.value;$("#sd-shape-tv").value=T;$("#sd-shape-dv").value=d;$("#sd-shape-kv").value=k;
+  const qf="color-mix(in srgb,var(--q) 30%,var(--card))",kf="color-mix(in srgb,var(--k) 30%,var(--card))",vf="color-mix(in srgb,var(--v) 30%,var(--card))",nf="var(--paper2)",sf="color-mix(in srgb,var(--muted) 28%,var(--card))";
+  const sw=w=>Math.max(w,40);let g="";
+  /* top row: X · [W_Q W_K W_V] = [Q K V] */
+  const y0=34;let x=14;g+=mat(x,y0,T,d,"var(--muted)",nf,"X",`${T}×${d}`);x+=sw(d*u)+10;g+=op(x+6,y0+Math.min(T,d)*u/2+6,"·");x+=22;
+  [["Q","var(--q)"],["K","var(--k)"],["V","var(--v)"]].forEach(([n,c])=>{g+=mat(x,y0,d,k,c,"var(--card)",`W<tspan baseline-shift='sub' font-size='10'>${n}</tspan>`,`${d}×${k}`);x+=sw(k*u)+8;});
+  g+=op(x+6,y0+Math.min(T,d)*u/2+6,"=");x+=24;
+  [["Q","var(--q)",qf],["K","var(--k)",kf],["V","var(--v)",vf]].forEach(([n,c,f])=>{g+=mat(x,y0,T,k,c,f,n,`${T}×${k}`);x+=sw(k*u)+8;});
+  /* bottom row: Q · Kᵀ = S → softmax → A · V = O */
+  const y1=34+16*u+44;x=14;const mid=y1+T*u/2+6;
+  g+=mat(x,y1,T,k,"var(--q)",qf,"Q",`${T}×${k}`);x+=sw(k*u)+8;g+=op(x+6,mid,"·");x+=20;
+  g+=mat(x,y1,k,T,"var(--k)",kf,"K<tspan baseline-shift='super' font-size='10'>⊤</tspan>",`${k}×${T}`);x+=sw(T*u)+8;g+=op(x+6,mid,"=");x+=20;
+  g+=mat(x,y1,T,T,"var(--muted)",sf,"S / √d<tspan baseline-shift='sub' font-size='10'>k</tspan>",`${T}×${T}`);x+=sw(T*u)+8;
+  g+=`<text x="${x+30}" y="${mid-10}" text-anchor="middle" font-size="11.5" fill="var(--muted)">softmax</text><text x="${x+30}" y="${mid+4}" text-anchor="middle" font-size="11.5" fill="var(--muted)">each row</text>`+op(x+30,mid+20,"→");x+=64;
+  g+=mat(x,y1,T,T,"var(--muted)",sf,"A",`${T}×${T}`);x+=sw(T*u)+8;g+=op(x+6,mid,"·");x+=20;
+  g+=mat(x,y1,T,k,"var(--v)",vf,"V",`${T}×${k}`);x+=sw(k*u)+8;g+=op(x+6,mid,"=");x+=20;
+  g+=mat(x,y1,T,k,"var(--tc)","color-mix(in srgb,var(--tc) 25%,var(--card))","O",`${T}×${k}`);
+  svg.innerHTML=g;
+  const proj=3*T*d*k,qk=T*T*k,av=T*T*k;
+  info.innerHTML=`X: ${T}×${d} = <b>${T*d}</b> numbers. Q, K, V: ${T}×${k} = <b>${T*k}</b> each. Scores S and weights A: ${T}×${T} = <b>${T*T}</b> each. Output O: ${T}×${k} = <b>${T*k}</b>. Multiply-adds: projections 3·T·d·d<sub>k</sub> = <b>${fmtInt(proj)}</b>, QK<sup>⊤</sup> T²·d<sub>k</sub> = <b>${fmtInt(qk)}</b>, AV T²·d<sub>v</sub> = <b>${fmtInt(av)}</b>. In code with batch and heads: Q is (B, H, ${T}, ${k}), scores are (B, H, ${T}, ${T}).`;}
+ [Ti,Di,Ki].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: why sqrt(d_k) ---------- */
+(function(){
+ const svg=$("#sd-scale-svg");if(!svg)return;const Di=$("#sd-scale-d"),On=$("#sd-scale-on"),info=$("#sd-scale-info");
+ const NK=8,NT=400,DM=1024;
+ /* one example: a query and 8 keys, prefixes of length d_k */
+ const g1=gauss(rng(7));const q1=Float32Array.from({length:DM},g1);const k1=Array.from({length:NK},()=>Float32Array.from({length:DM},g1));
+ /* 400 trials, each a query and 8 keys of length 1024; d_k uses the first d_k components */
+ const g2=gauss(rng(11));const data=new Float32Array(NT*(NK+1)*DM);for(let i=0;i<data.length;i++)data[i]=g2();
+ const ST={};
+ for(let n=1;n<=10;n++){const d=2**n;const acc={0:{max:0,ent:0,jac:0,s2:0},1:{max:0,ent:0,jac:0,s2:0}};
+  for(let t=0;t<NT;t++){const base=t*(NK+1)*DM;const raw=[];
+   for(let j=0;j<NK;j++){let s=0;const kb=base+(j+1)*DM;for(let l=0;l<d;l++)s+=data[base+l]*data[kb+l];raw.push(s);}
+   [0,1].forEach(sc=>{const z=sc?raw.map(v=>v/Math.sqrt(d)):raw;const st=softmaxStats(z);const a=acc[sc];a.max+=st.max;a.ent+=st.ent;a.jac+=st.jac;z.forEach(v=>a.s2+=v*v);});}
+  ST[n]={};[0,1].forEach(sc=>{const a=acc[sc];ST[n][sc]={max:a.max/NT,ent:a.ent/NT,jac:a.jac/NT,std:Math.sqrt(a.s2/(NT*NK))};});}
+ const PX=n=>420+(n-1)*(200/9),PY=v=>220-v*175;
+ function draw(){const n=+Di.value,d=2**n,sc=On.checked?1:0;$("#sd-scale-dv").value=d;
+  const z=[];for(let j=0;j<NK;j++){let s=0;for(let l=0;l<d;l++)s+=q1[l]*k1[j][l];z.push(sc?s/Math.sqrt(d):s);}
+  const ex=softmaxStats(z);let g="";
+  g+=`<line x1="30" y1="220" x2="350" y2="220" stroke="var(--muted)"/><text x="190" y="20" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">One query, 8 keys</text>`;
+  ex.a.forEach((p,j)=>{const x=40+j*39,h=p*175;g+=`<rect x="${x}" y="${(220-h).toFixed(1)}" width="28" height="${h.toFixed(1)}" rx="3" fill="var(--k)"/><text x="${x+14}" y="${(214-h).toFixed(1)}" text-anchor="middle" font-size="11" class="mono" fill="var(--ink2)">${p.toFixed(2)}</text><text x="${x+14}" y="236" text-anchor="middle" font-size="11.5" fill="var(--muted)">k${j+1}</text><text x="${x+14}" y="252" text-anchor="middle" font-size="10.5" class="mono" fill="var(--muted)">${mns((Math.abs(z[j])<0.05?0:z[j]).toFixed(1))}</text>`;});
+  g+=`<text x="30" y="266" font-size="10.5" fill="var(--muted)">score →</text>`;
+  /* right: curves */
+  g+=`<path d="M420 45 V220 H620" fill="none" stroke="var(--muted)"/><text x="520" y="20" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">Average largest weight</text>`;
+  [0,0.5,1].forEach(v=>g+=`<text x="414" y="${PY(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${v}</text><line x1="420" y1="${PY(v)}" x2="620" y2="${PY(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/>`);
+  g+=`<line x1="420" y1="${PY(1/8)}" x2="620" y2="${PY(1/8)}" stroke="var(--rule)"/><text x="622" y="${PY(1/8)+4}" font-size="10" fill="var(--muted)">1/8</text>`;
+  [1,4,7,10].forEach(m=>g+=`<text x="${PX(m)}" y="236" text-anchor="middle" font-size="11" fill="var(--muted)">${2**m}</text>`);
+  g+=`<text x="520" y="254" text-anchor="middle" font-size="11.5" fill="var(--muted)">d_k (log scale)</text>`;
+  [[0,"var(--tc)"],[1,"var(--q)"]].forEach(([s,c])=>{const pts=[];for(let m=1;m<=10;m++)pts.push(PX(m).toFixed(1)+","+PY(ST[m][s].max).toFixed(1));
+   g+=`<polyline points="${pts.join(" ")}" fill="none" stroke="${c}" stroke-width="2.4"/>`+pts.map(p=>`<circle cx="${p.split(",")[0]}" cy="${p.split(",")[1]}" r="2.6" fill="${c}"/>`).join("");});
+  g+=`<line x1="${PX(n)}" y1="45" x2="${PX(n)}" y2="220" stroke="var(--muted)" stroke-dasharray="4 4"/><circle cx="${PX(n)}" cy="${PY(ST[n][sc].max)}" r="6" fill="none" stroke="var(--ink)" stroke-width="2"/>`;
+  svg.innerHTML=g;const s=ST[n][sc],raw=ST[n][0];
+  info.innerHTML=`d<sub>k</sub> = <b>${d}</b>, ${sc?"scaled by 1/√d<sub>k</sub>":"<b>not scaled</b>"}. Raw score spread (std) <b>${raw.std.toFixed(2)}</b> (√d<sub>k</sub> = ${Math.sqrt(d).toFixed(2)}); spread of the scores fed to softmax <b>${s.std.toFixed(2)}</b>. Over 400 random queries: average largest weight <b>${s.max.toFixed(2)}</b>, average entropy <b>${s.ent.toFixed(2)}</b> nats (maximum ln 8 = 2.08), average softmax gradient size ‖J‖ <b>${s.jac.toFixed(3)}</b>${sc?"":` (scaled: ${ST[n][1].jac.toFixed(3)})`}.`;}
+ Di.addEventListener("input",draw);On.addEventListener("change",draw);draw();
+})();
+
+/* ---------- Figure 3: the worked example, step by step ---------- */
+(function(){
+ const svg=$("#sd-walk-svg");if(!svg)return;const info=$("#sd-walk-info"),qsel=$("#sd-walk-q");
+ const X=[[1,0,1,0],[0,1,0,1],[1,1,0,0]],WQ=[[1,0],[0,1],[1,0],[0,1]],WK=[[1,0],[1,1],[0,1],[0,-1]],WV=[[2,0],[0,1],[1,0],[0,1]];
+ const mm=(A,Bm)=>A.map(r=>Bm[0].map((_,j)=>r.reduce((s,v,l)=>s+v*Bm[l][j],0)));const tr=M=>M[0].map((_,j)=>M.map(r=>r[j]));
+ const Q=mm(X,WQ),K=mm(X,WK),V=mm(X,WV),S=mm(Q,tr(K)),sq=Math.sqrt(2),SS=S.map(r=>r.map(v=>v/sq));
+ const A=SS.map(r=>{const m=Math.max(...r);const e=r.map(v=>Math.exp(v-m));const s=e.reduce((a,b)=>a+b,0);return e.map(v=>v/s);});const O=mm(A,V);
+ let step=0,qi=0,cj=null;
+ const CW=46,CH=28;
+ function mat(x,y,M,col,name,o){o=o||{};const w=o.w||CW;const dec=o.dec;let g=`<text x="${x+M[0].length*w/2}" y="${y-8}" text-anchor="middle" font-size="13.5" font-weight="700" fill="var(--ink)">${name}</text>`;
+  M.forEach((r,i)=>r.forEach((v,j)=>{const hr=o.row!=null&&i===o.row,hc=o.col!=null&&j===o.col,hit=hr&&hc&&o.cell;
+   const fill=hit?`color-mix(in srgb,${col} 45%,var(--card))`:(hr||hc)?`color-mix(in srgb,${col} 20%,var(--card))`:"var(--card)";
+   g+=`<g${o.click?` class="sd-cell" data-i="${i}" data-j="${j}"`:""}><rect x="${x+j*w}" y="${y+i*CH}" width="${w}" height="${CH}" fill="${fill}" stroke="${col}" stroke-width="${hit?2.4:1}"/><text x="${x+j*w+w/2}" y="${y+i*CH+18.5}" text-anchor="middle" font-size="13" class="mono" fill="var(--ink)">${dec?f3(v):mns(v)}</text></g>`;}));
+  if(o.row!=null&&o.outline!==false)g+=`<rect x="${x-2}" y="${y+o.row*CH-2}" width="${M[0].length*w+4}" height="${CH+4}" fill="none" stroke="var(--ink)" stroke-width="2" rx="3"/>`;
+  if(o.colOutline!=null)g+=`<rect x="${x+o.colOutline*w-2}" y="${y-2}" width="${w+4}" height="${M.length*CH+4}" fill="none" stroke="var(--ink)" stroke-width="2" rx="3"/>`;
+  return g;}
+ const op=(x,y,t,fs)=>`<text x="${x}" y="${y}" text-anchor="middle" font-size="${fs||20}" font-weight="700" fill="var(--muted)">${t}</text>`;
+ const vec=v=>"("+v.map(x=>f3(x)).join(", ")+")";const ivec=v=>"("+v.map(mns).join(", ")+")";
+ const sub=(t,s)=>`${t}<tspan baseline-shift="sub" font-size="10">${s}</tspan>`;
+ function draw(k){step=k;let g="",t="";const y=70,i=qi;
+  if(k===0){g+=mat(20,y,X,"var(--muted)","X (3 tokens × d = 4)",{row:i,w:40})+mat(270,y,WQ,"var(--q)",sub("W","Q"))+mat(420,y,WK,"var(--k)",sub("W","K"))+mat(570,y,WV,"var(--v)",sub("W","V"));
+   t=`The input: 3 tokens, each a row of d = 4 numbers. Three learned weight matrices, each 4 × 2 (d × d<sub>k</sub>). Token ${i+1} is x<sub>${i+1}</sub> = ${ivec(X[i])}. Press Next.`;}
+  else if(k===1){g+=mat(20,y,X,"var(--muted)","X",{row:i,w:40})+op(215,y+48,"→")+mat(290,y,Q,"var(--q)","Q = XW"+"<tspan baseline-shift='sub' font-size='10'>Q</tspan>",{row:i})+mat(440,y,K,"var(--k)","K = XW<tspan baseline-shift='sub' font-size='10'>K</tspan>",{row:i})+mat(590,y,V,"var(--v)","V = XW<tspan baseline-shift='sub' font-size='10'>V</tspan>",{row:i});
+   const picks=X[i].map((v,l)=>v?l+1:0).filter(Boolean);
+   t=`Projections (17.2). x<sub>${i+1}</sub> = ${ivec(X[i])} has 1s in positions ${picks.join(" and ")}, so each projection adds rows ${picks.join(" and ")} of its weight matrix: q<sub>${i+1}</sub> = <b>${ivec(Q[i])}</b>, k<sub>${i+1}</sub> = <b>${ivec(K[i])}</b>, v<sub>${i+1}</sub> = <b>${ivec(V[i])}</b>.`;}
+  else if(k===2){const j=cj==null?S[i].indexOf(Math.max(...S[i])):cj;
+   g+=mat(20,y,Q,"var(--q)","Q",{row:i})+op(135,y+48,"×")+mat(165,y-14,tr(K),"var(--k)","K<tspan baseline-shift='super' font-size='10'>⊤</tspan>",{colOutline:j})+op(330,y+48,"=")+mat(365,y,S,"var(--muted)","S = QK<tspan baseline-shift='super' font-size='10'>⊤</tspan> (click a cell)",{row:i,col:j,cell:true,click:true,outline:false,w:56});
+   g+=`<rect x="${365+j*56-2}" y="${y+i*CH-2}" width="60" height="${CH+4}" fill="none" stroke="var(--ink)" stroke-width="2.4" rx="3"/>`;
+   t=`Scores (17.3). S<sub>${i+1}${j+1}</sub> = q<sub>${i+1}</sub> · k<sub>${j+1}</sub> = ${mns(Q[i][0])}×${mns(K[j][0])} + ${mns(Q[i][1])}×${mns(K[j][1])} = <b>${mns(S[i][j])}</b>. Row ${i+1} of S: <b>${ivec(S[i])}</b>. Each row is one query; each column is one key.`;}
+  else if(k===3){g+=mat(20,y,S,"var(--muted)","S",{row:i,w:56})+op(250,y+44,"÷ √2",18)+mat(310,y,SS,"var(--muted)","S / √d<tspan baseline-shift='sub' font-size='10'>k</tspan>",{row:i,dec:true,w:70});
+   t=`Scale (17.4). d<sub>k</sub> = 2, so divide by √2 = 1.414. Row ${i+1}: ${ivec(S[i])} / 1.414 = <b>${vec(SS[i])}</b>. Here the effect is small; with d<sub>k</sub> = 128 the raw scores would be about 11 times too spread out.`;}
+  else if(k===4){const m=Math.max(...SS[i]),e=SS[i].map(v=>Math.exp(v-m)),s=e.reduce((a,b)=>a+b,0);
+   g+=mat(20,y,SS,"var(--muted)","S / √d<tspan baseline-shift='sub' font-size='10'>k</tspan>",{row:i,dec:true,w:70})+op(290,y+38,"softmax",14)+op(290,y+60,"→")+mat(340,y,A,"var(--muted)","A (each row sums to 1)",{row:i,dec:true,w:70});
+   A.forEach((r,ri)=>g+=`<text x="${340+3*70+12}" y="${y+ri*CH+18.5}" font-size="12.5" class="mono" fill="var(--muted)">Σ = ${r.reduce((a,b)=>a+b,0).toFixed(3)}</text>`);
+   t=`Softmax over the keys (17.6), with the max trick (17.7). Row ${i+1}: subtract m = ${f3(m)} → ${vec(SS[i].map(v=>v-m))}; exponentials ${vec(e)}, sum ${f3(s)}; weights <b>${vec(A[i])}</b>, which add up to ${A[i].reduce((a,b)=>a+b,0).toFixed(3)}.`;}
+  else{g+=mat(20,y,A,"var(--muted)","A",{row:i,dec:true,w:70})+op(250,y+44,"×")+mat(280,y,V,"var(--v)","V")+op(400,y+44,"=")+mat(430,y,O,"var(--tc)","O = AV",{row:i,dec:true,w:70});
+   t=`Output (17.8). o<sub>${i+1}</sub> = ${A[i].map((a,j)=>`${f3(a)}·${ivec(V[j])}`).join(" + ")} = <b>${vec(O[i])}</b>. A weighted average of the value rows: it always lies between them.`;}
+  svg.innerHTML=g;info.innerHTML=t;
+  if(k===2)svg.querySelectorAll(".sd-cell").forEach(c=>c.addEventListener("click",()=>{qi=+c.dataset.i;cj=+c.dataset.j;syncQ();draw(2);}));}
+ function syncQ(){qsel.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",+b.dataset.q===qi?"true":"false"));}
+ qsel.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;qi=+b.dataset.q;cj=null;syncQ();draw(step);});
+ B.stepper({n:6,prev:$("#sd-walk-prev"),next:$("#sd-walk-next"),play:$("#sd-walk-play"),label:$("#sd-walk-lab"),ms:2800,onStep:draw});
+})();
+
+/* ---------- Figure 4: cost ---------- */
+(function(){
+ const svg=$("#sd-cost-svg");if(!svg)return;const Ti=$("#sd-cost-t"),seg=$("#sd-cost-m"),info=$("#sd-cost-info");
+ const M={gpt2:{name:"GPT-2 small",d:768,H:12,kv:12,L:12,ctx:1024},llama:{name:"Llama 3.1 8B",d:4096,H:32,kv:8,L:32,ctx:131072}};let cur="llama";
+ const proj=(m,T)=>{const dk=m.d/m.H;return 2*T*m.d*m.d*2+2*2*T*m.d*(m.kv*dk);},core=(m,T)=>4*T*T*m.d;
+ const bytes=b=>{const u=["B","KiB","MiB","GiB","TiB","PiB"];let i=0;while(b>=1024&&i<u.length-1){b/=1024;i++;}return (b>=100?b.toFixed(0):b>=10?b.toFixed(1):b.toFixed(2))+" "+u[i];};
+ const ex=v=>{const e=Math.floor(Math.log10(v));return (v/10**e).toFixed(2)+"×10<sup>"+e+"</sup>";};
+ const X=n=>70+(n-7)*55,Y=l=>230-(l-7)*25;
+ function draw(){const m=M[cur],n=+Ti.value,T=2**n;$("#sd-cost-tv").value=fmtInt(T);
+  let g=`<path d="M70 25 V230 H620" fill="none" stroke="var(--muted)"/>`;
+  for(let l=7;l<=15;l++)g+=`<line x1="70" y1="${Y(l)}" x2="620" y2="${Y(l)}" stroke="var(--rule)" stroke-dasharray="2 5"/><text x="64" y="${Y(l)+4}" text-anchor="end" font-size="11" fill="var(--muted)">10<tspan baseline-shift="super" font-size="8">${l}</tspan></text>`;
+  for(let k=7;k<=17;k+=2)g+=`<text x="${X(k)}" y="246" text-anchor="middle" font-size="11" fill="var(--muted)">${fmtInt(2**k)}</text>`;
+  g+=`<text x="345" y="264" text-anchor="middle" font-size="11.5" fill="var(--muted)">sequence length T (log scale)</text><text x="14" y="16" font-size="11.5" fill="var(--muted)">FLOPs per layer</text>`;
+  const line=(f,c)=>{const p=[];for(let k=7;k<=17;k+=0.25)p.push(X(k).toFixed(1)+","+Y(Math.log10(f(m,2**k))).toFixed(1));return `<polyline points="${p.join(" ")}" fill="none" stroke="${c}" stroke-width="2.6"/>`;};
+  g+=line(proj,"var(--q)")+line(core,"var(--k)");
+  const Tx=proj(m,1)/(4*m.d);const nx=Math.log2(Tx);g+=`<circle cx="${X(nx)}" cy="${Y(Math.log10(core(m,Tx)))}" r="5" fill="var(--ink)"/><text x="${X(nx)+8}" y="${Y(Math.log10(core(m,Tx)))+18}" font-size="11.5" fill="var(--ink2)">equal at T = ${fmtInt(Tx)}</text>`;
+  const nc=Math.log2(m.ctx);if(nc>=7&&nc<=17)g+=`<line x1="${X(nc)}" y1="25" x2="${X(nc)}" y2="230" stroke="var(--muted)" stroke-dasharray="6 4"/><text x="${X(nc)-4}" y="38" text-anchor="end" font-size="11" fill="var(--muted)">max context</text>`;
+  const P=proj(m,T),C=core(m,T),mem=m.H*T*T*2;
+  g+=`<line x1="${X(n)}" y1="25" x2="${X(n)}" y2="230" stroke="var(--ink)" stroke-width="1.2"/><circle cx="${X(n)}" cy="${Y(Math.log10(P))}" r="5" fill="var(--q)"/><circle cx="${X(n)}" cy="${Y(Math.log10(C))}" r="5" fill="var(--k)"/>`;
+  svg.innerHTML=g;
+  info.innerHTML=`${m.name} (d = ${fmtInt(m.d)}, ${m.H} query heads, ${m.kv} key-value heads), T = <b>${fmtInt(T)}</b>. Per layer: projections <b>${ex(P)}</b> FLOPs, attention core <b>${ex(C)}</b> FLOPs, core / projections = <b>${(C/P).toFixed(3)}</b>. Naive score memory, all heads, BF16: <b>${bytes(mem)}</b> per layer per sequence, <b>${bytes(mem*m.L)}</b> for all ${m.L} layers if kept for the backward pass.${T>m.ctx?` (Beyond this model’s ${fmtInt(m.ctx)}-token context.)`:""}`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;cur=b.dataset.m;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ Ti.addEventListener("input",draw);draw();
+})();
+})();
+</script></body></html>

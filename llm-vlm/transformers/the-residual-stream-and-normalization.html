@@ -1,0 +1,454 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>The residual stream and normalization · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../transformers/index.html">Attention and transformers</a><span class="sep">/</span><span>Session 22</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="the-residual-stream-and-normalization">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="the-residual-stream-and-normalization" data-session="the-residual-stream-and-normalization" style="--tc:var(--t2)"><header class="chap-head"><div class="chap-kicker"><span class="num">22</span><span>Track 2: Attention and transformers · session 7 of 15</span></div><h1 class="chap-title">The residual stream and normalization</h1><p class="chap-sub">Every transformer block reads from one shared vector per token and adds a small edit back to it: the residual stream. Before each read, the vector is rescaled by a normalization layer. This session explains residual connections, LayerNorm and RMSNorm, why modern LLMs put the norm before each layer (Pre-LN) instead of after it (Post-LN), and how QK-norm stops attention logits from blowing up.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 4, 17 and 21 (backprop, attention math, the FFN)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why a residual connection makes deep stacks trainable: the identity path in the gradient</li><li>The residual stream view: layers read through a norm and linear maps, and write by adding</li><li>Why the stream grows with depth, and why each layer needs a normalized copy</li><li>LayerNorm vs RMSNorm: what each removes, why RMSNorm is cheaper, and the details that matter in real code (FP32 statistics, epsilon, gain conventions)</li><li>Post-LN vs Pre-LN: gradients at initialization, warmup, and newer variants (sandwich norm, DeepNorm, scaled residual init)</li><li>Growing attention logits and the fixes: QK-norm, soft-capping and z-loss, with real values from Qwen3 and Gemma 2</li></ul></div></header><style>
+.rs-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.rs-grid input[type=range]{width:100%}
+.rs-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.rs-leg span::before{content:"";display:inline-block;width:18px;height:6px;border-radius:2px;margin-right:6px;vertical-align:2px;background:var(--c)}
+.rs-box rect{fill:var(--card);stroke:var(--rule);stroke-width:1.6}
+.rs-box.n rect{stroke:var(--k);fill:var(--k-soft)}.rs-box.f rect{stroke:var(--q);fill:var(--q-soft)}
+.rs-box text{font-family:var(--sans);text-anchor:middle;fill:var(--ink)}
+pre.code,code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A modern LLM is a stack of 30 to 100 blocks. Each block has an attention layer and a feed-forward layer. Two small pieces of plumbing hold the stack together: the <b>residual connection</b> (add the layer’s output to its input) and <b>normalization</b> (rescale a vector before a layer reads it). Without them, a deep transformer does not train.</p>
+<p>These pieces look boring, but they decide three things you meet in practice. First, <b>whether training is stable</b>: where you put the normalization changes whether you need a long warmup and whether the loss suddenly jumps to NaN. Second, <b>how to think about what the model does</b>: the residual connections create one shared vector per token, the <b>residual stream</b>, and every layer reads from it and writes into it. Interpretability work is built on this view. Third, <b>speed and numerics</b>: normalization runs dozens of times per token, so a cheaper version (RMSNorm) is used by almost every new open model, and its details matter for mixed precision and quantization.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “Why do transformers use residual connections?”, “What is the difference between LayerNorm and RMSNorm?”, “Pre-LN or Post-LN, and why?”, “Why does Post-LN need warmup?”, “What is QK-norm?”. All of them are answered below, with numbers.</aside>
+<p>In <a href="../transformers/the-feed-forward-network-mlp-inside-each.html">session 21</a> we built the second half of a block. In this session we connect the halves and the blocks to each other. In <a href="../transformers/the-full-transformer-and-its-three-families.html">Session 23</a> we then assemble the whole model.</p>
+
+<h2>The residual connection</h2>
+<p>Take one layer \(F\) (attention or a feed-forward network). A plain network replaces its input: \(\mathbf{x}_{\text{new}} = F(\mathbf{x})\). A <b>residual connection</b> (also called a skip connection) keeps the input and adds the layer’s output to it:</p>
+<div class="eq">\[ \mathbf{x}_{l+1} = \mathbf{x}_l + F_l(\mathbf{x}_l) \tag{22.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{x}_l \in \R^{d}\)</dt><dd>the vector of one token before sub-layer \(l\); \(d\) is the model width (4,096 in Llama 3 8B)</dd>
+<dt>\(F_l\)</dt><dd>sub-layer number \(l\): an attention layer or an FFN, together with its normalization</dd>
+<dt>\(F_l(\mathbf{x}_l)\)</dt><dd>the <b>edit</b> that this sub-layer adds; also called the residual branch</dd></dl>
+<p>The idea comes from ResNet in computer vision (He et al., 2015), where it made networks with more than 100 layers trainable. [Certain] The layer no longer has to learn the full new vector. It only has to learn the <b>change</b>. If the best thing a layer can do is nothing, it can output zeros, and the input passes through untouched. In a plain network, “do nothing” means learning an exact identity matrix, which is hard.</p>
+<h3>Unrolling the stack</h3>
+<p>Apply (22.1) again and again, from the embedding \(\mathbf{x}_0\) up to the last sub-layer. Every edit stays in the sum:</p>
+<div class="eq">\[ \mathbf{x}_L = \mathbf{x}_0 + \sum_{l=0}^{L-1} F_l(\mathbf{x}_l) \tag{22.2} \]</div>
+<p>The final vector is the embedding plus all edits. Nothing is ever overwritten; information is only added. (A layer can remove information by adding the negative of something, but it has to do this on purpose.)</p>
+<h3>Why gradients flow</h3>
+<p>Differentiate (22.1). The Jacobian (the matrix of partial derivatives) of one residual step is the identity plus the layer’s own Jacobian:</p>
+<div class="eq">\[ \frac{\partial \mathbf{x}_{l+1}}{\partial \mathbf{x}_l} = I + \frac{\partial F_l}{\partial \mathbf{x}_l}, \qquad \frac{\partial \mathcal{L}}{\partial \mathbf{x}_l} = \frac{\partial \mathcal{L}}{\partial \mathbf{x}_L} \prod_{k=l}^{L-1} \left( I + \frac{\partial F_k}{\partial \mathbf{x}_k} \right) \tag{22.3} \]</div>
+<p>Expand the product and one term is just \(\partial \mathcal{L} / \partial \mathbf{x}_L\) times \(I\): the gradient from the loss reaches every layer directly, through the chain of identities, without being multiplied by any weight matrix. In a plain deep network, the gradient is a product of \(L\) weight Jacobians. If their typical size is a bit below 1, the product shrinks to almost zero (vanishing gradients); if a bit above 1, it explodes. The identity path is a gradient highway. This is why the <a href="../foundations/before-transformers-rnn-lstm-seq2seq-and-the.html">session 7</a> session’s LSTM worked better than a plain RNN, and it is the same trick here, applied across depth instead of time.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Think of a shared document that passes through a team. A plain network gives each person a blank page and asks them to rewrite the whole document from memory. A residual network lets each person add a few notes to the margin of the same document. The original text is never lost, and a person with nothing useful to say just passes it on.</aside>
+
+<h2>The residual stream</h2>
+<p>Elhage et al. (2021) suggested a useful way to look at (22.2). [Certain] Do not think of the transformer as a pipe from layer to layer. Think of one <b>residual stream</b> per token: a vector of width \(d\) that runs from the embedding at the bottom to the output layer at the top. Each attention and FFN layer is a reader and writer attached to this stream:</p>
+<ul><li><b>Read:</b> the layer normalizes the stream and applies linear maps (for example \(W_Q, W_K, W_V\) in attention, or \(W_1\) in the FFN). Each linear map picks out some directions of the stream.</li>
+<li><b>Write:</b> the layer’s output projection (\(W_O\), or \(W_2\) in the FFN) turns its result back into a \(d\)-dimensional vector, which is <b>added</b> to the stream.</li></ul>
+<p>Attention is the only part that moves information <b>between</b> token positions: it reads the streams of earlier tokens and writes into the stream of the current token. The FFN works on each position alone. At the top, a final normalization and the output matrix read the stream and give the next-token logits.</p>
+<p>Three consequences of this view are worth remembering. (1) The stream is a <b>shared memory</b> with \(d\) dimensions. Many features must share it, so they are stored in many directions at once, not one per coordinate. (2) A layer far up can directly read what a layer far down wrote, because the write was added and never replaced. (3) Because the stream is linear (only sums), you can decompose the final vector into “contribution of each layer” and study each one. A popular trick, the <b>logit lens</b>, applies the output layer to the stream in the middle of the network to see what the model would predict at that depth. [Likely] Figure 1 walks one token through a small stack.</p>
+<figure class="fig wide" id="rs-stream"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="rs-stream-prev">Back</button><button type="button" class="btn primary" id="rs-stream-play">Play</button><button type="button" class="btn" id="rs-stream-next">Next</button><span id="rs-stream-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="rs-stream-svg" viewBox="0 0 760 300" role="img" aria-label="One token's residual stream with eight coordinates, and the edit added by each sub-layer"></svg></div>
+<div class="rs-leg"><span style="--c:var(--tc)">stream before this step</span><span style="--c:var(--v)">edit written by the sub-layer</span></div>
+<div class="readout" id="rs-stream-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> One token’s residual stream in a toy model with \(d = 8\) and 4 blocks (8 sub-layers). Each step, one sub-layer reads the stream and adds a small edit (green). The bars show the 8 coordinates of the stream. The last step applies the final RMSNorm, which is what the output layer reads.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Step forward and watch the bars. The edits are small compared to the stream, so the direction of the stream changes only a little at each step: the readout shows the cosine between the stream before and after the step, which stays near 0.97. Over 8 steps the small edits add up to a real change. The vector at the end still contains the embedding, plus every edit. The edits here are random numbers; in a trained model they are learned features. Real models are similar in one way: each layer’s write is usually much smaller than the stream itself. [Likely]</p></details></figure>
+
+<h2>Why normalize at all?</h2>
+<p>By (22.2), the stream is a sum of many terms. Its size changes from layer to layer and from token to token. If each edit is a random vector with about unit variance per coordinate, the variances add up, and the stream grows like the square root of the number of edits:</p>
+<div class="eq">\[ \E\big[\lVert \mathbf{x}_L \rVert^2\big] \approx d\,(1 + L) \quad\Rightarrow\quad \lVert \mathbf{x}_L \rVert \approx \sqrt{d\,(1+L)} \tag{22.4} \]</div>
+<p>(This assumes the embedding and every edit have unit variance per coordinate and are roughly uncorrelated, which is close to true at initialization.) For \(d = 64\) and \(L = 48\) this gives \(\sqrt{64 \cdot 49} = 56\); the simulation in Figure 4 measures 55.7. A layer that reads the stream directly would see inputs whose size depends on its depth, and on the token. Its weights would need a different scale at every depth, and its non-linearities (softmax, GELU) would work in different regimes. A <b>normalization layer</b> fixes this: it rescales the vector to a standard size before the layer reads it.</p>
+<h3>LayerNorm</h3>
+<p><b>Layer normalization</b> (Ba et al., 2016) works on one token’s vector at a time, over its \(d\) features. [Certain] It removes the mean, divides by the standard deviation, and then applies a learned per-feature scale and shift:</p>
+<div class="eq">\[ \mu = \frac{1}{d} \sum_{i=1}^{d} x_i, \qquad \sigma^2 = \frac{1}{d} \sum_{i=1}^{d} (x_i - \mu)^2, \qquad \text{LN}(\mathbf{x})_i = \gamma_i\, \frac{x_i - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \beta_i \tag{22.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mu, \sigma^2\)</dt><dd>mean and variance of the \(d\) numbers of this one vector (not of the batch)</dd>
+<dt>\(\varepsilon\)</dt><dd>a small constant (often \(10^{-5}\)) so we never divide by zero</dd>
+<dt>\(\gamma, \beta \in \R^d\)</dt><dd>learned gain and bias, one per feature; they start at 1 and 0</dd></dl>
+<p>Two properties follow. LayerNorm is <b>shift invariant</b>: adding the same constant to every coordinate does not change the output. It is <b>scale invariant</b>: multiplying the vector by any positive number does not change the output. Before \(\gamma\) and \(\beta\), the output always has mean 0 and variance 1. Its length is therefore always about \(\sqrt{d}\).</p>
+<p>Why not <b>batch normalization</b>, which CNNs use? BatchNorm averages each feature over the examples of a batch. In language models, the batch has sequences of different lengths, the statistics during generation (one token at a time) differ from training, and the model would depend on what else is in the batch. LayerNorm uses only the token itself, so training and inference behave the same.</p>
+<div class="worked"><div class="wt">Worked example: LayerNorm and RMSNorm on four numbers</div>
+<p>Take \(\mathbf{x} = (2, 4, 6, 8)\), with \(\gamma = 1\), \(\beta = 0\) and \(\varepsilon\) ignored.</p>
+<p><b>LayerNorm:</b> \(\mu = 5\). Deviations \((-3, -1, 1, 3)\), so \(\sigma^2 = (9 + 1 + 1 + 9)/4 = 5\) and \(\sigma = 2.236\). Output: \((-1.342, -0.447, 0.447, 1.342)\).</p>
+<p><b>RMSNorm</b> (next section): \(\text{RMS} = \sqrt{(4 + 16 + 36 + 64)/4} = \sqrt{30} = 5.477\). Output: \((0.365, 0.730, 1.095, 1.461)\).</p>
+<p>Now add 10 to every entry: \((12, 14, 16, 18)\). LayerNorm gives exactly the same output as before. RMSNorm gives \((0.791, 0.923, 1.055, 1.187)\): different, because RMSNorm does not remove the mean. Multiply the original by 100 instead: both outputs stay the same. The PyTorch code later in this session prints these numbers.</p></div>
+
+<h2>RMSNorm: drop the mean</h2>
+<p>Zhang and Sennrich (2019) asked: which part of LayerNorm actually helps? Their answer was that the rescaling (scale invariance) matters and the re-centering (removing the mean) is not needed. [Certain] <b>RMSNorm</b> keeps only the division by the root mean square:</p>
+<div class="eq">\[ \text{RMS}(\mathbf{x}) = \sqrt{\frac{1}{d} \sum_{i=1}^{d} x_i^2 + \varepsilon}, \qquad \text{RMSNorm}(\mathbf{x})_i = \gamma_i\, \frac{x_i}{\text{RMS}(\mathbf{x})} \tag{22.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\text{RMS}(\mathbf{x})\)</dt><dd>root mean square: the typical size of one coordinate, without subtracting the mean</dd>
+<dt>\(\gamma \in \R^d\)</dt><dd>learned gain, one per feature; there is no bias \(\beta\)</dd></dl>
+<p>What each one removes, in one sentence each:</p>
+<ul><li><b>LayerNorm</b> removes the mean (one direction, the all-ones direction) and the overall size of the vector.</li>
+<li><b>RMSNorm</b> removes only the overall size. The output always has RMS 1, so length \(\sqrt{d}\), but its mean can be anything.</li></ul>
+<p>Note that if the mean is already 0, the two are identical, since then \(\sigma = \text{RMS}\). Why is RMSNorm cheaper? LayerNorm needs two reductions over the vector (first the mean, then the variance of the centered values; or one fused pass that tracks both sums), a subtraction, and stores a bias. RMSNorm needs one reduction (sum of squares) and one multiply. Normalization does little arithmetic but reads and writes the whole activation, so on a GPU it is limited by memory traffic, and the saving comes from fewer passes and fewer parameters to read. The paper reports that RMSNorm “reduces the running time by 7%~64% on different models” compared with LayerNorm, with similar quality. [Certain] Nearly all recent open LLMs use RMSNorm: Llama, Mistral, Qwen, Gemma, DeepSeek. [Likely] GPT-2, BERT and most vision transformers use LayerNorm. [Certain] Figure 2 lets you see the difference.</p>
+<figure class="fig" id="rs-norm"><div class="fig-body">
+<div class="rs-grid">
+<label for="rs-norm-c">Shift \(c\) (add to every entry)</label><input type="range" id="rs-norm-c" min="-3" max="3" step="0.1" value="0"><output id="rs-norm-cv"></output>
+<label for="rs-norm-s">Scale \(s\) (multiply every entry)</label><input type="range" id="rs-norm-s" min="0.2" max="5" step="0.1" value="1"><output id="rs-norm-sv"></output>
+<label for="rs-norm-o">Outlier added to feature 4</label><input type="range" id="rs-norm-o" min="0" max="30" step="1" value="0"><output id="rs-norm-ov"></output></div>
+<svg id="rs-norm-svg" viewBox="0 0 640 300" role="img" aria-label="Input vector and its LayerNorm and RMSNorm outputs as bar charts"></svg>
+<div class="rs-leg"><span style="--c:var(--muted)">input \(s(\mathbf{x} + c)\)</span><span style="--c:var(--q)">LayerNorm output</span><span style="--c:var(--k)">RMSNorm output</span></div>
+<div class="readout" id="rs-norm-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> An 8-dimensional input vector (gray), its LayerNorm (blue) and its RMSNorm (orange), with \(\gamma = 1\) and \(\beta = 0\). The input is \(s\,(\mathbf{x} + c)\) for a fixed \(\mathbf{x}\), plus an optional outlier on feature 4.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Move the scale: the gray bars grow, but both outputs stay fixed. Both norms are scale invariant. Move the shift: LayerNorm still does not change, but the RMSNorm bars all move toward the same value, because a large common offset dominates the root mean square. In a trained network this rarely matters: the next layer can learn to ignore a common offset. Now add an outlier: one huge feature takes over the RMS (and \(\sigma\)), and all the other features are squashed toward zero in both norms. This is the “massive activation” effect seen in real LLMs, and one reason why quantizing activations is hard (<a href="../inference/index.html#row-weight-activation-quantization-llm-int8-smoothquant-zeroquant" title="Weight–activation quantization: LLM.int8(), SmoothQuant, ZeroQuant, OmniQuant (planned)">session 108</a>).</p></details></figure>
+<h3>Small details that matter in real code</h3>
+<ul><li><b>Compute the statistics in FP32.</b> In BF16, the sum of 4,096 squares loses precision. The Hugging Face Llama code casts to FP32, computes the RMS, normalizes, and casts back. [Certain]</li>
+<li><b>\(\varepsilon\) is a real hyper-parameter.</b> Llama 3.1 8B uses \(10^{-5}\); Qwen3 8B and Gemma 2 9B use \(10^{-6}\) (from their <code>config.json</code> files). [Certain] Using the wrong value when you load a checkpoint changes the outputs slightly.</li>
+<li><b>Gemma stores \(\gamma - 1\).</b> Its RMSNorm multiplies by \((1 + w)\), with \(w\) initialized to 0. A converter that treats \(w\) as \(\gamma\) breaks the model. [Likely]</li>
+<li><b>No weight decay on \(\gamma\) and \(\beta\).</b> Decaying a gain toward 0 shrinks the layer’s input, as discussed in <a href="../foundations/optimization-backprop-adamw.html">session 4</a>.</li>
+<li><b>Norms are tiny in parameters.</b> Llama 3 8B has two RMSNorms per block plus a final one: \(32 \times 2 \times 4{,}096 + 4{,}096 = 266{,}240\) parameters, about 0.003% of the model.</li></ul>
+
+<h2>Where to put the norm: Post-LN vs Pre-LN</h2>
+<p>There are two classic ways to combine a residual connection with a normalization. The original transformer (Vaswani et al., 2017) and BERT put the norm <b>after</b> the addition. This is <b>Post-LN</b>:</p>
+<div class="eq">\[ \text{Post-LN:}\qquad \mathbf{x}_{l+1} = \text{LN}\big(\mathbf{x}_l + F_l(\mathbf{x}_l)\big) \tag{22.7} \]</div>
+<p>GPT-2 moved the norm to the <b>input</b> of each sub-layer and added one final norm after the last block. [Certain] This is <b>Pre-LN</b>, and almost every LLM since then uses it:</p>
+<div class="eq">\[ \text{Pre-LN:}\qquad \mathbf{x}_{l+1} = \mathbf{x}_l + F_l\big(\text{LN}(\mathbf{x}_l)\big), \qquad \text{output} = \text{LN}_{\text{final}}(\mathbf{x}_L) \tag{22.8} \]</div>
+<p>The difference looks small, but it changes the residual stream completely. In Post-LN, there is no clean stream: every block normalizes the sum, so the identity path passes through \(L\) normalizations. In Pre-LN, the stream \(\mathbf{x}_l\) is a pure sum (22.2) that is never normalized; only copies of it are normalized before each layer reads them. The gradient highway of (22.3) is intact. Figure 3 shows the two layouts, and a third one used by some newer models.</p>
+<figure class="fig wide" id="rs-place"><div class="fig-body">
+<div class="scroll-x"><svg id="rs-place-svg" viewBox="0 0 780 360" role="img" aria-label="Block diagrams of Post-LN, Pre-LN and sandwich normalization"></svg></div>
+</div><figcaption><b>Figure 3.</b> Three ways to place the norm in one sub-layer. Post-LN (original transformer, BERT): add, then normalize; the stream itself is normalized. Pre-LN (GPT-2, Llama, Qwen): normalize a copy, run the layer, add the result; the stream is never normalized, so a final norm is needed at the top. Sandwich (Gemma 2 and 3): Pre-LN plus one more norm on the sub-layer’s output before it is added.</figcaption></figure>
+<h3>Why Post-LN needs warmup</h3>
+<p>The original transformer was trained with 4,000 warmup steps, and Post-LN models are known to diverge or train badly without warmup. [Certain] Xiong et al. (2020) analyzed this at initialization. They showed that in Post-LN, the expected gradients of the parameters near the output are large, so a normal learning rate makes the top layers take huge steps at the start. Warmup hides this by starting with a tiny learning rate. In Pre-LN, the gradients are well behaved and become smaller with depth, so Pre-LN models can be trained without warmup and with less tuning. [Certain] (In practice, LLMs still use a short warmup for other reasons, such as Adam’s statistics being noisy in the first steps. [Likely])</p>
+<p>A second explanation (Liu et al., 2020) is the <b>amplification effect</b>: in Post-LN, each layer depends heavily on its residual branch, so small changes of the weights produce large changes of the output, and training becomes unstable. [Certain] Both views agree that Pre-LN is easier to train. Figure 4 is a small experiment you can run: a deep stack of random linear sub-layers, once in Post-LN and once in Pre-LN form, with the gradient of every layer measured by backpropagation.</p>
+<figure class="fig" id="rs-grad"><div class="fig-body">
+<div class="rs-grid">
+<label for="rs-grad-L">Number of sub-layers \(L\)</label><input type="range" id="rs-grad-L" min="4" max="48" step="2" value="24"><output id="rs-grad-Lv"></output></div>
+<div class="controls" style="margin-top:8px"><button type="button" class="btn" id="rs-grad-seed">New random init</button><span id="rs-grad-seedv" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<svg id="rs-grad-svg" viewBox="0 0 640 300" role="img" aria-label="Gradient norm per layer for Post-LN and Pre-LN stacks, log scale"></svg>
+<div class="rs-leg"><span style="--c:var(--q)">Post-LN</span><span style="--c:var(--k)">Pre-LN</span></div>
+<div class="readout" id="rs-grad-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Gradient size \(\lVert \partial \mathcal{L} / \partial W_l \rVert\) for every sub-layer \(l\) at initialization (log scale), in a toy stack with width \(d = 64\), a batch of 16 random inputs, sub-layers \(F_l(\mathbf{h}) = W_l \mathbf{h}\) with \(W_l\) entries drawn with variance \(1/d\), and the loss \(\mathbf{c}^\top \mathbf{y}\) for a fixed random unit vector \(\mathbf{c}\). Everything is computed live in your browser.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Look at the right end of the curves: the layers closest to the output. Post-LN (blue) has much larger gradients there than Pre-LN (orange). Increase \(L\): the Pre-LN top-layer gradient shrinks (about 0.74 at \(L = 6\), 0.30 at \(L = 24\), 0.24 at \(L = 48\) for the first seed), because the final norm divides by the stream’s size, which grows like \(\sqrt{L}\) by (22.4). The Post-LN top layer stays of order 1 (between about 0.8 and 1.5 at these depths), whatever the depth. This is the gap Xiong et al. describe, and why the same learning rate is too large for Post-LN at the start. The toy is not a real transformer, so do not over-read the exact shapes; inside the Pre-LN stack, for example, the lower layers get the larger gradients here. The readout also shows the size of the Pre-LN stream at the top next to formula (22.4).</p></details></figure>
+<h3>Variants you will see</h3>
+<ul><li><b>Scaled residual initialization.</b> GPT-2 scales the initial weights of the layers that write into the stream by \(1/\sqrt{N}\), where \(N\) is the number of residual layers. [Certain] Each edit then starts small, and the stream does not grow too fast with depth. Many training codes (nanoGPT, for example) do the same.</li>
+<li><b>Sandwich norm.</b> Gemma 2 and Gemma 3 normalize both the input and the output of each sub-layer: \(\mathbf{x} + \text{Norm}(F(\text{Norm}(\mathbf{x})))\). [Likely] The extra norm limits how much any single layer can write.</li>
+<li><b>Norm on the output only.</b> OLMo 2 moved the norm from the input to the output of the sub-layer, \(\mathbf{x} + \text{Norm}(F(\mathbf{x}))\), as part of its stability changes. [Likely]</li>
+<li><b>DeepNorm.</b> Wang et al. (2022) kept Post-LN but scaled up the identity path, \(\text{LN}(\alpha \mathbf{x} + F(\mathbf{x}))\) with \(\alpha \gt 1\), plus a smaller initialization, and trained transformers with 1,000 layers. [Certain]</li></ul>
+<aside class="note watch side"><span class="nt">Watch out</span>Pre-LN is not free. Because the stream grows with depth while each edit has a fixed size, the deeper layers change the stream less and less in relative terms. Some work argues that the last layers of deep Pre-LN models contribute less than the first ones. [Speculation] Post-LN models, when they train well, are sometimes reported to reach slightly better quality. [Likely]</aside>
+
+<h2>Growing attention logits and QK-norm</h2>
+<p>Pre-LN fixes the stream, but one more problem remains inside attention. The attention score between a query and a key is \(\mathbf{q}^\top \mathbf{k} / \sqrt{d_h}\) (<a href="../transformers/scaled-dot-product-attention-the-math-and.html">session 17</a>), with \(\mathbf{q} = W_Q \mathbf{h}\) and \(\mathbf{k} = W_K \mathbf{h}\) computed from the normalized input \(\mathbf{h}\). The norm controls \(\mathbf{h}\), but not \(W_Q\) and \(W_K\). During training these weights can grow. If both grow by a factor \(g\), the logits grow by \(g^2\):</p>
+<div class="eq">\[ z_j = \frac{(g\, W_Q \mathbf{h})^\top (g\, W_K \mathbf{h}_j)}{\sqrt{d_h}} = g^2\, \frac{\mathbf{q}^\top \mathbf{k}_j}{\sqrt{d_h}} \tag{22.9} \]</div>
+<p>A 10% growth of both matrices makes the logits 21% larger; doubling them makes the logits 4 times larger. Large logits make the softmax almost one-hot: attention puts all its weight on one key, its entropy collapses to zero, and the gradient through the softmax becomes tiny or unstable. Dehghani et al. (2023) saw this when scaling vision transformers toward 22B parameters: without a fix, training diverged, with “unstable attention values”. [Certain] Wortsman et al. (2023) reproduced “the growth of logits in attention layers” in small models trained with high learning rates. [Certain]</p>
+<p>The fix, <b>QK-norm</b>, is simple: normalize the query and the key of each head (with LayerNorm or RMSNorm over the head dimension \(d_h\)) just before the dot product:</p>
+<div class="eq">\[ \hat{\mathbf{q}} = \text{RMSNorm}(\mathbf{q}), \qquad \hat{\mathbf{k}}_j = \text{RMSNorm}(\mathbf{k}_j), \qquad z_j = \frac{\hat{\mathbf{q}}^\top \hat{\mathbf{k}}_j}{\sqrt{d_h}} \tag{22.10} \]</div>
+<p>Now the size of the logits no longer depends on the size of \(W_Q\) and \(W_K\). With gains \(\gamma = 1\), \(\lVert \hat{\mathbf{q}} \rVert = \lVert \hat{\mathbf{k}}_j \rVert = \sqrt{d_h}\), so by the Cauchy–Schwarz inequality \(|z_j| \le \sqrt{d_h}\). The model can still make attention sharp, but only by growing the small gain vectors, which is slower and more controlled. QK-norm was used in ViT-22B [Certain], and is used in Qwen3 (which also removed the QKV bias of Qwen2) [Certain], OLMo 2 [Likely] and Gemma 3 [Likely]. In Qwen3 the norm is over the head dimension, with one gain vector of size 128 shared by all heads. [Certain] Figure 5 shows the effect.</p>
+<figure class="fig" id="rs-qk"><div class="fig-body">
+<div class="rs-grid">
+<label for="rs-qk-g">Weight growth \(g\) of \(W_Q\) and \(W_K\)</label><input type="range" id="rs-qk-g" min="0.5" max="4" step="0.1" value="1"><output id="rs-qk-gv"></output>
+<label for="rs-qk-gm">QK-norm gain \(\gamma\)</label><input type="range" id="rs-qk-gm" min="0.5" max="2" step="0.05" value="1"><output id="rs-qk-gmv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="rs-qk-on"> Use QK-norm</label></div>
+<svg id="rs-qk-svg" viewBox="0 0 640 290" role="img" aria-label="Attention logits and softmax weights over eight keys"></svg>
+<div class="rs-leg"><span style="--c:var(--k)">logit \(z_j\) (top)</span><span style="--c:var(--v)">attention weight \(p_j\) (bottom)</span></div>
+<div class="readout" id="rs-qk-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> One query attending to 8 keys, head dimension \(d_h = 16\), with fixed random \(\mathbf{q}\) and \(\mathbf{k}_j\). Without QK-norm the logits scale with \(g^2\). With QK-norm they depend only on the direction of \(\mathbf{q}\) and \(\mathbf{k}_j\) and on the gain \(\gamma\) (applied to both, so the logits scale with \(\gamma^2\)).</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Start at \(g = 1\): the largest weight is 0.57 and the entropy is 1.49 nats (the maximum for 8 keys is \(\ln 8 = 2.08\)). Move \(g\) to 2: the largest logit goes from 1.9 to 7.6, the largest weight to 0.998, and the entropy to almost 0. Attention has collapsed onto one key. Now turn on QK-norm: moving \(g\) does nothing at all; the largest logit stays at 2.26. The gain \(\gamma\) is the only way left to sharpen attention, and the readout shows the bound \(\gamma^2 \sqrt{d_h}\) on every logit.</p></details></figure>
+<h3>Other fixes for runaway logits</h3>
+<ul><li><b>Logit soft-capping</b> (Gemma 2): squash the logits smoothly into \((-c, c)\) with</li></ul>
+<div class="eq">\[ z \leftarrow c \tanh(z / c) \tag{22.11} \]</div>
+<ul><li>Gemma 2 9B uses \(c = 50\) for attention logits and \(c = 30\) for the final output logits (<code>attn_logit_softcapping</code> and <code>final_logit_softcapping</code> in its config). [Certain] A logit of 10 becomes 9.87 (almost unchanged), a logit of 100 becomes 48.2. A drawback: the tanh does not fit the fused FlashAttention kernels as easily as plain attention, which is one reason Gemma 3 switched to QK-norm. [Likely]</li>
+<li><b>z-loss</b> on the output logits: add a small penalty \(\alpha (\log Z)^2\), where \(Z\) is the softmax normalizer, to keep the final logits from drifting. PaLM used \(\alpha = 10^{-4}\). [Likely] Wortsman et al. show it fixes output logit divergence in their small proxies. [Likely]</li>
+<li><b>Lower learning rate, warmup, weight decay and gradient clipping</b> also slow down weight growth; they are covered in <a href="../pretraining/training-recipe-and-stability.html">session 36</a>.</li></ul>
+
+<h2>Putting it together: algorithms and code</h2>
+<p>Here is one Pre-LN transformer block, as used (with small differences) in Llama, Qwen and Mistral, and the normalization it uses.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: RMSNorm of one token vector</div><ol>
+<li><b>input:</b> vector \(\mathbf{x} \in \R^d\) (any precision), gain \(\gamma \in \R^d\), \(\varepsilon\)</li>
+<li>\(\mathbf{x}_{32} \leftarrow\) cast \(\mathbf{x}\) to FP32 <span class="c">// statistics need full precision</span></li>
+<li>\(m \leftarrow \frac{1}{d} \sum_i x_{32,i}^2\) <span class="c">// one reduction; LayerNorm also needs the mean</span></li>
+<li>\(\mathbf{y} \leftarrow \mathbf{x}_{32} \cdot \frac{1}{\sqrt{m + \varepsilon}}\) <span class="c">// formula (22.6)</span></li>
+<li><b>return</b> cast \(\mathbf{y}\) back to the input precision, times \(\gamma\)</li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: forward pass of a Pre-LN decoder with QK-norm</div><ol>
+<li><b>input:</b> token IDs \(t_1, \dots, t_T\)</li>
+<li>\(\mathbf{x} \leftarrow\) embedding of each token <span class="c">// the residual stream starts here</span></li>
+<li><b>for</b> each block \(b = 1, \dots, N\):</li>
+<li>&nbsp;&nbsp;\(\mathbf{h} \leftarrow \text{RMSNorm}_1(\mathbf{x})\) <span class="c">// read a normalized copy</span></li>
+<li>&nbsp;&nbsp;\(\mathbf{q}, \mathbf{k}, \mathbf{v} \leftarrow \mathbf{h} W_Q, \mathbf{h} W_K, \mathbf{h} W_V\), split into heads</li>
+<li>&nbsp;&nbsp;\(\mathbf{q}, \mathbf{k} \leftarrow \text{RMSNorm}_q(\mathbf{q}), \text{RMSNorm}_k(\mathbf{k})\) per head <span class="c">// QK-norm, formula (22.10)</span></li>
+<li>&nbsp;&nbsp;\(\mathbf{x} \leftarrow \mathbf{x} + \text{Attention}(\mathbf{q}, \mathbf{k}, \mathbf{v})\, W_O\) <span class="c">// write: add, formula (22.1)</span></li>
+<li>&nbsp;&nbsp;\(\mathbf{x} \leftarrow \mathbf{x} + \text{FFN}(\text{RMSNorm}_2(\mathbf{x}))\) <span class="c">// second sub-layer, same pattern</span></li>
+<li>\(\text{logits} \leftarrow \text{RMSNorm}_{\text{final}}(\mathbf{x})\, W_{\text{out}}\) <span class="c">// Pre-LN needs this final norm, formula (22.8)</span></li></ol></div>
+<p>The PyTorch version. It checks our RMSNorm and LayerNorm against the built-in ones, reproduces the worked example, and runs 8 Pre-LN blocks with QK-norm to show the stream growing while the final norm brings it back to RMS 1. It runs on a CPU in about a second (tested with PyTorch 2.8).</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+<span class="kw2">import</span> torch.nn <span class="kw2">as</span> nn
+<span class="kw2">import</span> torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="kw2">class</span> RMSNorm(nn.Module):
+    <span class="kw2">def</span> __init__(self, d, eps=1e-5):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(d))   <span class="cm"># gain only, no bias</span>
+    <span class="kw2">def</span> forward(self, x):
+        xf = x.float()                               <span class="cm"># statistics in FP32</span>
+        rms_inv = torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + self.eps)
+        <span class="kw2">return</span> (xf * rms_inv).to(x.dtype) * self.weight
+
+<span class="kw2">def</span> layer_norm(x, w, b, eps=1e-5):
+    mu  = x.mean(-1, keepdim=True)
+    var = (x - mu).pow(2).mean(-1, keepdim=True)     <span class="cm"># biased variance</span>
+    <span class="kw2">return</span> (x - mu) / torch.sqrt(var + eps) * w + b
+
+<span class="cm"># 1) check against PyTorch</span>
+x = torch.tensor([[2., 4., 6., 8.]])
+print(layer_norm(x, torch.ones(4), torch.zeros(4)))  <span class="cm"># [-1.3416, -0.4472, 0.4472, 1.3416]</span>
+print(RMSNorm(4)(x))                                 <span class="cm"># [0.3651, 0.7303, 1.0954, 1.4606]</span>
+print(torch.allclose(RMSNorm(4)(x), nn.RMSNorm(4, eps=1e-5)(x), atol=1e-6))                       <span class="cm"># True</span>
+print(torch.allclose(layer_norm(x, torch.ones(4), torch.zeros(4)), nn.LayerNorm(4)(x), atol=1e-6)) <span class="cm"># True</span>
+print(RMSNorm(4)(x + 10))                            <span class="cm"># [0.7913, 0.9231, 1.0550, 1.1869]: a shift changes RMSNorm</span>
+
+<span class="cm"># 2) a Pre-LN block with QK-norm</span>
+<span class="kw2">class</span> Block(nn.Module):
+    <span class="kw2">def</span> __init__(self, d, n_head, qk_norm=True):
+        super().__init__()
+        self.h, self.dh = n_head, d // n_head
+        self.norm1, self.norm2 = RMSNorm(d), RMSNorm(d)
+        self.qkv = nn.Linear(d, 3 * d, bias=False)
+        self.out = nn.Linear(d, d, bias=False)
+        self.mlp = nn.Sequential(nn.Linear(d, 4 * d, bias=False), nn.GELU(), nn.Linear(4 * d, d, bias=False))
+        self.qn = RMSNorm(self.dh) <span class="kw2">if</span> qk_norm <span class="kw2">else</span> nn.Identity()
+        self.kn = RMSNorm(self.dh) <span class="kw2">if</span> qk_norm <span class="kw2">else</span> nn.Identity()
+    <span class="kw2">def</span> attn(self, x):
+        B, T, D = x.shape
+        q, k, v = self.qkv(x).view(B, T, 3, self.h, self.dh).unbind(2)
+        q, k = self.qn(q), self.kn(k)                <span class="cm"># normalize each head's q and k</span>
+        y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        <span class="kw2">return</span> self.out(y.transpose(1, 2).reshape(B, T, D))
+    <span class="kw2">def</span> forward(self, x):
+        x = x + self.attn(self.norm1(x))             <span class="cm"># read with a norm, write by adding</span>
+        x = x + self.mlp(self.norm2(x))
+        <span class="kw2">return</span> x
+
+d, L = 64, 8
+blocks = nn.ModuleList([Block(d, 4) <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)])
+x = torch.randn(2, 10, d)
+print("start", round(x.norm(dim=-1).mean().item(), 2))  <span class="cm"># 8.13 (about sqrt(64))</span>
+<span class="kw2">for</span> i, blk <span class="kw2">in</span> enumerate(blocks):
+    x = blk(x)
+    print(i, round(x.norm(dim=-1).mean().item(), 2))  <span class="cm"># 8.46, 8.8, ..., 10.42: the stream grows</span>
+final_norm = RMSNorm(d)
+print(final_norm(x).pow(2).mean(-1).sqrt().mean().item())  <span class="cm"># 0.99999...: RMS 1 after the final norm</span></pre>
+<p>The stream grows slowly here (8.1 to 10.4) because PyTorch’s default <code>nn.Linear</code> initialization makes each edit small. With the unit-variance edits of formula (22.4), it would grow much faster. Try <code>qk_norm=False</code>, multiply <code>blk.qkv.weight</code> by 4, and print the attention entropy: you will see the collapse of Figure 5.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Model or setting</th><th>Norm and placement</th><th>Note</th></tr></thead><tbody>
+<tr><td>Original transformer (2017), BERT</td><td>LayerNorm, Post-LN</td><td>Needs warmup (4,000 steps in the original) [Certain]</td></tr>
+<tr><td>GPT-2, GPT-3</td><td>LayerNorm, Pre-LN with final norm, \(1/\sqrt{N}\) residual init</td><td>The layout most LLMs still follow [Certain for GPT-2]</td></tr>
+<tr><td>Llama 2 and 3, Mistral, DeepSeek</td><td>RMSNorm, Pre-LN</td><td>\(\varepsilon = 10^{-5}\) in Llama 3.1 8B [Certain]</td></tr>
+<tr><td>Qwen3</td><td>RMSNorm, Pre-LN, plus QK-norm per head</td><td>QKV bias of Qwen2 removed [Certain]</td></tr>
+<tr><td>Gemma 2, Gemma 3</td><td>RMSNorm, sandwich (pre and post), soft-capping in Gemma 2, QK-norm in Gemma 3</td><td>Caps 50 and 30 in Gemma 2 [Certain]; rest [Likely]</td></tr>
+<tr><td>ViT, CLIP, SigLIP image encoders</td><td>LayerNorm, Pre-LN; ViT-22B adds QK-norm</td><td>The vision side of most VLMs (<a href="../vision/index.html#row-the-vision-transformer-vit" title="The Vision Transformer (ViT) (planned)">session 164</a>)</td></tr>
+<tr><td>Video transformers (ViViT, TimeSformer, VideoMAE)</td><td>LayerNorm, Pre-LN, as in ViT [Likely]</td><td>Backbones for action recognition, video retrieval and key-moment detection (<a href="../video/index.html#row-video-encoders-from-3d-cnns-to-video" title="Video encoders: from 3D CNNs to video transformers (planned)">session 202</a>)</td></tr>
+<tr><td>VLM connectors (projector from vision encoder to LLM)</td><td>Often a LayerNorm before or inside the MLP projector [Likely]</td><td>Brings image features to the scale of text embeddings in the LLM’s residual stream</td></tr>
+<tr><td>Interpretability and model editing</td><td>Reads and edits the residual stream directly</td><td>Logit lens, probes, steering vectors (<a href="../applications/index.html#row-interpretability-looking-inside-the-model" title="Interpretability: looking inside the model (planned)">session 157</a>)</td></tr>
+<tr><td>Quantization of activations</td><td>Massive activations in the stream make outliers</td><td>A few features can be 100,000 times larger than typical ones (Sun et al., 2024) [Certain]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Forgetting the final norm in a Pre-LN model.</b> The stream at the top has a size that grows with depth (22.4). Feeding it straight into the output layer gives badly scaled logits.</li>
+<li><b>Normalizing over the wrong axis.</b> LayerNorm and RMSNorm work over the feature dimension of each token (the last axis), never over the sequence or the batch.</li>
+<li><b>Computing the RMS in BF16 or FP16.</b> The sum of thousands of squares loses precision or overflows in FP16. Upcast to FP32 for the statistics, as in Algorithm 1.</li>
+<li><b>Mixing up the \(\varepsilon\) or the gain convention</b> when you port a checkpoint (\(10^{-5}\) vs \(10^{-6}\); Gemma’s \(1 + w\)). The model still runs, so the bug is silent.</li>
+<li><b>Thinking RMSNorm is “LayerNorm without centering, so it is worse”.</b> In practice the quality is similar, and the next layer can absorb a common offset. It is chosen for speed and simplicity.</li>
+<li><b>Putting dropout or a norm on the identity path</b> (the skip connection) by accident. The skip should be a plain addition; all extra operations belong inside the residual branch.</li>
+<li><b>Training a Post-LN model with a Pre-LN recipe.</b> Without warmup and with a high learning rate, Post-LN often diverges early.</li>
+<li><b>Applying weight decay to norm gains,</b> which pushes them toward zero.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why do transformers use residual connections?<span class="lvl">basic</span></summary><div class="ans">A residual connection computes \(\mathbf{x} + F(\mathbf{x})\) instead of \(F(\mathbf{x})\). The layer only learns a change, and “do nothing” is easy (output zero). For the gradient, the Jacobian of each step is \(I + \partial F / \partial \mathbf{x}\), so there is always a direct path from the loss to every layer that is not multiplied by weight matrices (22.3). This prevents vanishing and exploding gradients in deep stacks. It also creates the residual stream: a shared vector that every layer reads from and adds to.</div></details>
+<details class="qa"><summary>What is the residual stream?<span class="lvl">basic</span></summary><div class="ans">In a Pre-LN transformer, each token has one vector of width \(d\) that starts as the embedding and ends at the final norm. Every attention and FFN layer reads a normalized copy of it through linear maps and adds its output back. So the final vector is the embedding plus the sum of all layer outputs (22.2). Attention moves information between positions; the FFN processes each position. Interpretability tools (logit lens, probes, steering vectors) work on this stream.</div></details>
+<details class="qa"><summary>What exactly does LayerNorm compute, and what does RMSNorm drop?<span class="lvl">core</span></summary><div class="ans">LayerNorm takes one token’s vector, subtracts its mean over the \(d\) features, divides by the standard deviation (plus \(\varepsilon\)), then applies a learned gain and bias (22.5). RMSNorm skips the mean subtraction and the bias: it divides by the root mean square and multiplies by a gain (22.6). LayerNorm is invariant to shifts and scales of the input; RMSNorm only to scales. When the mean is zero they are equal. Example: \((2, 4, 6, 8)\) gives \((-1.342, -0.447, 0.447, 1.342)\) with LayerNorm and \((0.365, 0.730, 1.095, 1.461)\) with RMSNorm.</div></details>
+<details class="qa"><summary>Why is RMSNorm cheaper, and is it worse?<span class="lvl">core</span></summary><div class="ans">It needs one reduction (sum of squares) instead of a mean and a variance, no subtraction, and no bias parameter. Normalization is memory-bound, so fewer passes over the data mean less time; the RMSNorm paper reports 7% to 64% less running time depending on the model. Quality is about the same, because re-centering turned out not to be needed. That is why Llama, Qwen, Mistral and Gemma use it.</div></details>
+<details class="qa"><summary>Why not BatchNorm in a language model?<span class="lvl">core</span></summary><div class="ans">BatchNorm normalizes each feature using statistics over the batch. In language models, sequences have different lengths and padding, generation runs one token at a time with batch statistics different from training, and the output of one sequence would depend on the other sequences in the batch. It also needs running averages for inference. LayerNorm and RMSNorm use only the token’s own vector, so they behave the same in training and inference and need no batch statistics.</div></details>
+<details class="qa"><summary>Explain Post-LN vs Pre-LN. Which do modern LLMs use and why?<span class="lvl">core</span></summary><div class="ans">Post-LN: \(\text{LN}(\mathbf{x} + F(\mathbf{x}))\), the original transformer and BERT. Pre-LN: \(\mathbf{x} + F(\text{LN}(\mathbf{x}))\) with a final norm at the top, from GPT-2 on. In Pre-LN, the stream is never normalized, so the identity path from the loss to every layer is clean; gradients at initialization are well behaved, and training is stable without a long warmup. In Post-LN, the identity path passes through every norm; the top layers get large gradients at the start (Xiong et al.) and the output is very sensitive to weight changes (Liu et al.), so it needs warmup and careful tuning. Almost all LLMs use Pre-LN, now usually with RMSNorm.</div></details>
+<details class="qa"><summary>Why does a Post-LN transformer need learning-rate warmup?<span class="lvl">advanced</span></summary><div class="ans">Xiong et al. (2020) show that at initialization, the expected gradient of the parameters near the output of a Post-LN transformer is large and does not shrink with depth, while in Pre-LN it shrinks roughly like \(1/\sqrt{L}\). With a normal learning rate, Post-LN’s first updates are too large and training diverges or gets stuck. Warmup starts with a tiny learning rate and grows it, so the early updates stay small until the model and Adam’s statistics settle. With Pre-LN, warmup can be much shorter or removed. Liu et al. add the amplification view: Post-LN depends so strongly on each residual branch that small weight changes cause large output changes.</div></details>
+<details class="qa"><summary>Does the residual stream grow with depth? Is that a problem?<span class="lvl">advanced</span></summary><div class="ans">Yes, in Pre-LN. The stream is a sum of the embedding and all edits; if the edits are roughly independent with unit variance per coordinate, \(\lVert \mathbf{x}_L \rVert \approx \sqrt{d(1 + L)}\) (22.4). Each layer reads a normalized copy, so its input is fine. But the final norm divides by this growing size, so the gradient reaching each layer shrinks, and each edit changes the stream less in relative terms in deep layers. Fixes include scaled residual init (GPT-2’s \(1/\sqrt{N}\)), sandwich or output norms (Gemma, OLMo 2), and DeepNorm-like scaling. In trained models, some features of the stream become huge (“massive activations”), which matters for quantization.</div></details>
+<details class="qa"><summary>What is QK-norm and what problem does it solve?<span class="lvl">advanced</span></summary><div class="ans">QK-norm applies LayerNorm or RMSNorm to each head’s query and key vectors right before the dot product (22.10). Without it, if \(W_Q\) and \(W_K\) grow by \(g\), the attention logits grow by \(g^2\) (22.9); the softmax becomes one-hot, its entropy collapses and training can diverge. This was seen when scaling ViT to 22B parameters and in small models with high learning rates (Wortsman et al.). With QK-norm and gain \(\gamma = 1\), every logit is bounded by \(\sqrt{d_h}\) in absolute value. Used in ViT-22B, Qwen3, OLMo 2 and Gemma 3.</div></details>
+<details class="qa"><summary>Compare QK-norm, soft-capping and z-loss.<span class="lvl">advanced</span></summary><div class="ans">All three fight runaway logits. QK-norm normalizes \(\mathbf{q}\) and \(\mathbf{k}\), so attention logits are bounded by construction and depend only on directions and a small gain. Soft-capping squashes logits with \(c \tanh(z/c)\) (Gemma 2: 50 for attention, 30 for the output); it keeps small logits almost unchanged but caps large ones, and it is harder to fuse into FlashAttention. z-loss adds \(\alpha (\log Z)^2\) to the loss to keep the output softmax normalizer near 1, which stops the final logits from drifting; it does not touch attention. Modern recipes often combine QK-norm for attention with z-loss or capping for the output.</div></details>
+<details class="qa"><summary>Where would you look if a pretraining run suddenly spikes to NaN?<span class="lvl">core</span></summary><div class="ans">Log the max attention logit per layer, the output logit size, the gradient norm and the stream norm per layer. A growing max attention logit points to the \(g^2\) effect: add QK-norm or lower the learning rate. Growing output logits point to z-loss or capping. Check that normalization statistics are computed in FP32, that \(\varepsilon\) is right, and that norms are Pre-LN with a final norm. Then use the usual tools: lower peak learning rate, longer warmup, gradient clipping, and restarting from a checkpoint before the spike while skipping the bad batches (<a href="../pretraining/training-recipe-and-stability.html">session 36</a>).</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Compute LayerNorm and RMSNorm of \(\mathbf{x} = (3, 4)\) by hand (\(\gamma = 1\), \(\beta = 0\), ignore \(\varepsilon\)).</li>
+<li>Show that LayerNorm of \(a\mathbf{x} + b\mathbf{1}\) equals LayerNorm of \(\mathbf{x}\) for any \(a \gt 0\) and any \(b\). Which part of the argument fails for RMSNorm?</li>
+<li>Count the normalization parameters of Qwen3 8B: 36 layers, \(d = 4{,}096\), two RMSNorms per block, QK-norm with one gain vector of size 128 for queries and one for keys per layer, and a final norm.</li>
+<li>Using (22.4), how large is the Pre-LN stream after 48 sub-layers with \(d = 64\)? Check it against the readout of Figure 4.</li>
+<li>Gemma 2 caps attention logits at \(c = 50\). What does a logit of 100 become? And a logit of 10? For a final-logit cap of 30, what does 40 become?</li>
+<li>If \(W_Q\) and \(W_K\) both grow by 10% during training, by how much do the attention logits grow without QK-norm? With QK-norm (gains fixed)?</li>
+<li>Write the gradient of \(\mathcal{L}\) with respect to \(\mathbf{x}_0\) for a 2-layer residual stack, and point to the term that does not involve any layer Jacobian.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. LayerNorm: \(\mu = 3.5\), \(\sigma = 0.5\), output \((-1, 1)\). RMSNorm: \(\text{RMS} = \sqrt{(9 + 16)/2} = \sqrt{12.5} = 3.536\), output \((0.849, 1.131)\). 2. The mean of \(a\mathbf{x} + b\mathbf{1}\) is \(a\mu + b\), so the centered vector is \(a(\mathbf{x} - \mu\mathbf{1})\); its standard deviation is \(a\sigma\); the ratio is \((\mathbf{x} - \mu\mathbf{1})/\sigma\), unchanged (ignoring \(\varepsilon\)). For RMSNorm there is no centering step, so \(b\) stays in both the numerator and the RMS; only the scale \(a\) cancels. 3. Per layer \(2 \times 4{,}096 + 2 \times 128 = 8{,}448\); times 36 is 304,128; plus the final 4,096 gives 308,224 parameters. 4. \(\sqrt{64 \times 49} = 56\); Figure 4 shows 55.7 for the first seed. 5. \(50 \tanh(2) = 48.2\); \(50 \tanh(0.2) = 9.87\); \(30 \tanh(4/3) = 26.1\). 6. By \(1.1^2 = 1.21\), so 21%; with QK-norm, not at all. 7. \(\frac{\partial \mathcal{L}}{\partial \mathbf{x}_0} = \frac{\partial \mathcal{L}}{\partial \mathbf{x}_2}(I + J_1)(I + J_0) = \frac{\partial \mathcal{L}}{\partial \mathbf{x}_2}(I + J_0 + J_1 + J_1 J_0)\), where \(J_l = \partial F_l / \partial \mathbf{x}_l\). The term \(\frac{\partial \mathcal{L}}{\partial \mathbf{x}_2} I\) goes straight from the loss to the input.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A residual connection adds each layer’s output to its input (22.1). The stack becomes a sum of edits (22.2), and the identity path carries the gradient to every layer (22.3).</li>
+<li>The residual stream is one shared vector per token. Layers read it through a norm and linear maps and write by adding. Attention moves information between tokens; the FFN works per token.</li>
+<li>The stream grows with depth (22.4), so each layer reads a normalized copy. LayerNorm (22.5) removes the mean and the scale; RMSNorm (22.6) removes only the scale, is cheaper, and is used by almost all new LLMs.</li>
+<li>Post-LN (22.7) normalizes the stream itself and needs warmup; Pre-LN (22.8) normalizes copies, keeps the stream clean, and needs a final norm. Modern LLMs use Pre-LN, sometimes with extra output norms.</li>
+<li>Attention logits grow like \(g^2\) when \(W_Q, W_K\) grow (22.9). QK-norm (22.10) bounds them; soft-capping (22.11) and z-loss are alternatives.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \mathbf{x}_{l+1} = \mathbf{x}_l + F_l(\text{Norm}(\mathbf{x}_l)), \qquad \text{RMSNorm}(\mathbf{x}) = \gamma \odot \frac{\mathbf{x}}{\sqrt{\tfrac{1}{d}\sum_i x_i^2 + \varepsilon}} \]</div>
+<div class="eq">\[ \text{LN}(\mathbf{x}) = \gamma \odot \frac{\mathbf{x} - \mu}{\sqrt{\sigma^2 + \varepsilon}} + \beta, \qquad z_j = \frac{\text{RMSNorm}(\mathbf{q})^\top \text{RMSNorm}(\mathbf{k}_j)}{\sqrt{d_h}} \]</div>
+<h2 class="plain" id="the-residual-stream-and-normalization-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhang &amp; Sennrich (2019). <a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noopener">Root Mean Square Layer Normalization</a></li><li>Xiong et al. (2020). <a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener">On Layer Normalization in the Transformer Architecture</a></li><li>Elhage et al. (2021). <a href="https://transformer-circuits.pub/2021/framework/index.html" target="_blank" rel="noopener">A Mathematical Framework for Transformer Circuits</a></li><li>Zhang &amp; Sennrich (2019). <a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noopener">Root Mean Square Layer Normalization</a></li><li>Xiong et al. (2020). <a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener">On Layer Normalization in the Transformer Architecture</a></li><li>Elhage et al. (2021). <a href="https://transformer-circuits.pub/2021/framework/index.html" target="_blank" rel="noopener">A Mathematical Framework for Transformer Circuits</a></li><li>He et al. (2015). <a href="https://arxiv.org/abs/1512.03385" target="_blank" rel="noopener">Deep Residual Learning for Image Recognition</a></li><li>Vaswani et al. (2017). <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a></li><li>Ba, Kiros, Hinton (2016). <a href="https://arxiv.org/abs/1607.06450" target="_blank" rel="noopener">Layer Normalization</a></li><li>Radford et al. (2019). <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener">Language Models are Unsupervised Multitask Learners</a></li><li>Liu, Liu, Gao, Chen, Han (2020). <a href="https://arxiv.org/abs/2004.08249" target="_blank" rel="noopener">Understanding the Difficulty of Training Transformers</a></li><li>Wang, Ma, Dong, Huang, Zhang, Wei (2022). <a href="https://arxiv.org/abs/2203.00555" target="_blank" rel="noopener">DeepNet: Scaling Transformers to 1,000 Layers</a></li><li>Dehghani et al. (2023). <a href="https://arxiv.org/abs/2302.05442" target="_blank" rel="noopener">Scaling Vision Transformers to 22 Billion Parameters</a></li><li>Henry, Dachapally, Pawar, Chen (2020). <a href="https://arxiv.org/abs/2010.04245" target="_blank" rel="noopener">Query-Key Normalization for Transformers</a></li><li>Wortsman et al. (2023). <a href="https://arxiv.org/abs/2309.14322" target="_blank" rel="noopener">Small-scale proxies for large-scale Transformer training instabilities</a></li><li>Sun, Chen, Kolter, Liu (2024). <a href="https://arxiv.org/abs/2402.17762" target="_blank" rel="noopener">Massive Activations in Large Language Models</a></li><li>Qwen Team (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;Qwen3 Technical Report&amp;quot;" target="_blank" rel="noopener">Qwen3 Technical Report</a></li><li>Gemma Team (2024). <a href="https://arxiv.org/abs/2408.00118" target="_blank" rel="noopener">Gemma 2: Improving Open Language Models at a Practical Size</a></li><li>Gemma Team (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;Gemma 3 Technical Report&amp;quot;" target="_blank" rel="noopener">Gemma 3 Technical Report</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../transformers/the-feed-forward-network-mlp-inside-each.html"><small>Previous · session 21</small>The feed-forward network (MLP) inside each block</a><a class="next" href="../transformers/the-full-transformer-and-its-three-families.html"><small>Next · session 23</small>The full transformer and its three families</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="the-residual-stream-and-normalization"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const num=v=>(Math.abs(v)<5e-4?0:v);
+const f2=v=>num(v).toFixed(2).replace("-","−");const f3=v=>num(v).toFixed(3).replace("-","−");
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+const norm=a=>Math.sqrt(a.reduce((s,v)=>s+v*v,0));
+const dot=(a,b)=>{let s=0;for(let i=0;i<a.length;i++)s+=a[i]*b[i];return s;};
+
+/* ---------- Figure 1: the residual stream, step by step ---------- */
+(function(){
+ const svg=$("#rs-stream-svg");if(!svg)return;const info=$("#rs-stream-info");
+ const d=8,G=gauss(rng(11));const x0=[];for(let i=0;i<d;i++)x0.push(G());
+ const xs=[x0],ds=[null];for(let k=0;k<8;k++){const dl=[];for(let i=0;i<d;i++)dl.push(0.3*G());ds.push(dl);xs.push(xs[k].map((v,i)=>v+dl[i]));}
+ const last=xs[8],rms=Math.sqrt(dot(last,last)/d);const fin=last.map(v=>v/rms);
+ const names=["embedding x₀"];for(let b=1;b<=4;b++){names.push(`block ${b}: attention`);names.push(`block ${b}: FFN`);}names.push("final RMSNorm");
+ const n=10,X0=150,W=600,Y0=150,S=45;
+ function draw(i){
+  const cur=i===9?fin:xs[i],prev=i>=1&&i<=8?xs[i-1]:null,dl=i>=1&&i<=8?ds[i]:null;
+  let g=`<line x1="${X0-10}" y1="${Y0}" x2="${X0+W}" y2="${Y0}" stroke="var(--rule)"/>`;
+  for(let t=-3;t<=3;t++){if(!t)continue;const y=Y0-t*S;g+=`<line x1="${X0-10}" y1="${y}" x2="${X0+W}" y2="${y}" stroke="var(--rule)" stroke-dasharray="2 5" opacity=".6"/><text x="${X0-16}" y="${y+4}" text-anchor="end" class="svgs" font-size="11">${t}</text>`;}
+  g+=`<text x="${X0-16}" y="${Y0+4}" text-anchor="end" class="svgs" font-size="11">0</text>`;
+  const bw=W/d;
+  for(let k=0;k<d;k++){const xc=X0+k*bw+bw/2;
+   const base=prev?prev[k]:cur[k];const y1=Y0-base*S;
+   g+=`<rect x="${(xc-bw*0.3).toFixed(1)}" y="${Math.min(Y0,y1).toFixed(1)}" width="${(bw*0.6).toFixed(1)}" height="${Math.abs(y1-Y0).toFixed(1)}" fill="var(--tc)" opacity="${i===9?0.9:0.75}" rx="2"/>`;
+   if(dl){const y2=Y0-cur[k]*S;g+=`<rect x="${(xc-bw*0.18).toFixed(1)}" y="${Math.min(y1,y2).toFixed(1)}" width="${(bw*0.36).toFixed(1)}" height="${Math.max(1.5,Math.abs(y2-y1)).toFixed(1)}" fill="var(--v)" rx="2"/>`;
+    g+=`<line x1="${(xc-bw*0.35).toFixed(1)}" x2="${(xc+bw*0.35).toFixed(1)}" y1="${y2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="var(--ink)" stroke-width="2"/>`;}
+   g+=`<text x="${xc.toFixed(1)}" y="${Y0+140}" text-anchor="middle" class="svgs" font-size="12">x${k+1}</text>`;}
+  // step track on the left
+  g+=`<text x="12" y="22" class="svgt" font-size="13" font-weight="700">${B.esc(names[i])}</text>`;
+  for(let k=0;k<n;k++){const y=44+k*24;g+=`<circle cx="20" cy="${y}" r="6" fill="${k===i?"var(--tc)":k<i?"var(--v)":"var(--card)"}" stroke="var(--rule)"/><text x="32" y="${y+4}" class="svgs" font-size="11">${k===0?"embed":k===9?"final norm":(k%2?"attn ":"FFN ")+Math.ceil(k/2)}</text>`;}
+  svg.innerHTML=g;
+  const nx=norm(cur);
+  if(i===0){info.dataset.norm=f2(nx);info.dataset.delta="";info.dataset.cos="";
+   info.innerHTML=`The token’s embedding starts the stream. ‖x₀‖ = <b>${f2(nx)}</b>. Nothing has been added yet.`;}
+  else if(i<=8){const c=dot(prev,cur)/norm(prev)/nx,nd=norm(dl);info.dataset.norm=f2(nx);info.dataset.delta=f2(nd);info.dataset.cos=f3(c);
+   info.innerHTML=`${B.esc(names[i])} reads a normalized copy and <b>adds</b> an edit with ‖Δ‖ = <b>${f2(nd)}</b>. The stream now has ‖x‖ = <b>${f2(nx)}</b>; cos(before, after) = <b>${f3(c)}</b>.<br>x after ${i} sub-layer${i>1?"s":""} = x₀ + ${i} edit${i>1?"s":""}; total change from x₀: ‖x − x₀‖ = ${f2(norm(cur.map((v,k)=>v-x0[k])))}.`;}
+  else{const rr=Math.sqrt(dot(fin,fin)/d);info.dataset.norm=f2(nx);info.dataset.delta="";info.dataset.cos=f3(dot(last,x0)/norm(last)/norm(x0));
+   info.innerHTML=`The final RMSNorm rescales the stream (‖x₈‖ = ${f2(norm(last))}) to RMS <b>${f2(rr)}</b>, so ‖x‖ = √8 = <b>${f2(nx)}</b>. This is what the output layer reads. cos(x₀, x₈) = <b>${f3(dot(last,x0)/norm(last)/norm(x0))}</b>: the embedding is still a large part of the final vector.`;}
+ }
+ B.stepper({n,prev:$("#rs-stream-prev"),next:$("#rs-stream-next"),play:$("#rs-stream-play"),label:$("#rs-stream-lab"),ms:1800,onStep:draw});
+})();
+
+/* ---------- Figure 2: LayerNorm vs RMSNorm ---------- */
+(function(){
+ const svg=$("#rs-norm-svg");if(!svg)return;const sc=$("#rs-norm-c"),ss=$("#rs-norm-s"),so=$("#rs-norm-o"),info=$("#rs-norm-info");
+ const base=[0.8,-1.2,0.3,2.0,-0.5,1.1,-1.6,0.4],d=8;
+ function draw(){const c=+sc.value,s=+ss.value,o=+so.value;$("#rs-norm-cv").value=c.toFixed(1);$("#rs-norm-sv").value=s.toFixed(1);$("#rs-norm-ov").value=o;
+  const x=base.map((v,i)=>s*(v+c)+(i===3?o:0));
+  const mu=x.reduce((a,b)=>a+b,0)/d,sd=Math.sqrt(x.reduce((a,v)=>a+(v-mu)*(v-mu),0)/d),rm=Math.sqrt(dot(x,x)/d);
+  const ln=x.map(v=>(v-mu)/sd),rn=x.map(v=>v/rm);
+  const mx=Math.max(...x.map(Math.abs),1e-9);
+  // top panel: input (own scale); bottom panel: outputs on fixed scale [-3,3]
+  let g=`<text x="10" y="16" class="svgt" font-size="12" font-weight="700">input (scale: max |x| = ${f2(mx)})</text>`;
+  const X0=40,W=590,bw=W/d,Yi=70,Si=50/mx,Yo=210,So=26;
+  g+=`<line x1="${X0}" x2="${X0+W}" y1="${Yi}" y2="${Yi}" stroke="var(--rule)"/><line x1="${X0}" x2="${X0+W}" y1="${Yo}" y2="${Yo}" stroke="var(--rule)"/>`;
+  for(const t of [-3,-2,-1,1,2,3]){const y=Yo-t*So;if(Math.abs(t)===3){g+=`<line x1="${X0}" x2="${X0+W}" y1="${y}" y2="${y}" stroke="var(--rule)" stroke-dasharray="2 5" opacity=".6"/>`;continue;}g+=`<line x1="${X0}" x2="${X0+W}" y1="${y}" y2="${y}" stroke="var(--rule)" stroke-dasharray="2 5" opacity=".6"/><text x="${X0-6}" y="${y+4}" text-anchor="end" class="svgs" font-size="10">${t}</text>`;}
+  g+=`<text x="10" y="138" class="svgt" font-size="12" font-weight="700">outputs (fixed scale)</text>`;
+  for(let k=0;k<d;k++){const xc=X0+k*bw+bw/2;const yi=Yi-x[k]*Si;
+   g+=`<rect x="${(xc-bw*0.25).toFixed(1)}" y="${Math.min(Yi,yi).toFixed(1)}" width="${(bw*0.5).toFixed(1)}" height="${Math.abs(yi-Yi).toFixed(1)}" fill="var(--muted)" rx="2"/>`;
+   const cl=v=>Math.max(-3.4,Math.min(3.4,v));const y1=Yo-cl(ln[k])*So,y2=Yo-cl(rn[k])*So;
+   g+=`<rect x="${(xc-bw*0.36).toFixed(1)}" y="${Math.min(Yo,y1).toFixed(1)}" width="${(bw*0.33).toFixed(1)}" height="${Math.abs(y1-Yo).toFixed(1)}" fill="var(--q)" rx="2"/>`;
+   g+=`<rect x="${(xc+0.03*bw).toFixed(1)}" y="${Math.min(Yo,y2).toFixed(1)}" width="${(bw*0.33).toFixed(1)}" height="${Math.abs(y2-Yo).toFixed(1)}" fill="var(--k)" rx="2"/>`;
+   g+=`<text x="${xc.toFixed(1)}" y="${296}" text-anchor="middle" class="svgs" font-size="11">${k+1}</text>`;}
+  svg.innerHTML=g;
+  info.dataset.ln1=f3(ln[0]);info.dataset.rms1=f3(rn[0]);info.dataset.mean=f3(mu);
+  const rmsLn=Math.sqrt(dot(ln,ln)/d),meanRn=rn.reduce((a,b)=>a+b,0)/d;
+  info.innerHTML=`Input: mean μ = <b>${f3(mu)}</b>, std σ = <b>${f3(sd)}</b>, RMS = <b>${f3(rm)}</b>.<br>Feature 1: LayerNorm = <b>${f3(ln[0])}</b>, RMSNorm = <b>${f3(rn[0])}</b>. Feature 4: LayerNorm = ${f3(ln[3])}, RMSNorm = ${f3(rn[3])}.<br>LayerNorm output: mean 0, RMS ${f3(rmsLn)}. RMSNorm output: RMS 1, mean <b>${f3(meanRn)}</b>.`;}
+ [sc,ss,so].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: placement of the norm (static) ---------- */
+(function(){
+ const svg=$("#rs-place-svg");if(!svg)return;
+ const box=(x,y,w,h,t,cls)=>`<g class="rs-box ${cls}"><rect x="${x-w/2}" y="${y-h/2}" width="${w}" height="${h}" rx="8"/><text x="${x}" y="${y+5}" font-size="14" font-weight="600">${t}</text></g>`;
+ const plus=(x,y)=>`<circle cx="${x}" cy="${y}" r="12" fill="var(--card)" stroke="var(--tc)" stroke-width="2"/><text x="${x}" y="${y+6}" text-anchor="middle" font-size="18" font-weight="700" fill="var(--tc)">+</text>`;
+ const ar=(x1,y1,x2,y2,c)=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c||"var(--muted)"}" stroke-width="2" marker-end="url(#rs-ah)"/>`;
+ let g=`<defs><marker id="rs-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+ const panels=[{t:"Post-LN",s:"original transformer, BERT",x:130},{t:"Pre-LN",s:"GPT-2, Llama, Qwen",x:390},{t:"Sandwich",s:"Gemma 2 and 3",x:650}];
+ panels.forEach((p,pi)=>{const sx=p.x-60,bx=p.x+45;
+  g+=`<text x="${p.x}" y="22" text-anchor="middle" class="svgt" font-size="16" font-weight="700">${p.t}</text><text x="${p.x}" y="40" text-anchor="middle" class="svgs" font-size="12">${p.s}</text>`;
+  g+=`<text x="${sx}" y="354" text-anchor="middle" class="svgs" font-size="13">xₗ</text>`;
+  if(pi===0){ // Post-LN: stream passes through Norm
+   g+=`<line x1="${sx}" y1="335" x2="${sx}" y2="172" stroke="var(--tc)" stroke-width="4"/>`+ar(sx,300,bx,300)+`<line x1="${bx}" y1="300" x2="${bx}" y2="270" stroke="var(--muted)" stroke-width="2"/>`;
+   g+=box(bx,250,90,38,"F","f")+`<line x1="${bx}" y1="231" x2="${bx}" y2="160" stroke="var(--muted)" stroke-width="2"/>`+ar(bx,160,sx+13,160)+plus(sx,160);
+   g+=`<line x1="${sx}" y1="148" x2="${sx}" y2="122" stroke="var(--tc)" stroke-width="4"/>`+box(sx,100,80,38,"Norm","n")+`<line x1="${sx}" y1="81" x2="${sx}" y2="58" stroke="var(--tc)" stroke-width="4"/>`;
+   g+=`<text x="${sx-10}" y="70" text-anchor="end" class="svgs" font-size="13">xₗ₊₁</text>`;
+   g+=`<text x="${p.x+10}" y="110" class="svgs" font-size="11">the stream</text><text x="${p.x+10}" y="124" class="svgs" font-size="11">itself is normalized</text>`;}
+  else{ // Pre-LN and sandwich
+   g+=`<line x1="${sx}" y1="335" x2="${sx}" y2="58" stroke="var(--tc)" stroke-width="4"/>`+ar(sx,310,bx,310)+`<line x1="${bx}" y1="310" x2="${bx}" y2="290" stroke="var(--muted)" stroke-width="2"/>`;
+   g+=box(bx,272,90,34,"Norm","n")+`<line x1="${bx}" y1="255" x2="${bx}" y2="232" stroke="var(--muted)" stroke-width="2"/>`+box(bx,212,90,38,"F","f");
+   let top=193;if(pi===2){g+=`<line x1="${bx}" y1="193" x2="${bx}" y2="172" stroke="var(--muted)" stroke-width="2"/>`+box(bx,154,90,34,"Norm","n");top=137;}
+   const py=pi===2?100:130;g+=`<line x1="${bx}" y1="${top}" x2="${bx}" y2="${py}" stroke="var(--muted)" stroke-width="2"/>`+ar(bx,py,sx+13,py)+plus(sx,py);
+   g+=`<text x="${sx-10}" y="70" text-anchor="end" class="svgs" font-size="13">xₗ₊₁</text>`;
+   g+=`<text x="${sx-8}" y="${pi===2?230:200}" text-anchor="end" class="svgs" font-size="11">clean</text><text x="${sx-8}" y="${pi===2?244:214}" text-anchor="end" class="svgs" font-size="11">stream</text>`;}
+ });
+ svg.innerHTML=g;
+})();
+
+/* ---------- Figure 4: Post-LN vs Pre-LN gradients at init ---------- */
+(function(){
+ const svg=$("#rs-grad-svg");if(!svg)return;const sl=$("#rs-grad-L"),info=$("#rs-grad-info"),sb=$("#rs-grad-seed"),sv=$("#rs-grad-seedv");
+ const d=64,Bn=16;let seed=1;
+ const lnF=x=>{let m=0;for(let i=0;i<d;i++)m+=x[i];m/=d;let v=0;const y=new Float64Array(d);for(let i=0;i<d;i++){y[i]=x[i]-m;v+=y[i]*y[i];}const s=Math.sqrt(v/d+1e-5);for(let i=0;i<d;i++)y[i]/=s;return{y,s};};
+ const lnB=(dy,y,s)=>{let a=0,b=0;for(let i=0;i<d;i++){a+=dy[i];b+=dy[i]*y[i];}a/=d;b/=d;const o=new Float64Array(d);for(let i=0;i<d;i++)o[i]=(dy[i]-a-y[i]*b)/s;return o;};
+ const mv=(W,h)=>{const o=new Float64Array(d);for(let i=0;i<d;i++){const r=W[i];let s=0;for(let j=0;j<d;j++)s+=r[j]*h[j];o[i]=s;}return o;};
+ const mtv=(W,g)=>{const o=new Float64Array(d);for(let i=0;i<d;i++){const gi=g[i],r=W[i];for(let j=0;j<d;j++)o[j]+=gi*r[j];}return o;};
+ function sim(L,sd){const G=gauss(rng(sd));const X0=[];for(let b=0;b<Bn;b++){const x=new Float64Array(d);for(let i=0;i<d;i++)x[i]=G();X0.push(x);}
+  const W=[];const sq=Math.sqrt(d);for(let l=0;l<L;l++){const M=[];for(let i=0;i<d;i++){const r=new Float64Array(d);for(let j=0;j<d;j++)r[j]=G()/sq;M.push(r);}W.push(M);}
+  const c=new Float64Array(d);for(let i=0;i<d;i++)c[i]=G();const cn=Math.sqrt(dot(c,c));for(let i=0;i<d;i++)c[i]/=cn;
+  const pre=new Array(L).fill(0),post=new Array(L).fill(0);const gWpre=[],gWpost=[];
+  for(let l=0;l<L;l++){gWpre.push(Array.from({length:d},()=>new Float64Array(d)));gWpost.push(Array.from({length:d},()=>new Float64Array(d)));}
+  let topNorm=0;
+  for(let b=0;b<Bn;b++){
+   // Pre-LN
+   let x=X0[b];const hs=[],ss=[];for(let l=0;l<L;l++){const r=lnF(x);hs.push(r.y);ss.push(r.s);const f=mv(W[l],r.y);const nx=new Float64Array(d);for(let i=0;i<d;i++)nx[i]=x[i]+f[i];x=nx;}
+   topNorm+=Math.sqrt(dot(x,x))/Bn;
+   const fr=lnF(x);const dy=c.map(v=>v/Bn);let gx=lnB(dy,fr.y,fr.s);
+   for(let l=L-1;l>=0;l--){const M=gWpre[l],h=hs[l];for(let i=0;i<d;i++){const gi=gx[i],r=M[i];for(let j=0;j<d;j++)r[j]+=gi*h[j];}
+    const gh=mtv(W[l],gx);const gl=lnB(gh,h,ss[l]);for(let i=0;i<d;i++)gx[i]+=gl[i];}
+   // Post-LN
+   x=X0[b];const ys=[x],ps=[];for(let l=0;l<L;l++){const f=mv(W[l],x);const z=new Float64Array(d);for(let i=0;i<d;i++)z[i]=x[i]+f[i];const r=lnF(z);ps.push(r.s);ys.push(r.y);x=r.y;}
+   gx=c.map(v=>v/Bn);
+   for(let l=L-1;l>=0;l--){const gz=lnB(gx,ys[l+1],ps[l]);const M=gWpost[l],xi=ys[l];for(let i=0;i<d;i++){const gi=gz[i],r=M[i];for(let j=0;j<d;j++)r[j]+=gi*xi[j];}
+    const t=mtv(W[l],gz);const ng=new Float64Array(d);for(let i=0;i<d;i++)ng[i]=gz[i]+t[i];gx=ng;}
+  }
+  const fro=M=>{let s=0;for(const r of M)for(let j=0;j<d;j++)s+=r[j]*r[j];return Math.sqrt(s);};
+  for(let l=0;l<L;l++){pre[l]=fro(gWpre[l]);post[l]=fro(gWpost[l]);}
+  return{pre,post,topNorm};}
+ function draw(){const L=+sl.value;$("#rs-grad-Lv").value=L;sv.textContent=`seed ${seed}`;
+  const r=sim(L,seed);const X0=60,W=560,Y0=20,H=240;const lo=Math.log10(0.05),hi=Math.log10(10);
+  const px=l=>X0+(L===1?0:l/(L-1))*W,py=v=>Y0+H*(hi-Math.log10(Math.max(v,0.05)))/(hi-lo);
+  let g="";for(const t of [0.1,1,10]){const y=py(t);g+=`<line x1="${X0}" x2="${X0+W}" y1="${y}" y2="${y}" stroke="var(--rule)" stroke-dasharray="${t===1?"":"2 5"}"/><text x="${X0-8}" y="${y+4}" text-anchor="end" class="svgs" font-size="11">${t}</text>`;}
+  for(const t of [0.2,0.5,2,5]){const y=py(t);g+=`<line x1="${X0}" x2="${X0+W}" y1="${y}" y2="${y}" stroke="var(--rule)" opacity=".35"/>`;}
+  g+=`<text x="${X0}" y="${Y0+H+28}" class="svgs" font-size="12">layer 1 (input side)</text><text x="${X0+W}" y="${Y0+H+28}" text-anchor="end" class="svgs" font-size="12">layer ${L} (output side)</text>`;
+  g+=`<text x="14" y="${Y0+H/2}" class="svgs" font-size="12" transform="rotate(-90 14 ${Y0+H/2})" text-anchor="middle">gradient size (log)</text>`;
+  const path=(a,col)=>`<polyline fill="none" stroke="${col}" stroke-width="2.5" points="${a.map((v,l)=>px(l).toFixed(1)+","+py(v).toFixed(1)).join(" ")}"/>`+a.map((v,l)=>`<circle cx="${px(l).toFixed(1)}" cy="${py(v).toFixed(1)}" r="3" fill="${col}"/>`).join("");
+  g+=path(r.post,"var(--q)")+path(r.pre,"var(--k)");svg.innerHTML=g;
+  const pl=r.pre[L-1],ql=r.post[L-1];info.dataset.pre=f3(pl);info.dataset.post=f3(ql);info.dataset.top=f2(r.topNorm);
+  info.innerHTML=`Top layer (layer ${L}): Post-LN gradient = <b>${f3(ql)}</b>, Pre-LN gradient = <b>${f3(pl)}</b>, ratio <b>${(ql/pl).toFixed(2)}</b>.<br>Bottom layer (layer 1): Post-LN ${f3(r.post[0])}, Pre-LN ${f3(r.pre[0])}.<br>Pre-LN stream size at the top: ‖x_L‖ = <b>${f2(r.topNorm)}</b>; formula (22.4) predicts √(64·${L+1}) = ${f2(Math.sqrt(64*(L+1)))}.`;}
+ sl.addEventListener("input",draw);sb.addEventListener("click",()=>{seed=seed%9+1;draw();});draw();
+})();
+
+/* ---------- Figure 5: attention logit growth and QK-norm ---------- */
+(function(){
+ const svg=$("#rs-qk-svg");if(!svg)return;const sg=$("#rs-qk-g"),sm=$("#rs-qk-gm"),on=$("#rs-qk-on"),info=$("#rs-qk-info");
+ const dh=16,n=8,G=gauss(rng(5));const q=[];for(let i=0;i<dh;i++)q.push(G());const K=[];for(let j=0;j<n;j++){const k=[];for(let i=0;i<dh;i++)k.push(G());K.push(k);}
+ const rmsn=v=>{const r=Math.sqrt(dot(v,v)/dh+1e-6);return v.map(x=>x/r);};
+ function draw(){const g=+sg.value,gm=+sm.value,qk=on.checked;$("#rs-qk-gv").value=g.toFixed(1);$("#rs-qk-gmv").value=gm.toFixed(2);
+  sm.disabled=!qk;
+  let z;if(qk){const qh=rmsn(q).map(v=>v*gm);z=K.map(k=>dot(qh,rmsn(k).map(v=>v*gm))/Math.sqrt(dh));}else z=K.map(k=>g*g*dot(q,k)/Math.sqrt(dh));
+  const p=B.softmax(z);const H=-p.reduce((a,v)=>a+(v>0?v*Math.log(v):0),0);const zm=Math.max(...z),pm=Math.max(...p);
+  const X0=60,W=560,Y0=78,Sz=60/Math.max(8,...z.map(Math.abs)),bw=W/n,Yp=268;
+  let s=`<line x1="${X0}" x2="${X0+W}" y1="${Y0}" y2="${Y0}" stroke="var(--rule)"/>`;
+  const zs=Math.max(8,...z.map(Math.abs));s+=`<text x="${X0-8}" y="${Y0-60+4}" text-anchor="end" class="svgs" font-size="11">${f2(zs)}</text><text x="${X0-8}" y="${Y0+60+4}" text-anchor="end" class="svgs" font-size="11">−${f2(zs)}</text><text x="${X0}" y="${Y0-66}" class="svgs" font-size="11">logits</text><line x1="${X0}" x2="${X0+W}" y1="${Yp}" y2="${Yp}" stroke="var(--rule)"/><text x="${X0-8}" y="${Yp-95+4}" text-anchor="end" class="svgs" font-size="11">1</text><text x="${X0-8}" y="${Yp+4}" text-anchor="end" class="svgs" font-size="11">0</text><text x="${X0}" y="${Yp-104}" class="svgs" font-size="11">attention weights</text><text x="${X0-8}" y="${Y0+4}" text-anchor="end" class="svgs" font-size="11">0</text>`;
+  for(let j=0;j<n;j++){const xc=X0+j*bw+bw/2;const y=Y0-z[j]*Sz;
+   s+=`<rect x="${(xc-bw*0.15).toFixed(1)}" y="${Math.min(Y0,y).toFixed(1)}" width="${(bw*0.3).toFixed(1)}" height="${Math.abs(y-Y0).toFixed(1)}" fill="var(--k)" rx="2"/>`;
+   const ph=p[j]*95;s+=`<rect x="${(xc-bw*0.15).toFixed(1)}" y="${(Yp-ph).toFixed(1)}" width="${(bw*0.3).toFixed(1)}" height="${ph.toFixed(1)}" fill="var(--v)" opacity=".85" rx="2"/>`;
+   s+=`<text x="${xc.toFixed(1)}" y="${(Yp-ph-4).toFixed(1)}" text-anchor="middle" class="svgs" font-size="10">${p[j].toFixed(2)}</text>`;
+   s+=`<text x="${xc.toFixed(1)}" y="${Yp+16}" text-anchor="middle" class="svgs" font-size="12">k${j+1}</text>`;}
+  svg.innerHTML=s;
+  info.dataset.zmax=f3(zm);info.dataset.pmax=f3(pm);info.dataset.h=f3(H);
+  info.innerHTML=`${qk?`QK-norm on: every |z| ≤ γ²√d_h = <b>${f2(gm*gm*Math.sqrt(dh))}</b>; the weight growth g has no effect.`:`QK-norm off: logits scale with g² = <b>${f2(g*g)}</b>.`}<br>Largest logit = <b>${f3(zm)}</b>, largest attention weight = <b>${f3(pm)}</b>, entropy = <b>${f3(H)}</b> nats (uniform over 8 keys: ln 8 = 2.079).`;}
+ [sg,sm].forEach(e=>e.addEventListener("input",draw));on.addEventListener("change",draw);draw();
+})();
+})();
+</script></body></html>

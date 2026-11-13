@@ -1,0 +1,394 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Attention variants 2: a first look at sliding windows, linear attention and SSMs · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../transformers/index.html">Attention and transformers</a><span class="sep">/</span><span>Session 27</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="attention-variants-2-a-first-look-at">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="attention-variants-2-a-first-look-at" data-session="attention-variants-2-a-first-look-at" style="--tc:var(--t2)"><header class="chap-head"><div class="chap-kicker"><span class="num">27</span><span>Track 2: Attention and transformers · session 12 of 15</span></div><h1 class="chap-title">Attention variants 2: a first look at sliding windows, linear attention and SSMs</h1><p class="chap-sub">Full attention looks at every earlier token, so its cost grows with the square of the length and its cache grows forever. This session takes a first look at three ways out: sliding windows (Mistral, Gemma), linear attention, and state space models like Mamba. It also explains attention sinks, the strange reason a pretrained model breaks when you drop its first token.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 1.5 to 2 hours, exercises 1 hour)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 17, 19 and 26 (attention math, multi-head attention, KV cache)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Sliding-window attention: the banded mask, its cost, the rolling buffer KV cache, and the reach of about L × W tokens through L layers</li><li>Local + global designs: global tokens (Longformer, BigBird) and interleaved layers (Gemma 2 and Gemma 3), with cache numbers</li><li>Linear attention: the kernel trick, why it is an RNN with a d × d state, and why the cost becomes O(T)</li><li>What linear attention loses: sharp focus and recall, shown with real weights</li><li>State space models: the discretized recurrence, and how Mamba makes it selective</li><li>Attention sinks: why softmax creates them and how StreamingLLM keeps a model stable over millions of tokens</li><li>How to choose between these designs, and where they appear in long-context and video systems</li></ul></div></header><style>
+.a2-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.a2-grid input[type=range]{width:100%}
+.a2-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.a2-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.a2-cell{cursor:pointer}
+.a2-svgwrap{max-width:560px;margin:0 auto}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Standard attention lets every token look at every earlier token. That is its power, and also its cost: the work grows with the <b>square</b> of the sequence length, and the KV cache grows with the length itself. At 128K tokens, those costs dominate everything else.</p>
+<p>In <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a> we made the KV cache smaller by sharing keys and values between heads (MQA, GQA) or compressing them (MLA). Those methods keep the idea that each token can see the <b>whole</b> past. This session looks at three ideas that break that rule on purpose, and at one strange effect that appears when you do:</p>
+<ul>
+<li><b>Sliding-window attention.</b> Each token looks only at the last \(W\) tokens. Mistral 7B uses it in every layer; Gemma 2 and Gemma 3 mix window layers with full layers. [Certain]</li>
+<li><b>Linear attention.</b> Remove the softmax, use a “kernel” feature map instead, and attention becomes an RNN with a fixed-size state. Cost per token becomes constant.</li>
+<li><b>State space models (SSMs) such as Mamba.</b> A recurrent layer with a fixed-size state, designed from the start to be trained in parallel and run as an RNN.</li>
+<li><b>Attention sinks.</b> Models put a lot of attention on the first token, even when it means nothing. If you throw it out of a sliding window, the model breaks. Keep it, and the model can stream millions of tokens (StreamingLLM).</li>
+</ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “What is the receptive field of sliding-window attention after \(L\) layers?”, “Why is linear attention \(O(T)\) and what does it lose?”, “How is Mamba different from an LSTM?”, “What is an attention sink?”. Each one is answered below with numbers.</aside>
+<p>This is a <b>first look</b>. Each idea gets a full deep dive later, in the efficient-inference part of the course: <a href="../inference/index.html#row-sparse-attention-1-static-sparse-transformer-longformer" title="Sparse attention 1 (static): Sparse Transformer, Longformer, BigBird, StreamingLLM (planned)">session 116</a>, <a href="../inference/index.html#row-efficient-attention-3-kernel-based-attention-linear" title="Efficient attention 3: kernel-based attention (Linear Transformer, Performer, RFA) (planned)">session 99</a>, <a href="../inference/index.html#row-transformer-alternatives-1-state-space-models-from" title="Transformer alternatives 1: state space models from HiPPO to S4 (planned)">session 100</a> and <a href="../inference/index.html#row-transformer-alternatives-2-mamba-rwkv-retnet-hyena" title="Transformer alternatives 2: Mamba, RWKV, RetNet, Hyena and hybrids (planned)">session 101</a>. Here the goal is to understand what each one does, what it costs, and what it gives up, so that you can place it on a map and answer a first interview question about it.</p>
+
+<h2>The starting point: full causal attention</h2>
+<p>Recall the attention output for the token at position \(i\) in a decoder. It is a weighted average of the value vectors of all positions \(j \le i\):</p>
+<div class="eq">\[ \mathbf{o}_i = \sum_{j=1}^{i} \alpha_{ij}\, \mathbf{v}_j, \qquad \alpha_{ij} = \frac{\exp\!\left(\mathbf{q}_i^\top \mathbf{k}_j / \sqrt{d}\right)}{\sum_{l=1}^{i} \exp\!\left(\mathbf{q}_i^\top \mathbf{k}_l / \sqrt{d}\right)} \tag{27.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{q}_i, \mathbf{k}_j, \mathbf{v}_j\)</dt><dd>the query of token \(i\), and the key and value of token \(j\), each a vector of length \(d\) (one head)</dd>
+<dt>\(\alpha_{ij}\)</dt><dd>how much token \(i\) attends to token \(j\); for each \(i\) the weights are positive and sum to 1</dd>
+<dt>\(T\)</dt><dd>the sequence length (used below)</dd></dl>
+<p>Two costs follow directly. <b>Compute:</b> there is one score \(\mathbf{q}_i^\top \mathbf{k}_j\) for every pair \(j \le i\), so \(T(T+1)/2\) scores per head per layer. For \(T = 32{,}768\) that is 536,887,296 scores. <b>Memory at inference:</b> to make token \(i\), we need the keys and values of all earlier tokens. They are kept in the <b>KV cache</b>, which grows by one entry per token, forever.</p>
+<p>Everything in this session changes one of two things: <b>which</b> pairs \((i, j)\) are allowed (sliding windows, sinks, global tokens), or <b>how</b> the weighted average is computed (linear attention, SSMs).</p>
+
+<h2>Sliding-window attention</h2>
+<p>The simplest change: token \(i\) may only attend to the last \(W\) tokens, itself included. All other scores are masked to \(-\infty\) before the softmax, exactly like the causal mask, so they get weight 0:</p>
+<div class="eq">\[ \alpha_{ij} \ne 0 \ \text{ only if } \ i - W \lt j \le i \tag{27.2} \]</div>
+<p>\(W\) is the <b>window size</b>. Each row of the attention matrix now has at most \(W\) non-zero entries, so the work is about \(T \cdot W\) scores instead of \(T^2/2\). For \(T = 32{,}768\) and \(W = 4{,}096\), it is 125,831,168 scores instead of 536,887,296: 4.27 times fewer. The gain grows with \(T\).</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A relay of messengers along a road. Each messenger only talks to the people within \(W\) steps of them. Nobody can shout to the far end, but a message passed from messenger to messenger still travels far. Each layer is one more hand-off.</aside>
+<h3>Information still travels: the receptive field</h3>
+<p>A window does not mean the model forgets everything older than \(W\). In layer 1, token \(i\) sees positions \(i-W+1\) to \(i\). But each of those hidden states already summarizes its own window from the layer below. So after \(L\) layers, information can come from up to</p>
+<div class="eq">\[ \text{reach}(L) = L\,(W - 1) \ \text{ positions back} \ \approx\ L \cdot W \tag{27.3} \]</div>
+<p>The Mistral 7B paper uses exactly this argument: with \(W = 4{,}096\) and 32 layers, the theoretical span is about \(32 \times 4{,}096 = 131{,}072\) tokens. [Certain] The word “theoretical” matters. Information that must pass through 32 hand-offs gets mixed and diluted on the way. Direct attention to a fact 100K tokens back is not the same as an indirect path through every layer. [Likely] Figure 1 lets you see the window and the reach.</p>
+<figure class="fig" id="a2-mask"><div class="fig-body">
+<div class="controls"><span class="seg" id="a2-mask-mode"><button type="button" data-v="full" aria-pressed="false">Full causal</button><button type="button" data-v="swa" aria-pressed="true">Sliding window</button><button type="button" data-v="sink" aria-pressed="false">Window + 2 sinks</button><button type="button" data-v="glob" aria-pressed="false">Window + global tokens</button></span></div>
+<div class="a2-grid">
+<label for="a2-mask-w">Window \(W\)</label><input type="range" id="a2-mask-w" min="2" max="8" step="1" value="4"><output id="a2-mask-wv"></output>
+<label for="a2-mask-l">Layers \(L\) stacked</label><input type="range" id="a2-mask-l" min="1" max="4" step="1" value="1"><output id="a2-mask-lv"></output></div>
+<div class="a2-svgwrap"><svg id="a2-mask-svg" viewBox="0 0 400 400" role="img" aria-label="A 16 by 16 attention mask; rows are queries, columns are keys"></svg></div>
+<div class="a2-leg"><span style="--c:var(--q)">direct attention of the chosen row</span><span style="--c:var(--k-soft)">reached through earlier layers</span><span style="--c:var(--rule)">allowed pair, other rows</span></div>
+<div class="readout" id="a2-mask-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Attention masks for 16 tokens. Row \(i\) is the query, column \(j\) is the key. Click any row to choose a query. Increase \(L\) to see which positions can reach that query indirectly through \(L\) stacked layers.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with “Sliding window”, \(W = 4\), and the last row (query 15). It has 4 direct keys. Move \(L\) to 2, 3, 4: the reach grows by \(W - 1 = 3\) positions per layer, to 7, 10 and 13 positions, as formula (27.3) says. Now pick “Window + global tokens”: positions 0 and 8 can be seen by everyone and see everything before them. With \(L = 2\) the last row already reaches all 16 positions, because a global token acts as a hub. The readout also counts how many of the 136 causal pairs are kept.</p></details></figure>
+
+<h3>The KV cache becomes a fixed-size ring</h3>
+<p>The biggest practical win is at inference. A token that has left the window will never be attended to again, in any layer. So we can delete its keys and values. Mistral calls this a <b>rolling buffer cache</b>: a cache with exactly \(W\) slots, where the keys and values of token \(i\) are written into slot \(i \bmod W\), overwriting the oldest entry. [Certain] Memory stops growing once \(T \gt W\):</p>
+<div class="eq">\[ \text{KV bytes} = 2 \cdot L \cdot H_{kv} \cdot d_h \cdot b \cdot \min(T, W) \tag{27.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2\)</dt><dd>one key and one value per token</dd>
+<dt>\(L, H_{kv}, d_h\)</dt><dd>number of layers, number of key-value heads (after GQA), and the size of one head</dd>
+<dt>\(b\)</dt><dd>bytes per number: 2 for FP16 or BF16</dd>
+<dt>\(\min(T, W)\)</dt><dd>how many tokens are cached: all of them for full attention (\(W = \infty\)), at most \(W\) with a window</dd></dl>
+<div class="worked"><div class="wt">Worked example: Mistral 7B</div>
+<p>Mistral 7B has \(L = 32\) layers, \(H_{kv} = 8\) KV heads (GQA with 32 query heads), \(d_h = 128\), and \(W = 4{,}096\). [Certain] In BF16, one token costs \(2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes, which is 128 KiB.</p>
+<p>At \(T = 32{,}768\) tokens, a full cache needs \(32{,}768 \times 128\) KiB = 4 GiB per sequence. The rolling buffer keeps only 4,096 tokens: 0.5 GiB. That is the 8× saving reported in the Mistral paper for a 32K sequence. [Certain] At 128K tokens the full cache would be 16 GiB; the rolling buffer is still 0.5 GiB.</p></div>
+<p>The rolling buffer is the first algorithm of this session:</p>
+<div class="algo"><div class="algo-h">Algorithm 1: decoding with a rolling-buffer KV cache (one layer, one head)</div><ol>
+<li><b>input:</b> window \(W\); cache slots \(K[0..W{-}1]\), \(V[0..W{-}1]\); optional number of sink tokens \(S\) (0 for plain sliding window)</li>
+<li><b>for</b> each new token at position \(i = 0, 1, 2, \dots\):</li>
+<li>&nbsp;&nbsp;compute \(\mathbf{q}_i, \mathbf{k}_i, \mathbf{v}_i\)</li>
+<li>&nbsp;&nbsp;<b>if</b> \(i \lt S\): store \(\mathbf{k}_i, \mathbf{v}_i\) in a separate sink area that is never overwritten</li>
+<li>&nbsp;&nbsp;<b>else</b>: write them into slot \((i - S) \bmod (W - S)\) <span class="c">// overwrites the oldest non-sink token</span></li>
+<li>&nbsp;&nbsp;scores \(\leftarrow \mathbf{q}_i^\top \mathbf{k} / \sqrt{d}\) for every filled slot <span class="c">// order of slots does not matter for softmax</span></li>
+<li>&nbsp;&nbsp;\(\mathbf{o}_i \leftarrow \softmax(\text{scores})\, V\) <span class="c">// at most \(W\) entries: constant cost per token</span></li></ol></div>
+<p>One detail: the slots are not in time order, but softmax and the weighted sum do not care about order. Position information was already put into the keys (with RoPE, before caching), so nothing is lost. [Certain]</p>
+
+<h3>Local + global patterns</h3>
+<p>A pure window can never look directly far back. Two families of fixes are used in practice:</p>
+<ul>
+<li><b>Global tokens</b> (Longformer, BigBird). A few chosen positions, for example a [CLS] token or the question in a QA task, attend to everything and are attended by everyone. They act as hubs (Figure 1, last mode). BigBird also adds a few random links. [Certain] These designs were mostly used in encoders for long documents.</li>
+<li><b>Interleaved layers</b>. Some layers use a window, others use full attention. Gemma 2 alternates 1:1 with a 4,096-token window. Gemma 3 uses 5 local layers for every global layer, with a window of only 1,024 tokens, and a 128K context. [Certain] Only the global layers need a full-length KV cache.</li></ul>
+<div class="worked"><div class="wt">Worked example: how much cache does the 5:1 pattern save?</div>
+<p>A simple estimate, assuming all layers have the same KV shape. At \(T = 131{,}072\), a global layer caches 131,072 tokens and a local layer caches 1,024. The average over 6 layers is \((5 \times 1{,}024 + 131{,}072) / 6 = 22{,}699\) tokens, which is 17.3% of an all-global model. The 1:1 pattern of Gemma 2 with \(W = 4{,}096\) would keep 51.6%. Most of the remaining cost is in the few global layers.</p></div>
+<p>Figure 2 puts these numbers side by side for the Mistral 7B shape, so you can change \(T\) and \(W\).</p>
+<figure class="fig" id="a2-mem"><div class="fig-body">
+<div class="a2-grid">
+<label for="a2-mem-t">Sequence length \(T\)</label><input type="range" id="a2-mem-t" min="10" max="20" step="1" value="15"><output id="a2-mem-tv"></output>
+<label for="a2-mem-w">Window \(W\)</label><input type="range" id="a2-mem-w" min="10" max="14" step="1" value="12"><output id="a2-mem-wv"></output></div>
+<div class="scroll-x"><svg id="a2-mem-svg" viewBox="0 0 640 230" role="img" aria-label="Bar chart of KV-cache memory for four attention designs"></svg></div>
+<div class="readout" id="a2-mem-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> KV-cache (or state) memory per sequence in BF16, with the shape of Mistral 7B: 32 layers, 8 KV heads, head size 128. The bars use a log scale. The last bar is a hypothetical linear-attention model of the same shape, whose state is one \(128 \times 128\) matrix per KV head per layer.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>At \(T = 32{,}768\) and \(W = 4{,}096\) the full cache is 4 GiB and the window cache is 0.5 GiB: the 8× from the worked example. Move \(T\) to the right: the full bar keeps growing, the window bar stops at \(W\), and the linear-attention state never changes (8 MiB). The 5:1 bar always uses a window of 1,024 for its local layers, like Gemma 3. The readout also gives the number of attention scores per head and layer for full and windowed attention.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>Mistral 7B v0.1 used sliding windows. Later Mistral 7B versions (v0.2 and after) dropped the window and used full attention over a 32K context. [Likely] Always check <code>sliding_window</code> in the model’s <code>config.json</code> before you assume a cache size.</aside>
+
+<h2>Linear attention: the kernel trick</h2>
+<p>Sliding windows keep softmax and drop pairs. Linear attention keeps all pairs and drops the softmax. Write the attention weight with a general similarity function \(\text{sim}(\mathbf{q}, \mathbf{k})\). Softmax attention uses \(\text{sim} = \exp(\mathbf{q}^\top\mathbf{k}/\sqrt{d})\). Katharopoulos et al. (2020) replaced it with a dot product of <b>feature maps</b>, a function \(\phi\) applied to the query and to the key separately:</p>
+<div class="eq">\[ \text{sim}(\mathbf{q}, \mathbf{k}) = \phi(\mathbf{q})^\top \phi(\mathbf{k}), \qquad \phi(\mathbf{x}) = \operatorname{elu}(\mathbf{x}) + 1 \tag{27.5} \]</div>
+<p>Here \(\operatorname{elu}(x) = x\) for \(x \gt 0\) and \(e^x - 1\) otherwise, so \(\phi(x) \gt 0\) always. Positive weights are needed so that the normalized weights still look like an average. This idea is called the <b>kernel trick</b>, because a function \(\text{sim}(\mathbf{q}, \mathbf{k})\) that can be written as \(\phi(\mathbf{q})^\top\phi(\mathbf{k})\) is a kernel. Plug it into (27.1):</p>
+<div class="eq">\[ \mathbf{o}_i^\top = \frac{\sum_{j \le i} \phi(\mathbf{q}_i)^\top \phi(\mathbf{k}_j)\, \mathbf{v}_j^\top}{\sum_{j \le i} \phi(\mathbf{q}_i)^\top \phi(\mathbf{k}_j)} = \frac{\phi(\mathbf{q}_i)^\top \overbrace{\textstyle\sum_{j \le i} \phi(\mathbf{k}_j)\, \mathbf{v}_j^\top}^{S_i}}{\phi(\mathbf{q}_i)^\top \underbrace{\textstyle\sum_{j \le i} \phi(\mathbf{k}_j)}_{\mathbf{z}_i}} \tag{27.6} \]</div>
+<p>The trick is the step in the middle: \(\phi(\mathbf{q}_i)\) does not depend on \(j\), so it moves out of the sum. What is left, \(S_i\), is a \(d \times d\) matrix that does not depend on the query at all. It can be built once and updated one token at a time:</p>
+<div class="eq">\[ S_i = S_{i-1} + \phi(\mathbf{k}_i)\, \mathbf{v}_i^\top, \qquad \mathbf{z}_i = \mathbf{z}_{i-1} + \phi(\mathbf{k}_i), \qquad \mathbf{o}_i^\top = \frac{\phi(\mathbf{q}_i)^\top S_i}{\phi(\mathbf{q}_i)^\top \mathbf{z}_i} \tag{27.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\phi(\mathbf{k}_i)\, \mathbf{v}_i^\top\)</dt><dd>an outer product: a \(d \times d\) matrix that “writes” value \(\mathbf{v}_i\) under the address \(\phi(\mathbf{k}_i)\)</dd>
+<dt>\(S_i\)</dt><dd>the state: a fixed-size memory that sums all writes so far</dd>
+<dt>\(\mathbf{z}_i\)</dt><dd>the sum of all addresses, used to normalize (it plays the role of the softmax denominator)</dd>
+<dt>\(\phi(\mathbf{q}_i)^\top S_i\)</dt><dd>a “read” from the memory with the query as the address</dd></dl>
+<p>This is an RNN. The paper’s title says it: “Transformers are RNNs”. [Certain] At inference, each new token costs a fixed \(O(d^2)\) work and the state has a fixed size, no matter how long the sequence is. In training we can use the parallel form, with the causal mask applied to \(\phi(Q)\phi(K)^\top\), or a chunked mix of both.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Softmax attention is a library that keeps every book and, for each question, reads all of them again. Linear attention is a single notebook: every new book adds a few notes to the same pages. Answering a question is fast, because you read only the notebook. But the notes from different books pile on top of each other.</aside>
+<h3>Why the cost is \(O(T)\)</h3>
+<p>Without the causal mask, the whole computation is a question of where to put the brackets. With \(Q, K, V \in \R^{T \times d}\):</p>
+<div class="eq">\[ \underbrace{\big(\phi(Q)\,\phi(K)^\top\big)}_{T \times T}\, V \ \text{ costs } O(T^2 d), \qquad \phi(Q)\, \underbrace{\big(\phi(K)^\top V\big)}_{d \times d} \ \text{ costs } O(T d^2) \tag{27.8} \]</div>
+<p>Matrix multiplication is associative, so both give the same result. Softmax blocks this: \(\exp(\mathbf{q}^\top\mathbf{k})\) cannot be split into a part for \(\mathbf{q}\) and a part for \(\mathbf{k}\) with a finite \(\phi\). The second order is cheaper when \(T \gt d\). For \(T = 4{,}096\) and \(d = 128\), the score matrix \(T \times T\) has 16.8 million entries, while the state is a \(128 \times 128\) matrix with 16,384 entries. The authors report up to 4,000× faster autoregressive generation on very long sequences. [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 2: causal linear attention as an RNN (one head)</div><ol>
+<li><b>input:</b> queries, keys, values \(\mathbf{q}_i, \mathbf{k}_i, \mathbf{v}_i \in \R^{d}\) for \(i = 1..T\); feature map \(\phi\)</li>
+<li>\(S \leftarrow 0_{d \times d}\), \(\mathbf{z} \leftarrow 0_d\)</li>
+<li><b>for</b> \(i = 1\) to \(T\):</li>
+<li>&nbsp;&nbsp;\(S \leftarrow S + \phi(\mathbf{k}_i)\mathbf{v}_i^\top\) <span class="c">// write, formula (27.7)</span></li>
+<li>&nbsp;&nbsp;\(\mathbf{z} \leftarrow \mathbf{z} + \phi(\mathbf{k}_i)\)</li>
+<li>&nbsp;&nbsp;\(\mathbf{o}_i \leftarrow S^\top\phi(\mathbf{q}_i) \,/\, (\phi(\mathbf{q}_i)^\top\mathbf{z})\) <span class="c">// read; \(O(d^2)\) per token, no KV cache</span></li>
+<li><b>return</b> \(\mathbf{o}_1, \dots, \mathbf{o}_T\)</li></ol></div>
+<h3>What linear attention loses</h3>
+<p>There is no free lunch. Two things are lost, and both explain why pure linear attention has not replaced softmax in large LLMs: [Likely]</p>
+<ol>
+<li><b>Sharpness.</b> Softmax can put almost all its weight on one token, because \(\exp\) grows very fast. A feature map like \(\operatorname{elu} + 1\) grows only linearly, so the weights stay spread out. Figure 3 makes this concrete: with 8 keys and a perfectly matching query, softmax gives the matching key a weight of 0.982 at scale 16. Linear attention gives it only 0.222, and that value hardly moves as the scale grows.</li>
+<li><b>Memory capacity.</b> All the past is squeezed into one \(d \times d\) matrix. It can hold only about \(d\) different key directions without interference. With more tokens, new writes blur old ones. This shows up as weak <b>recall</b>: copying a phone number from far back, or finding one fact in a long document. [Likely]</li></ol>
+<figure class="fig" id="a2-lin"><div class="fig-body">
+<div class="a2-grid">
+<label for="a2-lin-s">Query scale \(s\)</label><input type="range" id="a2-lin-s" min="1" max="32" step="1" value="8"><output id="a2-lin-sv"></output></div>
+<div class="scroll-x"><svg id="a2-lin-svg" viewBox="0 0 640 250" role="img" aria-label="Attention weights over 8 keys for softmax and for linear attention"></svg></div>
+<div class="a2-leg"><span style="--c:var(--q)">softmax attention</span><span style="--c:var(--k)">linear attention, \(\phi = \operatorname{elu} + 1\)</span></div>
+<div class="readout" id="a2-lin-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Eight unit-length keys in 2-D, at angles 0°, 45°, …, 315°. The query points at 0° (exactly at key 0) and has length \(s\). Each group of bars shows the weight that key gets, with softmax (formula 27.1, no \(\sqrt d\)) and with linear attention (formula 27.5).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Move the scale \(s\) up. A larger query norm makes softmax sharper: the weight of key 0 rises from 0.268 at \(s = 1\) to 1.000 at \(s = 32\), and its entropy falls toward 0. Linear attention barely changes: its largest weight goes from 0.195 to 0.225, and the keys at 45° and 315° stay almost as important as key 0. A model with linear attention cannot “look at exactly one token”, which is the thing that recall tasks need.</p></details></figure>
+<p>Many later designs fix part of this. Performer uses random features that approximate the softmax kernel. [Certain] RetNet, gated linear attention and Mamba-2 multiply the state by a <b>decay</b> or a learned <b>gate</b> before each write, so old notes fade instead of piling up. [Likely] That brings us to state space models.</p>
+
+<h2>State space models and Mamba</h2>
+<p>A <b>state space model (SSM)</b> comes from control theory. It describes a system with a hidden state \(\mathbf{h}(t)\) that changes over continuous time, driven by an input \(x(t)\):</p>
+<div class="eq">\[ \mathbf{h}'(t) = A\,\mathbf{h}(t) + B\,x(t), \qquad y(t) = C\,\mathbf{h}(t) \tag{27.9} \]</div>
+<p>For text, time is discrete: one token per step. With a step size \(\Delta\), the standard “zero-order hold” rule turns (27.9) into a recurrence:</p>
+<div class="eq">\[ \mathbf{h}_t = \bar{A}\,\mathbf{h}_{t-1} + \bar{B}\,x_t, \qquad y_t = C\,\mathbf{h}_t, \qquad \bar{A} = e^{\Delta A}, \quad \bar{B} = (\Delta A)^{-1}\big(e^{\Delta A} - I\big)\,\Delta B \tag{27.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(x_t, y_t\)</dt><dd>one input channel and one output channel at step \(t\); a layer runs many channels side by side</dd>
+<dt>\(\mathbf{h}_t \in \R^{N}\)</dt><dd>the state for that channel; \(N\) is the state size (Mamba’s speed tests use \(N = 16\)) [Certain]</dd>
+<dt>\(A, B, C\)</dt><dd>learned matrices; \(A\) is usually diagonal with negative entries, so the state decays</dd>
+<dt>\(\Delta\)</dt><dd>the step size: small \(\Delta\) means “barely change the state”, large \(\Delta\) means “reset the state toward the new input”</dd></dl>
+<p>This looks like an RNN, and it is one. The difference from an LSTM is that the recurrence is <b>linear</b> in \(\mathbf{h}\) (no tanh inside the loop). Linear recurrences can be computed for all \(t\) at once, with a convolution (S4) or a parallel <b>scan</b>, so training is parallel like a transformer. At inference, the model is an RNN with a fixed-size state: no KV cache. [Certain]</p>
+<p>A 1-D example with \(A = -1\), \(B = C = 1\) makes (27.10) simple: \(\bar a = e^{-\Delta}\) and \(\bar b = 1 - e^{-\Delta}\), so</p>
+<div class="eq">\[ h_t = e^{-\Delta}\, h_{t-1} + \big(1 - e^{-\Delta}\big)\, x_t \tag{27.11} \]</div>
+<p>The state is a moving average whose memory length is set by \(\Delta\).</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A whiteboard of fixed size. A classic SSM erases the same fraction of the board after every word, whatever the word is. Mamba looks at each word first: for filler words it barely touches the board, for an important word it wipes a region and writes the word large.</aside>
+<h3>The Mamba idea: make the SSM selective</h3>
+<p>Earlier SSMs (S4) used the same \(\Delta, B, C\) for every token. Such a model is <b>linear time-invariant</b>: it treats every token the same way, so it cannot decide to remember one token and ignore the next. Gu and Dao (2023) argue that this is why such models were weak on language, which needs content-based decisions. [Certain] Mamba makes \(\Delta\), \(B\) and \(C\) <b>functions of the current input</b>:</p>
+<div class="eq">\[ \Delta_t = \operatorname{softplus}\big(\text{Linear}_\Delta(\mathbf{x}_t)\big), \qquad B_t = \text{Linear}_B(\mathbf{x}_t), \qquad C_t = \text{Linear}_C(\mathbf{x}_t) \tag{27.12} \]</div>
+<p>\(A\) stays a fixed learned parameter. Because \(\bar A_t\) now changes with \(t\), the convolution trick of S4 no longer works. Mamba instead uses a <b>hardware-aware parallel scan</b> that keeps the state in fast on-chip memory. [Certain] The Mamba block also replaces both the attention and the MLP block, with an expansion factor of 2. [Certain] Figure 4 shows why selectivity matters.</p>
+<figure class="fig" id="a2-ssm"><div class="fig-body">
+<div class="a2-grid">
+<label for="a2-ssm-d">Fixed step size \(\Delta\)</label><input type="range" id="a2-ssm-d" min="0.02" max="2" step="0.02" value="0.5"><output id="a2-ssm-dv"></output></div>
+<div class="scroll-x"><svg id="a2-ssm-svg" viewBox="0 0 640 260" role="img" aria-label="State of a fixed and a selective one-dimensional SSM over 16 tokens"></svg></div>
+<div class="a2-leg"><span style="--c:var(--rule2)">input \(x_t\)</span><span style="--c:var(--muted)">fixed \(\Delta\) (like S4)</span><span style="--c:var(--v)">selective \(\Delta_t\) (like Mamba)</span></div>
+<div class="readout" id="a2-ssm-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A 1-D state, formula (27.11), over 16 tokens. Token 3 carries the important value 1.0; the others are small filler values. The fixed model uses one \(\Delta\) for all tokens (slider). The selective model uses \(\Delta_t = 3\) on the important token and \(\Delta_t = 0.02\) on the filler.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The readout gives the final state \(h_{15}\) and the part of it that still comes from token 3, which is \((1 - e^{-\Delta_3}) \prod_{t \gt 3} e^{-\Delta_t}\). With a fixed \(\Delta\), there is a trade-off: a large \(\Delta\) writes token 3 strongly but erases it quickly; a small \(\Delta\) keeps it but writes it weakly. No fixed \(\Delta\) keeps more than about 2.9% of it. The selective model writes strongly once and then barely erases: 74.7% is left after 12 filler tokens.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 3: a selective SSM layer at inference (one channel, diagonal \(A\))</div><ol>
+<li><b>input:</b> state \(\mathbf{h} \in \R^N\) from the last token; new input vector \(\mathbf{x}_t\) and its channel value \(x_t\)</li>
+<li>\(\Delta_t \leftarrow \operatorname{softplus}(\text{Linear}_\Delta(\mathbf{x}_t))\); \(\;B_t \leftarrow \text{Linear}_B(\mathbf{x}_t)\); \(\;C_t \leftarrow \text{Linear}_C(\mathbf{x}_t)\) <span class="c">// formula (27.12)</span></li>
+<li>\(\bar{\mathbf{a}} \leftarrow \exp(\Delta_t\, \operatorname{diag}(A))\) <span class="c">// elementwise, each entry in (0, 1)</span></li>
+<li>\(\mathbf{h} \leftarrow \bar{\mathbf{a}} \odot \mathbf{h} + \Delta_t B_t\, x_t\) <span class="c">// formula (27.10); Mamba uses this simpler \(\bar B \approx \Delta B\)</span></li>
+<li>\(y_t \leftarrow C_t^\top \mathbf{h}\)</li>
+<li><b>return</b> \(y_t\) and the new \(\mathbf{h}\) <span class="c">// constant time and memory per token</span></li></ol></div>
+<p>The size of the state is easy to count. For a layer with model width 2,048, expansion 2 and \(N = 16\), there are \(2 \times 2{,}048 = 4{,}096\) channels with 16 numbers each: 65,536 numbers per layer, whatever the sequence length. Mamba reports about 5× higher generation throughput than a transformer of similar size, and Mamba-3B matching transformers twice its size in their tests. [Certain] (These are the paper’s numbers; the gap at larger scales and on recall-heavy tasks is a topic of <a href="../inference/index.html#row-transformer-alternatives-2-mamba-rwkv-retnet-hyena" title="Transformer alternatives 2: Mamba, RWKV, RetNet, Hyena and hybrids (planned)">session 101</a>.)</p>
+<h3>One family, seen from far away</h3>
+<p>Put formulas (27.7) and (27.10) next to each other. Linear attention adds \(\phi(\mathbf{k}_t)\mathbf{v}_t^\top\) to a matrix state and never forgets. An SSM multiplies the state by \(\bar A\) (forget a bit) and adds \(\bar B x_t\). A gated linear-attention layer does both: \(S_t = G_t \odot S_{t-1} + \mathbf{k}_t\mathbf{v}_t^\top\). Mamba-2 makes this link exact and calls it “state space duality”. [Certain] So the real design question is: <b>how big is the state, and how does the model decide what to forget?</b> Softmax attention answers “never forget, keep everything” and pays with a growing KV cache.</p>
+<p>In practice, many recent models are <b>hybrids</b>: mostly SSM or linear-attention layers, plus a few full-attention layers for exact recall. Jamba, for example, mixes Mamba layers and transformer layers with MoE and supports up to 256K tokens. [Certain] Its ratio is one attention layer for every seven Mamba layers. [Likely]</p>
+
+<h2>Attention sinks</h2>
+<p>Back to sliding windows, with a surprise. Take a model trained with full attention, such as Llama 2, and run it with a plain sliding-window cache: keep the last \(W\) tokens and evict the rest. As soon as the first token is evicted, the output becomes nonsense and perplexity explodes. [Certain] Xiao et al. (2023) found the reason. Trained LLMs put a large share of attention on the first few tokens in many heads and layers, even when those tokens are just “&lt;s&gt;” or “The”. They called these tokens <b>attention sinks</b>.</p>
+<p>Why does this happen? Softmax weights must sum to 1:</p>
+<div class="eq">\[ \sum_{j} \alpha_{ij} = 1 \quad \text{for every query } i \tag{27.13} \]</div>
+<p>A head that finds nothing useful still has to put its weight somewhere. The first token is visible to every later token, so the model learns to use it as a “do nothing” place: a key that matches many queries, with a value close to zero. [Likely] Evicting it forces the weight onto the remaining tokens. Every remaining weight is divided by \(1 - \alpha_{\text{sink}}\), so if the sink had 0.5, all other weights double, and the head now outputs a mix it never produced in training.</p>
+<p><b>StreamingLLM</b> fixes this without any training: keep the keys and values of the first 4 tokens forever, plus a rolling window of recent tokens (for example 4 + 1,020). Positions are assigned inside the cache, not in the original text. [Certain] With this, Llama 2, MPT, Falcon and Pythia model text stably for up to 4 million tokens, and it is up to 22.2× faster than recomputing a sliding window from scratch. [Certain] Note what it does <b>not</b> do: it does not give the model memory of the evicted middle. A fact that left the window is gone.</p>
+<figure class="fig" id="a2-sink"><div class="fig-body">
+<div class="controls"><span class="seg" id="a2-sink-mode"><button type="button" data-v="full" aria-pressed="true">Full cache (16 tokens)</button><button type="button" data-v="win" aria-pressed="false">Window only (last 8)</button><button type="button" data-v="sink" aria-pressed="false">Sink + window (1 + 7)</button></span></div>
+<div class="scroll-x"><svg id="a2-sink-svg" viewBox="0 0 640 230" role="img" aria-label="Attention weights of one query over 16 cached tokens"></svg></div>
+<div class="readout" id="a2-sink-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> One query at position 16 attending to a cache of 16 tokens. Token 0 has a large score (3.0) but a value of 0: it is a sink. The other tokens have scores between −0.5 and 0.9. Grey bars are evicted tokens.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>With the full cache the sink takes 0.495 of the attention, and the 7 most recent tokens (9–15) share 0.263. Switch to “Window only”: the sink is gone, and the same 7 tokens jump to 0.866 of the weight, more than 3 times as much. The output value changes from 0.131 to 0.271. Switch to “Sink + window”: the sink takes 0.653, the recent tokens get 0.347, close to the full-cache pattern. The output (0.044) is not identical, because tokens 1–8 are really gone, but the head behaves as it did in training.</p></details></figure>
+<p>Two follow-ups are worth knowing. First, the paper suggests adding a dedicated placeholder token to every training sequence, so that one known token plays the sink role. [Certain] Second, the same effect appears in vision: Vision Transformers dump attention into a few background patches with very large norms, and adding extra “register” tokens removes these artifacts. [Certain] Some recent open-weight models, for example OpenAI’s gpt-oss, build a learned sink directly into each attention head. [Likely]</p>
+
+<h2>PyTorch: windows, linear attention and a selective scan</h2>
+<p>The code below checks four claims of this session on random data: a windowed mask equals full attention on the first \(W\) rows; a rolling buffer gives the same outputs as the windowed mask; causal linear attention in parallel form equals its RNN form; and a selective \(\Delta\) keeps a key token that a fixed \(\Delta\) forgets. It runs on CPU in well under a second.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+T, d, W = 12, 8, 4
+q, k, v = torch.randn(3, T, d).unbind(0)
+
+<span class="cm"># 1) causal and sliding-window masks, formula (27.2)</span>
+i = torch.arange(T)[:, None]; j = torch.arange(T)[None, :]
+causal = j &lt;= i
+window = causal &amp; (i - j &lt; W)                    <span class="cm"># keys j with i - W &lt; j &lt;= i</span>
+<span class="kw2">def</span> attend(mask):
+    s = (q @ k.T) / d ** 0.5
+    <span class="kw2">return</span> torch.softmax(s.masked_fill(~mask, float(<span class="st">"-inf"</span>)), dim=-1) @ v
+full, swa = attend(causal), attend(window)
+print(int(causal.sum()), int(window.sum()))       <span class="cm"># 78 vs 42 scores</span>
+print((full[:W] - swa[:W]).abs().max().item())    <span class="cm"># 0.0: the first W rows are identical</span>
+
+<span class="cm"># 2) rolling-buffer decoding gives the same outputs as the windowed mask (Algorithm 1)</span>
+Kbuf, Vbuf = torch.zeros(W, d), torch.zeros(W, d)
+out = []
+<span class="kw2">for</span> t <span class="kw2">in</span> range(T):
+    Kbuf[t % W], Vbuf[t % W] = k[t], v[t]           <span class="cm"># overwrite the oldest slot</span>
+    n = min(t + 1, W)
+    s = Kbuf[:n] @ q[t] / d ** 0.5                  <span class="cm"># order inside the buffer does not matter</span>
+    out.append(torch.softmax(s, 0) @ Vbuf[:n])
+print((torch.stack(out) - swa).abs().max().item())  <span class="cm"># about 1e-7</span>
+
+<span class="cm"># 3) causal linear attention: parallel form = recurrent form, (27.6)-(27.7), Algorithm 2</span>
+phi = <span class="kw2">lambda</span> x: F.elu(x) + 1
+A = (phi(q) @ phi(k).T) * causal                  <span class="cm"># T x T, no softmax</span>
+par = (A @ v) / A.sum(-1, keepdim=True)
+S, z, rec = torch.zeros(d, d), torch.zeros(d), []
+<span class="kw2">for</span> t <span class="kw2">in</span> range(T):
+    S = S + torch.outer(phi(k[t]), v[t])            <span class="cm"># state: d x d, fixed size</span>
+    z = z + phi(k[t])
+    rec.append(phi(q[t]) @ S / (phi(q[t]) @ z))
+print((torch.stack(rec) - par).abs().max().item())  <span class="cm"># about 1e-7</span>
+
+<span class="cm"># 4) a one-channel selective scan, formula (27.11): A = -1, B = C = 1</span>
+x = torch.tensor([0., 0., 0., 1., .2, -.1, .3, 0., -.2, .1, .2, 0.])
+<span class="kw2">def</span> scan(delta):
+    h, hs = torch.tensor(0.), []
+    <span class="kw2">for</span> t <span class="kw2">in</span> range(len(x)):
+        a = torch.exp(-delta[t])                    <span class="cm"># A_bar = exp(delta * A)</span>
+        h = a * h + (1 - a) * x[t]                  <span class="cm"># B_bar = 1 - exp(-delta)</span>
+        hs.append(h)
+    <span class="kw2">return</span> torch.stack(hs)
+fixed  = scan(torch.full((12,), 0.5))
+select = scan(torch.where(x.abs() &gt; 0.5, 3.0, 0.02))   <span class="cm"># big step only on the key token</span>
+print(round(fixed[-1].item(), 4), round(select[-1].item(), 4))   <span class="cm"># 0.062 0.8188</span></pre>
+<p>Real implementations differ in important ways: sliding windows are done inside FlashAttention kernels (which skip the masked blocks instead of computing them), linear attention is trained in chunks, and Mamba’s scan is a fused GPU kernel. The math is the same as above.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Design</th><th>Why</th></tr></thead><tbody>
+<tr><td>Mistral 7B (v0.1)</td><td>Sliding window \(W = 4{,}096\) in all 32 layers, rolling buffer cache</td><td>Fixed cache; 8× less cache memory at 32K tokens</td></tr>
+<tr><td>Gemma 2, Gemma 3</td><td>Local and global layers interleaved (1:1 with \(W = 4{,}096\); 5:1 with \(W = 1{,}024\))</td><td>Most layers have a small cache; a few global layers keep long-range recall</td></tr>
+<tr><td>Long-document encoders (Longformer, BigBird)</td><td>Window + global tokens (+ random links in BigBird)</td><td>Classify or answer questions over documents of thousands of tokens</td></tr>
+<tr><td>Chat and agents that run for hours</td><td>Attention sinks + window (StreamingLLM)</td><td>Endless streaming with fixed memory; the far past is dropped</td></tr>
+<tr><td>Mamba, RWKV, RetNet and hybrids such as Jamba</td><td>Recurrent layers with a fixed-size state, often with a few attention layers</td><td>Constant memory and time per token; high throughput for long outputs</td></tr>
+<tr><td>Live video streams (surveillance, sports, key-moment detection)</td><td>Window over recent frame tokens + a few sink or summary tokens, or an SSM over frames [Likely]</td><td>Frames arrive forever; cost per frame must not grow with stream length</td></tr>
+<tr><td>Long video classification and action recognition</td><td>Local attention inside short clips, global attention or SSM layers across clips [Likely]</td><td>An hour of video has hundreds of thousands of patch tokens; full attention over all of them is too expensive (<a href="../video/index.html#row-long-video" title="Long video (planned)">session 206</a>)</td></tr>
+<tr><td>Vision Transformers (DINOv2 and others)</td><td>Extra register tokens</td><td>Give the model a sink so that background patches stay clean</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Saying a sliding-window model “cannot see beyond \(W\)”.</b> Through stacked layers it can reach about \(L \cdot W\) tokens (27.3). The correct statement: it cannot attend <b>directly</b> beyond \(W\), and long indirect paths are weak.</li>
+<li><b>Running a full-attention model with a plain window cache.</b> Evicting the first tokens destroys the attention sinks and the output collapses. Keep the first few tokens (StreamingLLM), or use a model trained with windows.</li>
+<li><b>Assigning original positions after eviction.</b> StreamingLLM assigns positions inside the cache. Using the original text positions creates distances the model never saw in training.</li>
+<li><b>Thinking linear attention is an approximation of softmax.</b> With \(\phi = \operatorname{elu} + 1\) it is a different model with different behavior (Figure 3). Only random-feature methods such as Performer try to approximate softmax.</li>
+<li><b>Forgetting the denominator \(\mathbf{z}\) in linear attention</b>, or computing it without the causal mask. The output then grows with sequence length, or leaks future tokens.</li>
+<li><b>Calling Mamba “just an RNN like an LSTM”.</b> Its recurrence is linear in the state, so it can be trained with a parallel scan, and its gates come from the input through \(\Delta_t, B_t, C_t\). An LSTM has a nonlinear recurrence and must be trained step by step.</li>
+<li><b>Comparing only FLOPs.</b> For short sequences (\(T \lt d\) or a few thousand tokens), full attention with FlashAttention is often as fast as the “efficient” variant, and better. The gains of these variants are mainly in long contexts and in decode memory.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is sliding-window attention, and what does it save?<span class="lvl">basic</span></summary><div class="ans">Each token attends only to the last \(W\) tokens (a banded causal mask). Compute drops from about \(T^2/2\) scores to about \(T \cdot W\) per head and layer, and at inference the KV cache can be a ring buffer of \(W\) slots, so memory stops growing with \(T\). For Mistral 7B at 32K tokens, the cache drops from 4 GiB to 0.5 GiB per sequence, 8×.</div></details>
+<details class="qa"><summary>A model uses \(W = 4{,}096\) in 32 layers. How far back can information travel?<span class="lvl">core</span></summary><div class="ans">Each layer can move information back by up to \(W - 1\) positions, so after 32 layers about \(32 \times 4{,}096 \approx 131\)K tokens (Mistral’s “theoretical attention span”). But this is an indirect path through many layers; in practice, recall of a specific fact far outside the window is much weaker than with direct attention.</div></details>
+<details class="qa"><summary>How does a rolling buffer cache work, and why is the order of slots not a problem?<span class="lvl">core</span></summary><div class="ans">The cache has \(W\) slots; token \(i\) writes its key and value into slot \(i \bmod W\), overwriting the token that just left the window. Softmax attention is a weighted sum over a set, so slot order does not matter. Positions are already encoded in the keys (RoPE is applied before caching), so the relative distances stay correct.</div></details>
+<details class="qa"><summary>Why do Gemma 2 and Gemma 3 mix local and global layers instead of using only windows?<span class="lvl">core</span></summary><div class="ans">Pure windows make long-range recall indirect and weak. A few global layers give direct access to the whole context, while the local layers keep most of the KV cache small. With 5 local layers (\(W = 1{,}024\)) per global layer at 128K tokens, a simple estimate gives about 17% of the cache of an all-global model.</div></details>
+<details class="qa"><summary>Explain the kernel trick in linear attention. Why is the cost \(O(T)\)?<span class="lvl">core</span></summary><div class="ans">Replace \(\exp(\mathbf{q}^\top\mathbf{k})\) with \(\phi(\mathbf{q})^\top\phi(\mathbf{k})\). Then \(\phi(\mathbf{q}_i)\) can be pulled out of the sum over \(j\), leaving \(S_i = \sum_{j \le i}\phi(\mathbf{k}_j)\mathbf{v}_j^\top\), a \(d \times d\) matrix that is updated with one outer product per token. Total cost is \(O(T d^2)\) instead of \(O(T^2 d)\): it is the choice of computing \(\phi(K)^\top V\) first. At inference it is an RNN with a constant-size state and no KV cache.</div></details>
+<details class="qa"><summary>What does linear attention lose compared with softmax attention?<span class="lvl">advanced</span></summary><div class="ans">Two things. (1) Sharpness: softmax grows exponentially, so it can focus almost all weight on one key; a feature map like \(\operatorname{elu}+1\) grows linearly and the weights stay spread (in a small test, the best key gets 0.98 with softmax but only 0.22 with linear attention). (2) Capacity: the entire past is stored in one \(d \times d\) matrix, so with more than about \(d\) distinct keys, writes interfere. Both hurt associative recall and copying. Gates and decays (RetNet, GLA, Mamba-2) and hybrid models with a few softmax layers are the common fixes.</div></details>
+<details class="qa"><summary>What is a state space model, and how is Mamba different from S4?<span class="lvl">core</span></summary><div class="ans">An SSM is a linear recurrence \(\mathbf{h}_t = \bar A\mathbf{h}_{t-1} + \bar B x_t\), \(y_t = C\mathbf{h}_t\), obtained by discretizing a continuous system with step \(\Delta\). S4 uses the same \(\Delta, B, C\) for all tokens (time-invariant), so it can be computed as a long convolution but cannot choose what to remember. Mamba makes \(\Delta, B, C\) depend on the current token (selective), which lets it keep important tokens and skip filler, and computes it with a hardware-aware parallel scan.</div></details>
+<details class="qa"><summary>How is Mamba different from an LSTM?<span class="lvl">advanced</span></summary><div class="ans">Both are recurrent with input-dependent gating. But the LSTM recurrence is nonlinear (tanh and sigmoid of the previous hidden state), so training must go step by step. Mamba’s recurrence is linear in the state; the gates depend only on the input, so all steps can be computed with a parallel scan on a GPU. Mamba also uses a large state per channel (\(N\) numbers per channel, many channels) and a modern block design.</div></details>
+<details class="qa"><summary>What is an attention sink, and why does a plain sliding-window cache break a pretrained LLM?<span class="lvl">core</span></summary><div class="ans">Softmax weights must sum to 1, so heads that find nothing useful put their weight on a token that everyone can see: the first token. It gets large attention despite little meaning. If a window cache evicts it, the leftover weight moves to other tokens, every weight is scaled by \(1/(1 - \alpha_{\text{sink}})\), and the outputs leave the training distribution; perplexity explodes. StreamingLLM keeps the first 4 tokens plus a recent window and assigns positions inside the cache.</div></details>
+<details class="qa"><summary>Does StreamingLLM give the model a 4-million-token memory?<span class="lvl">advanced</span></summary><div class="ans">No. It lets the model keep <b>generating</b> stable text over millions of tokens with a fixed cache, but anything evicted from the window is gone. It is a fix for the sink problem, not a long-context method. For real long-range memory you need a long context window (<a href="../transformers/what-context-means-and-how-to-make.html">session 28</a>), retrieval, or a compressed memory.</div></details>
+<details class="qa"><summary>You must serve a model that writes very long outputs on small GPUs. Which of these designs would you consider, and what would you test?<span class="lvl">advanced</span></summary><div class="ans">Options: a sliding-window or local-global model (fixed or reduced KV cache), a hybrid SSM or linear-attention model (constant state), or a full-attention model with GQA plus KV-cache quantization. Test the tasks that these designs are weak at: needle-in-a-haystack and multi-fact recall at the target length, copying, and long-range QA, not just perplexity. Measure memory per sequence, tokens per second at the target batch size, and quality on your own data.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>With \(T = 16\) and \(W = 4\), how many query–key pairs does the sliding-window mask keep? Check in Figure 1.</li>
+<li>Compute the BF16 KV cache of Mistral 7B at \(T = 8{,}192\), with and without the 4,096-token rolling buffer.</li>
+<li>A model has 24 layers and a window of 2,048. What is its theoretical reach (formula 27.3)?</li>
+<li>Show that \((\phi(Q)\phi(K)^\top)V = \phi(Q)(\phi(K)^\top V)\) has the costs in (27.8). For which \(T\) is the second order cheaper when \(d = 64\)?</li>
+<li>In the 1-D SSM (27.11) with a fixed \(\Delta\), the share of token 3 left after 12 more tokens is \((1 - a)\,a^{12}\) with \(a = e^{-\Delta}\). Find the best \(a\) and the best share.</li>
+<li>A sink has weight 0.6 in some head. The window cache evicts it. By what factor does every other weight change?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Rows 0–3 keep 1, 2, 3, 4 pairs; rows 4–15 keep 4 each: \(10 + 12 \times 4 = 58\) of 136. 2. \(8{,}192 \times 128\) KiB = 1 GiB full; 0.5 GiB with the buffer (2×). 3. \(24 \times 2{,}047 = 49{,}128\), about \(24 \times 2{,}048 = 49{,}152\) tokens. 4. \(\phi(Q)\phi(K)^\top\) is \(T \times d\) times \(d \times T\): \(T^2 d\) multiply-adds, then times \(V\): another \(T^2 d\). \(\phi(K)^\top V\) is \(d \times T\) times \(T \times d\): \(T d^2\), then \(\phi(Q)\) times it: \(T d^2\). The second is cheaper when \(T d^2 \lt T^2 d\), so \(T \gt d = 64\). 5. The derivative of \((1-a)a^{12}\) is zero at \(a = 12/13\) (\(\Delta \approx 0.08\)); the share is \((1/13)(12/13)^{12} \approx 0.029\), so about 2.9%. 6. Every other weight is divided by \(1 - 0.6 = 0.4\): multiplied by 2.5.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Sliding-window attention (27.2) keeps only the last \(W\) keys: about \(T \cdot W\) scores, and a rolling KV cache of fixed size (27.4). Reach through \(L\) layers is about \(L \cdot W\) (27.3), but only indirectly.</li>
+<li>Local + global designs (Longformer, BigBird, Gemma 2 and 3) keep a few full-attention paths for recall and make most of the cache small.</li>
+<li>Linear attention replaces \(\exp\) with a feature-map dot product (27.5). Attention becomes an RNN with a \(d \times d\) state (27.7) and \(O(T)\) cost (27.8), but it loses sharpness and recall.</li>
+<li>SSMs are linear recurrences (27.10) that train in parallel and run with constant memory. Mamba makes \(\Delta, B, C\) depend on the input (27.12), so it can choose what to remember.</li>
+<li>Softmax must sum to 1 (27.13), so trained models park attention on the first tokens. Keep these attention sinks when you evict tokens (StreamingLLM).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ i - W \lt j \le i, \qquad \text{reach} \approx L \cdot W, \qquad S_i = S_{i-1} + \phi(\mathbf{k}_i)\mathbf{v}_i^\top, \qquad \mathbf{h}_t = e^{\Delta_t A}\,\mathbf{h}_{t-1} + \bar{B}_t x_t \]</div>
+<h2 class="plain" id="attention-variants-2-a-first-look-at-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Jiang et al. (2023). <a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a></li><li>Katharopoulos et al. (2020). <a href="https://arxiv.org/abs/2006.16236" target="_blank" rel="noopener">Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention</a></li><li>Gu &amp; Dao (2023). <a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener">Mamba: Linear-Time Sequence Modeling with Selective State Spaces</a></li><li>Xiao et al. (2023). <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">Efficient Streaming Language Models with Attention Sinks</a></li><li>Vaswani et al. (2017). <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a></li><li>Jiang et al. (2023). <a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a></li><li>Beltagy et al. (2020). <a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noopener">Longformer: The Long-Document Transformer</a></li><li>Zaheer et al. (2020). <a href="https://arxiv.org/abs/2007.14062" target="_blank" rel="noopener">Big Bird: Transformers for Longer Sequences</a></li><li>Child et al. (2019). <a href="https://arxiv.org/abs/1904.10509" target="_blank" rel="noopener">Generating Long Sequences with Sparse Transformers</a></li><li>Gemma Team (2024). <a href="https://arxiv.org/abs/2408.00118" target="_blank" rel="noopener">Gemma 2: Improving Open Language Models at a Practical Size</a></li><li>Gemma Team (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;Gemma 3 Technical Report&amp;quot;" target="_blank" rel="noopener">Gemma 3 Technical Report</a></li><li>Katharopoulos et al. (2020). <a href="https://arxiv.org/abs/2006.16236" target="_blank" rel="noopener">Transformers are RNNs: Fast Autoregressive Transformers with Linear Attention</a></li><li>Choromanski et al. (2020). <a href="https://arxiv.org/abs/2009.14794" target="_blank" rel="noopener">Rethinking Attention with Performers</a></li><li>Gu et al. (2021). <a href="https://arxiv.org/abs/2111.00396" target="_blank" rel="noopener">Efficiently Modeling Long Sequences with Structured State Spaces</a></li><li>Gu &amp; Dao (2023). <a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener">Mamba: Linear-Time Sequence Modeling with Selective State Spaces</a></li><li>Dao &amp; Gu (2024). <a href="https://arxiv.org/abs/2405.21060" target="_blank" rel="noopener">Transformers are SSMs: Generalized Models and Efficient Algorithms Through Structured State Space Duality</a></li><li>Sun et al. (2023). <a href="https://arxiv.org/abs/2307.08621" target="_blank" rel="noopener">Retentive Network: A Successor to Transformer for Large Language Models</a></li><li>Peng et al. (2023). <a href="https://arxiv.org/abs/2305.13048" target="_blank" rel="noopener">RWKV: Reinventing RNNs for the Transformer Era</a></li><li>Lieber et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Jamba: A Hybrid Transformer-Mamba Language Model&amp;quot;" target="_blank" rel="noopener">Jamba: A Hybrid Transformer-Mamba Language Model</a></li><li>Xiao et al. (2023). <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">Efficient Streaming Language Models with Attention Sinks</a></li><li>Darcet, Oquab, Mairal, Bojanowski (2023). <a href="https://arxiv.org/abs/2309.16588" target="_blank" rel="noopener">Vision Transformers Need Registers</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html"><small>Previous · session 26</small>Attention variants 1: MHA, MQA, GQA, MLA and the KV cache</a><a class="next" href="../transformers/what-context-means-and-how-to-make.html"><small>Next · session 28</small>What “context” means, and how to make it longer</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="attention-variants-2-a-first-look-at"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const comma=n=>Math.round(n).toLocaleString("en-US");
+const f3=v=>(Math.abs(v)<5e-4?0:v).toFixed(3).replace("-","−");
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+
+/* ---------- Figure 1: masks and reach ---------- */
+(function(){
+ const svg=$("#a2-mask-svg");if(!svg)return;const Wl=$("#a2-mask-w"),Ll=$("#a2-mask-l"),info=$("#a2-mask-info");
+ const T=16,S=2,G=[0,8];let mode="swa",row=15;
+ function ok(i,j,W){if(j>i)return false;if(mode==="full")return true;const win=i-j<W;if(mode==="swa")return win;if(mode==="sink")return win||j<S;return win||G.indexOf(j)>=0||G.indexOf(i)>=0;}
+ function draw(){const W=+Wl.value,L=+Ll.value;$("#a2-mask-wv").value=W;$("#a2-mask-lv").value=L;
+  let reach=new Set([row]);const layers=[];for(let l=0;l<L;l++){const nx=new Set();reach.forEach(a=>{for(let b=0;b<T;b++)if(ok(a,b,W))nx.add(b);});reach=nx;layers.push(nx);}
+  const direct=layers[0];let total=0;const c=22,o0=42;
+  let g=`<text x="${o0+T*c/2}" y="14" text-anchor="middle" class="svgs" font-size="12">key position j</text><text x="12" y="${o0+T*c/2}" text-anchor="middle" class="svgs" font-size="12" transform="rotate(-90 12 ${o0+T*c/2})">query position i</text>`;
+  for(let k=0;k<T;k+=1){if(k%3===0||k===T-1){g+=`<text x="${o0+k*c+c/2}" y="${o0-6}" text-anchor="middle" class="svgs" font-size="10.5">${k}</text><text x="${o0-6}" y="${o0+k*c+c/2+4}" text-anchor="end" class="svgs" font-size="10.5">${k}</text>`;}}
+  for(let i=0;i<T;i++){for(let j=0;j<T;j++){const a=ok(i,j,W);if(a)total++;let fill="var(--paper2)";
+    if(i===row){fill=direct.has(j)?"var(--q)":(reach.has(j)?"var(--k-soft)":(j<=i?"var(--paper2)":"var(--paper2)"));}
+    else if(a)fill="var(--rule)";
+    const ind=i===row&&!direct.has(j)&&reach.has(j);
+    g+=`<rect class="a2-cell" data-i="${i}" x="${o0+j*c+1}" y="${o0+i*c+1}" width="${c-2}" height="${c-2}" rx="3" fill="${fill}"${ind?` stroke="var(--k)" stroke-width="1.5"`:""}/>`;}}
+  g+=`<rect x="${o0-2}" y="${o0+row*c}" width="${T*c+4}" height="${c}" fill="none" stroke="var(--q)" stroke-width="2" rx="4"/>`;
+  svg.innerHTML=g;
+  const names={full:"Full causal",swa:"Sliding window",sink:"Window + 2 sinks",glob:"Window + global tokens 0 and 8"};
+  info.dataset.pairs=total;info.dataset.direct=direct.size;info.dataset.reach=reach.size;
+  info.innerHTML=`${names[mode]}${mode==="full"?"":`, W = ${W}`}: <b>${total}</b> of 136 causal pairs kept (${(100*total/136).toFixed(0)}%). Query ${row}: <b>${direct.size}</b> direct keys; after ${L} layer${L>1?"s":""} it can receive information from <b>${reach.size}</b> positions${reach.size===row+1?" (all of its past)":""}.${mode==="swa"&&row>=(W-1)*L?` Formula (27.3): L(W − 1) = ${L*(W-1)} positions back, plus itself.`:""}`;}
+ svg.addEventListener("click",e=>{const r=e.target.closest(".a2-cell");if(!r)return;row=+r.dataset.i;draw();});
+ seg($("#a2-mask-mode"),v=>{mode=v;draw();});[Wl,Ll].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: KV memory ---------- */
+(function(){
+ const svg=$("#a2-mem-svg");if(!svg)return;const Tl=$("#a2-mem-t"),Wl=$("#a2-mem-w"),info=$("#a2-mem-info");
+ const per=2*32*8*128*2;const state=32*8*128*128*2;
+ const fmt=b=>b>=2**30?(b/2**30).toFixed(b/2**30<10?2:1).replace(/\.?0+$/,"")+" GiB":(b/2**20).toFixed(b/2**20<10?2:0).replace(/\.?0+$/,"")+" MiB";
+ function draw(){const T=2**(+Tl.value),W=2**(+Wl.value);$("#a2-mem-tv").value=comma(T);$("#a2-mem-wv").value=comma(W);
+  const rows=[["Full attention",per*T,"var(--q)"],[`Sliding window, W = ${comma(W)}`,per*Math.min(T,W),"var(--k)"],["5 local (W = 1,024) : 1 global",per*(5*Math.min(T,1024)+T)/6,"var(--v)"],["Linear attention state",state,"var(--muted)"]];
+  const lo=Math.log2(2**20),hi=Math.log2(2**36),X=b=>220+(Math.log2(b)-lo)/(hi-lo)*380;
+  let g="";[20,25,30,35].forEach(e=>{const x=X(2**e);g+=`<line x1="${x}" y1="10" x2="${x}" y2="190" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="${x}" y="206" text-anchor="middle" class="svgs" font-size="11.5">${fmt(2**e)}</text>`;});
+  rows.forEach(([n,b,c],k)=>{const y=22+k*44;g+=`<text x="212" y="${y+19}" text-anchor="end" class="svgt" font-size="13">${n}</text><rect x="220" y="${y}" width="${Math.max(2,X(b)-220).toFixed(1)}" height="28" rx="5" fill="${c}" opacity=".85"/><text x="${(X(b)+6).toFixed(1)}" y="${y+19}" class="svgt" font-size="13" font-weight="700">${fmt(b)}</text>`;});
+  g+=`<text x="410" y="224" text-anchor="middle" class="svgs" font-size="12">bytes per sequence (log scale)</text>`;svg.innerHTML=g;
+  const pf=T*(T+1)/2,ps=T<=W?pf:W*T-W*(W-1)/2;
+  info.dataset.full=fmt(rows[0][1]);info.dataset.swa=fmt(rows[1][1]);info.dataset.ratio=(rows[0][1]/rows[1][1]).toFixed(2);
+  info.innerHTML=`T = ${comma(T)}: full cache <b>${fmt(rows[0][1])}</b>, window cache <b>${fmt(rows[1][1])}</b> (${(rows[0][1]/rows[1][1]).toFixed(2)}× smaller), 5:1 pattern ${fmt(rows[2][1])} (${(100*rows[2][1]/rows[0][1]).toFixed(1)}% of full), linear-attention state ${fmt(state)}. One token costs 128 KiB of cache. Attention scores per head and layer: full ${comma(pf)}, window ${comma(ps)} (${(pf/ps).toFixed(2)}× fewer).`;}
+ [Tl,Wl].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: softmax vs linear attention ---------- */
+(function(){
+ const svg=$("#a2-lin-svg");if(!svg)return;const Sl=$("#a2-lin-s"),info=$("#a2-lin-info");
+ const elu1=x=>x>0?x+1:Math.exp(x);const K=[0,45,90,135,180,225,270,315].map(a=>[Math.cos(a*Math.PI/180),Math.sin(a*Math.PI/180)]);
+ const ent=p=>-p.reduce((a,x)=>a+(x>0?x*Math.log(x):0),0);
+ function draw(){const s=+Sl.value;$("#a2-lin-sv").value=s;const q=[s,0];
+  const sc=K.map(k=>q[0]*k[0]+q[1]*k[1]);const sm=B.softmax(sc);
+  const fq=q.map(elu1);const la0=K.map(k=>fq[0]*elu1(k[0])+fq[1]*elu1(k[1]));const Z=la0.reduce((a,b)=>a+b,0);const la=la0.map(x=>x/Z);
+  const Y=v=>200-v*170;let g=`<line x1="40" y1="200" x2="630" y2="200" stroke="var(--muted)"/>`;
+  [0,0.5,1].forEach(v=>g+=`<text x="34" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${v}</text><line x1="40" y1="${Y(v)}" x2="630" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/>`);
+  K.forEach((k,i)=>{const x0=55+i*72;g+=`<rect x="${x0}" y="${Y(sm[i]).toFixed(1)}" width="26" height="${(200-Y(sm[i])).toFixed(1)}" fill="var(--q)" rx="3"/><rect x="${x0+28}" y="${Y(la[i]).toFixed(1)}" width="26" height="${(200-Y(la[i])).toFixed(1)}" fill="var(--k)" rx="3"/><text x="${x0+27}" y="218" text-anchor="middle" class="svgs" font-size="12">key ${i} (${i*45}°)</text>`;});
+  svg.innerHTML=g;const ms=Math.max(...sm),ml=Math.max(...la);
+  info.dataset.sm=ms.toFixed(3);info.dataset.lin=ml.toFixed(3);
+  info.innerHTML=`s = ${s}: softmax gives key 0 a weight of <b>${sm[0].toFixed(3)}</b> (entropy ${ent(sm).toFixed(3)} nats). Linear attention gives key 0 <b>${la[0].toFixed(3)}</b>; its largest weight is ${ml.toFixed(3)} (entropy ${ent(la).toFixed(3)} nats; uniform would be ${Math.log(8).toFixed(3)}).`;}
+ Sl.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 4: fixed vs selective SSM ---------- */
+(function(){
+ const svg=$("#a2-ssm-svg");if(!svg)return;const Dl=$("#a2-ssm-d"),info=$("#a2-ssm-info");
+ const x=[0,0,0,1,.2,-.1,.3,0,-.2,.1,.2,0,-.3,.1,0,.2];const sel=x.map(v=>Math.abs(v)>0.5?3:0.02);
+ const scan=D=>{let h=0;return x.map((v,t)=>{const a=Math.exp(-D[t]);h=a*h+(1-a)*v;return h;});};
+ const keep=D=>{let c=1-Math.exp(-D[3]);for(let t=4;t<16;t++)c*=Math.exp(-D[t]);return c;};
+ const X=t=>60+t*36,Y=v=>150-v*110;
+ function draw(){const d=+Dl.value;$("#a2-ssm-dv").value=d.toFixed(2);const F=x.map(()=>d);const hf=scan(F),hs=scan(sel);
+  let g=`<line x1="50" y1="${Y(0)}" x2="630" y2="${Y(0)}" stroke="var(--muted)"/>`;[-0.5,0,0.5,1].forEach(v=>g+=`<text x="44" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${v}</text>`);
+  x.forEach((v,t)=>{g+=`<rect x="${X(t)-9}" y="${Math.min(Y(v),Y(0)).toFixed(1)}" width="18" height="${Math.abs(Y(v)-Y(0)).toFixed(1)}" fill="var(--rule2)" rx="2"/><text x="${X(t)}" y="232" text-anchor="middle" class="svgs" font-size="11">${t}</text>`;});
+  const line=(h,c)=>`<polyline points="${h.map((v,t)=>X(t)+","+Y(v).toFixed(1)).join(" ")}" fill="none" stroke="${c}" stroke-width="2.6"/>`+h.map((v,t)=>`<circle cx="${X(t)}" cy="${Y(v).toFixed(1)}" r="3" fill="${c}"/>`).join("");
+  g+=line(hf,"var(--muted)")+line(hs,"var(--v)")+`<text x="${X(3)}" y="${Y(1)-8}" text-anchor="middle" class="svgt" font-size="12" font-weight="700">key token</text><text x="340" y="250" text-anchor="middle" class="svgs" font-size="12">token t</text>`;
+  svg.innerHTML=g;const kf=keep(F),ks=keep(sel);info.dataset.fixed=kf.toFixed(3);info.dataset.sel=ks.toFixed(3);
+  info.innerHTML=`Fixed Δ = ${d.toFixed(2)}: final state h<sub>15</sub> = ${f3(hf[15])}; share still from token 3 = <b>${f3(kf)}</b> (${(100*kf).toFixed(1)}%). Selective: h<sub>15</sub> = ${f3(hs[15])}; share from token 3 = <b>${f3(ks)}</b> (${(100*ks).toFixed(1)}%). The best possible fixed Δ is about 0.08, and it keeps only 2.9%.`;}
+ Dl.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 5: attention sinks ---------- */
+(function(){
+ const svg=$("#a2-sink-svg");if(!svg)return;const info=$("#a2-sink-info");
+ const lg=[3.0,0.4,-0.2,0.6,0.1,-0.5,0.3,0.0,0.5,-0.3,0.2,0.7,-0.1,0.4,0.9,0.6];
+ const val=[0.0,1.0,-1.0,0.5,0.8,-0.6,0.2,-0.4,1.2,0.3,-0.9,0.6,-0.2,1.0,0.4,-0.7];let mode="full";
+ function draw(){const keep=lg.map((_,j)=>mode==="full"?true:mode==="win"?j>=8:(j===0||j>=9));
+  const idx=lg.map((_,j)=>j).filter(j=>keep[j]);const w=new Array(16).fill(0);const sm=B.softmax(idx.map(j=>lg[j]));idx.forEach((j,k)=>w[j]=sm[k]);
+  const out=w.reduce((a,v,j)=>a+v*val[j],0);const rec=w.slice(9).reduce((a,b)=>a+b,0);
+  const Y=v=>190-v*230;let g=`<line x1="40" y1="190" x2="630" y2="190" stroke="var(--muted)"/>`;
+  [0,0.25,0.5,0.75].forEach(v=>g+=`<text x="34" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${v}</text><line x1="40" y1="${Y(v)}" x2="630" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/>`);
+  lg.forEach((_,j)=>{const x0=50+j*36;const c=!keep[j]?"var(--rule)":j===0?"var(--v)":j>=9?"var(--k)":"var(--q)";
+   g+=keep[j]?`<rect x="${x0}" y="${Y(w[j]).toFixed(1)}" width="26" height="${Math.max(1,190-Y(w[j])).toFixed(1)}" fill="${c}" rx="3"/><text x="${x0+13}" y="${(Y(w[j])-5).toFixed(1)}" text-anchor="middle" class="svgs" font-size="10">${w[j].toFixed(2)}</text>`:`<rect x="${x0}" y="182" width="26" height="8" fill="var(--rule)" rx="2"/><text x="${x0+13}" y="176" text-anchor="middle" class="svgs" font-size="10">gone</text>`;
+   g+=`<text x="${x0+13}" y="206" text-anchor="middle" class="svgs" font-size="11">${j}</text>`;});
+  g+=`<text x="335" y="224" text-anchor="middle" class="svgs" font-size="12">token position (0 = sink, 9 to 15 = the 7 most recent)</text>`;svg.innerHTML=g;
+  info.dataset.sink=w[0].toFixed(3);info.dataset.recent=rec.toFixed(3);info.dataset.out=out.toFixed(3);
+  info.innerHTML=`Weight on the sink: <b>${w[0].toFixed(3)}</b>. Weight on tokens 9–15: <b>${rec.toFixed(3)}</b> (full cache: 0.263). Head output (a weighted sum of 1-D values): <b>${f3(out)}</b> (full cache: 0.131).${mode==="win"?" Without the sink, recent tokens get "+(rec/0.263).toFixed(1)+"× their normal weight.":""}`;}
+ seg($("#a2-sink-mode"),v=>{mode=v;draw();});draw();
+})();
+})();
+</script></body></html>

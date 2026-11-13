@@ -1,0 +1,436 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Multi-head attention · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../transformers/index.html">Attention and transformers</a><span class="sep">/</span><span>Session 19</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="multi-head-attention">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="multi-head-attention" data-session="multi-head-attention" style="--tc:var(--t2)"><header class="chap-head"><div class="chap-kicker"><span class="num">19</span><span>Track 2: Attention and transformers · session 4 of 15</span></div><h1 class="chap-title">Multi-head attention</h1><p class="chap-sub">One attention map can only look at one mix of places at a time. Multi-head attention cuts the model width into h smaller pieces, runs h attention maps side by side, and joins the results with one output matrix. This session builds it step by step with real numbers, shows why it costs the same as one big head, counts its 4·d<sub>model</sub>² parameters, and looks at what real heads learn.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 16, 17 and 18 (query, key, value; scaled dot-product attention; masks)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why one softmax over the keys is a limit: it must share one unit of weight between everything the token needs</li><li>The split: d<sub>model</sub> = h · d<sub>k</sub>, and the reshape (B, T, d) → (B, h, T, d<sub>k</sub>) that runs all heads in one matrix multiplication</li><li>Concatenation and the output projection W<sub>O</sub>, and the equivalent view as a sum of per-head contributions</li><li>Counting: 4·d<sub>model</sub>² weights per layer, and FLOPs that do not depend on the number of heads</li><li>What heads learn in practice: previous-token, syntax, coreference and delimiter heads, and why many heads can be pruned</li><li>A from-scratch PyTorch module checked against nn.MultiheadAttention and scaled_dot_product_attention</li><li>How the same block is used in vision and video transformers</li></ul></div></header><style>
+.mh-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.mh-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+.mh-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.mh-grid input[type=range]{width:100%}
+.mh-toks{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 10px}
+.mh-toks button{font:600 14.5px var(--mono);font-variant-ligatures:none;border:1.5px solid var(--rule);background:var(--card);color:var(--ink);padding:5px 9px;border-radius:8px;cursor:pointer}
+.mh-toks button[aria-pressed="true"]{border-color:var(--q);background:var(--q-soft)}
+.mh-mono{font-family:var(--mono);font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../transformers/scaled-dot-product-attention-the-math-and.html">session 17</a> each token computed <b>one</b> set of attention weights: one softmax over all the keys. That single map is a hard limit. The weights add up to 1, so if a token needs two different things from two different places, it must split its attention between them, and the two pieces of information arrive mixed together in one vector.</p>
+<p>Think of the word <span class="mh-mono">it</span> in “The animal did not cross the street because it was tired”. To understand <span class="mh-mono">it</span>, the model wants several things at once: which noun <span class="mh-mono">it</span> refers to (<span class="mh-mono">animal</span>), what the word just before was (<span class="mh-mono">because</span>), and what verb comes with it. One attention map has to choose. <b>Multi-head attention</b> runs \(h\) small attention maps in parallel. Each one, called a <b>head</b>, has its own queries, keys and values, so each can look at a different place for a different reason. Then the results are joined.</p>
+<p>The surprising part: this costs almost nothing extra. The model width \(d_{\text{model}}\) is cut into \(h\) slices of size \(d_k = d_{\text{model}}/h\), so the total work stays the same as one big head. Every transformer you will meet uses it: the original Transformer (\(h = 8\), \(d_k = 64\)), GPT-2 small and BERT-base (\(h = 12\), \(d_k = 64\)), Llama 2 7B (\(h = 32\), \(d_k = 128\)), and the Vision Transformer ViT-B/16 (\(h = 12\), \(d_k = 64\)). [Certain: from the paper and the published config files]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Expect: “Why multiple heads instead of one big head?”, “How many parameters does a multi-head attention layer have?”, “Does adding heads add compute?”, “Write multi-head attention in PyTorch”, “What does W<sub>O</sub> do?”. Each has a short answer with numbers below.</aside>
+<p>This session builds the layer from the pieces you know. You will do the full forward pass by hand with real numbers, write it in PyTorch and check it against the built-in module, count its parameters and FLOPs, and see what real heads learn. Multi-head attention is also the starting point of the KV-cache savings in <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a> (MQA, GQA and MLA change how many heads share keys and values).</p>
+
+<h2>The limit of a single head</h2>
+<p>Recall single-head attention from <a href="../transformers/scaled-dot-product-attention-the-math-and.html">session 17</a>. For queries \(Q\), keys \(K\), values \(V\) and an optional mask \(M\) (<a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a>):</p>
+<div class="eq">\[ \operatorname{Attention}(Q, K, V) = \softmax\!\left( \frac{Q K^\top}{\sqrt{d_k}} + M \right) V \tag{19.1} \]</div>
+<p>Each row of the softmax is a set of weights that are positive and add up to 1. The output for a token is a <b>weighted average</b> of the value vectors. An average has two weaknesses when a token needs several things:</p>
+<ol>
+<li><b>The weight is shared.</b> If the token needs \(m\) different positions equally, each can get at most \(1/m\) of the weight. The rest of the sequence also takes some weight, so it is less than that.</li>
+<li><b>The information is mixed.</b> The value of position A and the value of position B are added into one vector. Later layers cannot tell which part came from where, unless A and B happened to write into different dimensions.</li>
+</ol>
+<p>The authors of the Transformer said it in one sentence: “With a single attention head, averaging inhibits this.” [Certain: Vaswani et al., section 3.2.2] Here “this” is attending to information from different representation subspaces at different positions.</p>
+<p>We can measure the first weakness. Say a query has \(n\) keys. It wants \(m\) of them (the targets), and gives each target a score \(g\) higher than the other keys. With one head, the weight on each target is</p>
+<div class="eq">\[ p_{\text{one head}} = \frac{e^{g}}{m\, e^{g} + (n - m)} \lt \frac{1}{m} \tag{19.2} \]</div>
+<p>If instead we have \(m\) heads and each head looks for only one target, each head puts on its target the weight</p>
+<div class="eq">\[ p_{\text{per head}} = \frac{e^{g}}{e^{g} + (n - 1)} \;\to\; 1 \quad \text{as } g \text{ grows} \tag{19.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n\)</dt><dd>number of keys the query can see</dd>
+<dt>\(m\)</dt><dd>number of different positions the query needs at the same time</dd>
+<dt>\(g\)</dt><dd>how much higher the score of a target is than the score of the other keys (the gap)</dd>
+<dt>\(p\)</dt><dd>the softmax weight that lands on one target</dd></dl>
+<p>With \(n = 8\), \(m = 2\) and \(g = 4\): one head gives each target 0.474; two heads give each target 0.886, each in its own head. Even with a huge gap, the single head never passes 0.5. Try it in Figure 1.</p>
+<figure class="fig" id="mh-one"><div class="fig-body">
+<div class="mh-grid">
+<label for="mh-one-g">Score gap \(g\)</label><input type="range" id="mh-one-g" min="0" max="8" step="0.5" value="4"><output id="mh-one-gv"></output>
+<label for="mh-one-m">Targets needed \(m\)</label><input type="range" id="mh-one-m" min="1" max="4" step="1" value="2"><output id="mh-one-mv"></output></div>
+<div class="scroll-x"><svg id="mh-one-svg" viewBox="0 0 680 300" role="img" aria-label="Attention weights over eight keys for one head and for several heads"></svg></div>
+<div class="mh-leg"><span style="--c:var(--k)">target key</span><span style="--c:var(--rule)">other key</span></div>
+<div class="readout" id="mh-one-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> One query, eight keys. Left: one head must share its weight between all \(m\) targets (formula 19.2). Right: \(m\) heads, each one looking for one target (formula 19.3). Bars are the softmax weights.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Set \(m = 1\): both sides are equal, because one target needs only one head. Now set \(m = 2\) and push \(g\) to 8: the single head stays just under 0.5 per target, while each of the two heads goes to almost 1.0. With \(m = 4\) the single head is capped near 0.25. Also notice the second weakness: on the left, all targets are summed into one output vector; on the right, each head writes its own slice of the output, so the pieces stay separate.</p></details></figure>
+<aside class="note analogy side"><span class="nt">Analogy</span>A reporter writes one story and has one hour of interviews. If she must cover the police, the doctors and the witnesses, each gets 20 minutes and the notes are in one notebook. A newsroom sends three reporters, each with one hour and a separate notebook. The editor (the output matrix \(W_O\)) then reads all three notebooks and writes the final story.</aside>
+
+<h2>Multi-head attention: split, attend, concatenate</h2>
+<p>The idea is simple. Instead of one set of projections \(W_Q, W_K, W_V\) of size \(d_{\text{model}} \times d_{\text{model}}\), give each head \(i = 1, \dots, h\) its own smaller set, of size \(d_{\text{model}} \times d_k\). Each head runs ordinary attention (19.1) in its own small space:</p>
+<div class="eq">\[ \text{head}_i = \operatorname{Attention}\!\left( X W_Q^{i},\; X W_K^{i},\; X W_V^{i} \right) \in \R^{T \times d_k} \tag{19.4} \]</div>
+<p>Then the \(h\) outputs are put side by side (concatenated) and multiplied by one more matrix, the <b>output projection</b> \(W_O\):</p>
+<div class="eq">\[ \operatorname{MHA}(X) = \operatorname{Concat}\!\left( \text{head}_1, \dots, \text{head}_h \right) W_O, \qquad W_O \in \R^{h d_k \times d_{\text{model}}} \tag{19.5} \]</div>
+<p>And the head size is chosen so that the total width does not change:</p>
+<div class="eq">\[ d_k = d_v = \frac{d_{\text{model}}}{h} \tag{19.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(X\)</dt><dd>the input, of shape \(T \times d_{\text{model}}\): \(T\) token vectors, each of width \(d_{\text{model}}\) (for cross-attention, keys and values come from another sequence; see <a href="../transformers/self-attention-vs-cross-attention.html">session 20</a>)</dd>
+<dt>\(h\)</dt><dd>number of heads</dd>
+<dt>\(W_Q^{i}, W_K^{i}, W_V^{i}\)</dt><dd>the query, key and value projections of head \(i\), each of shape \(d_{\text{model}} \times d_k\); each head has its own, learned separately</dd>
+<dt>\(d_k, d_v\)</dt><dd>width of one head’s queries and keys (\(d_k\)) and values (\(d_v\)); almost always equal</dd>
+<dt>\(\operatorname{Concat}\)</dt><dd>put the \(h\) matrices of shape \(T \times d_k\) next to each other: the result is \(T \times h d_k = T \times d_{\text{model}}\)</dd>
+<dt>\(W_O\)</dt><dd>the output projection: mixes the heads’ results and maps them back into the model’s space</dd></dl>
+<p>In the original Transformer, \(d_{\text{model}} = 512\) and \(h = 8\), so \(d_k = 64\). [Certain] Notice the scale \(\sqrt{d_k}\) in (19.1) uses the <b>head</b> size \(d_k\), not \(d_{\text{model}}\): each dot product is a sum of \(d_k\) terms.</p>
+<figure class="fig wide" id="mh-diag"><div class="fig-body">
+<div class="scroll-x"><svg id="mh-diag-svg" viewBox="0 0 760 330" role="img" aria-label="Diagram of multi-head attention: the input is projected to queries, keys and values, split into heads, each head runs attention, the head outputs are concatenated and multiplied by the output matrix"></svg></div>
+</div><figcaption><b>Figure 2.</b> The data flow of multi-head attention with \(h = 4\). One input \(X\) is projected three times (blue queries, orange keys, green values). Each projection is cut into four slices of width \(d_k\). Each head runs attention on its own slices, the four outputs are joined, and \(W_O\) mixes them.</figcaption></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>The heads do <b>not</b> see different parts of the input vector. Every head reads the whole \(X\) (all \(d_{\text{model}}\) dimensions). What is split is the <b>output</b> of the projections: head \(i\) gets columns \((i-1)d_k + 1\) to \(i\,d_k\) of \(XW_Q\). The projection is learned, so each head learns its own view of the full input.</aside>
+
+<h2>Shapes: all heads in one matrix multiplication</h2>
+<p>We never run \(h\) separate small multiplications in real code. Stack the \(h\) small matrices \(W_Q^{i}\) side by side and you get one big \(d_{\text{model}} \times d_{\text{model}}\) matrix \(W_Q = [W_Q^{1} \cdots W_Q^{h}]\). So the first step is exactly the single-head projection \(Q = XW_Q\). Then we only <b>reshape</b> the result. With a batch of \(B\) sequences:</p>
+<div class="algo"><div class="algo-h">Algorithm 1: multi-head attention, the shape view</div><ol>
+<li><b>input:</b> \(X\) of shape \((B, T, d)\) with \(d = d_{\text{model}}\); weights \(W_Q, W_K, W_V, W_O\) of shape \((d, d)\); number of heads \(h\); mask \(M\)</li>
+<li>\(Q, K, V \leftarrow XW_Q,\; XW_K,\; XW_V\) <span class="c">// each (B, T, d): one big matmul each, or one fused (d, 3d) matmul</span></li>
+<li>reshape each to \((B, T, h, d_k)\) <span class="c">// no data moves: dimension d is read as h blocks of d_k</span></li>
+<li>transpose to \((B, h, T, d_k)\) <span class="c">// the head axis becomes a batch axis</span></li>
+<li>\(S \leftarrow Q K^\top / \sqrt{d_k} + M\) <span class="c">// (B, h, T, T): one score map per head</span></li>
+<li>\(A \leftarrow \softmax(S)\) along the last axis</li>
+<li>\(O \leftarrow A V\) <span class="c">// (B, h, T, d_k)</span></li>
+<li>transpose back to \((B, T, h, d_k)\), reshape to \((B, T, d)\) <span class="c">// this is the concatenation</span></li>
+<li><b>return</b> \(O\, W_O\) <span class="c">// (B, T, d)</span></li></ol></div>
+<p>The key trick is step 4. After the transpose, the head axis sits next to the batch axis, and a batched matrix multiplication treats “4 sequences × 12 heads” the same as “48 independent sequences”. GPUs are very good at that. Use Figure 3 to see the split and the costs for real models.</p>
+<figure class="fig" id="mh-split"><div class="fig-body">
+<div class="controls"><span class="seg" id="mh-split-pre"><button type="button" data-v="toy" aria-pressed="false">Toy (d = 12)</button><button type="button" data-v="base" aria-pressed="false">Transformer base</button><button type="button" data-v="gpt2" aria-pressed="true">GPT-2 small</button><button type="button" data-v="llama" aria-pressed="false">Llama 2 7B</button></span></div>
+<div class="mh-grid">
+<label for="mh-split-h">Number of heads \(h\)</label><input type="range" id="mh-split-h" min="0" max="10" step="1" value="0"><output id="mh-split-hv"></output>
+<label for="mh-split-n">Sequence length \(T\)</label><input type="range" id="mh-split-n" min="7" max="15" step="1" value="10"><output id="mh-split-nv"></output></div>
+<div class="scroll-x"><svg id="mh-split-svg" viewBox="0 0 680 250" role="img" aria-label="The model width cut into head slices, and the tensor shapes of multi-head attention"></svg></div>
+<div class="readout" id="mh-split-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Splitting \(d_{\text{model}}\) into heads. The bar is one token’s query vector, colored by head. The slider only offers values of \(h\) that divide \(d_{\text{model}}\). The readout counts weights, FLOPs per token and the memory of the score maps for one layer.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Move the heads slider for GPT-2 small. The parameters (2,359,296 per layer) and the FLOPs per token do not change at all: they depend only on \(d_{\text{model}}\) and \(T\). Only two things change: the head size \(d_k\) gets smaller, and the number of \(T \times T\) score maps grows. If the score maps are stored (plain attention, not FlashAttention), their memory grows with \(h\). Now pick Llama 2 7B and \(T = 4096\): 32 heads store about 1.07 GB of BF16 scores per layer for one sequence.</p></details></figure>
+
+<h2>The whole forward pass with real numbers</h2>
+<p>Let us run every step on a tiny example: \(T = 3\) tokens, \(d_{\text{model}} = 4\), \(h = 2\) heads, so \(d_k = 2\). No mask, so every token can see every token. The weights are chosen by hand so that the two heads do clearly different things. Step through Figure 4.</p>
+<div class="eq">\[ X = \begin{bmatrix} 2 & 0 & 1 & 0 \\ 0 & 2 & 0 & 1 \\ 1 & 1 & 1 & 1 \end{bmatrix}, \quad W_Q = \begin{bmatrix} 1 & 0 & 1 & 0 \\ 0 & 1 & 0 & 1 \\ 0 & 0 & 0 & 0 \\ 0 & 0 & 0 & 0 \end{bmatrix}, \quad W_K = \begin{bmatrix} 1 & 0 & 0 & 1 \\ 0 & 1 & 1 & 0 \\ 0 & 0 & 0 & 0 \\ 0 & 0 & 0 & 0 \end{bmatrix} \]</div>
+<div class="eq">\[ W_V = \begin{bmatrix} 0 & 0 & 1 & 0 \\ 0 & 0 & 0 & 1 \\ 1 & 0 & 0 & 0 \\ 0 & 1 & 0 & 0 \end{bmatrix}, \qquad W_O = \frac{1}{2}\begin{bmatrix} 1 & 0 & 1 & 0 \\ 0 & 1 & 0 & 1 \\ 1 & 0 & -1 & 0 \\ 0 & 1 & 0 & -1 \end{bmatrix} \]</div>
+<figure class="fig wide" id="mh-step"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="mh-step-prev">Back</button><button type="button" class="btn primary" id="mh-step-play">Play</button><button type="button" class="btn" id="mh-step-next">Next</button><span id="mh-step-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="mh-step-svg" viewBox="0 0 760 180" role="img" aria-label="Matrices of the multi-head attention forward pass, one step at a time"></svg></div>
+<div class="readout" id="mh-step-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Multi-head attention by hand, with two heads. Columns that belong to head 1 are tinted in one color, columns of head 2 in another. Every number is computed live in your browser.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Watch the two attention maps at step 5. Head 1 compares the first two features of the query with the same two features of the key, so tokens 1 and 2 attend mostly to <b>themselves</b> (0.768). Head 2 compares them crosswise, so token 1 attends mostly to token 2 and token 2 to token 1 (also 0.768). Same input, same rule, two different patterns: that is the point of having heads. Token 3 is “neutral” and spreads 1/3 everywhere in both heads.</p></details></figure>
+<div class="worked"><div class="wt">The numbers for token 1</div>
+<p><b>Projections.</b> \(\mathbf{q}_1 = (2, 0, 2, 0)\). Head 1 uses \((2, 0)\), head 2 uses \((2, 0)\) as well. The keys of head 1 are \((2,0), (0,2), (1,1)\); the keys of head 2 are \((0,2), (2,0), (1,1)\).</p>
+<p><b>Scores</b> (divided by \(\sqrt{d_k} = \sqrt 2\)). Head 1: \((4, 0, 2)/\sqrt2 = (2.828, 0, 1.414)\). Head 2: \((0, 4, 2)/\sqrt2 = (0, 2.828, 1.414)\).</p>
+<p><b>Softmax.</b> Head 1: \((0.768, 0.045, 0.187)\). Head 2: \((0.045, 0.768, 0.187)\).</p>
+<p><b>Head outputs.</b> The values of head 1 are \((1,0), (0,1), (1,1)\), so \(\text{head}_1 = 0.768(1,0) + 0.045(0,1) + 0.187(1,1) = (0.955, 0.232)\). The values of head 2 are \((2,0), (0,2), (1,1)\), so \(\text{head}_2 = (0.277, 1.723)\).</p>
+<p><b>Concatenate and project.</b> \([0.955, 0.232, 0.277, 1.723]\, W_O = (0.616, 0.977, 0.339, -0.745)\). This \(W_O\) writes the average of the two heads into the first two output dimensions and half their difference into the last two. A real \(W_O\) is learned, but it does the same kind of job: it decides how the heads’ findings are combined.</p></div>
+
+<h2>What W<sub>O</sub> really does: a sum over heads</h2>
+<p>Concatenation followed by \(W_O\) looks like one step, but we can split it. Cut \(W_O\) into \(h\) row blocks \(W_O^{i}\) of shape \(d_k \times d_{\text{model}}\), one per head. A row vector times a matrix is a sum of (piece of the vector) times (matching rows of the matrix), so</p>
+<div class="eq">\[ \operatorname{Concat}(\text{head}_1, \dots, \text{head}_h)\, W_O = \sum_{i=1}^{h} \text{head}_i\, W_O^{i} \tag{19.7} \]</div>
+<p>This is a very useful view. Each head computes its result and <b>adds</b> its own contribution, of full width \(d_{\text{model}}\), into the output. In the worked example, for token 1, head 1 adds \((0.477, 0.116, 0.477, 0.116)\) and head 2 adds \((0.139, 0.861, -0.139, -0.861)\). Their sum is the output above. In a real model this output is added to the residual stream (<a href="../transformers/the-residual-stream-and-normalization.html">session 22</a>), so every head writes into the same shared vector.</p>
+<p>Putting (19.4) into (19.7) gives a second insight. Head \(i\) uses its weights only in two products:</p>
+<div class="eq">\[ \text{head}_i\, W_O^{i} = \softmax\!\left( \frac{X\, W_Q^{i} (W_K^{i})^\top X^\top}{\sqrt{d_k}} \right) X \, W_V^{i} W_O^{i} \tag{19.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W_Q^{i} (W_K^{i})^\top\)</dt><dd>a \(d_{\text{model}} \times d_{\text{model}}\) matrix that decides <b>where</b> head \(i\) looks; called the <b>QK circuit</b></dd>
+<dt>\(W_V^{i} W_O^{i}\)</dt><dd>a \(d_{\text{model}} \times d_{\text{model}}\) matrix that decides <b>what</b> head \(i\) copies from there into the output; called the <b>OV circuit</b></dd></dl>
+<p>This is the view of Elhage et al., <i>A Mathematical Framework for Transformer Circuits</i>. Both circuits are products of a \(d_{\text{model}} \times d_k\) and a \(d_k \times d_{\text{model}}\) matrix, so both have rank at most \(d_k\):</p>
+<div class="eq">\[ \operatorname{rank}\!\left( W_Q^{i} (W_K^{i})^\top \right) \le d_k, \qquad \operatorname{rank}\!\left( W_V^{i} W_O^{i} \right) \le d_k \tag{19.9} \]</div>
+<p>So each head is a <b>low-rank</b> attention: it can only compare and copy along \(d_k\) directions. That is the price of many heads. With too many heads, \(d_k\) gets so small that a head cannot express the comparison it needs; Bhojanapalli et al. call this the <b>low-rank bottleneck</b>. The Transformer paper’s own ablation shows the trade-off: [Certain: Table 3, rows A, English–German dev set]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Heads \(h\)</th><th>\(d_k = d_v\)</th><th>Dev perplexity</th><th>Dev BLEU</th></tr></thead><tbody>
+<tr><td>1</td><td>512</td><td>5.29</td><td>24.9</td></tr>
+<tr><td>4</td><td>128</td><td>5.00</td><td>25.5</td></tr>
+<tr><td>8 (base)</td><td>64</td><td>4.92</td><td>25.8</td></tr>
+<tr><td>16</td><td>32</td><td>4.91</td><td>25.8</td></tr>
+<tr><td>32</td><td>16</td><td>5.01</td><td>25.4</td></tr></tbody></table></div>
+<p>One head is 0.9 BLEU worse than the best; 32 heads of size 16 are worse again. In practice almost all LLMs use \(d_k = 64\) or \(128\) and choose \(h = d_{\text{model}} / d_k\). [Likely]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Why not just one head of size \(d_{\text{model}}\)?” Two reasons: (1) one softmax shares one unit of weight and mixes the values (formula 19.2), (2) the same compute buys \(h\) independent attention patterns. “Why not \(h = d_{\text{model}}\)?” Then \(d_k = 1\): each score is a product of two numbers, the QK circuit has rank 1, and the head cannot express useful comparisons.</aside>
+
+<h2>Counting parameters and FLOPs</h2>
+<h3>Parameters</h3>
+<p>The four matrices \(W_Q, W_K, W_V, W_O\) are each \(d_{\text{model}} \times d_{\text{model}}\) (stack the heads). The number of heads does not appear:</p>
+<div class="eq">\[ P_{\text{attn}} = 4\, d_{\text{model}}^2 \quad (\text{without biases}), \qquad 4\, d_{\text{model}}^2 + 4\, d_{\text{model}} \quad (\text{with biases}) \tag{19.10} \]</div>
+<div class="worked"><div class="wt">Worked example: real models</div>
+<p><b>GPT-2 small</b> (\(d_{\text{model}} = 768\), with biases): \(4 \cdot 768^2 + 4 \cdot 768 = 2{,}362{,}368\) per layer, about 28.3 million over its 12 layers.</p>
+<p><b>Llama 2 7B</b> (\(d_{\text{model}} = 4096\), no biases): \(4 \cdot 4096^2 = 67{,}108{,}864\) per layer. Over 32 layers that is 2.15 billion, about 32% of the model’s 6.74 billion parameters. (Most of the rest is the feed-forward network, <a href="../transformers/the-feed-forward-network-mlp-inside-each.html">session 21</a>.)</p></div>
+<h3>FLOPs</h3>
+<p>A matrix multiply of \((T \times a)\) by \((a \times b)\) costs about \(2Tab\) FLOPs (one multiply and one add per term). Per token, for a sequence of length \(T\):</p>
+<div class="eq">\[ \text{FLOPs per token} \approx \underbrace{8\, d_{\text{model}}^2}_{\text{4 projections}} + \underbrace{4\, T\, d_{\text{model}}}_{QK^\top \text{ and } AV} \tag{19.11} \]</div>
+<p>Where does \(4 T d_{\text{model}}\) come from? Each head computes \(T\) dot products of length \(d_k\) for the scores (\(2Td_k\)) and a weighted sum of \(T\) vectors of length \(d_k\) (\(2Td_k\)). Times \(h\) heads: \(4 T h d_k = 4 T d_{\text{model}}\). Again \(h\) cancels. So <b>more heads are free in FLOPs</b>; what grows is the number of softmax maps (\(h \cdot T^2\) entries) and, on real GPUs, some overhead for small \(d_k\). For Llama 2 7B at \(T = 4096\): \(8 \cdot 4096^2 = 134\) million FLOPs for the projections and \(4 \cdot 4096 \cdot 4096 = 67\) million for the attention part, per token per layer. <a href="../transformers/counting-parameters-flops-and-memory-of-a.html">Session 25</a> does the full model.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Formula (19.11) is the average over a full sequence. With a causal mask, half of the score matrix is never needed, and kernels like FlashAttention skip it (<a href="../inference/index.html#row-attention-operator-1-flashattention-1-2-and" title="Attention operator 1: FlashAttention 1, 2 and 3 (planned)">session 124</a>). During generation with a KV cache, one new token costs \(8d^2 + 4Td\) and reads all cached keys and values (<a href="../inference/index.html#row-the-kv-cache" title="The KV cache (planned)">session 80</a>).</aside>
+
+<h2>What do real heads learn?</h2>
+<p>Nobody tells a head what to do. Each head’s matrices start random, and training pushes different heads toward different jobs because that lowers the loss. Studies that look at trained models find heads with clear roles:</p>
+<ul>
+<li><b>Positional heads:</b> attend to the previous token, or the next one (in BERT). Clark et al. found heads that attend to specific relative positions. [Certain]</li>
+<li><b>Syntactic heads:</b> a verb attends to its direct object, a noun to its determiner, a preposition to its object. Clark et al. report BERT heads that match these relations well. [Certain]</li>
+<li><b>Coreference heads:</b> a pronoun attends to the noun it refers to. [Certain: Clark et al. report a head that does coreference well]</li>
+<li><b>Delimiter and “sink” heads:</b> many heads put most of their weight on <span class="mh-mono">[SEP]</span> or <span class="mh-mono">[CLS]</span> in BERT, or on the first token in GPT-style models. This acts like a “do nothing” option when the head has nothing useful to read. [Likely: Clark et al. for BERT; Xiao et al. call these attention sinks in LLMs]</li>
+<li><b>Induction heads:</b> in a sequence like “… A B … A”, a pair of heads in two layers predicts “B” again: copy what came after the last time you saw this token. Olsson et al. connect them to in-context learning. [Likely]</li></ul>
+<p>Figure 5 shows a hand-built version of four such heads on one sentence. The patterns are designed by us to look like the ones reported in the papers; they are not read from a trained model.</p>
+<figure class="fig" id="mh-sent"><div class="fig-body">
+<div class="controls" style="margin-bottom:2px"><span style="font:600 14px var(--sans);color:var(--muted)">Pick the query token:</span></div>
+<div class="mh-toks" id="mh-sent-toks"></div>
+<div class="controls"><label class="sl"><input type="checkbox" id="mh-sent-avg"> Also show what one head that averages all four would see</label></div>
+<div class="scroll-x"><svg id="mh-sent-svg" viewBox="0 0 680 270" role="img" aria-label="Attention weights of four heads for the chosen query token"></svg></div>
+<div class="readout" id="mh-sent-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Four hand-built heads with a causal mask: previous token, coreference, verb-to-subject, and first-token sink. Each row is one head’s softmax for the chosen query; darker means more weight. Grey cells are future tokens, hidden by the mask.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Click <span class="mh-mono">it</span>. The coreference head puts 0.886 of its weight on <span class="mh-mono">animal</span>, and the previous-token head puts 0.949 on <span class="mh-mono">because</span>. Each head gets a clean answer to its own question. Turn on the average row: one head that tried to do all four jobs would put only 0.243 on <span class="mh-mono">animal</span>, mixed with <span class="mh-mono">The</span> and <span class="mh-mono">because</span>. Click <span class="mh-mono">cross</span> or <span class="mh-mono">tired</span>: the verb-to-subject head finds <span class="mh-mono">animal</span> and <span class="mh-mono">it</span>.</p></details></figure>
+<h3>Are all heads needed?</h3>
+<p>No, not after training. Michel et al. found that a large share of heads can be removed at test time without a big loss in quality, and some layers can be reduced to a single head. [Certain] Voita et al. pruned 38 of 48 encoder heads of an English–Russian translation model and lost only 0.15 BLEU; the heads that survive are the specialized ones (positional, syntactic, rare-word heads). [Certain] Michel et al. also give early evidence that many heads help <b>training</b> more than the final model. [Likely] This redundancy is why head pruning works (<a href="../inference/index.html#row-structured-pruning-llm-pruner-sheared-llama-slicegpt" title="Structured pruning: LLM-Pruner, Sheared LLaMA, SliceGPT, Minitron (planned)">session 115</a>), and also why sharing keys and values across heads (MQA and GQA, <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>) loses little quality.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>An attention map shows where a head <b>reads</b>, not what it does with what it reads. A head can look at the right word and contribute almost nothing (small \(W_V^{i}W_O^{i}\)). Do not explain a model’s decision from attention maps alone (<a href="../applications/index.html#row-interpretability-looking-inside-the-model" title="Interpretability: looking inside the model (planned)">session 157</a>).</aside>
+
+<h2>Multi-head attention in PyTorch</h2>
+<div class="algo"><div class="algo-h">Algorithm 2: multi-head attention, the per-head (sum) view</div><ol>
+<li><b>input:</b> \(X \in \R^{T \times d}\), per-head weights \(W_Q^{i}, W_K^{i}, W_V^{i} \in \R^{d \times d_k}\), \(W_O^{i} \in \R^{d_k \times d}\), mask \(M\)</li>
+<li>\(Y \leftarrow 0 \in \R^{T \times d}\)</li>
+<li><b>for</b> \(i = 1\) <b>to</b> \(h\) <b>do</b> <span class="c">// in real code, all heads run at once (Algorithm 1)</span></li>
+<li>&nbsp;&nbsp;\(Q_i, K_i, V_i \leftarrow XW_Q^{i},\; XW_K^{i},\; XW_V^{i}\) <span class="c">// each (T, d_k)</span></li>
+<li>&nbsp;&nbsp;\(A_i \leftarrow \softmax(Q_i K_i^\top / \sqrt{d_k} + M)\) <span class="c">// (T, T): where head i looks</span></li>
+<li>&nbsp;&nbsp;\(Y \leftarrow Y + A_i V_i W_O^{i}\) <span class="c">// formula (19.7): each head adds its contribution</span></li>
+<li><b>return</b> \(Y\)</li></ol></div>
+<p>The module below follows Algorithm 1 with one fused \((d, 3d)\) projection for Q, K and V, as GPT-2 does. It then checks the result three ways: against PyTorch’s fused kernel, against <code>nn.MultiheadAttention</code> with the same weights, and against the sum-over-heads view of Algorithm 2.</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+<span class="kw2">import</span> torch.nn <span class="kw2">as</span> nn
+<span class="kw2">import</span> torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="kw2">class</span> MultiHeadAttention(nn.Module):
+    <span class="kw2">def</span> __init__(self, d_model, n_heads, bias=False):
+        super().__init__()
+        <span class="kw2">assert</span> d_model % n_heads == 0, "d_model must be divisible by n_heads"
+        self.h, self.dk = n_heads, d_model // n_heads
+        self.qkv = nn.Linear(d_model, 3 * d_model, bias=bias)   <span class="cm"># W_Q, W_K, W_V in one matmul</span>
+        self.out = nn.Linear(d_model, d_model, bias=bias)       <span class="cm"># W_O</span>
+
+    <span class="kw2">def</span> forward(self, x, causal=True):
+        B, T, D = x.shape
+        q, k, v = self.qkv(x).split(D, dim=-1)                 <span class="cm"># each (B, T, D)</span>
+        <span class="cm"># split heads: (B, T, D) -> (B, T, h, dk) -> (B, h, T, dk)</span>
+        q, k, v = (t.view(B, T, self.h, self.dk).transpose(1, 2) <span class="kw2">for</span> t <span class="kw2">in</span> (q, k, v))
+        s = q @ k.transpose(-2, -1) / math.sqrt(self.dk)       <span class="cm"># (B, h, T, T), formula (19.1)</span>
+        <span class="kw2">if</span> causal:
+            mask = torch.triu(torch.ones(T, T, dtype=torch.bool), 1)
+            s = s.masked_fill(mask, float("-inf"))
+        a = s.softmax(dim=-1)                                  <span class="cm"># one T x T map per head</span>
+        o = a @ v                                              <span class="cm"># (B, h, T, dk)</span>
+        o = o.transpose(1, 2).reshape(B, T, D)                 <span class="cm"># concat heads, formula (19.5)</span>
+        <span class="kw2">return</span> self.out(o), a
+
+B, T, D, H = 2, 5, 16, 4
+x = torch.randn(B, T, D)
+mha = MultiHeadAttention(D, H)
+y, a = mha(x)
+print(y.shape, a.shape)                    <span class="cm"># torch.Size([2, 5, 16]) torch.Size([2, 4, 5, 5])</span>
+
+<span class="cm"># 1) the same result from PyTorch's fused kernel</span>
+q, k, v = mha.qkv(x).split(D, dim=-1)
+q, k, v = (t.view(B, T, H, D // H).transpose(1, 2) <span class="kw2">for</span> t <span class="kw2">in</span> (q, k, v))
+o = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+y2 = mha.out(o.transpose(1, 2).reshape(B, T, D))
+print((y - y2).abs().max().item())         <span class="cm"># about 6e-08: equal up to float rounding</span>
+
+<span class="cm"># 2) the same result from nn.MultiheadAttention with copied weights</span>
+ref = nn.MultiheadAttention(D, H, bias=False, batch_first=True)
+<span class="kw2">with</span> torch.no_grad():
+    ref.in_proj_weight.copy_(mha.qkv.weight)               <span class="cm"># stacked (3D, D): q, k, v rows</span>
+    ref.out_proj.weight.copy_(mha.out.weight)
+mask = torch.triu(torch.ones(T, T, dtype=torch.bool), 1)  <span class="cm"># True = not allowed</span>
+y3, _ = ref(x, x, x, attn_mask=mask, need_weights=False)
+print((y - y3).abs().max().item())         <span class="cm"># about 6e-08</span>
+
+<span class="cm"># 3) concat-then-W_O equals a sum over heads of head_i @ W_O^i, formula (19.7)</span>
+Wo = mha.out.weight.T                      <span class="cm"># (D, D); nn.Linear stores W transposed</span>
+heads = a @ v                              <span class="cm"># (B, h, T, dk)</span>
+y4 = sum(heads[:, i] @ Wo[i * (D // H):(i + 1) * (D // H)] <span class="kw2">for</span> i <span class="kw2">in</span> range(H))
+print((y - y4).abs().max().item())         <span class="cm"># about 6e-08</span>
+
+<span class="cm"># 4) parameter count, formula (19.10): 4 * d_model^2 without biases</span>
+print(sum(p.numel() <span class="kw2">for</span> p <span class="kw2">in</span> mha.parameters()), 4 * D * D)   <span class="cm"># 1024 1024</span></pre>
+<p>Two details trip people up. First, <code>view</code> then <code>transpose</code> is right, but <code>view(B, h, T, dk)</code> directly is <b>wrong</b>: it would cut the sequence into pieces instead of cutting each token’s vector. Second, after the transpose the tensor is not contiguous in memory, so going back needs <code>reshape</code> (or <code>contiguous().view</code>).</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical heads</th><th>What the heads do there</th></tr></thead><tbody>
+<tr><td>Decoder LLMs (GPT-2, Llama)</td><td>GPT-2 small: 12 heads of 64; Llama 2 7B: 32 heads of 128 [Certain]</td><td>Causal self-attention in every layer; newer models share K and V across heads (GQA) to shrink the KV cache (<a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>)</td></tr>
+<tr><td>Encoders for classification and retrieval (BERT, sentence embedders)</td><td>BERT-base: 12 heads of 64 [Certain]</td><td>Bidirectional attention; syntactic and coreference heads found by probing (Clark et al.)</td></tr>
+<tr><td>Vision Transformer (images)</td><td>ViT-B/16: 12 heads of 64 [Certain]</td><td>Patches attend to patches; some heads stay local like a small convolution, others look across the whole image (Dosovitskiy et al.) (<a href="../vision/index.html#row-the-vision-transformer-vit" title="The Vision Transformer (ViT) (planned)">session 164</a>)</td></tr>
+<tr><td>Video encoders for action recognition and video classification</td><td>Same block, on space–time patch tokens</td><td>Some designs split heads or layers into spatial and temporal attention, so a head can follow motion across frames [Likely] (<a href="../video/index.html#row-video-encoders-from-3d-cnns-to-video" title="Video encoders: from 3D CNNs to video transformers (planned)">session 202</a>)</td></tr>
+<tr><td>Text-to-video retrieval and Video-RAG</td><td>Cross-attention heads in fusion layers</td><td>Text queries attend to frame tokens; different heads can pick objects, actions or on-screen text [Speculation about exact roles] (<a href="../video/index.html#row-text-to-video-retrieval" title="Text-to-video retrieval (planned)">session 208</a>)</td></tr>
+<tr><td>Key-moment detection and temporal grounding</td><td>Heads in a temporal transformer over frame features</td><td>Heads compare a moment with nearby and far frames to find boundaries (<a href="../video/index.html#row-temporal-grounding-and-key-moment-detection" title="Temporal grounding and key-moment detection (planned)">session 207</a>)</td></tr>
+<tr><td>Model compression</td><td>Prune heads, or share K and V</td><td>Redundant heads (Michel et al., Voita et al.) are removed or merged</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Wrong reshape.</b> <code>x.view(B, h, T, dk)</code> instead of <code>x.view(B, T, h, dk).transpose(1, 2)</code>. Both have the right shape, so nothing crashes, but the first mixes tokens. Always split the last axis.</li>
+<li><b>Scaling by \(\sqrt{d_{\text{model}}}\)</b> instead of \(\sqrt{d_k}\). The scores become \(\sqrt h\) times too small, and attention is too flat at the start of training.</li>
+<li><b>Forgetting W<sub>O</sub></b>, or thinking it is optional. Without it, head \(i\) can only write into its own \(d_k\) slice of the output, and heads cannot be combined.</li>
+<li><b>Thinking heads add compute or parameters.</b> With \(d_k = d_{\text{model}}/h\), both stay at \(4d^2\) parameters and \(8d^2 + 4Td\) FLOPs per token (19.10, 19.11). What grows is the number of score maps.</li>
+<li><b>Choosing \(h\) that does not divide \(d_{\text{model}}\).</b> The reshape fails. (Some models pick \(d_k\) first and let \(h\,d_k \ne d_{\text{model}}\); then \(W_O\) is \(h d_k \times d_{\text{model}}\), as in 19.5.)</li>
+<li><b>Mask with the wrong shape.</b> A mask of shape \((B, T, T)\) must become \((B, 1, T, T)\) to broadcast over heads. <code>nn.MultiheadAttention</code> wants \((B \cdot h, T, T)\) for 3-D masks.</li>
+<li><b>Mixing the mask conventions.</b> In <code>nn.MultiheadAttention</code>, a boolean <code>True</code> means “do not attend”; in <code>F.scaled_dot_product_attention</code>, a boolean <code>True</code> means “attend”. Test with a tiny example.</li>
+<li><b>Reading too much into one head’s map.</b> Where a head looks is not what it contributes (see the OV circuit in 19.8).</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is multi-head attention, in two sentences?<span class="lvl">basic</span></summary><div class="ans">The input is projected into \(h\) sets of smaller queries, keys and values (size \(d_k = d_{\text{model}}/h\)), and ordinary scaled dot-product attention runs in each set separately. The \(h\) outputs are concatenated and multiplied by an output matrix \(W_O\), so each head can attend to different positions for different reasons and the results are combined.</div></details>
+<details class="qa"><summary>Why use several heads instead of one head of size d<sub>model</sub>?<span class="lvl">core</span></summary><div class="ans">A single softmax shares one unit of weight across all keys, so a token that needs \(m\) positions gives each less than \(1/m\) (formula 19.2), and their values are averaged into one vector. Several heads give several independent distributions, each able to focus sharply, and each writes its own slice before \(W_O\) mixes them. Because \(d_k = d_{\text{model}}/h\), this costs the same parameters and FLOPs. In the Transformer ablation, one head was 0.9 BLEU worse than the best setting.</div></details>
+<details class="qa"><summary>How many parameters does one multi-head attention layer have? Does it depend on h?<span class="lvl">basic</span></summary><div class="ans">\(4d_{\text{model}}^2\) without biases (Q, K, V and O are each \(d \times d\) when the heads are stacked), \(4d^2 + 4d\) with biases. It does not depend on \(h\). For GPT-2 small: 2,362,368 per layer with biases; for Llama 2 7B: 67,108,864 per layer.</div></details>
+<details class="qa"><summary>How does the number of heads change FLOPs and memory?<span class="lvl">core</span></summary><div class="ans">FLOPs per token are about \(8d^2 + 4Td\): the projections plus \(QK^\top\) and \(AV\). \(h\) cancels because \(h \cdot d_k = d\). What does change: the number of \(T \times T\) score maps (\(h\,T^2\) entries per layer and sequence), which matters if they are stored, and GPU efficiency, since very small \(d_k\) gives small, inefficient matrix multiplies. With GQA or MQA, the number of K/V heads also sets the KV-cache size.</div></details>
+<details class="qa"><summary>What does W<sub>O</sub> do? Could you drop it?<span class="lvl">core</span></summary><div class="ans">\(W_O\) maps the concatenated head outputs back to the model space and mixes them. Equivalently, \(\text{Concat}(\text{heads})W_O = \sum_i \text{head}_i W_O^{i}\): each head adds a full-width contribution to the residual stream. Without it, head \(i\) could only write to its own \(d_k\) dimensions and the heads’ outputs would never be combined in that layer. It also lets the value size \(h d_v\) differ from \(d_{\text{model}}\).</div></details>
+<details class="qa"><summary>Write the reshape that splits heads, and explain why the order matters.<span class="lvl">core</span></summary><div class="ans"><code>q.view(B, T, h, dk).transpose(1, 2)</code> gives \((B, h, T, d_k)\). The view must cut the <b>last</b> axis (each token’s vector) into \(h\) blocks; <code>view(B, h, T, dk)</code> has the same shape but cuts the flat memory differently, mixing tokens across heads. After attention: <code>o.transpose(1, 2).reshape(B, T, d)</code>; <code>reshape</code> (or <code>contiguous()</code>) is needed because the transpose makes the tensor non-contiguous.</div></details>
+<details class="qa"><summary>Why scale by √d<sub>k</sub> and not √d<sub>model</sub>?<span class="lvl">basic</span></summary><div class="ans">Each head’s score is a dot product of two \(d_k\)-dimensional vectors. If the entries have variance about 1, the dot product has variance about \(d_k\), so dividing by \(\sqrt{d_k}\) brings it back to about 1 and keeps the softmax from saturating. \(d_{\text{model}}\) plays no role inside a head.</div></details>
+<details class="qa"><summary>What is the low-rank bottleneck of attention heads?<span class="lvl">advanced</span></summary><div class="ans">Head \(i\)’s scores are \(XW_Q^{i}(W_K^{i})^\top X^\top\). The middle matrix is \(d \times d\) but has rank at most \(d_k\), so a head can only compare tokens along \(d_k\) directions (formula 19.9). As \(h\) grows with fixed \(d\), \(d_k\) shrinks and heads lose expressiveness; the Transformer ablation shows quality falling at 32 heads of size 16. Bhojanapalli et al. propose setting the head size independently of \(h\) to avoid it.</div></details>
+<details class="qa"><summary>Are all heads necessary? What does the pruning literature say?<span class="lvl">advanced</span></summary><div class="ans">No. Michel et al. removed a large share of heads at test time with little loss, some layers down to one head. Voita et al. pruned 38 of 48 encoder heads in an English–Russian model for only 0.15 BLEU; the surviving heads had clear roles (positional, syntactic, rare words). Many heads seem to help optimization during training more than they are needed at the end. This redundancy motivates head pruning and K/V sharing (MQA, GQA).</div></details>
+<details class="qa"><summary>Explain the QK and OV circuits of a head.<span class="lvl">advanced</span></summary><div class="ans">From formula (19.8), head \(i\) depends on its four matrices only through two products. \(W_Q^{i}(W_K^{i})^\top\) (the QK circuit) is a bilinear form that decides which source token each destination token attends to. \(W_V^{i}W_O^{i}\) (the OV circuit) decides what information is moved from the source into the destination’s residual stream. Both are \(d \times d\) of rank at most \(d_k\). This view (Elhage et al.) is the basis of circuit analysis, such as induction heads.</div></details>
+<details class="qa"><summary>How is multi-head attention related to MQA and GQA?<span class="lvl">core</span></summary><div class="ans">In standard MHA every head has its own K and V, so the KV cache stores \(2 \cdot h \cdot d_k\) numbers per token per layer. MQA uses one K/V head shared by all query heads; GQA uses \(g\) groups (Llama 3 8B: 32 query heads, 8 K/V heads). The query side stays multi-head, so the model keeps many attention patterns while the cache shrinks by \(h/g\). Details in <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A model has \(d_{\text{model}} = 1024\) and \(h = 16\). What is \(d_k\)? How many weights do \(W_Q, W_K, W_V, W_O\) have together, without biases?</li>
+<li>With \(n = 8\) keys, \(m = 2\) targets and \(g = 6\), compute the weight per target for one head (19.2) and for one head per target (19.3). Check in Figure 1.</li>
+<li>In the worked example, compute the output of head 1 and head 2 for token 2. Use symmetry.</li>
+<li>Show that changing \(h\) from 8 to 16 with \(d_{\text{model}} = 512\) does not change the FLOPs of \(QK^\top\) for one token and \(T = 1000\).</li>
+<li>For Llama 2 7B at \(T = 2048\), how many bytes do the BF16 score maps of one layer need for one sequence, if they are stored?</li>
+<li>You want each head to write into the full output, but you remove \(W_O\) and keep the concatenation. Which output dimensions can head 3 change, with \(d_{\text{model}} = 768\) and \(h = 12\)?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(d_k = 1024/16 = 64\). Weights: \(4 \cdot 1024^2 = 4{,}194{,}304\) (this is the Transformer big model’s width). 2. One head: \(e^6/(2e^6 + 6) = 0.496\). One head per target: \(e^6/(e^6 + 7) = 0.983\). 3. Token 2 is the mirror of token 1 (features 1 and 2 swapped), so head 1 gives \((0.232, 0.955)\) and head 2 gives \((1.723, 0.277)\); the final output is \((0.977, 0.616, -0.745, 0.339)\). 4. FLOPs of \(QK^\top\) per token: \(h \cdot 2Td_k = 2Td_{\text{model}}\). With \(h = 8, d_k = 64\): \(8 \cdot 2 \cdot 1000 \cdot 64 = 1{,}024{,}000\). With \(h = 16, d_k = 32\): \(16 \cdot 2 \cdot 1000 \cdot 32 = 1{,}024{,}000\). The same. 5. \(32 \cdot 2048^2 \cdot 2 = 268{,}435{,}456\) bytes, about 268 MB per layer (32 layers: about 8.6 GB). This is why FlashAttention never stores them. 6. \(d_k = 64\), so head 3 can only change dimensions 129 to 192 (its own slice); the other 704 dimensions never see it. With \(W_O\), every head can write to all 768 dimensions.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>One softmax shares one unit of weight and averages the values; a token that needs \(m\) things gets less than \(1/m\) for each (19.2). Several heads give several independent attention maps (19.3).</li>
+<li>Multi-head attention: project, split into \(h\) heads of size \(d_k = d_{\text{model}}/h\), attend in each head, concatenate, multiply by \(W_O\) (19.4–19.6).</li>
+<li>In code it is one big projection plus a reshape \((B, T, d) \to (B, h, T, d_k)\); the head axis acts like a batch axis.</li>
+<li>Concatenation then \(W_O\) is a sum of per-head contributions (19.7); each head has a QK circuit (where to look) and an OV circuit (what to copy), both of rank at most \(d_k\) (19.8, 19.9).</li>
+<li>Parameters are \(4d_{\text{model}}^2\) and FLOPs are \(8d^2 + 4Td\) per token, whatever \(h\) is (19.10, 19.11). Too many heads make \(d_k\) too small; 64 or 128 is common.</li>
+<li>Trained heads specialize (previous token, syntax, coreference, sinks, induction), and many of them can be pruned after training.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \operatorname{MHA}(X) = \operatorname{Concat}_{i=1}^{h}\!\left[ \softmax\!\left( \frac{XW_Q^{i}(XW_K^{i})^\top}{\sqrt{d_k}} + M \right) XW_V^{i} \right] W_O = \sum_{i=1}^{h} \text{head}_i W_O^{i} \]</div>
+<div class="eq">\[ d_k = \frac{d_{\text{model}}}{h}, \qquad P = 4 d_{\text{model}}^2, \qquad \text{FLOPs per token} \approx 8 d_{\text{model}}^2 + 4 T d_{\text{model}} \]</div>
+<h2 class="plain" id="multi-head-attention-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Vaswani et al. (2017). <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a></li><li>Elhage et al. (2021). <a href="https://transformer-circuits.pub/2021/framework/index.html" target="_blank" rel="noopener">A Mathematical Framework for Transformer Circuits</a></li><li>Raschka, <a href="https://github.com/rasbt/LLMs-from-scratch" target="_blank" rel="noopener"><i>Build a Large Language Model (From Scratch)</i></a>, chapter 3: Coding attention mechanisms</li><li>Michel, Levy, Neubig (2019). <a href="https://arxiv.org/abs/1905.10650" target="_blank" rel="noopener">Are Sixteen Heads Really Better than One?</a></li><li>Voita, Talbot, Moiseev, Sennrich, Titov (2019). <a href="https://arxiv.org/abs/1905.09418" target="_blank" rel="noopener">Analyzing Multi-Head Self-Attention: Specialized Heads Do the Heavy Lifting, the Rest Can Be Pruned</a></li><li>Clark, Khandelwal, Levy, Manning (2019). <a href="https://arxiv.org/abs/1906.04341" target="_blank" rel="noopener">What Does BERT Look At? An Analysis of BERT&#x27;s Attention</a></li><li>Bhojanapalli, Yun, Rawat, Reddi, Kumar (2020). <a href="https://arxiv.org/abs/2002.07028" target="_blank" rel="noopener">Low-Rank Bottleneck in Multi-head Attention Models</a></li><li>Olsson et al. (2022). <a href="https://arxiv.org/abs/2209.11895" target="_blank" rel="noopener">In-context Learning and Induction Heads</a></li><li>Xiao et al. (2023). <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">Efficient Streaming Language Models with Attention Sinks</a></li><li>Radford et al. (2019). <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener">Language Models are Unsupervised Multitask Learners</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">Llama 2: Open Foundation and Fine-Tuned Chat Models</a></li><li>Dosovitskiy et al. (2020). <a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener">An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale</a></li><li>Shazeer (2019). <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener">Fast Transformer Decoding: One Write-Head is All You Need</a></li><li>Ainslie et al. (2023). <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html"><small>Previous · session 18</small>Masks: causal, padding, bidirectional, prefix and packing masks</a><a class="next" href="../transformers/self-attention-vs-cross-attention.html"><small>Next · session 20</small>Self-attention vs cross-attention</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="multi-head-attention"]');if(!R)return;
+const $=s=>R.querySelector(s);const esc=B&&B.esc?B.esc:(s=>String(s));
+const sm=(z)=>{const m=Math.max(...z);const e=z.map(v=>Math.exp(v-m));const s=e.reduce((a,b)=>a+b,0);return e.map(v=>v/s);};
+const HC=["var(--t1)","var(--t3)","var(--t5)","var(--t7)","var(--t2)","var(--t4)","var(--t6)","var(--t8)","var(--t9)","var(--t10)"];
+const fmtN=v=>{const r=Math.abs(v)<5e-4?0:v;return (Math.abs(r-Math.round(r))<5e-4?String(Math.round(r)):r.toFixed(3)).replace("-","−");};
+const big=v=>Math.round(v).toLocaleString("en-US");
+const human=v=>v>=1e9?(v/1e9).toFixed(2)+" billion":v>=1e6?(v/1e6).toFixed(1)+" million":big(v);
+const bytes=v=>v>=1e9?(v/1e9).toFixed(2)+" GB":v>=1e6?(v/1e6).toFixed(1)+" MB":v>=1e3?(v/1e3).toFixed(1)+" kB":v+" B";
+function matmul(A,Bm){return A.map(r=>Bm[0].map((_,j)=>r.reduce((s,v,k)=>s+v*Bm[k][j],0)));}
+const T_=A=>A[0].map((_,j)=>A.map(r=>r[j]));
+const cols=(A,a,b)=>A.map(r=>r.slice(a,b));
+
+/* ---------- Figure 1: one head vs several heads ---------- */
+(function(){
+ const svg=$("#mh-one-svg");if(!svg)return;const G=$("#mh-one-g"),Mm=$("#mh-one-m"),info=$("#mh-one-info");
+ const N=8,TG=[1,4,6,2];
+ function draw(){const g=+G.value,m=+Mm.value;$("#mh-one-gv").value=g.toFixed(1);$("#mh-one-mv").value=m;
+  const tg=TG.slice(0,m);const one=sm(Array.from({length:N},(_,j)=>tg.includes(j)?g:0));
+  const per=tg.map(t=>sm(Array.from({length:N},(_,j)=>j===t?g:0)));
+  let s=`<text x="170" y="20" text-anchor="middle" class="svgs" font-size="14" font-weight="700">one head</text><text x="510" y="20" text-anchor="middle" class="svgs" font-size="14" font-weight="700">${m} head${m>1?"s":""}, one target each</text>`;
+  const bars=(x0,y0,H,w,ws,col)=>{let o=`<line x1="${x0-4}" y1="${y0}" x2="${x0+N*w}" y2="${y0}" stroke="var(--muted)"/>`;ws.forEach((p,j)=>{const isT=col.includes(j),hh=Math.max(0.5,p*H);o+=`<rect x="${x0+j*w+3}" y="${(y0-hh).toFixed(1)}" width="${w-6}" height="${hh.toFixed(1)}" rx="2" fill="${isT?"var(--k)":"var(--rule)"}"/>`;});return o;};
+  s+=bars(30,250,200,34,one,tg);
+  one.forEach((p,j)=>{s+=`<text x="${30+j*34+17}" y="268" text-anchor="middle" class="svgs" font-size="11.5">k${j+1}</text>`;if(tg.includes(j))s+=`<text x="${30+j*34+17}" y="${(250-p*200-6).toFixed(1)}" text-anchor="middle" font-size="12" font-weight="700" fill="var(--ink)">${p.toFixed(2)}</text>`;});
+  s+=`<line x1="335" y1="30" x2="335" y2="280" stroke="var(--rule)" stroke-dasharray="4 4"/>`;
+  const rowH=230/m;per.forEach((w,i)=>{const y0=40+rowH*(i+1)-14;s+=bars(380,y0,rowH-26,34,w,[tg[i]]);s+=`<text x="372" y="${y0-4}" text-anchor="end" font-size="11.5" font-weight="700" fill="${HC[i]}">h${i+1}</text>`;
+   s+=`<text x="${380+tg[i]*34+17}" y="${(y0-w[tg[i]]*(rowH-26)-4).toFixed(1)}" text-anchor="middle" font-size="12" font-weight="700" fill="var(--ink)">${w[tg[i]].toFixed(2)}</text>`;});
+  Array.from({length:N},(_,j)=>s+=`<text x="${380+j*34+17}" y="290" text-anchor="middle" class="svgs" font-size="11.5">k${j+1}</text>`);
+  svg.innerHTML=s;
+  const p1=one[tg[0]],p2=per[0][tg[0]];
+  info.innerHTML=`One head: each of the ${m} target${m>1?"s":""} gets <b>${p1.toFixed(3)}</b> (cap 1/${m} = ${(1/m).toFixed(3)}), and their values are summed into one vector. ${m} head${m>1?"s":""}: each head gives its own target <b>${p2.toFixed(3)}</b>, in its own slice of the output.${m===1?" With one target, one head is enough: both sides are equal.":""}`;}
+ [G,Mm].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: static diagram ---------- */
+(function(){
+ const svg=$("#mh-diag-svg");if(!svg)return;const H=4;
+ let s=`<defs><marker id="mh-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+ const box=(x,y,w,h,txt,stroke,fill,fs)=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="9" fill="${fill||"var(--card)"}" stroke="${stroke||"var(--rule)"}" stroke-width="1.6"/><text x="${x+w/2}" y="${y+h/2+5}" text-anchor="middle" font-family="var(--sans)" font-size="${fs||13.5}" font-weight="700" fill="var(--ink)">${txt}</text>`;
+ const ar=(x1,y1,x2,y2,o)=>`<path d="M${x1} ${y1} C ${(x1+x2)/2} ${y1}, ${(x1+x2)/2} ${y2}, ${x2} ${y2}" fill="none" stroke="var(--muted)" stroke-width="1.3" opacity="${o||1}" marker-end="url(#mh-ah)"/>`;
+ s+=box(14,140,64,50,"X");s+=`<text x="46" y="208" text-anchor="middle" class="svgs" font-size="11">(T, d)</text>`;
+ const P=[["W","Q","var(--q)",40],["W","K","var(--k)",140],["W","V","var(--v)",240]];
+ P.forEach(([a,b,c,y])=>{s+=ar(78,165,118,y+23);s+=`<rect x="120" y="${y}" width="96" height="46" rx="9" fill="var(--card)" stroke="${c}" stroke-width="2"/><text x="168" y="${y+28}" text-anchor="middle" font-family="var(--sans)" font-size="13.5" font-weight="700" fill="var(--ink)">X·${a}<tspan font-size="10" dy="4">${b}</tspan></text>`;
+  for(let i=0;i<H;i++){s+=`<rect x="${236+i*22}" y="${y+8}" width="20" height="30" rx="3" fill="${c}" opacity="${0.35+0.15*i}"/>`;}
+  s+=ar(216,y+23,234,y+23);});
+ s+=`<text x="280" y="22" text-anchor="middle" class="svgs" font-size="11.5">split into ${H} slices of d<tspan font-size="9" dy="3">k</tspan></text>`;
+ const hy=[22,100,178,256];
+ hy.forEach((y,i)=>{P.forEach(([a,b,c,py],pi)=>{s+=ar(236+i*22+10,py+38,404,y+16+pi*12,0.45);});
+  s+=`<rect x="406" y="${y}" width="150" height="56" rx="10" fill="var(--card)" stroke="${HC[i]}" stroke-width="2"/><text x="481" y="${y+22}" text-anchor="middle" font-family="var(--sans)" font-size="13" font-weight="700" fill="${HC[i]}">head ${i+1}</text><text x="481" y="${y+42}" text-anchor="middle" font-family="var(--sans)" font-size="11.5" fill="var(--ink2)">softmax(q kᵀ/√d<tspan font-size="8.5" dy="3">k</tspan><tspan dy="-3">) v</tspan></text>`;
+  s+=ar(556,y+28,586,70+i*50);});
+ for(let i=0;i<H;i++)s+=`<rect x="588" y="${48+i*50}" width="30" height="46" fill="${HC[i]}" opacity=".75" stroke="var(--card)" stroke-width="2"/>`;
+ s+=`<text x="603" y="40" text-anchor="middle" class="svgs" font-size="11.5">concat</text>`;
+ s+=ar(618,145,640,145);s+=box(642,120,60,50,"W<tspan font-size='10' dy='4'>O</tspan>","var(--ink2)");s+=ar(702,145,722,145);
+ s+=`<text x="740" y="150" text-anchor="middle" font-family="var(--sans)" font-size="13.5" font-weight="700" fill="var(--ink)">out</text><text x="740" y="208" text-anchor="middle" class="svgs" font-size="11">(T, d)</text>`;
+ svg.innerHTML=s;
+})();
+
+/* ---------- Figure 3: split calculator ---------- */
+(function(){
+ const svg=$("#mh-split-svg");if(!svg)return;const Hs=$("#mh-split-h"),Ns=$("#mh-split-n"),info=$("#mh-split-info"),seg=$("#mh-split-pre");
+ const PRE={toy:{d:12,h:3,L:1,bias:false,name:"Toy model",lay:"1 layer"},base:{d:512,h:8,L:6,bias:false,name:"Transformer base",lay:"6 encoder layers"},gpt2:{d:768,h:12,L:12,bias:true,name:"GPT-2 small",lay:"12 layers"},llama:{d:4096,h:32,L:32,bias:false,name:"Llama 2 7B",lay:"32 layers"}};
+ let cur="gpt2",divs=[];
+ function setPre(k){cur=k;const p=PRE[k];divs=[];for(let i=1;i<=p.d;i++)if(p.d%i===0)divs.push(i);Hs.max=divs.length-1;Hs.value=divs.indexOf(p.h);
+  seg.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.v===k?"true":"false"));draw();}
+ function draw(){const p=PRE[cur],h=divs[+Hs.value],d=p.d,dk=d/h,T=2**(+Ns.value);$("#mh-split-hv").value=h;$("#mh-split-nv").value=T.toLocaleString("en-US");
+  let s=`<text x="20" y="22" class="svgs" font-size="13">One token’s query vector, d<tspan font-size="9.5" dy="3">model</tspan><tspan dy="-3"> = ${d}, cut into ${h} head${h>1?"s":""} of d</tspan><tspan font-size="9.5" dy="3">k</tspan><tspan dy="-3"> = ${dk}</tspan></text>`;
+  const x0=20,W=640,y0=34,hh=36,sw=W/h;
+  if(h<=128){for(let i=0;i<h;i++){s+=`<rect x="${(x0+i*sw).toFixed(2)}" y="${y0}" width="${Math.max(0.6,sw-(h>64?0.3:1)).toFixed(2)}" height="${hh}" fill="${HC[i%HC.length]}" opacity=".8"/>`;if(sw>=44)s+=`<text x="${(x0+i*sw+sw/2).toFixed(1)}" y="${y0+23}" text-anchor="middle" font-family="var(--sans)" font-size="12" font-weight="700" fill="var(--paper)">h${i+1}</text>`;}}
+  else{s+=`<rect x="${x0}" y="${y0}" width="${W}" height="${hh}" fill="var(--t1)" opacity=".25"/>`;for(let i=0;i<h;i+=Math.ceil(h/128)){s+=`<line x1="${(x0+i*sw).toFixed(2)}" y1="${y0}" x2="${(x0+i*sw).toFixed(2)}" y2="${y0+hh}" stroke="var(--t1)" stroke-width=".5"/>`;}}
+  if(d<=64)for(let j=1;j<d;j++)s+=`<line x1="${(x0+j*W/d).toFixed(1)}" y1="${y0}" x2="${(x0+j*W/d).toFixed(1)}" y2="${y0+hh}" stroke="var(--card)" stroke-width="1"/>`;
+  s+=`<rect x="${x0}" y="${y0}" width="${W}" height="${hh}" fill="none" stroke="var(--ink2)" stroke-width="1.2"/>`;
+  const shp=[["input","(B, "+T+", "+d+")"],["view","(B, "+T+", "+h+", "+dk+")"],["transpose","(B, "+h+", "+T+", "+dk+")"],["scores QKᵀ","(B, "+h+", "+T+", "+T+")"]];
+  shp.forEach(([a,b],i)=>{const x=20+i*165;s+=`<rect x="${x}" y="100" width="148" height="52" rx="9" fill="var(--card)" stroke="${i===3?"var(--k)":"var(--rule)"}" stroke-width="1.5"/><text x="${x+74}" y="119" text-anchor="middle" font-family="var(--sans)" font-size="12" fill="var(--muted)">${a}</text><text x="${x+74}" y="140" text-anchor="middle" font-family="var(--mono)" font-size="${b.length>20?10.5:12}" fill="var(--ink)">${b}</text>`;if(i<3)s+=`<path d="M${x+150} 126 H${x+162}" stroke="var(--muted)" stroke-width="1.5"/>`;});
+  const nm=Math.min(h,48);s+=`<text x="20" y="182" class="svgs" font-size="12.5">score maps for one sequence and one layer: ${h} × (${T} × ${T})</text>`;
+  for(let i=0;i<nm;i++){s+=`<rect x="${20+i*13.2}" y="194" width="11" height="11" rx="1.5" fill="${HC[i%HC.length]}" opacity=".75"/>`;}
+  if(h>nm)s+=`<text x="${24+nm*13.2}" y="204" class="svgs" font-size="12">+ ${h-nm} more</text>`;
+  s+=`<text x="20" y="236" class="svgs" font-size="12">B = batch size, T = sequence length. View and transpose only change how the axes are read.</text>`;
+  svg.innerHTML=s;
+  const P4=4*d*d,Pb=P4+4*d,proj=8*d*d,att=4*T*d,sc=h*T*T;
+  info.innerHTML=`<b>${p.name}</b>: d<sub>k</sub> = ${d} / ${h} = <b>${dk}</b>. Weights per layer: 4·d² = <b>${big(P4)}</b>${p.bias?` (${big(Pb)} with biases)`:""}; over ${p.lay}: ${human((p.bias?Pb:P4)*p.L)}. FLOPs per token per layer: projections 8d² = ${human(proj)}, attention 4Td = ${human(att)}: <b>the same for every h</b>. Score maps: ${big(sc)} entries, <b>${bytes(2*sc)}</b> in BF16 if stored.`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;setPre(b.dataset.v);});
+ [Hs,Ns].forEach(e=>e.addEventListener("input",draw));setPre("gpt2");
+})();
+
+/* ---------- Figure 4: forward pass by hand ---------- */
+(function(){
+ const svg=$("#mh-step-svg");if(!svg)return;const info=$("#mh-step-info");
+ const X=[[2,0,1,0],[0,2,0,1],[1,1,1,1]];
+ const WQ=[[1,0,1,0],[0,1,0,1],[0,0,0,0],[0,0,0,0]],WK=[[1,0,0,1],[0,1,1,0],[0,0,0,0],[0,0,0,0]],WV=[[0,0,1,0],[0,0,0,1],[1,0,0,0],[0,1,0,0]];
+ const WO=[[1,0,1,0],[0,1,0,1],[1,0,-1,0],[0,1,0,-1]].map(r=>r.map(v=>v/2));
+ const Q=matmul(X,WQ),K=matmul(X,WK),V=matmul(X,WV);const dk=2,sq=Math.sqrt(dk);
+ const Qh=[cols(Q,0,2),cols(Q,2,4)],Kh=[cols(K,0,2),cols(K,2,4)],Vh=[cols(V,0,2),cols(V,2,4)];
+ const S=Qh.map((q,i)=>matmul(q,T_(Kh[i])).map(r=>r.map(v=>v/sq)));const A=S.map(Si=>Si.map(r=>sm(r)));const O=A.map((a,i)=>matmul(a,Vh[i]));
+ const C=O[0].map((r,t)=>r.concat(O[1][t]));const Y=matmul(C,WO);
+ R.__mhStep={Q,K,V,S,A,O,C,Y};
+ const tint=(c)=>`color-mix(in srgb,${c} 18%,var(--card))`;
+ function mat(x,y,M,title,o){o=o||{};const cw=o.cw||44,ch=24;let s=`<text x="${x+M[0].length*cw/2}" y="${y-8}" text-anchor="middle" font-family="var(--sans)" font-size="13" font-weight="700" fill="${o.tc||"var(--ink)"}">${title.replace(/_([A-Z])/g,'<tspan font-size="10" dy="4">$1</tspan><tspan dy="-4"> </tspan>')}</text>`;
+  M.forEach((r,i)=>r.forEach((v,j)=>{const f=o.heat?`color-mix(in srgb,${o.heat} ${Math.round(v*85)}%,var(--card))`:o.cc?tint(o.cc(j)):"var(--card)";
+   s+=`<rect x="${x+j*cw}" y="${y+i*ch}" width="${cw}" height="${ch}" fill="${f}" stroke="var(--rule)" stroke-width="1"/><text x="${x+j*cw+cw/2}" y="${y+i*ch+16}" text-anchor="middle" font-family="var(--mono)" font-size="${o.fs||11.5}" fill="var(--ink)">${fmtN(v)}</text>`;}));
+  return s;}
+ const hc=j=>j<2?HC[0]:HC[1];
+ const steps=[
+  ()=>({g:mat(14,40,X,"X (3 tokens × 4)",{cw:36})+mat(184,40,WQ,"W_Q",{cw:36,cc:hc,tc:"var(--q)"})+mat(354,40,WK,"W_K",{cw:36,cc:hc,tc:"var(--k)"})+mat(524,40,WV,"W_V",{cw:36,cc:hc,tc:"var(--v)"}),
+   t:"The input X: 3 tokens, d<sub>model</sub> = 4. Each projection is 4 × 4. Columns 1–2 of every W will feed head 1, columns 3–4 head 2 (the tint)."}),
+  ()=>({g:mat(30,50,Q,"Q = X W_Q",{cc:hc,tc:"var(--q)"})+mat(270,50,K,"K = X W_K",{cc:hc,tc:"var(--k)"})+mat(510,50,V,"V = X W_V",{cc:hc,tc:"var(--v)"}),
+   t:`One big matrix multiply per projection. Token 1: q = (${Q[0].map(fmtN).join(", ")}), k = (${K[0].map(fmtN).join(", ")}), v = (${V[0].map(fmtN).join(", ")}).`}),
+  ()=>({g:`<text x="190" y="22" text-anchor="middle" font-family="var(--sans)" font-size="13.5" font-weight="700" fill="${HC[0]}">head 1</text><text x="560" y="22" text-anchor="middle" font-family="var(--sans)" font-size="13.5" font-weight="700" fill="${HC[1]}">head 2</text>`+
+    [0,1].map(h=>{const x=h?440:70;return mat(x,60,Qh[h],"Q"+(h+1),{cc:()=>HC[h],tc:"var(--q)"})+mat(x+100,60,Kh[h],"K"+(h+1),{cc:()=>HC[h],tc:"var(--k)"})+mat(x+200,60,Vh[h],"V"+(h+1),{cc:()=>HC[h],tc:"var(--v)"});}).join(""),
+   t:"Split: head 1 takes columns 1–2 of Q, K and V; head 2 takes columns 3–4. In code this is a reshape (T, 4) → (T, 2, 2) and a transpose. No numbers change."}),
+  ()=>({g:mat(80,60,S[0],"S1 = Q1 K1ᵀ / √2",{cw:60,cc:()=>HC[0]})+mat(450,60,S[1],"S2 = Q2 K2ᵀ / √2",{cw:60,cc:()=>HC[1]}),
+   t:`Scores, one 3 × 3 map per head, scaled by √d<sub>k</sub> = √2 (not √4). Token 1, head 1: (${S[0][0].map(fmtN).join(", ")}); head 2: (${S[1][0].map(fmtN).join(", ")}).`}),
+  ()=>({g:mat(80,60,A[0],"A1 = softmax(S1)",{cw:60,heat:HC[0]})+mat(450,60,A[1],"A2 = softmax(S2)",{cw:60,heat:HC[1]}),
+   t:`Softmax per row. Head 1: tokens 1 and 2 attend to <b>themselves</b> (${A[0][0][0].toFixed(3)}). Head 2: they attend to <b>each other</b> (${A[1][0][1].toFixed(3)}). Token 3 spreads 1/3 everywhere in both heads.`}),
+  ()=>({g:mat(80,60,A[0],"A1",{cw:54,heat:HC[0]})+mat(260,60,O[0],"head1 = A1 V1",{cc:()=>HC[0]})+mat(400,60,A[1],"A2",{cw:54,heat:HC[1]})+mat(580,60,O[1],"head2 = A2 V2",{cc:()=>HC[1]}),
+   t:`Each head averages its own values. Token 1: head<sub>1</sub> = (${O[0][0].map(fmtN).join(", ")}), head<sub>2</sub> = (${O[1][0].map(fmtN).join(", ")}).`}),
+  ()=>({g:mat(270,60,C,"Concat(head1, head2)",{cw:52,cc:hc}),
+   t:`Concatenate: back to shape (3, 4). Token 1: (${C[0].map(fmtN).join(", ")}). In code: transpose back and reshape.`}),
+  ()=>({g:mat(20,60,C,"Concat",{cw:46,cc:hc})+mat(250,60,WO,"W_O",{cw:46})+mat(500,60,Y,"output = Concat · W_O",{cw:52}),
+   t:`W<sub>O</sub> mixes the heads. Here it writes their average into dimensions 1–2 and half their difference into 3–4. Token 1 output: <b>(${Y[0].map(fmtN).join(", ")})</b>.`})];
+ function draw(k){const st=steps[k]();svg.innerHTML=st.g;info.innerHTML=st.t;}
+ B.stepper({n:steps.length,prev:$("#mh-step-prev"),next:$("#mh-step-next"),play:$("#mh-step-play"),label:$("#mh-step-lab"),ms:2800,onStep:draw});
+})();
+
+/* ---------- Figure 5: heads on a sentence ---------- */
+(function(){
+ const svg=$("#mh-sent-svg");if(!svg)return;const box=$("#mh-sent-toks"),av=$("#mh-sent-avg"),info=$("#mh-sent-info");
+ const W="The animal did not cross the street because it was tired".split(" ");const n=W.length;
+ const NAMES=["previous token","coreference","verb → subject","first token (sink)"];
+ const SUBJ={2:1,4:1,9:8,10:8};
+ function logit(hd,i,j){if(hd===0)return j===i-1?5:0;if(hd===1){if(i===8)return j===1?5:j===6?2.5:0;return j===i?2:0;}
+  if(hd===2){if(i in SUBJ)return j===SUBJ[i]?5:0;return j===0?2:0;}return j===0?4:0;}
+ const row=(hd,i)=>sm(Array.from({length:i+1},(_,j)=>logit(hd,i,j)));
+ let q=8;
+ box.innerHTML=W.map((w,i)=>`<button type="button" data-i="${i}" aria-pressed="${i===q}">${esc(w)}</button>`).join("");
+ function draw(){box.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",+b.dataset.i===q?"true":"false"));
+  const rows=[0,1,2,3].map(h=>row(h,q));const avg=rows[0].map((_,j)=>rows.reduce((s,r)=>s+r[j],0)/4);
+  const show=av.checked?rows.concat([avg]):rows;const cw=50,x0=128,y0=46,rh=40;
+  let s=W.map((w,j)=>`<text x="${x0+j*cw+cw/2}" y="${y0-14}" text-anchor="middle" font-family="var(--sans)" font-size="12" font-weight="${j===q?700:500}" fill="${j===q?"var(--q)":"var(--ink2)"}">${esc(w)}</text>`).join("");
+  show.forEach((r,h)=>{const y=y0+h*rh+(h===4?8:0);const c=h<4?HC[h]:"var(--ink2)";s+=`<text x="${x0-8}" y="${y+24}" text-anchor="end" font-family="var(--sans)" font-size="12" font-weight="700" fill="${c}">${h<4?NAMES[h]:"average of 4"}</text>`;
+   for(let j=0;j<n;j++){if(j>q){s+=`<rect x="${x0+j*cw}" y="${y}" width="${cw-2}" height="${rh-4}" rx="4" fill="var(--paper2)"/>`;continue;}
+    const p=r[j];s+=`<rect x="${x0+j*cw}" y="${y}" width="${cw-2}" height="${rh-4}" rx="4" fill="color-mix(in srgb,${c} ${Math.round(p*90)}%,var(--card))" stroke="var(--rule)" stroke-width=".8"/>`;
+    if(p>=0.05)s+=`<text x="${x0+j*cw+cw/2-1}" y="${y+23}" text-anchor="middle" font-family="var(--mono)" font-size="11.5" fill="${p>0.55?"var(--paper)":"var(--ink)"}">${p.toFixed(2)}</text>`;}});
+  svg.setAttribute("viewBox",`0 0 690 ${av.checked?270:225}`);svg.innerHTML=s;
+  const top=r=>{let b=0;r.forEach((v,j)=>{if(v>r[b])b=j;});return b;};
+  info.innerHTML=`Query <b>${esc(W[q])}</b>: `+rows.map((r,h)=>{const b=top(r);return `${NAMES[h]} → <b>${esc(W[b])}</b> ${r[b].toFixed(3)}`;}).join("; ")+(av.checked?`. One averaging head: top weight ${avg[top(avg)].toFixed(3)} on <b>${esc(W[top(avg)])}</b>${q===8?`, only ${avg[1].toFixed(3)} on animal`:""}.`:".");}
+ box.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;q=+b.dataset.i;draw();});av.addEventListener("change",draw);draw();
+})();
+})();
+</script></body></html>

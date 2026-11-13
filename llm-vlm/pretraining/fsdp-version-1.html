@@ -1,0 +1,536 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>FSDP (version 1) · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 46</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="fsdp-version-1">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="fsdp-version-1" data-session="fsdp-version-1" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">46</span><span>Track 3: Pretraining and scale · session 16 of 22</span></div><h1 class="chap-title">FSDP (version 1)</h1><p class="chap-sub">DDP keeps a full copy of the model, its gradients and its optimizer states on every GPU, so a 7B model needs about 108 GB per GPU before any activation. FSDP is PyTorch's built-in way to shard all of this across GPUs: each GPU keeps only a slice, and gathers the full weights of one block just before it needs them. This session shows how FSDP (version 1) does it: the FlatParameter, the all-gather and reduce-scatter schedule, wrapping, prefetching, sharding strategies, mixed precision and CPU offload.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 38, 43, 44 and 45 (memory math for training, collective communication, DDP, ZeRO)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How FSDP turns ZeRO stage 3 into a PyTorch wrapper: FSDP units, and the FlatParameter that flattens, pads and shards each unit</li><li>The schedule of one training step: all-gather, compute, free in the forward pass; all-gather, gradients, reduce-scatter in the backward pass</li><li>Why full sharding sends 1.5 times the bytes of DDP, and why the root unit is not gathered twice</li><li>How the wrapping policy sets peak memory and the number of collectives, with real numbers for Llama 2 7B</li><li>Backward prefetching (BACKWARD_PRE, BACKWARD_POST), forward prefetching and the rate limiter, and how they hide communication</li><li>The sharding strategies FULL_SHARD, SHARD_GRAD_OP, NO_SHARD, HYBRID_SHARD and _HYBRID_SHARD_ZERO2, and when to use each</li><li>MixedPrecision (param, reduce and buffer dtypes), CPU offload, state dicts, and the bugs people hit most often</li></ul></div></header><style>
+.fs1-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.fs1-grid input[type=range]{width:100%}
+.fs1-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.fs1-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c);border:1px solid var(--muted)}
+.fs1-rank{cursor:pointer}
+.fs1-rank:focus{outline:none}
+.fs1-rank:focus rect.fs1-hit{stroke:var(--tc);stroke-width:2.5}
+[data-session="fsdp-version-1"] pre.code{font-variant-ligatures:none}
+[data-session="fsdp-version-1"] :not(pre)>code{overflow-wrap:anywhere}
+[data-session="fsdp-version-1"] svg text:not([font-family]){font-family:var(--sans)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../pretraining/index.html#row-data-parallelism-ddp" title="Data parallelism (DDP) (planned)">session 44</a> every GPU holds the full model, the full gradients and the full optimizer states. For mixed-precision AdamW that is 16 bytes per parameter. Llama 2 7B has 6.74 billion parameters, so DDP needs about 108 GB per GPU before a single activation is stored. An 80 GB GPU cannot do it, however many GPUs you buy.</p>
+<p><a href="../pretraining/index.html#row-zero-stages-1-2-and-3" title="ZeRO stages 1, 2 and 3 (planned)">Session 45</a> showed the cure: do not replicate, <b>shard</b>. Each of \(F\) GPUs keeps only \(1/F\) of the weights, gradients and optimizer states, and the GPUs pass weights to each other just in time. <b>FSDP</b> (Fully Sharded Data Parallel) is PyTorch’s own implementation of this idea (ZeRO stage 3). On 8 GPUs, the same 7B model needs about 13.5 GB of model states per GPU instead of 108 GB.</p>
+<p>This session is about the first version of FSDP: the <code>FullyShardedDataParallel</code> wrapper described by Zhao et al. (2023). Its main data structure is the <b>FlatParameter</b>. The next session, <a href="../pretraining/index.html#row-fsdp2-per-parameter-sharding-with-dtensor" title="FSDP2: per-parameter sharding with DTensor (planned)">session 47</a>, replaces it with per-parameter sharding. You need to know version 1 well for three reasons. A lot of training code (Hugging Face Accelerate, older Lightning and many research repositories) still uses it [Likely]. Its ideas (units, all-gather and reduce-scatter, prefetching) are the same in FSDP2. And interviewers love to ask about it.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “What happens in the forward and backward pass of FSDP?”, “How much more communication than DDP?”, “What is the difference between FULL_SHARD and SHARD_GRAD_OP?”, “Why wrap each transformer block separately?”, “When do you use HYBRID_SHARD?”. Each one is answered with numbers below.</aside>
+<p>How well does it work? In the FSDP paper, a 175B GPT model trained on 128 to 512 A100 GPUs reached more than 173 TFLOPS per GPU with batch size 1 and 186 with batch size 2, about 55% and 60% of the A100’s 312 TFLOPS BF16 peak, and scaled almost linearly in TFLOPS from 128 to 512 GPUs. [Certain] For small models (611M and 2.28B parameters) it was as fast as DDP, and it trained an 11B T5 model where DDP ran out of memory. [Certain]</p>
+
+<h2>From ZeRO-3 to FSDP: the idea in one picture</h2>
+<p>Let \(\Psi\) be the number of parameters, and \(F\) the <b>sharding factor</b>: the number of GPUs (ranks) that share one copy of the model. With mixed-precision AdamW, the model states cost 16 bytes per parameter (<a href="../pretraining/index.html#row-memory-math-for-training" title="Memory math for training (planned)">session 38</a>). DDP keeps all of them on every GPU. FSDP with full sharding keeps \(1/F\) of them:</p>
+<div class="eq">\[ M_{\text{DDP}} = 16\,\Psi \ \text{bytes per GPU}, \qquad M_{\text{FSDP}} \approx \frac{16\,\Psi}{F} + M_{\text{unsharded}} \tag{46.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\Psi\)</dt><dd>number of parameters of the model (6.74 billion for Llama 2 7B)</dd>
+<dt>\(F\)</dt><dd>sharding factor: how many GPUs split one copy of the model. With full sharding, \(F\) is the number of GPUs.</dd>
+<dt>16</dt><dd>bytes per parameter: FP32 weights (4), FP32 gradients (4), Adam \(m\) and \(v\) (4 + 4)</dd>
+<dt>\(M_{\text{unsharded}}\)</dt><dd>the extra memory for the few layers whose full weights are gathered right now. FSDP keeps this small by gathering only one block at a time.</dd></dl>
+<p>But a GPU cannot multiply by weights it does not have. So before a layer runs, the GPUs do an <b>all-gather</b>: every GPU sends its slice to everyone, and every GPU ends up with the full weights of that layer. After the layer runs, the full weights are thrown away again. In the backward pass, each GPU computes gradients for the full layer from its own data, and a <b>reduce-scatter</b> sums the gradients over GPUs and leaves each GPU with only the summed gradient of its own slice (<a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">session 43</a>). Each GPU then runs the optimizer step on its own slice only.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Eight neighbors share one big set of tools. Each neighbor stores only one eighth of the tools in their own shed. When the group starts a job (a layer), everyone brings their tools to the street, uses the full set, and then takes their own tools home again. Nobody needs a shed big enough for all the tools. The price is the walking back and forth: that is the communication.</aside>
+<p>Two engineering questions decide whether this is fast: <b>in what pieces</b> do we gather the weights, and <b>when</b> do we start each transfer so that it hides behind computation. The rest of the session answers both.</p>
+
+<h2>FSDP units and the FlatParameter</h2>
+<p>FSDP does not gather one tensor at a time. A transformer block has about ten weight tensors (attention projections, MLP matrices, norm weights), and one collective per tensor would be slow: every collective has a fixed launch cost, and small messages use the network badly. In the paper’s measurements, with the same total amount of data, all-gather time began to rise quickly once each all-gather moved fewer than about 33 million elements. [Certain] NCCL’s fastest all-gather also wants the same input size on every rank.</p>
+<p>So FSDP groups modules into <b>FSDP units</b>. You choose them: usually one unit per transformer block, plus a <b>root</b> unit (the outermost wrapper) that takes all leftover parameters, such as the embedding and the output head. For each unit, FSDP builds one <b>FlatParameter</b>:</p>
+<ol><li><b>Flatten</b> every parameter of the unit into a 1-D vector.</li>
+<li><b>Concatenate</b> them into one long 1-D vector of \(\psi\) elements.</li>
+<li><b>Pad</b> with zeros on the right so the length is divisible by \(F\).</li>
+<li><b>Chunk</b> it into \(F\) equal pieces. Rank \(r\) keeps piece \(r\) and frees the rest.</li></ol>
+<div class="eq">\[ \tilde\psi = F \left\lceil \frac{\psi}{F} \right\rceil, \qquad \text{shard size} = \frac{\tilde\psi}{F}, \qquad \text{padding} = \tilde\psi - \psi \le F - 1 \tag{46.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\psi\)</dt><dd>number of elements in all parameters of one unit together</dd>
+<dt>\(\tilde\psi\)</dt><dd>the padded length, the smallest multiple of \(F\) that is at least \(\psi\)</dd>
+<dt>\(\lceil x \rceil\)</dt><dd>round up to the next whole number</dd></dl>
+<p>The original parameters (for example <code>weight</code> of shape 3 × 4) become <b>views</b> into the FlatParameter: they share its memory. When the FlatParameter is unsharded, FSDP points each original parameter at its slice of the full vector, so normal PyTorch code runs unchanged. The gradient of the FlatParameter has the same layout. This layout is exactly what all-gather writes and reduce-scatter reads, so neither needs an extra copy. [Certain] Figure 1 builds a FlatParameter for small units.</p>
+<figure class="fig wide" id="fs1-flat"><div class="fig-body">
+<div class="controls"><span class="seg" id="fs1-flat-unit"><button type="button" data-v="0" aria-pressed="true">Linear(4, 3)</button><button type="button" data-v="1" aria-pressed="false">LayerNorm(4) + Linear(4, 6)</button><button type="button" data-v="2" aria-pressed="false">Linear(3, 4) + Linear(4, 2)</button></span></div>
+<div class="controls"><span style="font:500 14px var(--sans);color:var(--muted)">Ranks F:</span><span class="seg" id="fs1-flat-f"><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="3" aria-pressed="false">3</button><button type="button" data-v="4" aria-pressed="true">4</button><button type="button" data-v="8" aria-pressed="false">8</button><button type="button" data-v="16" aria-pressed="false">16</button></span></div>
+<div class="scroll-x"><svg id="fs1-flat-svg" viewBox="0 0 780 300" role="img" aria-label="Original parameters flattened into one vector, padded, and split into one equal shard per rank"></svg></div>
+<div class="readout" id="fs1-flat-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Building a FlatParameter. Top: the original parameters, each in its own color. Middle: flattened and concatenated into one vector, with gray zero padding at the end. Bottom: the vector cut into \(F\) equal shards, one per rank. Click (or Tab to and press Enter on) a rank to see what it stores.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with Linear(4, 3) and \(F = 16\): 12 weight numbers plus 3 bias numbers make 15, so FSDP adds 1 zero and each rank holds exactly one number. This is the example in the FSDP paper. Now pick \(F = 3\) for the two-layer unit: 26 numbers, 1 padding, 9 per rank. Notice that a shard does not respect parameter borders. A rank may hold half of a weight matrix and a piece of a bias. That is why, in FSDP1, “the part of <code>weight</code> on rank 2” is not a clean tensor, and why per-parameter tricks (freezing one tensor, a different learning rate for one tensor) are awkward. FSDP2 fixes exactly this.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 1: build and shard the FlatParameter of one FSDP unit</div><ol>
+<li><b>input:</b> the parameters \(p_1, \dots, p_k\) of one unit, sharding factor \(F\), this rank’s index \(r\)</li>
+<li>\(\text{flat} \leftarrow \text{concat}(\text{flatten}(p_1), \dots, \text{flatten}(p_k))\) <span class="c">// length \(\psi\)</span></li>
+<li>append \(\tilde\psi - \psi\) zeros to flat <span class="c">// formula (46.2), at most \(F - 1\) zeros</span></li>
+<li>\(\text{shard}_r \leftarrow \text{flat}[\,r\tilde\psi/F : (r+1)\tilde\psi/F\,]\); free the rest of flat</li>
+<li>remember each \(p_i\)’s offset and shape, so it can later be a view into the unsharded flat vector</li>
+<li>the optimizer receives \(\text{shard}_r\) (one 1-D tensor) instead of \(p_1, \dots, p_k\)</li></ol></div>
+<aside class="note watch side"><span class="nt">Watch out</span>Because the optimizer sees one flat shard per unit, every parameter inside a unit must share the same optimizer settings, the same dtype and the same <code>requires_grad</code>, unless you pass <code>use_orig_params=True</code>. Then FSDP shows the optimizer the original parameters (each one is a view into the shard, possibly empty on some ranks). [Certain]</aside>
+
+<h2>One training step: all-gather, compute, free</h2>
+<p>With full sharding, every non-root unit goes through the same life in each training step:</p>
+<ul><li><b>Forward:</b> all-gather the unit’s FlatParameter, run the unit’s forward, free the full weights (keep only the local shard).</li>
+<li><b>Backward:</b> all-gather the unit again (it was freed), compute the gradients for the full unit, reduce-scatter the gradients so each rank keeps the summed gradient of its own shard, free the full weights and full gradients.</li>
+<li><b>Optimizer step:</b> each rank updates only its own shard, with its own shard of the Adam states. No communication.</li></ul>
+<p>The root unit is special. It is gathered at the start of the forward pass and <b>kept</b> until the backward pass is done, because the backward pass begins right where the forward pass ended: freeing it and gathering it again at once would be pure waste. [Certain] This saves one all-gather per step.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: one FSDP training step with FULL_SHARD, seen from rank \(r\)</div><ol>
+<li><b>input:</b> units \(U_0\) (root), \(U_1, \dots, U_N\); local shards; this rank’s micro-batch \(x_r\)</li>
+<li>all-gather \(U_0\) <span class="c">// root stays unsharded for the whole step</span></li>
+<li><b>for</b> \(i = 1, \dots, N\): all-gather \(U_i\); run forward of \(U_i\); free \(U_i\)’s full weights <span class="c">// activations are kept</span></li>
+<li>finish the root’s forward (for example the output head) and compute the loss on \(x_r\)</li>
+<li>start backward; the root’s full gradient buffer is allocated when the head’s gradient is computed</li>
+<li><b>for</b> \(i = N, \dots, 1\): all-gather \(U_i\); compute gradients of \(U_i\); reduce-scatter them (average over ranks); free full weights and full gradients</li>
+<li>finish the root’s backward; reduce-scatter the root’s gradients; free the root’s full weights</li>
+<li>optimizer step on the local shards only <span class="c">// sharded Adam states, no communication</span></li></ol></div>
+<p>Step through it in Figure 2. The model has a root and three blocks of 100 million parameters each, on 4 GPUs, with BF16 for the gathered weights and gradients.</p>
+<figure class="fig wide" id="fs1-step"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="fs1-step-prev">Back</button><button type="button" class="btn primary" id="fs1-step-play">Play</button><button type="button" class="btn" id="fs1-step-next">Next</button><span id="fs1-step-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="fs1-step-svg" viewBox="0 0 780 300" role="img" aria-label="State of each FSDP unit on GPU 0 during one training step"></svg></div>
+<div class="fs1-leg"><span style="--c:var(--q-soft)">local shard only (1/4)</span><span style="--c:var(--q)">full weights gathered (BF16)</span><span style="--c:var(--k)">full gradients (BF16)</span><span style="--c:var(--v)">gradient shard after reduce-scatter</span></div>
+<div class="readout" id="fs1-step-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> One FULL_SHARD training step as seen by GPU 0 of 4. Each column is one FSDP unit (100M parameters each). The bar under the units is GPU 0’s parameter-related memory: the fixed 1.6 GB of sharded model states plus whatever is gathered right now. Activations are not shown.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Watch the memory bar. In the forward pass it rises by 0.2 GB for one block at a time and falls back. In the backward pass a block needs its weights <i>and</i> its full gradients, so it costs 0.4 GB while it runs. The root is the exception: its full weights stay from the first step to the last, and its full gradient buffer lives through the whole backward pass, because the root’s gradient is only complete when the embedding (the first layer) has its gradient. Count the collectives at the end: 7 all-gathers and 4 reduce-scatters, not 8 and 4, because the root is gathered once.</p></details></figure>
+<h3>How much does it communicate?</h3>
+<p>Count elements sent per GPU, with the ring algorithms from <a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">session 43</a>. An all-gather or a reduce-scatter of \(\Psi\) elements over \(F\) ranks sends \(\Psi (F-1)/F\) per GPU, and an all-reduce sends twice that. DDP does one all-reduce of the gradients. Full sharding does one all-gather in the forward pass, one in the backward pass, and one reduce-scatter:</p>
+<div class="eq">\[ V_{\text{DDP}} = 2\,\Psi\,\frac{F-1}{F}, \qquad V_{\text{FULL\_SHARD}} = 3\,\Psi\,\frac{F-1}{F} = 1.5 \times V_{\text{DDP}} \tag{46.3} \]</div>
+<p>This is the 1.5× from the FSDP paper and from ZeRO stage 3. [Certain] The root skips one all-gather, so the real number is slightly below 1.5×. In Figure 2: 11 collectives of 150 MB each (\(100\text{M} \times 3/4 \times 2\) bytes) make 1.65 GB, while formula (46.3) for 400M parameters gives 1.8 GB. With BF16 communication (next sections), each element is 2 bytes.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>DDP is like every cook owning the full cookbook; they only phone each other at the end to agree on corrections (all-reduce). FSDP is like each cook owning a few pages: they must photocopy the pages for each dish twice (forward and backward) and then send back corrections for their own pages. More phone calls, much smaller kitchens.</aside>
+
+<h2>Peak memory and the wrapping policy</h2>
+<p>How you cut the model into units decides two things. Let the units have \(\psi_1, \dots, \psi_N\) elements, with \(\sum_i \psi_i = \Psi\). Every rank always keeps all its shards, and it has to hold the full weights of about one unit at a time. So the paper writes the parameter memory as [Certain]</p>
+<div class="eq">\[ M_{\text{param}} = O\!\left( \sum_{i=1}^{N} \frac{\psi_i}{F} + \max_{i} \psi_i \right), \qquad \text{collectives per step} = O(N) \tag{46.4} \]</div>
+<p>The first term is fixed (\(\Psi / F\)). Only the second term depends on the wrapping: smaller units give a smaller peak, but more and smaller collectives. That is FSDP’s memory–throughput trade-off, and you set it with the <code>auto_wrap_policy</code>:</p>
+<ul><li><b><code>transformer_auto_wrap_policy</code></b> with <code>transformer_layer_cls={LlamaDecoderLayer}</code> (or your block class): one unit per transformer block. This is the standard choice for LLMs. Everything not inside a block (embedding, final norm, output head) falls into the root.</li>
+<li><b><code>size_based_auto_wrap_policy</code></b>: wrap any submodule with at least <code>min_num_params</code> parameters (default \(10^8\)). [Certain] Simple, but its cuts may not follow the block structure.</li>
+<li><b>No policy</b>: the whole model is one unit. Then all-gathering “one unit” means all-gathering the whole model, and FSDP saves memory only on gradients and optimizer states: the peak is the full model again.</li></ul>
+<p>Figure 3 applies the same simple memory model to Llama 2 7B (32 blocks of 202.4M parameters; embedding and output head of 131.1M each, not tied).</p>
+<figure class="fig" id="fs1-wrap"><div class="fig-body">
+<div class="controls"><span class="seg" id="fs1-wrap-pol"><button type="button" data-v="whole" aria-pressed="false">No wrapping</button><button type="button" data-v="block" aria-pressed="true">Per block</button><button type="button" data-v="blockemb" aria-pressed="false">Per block + embeddings apart</button><button type="button" data-v="sub" aria-pressed="false">Attention and MLP apart</button></span></div>
+<div class="controls"><span style="font:500 14px var(--sans);color:var(--muted)">Backward prefetch:</span><span class="seg" id="fs1-wrap-pf"><button type="button" data-v="pre" aria-pressed="true">BACKWARD_PRE</button><button type="button" data-v="post" aria-pressed="false">BACKWARD_POST</button><button type="button" data-v="none" aria-pressed="false">None</button></span></div>
+<div class="fs1-grid"><label for="fs1-wrap-f">GPUs (sharding factor F)</label><input type="range" id="fs1-wrap-f" min="0" max="6" step="1" value="1"><output id="fs1-wrap-fv"></output></div>
+<svg id="fs1-wrap-svg" viewBox="0 0 640 200" role="img" aria-label="Stacked bar of per-GPU memory: sharded model states and gathered working buffers"></svg>
+<div class="fs1-leg"><span style="--c:var(--q-soft)">sharded model states 16Ψ/F</span><span style="--c:var(--k)">root: full weights + full gradients</span><span style="--c:var(--q)">largest other unit(s), in flight</span></div>
+<div class="readout" id="fs1-wrap-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Peak parameter-related memory per GPU for Llama 2 7B with FULL_SHARD and BF16 gathering, for four ways to wrap the model. The model: sharded states \(16\Psi/F\), plus 2 bytes × (root weights + root gradients + \(k\) × largest other unit), where \(k = 3\) for BACKWARD_PRE and \(k = 2\) otherwise. Activations, temporary buffers and fragmentation are not included.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Start at 8 GPUs, per block: 13.48 GB sharded plus 2.26 GB in flight. Switch to “No wrapping”: the in-flight part jumps to 27 GB, because the whole model is gathered with its gradients. Now slide to 64 GPUs. The sharded part falls to 1.68 GB, but the in-flight part does not shrink at all: it depends on unit size, not on \(F\). At large scale, the wrapping is what decides your peak. Also notice the root: with per-block wrapping, the root (embedding + head, 262M) is <i>bigger</i> than a block (202M). Wrapping the embedding and the head as their own units drops the peak by about 1 GB [Likely]. The cost is the collective count shown in the readout.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: Llama 2 7B on 8 GPUs</div>
+<p>Parameters: each block has \(4d^2 = 67{,}108{,}864\) attention weights, \(3 d\, d_{ff} = 135{,}266{,}304\) MLP weights and \(2d = 8{,}192\) norm weights: 202,383,360. The embedding and the output head have \(32{,}000 \times 4{,}096 = 131{,}072{,}000\) each. Total: \(32 \times 202{,}383{,}360 + 2 \times 131{,}072{,}000 + 4{,}096 = 6{,}738{,}415{,}616\).</p>
+<p>DDP: \(16 \times 6.738 \times 10^9 = 107.8\) GB per GPU. FSDP, \(F = 8\): \(107.8 / 8 = 13.48\) GB of sharded states. Per-block wrapping with BACKWARD_PRE adds \(2 \times (2 \times 262.1\text{M} + 3 \times 202.4\text{M}) = 2.26\) GB, so about 15.7 GB, plus activations. That leaves most of an 80 GB GPU for activations.</p>
+<p>Communication per step and per GPU, formula (46.3) in BF16: \(3 \times 6.738 \times 10^9 \times 7/8 \times 2\) bytes \(= 35.4\) GB, against 23.6 GB for DDP’s all-reduce.</p></div>
+
+<h2>Hiding the communication: prefetching and the rate limiter</h2>
+<p>An all-gather takes time. If the GPU waits for each one, the step gets slower. FSDP runs all collectives on a separate CUDA <b>stream</b> (a queue of GPU work), so they can run while the compute stream is busy. But all of FSDP’s all-gathers and reduce-scatters go through <b>one</b> NCCL stream, so they run one after another, in the order the CPU issued them. [Certain] The order is everything.</p>
+<p><b>Forward pass.</b> The CPU usually runs ahead of the GPU, so the all-gather for block \(i+1\) is issued while block \(i\) still computes, and it overlaps naturally. If the CPU is slow (many small kernels), <code>forward_prefetch=True</code> issues the next all-gather explicitly before the current block’s forward. It uses the order of the previous step, so it is only for models whose execution order does not change. [Certain]</p>
+<p><b>Backward pass.</b> Here the natural order is bad. After block \(i\) computes its gradients, FSDP issues its reduce-scatter. Only then does autograd reach block \(i-1\) and ask for its all-gather. On a single NCCL stream the all-gather waits for the reduce-scatter, and the compute waits for the all-gather: two transfers in a row, fully exposed. The <code>backward_prefetch</code> option changes the issue order: [Certain]</p>
+<ul><li><b><code>BACKWARD_PRE</code></b> (the default): issue the all-gather of the next block <i>before</i> computing the current block’s gradients. Most overlap. At the peak, a rank holds the current weights, the next weights and the current gradients.</li>
+<li><b><code>BACKWARD_POST</code></b>: issue the next all-gather <i>after</i> the current gradients, but before the current reduce-scatter. Less overlap, less memory (the current weights are freed first).</li>
+<li><b><code>None</code></b>: no prefetching. Not recommended: it can be much slower.</li></ul>
+<p>FSDP knows which block comes “next” in the backward pass by recording the forward order and reversing it, freshly each step. [Certain] In the paper, backward prefetching made a 175B model about 18% faster on 128 to 512 GPUs. [Certain]</p>
+<p><b>The rate limiter.</b> If the CPU runs too far ahead, it issues many all-gathers at once. Their output buffers are allocated on the communication stream, and the PyTorch caching allocator cannot reuse those blocks for the compute stream until the GPU is done with them. Memory fills up, and the allocator falls back to slow <code>cudaFree</code> and <code>cudaMalloc</code> calls (“malloc retries”). <code>limit_all_gathers=True</code> (the default) blocks the CPU so that at most two units are gathered at a time: the one computing and the one prefetched. [Certain] In the paper it gave up to 5× speedups on T5-11B but cost about 5% on a DeepViT model, so check <code>torch.cuda.memory_stats()["num_alloc_retries"]</code> before you change it. [Certain]</p>
+<p>A simple model of step time: if \(T_{\text{comp}}\) is the pure compute time, the step takes</p>
+<div class="eq">\[ T_{\text{step}} = T_{\text{comp}} + T_{\text{exposed}}, \qquad T_{\text{exposed}} \ge \underbrace{t_{\text{AG}}}_{\text{first gather}} + \underbrace{t_{\text{RS}}}_{\text{last reduce-scatter}} \tag{46.5} \]</div>
+<p>The first all-gather and the last reduce-scatter can never be hidden; everything in between can be, if prefetching is on and each transfer is shorter than the compute it overlaps. Figure 4 simulates it for 4 blocks.</p>
+<figure class="fig" id="fs1-tl"><div class="fig-body">
+<div class="controls"><span class="seg" id="fs1-tl-mode"><button type="button" data-v="none" aria-pressed="false">No prefetch</button><button type="button" data-v="post" aria-pressed="false">BACKWARD_POST</button><button type="button" data-v="pre" aria-pressed="true">BACKWARD_PRE</button></span><label class="sl"><input type="checkbox" id="fs1-tl-lim" checked> Rate limiter (at most 2 units gathered)</label></div>
+<div class="fs1-grid"><label for="fs1-tl-a">Time of one all-gather (and one reduce-scatter)</label><input type="range" id="fs1-tl-a" min="0.1" max="2" step="0.1" value="0.6"><output id="fs1-tl-av"></output></div>
+<div class="scroll-x"><svg id="fs1-tl-svg" viewBox="0 0 780 200" role="img" aria-label="Timeline of compute and communication streams for one FSDP training step"></svg></div>
+<div class="fs1-leg"><span style="--c:var(--q)">forward compute (1 per block)</span><span style="--c:var(--k)">backward compute (2 per block)</span><span style="--c:var(--q-soft)">all-gather</span><span style="--c:var(--v-soft)">reduce-scatter</span></div>
+<div class="readout" id="fs1-tl-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A toy timeline of one step with 4 FSDP units. Forward compute takes 1 time unit per block, backward 2. All collectives share one NCCL stream (bottom lane), in the order FSDP issues them. Pure compute is 12 time units; the readout shows how much communication is still exposed.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At the default (transfer 0.6), no prefetch gives 17.4 time units: every backward block waits for a reduce-scatter and then an all-gather. BACKWARD_POST gives 15.6: only the all-gather waits. BACKWARD_PRE gives 13.8: only the first all-gather of each pass and the final reduce-scatter are exposed. Raise the transfer time above 1.0 and even BACKWARD_PRE cannot hide everything, because two transfers (a reduce-scatter and the next all-gather) must fit inside one block’s backward compute of 2. That is the regime of small batches and slow networks, where HYBRID_SHARD (next section) helps.</p></details></figure>
+
+<h2>Sharding strategies</h2>
+<p>Full sharding is not always the best choice. The <code>sharding_strategy</code> argument picks how much is sharded, and over how many GPUs: [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Strategy</th><th>What is sharded</th><th>Collectives per step</th><th>Like</th></tr></thead><tbody>
+<tr><td><code>FULL_SHARD</code> (default)</td><td>Weights, gradients, optimizer states over all \(W\) GPUs. Weights are freed after forward and gathered again for backward.</td><td>2 all-gathers + 1 reduce-scatter per unit</td><td>ZeRO-3</td></tr>
+<tr><td><code>SHARD_GRAD_OP</code></td><td>Gradients and optimizer states. Weights are sharded outside the step, but the gathered weights are <b>kept</b> from the forward pass until the end of the backward pass.</td><td>1 all-gather + 1 reduce-scatter per unit</td><td>ZeRO-2 (roughly)</td></tr>
+<tr><td><code>NO_SHARD</code></td><td>Nothing. Gradients are all-reduced.</td><td>1 all-reduce</td><td>DDP</td></tr>
+<tr><td><code>HYBRID_SHARD</code></td><td>FULL_SHARD inside each group of \(F\) GPUs (usually one node), replicated across groups</td><td>inside node: as FULL_SHARD; across nodes: 1 all-reduce of the gradient shard</td><td>ZeRO-3 + DDP</td></tr>
+<tr><td><code>_HYBRID_SHARD_ZERO2</code></td><td>SHARD_GRAD_OP inside each node, replicated across nodes</td><td>inside node: as SHARD_GRAD_OP; across nodes: 1 all-reduce</td><td>ZeRO-2 + DDP</td></tr></tbody></table></div>
+<p>SHARD_GRAD_OP trades memory for speed: it saves the second all-gather (one third of the communication) but keeps the full BF16 weights in memory during the whole step, \(2\Psi\) bytes. For Llama 2 7B that is 13.5 GB extra per GPU.</p>
+<h3>Hybrid sharding</h3>
+<p>Inside a node, GPUs talk over NVLink at hundreds of GB/s; between nodes, the network is usually several times slower (<a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>) [Likely]. Hybrid sharding uses this. With \(W\) GPUs in \(H = W/G\) nodes of \(G\) GPUs each, it shards over the \(G\) GPUs of one node (\(F = G\)) and keeps one full copy per node. The gradient sum is split into two steps, which is exact because addition can be grouped any way:</p>
+<div class="eq">\[ \sum_{r=1}^{W} \mathbf{g}_r = \sum_{i=1}^{H} \Big( \sum_{r \in S_i} \mathbf{g}_r \Big) \tag{46.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{g}_r\)</dt><dd>the gradient computed on rank \(r\) from its own data</dd>
+<dt>\(S_i\)</dt><dd>the sharding group \(i\): the \(G\) GPUs of node \(i\)</dd>
+<dt>\(H\)</dt><dd>number of sharding groups (nodes)</dd></dl>
+<p>The inner sum is a reduce-scatter inside the node. The outer sum is an all-reduce among the GPUs that hold the <i>same</i> shard, one per node (the “replication group”). Only that all-reduce crosses nodes, and it moves only a \(1/G\) slice of the gradients. With a ring over the \(H\) nodes, the bytes that leave each GPU through the network per step are</p>
+<div class="eq">\[ V_{\text{cross-node}}^{\text{HYBRID}} = 2\,\frac{\Psi}{G}\,\frac{H-1}{H} \qquad \text{vs.} \qquad V^{\text{FULL\_SHARD}} = 3\,\Psi\,\frac{W-1}{W} \ \text{(over the whole cluster)} \tag{46.7} \]</div>
+<p>The FSDP paper gives the same picture: hybrid sharding cuts cross-host traffic by roughly a factor \(G\) compared to full replication or full sharding. [Certain] The price is memory: each GPU holds \(16\Psi/G\) bytes of states, not \(16\Psi/W\). Hybrid sharding is a good fit for “medium” models that do not fit with DDP but do fit when sharded over one node. Figure 5 compares all five strategies.</p>
+<figure class="fig" id="fs1-strat"><div class="fig-body">
+<div class="fs1-grid">
+<label for="fs1-strat-p">Model size Ψ (billions)</label><input type="range" id="fs1-strat-p" min="0" max="8" step="1" value="3"><output id="fs1-strat-pv"></output>
+<label for="fs1-strat-w">Total GPUs W</label><input type="range" id="fs1-strat-w" min="0" max="6" step="1" value="3"><output id="fs1-strat-wv"></output></div>
+<div class="controls" style="margin-top:6px"><span style="font:500 14px var(--sans);color:var(--muted)">GPUs per node G = 8. Highlight:</span><span class="seg" id="fs1-strat-s"><button type="button" data-v="0" aria-pressed="true">FULL_SHARD</button><button type="button" data-v="1" aria-pressed="false">SHARD_GRAD_OP</button><button type="button" data-v="2" aria-pressed="false">NO_SHARD</button><button type="button" data-v="3" aria-pressed="false">HYBRID_SHARD</button><button type="button" data-v="4" aria-pressed="false">_HYBRID_SHARD_ZERO2</button></span></div>
+<div class="scroll-x"><svg id="fs1-strat-svg" viewBox="0 0 640 260" role="img" aria-label="Memory and communication per GPU for five FSDP sharding strategies"></svg></div>
+<div class="readout" id="fs1-strat-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Per-GPU model-state memory (left bars) and per-step communication volume in BF16 (right bars) for the five strategies. For the hybrid ones, communication is split into traffic inside the node and traffic between nodes (darker). Memory counts 16 bytes per sharded parameter plus the kept BF16 weights for the ZeRO-2-like strategies; activations are not included. The dashed line is 80 GB.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Defaults: a 7B model (6.74B) on 64 GPUs. FULL_SHARD needs only 1.68 GB of states but sends 39.8 GB per step, all of it over a group that spans 8 nodes. HYBRID_SHARD needs 13.5 GB and sends 35.4 GB, but only 2.95 GB of it leaves the node. NO_SHARD (DDP) needs about 108 GB: it does not fit. Push the model to 70B: now HYBRID_SHARD needs 140 GB per GPU and no longer fits, so you must shard across nodes, or use larger sharding groups, or add tensor parallelism (<a href="../pretraining/index.html#row-tensor-parallelism-and-sequence-parallelism" title="Tensor parallelism and sequence parallelism (planned)">session 48</a>).</p></details></figure>
+
+<h2>Mixed precision and CPU offload</h2>
+<h3>MixedPrecision</h3>
+<p>FSDP has its own mixed-precision option, <code>MixedPrecision</code>, with three dtypes (all default to <code>None</code>, meaning “keep FP32”): [Certain]</p>
+<ul><li><b><code>param_dtype</code></b>: the dtype of the gathered weights, used in forward and backward. The <b>sharded</b> weights stay in FP32 for the optimizer step, and checkpoints are saved in FP32.</li>
+<li><b><code>reduce_dtype</code></b>: the dtype of the gradient reduce-scatter (or all-reduce). If it is <code>None</code> but <code>param_dtype</code> is set, it follows <code>param_dtype</code>. Set it to FP32 if you want the gradient sum in full precision.</li>
+<li><b><code>buffer_dtype</code></b>: the dtype of buffers (for example rotary-embedding tables). FSDP does not shard buffers.</li></ul>
+<p>The key trick: FSDP casts the local FP32 shard to BF16 <b>before</b> the all-gather. So the all-gather moves half the bytes, and the gathered copy costs half the memory. The FP32 copy of the full unit never exists. The paper writes the peak parameter memory as [Certain]</p>
+<div class="eq">\[ K_{\text{full}} \frac{\Psi}{F} + K_{\text{full}} \max_i \psi_i \quad \longrightarrow \quad K_{\text{full}} \frac{\Psi}{F} + K_{\text{low}} \max_i \psi_i \tag{46.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(K_{\text{full}}\)</dt><dd>bytes per element in full precision (4 for FP32)</dd>
+<dt>\(K_{\text{low}}\)</dt><dd>bytes per element in low precision (2 for BF16 or FP16)</dd></dl>
+<p>Example, Llama 2 7B with per-block wrapping on 8 GPUs, where the largest unit is the 262M-parameter root: \(4 \times 6.738\text{B}/8 + 4 \times 262\text{M} = 4.42\) GB becomes \(3.37 + 0.52 = 3.89\) GB. FSDP’s cast happens once per unit per gather, unlike <code>torch.autocast</code>, which casts at each operation. [Certain] With FP16, use <code>ShardedGradScaler</code>, not the normal <code>GradScaler</code>: the gradients are sharded, so the check for infinities must look at all ranks. [Certain] BF16 does not need a scaler (<a href="../pretraining/index.html#row-numbers-on-gpus-fp32-tf32-fp16-bf16" title="Numbers on GPUs: FP32, TF32, FP16, BF16, FP8 and mixed precision (planned)">session 37</a>).</p>
+<aside class="note watch side"><span class="nt">Watch out</span>When <code>param_dtype</code> is BF16 and <code>reduce_dtype</code> is also BF16, the gradient is summed over all ranks in BF16. On hundreds of GPUs, many small BF16 additions lose precision. A common recipe is <code>MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)</code>: compute in BF16, sum in FP32, at the cost of twice the reduce-scatter bytes. [Likely]</aside>
+<h3>CPU offload</h3>
+<p><code>CPUOffload(offload_params=True)</code> keeps the sharded parameters on the CPU when they are not in use. It offloads the gradients too, so <b>the optimizer step runs on the CPU</b>. [Certain] Before each all-gather, the shard is copied to the GPU over PCIe; after each reduce-scatter, the gradient shard is copied back. This frees nearly all of the \(16\Psi/F\) on the GPU (for Llama 2 7B on 8 GPUs: 13.5 GB per GPU, so 108 GB of CPU RAM per node), but PCIe is much slower than GPU memory, and an Adam step on CPU is slow. Use it when nothing else fits (for example, fine-tuning a big model on few GPUs), not for large pretraining runs. [Likely]</p>
+
+<h2>Using FSDP1 in PyTorch</h2>
+<p>First, the mechanics without any distributed library: a FlatParameter for one unit on 4 simulated ranks, all-gather and reduce-scatter written by hand, and a check that one sharded SGD step equals one normal SGD step on the full batch.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+F = 4                                                    <span class="cm"># sharding factor = number of ranks</span>
+
+<span class="cm"># --- 1) build a FlatParameter for one unit: flatten, concat, pad, chunk (Algorithm 1) ---</span>
+unit = torch.nn.Linear(4, 3)                             <span class="cm"># weight 3x4 = 12, bias 3 -> 15 numbers</span>
+params = [unit.weight, unit.bias]
+numels = [p.numel() <span class="kw2">for</span> p <span class="kw2">in</span> params]
+flat = torch.cat([p.detach().reshape(-1) <span class="kw2">for</span> p <span class="kw2">in</span> params])
+pad = (-flat.numel()) % F                                <span class="cm"># formula (46.2): at most F - 1</span>
+flat = torch.cat([flat, flat.new_zeros(pad)])
+shards = list(flat.chunk(F))                             <span class="cm"># rank r keeps shards[r] only</span>
+print(<span class="st">"numel"</span>, sum(numels), <span class="st">"pad"</span>, pad, <span class="st">"shard size"</span>, shards[0].numel())   <span class="cm"># 15 1 4</span>
+
+<span class="kw2">def</span> all_gather(shards):                                  <span class="cm"># every rank gets the full flat tensor</span>
+    <span class="kw2">return</span> torch.cat(shards)
+<span class="kw2">def</span> reduce_scatter(full_grads):                          <span class="cm"># sum over ranks, rank r keeps chunk r</span>
+    <span class="kw2">return</span> list(torch.stack(full_grads).sum(0).chunk(F))
+<span class="kw2">def</span> views(full):                                         <span class="cm"># original shapes are views into the flat tensor</span>
+    <span class="kw2">return</span> full[:numels[0]].view(3, 4), full[numels[0]:numels[0] + numels[1]]
+
+<span class="cm"># --- 2) one FSDP step with SGD (Algorithm 2), data split over F ranks ---</span>
+X, Y = torch.randn(8, 4), torch.randn(8, 3)
+lr, grads = 0.1, []
+<span class="kw2">for</span> r <span class="kw2">in</span> range(F):
+    full = all_gather(shards).requires_grad_(True)       <span class="cm"># unshard</span>
+    w, b = views(full)
+    x, y = X.chunk(F)[r], Y.chunk(F)[r]
+    loss = ((x @ w.T + b - y) ** 2).mean() / F           <span class="cm"># /F: average over ranks</span>
+    loss.backward()                                      <span class="cm"># gradient of the whole flat tensor</span>
+    grads.append(full.grad)                              <span class="cm"># (then the full weights are freed)</span>
+g_shards = reduce_scatter(grads)                         <span class="cm"># each rank: summed gradient of its own chunk</span>
+shards = [s - lr * g <span class="kw2">for</span> s, g <span class="kw2">in</span> zip(shards, g_shards)]  <span class="cm"># local optimizer step on the shard</span>
+
+<span class="cm"># --- 3) reference: plain single-device SGD on the whole batch ---</span>
+ref = torch.nn.Linear(4, 3); ref.load_state_dict(unit.state_dict())
+((ref(X) - Y) ** 2).mean().backward()
+<span class="kw2">with</span> torch.no_grad():
+    <span class="kw2">for</span> p <span class="kw2">in</span> ref.parameters(): p -= lr * p.grad
+w, b = views(all_gather(shards))
+print(<span class="st">"max diff:"</span>, max((w - ref.weight).abs().max().item(), (b - ref.bias).abs().max().item()))  <span class="cm"># about 3e-8</span>
+print(<span class="st">"padding stays zero:"</span>, all_gather(shards)[-pad:].abs().max().item())                     <span class="cm"># 0.0</span></pre>
+<p>Now the real thing. This script runs PyTorch’s FSDP1 on 4 CPU processes with the <code>gloo</code> backend, so it works on a laptop. It wraps each block as a unit, trains 3 AdamW steps with each rank on a quarter of the batch, and compares the gathered weights with single-process AdamW on the full batch. We ran it with PyTorch 2.8: it prints 4 units, local shard sizes [53, 540, 540, 540] (the root has \(144 + 68 = 212\) parameters, each block 2,160), matching keys, and a maximum difference of about \(10^{-7}\).</p>
+<pre class="code"><span class="kw2">import</span> os, functools, torch, torch.nn <span class="kw2">as</span> nn
+<span class="kw2">import</span> torch.distributed <span class="kw2">as</span> dist, torch.multiprocessing <span class="kw2">as</span> mp
+<span class="kw2">from</span> torch.distributed.fsdp <span class="kw2">import</span> (FullyShardedDataParallel <span class="kw2">as</span> FSDP, ShardingStrategy,
+    StateDictType, FullStateDictConfig)
+<span class="kw2">from</span> torch.distributed.fsdp.wrap <span class="kw2">import</span> transformer_auto_wrap_policy
+
+<span class="kw2">class</span> Block(nn.Module):                       <span class="cm"># one "transformer block" (an MLP block here)</span>
+    <span class="kw2">def</span> __init__(s, d):
+        super().__init__(); s.norm = nn.LayerNorm(d); s.up = nn.Linear(d, 4 * d); s.down = nn.Linear(4 * d, d)
+    <span class="kw2">def</span> forward(s, x): <span class="kw2">return</span> x + s.down(torch.relu(s.up(s.norm(x))))
+
+<span class="kw2">def</span> make_model():
+    torch.manual_seed(0)                      <span class="cm"># same init on every rank and for the reference</span>
+    <span class="kw2">return</span> nn.Sequential(nn.Linear(8, 16), Block(16), Block(16), Block(16), nn.Linear(16, 4))
+
+<span class="kw2">def</span> worker(rank, W):
+    os.environ.update(MASTER_ADDR=<span class="st">"127.0.0.1"</span>, MASTER_PORT=<span class="st">"29541"</span>)
+    dist.init_process_group(<span class="st">"gloo"</span>, rank=rank, world_size=W)     <span class="cm"># CPU backend; use "nccl" on GPUs</span>
+    policy = functools.partial(transformer_auto_wrap_policy, transformer_layer_cls={Block})
+    model = FSDP(make_model(), auto_wrap_policy=policy, device_id=torch.device(<span class="st">"cpu"</span>),
+                 sharding_strategy=ShardingStrategy.FULL_SHARD)
+    units = [m <span class="kw2">for</span> m <span class="kw2">in</span> model.modules() <span class="kw2">if</span> isinstance(m, FSDP)]
+    <span class="kw2">if</span> rank == 0:
+        print(<span class="st">"FSDP units:"</span>, len(units))
+        print(<span class="st">"local shard numels:"</span>, [u._flat_param.numel() <span class="kw2">for</span> u <span class="kw2">in</span> units])  <span class="cm"># private attribute, for teaching only</span>
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-2)        <span class="cm"># created AFTER wrapping: sees only shards</span>
+    ref = make_model(); ropt = torch.optim.AdamW(ref.parameters(), lr=1e-2)
+    torch.manual_seed(1); X, Y = torch.randn(16, 8), torch.randn(16, 4)
+    <span class="kw2">for</span> step <span class="kw2">in</span> range(3):
+        x, y = X.chunk(W)[rank], Y.chunk(W)[rank]                 <span class="cm"># each rank: its own quarter</span>
+        loss = nn.functional.mse_loss(model(x), y)
+        loss.backward(); opt.step(); opt.zero_grad()              <span class="cm"># gradients are averaged over ranks</span>
+        rl = nn.functional.mse_loss(ref(X), Y); rl.backward(); ropt.step(); ropt.zero_grad()
+    cfg = FullStateDictConfig(rank0_only=True)
+    <span class="kw2">with</span> FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+        sd = model.state_dict()                                   <span class="cm"># gathers full, original-shaped weights on rank 0</span>
+    <span class="kw2">if</span> rank == 0:
+        diff = max((sd[k] - v).abs().max().item() <span class="kw2">for</span> k, v <span class="kw2">in</span> ref.state_dict().items())
+        print(<span class="st">"keys match:"</span>, sorted(sd) == sorted(ref.state_dict()), <span class="st">" max diff vs 1-GPU AdamW:"</span>, f<span class="st">"{diff:.1e}"</span>)
+    dist.destroy_process_group()
+
+<span class="kw2">if</span> __name__ == <span class="st">"__main__"</span>:
+    mp.spawn(worker, args=(4,), nprocs=4)     <span class="cm"># 4 ranks = 4 "GPUs"</span></pre>
+<p>Change <code>FULL_SHARD</code> to <code>SHARD_GRAD_OP</code> and the result is the same. With <code>NO_SHARD</code> the local sizes become [212, 2160, 2160, 2160]: nothing is sharded. With <code>MixedPrecision(param_dtype=torch.bfloat16, reduce_dtype=torch.float32)</code> (and the loss computed on <code>model(x).float()</code>), the difference grows to about \(2 \times 10^{-2}\) after 3 steps: that is BF16 rounding in forward and backward, not a bug. On a GPU cluster, a typical FSDP1 setup for a Llama-style model looks like this (launched with <code>torchrun --nproc_per_node=8</code>; not run here, it needs GPUs):</p>
+<pre class="code"><span class="kw2">from</span> torch.distributed.fsdp <span class="kw2">import</span> (FullyShardedDataParallel <span class="kw2">as</span> FSDP, ShardingStrategy,
+    MixedPrecision, BackwardPrefetch, CPUOffload)
+<span class="kw2">from</span> transformers.models.llama.modeling_llama <span class="kw2">import</span> LlamaDecoderLayer
+
+torch.cuda.set_device(local_rank)
+model = FSDP(model,
+    auto_wrap_policy=functools.partial(transformer_auto_wrap_policy,
+                                       transformer_layer_cls={LlamaDecoderLayer}),
+    sharding_strategy=ShardingStrategy.FULL_SHARD,          <span class="cm"># or HYBRID_SHARD across nodes</span>
+    mixed_precision=MixedPrecision(param_dtype=torch.bfloat16,
+                                   reduce_dtype=torch.float32, buffer_dtype=torch.bfloat16),
+    backward_prefetch=BackwardPrefetch.BACKWARD_PRE,        <span class="cm"># the default</span>
+    limit_all_gathers=True,                                 <span class="cm"># the rate limiter (default)</span>
+    cpu_offload=CPUOffload(offload_params=False),           <span class="cm"># True only if nothing else fits</span>
+    device_id=torch.cuda.current_device(),                  <span class="cm"># shard on GPU, fast init</span>
+    sync_module_states=True,                                <span class="cm"># broadcast rank 0's weights (e.g. loaded checkpoint)</span>
+    use_orig_params=True)                                   <span class="cm"># needed for torch.compile and per-parameter groups</span>
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, weight_decay=0.1)  <span class="cm"># after wrapping!</span>
+...
+model.clip_grad_norm_(1.0)                                  <span class="cm"># FSDP's own: computes the norm over all shards</span></pre>
+
+<h2>State dicts, gradient accumulation and other details</h2>
+<ul><li><b>Saving.</b> <code>StateDictType.FULL_STATE_DICT</code> gathers normal, original-shaped weights (use <code>rank0_only=True</code> and <code>offload_to_cpu=True</code> on GPUs to avoid running out of memory). <code>SHARDED_STATE_DICT</code> saves each rank’s piece with the original names, and can be loaded with a different number of GPUs. <code>LOCAL_STATE_DICT</code> saves the raw flat shards and only works with the same setup. [Certain] Big runs use sharded checkpoints (<a href="../pretraining/index.html#row-distributed-checkpoints-fault-tolerance-and-mfu" title="Distributed checkpoints, fault tolerance and MFU (planned)">session 51</a>).</li>
+<li><b>Gradient accumulation</b> (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>). Without anything special, FSDP still reduce-scatters after every micro-batch and adds the sharded gradients. Inside <code>model.no_sync()</code> it skips the communication but keeps <b>unsharded</b> gradients, which costs much more memory. [Certain]</li>
+<li><b>Initialization of huge models.</b> Build the model on the <code>meta</code> device (no memory), and let FSDP materialize and shard it one unit at a time with <code>param_init_fn</code>, or load weights on rank 0 only and use <code>sync_module_states=True</code>. [Certain]</li>
+<li><b>Activation checkpointing</b> combines well with FSDP: apply it to the same blocks you wrap. FSDP shards the model states; checkpointing cuts the activations. The paper’s 175B run used both. [Certain]</li></ul>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical FSDP1 setup</th><th>Why</th></tr></thead><tbody>
+<tr><td>Pretraining 1B–70B models on a cluster</td><td>FULL_SHARD or HYBRID_SHARD, per-block wrap, BF16 params, BACKWARD_PRE, activation checkpointing</td><td>Model states no longer limit the model size; hybrid keeps slow cross-node traffic small</td></tr>
+<tr><td>Full fine-tuning of a 7B–13B model on one 8-GPU node</td><td>FULL_SHARD over 8 GPUs, often through Hugging Face Accelerate or Trainer [Likely]</td><td>108 GB of states for 7B becomes 13.5 GB per GPU</td></tr>
+<tr><td>Fine-tuning a big model on very few GPUs</td><td>FULL_SHARD + <code>CPUOffload</code> (slow) or QLoRA instead</td><td>Trades speed for memory when nothing else fits</td></tr>
+<tr><td>Vision-language models (vision encoder + LLM)</td><td>Wrap the vision blocks and the LLM blocks as separate units; often freeze the vision tower with <code>use_orig_params=True</code> [Likely]</td><td>Units of very different sizes; frozen and trainable tensors must not share one FlatParameter without <code>use_orig_params</code></td></tr>
+<tr><td>Video encoders and video-language models (video classification, action recognition, Video-RAG retrieval encoders)</td><td>FSDP for the model states, plus activation checkpointing, because long frame sequences make activations huge [Likely]</td><td>FSDP alone does not shrink activations; the two tools solve different halves of the memory bill</td></tr>
+<tr><td>Recommendation models (DHEN in the paper)</td><td>Dense part with FSDP, huge sparse embedding tables with a different sharding</td><td>The paper trained 550M dense parameters with FSDP next to 768B sparse ones [Certain]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Creating the optimizer before wrapping.</b> The optimizer then holds the original, full parameters, which FSDP has replaced. Always wrap first, then build the optimizer from <code>model.parameters()</code>.</li>
+<li><b>No auto-wrap policy.</b> The whole model becomes one unit, so the forward pass gathers the full model: the peak memory is the full model again (Figure 3, “No wrapping”).</li>
+<li><b>Using <code>torch.nn.utils.clip_grad_norm_</code> on sharded gradients.</b> Each rank would compute the norm of its own shard only. Use <code>model.clip_grad_norm_()</code>, which combines the norms of all ranks. [Certain]</li>
+<li><b>Calling a submodule’s forward directly</b> (for example <code>model.lm_head(h)</code> outside the wrapped forward) when it belongs to an FSDP unit whose weights are not gathered at that moment. You get an error about a size-0 or 1-D tensor. Only run code through the wrapped module’s forward, or use <code>summon_full_params</code>.</li>
+<li><b>Mixing frozen and trainable parameters in one unit</b> without <code>use_orig_params=True</code>. A FlatParameter has one <code>requires_grad</code>, so this fails. Common in LoRA and VLM fine-tuning (<a href="../pretraining/index.html#row-fsdp2-per-parameter-sharding-with-dtensor" title="FSDP2: per-parameter sharding with DTensor (planned)">session 47</a> makes it easy).</li>
+<li><b>Saving with FULL_STATE_DICT on every rank.</b> Each rank gathers the full model in GPU memory and may run out. Use <code>rank0_only=True, offload_to_cpu=True</code>, or a sharded state dict.</li>
+<li><b>Using <code>no_sync()</code> for accumulation to “save communication”</b> and then running out of memory: it keeps full, unsharded gradients for every unit.</li>
+<li><b>Using the plain <code>GradScaler</code> with FP16.</b> Use <code>ShardedGradScaler</code>, or switch to BF16.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What does FSDP do in the forward and backward pass of one unit?<span class="lvl">basic</span></summary><div class="ans">Forward: all-gather the unit’s sharded FlatParameter so every rank has the full weights, run the unit’s forward, then free the full weights and keep only the local shard. Backward: all-gather the weights again, compute the unit’s full gradients from the local micro-batch, reduce-scatter the gradients so each rank keeps the averaged gradient of its own shard, then free the full weights and gradients. The optimizer updates only the local shard. The root unit is kept gathered from the start of the forward to the end of the backward.</div></details>
+<details class="qa"><summary>What is a FlatParameter, and why does FSDP1 use it?<span class="lvl">core</span></summary><div class="ans">For each FSDP unit, FSDP flattens all its parameters into 1-D, concatenates them into one vector, pads it with zeros to a multiple of the sharding factor \(F\) (at most \(F - 1\) zeros), and splits it into \(F\) equal shards. Reasons: one big collective per unit instead of one per tensor (less launch overhead, better bandwidth use; the paper saw all-gather time rise quickly below about 33M elements per call), equal sizes on all ranks (what NCCL’s fastest all-gather and reduce-scatter want), and a layout that collectives can read and write without extra copies. The original parameters become views into it.</div></details>
+<details class="qa"><summary>How much does FSDP communicate compared to DDP?<span class="lvl">core</span></summary><div class="ans">Per GPU and step, with ring algorithms: DDP does one all-reduce of the gradients, \(2\Psi(F-1)/F\) elements. FULL_SHARD does two all-gathers (forward and backward) and one reduce-scatter, \(3\Psi(F-1)/F\): 1.5× DDP. The root unit skips its second all-gather, so it is a bit less. SHARD_GRAD_OP does one all-gather and one reduce-scatter, the same volume as DDP. With BF16 communication each element is 2 bytes.</div></details>
+<details class="qa"><summary>FULL_SHARD vs SHARD_GRAD_OP: what is the trade-off?<span class="lvl">core</span></summary><div class="ans">FULL_SHARD frees the gathered weights after each unit’s forward and gathers them again for the backward: lowest memory, 1.5× DDP communication. SHARD_GRAD_OP keeps the gathered weights from the forward until the end of the backward, so it saves the second all-gather (same volume as DDP) but holds the full low-precision weights during the step, \(2\Psi\) bytes in BF16 (13.5 GB for a 7B model). Use SHARD_GRAD_OP when the model fits that way and communication is the bottleneck.</div></details>
+<details class="qa"><summary>When would you use HYBRID_SHARD? What exactly does it communicate?<span class="lvl">advanced</span></summary><div class="ans">On multi-node clusters where the network between nodes is much slower than NVLink inside a node, for models that fit when sharded over one node. It does FULL_SHARD inside each node (all-gathers and reduce-scatters over NVLink) and keeps one copy per node. After the in-node reduce-scatter, GPUs holding the same shard in different nodes all-reduce it. Only that all-reduce crosses nodes, and it moves only \(1/G\) of the gradients: \(2(\Psi/G)(H-1)/H\) per GPU. The sum is exact because addition can be regrouped (formula 46.6). The cost is memory: \(16\Psi/G\) per GPU instead of \(16\Psi/W\).</div></details>
+<details class="qa"><summary>Why wrap each transformer block as its own FSDP unit?<span class="lvl">core</span></summary><div class="ans">Peak parameter memory is about \(\Psi/F + \max_i \psi_i\): the shards plus the largest unit that is gathered at once. With one unit for the whole model, the second term is the whole model, so FSDP would gather everything. One unit per block keeps it at one or two blocks, and blocks are natural points for prefetching and activation checkpointing. Smaller units (attention and MLP apart) lower the peak a little more, but double the number of collectives, which hurts throughput. Watch the root: embedding plus output head can be larger than a block.</div></details>
+<details class="qa"><summary>Explain BACKWARD_PRE vs BACKWARD_POST.<span class="lvl">advanced</span></summary><div class="ans">All FSDP collectives use one NCCL stream, so their issue order matters. Without prefetch, after a block’s gradients FSDP issues its reduce-scatter, then the next block’s all-gather, and the next compute waits for both. BACKWARD_PRE issues the next all-gather before the current gradient computation: maximum overlap, but at the peak it holds current weights, next weights and current gradients. BACKWARD_POST issues it after the current gradient computation but before the reduce-scatter: the reduce-scatter overlaps the next compute; less overlap, less memory. FSDP finds “next” by reversing the recorded forward order each step. The paper measured about 18% speedup from backward prefetching on a 175B model.</div></details>
+<details class="qa"><summary>What is the rate limiter (limit_all_gathers) and why does it exist?<span class="lvl">advanced</span></summary><div class="ans">The CPU can issue all-gathers far ahead of the GPU. Their output buffers are allocated on the communication stream, and the caching allocator cannot reuse those blocks for compute-stream allocations until they are free, so memory is over-reserved and the allocator must do slow cudaFree/cudaMalloc retries. The rate limiter blocks the CPU so at most two units are gathered at a time (current and prefetched), the minimum for overlap. It gave up to 5× speedup on T5-11B in the paper, but about 5% slowdown on DeepViT, so check num_alloc_retries in torch.cuda.memory_stats() before tuning it.</div></details>
+<details class="qa"><summary>How does FSDP’s MixedPrecision save memory and bandwidth compared to autocast?<span class="lvl">core</span></summary><div class="ans">The sharded master weights stay FP32. Before each all-gather, FSDP casts the local shard to param_dtype (for example BF16), so the all-gather moves half the bytes and the gathered full unit costs 2 instead of 4 bytes per element; the FP32 full unit never exists. Peak parameter memory goes from \(K_\text{full}\Psi/F + K_\text{full}\max\psi_i\) to \(K_\text{full}\Psi/F + K_\text{low}\max\psi_i\). Autocast instead keeps FP32 weights and casts per operation. reduce_dtype sets the dtype of the gradient reduction (often FP32 for accuracy); buffer_dtype sets the buffers’ dtype. With FP16 you need ShardedGradScaler.</div></details>
+<details class="qa"><summary>Why is FSDP1 awkward for LoRA, frozen layers and torch.compile, and what fixes it?<span class="lvl">advanced</span></summary><div class="ans">A FlatParameter merges many tensors into one 1-D vector with one dtype and one requires_grad, and shards cut across tensor borders. So frozen and trainable tensors cannot share a unit, per-parameter optimizer groups do not map to shards, and the state dict needs special handling. use_orig_params=True exposes the original parameters as views (some may be empty on some ranks), which helps with freezing, parameter groups and torch.compile, but adds complexity. FSDP2 shards each parameter separately as a DTensor on dim 0, which solves these problems cleanly.</div></details>
+<details class="qa"><summary>A 7B model on 8 × 80 GB GPUs runs out of memory with FSDP. What do you check?<span class="lvl">core</span></summary><div class="ans">Model states should be only about 13.5 GB per GPU (\(16 \times 6.74\text{B}/8\)), so look elsewhere. (1) Is there an auto-wrap policy? Without one the whole model is gathered. (2) Is the root unit too big (embedding and head)? Wrap them separately. (3) Activations: enable activation checkpointing per block, reduce micro-batch or sequence length. (4) Was the optimizer created before wrapping? (5) Is no_sync() keeping unsharded gradients? (6) Saving a FULL_STATE_DICT without rank0_only and offload_to_cpu. (7) Fragmentation: check reserved versus allocated memory and num_alloc_retries.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A unit has parameters of 1,000, 300 and 7 elements, and \(F = 8\). How much padding does FSDP add, and how large is each shard?</li>
+<li>A 13B model is trained with FULL_SHARD on 32 GPUs. How many GB of model states (16 bytes per parameter) does each GPU hold? How many GB does each GPU send per step in BF16, by formula (46.3)?</li>
+<li>Same model and GPUs, but SHARD_GRAD_OP. What are the memory (states plus the kept BF16 weights) and the communication now?</li>
+<li>In Figure 2, why are there 7 all-gathers and not 8? What would you get with 10 non-root blocks?</li>
+<li>With 128 GPUs in nodes of 8, and a 7B (6.74B) model, compute the cross-node bytes per GPU per step in BF16 for HYBRID_SHARD by formula (46.7).</li>
+<li>In Figure 4, with transfer time 0.6 and BACKWARD_PRE, the exposed time is 1.8. Name the three transfers that cannot be hidden.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(\psi = 1{,}307\); the next multiple of 8 is 1,312, so 5 zeros of padding and shards of 164 elements. 2. \(16 \times 13 \times 10^9 / 32 = 6.5\) GB. Communication: \(3 \times 13 \times 10^9 \times 31/32 \times 2\) bytes \(= 75.6\) GB per step. 3. Memory: \(6.5 + 2 \times 13 = 32.5\) GB. Communication: \(2 \times 13 \times 10^9 \times 31/32 \times 2 = 50.4\) GB. 4. The root unit is gathered once at the start of the forward and kept until the end of the backward, so it does not need a second all-gather. With 10 blocks: \(1 + 2 \times 10 = 21\) all-gathers and 11 reduce-scatters. 5. \(H = 16\): \(2 \times (6.738 \times 10^9 / 8) \times 15/16 \times 2\) bytes \(= 3.16\) GB. 6. The all-gather of the first block in the forward pass, the all-gather of the last block at the start of the backward pass (nothing is computing at that moment in this toy model), and the reduce-scatter of the first block at the very end, which the optimizer step must wait for.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>FSDP is PyTorch’s ZeRO-3: each of \(F\) GPUs keeps \(1/F\) of the weights, gradients and optimizer states (46.1). A 7B model drops from 108 GB to 13.5 GB of states per GPU on 8 GPUs.</li>
+<li>FSDP1 groups parameters into units and stores each unit as a FlatParameter: flatten, concatenate, pad to a multiple of \(F\), split into equal shards (46.2).</li>
+<li>Forward: all-gather, compute, free. Backward: all-gather, gradients, reduce-scatter. That is 1.5× the communication of DDP (46.3); the root unit is gathered once.</li>
+<li>Peak memory is the shards plus the largest gathered unit (46.4): wrap per transformer block, and watch the root.</li>
+<li>BACKWARD_PRE prefetching and the rate limiter hide most communication; the first gather and the last reduce-scatter always stay exposed (46.5).</li>
+<li>FULL_SHARD, SHARD_GRAD_OP, NO_SHARD, HYBRID_SHARD and _HYBRID_SHARD_ZERO2 trade memory against communication; hybrid keeps cross-node traffic to \(1/G\) of the gradients (46.6, 46.7).</li>
+<li>MixedPrecision gathers in BF16 from FP32 shards (46.8); CPU offload frees GPU memory at a large speed cost.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ M_{\text{FSDP}} \approx \frac{16\Psi}{F} + K_{\text{low}} \max_i \psi_i, \quad \tilde\psi = F\left\lceil \frac{\psi}{F} \right\rceil, \quad V_{\text{FULL\_SHARD}} = 3\Psi\frac{F-1}{F}, \quad V^{\text{HYBRID}}_{\text{cross}} = 2\frac{\Psi}{G}\frac{H-1}{H} \]</div>
+<h2 class="plain" id="fsdp-version-1-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhao et al. (2023). <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener">PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel</a></li><li>PyTorch (docs). <a href="https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html" target="_blank" rel="noopener">Getting Started with Fully Sharded Data Parallel (FSDP2)</a></li><li>Zhao et al. (2023). <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener">PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel</a></li><li>PyTorch (docs). <a href="https://pytorch.org/tutorials/intermediate/FSDP_tutorial.html" target="_blank" rel="noopener">Getting Started with Fully Sharded Data Parallel (FSDP2)</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/docs/stable/fsdp.html" target="_blank" rel="noopener">FullyShardedDataParallel (FSDP1) API reference: ShardingStrategy, BackwardPrefetch, MixedPrecision, CPUOffload</a></li><li>Rajbhandari et al. (2019). <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></li><li>Li et al. (2020). <a href="https://arxiv.org/abs/2006.15704" target="_blank" rel="noopener">PyTorch Distributed: Experiences on Accelerating Data Parallel Training</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Micikevicius et al. (2017). <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Mixed Precision Training</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/tutorials/intermediate/FSDP_advanced_tutorial.html" target="_blank" rel="noopener">Advanced Model Training with Fully Sharded Data Parallel (FSDP1 tutorial)</a></li></ol><nav class="pn" aria-label="Previous and next session"><span class="prev"><small>Previous · session 45, planned</small>ZeRO stages 1, 2 and 3</span><span class="next"><small>Next · session 47, planned</small>FSDP2: per-parameter sharding with DTensor</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="fsdp-version-1"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const esc=s=>(B&&B.esc)?B.esc(String(s)):String(s);
+function seg(el,cb){if(!el)return;el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b||!el.contains(b))return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segVal=el=>{const b=el.querySelector('button[aria-pressed="true"]');return b?b.dataset.v:null;};
+const COL=[["var(--q)","var(--q-soft)"],["var(--k)","var(--k-soft)"],["var(--v)","var(--v-soft)"],["var(--tc)","var(--paper2)"]];
+const gb=v=>v<10?v.toFixed(2):v<100?v.toFixed(1):v.toFixed(0);
+
+/* ---------- Figure 1: FlatParameter builder ---------- */
+(function(){
+ const svg=$("#fs1-flat-svg");if(!svg)return;const info=$("#fs1-flat-info");
+ const UNITS=[[["weight",[3,4]],["bias",[3]]],
+  [["norm.weight",[4]],["norm.bias",[4]],["weight",[6,4]],["bias",[6]]],
+  [["0.weight",[4,3]],["0.bias",[4]],["1.weight",[2,4]],["1.bias",[2]]]];
+ let u=0,F=4,sel=0;
+ function draw(){
+  const ps=UNITS[u].map(([n,sh],i)=>({n,sh,k:sh.reduce((a,b)=>a*b,1),c:i%4}));
+  const psi=ps.reduce((a,p)=>a+p.k,0),pt=F*Math.ceil(psi/F),pad=pt-psi,ss=pt/F;if(sel>=F)sel=0;
+  const owner=[];ps.forEach((p,i)=>{for(let j=0;j<p.k;j++)owner.push([i,j]);});for(let j=0;j<pad;j++)owner.push([-1,j]);
+  let g="";
+  /* row 1: original params as grids */
+  let x=20;const cs=14;
+  g+=`<text x="20" y="16" class="svgs" font-size="12.5">original parameters</text>`;
+  ps.forEach(p=>{const r=p.sh.length===2?p.sh[0]:1,c=p.sh.length===2?p.sh[1]:p.sh[0];
+   for(let a=0;a<r;a++)for(let b=0;b<c;b++)g+=`<rect x="${x+b*cs}" y="${28+a*cs}" width="${cs-2}" height="${cs-2}" rx="2" fill="${COL[p.c][1]}" stroke="${COL[p.c][0]}" stroke-width="1.2"/>`;
+   g+=`<text x="${x}" y="${28+Math.max(r,1)*cs+13}" font-size="11.5" fill="var(--ink2)" font-family="var(--mono)">${esc(p.n)} ${p.sh.join("×")}</text>`;
+   x+=Math.max(c*cs,p.n.length*7+30)+22;});
+  /* row 2: flat vector */
+  const y2=150,cw=Math.min(18,740/pt);
+  g+=`<text x="20" y="${y2-10}" class="svgs" font-size="12.5">FlatParameter: flatten + concatenate + pad (ψ = ${psi}, padded to ${pt})</text>`;
+  owner.forEach(([i],k)=>{const fill=i<0?"var(--rule)":COL[ps[i].c][1],st=i<0?"var(--muted)":COL[ps[i].c][0];g+=`<rect x="${(20+k*cw).toFixed(1)}" y="${y2}" width="${(cw-1.5).toFixed(1)}" height="22" rx="2" fill="${fill}" stroke="${st}" stroke-width="1"/>`;});
+  /* row 3: shards */
+  const y3=225,gap=8,cw3=Math.min(18,(740-(F-1)*gap)/pt);
+  g+=`<text x="20" y="${y3-10}" class="svgs" font-size="12.5">shards: ${F} ranks × ${ss} element${ss===1?"":"s"}</text>`;
+  for(let r=0;r<F;r++){const x0=20+r*(ss*cw3+gap);
+   g+=`<g class="fs1-rank" data-r="${r}" tabindex="0" role="button" aria-label="rank ${r}"><rect class="fs1-hit" x="${(x0-3).toFixed(1)}" y="${y3-4}" width="${(ss*cw3+4).toFixed(1)}" height="30" rx="4" fill="${r===sel?"var(--paper2)":"transparent"}" stroke="${r===sel?"var(--tc)":"var(--rule)"}" stroke-width="${r===sel?2.2:1}"/>`;
+   for(let j=0;j<ss;j++){const [i]=owner[r*ss+j];const fill=i<0?"var(--rule)":COL[ps[i].c][1],st=i<0?"var(--muted)":COL[ps[i].c][0];g+=`<rect x="${(x0+j*cw3).toFixed(1)}" y="${y3}" width="${(cw3-1.5).toFixed(1)}" height="22" rx="2" fill="${fill}" stroke="${st}" stroke-width="1"/>`;}
+   g+=`<text x="${(x0+ss*cw3/2-1).toFixed(1)}" y="${y3+44}" text-anchor="middle" font-size="${F>8?10:12}" fill="${r===sel?"var(--ink)":"var(--muted)"}" font-weight="${r===sel?700:500}">${F>8?r:"rank "+r}</text></g>`;}
+  svg.innerHTML=g;
+  /* readout for selected rank */
+  const parts=[];let cur=null;
+  for(let j=0;j<ss;j++){const [i,e]=owner[sel*ss+j];if(!cur||cur.i!==i){cur={i,a:e,b:e};parts.push(cur);}else cur.b=e;}
+  const desc=parts.map(p=>p.i<0?`${p.b-p.a+1} padding zero${p.b>p.a?"s":""}`:`${esc(ps[p.i].n)}[${p.a}..${p.b}] (${p.b-p.a+1} of ${ps[p.i].k}${p.b-p.a+1===ps[p.i].k?", whole tensor":", partial"})`).join(" + ");
+  info.innerHTML=`ψ = <b>${psi}</b> elements, padded to <b>${pt}</b> with <b>${pad}</b> zero${pad===1?"":"s"} (at most F − 1 = ${F-1}). Each of ${F} ranks keeps <b>${ss}</b> element${ss===1?"":"s"}, ${(100/F).toFixed(F===3?1:F>8?2:0)}% of the unit. Rank ${sel} holds: ${desc}.`;
+ }
+ svg.addEventListener("click",e=>{const t=e.target.closest(".fs1-rank");if(!t)return;sel=+t.dataset.r;draw();});
+ svg.addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const t=e.target.closest(".fs1-rank");if(!t)return;e.preventDefault();sel=+t.dataset.r;draw();const n=svg.querySelector(`.fs1-rank[data-r="${sel}"]`);if(n)n.focus();});
+ seg($("#fs1-flat-unit"),v=>{u=+v;sel=0;draw();});seg($("#fs1-flat-f"),v=>{F=+v;sel=0;draw();});draw();
+})();
+
+/* ---------- Figure 2: one training step, stepper ---------- */
+(function(){
+ const svg=$("#fs1-step-svg");if(!svg)return;const info=$("#fs1-step-info");
+ const NAMES=["U0 root (embed + head)","U1 block","U2 block","U3 block"];
+ /* state: p[i] in s|f ; g[i] in -|f|s ; ag, rs counters ; act: [unit, label] */
+ const S=[];let p=["s","s","s","s"],g=["-","-","-","-"],ag=0,rs=0;
+ const push=(t,act)=>S.push({p:p.slice(),g:g.slice(),ag,rs,t,act});
+ push("Start. GPU 0 holds only its quarter of every unit: FP32 weights, FP32 gradient space and Adam states, 16 bytes × 400M / 4 = 1.6 GB.",null);
+ p[0]="f";ag++;push("Forward begins. <b>All-gather the root</b> (embedding and output head) in BF16. The embedding runs. The root will stay gathered until the end of the backward pass.",[0,"all-gather"]);
+ p[1]="f";ag++;push("<b>All-gather U1</b> and run its forward. Its activations are kept for the backward pass; its full weights are not.",[1,"all-gather"]);
+ p[1]="s";p[2]="f";ag++;push("<b>Free U1</b>’s full weights. <b>All-gather U2</b> and run its forward.",[2,"all-gather"]);
+ p[2]="s";p[3]="f";ag++;push("<b>Free U2</b>. <b>All-gather U3</b> and run its forward.",[3,"all-gather"]);
+ p[3]="s";push("<b>Free U3</b>. The root’s output head (still gathered) gives the logits, and GPU 0 computes the loss on its own micro-batch.",[0,"forward"]);
+ g[0]="f";push("Backward begins at the head. The <b>root’s full gradient buffer</b> is allocated. It cannot be reduced yet: the embedding’s gradient comes last.",[0,"backward"]);
+ p[3]="f";g[3]="f";ag++;push("<b>All-gather U3 again</b> (it was freed) and compute its full gradients from GPU 0’s data. This is the peak: root weights + root gradients + U3 weights + U3 gradients.",[3,"all-gather"]);
+ p[3]="s";g[3]="s";rs++;push("<b>Reduce-scatter U3</b>’s gradients: summed over the 4 GPUs, GPU 0 keeps only its quarter. Free U3’s full weights and gradients.",[3,"reduce-scatter"]);
+ p[2]="f";g[2]="f";ag++;push("<b>All-gather U2</b>, compute its gradients.",[2,"all-gather"]);
+ p[2]="s";g[2]="s";rs++;push("<b>Reduce-scatter U2</b>, free it.",[2,"reduce-scatter"]);
+ p[1]="f";g[1]="f";ag++;push("<b>All-gather U1</b>, compute its gradients.",[1,"all-gather"]);
+ p[1]="s";g[1]="s";rs++;push("<b>Reduce-scatter U1</b>, free it.",[1,"reduce-scatter"]);
+ p[0]="s";g[0]="s";rs++;push("The embedding’s gradient completes the root’s gradient. <b>Reduce-scatter the root</b> and free its full weights and gradients.",[0,"reduce-scatter"]);
+ push("<b>Optimizer step</b>: GPU 0 runs AdamW on its own quarter of every unit, with its own quarter of m and v. No communication. The next step starts from here.",null);
+ const X=i=>40+i*180,W=160,GB=0.2,base=1.6;
+ const memOf=st=>base+GB*st.p.filter(v=>v==="f").length+GB*st.g.filter(v=>v==="f").length;
+ const peaks=[];S.forEach((st,k)=>peaks.push(Math.max(k?peaks[k-1]:0,memOf(st))));
+ function draw(k){const st=S[k];let s="";
+  NAMES.forEach((n,i)=>{const x=X(i);const act=st.act&&st.act[0]===i;
+   s+=`<text x="${x+W/2}" y="20" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">${n}</text>`;
+   s+=`<rect x="${x}" y="30" width="${W}" height="128" rx="10" fill="none" stroke="${act?"var(--tc)":"var(--rule)"}" stroke-width="${act?2.4:1.2}"/>`;
+   s+=`<text x="${x+10}" y="50" font-size="11.5" fill="var(--muted)">weights</text>`;
+   if(st.p[i]==="f")s+=`<rect x="${x+10}" y="56" width="${W-20}" height="30" rx="5" fill="var(--q)" opacity=".85"/><text x="${x+W/2}" y="76" text-anchor="middle" font-size="12" fill="var(--paper)" font-weight="700">full, BF16</text>`;
+   else s+=`<rect x="${x+10}" y="56" width="${W-20}" height="30" rx="5" fill="none" stroke="var(--rule)" stroke-dasharray="4 4"/><rect x="${x+10}" y="56" width="${(W-20)/4}" height="30" rx="5" fill="var(--q-soft)" stroke="var(--q)"/><text x="${x+10+(W-20)/8}" y="76" text-anchor="middle" font-size="11" fill="var(--ink2)">1/4</text>`;
+   s+=`<text x="${x+10}" y="104" font-size="11.5" fill="var(--muted)">gradients</text>`;
+   if(st.g[i]==="f")s+=`<rect x="${x+10}" y="110" width="${W-20}" height="30" rx="5" fill="var(--k)" opacity=".85"/><text x="${x+W/2}" y="130" text-anchor="middle" font-size="12" fill="var(--paper)" font-weight="700">full, BF16</text>`;
+   else if(st.g[i]==="s")s+=`<rect x="${x+10}" y="110" width="${W-20}" height="30" rx="5" fill="none" stroke="var(--rule)" stroke-dasharray="4 4"/><rect x="${x+10}" y="110" width="${(W-20)/4}" height="30" rx="5" fill="var(--v-soft)" stroke="var(--v)"/><text x="${x+10+(W-20)/8}" y="130" text-anchor="middle" font-size="11" fill="var(--ink2)">1/4</text>`;
+   else s+=`<rect x="${x+10}" y="110" width="${W-20}" height="30" rx="5" fill="none" stroke="var(--rule)" stroke-dasharray="4 4"/><text x="${x+W/2}" y="130" text-anchor="middle" font-size="11" fill="var(--muted)">none yet</text>`;
+   if(act)s+=`<text x="${x+W/2}" y="176" text-anchor="middle" font-size="12.5" font-weight="700" fill="var(--tc)">${st.act[1]}</text>`;});
+  /* memory bar */
+  const m=memOf(st),sc=700/3.0,y=212;let x0=40;
+  s+=`<text x="40" y="${y-8}" font-size="12.5" class="svgs">GPU 0 memory (parameters and gradients only)</text>`;
+  s+=`<rect x="40" y="${y}" width="700" height="26" rx="5" fill="none" stroke="var(--rule)"/>`;
+  s+=`<rect x="${x0}" y="${y}" width="${base*sc}" height="26" rx="5" fill="var(--q-soft)" stroke="var(--q)"/>`;x0+=base*sc;
+  const nf=st.p.filter(v=>v==="f").length,ng=st.g.filter(v=>v==="f").length;
+  if(nf){s+=`<rect x="${x0}" y="${y}" width="${nf*GB*sc}" height="26" fill="var(--q)" opacity=".85"/>`;x0+=nf*GB*sc;}
+  if(ng){s+=`<rect x="${x0}" y="${y}" width="${ng*GB*sc}" height="26" fill="var(--k)" opacity=".85"/>`;x0+=ng*GB*sc;}
+  [0,1,2,3].forEach(v=>s+=`<text x="${40+v*sc}" y="${y+42}" text-anchor="middle" font-size="11" class="svgs">${v} GB</text>`);
+  s+=`<line x1="${40+peaks[k]*sc}" y1="${y-4}" x2="${40+peaks[k]*sc}" y2="${y+30}" stroke="var(--bad)" stroke-width="2" stroke-dasharray="3 3"/><text x="${40+peaks[k]*sc+4}" y="${y+58}" font-size="11" fill="var(--bad)">peak so far ${peaks[k].toFixed(1)} GB</text>`;
+  svg.innerHTML=s;
+  info.innerHTML=`${st.t}<br>GPU 0 memory: <b>${m.toFixed(1)} GB</b> (peak so far ${peaks[k].toFixed(1)} GB). Collectives so far: <b>${st.ag} all-gathers, ${st.rs} reduce-scatters</b>, ${((st.ag+st.rs)*0.15).toFixed(2)} GB moved per GPU (150 MB each).`;}
+ B.stepper({n:S.length,prev:$("#fs1-step-prev"),next:$("#fs1-step-next"),play:$("#fs1-step-play"),label:$("#fs1-step-lab"),ms:2600,onStep:draw});
+})();
+
+/* ---------- Figure 3: wrapping policy and peak memory (Llama 2 7B) ---------- */
+(function(){
+ const svg=$("#fs1-wrap-svg");if(!svg)return;const info=$("#fs1-wrap-info"),Fs=$("#fs1-wrap-f");
+ const d=4096,ff=11008,L=32,V=32000,attn=4*d*d,mlp=3*d*ff,blk=attn+mlp+2*d,emb=V*d,head=V*d,norm=d,P=L*blk+emb+head+norm;
+ const FL=[4,8,16,32,64,128,256];
+ const POL={whole:["No wrapping",P,[]],block:["Per block",emb+head+norm,Array(L).fill(blk)],
+  blockemb:["Per block + embeddings apart",norm,[emb].concat(Array(L).fill(blk),[head])],
+  sub:["Attention and MLP apart",emb+head+norm,[].concat(...Array.from({length:L},()=>[attn+d,mlp+d]))]};
+ const ORDER=["whole","block","blockemb","sub"];
+ function calc(pol,F,mode){const [,root,units]=POL[pol];const mx=units.length?Math.max(...units):0;const k=mode==="pre"?3:2;
+  return {sh:16*P/F/1e9,root:2*2*root/1e9,unit:2*k*mx/1e9,n:3*units.length+2,N:units.length+1,mx,root0:root};}
+ function draw(){const F=FL[+Fs.value],mode=segVal($("#fs1-wrap-pf")),cur=segVal($("#fs1-wrap-pol"));$("#fs1-wrap-fv").value=F;
+  const res=ORDER.map(p=>calc(p,F,mode));const mxT=Math.max(...res.map(r=>r.sh+r.root+r.unit))*1.08;
+  const X0=200,Wd=420,sc=Wd/mxT;let s="";
+  res.forEach((r,i)=>{const y=12+i*44,on=ORDER[i]===cur;let x=X0;
+   s+=`<text x="${X0-8}" y="${y+19}" text-anchor="end" font-size="12.5" fill="${on?"var(--ink)":"var(--muted)"}" font-weight="${on?700:500}">${POL[ORDER[i]][0]}</text>`;
+   s+=`<rect x="${x}" y="${y}" width="${r.sh*sc}" height="28" fill="var(--q-soft)" stroke="var(--q)"/>`;x+=r.sh*sc;
+   s+=`<rect x="${x}" y="${y}" width="${r.root*sc}" height="28" fill="var(--k)" opacity=".85"/>`;x+=r.root*sc;
+   s+=`<rect x="${x}" y="${y}" width="${r.unit*sc}" height="28" fill="var(--q)" opacity=".85"/>`;x+=r.unit*sc;
+   if(on)s+=`<rect x="${X0-2}" y="${y-2}" width="${x-X0+4}" height="32" fill="none" stroke="var(--tc)" stroke-width="2.2" rx="3"/>`;
+   s+=`<text x="${Math.min(x+6,600)}" y="${y+19}" font-size="12" fill="var(--ink2)" font-family="var(--mono)">${(r.sh+r.root+r.unit).toFixed(2)}</text>`;});
+  s+=`<text x="${X0}" y="194" font-size="11.5" class="svgs">GB per GPU (scale changes with F)</text>`;
+  svg.innerHTML=s;
+  const r=calc(cur,F,mode),tot=r.sh+r.root+r.unit;
+  info.innerHTML=`<b>${POL[cur][0]}</b>, F = ${F}, ${mode==="pre"?"BACKWARD_PRE":mode==="post"?"BACKWARD_POST":"no prefetch"}: sharded states <b>${r.sh.toFixed(2)} GB</b> + root ${r.root0>=1e6?(r.root0/1e6).toFixed(1)+"M":r.root0.toLocaleString("en-US")} params with gradients <b>${r.root.toFixed(2)} GB</b> + in-flight units <b>${r.unit.toFixed(2)} GB</b> = <b>${tot.toFixed(2)} GB</b> per GPU, before activations. ${r.N} FSDP unit${r.N>1?"s":""}, <b>${r.n} collectives</b> per step.${cur==="block"?" The root (262.1M) is larger than one block (202.4M).":""}`;}
+ seg($("#fs1-wrap-pol"),draw);seg($("#fs1-wrap-pf"),draw);Fs.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 4: overlap timeline ---------- */
+(function(){
+ const svg=$("#fs1-tl-svg");if(!svg)return;const info=$("#fs1-tl-info"),A=$("#fs1-tl-a"),LIM=$("#fs1-tl-lim");
+ function sim(N,f,a,mode,lim){const b=2*f;let K=0,C=0;const ops=[],FE={},BG={},BE={};
+  for(let i=1;i<=N;i++){let s=K;if(lim&&i>=3)s=Math.max(s,FE[i-2]);K=s+a;ops.push(["K","AG"+i,s,s+a,"ag"]);
+   s=Math.max(C,K);FE[i]=s+f;C=s+f;ops.push(["C","F"+i,s,s+f,"f"]);}
+  const bg=(i,e)=>{const s=Math.max(K,e);BG[i]=s+a;K=s+a;ops.push(["K","AG"+i,s,s+a,"ag"]);};
+  const rs=i=>{const s=Math.max(K,BE[i]);K=s+a;ops.push(["K","RS"+i,s,s+a,"rs"]);};
+  bg(N,FE[N]);
+  for(let i=N;i>=1;i--){if(mode==="pre"&&i>1)bg(i-1,0);
+   const s=Math.max(C,BG[i]);BE[i]=s+b;C=s+b;ops.push(["C","B"+i,s,s+b,"b"]);
+   if(mode==="post"){if(i>1)bg(i-1,BE[i]);rs(i);}else if(mode==="none"){rs(i);if(i>1)bg(i-1,BE[i]);}else rs(i);}
+  return {T:Math.max(C,K),ops};}
+ function draw(){const a=+A.value,mode=segVal($("#fs1-tl-mode")),lim=LIM.checked;$("#fs1-tl-av").value=a.toFixed(1);
+  const N=4,{T,ops}=sim(N,1,a,mode,lim);const sc=680/Math.max(T,14),X=t=>70+t*sc;
+  const FILL={f:"var(--q)",b:"var(--k)",ag:"var(--q-soft)",rs:"var(--v-soft)"},TXT={f:"var(--paper)",b:"var(--paper)",ag:"var(--ink)",rs:"var(--ink)"};
+  let s=`<text x="62" y="52" text-anchor="end" font-size="12" fill="var(--ink2)">compute</text><text x="62" y="112" text-anchor="end" font-size="12" fill="var(--ink2)">NCCL</text>`;
+  ops.forEach(([ln,lab,t0,t1,k])=>{const y=ln==="C"?32:92,w=(t1-t0)*sc;s+=`<rect x="${X(t0).toFixed(1)}" y="${y}" width="${Math.max(1,w-1).toFixed(1)}" height="30" rx="3" fill="${FILL[k]}" stroke="${k==="ag"?"var(--q)":k==="rs"?"var(--v)":"none"}"/>`;
+   if(w>22)s+=`<text x="${(X(t0)+w/2).toFixed(1)}" y="${y+20}" text-anchor="middle" font-size="11" fill="${TXT[k]}">${lab}</text>`;});
+  for(let t=0;t<=Math.max(T,14);t+=2)s+=`<line x1="${X(t)}" y1="128" x2="${X(t)}" y2="134" stroke="var(--muted)"/><text x="${X(t)}" y="148" text-anchor="middle" font-size="11" class="svgs">${t}</text>`;
+  s+=`<line x1="${X(0)}" y1="128" x2="${X(Math.max(T,14))}" y2="128" stroke="var(--muted)"/><line x1="${X(12)}" y1="24" x2="${X(12)}" y2="128" stroke="var(--muted)" stroke-dasharray="4 4"/><text x="${X(12)}" y="18" text-anchor="middle" font-size="11" class="svgs">pure compute = 12</text>`;
+  s+=`<line x1="${X(T)}" y1="24" x2="${X(T)}" y2="160" stroke="var(--bad)" stroke-width="2"/><text x="${Math.min(X(T),700)}" y="176" text-anchor="middle" font-size="12" fill="var(--bad)" font-weight="700">step ends at ${T.toFixed(1)}</text>`;
+  svg.innerHTML=s;const ex=T-12;
+  info.innerHTML=`Step time <b>${T.toFixed(1)}</b> time units; pure compute 12; exposed communication <b>${ex.toFixed(1)}</b> (${(100*ex/T).toFixed(0)}% of the step). All 12 transfers (8 all-gathers, 4 reduce-scatters) take ${(12*a).toFixed(1)} in total, so <b>${Math.max(0,12*a-ex).toFixed(1)}</b> of that is hidden behind compute.`;}
+ seg($("#fs1-tl-mode"),draw);A.addEventListener("input",draw);LIM.addEventListener("change",draw);draw();
+})();
+
+/* ---------- Figure 5: sharding strategies ---------- */
+(function(){
+ const svg=$("#fs1-strat-svg");if(!svg)return;const info=$("#fs1-strat-info"),Ps=$("#fs1-strat-p"),Ws=$("#fs1-strat-w");
+ const PL=[0.5,1,3,6.738,13,34,70,175,405],WL=[8,16,32,64,128,256,512],G=8;
+ const NAMES=["FULL_SHARD","SHARD_GRAD_OP","NO_SHARD","HYBRID_SHARD","_HYBRID_SHARD_ZERO2"],SHORT=["FULL","SGO","NO","HYBRID","HYB-Z2"];
+ function calc(Pb,W){const P=Pb*1e9,H=W/G,Bt=2,inter=W>G?2*(P/G)*(H-1)/H*Bt/1e9:0;
+  return [{m:16*P/W/1e9,c:3*P*(W-1)/W*Bt/1e9,x:null},{m:(16*P/W+2*P)/1e9,c:2*P*(W-1)/W*Bt/1e9,x:null},{m:16*P/1e9,c:2*P*(W-1)/W*Bt/1e9,x:null},
+   {m:16*P/G/1e9,c:3*P*(G-1)/G*Bt/1e9+inter,x:inter},{m:(16*P/G+2*P)/1e9,c:2*P*(G-1)/G*Bt/1e9+inter,x:inter}];}
+ function draw(){const Pb=PL[+Ps.value],W=WL[+Ws.value],sel=+segVal($("#fs1-strat-s"));
+  $("#fs1-strat-pv").value=Pb===6.738?"6.74B (7B)":Pb+"B";$("#fs1-strat-wv").value=W+" ("+Math.max(1,W/G)+" node"+(W>G?"s":"")+")";
+  const r=calc(Pb,W);
+  /* memory: log scale 0.1 .. 10000 GB */
+  const lo=-1,hi=4,Y0=210,Hh=180,ly=v=>Y0-(Math.log10(Math.max(v,0.1))-lo)/(hi-lo)*Hh;let s="";
+  s+=`<text x="40" y="14" font-size="12.5" class="svgs">memory per GPU (GB, log scale)</text>`;
+  [0.1,1,10,100,1000,10000].forEach(v=>s+=`<line x1="44" y1="${ly(v)}" x2="300" y2="${ly(v)}" stroke="var(--rule)" stroke-width=".6"/><text x="40" y="${ly(v)+4}" text-anchor="end" font-size="10.5" class="svgs">${v>=1?v:"0.1"}</text>`);
+  s+=`<line x1="44" y1="${ly(80)}" x2="300" y2="${ly(80)}" stroke="var(--bad)" stroke-dasharray="5 4" stroke-width="1.6"/><text x="300" y="${ly(80)-4}" text-anchor="end" font-size="10.5" fill="var(--bad)">80 GB</text>`;
+  r.forEach((q,i)=>{const x=54+i*49,on=i===sel,y=ly(q.m);s+=`<rect x="${x}" y="${y.toFixed(1)}" width="36" height="${(Y0-y).toFixed(1)}" fill="${q.m>80?"var(--bad)":"var(--q)"}" opacity="${on?0.95:0.45}" stroke="${on?"var(--tc)":"none"}" stroke-width="2.2"/><text x="${x+18}" y="${Y0+16}" text-anchor="middle" font-size="10.5" fill="${on?"var(--ink)":"var(--muted)"}" font-weight="${on?700:500}">${SHORT[i]}</text>`;});
+  /* comm: linear */
+  const cm=Math.max(...r.map(q=>q.c))*1.1||1,lc=v=>Y0-v/cm*Hh;
+  s+=`<text x="350" y="14" font-size="12.5" class="svgs">sent per GPU per step (GB, BF16)</text><line x1="350" y1="${Y0}" x2="630" y2="${Y0}" stroke="var(--muted)"/>`;
+  r.forEach((q,i)=>{const x=362+i*53,on=i===sel,y=lc(q.c);s+=`<rect x="${x}" y="${y.toFixed(1)}" width="38" height="${(Y0-y).toFixed(1)}" fill="var(--k-soft)" stroke="${on?"var(--tc)":"var(--k)"}" stroke-width="${on?2.2:1}" opacity="${on?1:0.6}"/>`;
+   if(q.x){const y2=lc(q.x);s+=`<rect x="${x}" y="${y2.toFixed(1)}" width="38" height="${(Y0-y2).toFixed(1)}" fill="var(--k)" opacity="${on?0.95:0.5}"/>`;}
+   s+=`<text x="${x+19}" y="${(y-5).toFixed(1)}" text-anchor="middle" font-size="10.5" fill="var(--ink2)">${gb(q.c)}</text><text x="${x+19}" y="${Y0+16}" text-anchor="middle" font-size="10.5" fill="${on?"var(--ink)":"var(--muted)"}" font-weight="${on?700:500}">${SHORT[i]}</text>`;});
+  svg.innerHTML=s;
+  const q=r[sel],fits=q.m<=80;
+  info.innerHTML=`<b>${NAMES[sel]}</b>, Ψ = ${Pb===6.738?"6.74":Pb}B on ${W} GPUs: model states <b>${gb(q.m)} GB</b> per GPU (${fits?"fits":"<b style='color:var(--bad)'>does not fit</b>"} in 80 GB, before activations). Communication <b>${gb(q.c)} GB</b> per step${q.x!==null?`: <b>${gb(q.c-q.x)} GB</b> inside the node and <b>${gb(q.x)} GB</b> between nodes`:W>G?", over a group that spans all "+W/G+" nodes":", all inside one node"}.`;}
+ seg($("#fs1-strat-s"),draw);Ps.addEventListener("input",draw);Ws.addEventListener("input",draw);draw();
+})();
+})();
+</script></body></html>

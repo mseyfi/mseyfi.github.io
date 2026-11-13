@@ -1,0 +1,443 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Collective communication: all-reduce, reduce-scatter, all-gather · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 43</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="collective-communication-all-reduce-reduce-scatter-all">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="collective-communication-all-reduce-reduce-scatter-all" data-session="collective-communication-all-reduce-reduce-scatter-all" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">43</span><span>Track 3: Pretraining and scale · session 13 of 22</span></div><h1 class="chap-title">Collective communication: all-reduce, reduce-scatter, all-gather</h1><p class="chap-sub">When a model trains on many GPUs, the GPUs must keep exchanging numbers: gradients, weights, activations. A small set of patterns, called collectives, covers almost all of this traffic. This session shows what each collective does, why the ring all-reduce is built from a reduce-scatter and an all-gather, how to predict its time from bandwidth and latency, what hardware carries the bytes, and how training hides the communication behind computation.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 38 and 42 (memory math for training, GPU architecture for ML)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>What broadcast, reduce, all-reduce, reduce-scatter, all-gather and all-to-all do, with the same four GPUs and the same numbers</li><li>How the ring all-reduce works step by step, and why it is a reduce-scatter followed by an all-gather</li><li>The alpha-beta cost model: why each GPU sends 2(N−1)/N of the data, and when latency matters more than bandwidth</li><li>Ring versus tree, algorithm bandwidth versus bus bandwidth, and how to read an nccl-tests result</li><li>The hardware: NVLink and NVSwitch inside a node, PCIe, InfiniBand and Ethernet between nodes, and hierarchical all-reduce</li><li>Which parallel method uses which collective: DDP, ZeRO and FSDP, tensor and sequence parallelism, mixture of experts</li><li>How gradient buckets let communication run during the backward pass, and how to estimate the time that is still exposed</li></ul></div></header><style>
+[data-session="collective-communication-all-reduce-reduce-scatter-all"] code,[data-session="collective-communication-all-reduce-reduce-scatter-all"] pre.code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.cc-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.cc-grid input[type=range]{width:100%}
+.cc-grid output{font:600 14px var(--mono);min-width:86px;text-align:right}
+.cc-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.cc-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+.cc-seg{flex-wrap:wrap}
+.cc-cell text{font-family:var(--mono);text-anchor:middle}
+.cc-arrow{fill:none;stroke:var(--k);stroke-width:2.2}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">One GPU cannot train a modern LLM in a reasonable time. Llama-class models are trained on thousands of GPUs at once. Those GPUs only help if they can share their work: every step, each GPU must give its gradients to the others and get theirs back. If this sharing is slow, the GPUs sit idle and you pay for hardware that does nothing.</p>
+<p>The sharing happens through a small set of standard patterns called <b>collective operations</b>, or <b>collectives</b>. A collective is a communication step in which <b>all</b> GPUs of a group take part at the same time, each with its own piece of data. The most important ones are <b>all-reduce</b> (everyone ends with the sum of everyone’s data), <b>reduce-scatter</b> (everyone ends with one slice of the sum) and <b>all-gather</b> (everyone ends with all the slices). Every parallel training method in the next sessions is built from these: data parallelism uses all-reduce, ZeRO and FSDP use reduce-scatter and all-gather, tensor parallelism uses all-reduce inside each layer, and mixture-of-experts models use all-to-all. [Certain]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “How does ring all-reduce work, and what does it cost?”, “Why is all-reduce = reduce-scatter + all-gather?”, “Why does FSDP communicate 1.5 times more than DDP?”, “NVLink vs InfiniBand?”, “How do you overlap communication with compute?”. You can answer all of them with one formula, (43.4).</aside>
+<p>In <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a> we asked whether a kernel is limited by compute or by memory bandwidth. This session asks the same question one level up: is a training step limited by compute or by the <b>network</b> between GPUs? By the end you will be able to estimate, on paper, how long an all-reduce of 16 GB takes on 8 GPUs inside a server or on 64 GPUs across servers, and whether that time can be hidden.</p>
+
+<h2>The vocabulary: ranks, groups and the six collectives</h2>
+<p>Some words first. Each GPU runs one copy of the training program, called a <b>process</b>. Each process has a number, its <b>rank</b>, from 0 to \(N-1\), where \(N\) is the <b>world size</b> (the number of processes). A collective runs inside a <b>process group</b>: a chosen set of ranks, for example all 64, or only the 8 GPUs inside one server. All ranks of the group must call the same collective, with buffers of matching size; if one rank does not call it, the others wait forever.</p>
+<p>Take four GPUs. Each holds a vector of four numbers, split into four <b>chunks</b> (here one number per chunk). GPU 0 holds \([1, 2, 3, 4]\), GPU 1 holds \([5, 6, 7, 8]\), and so on. In a real job each “number” would be a chunk of millions of gradient values; the patterns are the same.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Collective</th><th>Input on each rank</th><th>Output on each rank</th><th>Typical use in training</th></tr></thead><tbody>
+<tr><td><b>Broadcast</b></td><td>rank 0 has \(x\)</td><td>everyone has \(x\)</td><td>send the initial weights from rank 0 to all ranks</td></tr>
+<tr><td><b>Reduce</b></td><td>rank \(r\) has \(x_r\)</td><td>rank 0 has \(\sum_r x_r\)</td><td>sum a metric on one rank for logging</td></tr>
+<tr><td><b>All-reduce</b></td><td>rank \(r\) has \(x_r\)</td><td>everyone has \(\sum_r x_r\)</td><td>average gradients in data parallelism; tensor-parallel layers</td></tr>
+<tr><td><b>Reduce-scatter</b></td><td>rank \(r\) has \(x_r\) (\(N\) chunks)</td><td>rank \(r\) has chunk \(r\) of \(\sum_r x_r\)</td><td>gradients in ZeRO-2/3 and FSDP; sequence parallelism</td></tr>
+<tr><td><b>All-gather</b></td><td>rank \(r\) has chunk \(r\)</td><td>everyone has all \(N\) chunks</td><td>gather sharded weights in ZeRO-3 and FSDP; sequence parallelism</td></tr>
+<tr><td><b>All-to-all</b></td><td>rank \(r\) has \(N\) chunks, one for each rank</td><td>rank \(r\) has chunk \(r\) from every rank</td><td>send tokens to their experts in mixture of experts</td></tr></tbody></table></div>
+<p>“Reduce” means combine with an operation such as sum, max or average. Sum is by far the most common. Figure 1 shows each collective with real numbers. Click through them before you read on.</p>
+<figure class="fig wide" id="cc-gal"><div class="fig-body">
+<div class="controls"><span class="seg cc-seg" id="cc-gal-op"><button type="button" data-v="bc" aria-pressed="false">Broadcast</button><button type="button" data-v="red" aria-pressed="false">Reduce</button><button type="button" data-v="ar" aria-pressed="true">All-reduce</button><button type="button" data-v="rs" aria-pressed="false">Reduce-scatter</button><button type="button" data-v="ag" aria-pressed="false">All-gather</button><button type="button" data-v="a2a" aria-pressed="false">All-to-all</button></span></div>
+<div class="scroll-x"><svg id="cc-gal-svg" viewBox="0 0 760 300" role="img" aria-label="Four GPUs before and after the chosen collective, with the numbers in each chunk"></svg></div>
+<div class="cc-leg"><span style="--c:var(--q)">original data of this rank</span><span style="--c:var(--k)">reduced (summed) data</span><span style="--c:var(--v)">data copied from another rank</span><span style="--c:var(--rule)">empty or not needed</span></div>
+<div class="readout" id="cc-gal-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The six collectives on four GPUs. Left: what each rank holds before. Right: what it holds after. Colors show where each value came from.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Each row is one GPU; each box is one chunk. Compare all-reduce with reduce-scatter: reduce-scatter computes the same sums, 28, 32, 36 and 40, but each rank keeps only one of them. Then look at all-gather: it takes one chunk per rank and gives every rank all four. If you run reduce-scatter and then all-gather on its output, you get exactly the all-reduce result. All-to-all is a transpose: chunk \(c\) of rank \(r\) moves to rank \(c\), at position \(r\). No values are added.</p></details></figure>
+
+<h2>The naive way: send everything to one GPU</h2>
+<p>How would you build an all-reduce from simple sends and receives? The first idea is a <b>parameter server</b>: every rank sends its full vector of \(M\) bytes to rank 0. Rank 0 adds them and sends the result back to everyone. It works, but rank 0 receives \((N-1)M\) bytes and then sends \((N-1)M\) bytes. All other links sit idle while rank 0’s link carries everything. For 8 GPUs and 16 GB of gradients, rank 0 must receive 112 GB and send 112 GB. The time grows <b>linearly</b> with \(N\): add more GPUs and the all-reduce gets slower.</p>
+<p>The better idea is to give every GPU the same amount of work and to use every link at the same time. The ring algorithm does exactly that.</p>
+
+<h2>Ring all-reduce, step by step</h2>
+<p>Put the \(N\) GPUs in a circle. Each GPU sends only to its right neighbour and receives only from its left neighbour. Cut each vector into \(N\) chunks. The algorithm has two phases.</p>
+<ol><li><b>Reduce-scatter phase</b> (\(N-1\) steps). In each step, every GPU sends one chunk to the right. The receiver adds it to its own copy of that chunk. The chunk indices are chosen so that a partial sum keeps travelling around the circle and picks up one more GPU’s contribution at each hop. After \(N-1\) steps, every chunk has visited every GPU, and GPU \(r\) holds the <b>complete</b> sum of chunk \(r\).</li>
+<li><b>All-gather phase</b> (\(N-1\) steps). Now each GPU owns one finished chunk. In each step, every GPU passes a finished chunk to the right, and the receiver simply copies it (no addition). After \(N-1\) more steps, everyone has all \(N\) finished chunks.</li></ol>
+<aside class="note analogy"><span class="nt">Analogy</span>Four people at a round table each have a page of numbers in four columns, and they want the column totals. Instead of one person collecting all pages, each person passes one column to the right, the neighbour adds their own column and passes it on. After three passes each person has one finished total. Three more passes of finished totals and everyone has all four. Nobody ever handles more than one column at a time, and everyone is busy at every moment.</aside>
+<p>Step through it in Figure 2 with the numbers of Figure 1.</p>
+<figure class="fig wide" id="cc-ring"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="cc-ring-prev">Back</button><button type="button" class="btn primary" id="cc-ring-play">Play</button><button type="button" class="btn" id="cc-ring-next">Next</button><span id="cc-ring-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="cc-ring-svg" viewBox="0 0 760 330" role="img" aria-label="Ring all-reduce on four GPUs, one step at a time"></svg></div>
+<div class="cc-leg"><span style="--c:var(--q)">own original value</span><span style="--c:var(--k)">partial sum (some ranks added)</span><span style="--c:var(--v)">final sum of all 4 ranks</span></div>
+<div class="readout" id="cc-ring-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Ring all-reduce on four GPUs. Steps 1 to 3 are the reduce-scatter phase; steps 4 to 6 are the all-gather phase. The arrows show which chunk each GPU sends to its right neighbour in this step. The small number under a box counts how many ranks have been added into that value.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Follow chunk 0 (the first column). In step 1, GPU 1 sends its 5 to GPU 2, which now has \(9 + 5 = 14\). In step 2, GPU 2 sends 14 to GPU 3: \(13 + 14 = 27\). In step 3, GPU 3 sends 27 to GPU 0: \(1 + 27 = 28\), the full sum, and it lands on GPU 0. The starting chunks are chosen so that GPU \(r\) finishes with chunk \(r\), as PyTorch’s <code>reduce_scatter_tensor</code> does. After step 3, each GPU holds one green value, in its own column. The counter in the readout shows that every GPU sends exactly one chunk per step, so after 6 steps each GPU has sent 6 chunks of size \(M/4\): \(1.5M\) in total, which is \(2(N-1)/N \cdot M\) for \(N = 4\).</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 1: ring all-reduce on rank \(r\) of \(N\)</div><ol>
+<li><b>input:</b> buffer \(x\) of \(M\) bytes, split into chunks \(x[0], \dots, x[N-1]\); right neighbour \(r+1 \bmod N\), left neighbour \(r-1 \bmod N\)</li>
+<li><b>for</b> \(s = 0, \dots, N-2\) <span class="c">// reduce-scatter phase</span></li>
+<li>&nbsp;&nbsp;send \(x[(r - 1 - s) \bmod N]\) to the right; receive chunk \(c = (r - 2 - s) \bmod N\) from the left</li>
+<li>&nbsp;&nbsp;\(x[c] \leftarrow x[c] + \text{received}\) <span class="c">// one more rank added into this partial sum</span></li>
+<li><span class="c">// now \(x[r]\) is the full sum over all ranks</span></li>
+<li><b>for</b> \(s = 0, \dots, N-2\) <span class="c">// all-gather phase</span></li>
+<li>&nbsp;&nbsp;send \(x[(r - s) \bmod N]\) to the right; receive chunk \(c = (r - 1 - s) \bmod N\) from the left</li>
+<li>&nbsp;&nbsp;\(x[c] \leftarrow \text{received}\) <span class="c">// copy, no addition</span></li>
+<li><b>return</b> \(x\) <span class="c">// every rank holds the same summed buffer</span></li></ol></div>
+<p>Two remarks. First, the send and the receive in one step happen at the same time, over the two directions of the links. Second, real libraries split each chunk further into small pieces and <b>pipeline</b> them, so a GPU can forward the first piece while the next one is still arriving. [Certain] The formulas below assume this.</p>
+
+<h2>What a collective costs: the alpha-beta model</h2>
+<p>To predict the time of a collective we need a model of one message. The standard one is the <b>alpha-beta model</b> (also called the latency-bandwidth model): sending a message of \(n\) bytes over one link takes</p>
+<div class="eq">\[ T(n) = \alpha + \frac{n}{\beta} \tag{43.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\alpha\)</dt><dd>the <b>latency</b>: fixed time per message, paid even for 1 byte (launching the transfer, crossing switches, synchronizing). Microseconds on GPU links. [Likely]</dd>
+<dt>\(\beta\)</dt><dd>the <b>bandwidth</b> of the link in bytes per second, in one direction</dd>
+<dt>\(n\)</dt><dd>the message size in bytes</dd></dl>
+<p>Small messages are <b>latency-bound</b> (\(\alpha\) dominates). Large messages are <b>bandwidth-bound</b> (\(n/\beta\) dominates). Example: with \(\alpha = 5\) µs and \(\beta = 50\) GB/s, a 1 MB message takes \(5 + 20 = 25\) µs; a 1 KB message takes about 5 µs, almost all latency.</p>
+<h3>Reduce-scatter and all-gather</h3>
+<p>In the ring reduce-scatter, there are \(N-1\) steps, and in each step every GPU sends one chunk of \(M/N\) bytes. All GPUs send at the same time on different links, so a step costs one message time:</p>
+<div class="eq">\[ T_{\text{RS}} = (N-1)\,\alpha + \frac{N-1}{N} \cdot \frac{M}{\beta} \tag{43.2} \]</div>
+<p>The all-gather has the same pattern of steps and chunk sizes (only “add” becomes “copy”), so it costs the same:</p>
+<div class="eq">\[ T_{\text{AG}} = (N-1)\,\alpha + \frac{N-1}{N} \cdot \frac{M}{\beta} \tag{43.3} \]</div>
+<p>Here \(M\) is the size of the <b>full</b> vector: for reduce-scatter, the input on each rank; for all-gather, the output on each rank (each rank contributes \(M/N\)).</p>
+<h3>All-reduce</h3>
+<p>The ring all-reduce is a reduce-scatter followed by an all-gather, so its time is the sum:</p>
+<div class="eq">\[ T_{\text{AR}} = 2(N-1)\,\alpha + \frac{2(N-1)}{N} \cdot \frac{M}{\beta} \tag{43.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\)</dt><dd>the number of GPUs in the ring</dd>
+<dt>\(M\)</dt><dd>the size of the buffer being summed, in bytes (for example all gradients: 2 bytes × parameters in BF16)</dd>
+<dt>\(2(N-1)\)</dt><dd>the number of ring steps; each pays one latency \(\alpha\)</dd>
+<dt>\(2(N-1)/N \cdot M\)</dt><dd>the bytes each GPU sends (and receives) in total</dd></dl>
+<p>Look at the bandwidth term. As \(N\) grows, \(2(N-1)/N\) goes to 2, not to infinity. Each GPU sends about \(2M\) bytes <b>no matter how many GPUs</b> there are. With 8 GPUs it is \(1.75M\); with 1,024 GPUs it is \(1.998M\). This is why the ring scaled data parallelism to many GPUs, and why Baidu and then Horovod (2017–2018) made it the standard for deep learning. [Certain] It is also the best possible: in any all-reduce algorithm, each GPU must send at least \(2(N-1)/N \cdot M\) bytes (Patarasuk and Yuan, 2009), so the ring is <b>bandwidth-optimal</b>. [Certain]</p>
+<p>Compare the naive parameter server: \(T \approx 2(N-1)(\alpha + M/\beta)\) on rank 0. Its bandwidth term grows with \(N\); the ring’s does not.</p>
+<div class="worked"><div class="wt">Worked example: all-reducing 16 GB of gradients</div>
+<p>An 8B-parameter model has \(8 \times 10^9 \times 2 = 16\) GB of BF16 gradients. Ignore latency, which is tiny for such a big buffer.</p>
+<p><b>8 GPUs inside one H100 server</b>, NVLink at 450 GB/s per direction: each GPU sends \(2 \cdot \tfrac{7}{8} \cdot 16 = 28\) GB, so \(T = 28 / 450 = 62\) ms.</p>
+<p><b>64 GPUs in one flat ring across 8 servers</b>, where the slowest links are InfiniBand at 50 GB/s per GPU: each GPU sends \(2 \cdot \tfrac{63}{64} \cdot 16 = 31.5\) GB, so \(T = 31.5 / 50 = 630\) ms. A ring is as slow as its slowest link.</p>
+<p>Is 630 ms a lot? With 4M tokens per step spread over 64 GPUs, each GPU processes 65,536 tokens, which costs \(6 \cdot 8\times10^9 \cdot 65{,}536 = 3.1 \times 10^{15}\) FLOPs. At 40% of the H100’s 989 dense BF16 TFLOP/s that takes about 8.0 s. So the all-reduce is about 8% of the step if it is <b>not</b> hidden, and close to 0% if it overlaps with the backward pass. With a smaller batch per GPU the ratio grows fast.</p></div>
+
+<h2>Latency, trees, and algorithm bandwidth vs bus bandwidth</h2>
+<p>The ring has one weak point: \(2(N-1)\) steps, each paying \(\alpha\). With 1,024 GPUs that is 2,046 latencies; at 5 µs each, over 10 ms, even for a 1 KB message. For small messages and many GPUs, <b>tree</b> algorithms are better. In a tree, partial sums flow up to a root and the result flows back down, so the number of steps grows with \(\log_2 N\) instead of \(N\). NCCL uses a <b>double binary tree</b>: two trees at once, so that each GPU is an inner node in one and a leaf in the other, and both halves of the data are busy. [Certain] A simple model for it is</p>
+<div class="eq">\[ T_{\text{tree}} \approx 2 \lceil \log_2 N \rceil\, \alpha + \frac{2M}{\beta} \tag{43.5} \]</div>
+<p>This is a rough model. Its bandwidth term is close to the ring’s, but its latency term is much smaller: 20 steps instead of 2,046 for \(N = 1{,}024\). [Likely] NCCL picks the algorithm (ring, tree, and others such as NVLS, which lets the NVSwitch do the additions) and the protocol for each call from the message size and the topology. [Certain]</p>
+<h3>Measuring a collective: algbw and busbw</h3>
+<p>The standard benchmark is <b>nccl-tests</b> (<code>all_reduce_perf</code> and friends). It reports two numbers. The <b>algorithm bandwidth</b> is the buffer size divided by the time, \(\text{algbw} = M / t\). The <b>bus bandwidth</b> corrects for how many bytes the algorithm really has to move per GPU, so you can compare it directly with the link speed:</p>
+<div class="eq">\[ \text{busbw}_{\text{AR}} = \frac{M}{t} \cdot \frac{2(N-1)}{N}, \qquad \text{busbw}_{\text{RS}} = \text{busbw}_{\text{AG}} = \frac{M}{t} \cdot \frac{N-1}{N} \tag{43.6} \]</div>
+<p>Formula (43.6) is (43.4) solved for \(\beta\) with \(\alpha = 0\). Example: a 1 GB all-reduce on 8 GPUs in 5 ms gives algbw 200 GB/s and busbw 350 GB/s. If the link is 450 GB/s per direction, you reach 78% of it. Busbw is what you should compare across GPU counts and with the hardware spec. [Certain]</p>
+<figure class="fig" id="cc-cost"><div class="fig-body">
+<div class="cc-grid">
+<label for="cc-cost-n">GPUs \(N\)</label><input type="range" id="cc-cost-n" min="1" max="10" step="1" value="3"><output id="cc-cost-nv"></output>
+<label for="cc-cost-m">Buffer size \(M\)</label><input type="range" id="cc-cost-m" min="3" max="10.5" step="0.25" value="9"><output id="cc-cost-mv"></output>
+<label for="cc-cost-a">Latency \(\alpha\) per step</label><input type="range" id="cc-cost-a" min="1" max="30" step="1" value="5"><output id="cc-cost-av"></output></div>
+<div class="controls" style="margin-top:8px"><span class="seg cc-seg" id="cc-cost-link"><button type="button" data-v="450" aria-pressed="true">NVLink 4 (450)</button><button type="button" data-v="63" aria-pressed="false">PCIe 5 x16 (63)</button><button type="button" data-v="50" aria-pressed="false">InfiniBand NDR (50)</button><button type="button" data-v="12.5" aria-pressed="false">100 GbE (12.5)</button></span></div>
+<svg id="cc-cost-svg" viewBox="0 0 640 280" role="img" aria-label="All-reduce time against buffer size for ring, tree and a parameter server"></svg>
+<div class="cc-leg"><span style="--c:var(--q)">ring (43.4)</span><span style="--c:var(--k)">tree (43.5)</span><span style="--c:var(--muted)">parameter server</span></div>
+<div class="readout" id="cc-cost-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Predicted all-reduce time from the alpha-beta model, on a log-log plot. The buttons set \(\beta\), the per-direction bandwidth in GB/s of each GPU’s slowest link. These are ideal link speeds; real collectives reach only part of them.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>On the left of the plot (small buffers), the lines are flat: time is all latency, and the tree wins because it has fewer steps. On the right (large buffers), the lines rise with slope 1: time is all bandwidth, and ring and tree are almost equal. Move \(N\) up to 1,024 and watch the ring’s flat part rise, since it pays \(2(N-1)\) latencies. Then switch from NVLink to 100 GbE: everything on the right moves up by a factor of 36. The readout gives the busbw you would measure if the model were exact.</p></details></figure>
+
+<h2>The hardware that carries the bytes</h2>
+<p>The \(\beta\) in the formulas is not one number. A training cluster has a <b>hierarchy</b> of links, each about an order of magnitude apart.</p>
+<ul>
+<li><b>NVLink and NVSwitch</b> (inside a server). NVLink is NVIDIA’s direct GPU-to-GPU link. On H100, each GPU has 18 NVLink 4 links with 900 GB/s in total, which is 450 GB/s in each direction. In an 8-GPU server such as DGX H100, the links go to NVSwitch chips, so <b>every</b> pair of GPUs can talk at full speed at the same time. Blackwell (NVLink 5) doubles this to 1,800 GB/s per GPU. [Certain]</li>
+<li><b>PCIe</b> (GPU to CPU, and to network cards). PCIe Gen5 x16 gives about 63 GB/s per direction; Gen4 x16 about 32 GB/s. [Certain] GPUs without NVLink (many workstation and cloud cards) do all-reduce over PCIe, often through the CPU’s root complex, and are much slower.</li>
+<li><b>InfiniBand</b> (between servers). A low-latency network built for clusters. An NDR port runs at 400 Gb/s, which is 50 GB/s. DGX H100 has eight such ports, one per GPU. [Certain] With <b>GPUDirect RDMA</b>, the network card reads and writes GPU memory directly, without a copy through the CPU. [Certain] Some InfiniBand switches can also do the additions themselves (SHARP), which halves the data each GPU must send. [Likely]</li>
+<li><b>Ethernet with RoCE</b> (between servers). RDMA over Converged Ethernet runs the same kind of direct transfers on Ethernet at 100, 200 or 400 Gb/s. Many large clusters use it instead of InfiniBand. Plain TCP Ethernet works too but has higher latency and uses CPU time. [Likely]</li></ul>
+<figure class="fig wide" id="cc-hw"><div class="fig-body">
+<div class="scroll-x"><svg id="cc-hw-svg" viewBox="0 0 760 330" role="img" aria-label="Two 8-GPU servers: NVSwitch inside each server, one InfiniBand port per GPU between servers"></svg></div>
+</div><figcaption><b>Figure 4.</b> The link hierarchy of a typical H100 cluster. Inside a server, every GPU reaches every other GPU through NVSwitch at 450 GB/s per direction. Between servers, GPU \(i\) of each server uses its own 50 GB/s InfiniBand port, and ports with the same index usually share a switch (a “rail”). [Likely] The step from NVLink to the network is about 9 times.</figcaption></figure>
+<h3>Hierarchical all-reduce</h3>
+<p>The worked example showed that a flat 64-GPU ring runs at InfiniBand speed. A <b>hierarchical</b> all-reduce uses the fast links for most of the work. With \(G\) GPUs per server and \(K\) servers:</p>
+<ol><li>Reduce-scatter inside each server over NVLink: each GPU now holds the server’s sum of \(1/G\) of the buffer.</li>
+<li>All-reduce across servers, \(K\) GPUs per ring, one ring per GPU index, all \(G\) rings in parallel over their own ports. Each ring carries only \(M/G\) bytes.</li>
+<li>All-gather inside each server over NVLink.</li></ol>
+<div class="eq">\[ T_{\text{hier}} \approx \frac{2(G-1)}{G} \cdot \frac{M}{\beta_{\text{NVLink}}} + \frac{2(K-1)}{K} \cdot \frac{M/G}{\beta_{\text{net}}} \tag{43.7} \]</div>
+<p>For the same 16 GB on \(K = 8\) servers of \(G = 8\) GPUs: \(62\) ms on NVLink plus \(2 \cdot \tfrac{7}{8} \cdot 2 / 50 = 70\) ms on InfiniBand, about 132 ms in total instead of 630 ms. NCCL builds this kind of schedule automatically from the topology it detects. [Likely]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Link speeds are often quoted in both directions added together (NVLink “900 GB/s”) or in bits (InfiniBand “400 Gb/s”). For formula (43.4), use bytes per second in <b>one</b> direction: 450 GB/s and 50 GB/s.</aside>
+
+<h2>NCCL: the library under PyTorch</h2>
+<p><b>NCCL</b> (NVIDIA Collective Communications Library, pronounced “nickel”) implements all of the collectives above for NVIDIA GPUs. PyTorch calls it when you create a process group with the <code>"nccl"</code> backend; AMD GPUs use RCCL, a port with the same interface, and CPUs use Gloo. [Certain] A few facts that matter in practice:</p>
+<ul>
+<li><b>Collectives are GPU kernels.</b> NCCL runs its copies and additions as CUDA kernels on a few SMs. So communication uses some GPU compute, and it is ordered on a CUDA <b>stream</b> like any kernel. [Certain]</li>
+<li><b>Topology detection.</b> At start-up NCCL finds NVLink, PCIe switches and network cards and builds rings and trees that use the fastest paths. [Certain]</li>
+<li><b>Algorithms and protocols.</b> <code>NCCL_ALGO</code> can force Ring, Tree, NVLS, CollNet or PAT; <code>NCCL_PROTO</code> chooses LL, LL128 or Simple (the low-latency protocols are for small messages). Normally you leave both to NCCL’s tuner. [Certain]</li>
+<li><b>Debugging.</b> <code>NCCL_DEBUG=INFO</code> prints the topology and the chosen rings; it is the first thing to look at when multi-node training is slow. A rank that never reaches a collective causes a <b>hang</b>, not an error, until a timeout fires. [Certain]</li></ul>
+<p>The PyTorch calls map one to one onto the collectives. The first listing simulates Algorithm 1 on four “GPUs” in one process, so you can check the ring logic. The second runs the real collectives on four CPU processes with the Gloo backend; change <code>"gloo"</code> to <code>"nccl"</code> and move the tensors to the GPU to run on GPUs.</p>
+<pre class="code"><span class="kw2">import</span> torch
+
+<span class="kw2">def</span> ring_all_reduce(bufs):
+    <span class="cm">"""Simulate a ring all-reduce. bufs: N equal 1-D tensors, one per GPU. Sums in place."""</span>
+    N = len(bufs)
+    ch = [list(b.chunk(N)) <span class="kw2">for</span> b <span class="kw2">in</span> bufs]        <span class="cm"># ch[r][c] is a view of chunk c on rank r</span>
+    <span class="kw2">for</span> s <span class="kw2">in</span> range(N - 1):                        <span class="cm"># phase 1: reduce-scatter, N-1 steps</span>
+        msgs = [(r, (r - 1 - s) % N, ch[r][(r - 1 - s) % N].clone()) <span class="kw2">for</span> r <span class="kw2">in</span> range(N)]
+        <span class="kw2">for</span> r, c, data <span class="kw2">in</span> msgs:                   <span class="cm"># all ranks send at the same time</span>
+            ch[(r + 1) % N][c] += data            <span class="cm"># the right neighbour adds it</span>
+    <span class="cm"># now rank r holds the full sum of chunk r</span>
+    <span class="kw2">for</span> s <span class="kw2">in</span> range(N - 1):                        <span class="cm"># phase 2: all-gather, N-1 steps</span>
+        msgs = [(r, (r - s) % N, ch[r][(r - s) % N].clone()) <span class="kw2">for</span> r <span class="kw2">in</span> range(N)]
+        <span class="kw2">for</span> r, c, data <span class="kw2">in</span> msgs:
+            ch[(r + 1) % N][c].copy_(data)        <span class="cm"># the right neighbour overwrites it</span>
+    <span class="kw2">return</span> bufs
+
+torch.manual_seed(0)
+grads = [torch.randn(12) <span class="kw2">for</span> _ <span class="kw2">in</span> range(4)]
+expected = torch.stack(grads).sum(0)
+out = ring_all_reduce([g.clone() <span class="kw2">for</span> g <span class="kw2">in</span> grads])
+print(all(torch.allclose(o, expected, atol=1e-6) <span class="kw2">for</span> o <span class="kw2">in</span> out))      <span class="cm"># True</span>
+fig2 = [torch.arange(4.) + 1 + 4 * r <span class="kw2">for</span> r <span class="kw2">in</span> range(4)]                <span class="cm"># the numbers of Figure 2</span>
+print(ring_all_reduce(fig2)[2])                                        <span class="cm"># tensor([28., 32., 36., 40.])</span></pre>
+<pre class="code"><span class="kw2">import</span> os, torch, torch.distributed <span class="kw2">as</span> dist, torch.multiprocessing <span class="kw2">as</span> mp
+
+<span class="kw2">def</span> worker(rank, world):
+    os.environ["MASTER_ADDR"], os.environ["MASTER_PORT"] = "127.0.0.1", "29515"
+    dist.init_process_group("gloo", rank=rank, world_size=world)   <span class="cm"># "nccl" on GPUs</span>
+    x = torch.arange(4.) + 1 + 4 * rank        <span class="cm"># rank 0: [1,2,3,4], rank 1: [5,6,7,8], ...</span>
+
+    ar = x.clone(); dist.all_reduce(ar)                     <span class="cm"># sum, on every rank</span>
+    rs = torch.zeros(1); dist.reduce_scatter_tensor(rs, x)  <span class="cm"># rank r gets the sum of chunk r</span>
+    ag = torch.zeros(4 * world); dist.all_gather_into_tensor(ag, x)  <span class="cm"># everyone gets everything</span>
+    bc = x.clone(); dist.broadcast(bc, src=0)               <span class="cm"># everyone gets rank 0's copy</span>
+
+    <span class="cm"># all-reduce = reduce-scatter + all-gather</span>
+    ag2 = torch.zeros(world); dist.all_gather_into_tensor(ag2, rs)
+
+    <span class="cm"># overlap: start the collective, do other work, wait only when the result is needed</span>
+    w = x.clone(); work = dist.all_reduce(w, async_op=True)
+    busy = (x @ x)                                          <span class="cm"># compute runs meanwhile</span>
+    work.wait()
+
+    <span class="kw2">if</span> rank == 1:
+        print("all_reduce     ", ar.tolist())   <span class="cm"># [28.0, 32.0, 36.0, 40.0]</span>
+        print("reduce_scatter ", rs.tolist())   <span class="cm"># [32.0]  (chunk 1 of the sum)</span>
+        print("all_gather     ", ag.tolist())   <span class="cm"># [1.0, 2.0, ..., 16.0]</span>
+        print("broadcast      ", bc.tolist())   <span class="cm"># [1.0, 2.0, 3.0, 4.0]</span>
+        print("RS then AG     ", ag2.tolist(), torch.equal(ag2, ar))   <span class="cm"># [28.0, ...] True</span>
+        print("async          ", w.tolist())    <span class="cm"># [28.0, 32.0, 36.0, 40.0]</span>
+    dist.destroy_process_group()
+
+<span class="kw2">if</span> __name__ == "__main__":
+    mp.spawn(worker, args=(4,), nprocs=4)</pre>
+<p>Gloo does not implement <code>all_to_all</code>; it needs the NCCL (or MPI) backend. [Certain, checked with PyTorch 2.8]</p>
+
+<h2>Which parallel method uses which collective</h2>
+<p>The next sessions are all built from these pieces, so it helps to see the bill for each method now. Let \(\Psi\) be the number of bytes of one full copy of the gradients (or weights), and \(N\) the number of data-parallel GPUs. Each GPU sends:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Method</th><th>Collectives per step</th><th>Bytes sent per GPU</th></tr></thead><tbody>
+<tr><td>DDP (<a href="../pretraining/index.html#row-data-parallelism-ddp" title="Data parallelism (DDP) (planned)">session 44</a>)</td><td>all-reduce of gradients</td><td>\(2\frac{N-1}{N}\Psi\)</td></tr>
+<tr><td>ZeRO-1 and ZeRO-2 (<a href="../pretraining/index.html#row-zero-stages-1-2-and-3" title="ZeRO stages 1, 2 and 3 (planned)">session 45</a>)</td><td>reduce-scatter of gradients, all-gather of updated weights</td><td>\(2\frac{N-1}{N}\Psi\), the same as DDP</td></tr>
+<tr><td>ZeRO-3 and FSDP (<a href="../pretraining/fsdp-version-1.html">session 46</a>)</td><td>all-gather weights in forward, again in backward; reduce-scatter gradients</td><td>\(3\frac{N-1}{N}\Psi\), 1.5 times DDP</td></tr>
+<tr><td>Tensor parallelism (<a href="../pretraining/index.html#row-tensor-parallelism-and-sequence-parallelism" title="Tensor parallelism and sequence parallelism (planned)">session 48</a>)</td><td>2 all-reduces of activations per layer in forward, 2 in backward (Megatron-LM)</td><td>depends on batch × sequence × hidden size, not on parameters</td></tr>
+<tr><td>Sequence parallelism</td><td>each all-reduce becomes a reduce-scatter plus an all-gather</td><td>the same bytes, but activations between them are split</td></tr>
+<tr><td>Mixture of experts</td><td>2 all-to-alls per MoE layer in forward (send tokens to experts, bring results back), 2 in backward</td><td>\(\frac{N-1}{N}\) of the routed activations per all-to-all</td></tr>
+<tr><td>Pipeline and context parallelism (<a href="../pretraining/index.html#row-pipeline-context-and-expert-parallelism-3d-and" title="Pipeline, context and expert parallelism; 3D and 4D parallel (planned)">session 49</a>)</td><td>point-to-point send and receive between neighbours; ring attention passes K and V around a ring</td><td>activations at stage borders; K and V blocks</td></tr></tbody></table></div>
+<p>The ZeRO paper makes this exact accounting: stages 1 and 2 keep the DDP volume, and stage 3 adds one more all-gather. [Certain] That table is also the reason for the identity in Figure 1: since all-reduce = reduce-scatter + all-gather, ZeRO can stop after the reduce-scatter, update only its own slice of the weights, and all-gather the result. It moves the same bytes as DDP but keeps only \(1/N\) of the optimizer state.</p>
+
+<h2>Overlapping communication with compute</h2>
+<p>Even a fast all-reduce is wasted time if the GPU waits for it. The fix is <b>overlap</b>: run the communication on a separate CUDA stream while the compute stream keeps working. GPUs can do this because the NCCL kernels use only a few SMs and the copy engines and network cards work in parallel with the math. [Likely]</p>
+<p>For data parallelism the opportunity is in the backward pass. The gradients of the <b>last</b> layer are ready first, long before the backward pass reaches the first layer. So we do not need to wait for all gradients: as soon as a group of gradients is ready, we start its all-reduce. PyTorch DDP groups gradients into <b>buckets</b> (25 MB by default, with a smaller first bucket of 1 MB) and launches one all-reduce per bucket from a hook that fires when the bucket is full. [Certain, checked in PyTorch 2.8 source] If the network is fast enough, only the last bucket’s all-reduce is left after the backward pass ends:</p>
+<div class="eq">\[ T_{\text{step}} \approx T_{\text{fwd}} + \max\big(T_{\text{bwd}},\ T_{\text{comm}}\big) + T_{\text{tail}} \tag{43.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(T_{\text{comm}}\)</dt><dd>the total time of all bucket all-reduces, from (43.4)</dd>
+<dt>\(T_{\text{tail}}\)</dt><dd>the part that cannot be hidden: mostly the all-reduce of the last bucket, which can only start when the backward pass ends</dd></dl>
+<p>Bucket size is a trade-off. Small buckets start early and leave a short tail, but each one pays the latency \(2(N-1)\alpha\), and many small calls use the links badly. One huge bucket is efficient per byte but starts only at the end, so nothing overlaps. Figure 5 lets you try it.</p>
+<figure class="fig wide" id="cc-ov"><div class="fig-body">
+<div class="cc-grid">
+<label for="cc-ov-b">Bucket size</label><input type="range" id="cc-ov-b" min="25" max="2400" step="25" value="100"><output id="cc-ov-bv"></output>
+<label for="cc-ov-w">Link bandwidth \(\beta\)</label><input type="range" id="cc-ov-w" min="0" max="5" step="1" value="2"><output id="cc-ov-wv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="cc-ov-on" checked> Overlap communication with the backward pass</label></div>
+<div class="scroll-x"><svg id="cc-ov-svg" viewBox="0 0 760 200" role="img" aria-label="Timeline of forward, backward and bucket all-reduces on two streams"></svg></div>
+<div class="cc-leg"><span style="--c:var(--q)">forward</span><span style="--c:var(--k)">backward</span><span style="--c:var(--v)">bucket all-reduce</span></div>
+<div class="readout" id="cc-ov-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> One data-parallel training step on 8 GPUs. A toy model with 24 layers: 5 ms forward and 10 ms backward per layer, 100 MB of BF16 gradients per layer (2.4 GB in total), produced in pieces of 25 MB. Each bucket’s all-reduce follows (43.4) with an assumed \(\alpha = 20\) µs. The numbers are a model, not a measurement.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>The top row is the compute stream; the bottom row is the communication stream. With the defaults (100 MB buckets, 50 GB/s), the all-reduces run under the backward pass and only about 4 ms remain after it. Turn overlap off: the step grows by the full 91 ms of communication. Set the bucket size to 2,400 MB: one bucket, which can only start at the end, so overlap does nothing. Now drop the bandwidth to 12.5 GB/s: the communication (343 ms) is longer than the whole backward pass (240 ms), so even perfect overlap leaves over 100 ms exposed. Then the step is <b>communication-bound</b>, and the fixes are a faster network, gradient compression, or fewer bytes (for example, larger batches per GPU, so communication happens less often per token).</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 2: backward pass with bucketed, overlapped all-reduce (the idea behind DDP)</div><ol>
+<li><b>before training:</b> split the parameters into buckets of about \(B\) bytes, in <b>reverse</b> order of the forward pass</li>
+<li><b>for each</b> parameter, register a hook that fires when its gradient is ready</li>
+<li><b>in the hook:</b> mark the gradient ready; <b>if</b> all gradients of its bucket are ready <b>then</b></li>
+<li>&nbsp;&nbsp;launch <code>all_reduce(bucket, async_op=True)</code> on the communication stream <span class="c">// the backward pass keeps running</span></li>
+<li><b>after</b> the backward pass: wait for all outstanding all-reduces</li>
+<li>divide each gradient by \(N\) <span class="c">// sum to average; often folded into the all-reduce</span></li>
+<li>run the optimizer step <span class="c">// every rank has the same gradients, so the weights stay identical</span></li></ol></div>
+<p>The same idea shows up everywhere. FSDP <b>prefetches</b>: it starts the all-gather of the next layer’s weights while the current layer computes. Tensor parallelism can split matrix multiplications into pieces so that one piece’s all-reduce overlaps with the next piece’s math. [Likely] The cost of overlap is that the communication kernels take some SMs and memory bandwidth away from compute, so the compute runs a little slower while they run. [Likely]</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Collective</th><th>Why</th></tr></thead><tbody>
+<tr><td>LLM pretraining with data parallelism</td><td>all-reduce of gradients, bucketed and overlapped</td><td>every replica must apply the same update (<a href="../pretraining/index.html#row-data-parallelism-ddp" title="Data parallelism (DDP) (planned)">session 44</a>)</td></tr>
+<tr><td>LLM pretraining with FSDP or ZeRO-3</td><td>all-gather of weights, reduce-scatter of gradients</td><td>each GPU keeps only \(1/N\) of weights, gradients and optimizer state</td></tr>
+<tr><td>Serving a 70B model on 8 GPUs with tensor parallelism</td><td>all-reduce of activations, twice per layer, for every generated token</td><td>small messages, so latency (\(\alpha\)) and NVLink matter more than bandwidth [Likely]</td></tr>
+<tr><td>Mixture-of-experts training and serving</td><td>all-to-all to send tokens to experts and back</td><td>experts live on different GPUs (<a href="../transformers/index.html#row-mixture-of-experts-moe" title="Mixture of Experts (MoE) (planned)">session 29</a>)</td></tr>
+<tr><td>Contrastive training of video–text retrieval models (CLIP-style)</td><td>all-gather of embeddings from all GPUs</td><td>each clip is compared with the texts of the whole global batch, not only the local one, so there are many more negatives</td></tr>
+<tr><td>Long-video understanding with very long context</td><td>point-to-point ring passing of K and V blocks (ring attention)</td><td>the sequence of frame tokens is split across GPUs; each GPU must see every key</td></tr>
+<tr><td>Distributed evaluation (video classification, action recognition)</td><td>all-reduce of counts, or all-gather of predictions</td><td>each GPU scores a shard of the test set; the final accuracy needs all of them</td></tr>
+<tr><td>Sharded video fingerprint or Video-RAG index search</td><td>all-gather of each shard’s top-k results, then a merge</td><td>the index is too large for one GPU; each GPU searches its part</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Mixing up bits and bytes, or one and two directions.</b> 400 Gb/s InfiniBand is 50 GB/s; NVLink 4’s “900 GB/s” is 450 GB/s each way. A factor of 8 or 2 in a capacity plan is a real money mistake.</li>
+<li><b>Reading algbw as link speed.</b> An all-reduce algbw of 200 GB/s on 8 GPUs means busbw 350 GB/s. Compare busbw with the hardware, formula (43.6).</li>
+<li><b>Forgetting that a ring runs at its slowest link.</b> One slow server, one bad cable, or one GPU on the wrong PCIe switch slows down the whole job. A flat ring across servers runs at network speed, not NVLink speed.</li>
+<li><b>Ranks calling collectives in different orders or with different sizes.</b> The result is a hang, not an error message. A typical cause is an <code>if rank == 0:</code> block that contains a collective, or data-dependent control flow that differs between ranks.</li>
+<li><b>Summing instead of averaging.</b> All-reduce with SUM gives \(N\) times the gradient. DDP divides by \(N\); in hand-written code you must do it yourself, or the effective learning rate is \(N\) times too large.</li>
+<li><b>Too many tiny collectives.</b> Reducing each parameter tensor separately pays \(2(N-1)\alpha\) hundreds of times. Bucket them (or flatten them into one buffer).</li>
+<li><b>Reducing in low precision without care.</b> Summing BF16 gradients across many ranks loses precision; many setups reduce in FP32, or at least accumulate in FP32. [Likely]</li>
+<li><b>Expecting overlap without checking.</b> If you call <code>wait()</code> or read the result right after launching, or run everything on one stream, nothing overlaps. Confirm in a profiler trace that the NCCL kernels run under the backward kernels (<a href="../pretraining/index.html#row-lab-ddp-vs-fsdp2-and-reading-a" title="DDP vs FSDP2 and reading a profile (planned)">session 52</a>).</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is the difference between all-reduce, reduce-scatter and all-gather?<span class="lvl">basic</span></summary><div class="ans">All three start with one buffer per rank. All-reduce leaves every rank with the elementwise sum (or another reduction) of all buffers. Reduce-scatter computes the same sum but leaves rank \(r\) with only chunk \(r\) of it. All-gather starts with one chunk per rank and leaves every rank with all chunks concatenated. All-reduce = reduce-scatter followed by all-gather.</div></details>
+<details class="qa"><summary>Explain ring all-reduce and derive its cost.<span class="lvl">core</span></summary><div class="ans">Arrange \(N\) ranks in a ring and split the buffer into \(N\) chunks. In the reduce-scatter phase, in each of \(N-1\) steps, every rank sends one chunk to its right neighbour, which adds it; afterwards each rank owns one fully reduced chunk. In the all-gather phase, \(N-1\) more steps pass the finished chunks around. Each step moves \(M/N\) bytes per rank, all links in parallel, so \(T = 2(N-1)\alpha + 2\frac{N-1}{N}\frac{M}{\beta}\). The bandwidth term approaches \(2M/\beta\) and does not grow with \(N\).</div></details>
+<details class="qa"><summary>Why is the ring bandwidth-optimal? Why not always use it?<span class="lvl">advanced</span></summary><div class="ans">Every rank must send its data to be combined with all others, and must receive the result; a counting argument shows that each rank must send at least \(2\frac{N-1}{N}M\) bytes, which the ring achieves (Patarasuk and Yuan). But it has \(2(N-1)\) sequential steps, so its latency term grows linearly with \(N\). For small messages or very large \(N\), trees (\(\log N\) steps) or hierarchical schemes are faster. NCCL chooses per call.</div></details>
+<details class="qa"><summary>An 8-GPU node all-reduces 1 GB in 5 ms. What are algbw and busbw, and is this good?<span class="lvl">core</span></summary><div class="ans">algbw \(= 1\text{ GB} / 5\text{ ms} = 200\) GB/s. busbw \(= 200 \times 2 \cdot 7/8 = 350\) GB/s. On H100 NVLink (450 GB/s per direction) that is about 78% of the link speed, which is reasonable for a real collective; you would compare it with nccl-tests on the same machine.</div></details>
+<details class="qa"><summary>Why does ZeRO-3 / FSDP communicate 1.5 times as much as DDP?<span class="lvl">core</span></summary><div class="ans">DDP does one all-reduce of gradients per step, which is a reduce-scatter plus an all-gather: \(2\frac{N-1}{N}\Psi\) per GPU. ZeRO-3 keeps weights sharded, so it all-gathers them before the forward pass, all-gathers them again before the backward pass (they were freed in between to save memory), and reduce-scatters the gradients: three operations of \(\frac{N-1}{N}\Psi\) each. Three over two is 1.5.</div></details>
+<details class="qa"><summary>Compare NVLink, PCIe, InfiniBand and Ethernet for training.<span class="lvl">basic</span></summary><div class="ans">NVLink with NVSwitch connects GPUs inside a server: 450 GB/s per direction per H100, all pairs at once. PCIe Gen5 x16 is about 63 GB/s per direction and connects GPUs to CPUs and network cards. InfiniBand NDR (400 Gb/s = 50 GB/s per port, often one per GPU) and RoCE Ethernet connect servers, with RDMA and GPUDirect for low latency. The gap between in-server and between-server bandwidth (about 9 times on H100) is why parallelism is placed hierarchically: the most communication-heavy kind (tensor parallelism) stays inside a server.</div></details>
+<details class="qa"><summary>How does DDP overlap communication with the backward pass?<span class="lvl">core</span></summary><div class="ans">It groups gradients into buckets (25 MB by default) in reverse layer order and registers autograd hooks. When all gradients of a bucket are ready, it launches an asynchronous all-reduce for that bucket on a separate stream while the backward pass continues with earlier layers. Only the last bucket(s) remain after backward finishes. Overlap works only if total communication time is less than backward time, and it costs some SMs.</div></details>
+<details class="qa"><summary>How do you choose the bucket size?<span class="lvl">advanced</span></summary><div class="ans">Small buckets start communicating early and leave a short tail, but each pays the per-call latency \(2(N-1)\alpha\) and small messages reach lower bandwidth. Large buckets are efficient per byte but start late, and one giant bucket overlaps nothing. The best size depends on \(\alpha\), \(\beta\), \(N\) and the backward time per layer; the default of 25 MB is a reasonable middle, and you tune it by measuring step time in a profiler.</div></details>
+<details class="qa"><summary>Your 64-GPU job is much slower per GPU than the 8-GPU job. What do you check?<span class="lvl">advanced</span></summary><div class="ans">First estimate with (43.4) and (43.7): is communication now longer than the backward pass? Then run nccl-tests across nodes and compare busbw with the network spec. Check <code>NCCL_DEBUG=INFO</code> for the topology (is it using InfiniBand or falling back to TCP sockets? GPUDirect RDMA?). Look for one slow node or link, since a ring runs at its slowest link. In a profiler, check that NCCL kernels overlap with compute. Fixes: hierarchical or sharded schemes, larger per-GPU batch (more compute per byte), better bucketing, or moving a parallel dimension inside the server.</div></details>
+<details class="qa"><summary>What is all-to-all, and why is it hard for mixture-of-experts models?<span class="lvl">advanced</span></summary><div class="ans">In all-to-all, each rank sends a different chunk to every other rank (a distributed transpose). In MoE, each GPU sends each token to the GPU that holds its chosen expert and receives the results back: two all-to-alls per MoE layer in forward and two in backward. The chunk sizes depend on routing and are uneven, every pair of GPUs talks, and it crosses the network if experts span servers, so it is latency- and bisection-bandwidth-sensitive. Capacity limits, expert placement inside a server and overlap are the usual remedies.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>In Figure 2’s ring with \(N = 4\), how many chunks does each GPU send in total, and what fraction of \(M\) is that? Repeat for \(N = 8\).</li>
+<li>Using (43.4) with \(\alpha = 0\): how long does an all-reduce of 2 GB take on 8 GPUs over PCIe Gen5 (63 GB/s)? And on NVLink 4 (450 GB/s)?</li>
+<li>With \(\alpha = 5\) µs and \(\beta = 50\) GB/s, at what buffer size \(M\) is the ring’s latency term equal to its bandwidth term for \(N = 64\)?</li>
+<li>nccl-tests reports a reduce-scatter on 16 GPUs with algbw 40 GB/s. What is the busbw?</li>
+<li>A ZeRO-3 job with 70B parameters in BF16 runs on 64 GPUs. How many bytes does each GPU send per step for weights and gradients?</li>
+<li>Show that running a reduce-scatter and then an all-gather costs exactly (43.4).</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(2(N-1) = 6\) chunks of \(M/4\), so \(1.5M\). For \(N = 8\): 14 chunks of \(M/8\), so \(1.75M\). 2. Each GPU sends \(1.75 \times 2 = 3.5\) GB: \(3.5/63 = 56\) ms on PCIe, \(3.5/450 = 7.8\) ms on NVLink. 3. Latency term \(2 \cdot 63 \cdot 5\) µs \(= 630\) µs. Bandwidth term \(2 \cdot \tfrac{63}{64} M / \beta\); set equal: \(M = 630\text{ µs} \times 50\text{ GB/s} / 1.96875 = 16\) MB. Below about 16 MB the ring is mostly latency. 4. busbw \(= 40 \times 15/16 = 37.5\) GB/s. 5. \(\Psi = 140\) GB; \(3 \cdot \tfrac{63}{64} \cdot 140 = 413\) GB per GPU per step. 6. (43.2) plus (43.3) is \(2(N-1)\alpha + 2\frac{N-1}{N}\frac{M}{\beta}\), which is (43.4).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Six collectives cover nearly all training traffic: broadcast, reduce, all-reduce, reduce-scatter, all-gather and all-to-all. All-reduce = reduce-scatter + all-gather.</li>
+<li>Message time is \(\alpha + n/\beta\) (43.1). The ring all-reduce costs \(2(N-1)\alpha + 2\frac{N-1}{N}\frac{M}{\beta}\) (43.4): each GPU sends about \(2M\), whatever \(N\) is, which is optimal.</li>
+<li>For small messages and many GPUs, latency dominates and trees (43.5) or NVSwitch reductions win. Measure with nccl-tests and compare busbw (43.6) with the one-direction link speed.</li>
+<li>Links form a hierarchy: NVLink (450 GB/s per direction on H100) inside a server, PCIe (63 GB/s), InfiniBand or RoCE (50 GB/s per 400 Gb/s port) between servers. Hierarchical all-reduce (43.7) keeps most bytes on the fast links.</li>
+<li>DDP sends \(2\Psi\) per GPU per step, ZeRO-3 and FSDP \(3\Psi\); tensor parallelism all-reduces activations; MoE uses all-to-all.</li>
+<li>Bucketing and async collectives hide communication behind the backward pass (43.8), as long as it is shorter than the backward pass.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ T_{\text{AR}} = 2(N-1)\alpha + \frac{2(N-1)}{N}\frac{M}{\beta}, \qquad T_{\text{RS}} = T_{\text{AG}} = (N-1)\alpha + \frac{N-1}{N}\frac{M}{\beta} \]</div>
+<div class="eq">\[ \text{busbw}_{\text{AR}} = \frac{M}{t}\cdot\frac{2(N-1)}{N}, \qquad T_{\text{step}} \approx T_{\text{fwd}} + \max(T_{\text{bwd}}, T_{\text{comm}}) + T_{\text{tail}} \]</div>
+<h2 class="plain" id="collective-communication-all-reduce-reduce-scatter-all-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>NVIDIA (docs). <a href="https://github.com/NVIDIA/nccl-tests/blob/master/doc/PERFORMANCE.md" target="_blank" rel="noopener">nccl-tests: Performance reported by NCCL tests (algbw and busbw)</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/deeplearning/nccl/user-guide/docs/index.html" target="_blank" rel="noopener">NCCL User Guide: Collective Operations and Environment Variables</a></li><li>Patarasuk and Yuan (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Bandwidth optimal all-reduce algorithms for clusters of workstations&amp;quot;" target="_blank" rel="noopener">Bandwidth optimal all-reduce algorithms for clusters of workstations</a></li><li>Thakur, Rabenseifner and Gropp (2005). <a href="https://scholar.google.com/scholar?q=&amp;quot;Optimization of Collective Communication Operations in MPICH&amp;quot;" target="_blank" rel="noopener">Optimization of Collective Communication Operations in MPICH</a></li><li>Sergeev and Del Balso (2018). <a href="https://arxiv.org/abs/1802.05799" target="_blank" rel="noopener">Horovod: fast and easy distributed deep learning in TensorFlow</a></li><li>Li et al. (2020). <a href="https://arxiv.org/abs/2006.15704" target="_blank" rel="noopener">PyTorch Distributed: Experiences on Accelerating Data Parallel Training</a></li><li>Rajbhandari et al. (2019). <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></li><li>Zhao et al. (2023). <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener">PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel</a></li><li>Shoeybi et al. (2019). <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</a></li><li>Fedus et al. (2021). <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">Switch Transformers</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.01889" target="_blank" rel="noopener">Ring Attention with Blockwise Transformers for Near-Infinite Context</a></li><li>NVIDIA (web). <a href="https://www.nvidia.com/en-us/data-center/nvlink/" target="_blank" rel="noopener">NVLink and NVLink Switch</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../pretraining/gpu-architecture-for-ml.html"><small>Previous · session 42</small>GPU architecture for ML</a><span class="next"><small>Next · session 44, planned</small>Data parallelism (DDP)</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="collective-communication-all-reduce-reduce-scatter-all"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const FILL={q:"var(--q-soft)",k:"var(--k-soft)",v:"var(--v-soft)","":"var(--paper2)"};
+const STROKE={q:"var(--q)",k:"var(--k)",v:"var(--v)","":"var(--rule)"};
+function cell(x,y,w,h,val,kind,sub){let g=`<g class="cc-cell"><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="7" fill="${FILL[kind]}" stroke="${STROKE[kind]}" stroke-width="${kind?1.8:1.2}"/>`;
+ if(val!==null&&val!==undefined)g+=`<text x="${x+w/2}" y="${y+h/2+5}" font-size="15" font-weight="700" fill="var(--ink)">${val}</text>`;
+ if(sub)g+=`<text x="${x+w/2}" y="${y+h+13}" font-size="11" fill="var(--muted)">${sub}</text>`;return g+`</g>`;}
+const N=4;const X0=(r,c)=>1+4*r+c; /* rank r, chunk c: 1..16 */
+const SUM=c=>{let s=0;for(let r=0;r<N;r++)s+=X0(r,c);return s;};
+
+/* ---------- Figure 1: gallery of collectives ---------- */
+(function(){
+ const svg=$("#cc-gal-svg");if(!svg)return;const info=$("#cc-gal-info"),seg=$("#cc-gal-op");let op="ar";
+ const own=()=>Array.from({length:N},(_,r)=>Array.from({length:N},(_,c)=>[X0(r,c),"q"]));
+ const empty=()=>Array.from({length:N},()=>Array.from({length:N},()=>[null,""]));
+ function states(op){let a=own(),b;
+  if(op==="bc"){a=empty();for(let c=0;c<N;c++)a[0][c]=[X0(0,c),"q"];b=Array.from({length:N},(_,r)=>Array.from({length:N},(_,c)=>[X0(0,c),r===0?"q":"v"]));}
+  else if(op==="red"){b=own();for(let c=0;c<N;c++)b[0][c]=[SUM(c),"k"];for(let r=1;r<N;r++)for(let c=0;c<N;c++)b[r][c]=[X0(r,c),""];}
+  else if(op==="ar"){b=Array.from({length:N},()=>Array.from({length:N},(_,c)=>[SUM(c),"k"]));}
+  else if(op==="rs"){b=empty();for(let r=0;r<N;r++)b[r][r]=[SUM(r),"k"];}
+  else if(op==="ag"){a=empty();for(let r=0;r<N;r++)a[r][r]=[X0(r,r),"q"];b=Array.from({length:N},(_,r)=>Array.from({length:N},(_,c)=>[X0(c,c),r===c?"q":"v"]));}
+  else{b=Array.from({length:N},(_,r)=>Array.from({length:N},(_,c)=>[X0(c,r),r===c?"q":"v"]));}
+  return [a,b];}
+ const TXT={bc:["Broadcast from rank 0","Every rank ends with rank 0’s vector [1, 2, 3, 4].","about M (pipelined ring or tree)","1","sending the initial weights to all ranks"],
+  red:["Reduce to rank 0","Rank 0 ends with the sums [28, 32, 36, 40]; the other ranks keep their input, which nobody needs.","about M","1","summing a loss or a metric for logging"],
+  ar:["All-reduce","Every rank ends with the sums [28, 32, 36, 40].","2(N−1)/N · M = 1.50 M","2(N−1)/N = 1.50","averaging gradients in DDP; the two all-reduces per layer in tensor parallelism"],
+  rs:["Reduce-scatter","Rank r ends with only chunk r of the sum: 28 on rank 0, 32 on rank 1, 36 on rank 2, 40 on rank 3.","(N−1)/N · M = 0.75 M (M = input per rank)","(N−1)/N = 0.75","sharded gradients in ZeRO-2/3 and FSDP; sequence parallelism"],
+  ag:["All-gather","Each rank starts with one chunk (1, 6, 11, 16) and ends with all four: [1, 6, 11, 16].","(N−1)/N · M = 0.75 M (M = output per rank)","(N−1)/N = 0.75","gathering sharded weights before a layer runs in FSDP and ZeRO-3"],
+  a2a:["All-to-all","Chunk c of rank r moves to rank c, at position r: a transpose. Rank 0 ends with [1, 5, 9, 13]. Nothing is added.","(N−1)/N · M = 0.75 M, a different piece to each peer","(N−1)/N = 0.75","sending tokens to their experts and back in mixture of experts"]};
+ function draw(){const [a,b]=states(op);const W=60,H=40,G=8;let g="";
+  const block=(st,x0,title)=>{g+=`<text x="${x0+(4*W+3*G)/2}" y="22" text-anchor="middle" class="svgt" font-size="15" font-weight="700">${title}</text>`;
+   for(let r=0;r<N;r++){const y=40+r*62;for(let c=0;c<N;c++)g+=cell(x0+c*(W+G),y,W,H,st[r][c][0],st[r][c][1]);}};
+  for(let r=0;r<N;r++)g+=`<text x="58" y="${40+r*62+26}" text-anchor="end" class="svgt" font-size="14" font-weight="600">GPU ${r}</text>`;
+  block(a,72,"Before");block(b,468,"After");
+  g+=`<path d="M372 150 H452" stroke="var(--muted)" stroke-width="2.5" fill="none"/><path d="M452 143 L464 150 L452 157z" fill="var(--muted)"/><text x="414" y="138" text-anchor="middle" class="svgs" font-size="13">${TXT[op][0]}</text>`;
+  for(let c=0;c<N;c++)g+=`<text x="${72+c*(W+G)+W/2}" y="${40+4*62+6}" text-anchor="middle" class="svgs" font-size="12">chunk ${c}</text><text x="${468+c*(W+G)+W/2}" y="${40+4*62+6}" text-anchor="middle" class="svgs" font-size="12">chunk ${c}</text>`;
+  svg.innerHTML=g;const t=TXT[op];
+  info.innerHTML=`<b>${t[0]}.</b> ${t[1]} Bytes each rank sends with the standard algorithm: <b>${t[2]}</b>. nccl-tests busbw factor: ${t[3]}. Used for: ${t[4]}.`;}
+ seg.addEventListener("click",e=>{const btn=e.target.closest("button");if(!btn)return;op=btn.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===btn?"true":"false"));draw();});
+ draw();
+})();
+
+/* ---------- Figure 2: ring all-reduce stepper ---------- */
+(function(){
+ const svg=$("#cc-ring-svg");if(!svg)return;const info=$("#cc-ring-info");
+ /* precompute states: val[r][c], cnt[r][c], and the messages of each step */
+ const S=[];let val=Array.from({length:N},(_,r)=>Array.from({length:N},(_,c)=>X0(r,c))),cnt=Array.from({length:N},()=>Array(N).fill(1));
+ const snap=(msgs,phase,k)=>S.push({val:val.map(x=>x.slice()),cnt:cnt.map(x=>x.slice()),msgs,phase,k});
+ snap([],"start",0);
+ for(let s=0;s<N-1;s++){const m=[];for(let r=0;r<N;r++){const c=((r-1-s)%N+N)%N;m.push([r,c,val[r][c],cnt[r][c]]);}
+  m.forEach(([r,c,v,n])=>{const d=(r+1)%N;val[d][c]+=v;cnt[d][c]+=n;});snap(m,"rs",s+1);}
+ for(let s=0;s<N-1;s++){const m=[];for(let r=0;r<N;r++){const c=((r-s)%N+N)%N;m.push([r,c,val[r][c],cnt[r][c]]);}
+  m.forEach(([r,c,v,n])=>{const d=(r+1)%N;val[d][c]=v;cnt[d][c]=n;});snap(m,"ag",s+1);}
+ R.ccRing=S; /* exposed for tests */
+ const W=78,H=40,cx=c=>110+c*100,ry=r=>40+r*70;
+ function draw(i){const st=S[i];let g=`<defs><marker id="cc-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--k)"/></marker></defs>`;
+  for(let c=0;c<N;c++)g+=`<text x="${cx(c)+W/2}" y="16" text-anchor="middle" class="svgs" font-size="12">chunk ${c}</text>`;
+  for(let r=0;r<N;r++){g+=`<text x="92" y="${ry(r)+26}" text-anchor="end" class="svgt" font-size="14" font-weight="600">GPU ${r}</text>`;
+   for(let c=0;c<N;c++){const n=st.cnt[r][c];const kind=n===N?"v":n>1?"k":"q";g+=cell(cx(c),ry(r),W,H,st.val[r][c],kind,n>1&&n<N?`${n} ranks`:n===N?"final":"");}}
+  st.msgs.forEach(([r,c])=>{const x=cx(c)+W/2+(r===N-1?0:0);
+   if(r<N-1)g+=`<path class="cc-arrow" d="M${x} ${ry(r)+H+15} V${ry(r+1)-3}" marker-end="url(#cc-ah)"/>`;
+   else g+=`<path class="cc-arrow" stroke-dasharray="6 4" d="M${x} ${ry(r)+H+17} V${ry(r)+H+28} H${520} V${ry(0)-12} H${x} V${ry(0)-3}" marker-end="url(#cc-ah)"/>`;});
+  /* mini ring */
+  const ox=650,oy=170,rad=70;const pos=r=>[ox+rad*Math.sin(r*Math.PI/2),oy-rad*Math.cos(r*Math.PI/2)];
+  for(let r=0;r<N;r++){const [x1,y1]=pos(r),[x2,y2]=pos((r+1)%N);const mx=(x1+x2)/2,my=(y1+y2)/2;const k=1.35;
+   g+=`<path d="M${x1} ${y1} Q ${ox+(mx-ox)*k} ${oy+(my-oy)*k} ${x2} ${y2}" fill="none" stroke="${st.msgs.length?"var(--k)":"var(--rule)"}" stroke-width="2" marker-end="url(#cc-ah)"/>`;}
+  for(let r=0;r<N;r++){const [x,y]=pos(r);g+=`<circle cx="${x}" cy="${y}" r="20" fill="var(--card)" stroke="var(--ink2)" stroke-width="1.6"/><text x="${x}" y="${y+5}" text-anchor="middle" class="svgt" font-size="13" font-weight="700">${r}</text>`;}
+  g+=`<text x="${ox}" y="${oy+5}" text-anchor="middle" class="svgs" font-size="12">ring</text>`;
+  const ph=st.phase==="rs"?"Reduce-scatter":"All-gather";g+=`<text x="${ox}" y="${oy+112}" text-anchor="middle" class="svgt" font-size="14" font-weight="700">${st.phase==="start"?"Start":ph+", step "+st.k+" of 3"}</text>`;
+  svg.innerHTML=g;
+  const sent=i;let t;
+  if(st.phase==="start")t=`Each GPU holds its own 4 chunks. Goal: every GPU ends with [${[0,1,2,3].map(SUM).join(", ")}]. Press Next.`;
+  else{const ms=st.msgs.map(([r,c,v])=>`GPU ${r}→${(r+1)%N}: chunk ${c} (${v})`).join("; ");
+   t=`<b>${ph}, step ${st.k}.</b> ${ms}. ${st.phase==="rs"?"Each receiver <b>adds</b> the value to its own copy.":"Each receiver <b>copies</b> the finished value."}`;
+   if(st.phase==="rs"&&st.k===N-1)t+=` Now GPU r holds the full sum of chunk r: ${[0,1,2,3].map(r=>st.val[r][r]).join(", ")}. This is the reduce-scatter result.`;
+   if(i===S.length-1)t+=` Done: every GPU holds [${st.val[0].join(", ")}].`;}
+  t+=` Sent so far by each GPU: <b>${sent} chunks = ${(sent/N).toFixed(2)} M</b>${i===S.length-1?" = 2(N−1)/N · M":""}.`;
+  info.innerHTML=t;}
+ B.stepper({n:S.length,prev:$("#cc-ring-prev"),next:$("#cc-ring-next"),play:$("#cc-ring-play"),label:$("#cc-ring-lab"),ms:2600,onStep:draw});
+})();
+
+/* ---------- Figure 3: alpha-beta cost model ---------- */
+const fmtT=s=>s<1e-3?(s*1e6).toFixed(s<1e-5?2:1)+" µs":s<1?(s*1e3).toFixed(s<1e-2?2:1)+" ms":s.toFixed(2)+" s";
+const fmtB=b=>b<1e6?(b/1e3).toFixed(b<1e4?1:0)+" KB":b<1e9?(b/1e6).toFixed(b<1e7?1:0)+" MB":(b/1e9).toFixed(b<1e10?2:1)+" GB";
+(function(){
+ const svg=$("#cc-cost-svg");if(!svg)return;const Ns=$("#cc-cost-n"),Ms=$("#cc-cost-m"),As=$("#cc-cost-a"),seg=$("#cc-cost-link"),info=$("#cc-cost-info");let beta=450e9;
+ const ring=(n,m,a,b)=>2*(n-1)*a+2*(n-1)/n*m/b,tree=(n,m,a,b)=>2*Math.ceil(Math.log2(n))*a+2*m/b,ps=(n,m,a,b)=>2*(n-1)*(a+m/b);
+ const x0=3,x1=10.5,X=l=>60+(l-x0)/(x1-x0)*560;
+ function draw(){const n=2**(+Ns.value),lm=+Ms.value,m=10**lm,a=(+As.value)*1e-6;$("#cc-cost-nv").value=n;$("#cc-cost-mv").value=fmtB(m);$("#cc-cost-av").value=(+As.value)+" µs";
+  const fs=[[ring,"var(--q)"],[tree,"var(--k)"],[ps,"var(--muted)"]];let lo=Infinity,hi=-Infinity;const pts=fs.map(([f])=>{const p=[];for(let l=x0;l<=x1+1e-9;l+=0.05){const t=f(n,10**l,a,beta);p.push([l,Math.log10(t)]);lo=Math.min(lo,Math.log10(t));hi=Math.max(hi,Math.log10(t));}return p;});
+  lo=Math.floor(lo);hi=Math.ceil(hi);const Y=v=>240-(v-lo)/(hi-lo)*220;
+  let g=`<path d="M60 20 V240 H625" fill="none" stroke="var(--muted)"/>`;
+  for(let l=3;l<=10;l++){g+=`<line x1="${X(l)}" y1="240" x2="${X(l)}" y2="244" stroke="var(--muted)"/><text x="${X(l)}" y="258" text-anchor="middle" class="svgs" font-size="11.5">${fmtB(10**l).replace(".0 "," ").replace(".00 "," ")}</text>`;}
+  for(let v=lo;v<=hi;v++){g+=`<line x1="60" y1="${Y(v)}" x2="625" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="54" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${fmtT(10**v).replace(".0 "," ").replace(".00 "," ")}</text>`;}
+  pts.forEach((p,i)=>{g+=`<polyline points="${p.map(q=>X(q[0]).toFixed(1)+","+Y(q[1]).toFixed(1)).join(" ")}" fill="none" stroke="${fs[i][1]}" stroke-width="${i===2?2:2.8}"${i===2?' stroke-dasharray="6 4"':""}/>`;});
+  const tr=ring(n,m,a,beta),tt=tree(n,m,a,beta),tp=ps(n,m,a,beta);
+  g+=`<line x1="${X(lm)}" y1="20" x2="${X(lm)}" y2="240" stroke="var(--ink2)" stroke-dasharray="4 4"/><circle cx="${X(lm)}" cy="${Y(Math.log10(tr))}" r="5" fill="var(--q)"/><circle cx="${X(lm)}" cy="${Y(Math.log10(tt))}" r="5" fill="var(--k)"/>`;
+  g+=`<text x="342" y="276" text-anchor="middle" class="svgs" font-size="12.5">buffer size M (log scale)</text>`;svg.innerHTML=g;
+  const algbw=m/tr,busbw=algbw*2*(n-1)/n,bwShare=(2*(n-1)/n*m/beta)/tr;
+  info.innerHTML=`N = ${n}, M = ${fmtB(m)}, β = ${beta/1e9} GB/s, α = ${(+As.value)} µs. Ring: <b>${fmtT(tr)}</b> (${(100*bwShare).toFixed(0)}% of it is the bandwidth term; ${2*(n-1)} steps). Tree: <b>${fmtT(tt)}</b> (${2*Math.ceil(Math.log2(n))} steps). Parameter server: ${fmtT(tp)}. ${tt<tr?"Tree is faster here.":"Ring is faster here."} Ring algbw = ${(algbw/1e9).toPrecision(3)} GB/s, busbw = <b>${(busbw/1e9).toPrecision(3)} GB/s</b> (the link speed is ${beta/1e9}).`;}
+ seg.addEventListener("click",e=>{const btn=e.target.closest("button");if(!btn)return;beta=(+btn.dataset.v)*1e9;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===btn?"true":"false"));draw();});
+ [Ns,Ms,As].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: hardware hierarchy (static) ---------- */
+(function(){
+ const svg=$("#cc-hw-svg");if(!svg)return;let g="";
+ const server=(ox,name)=>{g+=`<rect x="${ox}" y="10" width="356" height="232" rx="14" fill="var(--paper2)" stroke="var(--rule)" stroke-width="1.5"/><text x="${ox+178}" y="30" text-anchor="middle" class="svgt" font-size="14" font-weight="700">${name}</text>`;
+  for(let i=0;i<8;i++){const x=ox+12+i*43;g+=`<line x1="${x+19}" y1="72" x2="${x+19}" y2="100" stroke="var(--v)" stroke-width="3"/><line x1="${x+19}" y1="140" x2="${x+19}" y2="172" stroke="var(--muted)" stroke-width="2"/><line x1="${x+19}" y1="192" x2="${x+19}" y2="262" stroke="var(--k)" stroke-width="2"/>`;}
+  g+=`<rect x="${ox+12}" y="42" width="332" height="30" rx="8" fill="var(--v-soft)" stroke="var(--v)" stroke-width="1.6"/><text x="${ox+178}" y="62" text-anchor="middle" class="svgt" font-size="12.5" font-weight="600">NVSwitch: 450 GB/s per direction per GPU</text>`;
+  for(let i=0;i<8;i++){const x=ox+12+i*43;
+   g+=`<rect x="${x}" y="100" width="38" height="40" rx="6" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1.6"/><text x="${x+19}" y="117" text-anchor="middle" class="svgt" font-size="11" font-weight="700">GPU</text><text x="${x+19}" y="132" text-anchor="middle" class="svgt" font-size="11" font-weight="700">${i}</text>`;
+   g+=`<rect x="${x+3}" y="172" width="32" height="20" rx="5" fill="var(--card)" stroke="var(--k)" stroke-width="1.4"/><text x="${x+19}" y="186" text-anchor="middle" class="svgs" font-size="10">NIC</text>`;}
+  g+=`<rect x="${ox+48}" y="203" width="260" height="20" rx="5" fill="var(--paper2)"/><text x="${ox+178}" y="217" text-anchor="middle" class="svgs" font-size="11">GPU to NIC: PCIe Gen5 x16, about 63 GB/s per direction</text>`;};
+ server(16,"Server A (8 × H100)");server(388,"Server B (8 × H100)");
+ g+=`<rect x="16" y="262" width="728" height="34" rx="9" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1.6"/><text x="380" y="284" text-anchor="middle" class="svgt" font-size="13" font-weight="600">InfiniBand NDR or RoCE network: 400 Gb/s = 50 GB/s per GPU, one NIC per GPU</text>`;
+ g+=`<text x="380" y="318" text-anchor="middle" class="svgs" font-size="12.5">GPU i of every server connects to the same rail switch, so cross-server rings stay on one rail.</text>`;
+ svg.innerHTML=g;
+})();
+
+/* ---------- Figure 5: overlap timeline ---------- */
+(function(){
+ const svg=$("#cc-ov-svg");if(!svg)return;const Bs=$("#cc-ov-b"),Ws=$("#cc-ov-w"),On=$("#cc-ov-on"),info=$("#cc-ov-info");
+ const BW=[12.5,25,50,63,100,450],NG=8,L=24,TF=5,TB=10,PIECE=25,PER=4,ALPHA=0.02;
+ function sim(cap,beta,ov){const fwd=L*TF;let t=fwd;const items=[];for(let l=0;l<L;l++)for(let k=0;k<PER;k++){t+=TB/PER;items.push([t,PIECE]);}
+  const bwdEnd=t,buckets=[];let cur=0;items.forEach(([ti,sz],i)=>{cur+=sz;if(cur>=cap||i===items.length-1){buckets.push([ti,cur]);cur=0;}});
+  let end=ov?0:bwdEnd,tot=0;const runs=[];buckets.forEach(([ready,sz])=>{const c=2*(NG-1)*ALPHA+2*(NG-1)/NG*sz*1e6/(beta*1e9)*1e3;tot+=c;const st=ov?Math.max(ready,end):end;end=st+c;runs.push([st,end,sz]);});
+  const stepEnd=Math.max(bwdEnd,end);return {fwd,bwdEnd,runs,tot,stepEnd,exposed:stepEnd-bwdEnd,n:buckets.length};}
+ R.ccOverlap=sim;
+ const TMAX=800,X=t=>74+t*(670/TMAX);
+ function draw(){const cap=+Bs.value,beta=BW[+Ws.value],ov=On.checked;$("#cc-ov-bv").value=cap+" MB";$("#cc-ov-wv").value=beta+" GB/s";
+  const s=sim(cap,beta,ov);let g=`<text x="66" y="52" text-anchor="end" class="svgs" font-size="12">compute</text><text x="66" y="117" text-anchor="end" class="svgs" font-size="12">comm</text>`;
+  g+=`<rect x="${X(0)}" y="30" width="${X(s.fwd)-X(0)}" height="36" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1.4"/><text x="${(X(0)+X(s.fwd))/2}" y="53" text-anchor="middle" class="svgt" font-size="12">forward</text>`;
+  for(let l=0;l<L;l++){const a=s.fwd+l*TB;g+=`<rect x="${X(a)}" y="30" width="${X(a+TB)-X(a)}" height="36" fill="var(--k-soft)" stroke="var(--k)" stroke-width="0.8"/>`;}
+  g+=`<text x="${(X(s.fwd)+X(s.bwdEnd))/2}" y="53" text-anchor="middle" class="svgt" font-size="12">backward (24 layers, last layer first)</text>`;
+  s.runs.forEach(([a,b])=>{g+=`<rect x="${X(a)}" y="95" width="${Math.max(0.8,X(b)-X(a))}" height="36" fill="var(--v-soft)" stroke="var(--v)" stroke-width="0.8"/>`;});
+  g+=`<line x1="${X(s.bwdEnd)}" y1="22" x2="${X(s.bwdEnd)}" y2="140" stroke="var(--ink2)" stroke-dasharray="4 4"/><line x1="${X(s.stepEnd)}" y1="22" x2="${X(s.stepEnd)}" y2="140" stroke="var(--bad)" stroke-width="2"/>`;
+  if(s.exposed>0.5)g+=`<rect x="${X(s.bwdEnd)}" y="138" width="${X(s.stepEnd)-X(s.bwdEnd)}" height="6" fill="var(--bad)"/>`;
+  for(let t=0;t<=TMAX;t+=100)g+=`<line x1="${X(t)}" y1="150" x2="${X(t)}" y2="155" stroke="var(--muted)"/><text x="${X(t)}" y="170" text-anchor="middle" class="svgs" font-size="11.5">${t}</text>`;
+  g+=`<line x1="${X(0)}" y1="150" x2="${X(TMAX)}" y2="150" stroke="var(--muted)"/><text x="400" y="190" text-anchor="middle" class="svgs" font-size="12.5">time in ms (red line: end of the step; red bar: exposed communication)</text>`;
+  svg.innerHTML=g;
+  const hidden=s.tot>0?Math.max(0,1-s.exposed/s.tot):0;
+  info.innerHTML=`${s.n} bucket${s.n>1?"s":""} of up to ${Math.min(cap,2400)} MB. Total all-reduce time: <b>${s.tot.toFixed(1)} ms</b>; backward ends at ${s.bwdEnd.toFixed(0)} ms; the step ends at <b>${s.stepEnd.toFixed(1)} ms</b>. Exposed communication: <b>${s.exposed.toFixed(1)} ms</b> (${(100*hidden).toFixed(0)}% of the communication is hidden). ${s.tot>s.bwdEnd-s.fwd?"Communication is longer than the backward pass: this step is communication-bound.":""}`;}
+ [Bs,Ws].forEach(e=>e.addEventListener("input",draw));On.addEventListener("change",draw);draw();
+})();
+})();
+</script></body></html>

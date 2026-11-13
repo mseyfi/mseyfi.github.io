@@ -1,0 +1,583 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Encoder–decoder in depth: T5 span corruption, sentinel tokens, BART denoising · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../transformers/index.html">Attention and transformers</a><span class="sep">/</span><span>Session 24</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="encoder-decoder-in-depth-t5-span-corruption">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="encoder-decoder-in-depth-t5-span-corruption" data-session="encoder-decoder-in-depth-t5-span-corruption" style="--tc:var(--t2)"><header class="chap-head"><div class="chap-kicker"><span class="num">24</span><span>Track 2: Attention and transformers · session 9 of 15</span></div><h1 class="chap-title">Encoder–decoder in depth: T5 span corruption, sentinel tokens, BART denoising</h1><p class="chap-sub">An encoder–decoder reads the whole input with one stack of layers and writes the output with another, and the writer looks back at the reader at every step through cross-attention. This session opens up the two most important encoder–decoders, T5 and BART: how T5 turns every task into text in and text out, how span corruption with sentinel tokens gives short and cheap training targets, how BART learns by rebuilding damaged text, and where this design still beats decoder-only models today.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 7, 20 and 23 (seq2seq and attention, self- vs cross-attention, the three transformer families)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The text-to-text idea of T5: one model, one loss, every task written as an input string and an output string</li><li>The three sublayers of a decoder block, and exactly what cross-attention reads from the encoder</li><li>Span corruption with sentinel tokens: how inputs and targets are built, how long they are, and why short targets make pretraining cheaper</li><li>How the decoder uses the encoder at every step, in training (teacher forcing) and at inference (encode once, cache K and V)</li><li>BART’s noising functions (masking, deletion, infilling, sentence permutation, rotation) and why text infilling won</li><li>The cost of an L+L encoder–decoder compared with decoder-only models: parameters, FLOPs and attention masks</li><li>When encoder–decoders still win: translation, summarization, speech (Whisper), OCR and text encoders for image and video generation</li></ul></div></header><style>
+[data-session="encoder-decoder-in-depth-t5-span-corruption"] code,[data-session="encoder-decoder-in-depth-t5-span-corruption"] pre.code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.ed-toks,.ed-seq{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 10px}
+.ed-tok{font:600 14px var(--mono);padding:5px 8px;border-radius:7px;border:1.5px solid var(--rule);background:var(--card);color:var(--ink);font-variant-ligatures:none}
+button.ed-tok{cursor:pointer}
+.ed-tok[aria-pressed="true"],.ed-tok.noise{border-color:var(--k);background:color-mix(in srgb,var(--k) 18%,var(--card));text-decoration:line-through;text-decoration-color:var(--k)}
+.ed-tok.sent{border-color:var(--tc);background:var(--tc);color:#fff}
+.ed-tok.msk{border-color:var(--q);background:color-mix(in srgb,var(--q) 22%,var(--card))}
+.ed-tok.eos{color:var(--muted);border-style:dashed}
+.ed-tok.moved{border-color:var(--v);background:color-mix(in srgb,var(--v) 16%,var(--card))}
+.ed-lbl{font:700 13px var(--sans);color:var(--muted);margin-top:6px}
+.ed-grid{border-collapse:separate;border-spacing:2px;margin:0 auto;font:600 12px var(--mono)}
+.ed-grid td{width:26px;height:26px;border-radius:4px;background:var(--paper2);text-align:center;padding:0}
+.ed-grid th{font:600 12px var(--mono);color:var(--muted);padding:0 4px;white-space:nowrap}
+.ed-leg{display:flex;flex-wrap:wrap;gap:6px 16px;justify-content:center;font:500 13px var(--sans);color:var(--muted);margin-top:8px}
+.ed-leg i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Many useful tasks have the shape “here is an input, write an output”: translate this sentence, summarize this article, transcribe this audio, read the text in this image. The <b>encoder–decoder</b> transformer is built for exactly this shape. One stack of layers, the <b>encoder</b>, reads the whole input at once. A second stack, the <b>decoder</b>, writes the output one token at a time, and at every step it looks back at the encoder’s result through <b>cross-attention</b>.</p>
+<p>In <a href="../transformers/the-full-transformer-and-its-three-families.html">session 23</a> we met this design as one of three families, next to encoder-only (BERT) and decoder-only (GPT, Llama). This session opens it up, using its two most famous members:</p>
+<ul><li><b>T5</b> (Raffel et al., 2019) treats <b>every</b> task as text in, text out, and pretrains with <b>span corruption</b>: it cuts pieces out of the input, puts a placeholder called a <b>sentinel token</b> in each hole, and asks the decoder to write only the missing pieces.</li>
+<li><b>BART</b> (Lewis et al., 2019) damages text in several ways (masking, deleting, shuffling) and trains the decoder to rebuild the full original.</li></ul>
+<p>Why should you care when almost all new chat LLMs are decoder-only? Three reasons. First, encoder–decoders are still the main design for speech recognition (Whisper), much of machine translation (NLLB), OCR and document reading (Donut, TrOCR), and they are the text encoders inside many image and video generators (T5-XXL in Imagen and Stable Diffusion 3). Second, the ideas travel: sentinel tokens, denoising objectives and cross-attention appear again in VLMs, where a language model attends to image features, and in <a href="../pretraining/pretraining-objectives.html">session 31</a>. Third, interviewers love the comparison: “What does cross-attention read from the encoder?”, “Why are T5 targets so short?”, “Is an encoder–decoder with 12+12 layers more expensive than a 12-layer GPT?”. By the end you can answer each one with a formula and a number.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>When asked “encoder–decoder or decoder-only?”, do not answer by fashion. Say what the task looks like (a long input and a shorter, tightly constrained output favors encoder–decoder), what the compute budget is, and whether you need open-ended chat and in-context learning (which favors decoder-only). Then give the cost fact from formula (24.11).</aside>
+
+<h2>T5: every task is text-to-text</h2>
+<p>Before T5, each task had its own output layer: a classifier head for sentiment, a span-pointer head for question answering, a decoder for translation. T5 removed all of them. Every task is written as an <b>input string</b> and an <b>output string</b>, and one model with one loss learns them all. A short <b>task prefix</b> at the start of the input tells the model which task it is doing. These examples come from the paper [Certain]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Task</th><th>Input string</th><th>Target string</th></tr></thead><tbody>
+<tr><td>Translation</td><td><code>translate English to German: That is good.</code></td><td><code>Das ist gut.</code></td></tr>
+<tr><td>Grammar check (CoLA)</td><td><code>cola sentence: The course is jumping well.</code></td><td><code>not acceptable</code></td></tr>
+<tr><td>Similarity score (STS-B)</td><td><code>stsb sentence1: The rhino grazed on the grass. sentence2: A rhino is grazing in a field.</code></td><td><code>3.8</code></td></tr>
+<tr><td>Summarization</td><td><code>summarize: state authorities dispatched emergency crews tuesday to …</code></td><td><code>six people hospitalized after a storm in attala county.</code></td></tr></tbody></table></div>
+<p>Even a number becomes text. STS-B scores go from 1 to 5, so T5 rounds them to the nearest multiple of 0.2 and writes them as strings like <code>3.8</code>; this turns a regression task into a choice among 21 strings (1.0, 1.2, …, 5.0). [Certain] Classification labels become words such as <code>acceptable</code> or <code>entailment</code>. If the model writes a word that is not a label, the answer simply counts as wrong.</p>
+<p>The model is trained with the same objective for every task: maximum likelihood of the target string, given the input string. Write the input tokens as \(\mathbf{x} = (x_1, \dots, x_{n})\) and the target tokens as \(\mathbf{y} = (y_1, \dots, y_{m})\):</p>
+<div class="eq">\[ p_\theta(\mathbf{y} \mid \mathbf{x}) = \prod_{t=1}^{m} p_\theta\big(y_t \mid y_{\lt t},\ \mathbf{x}\big), \qquad \mathcal{L} = -\sum_{t=1}^{m} \log p_\theta\big(y_t \mid y_{\lt t},\ \mathbf{x}\big) \tag{24.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{x}\)</dt><dd>the input tokens, including the task prefix; the encoder reads all of them at once</dd>
+<dt>\(\mathbf{y}\)</dt><dd>the target tokens; the decoder writes them one by one, ending with an end-of-sequence token <code>&lt;/s&gt;</code></dd>
+<dt>\(y_{\lt t}\)</dt><dd>the target tokens before position \(t\). The decoder may look at these, but not at \(y_t\) or later.</dd>
+<dt>\(\theta\)</dt><dd>all the model’s weights: encoder, decoder and the shared embedding table</dd></dl>
+<p>This is the same formula as the seq2seq models of <a href="../foundations/before-transformers-rnn-lstm-seq2seq-and-the.html">session 7</a>, formula (7.5), with one change that matters a lot: the condition is the full sequence of encoder outputs, not one squeezed vector. It is also the same next-token loss as a decoder-only LLM (<a href="../foundations/next-token-prediction.html">session 6</a>), except the loss is computed only on the target tokens, and the input is read by separate weights.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Before T5, every task had its own form to fill in: a box to tick for sentiment, a line to underline for question answering, a blank page for translation. T5 replaced all the forms with one blank sheet of paper and a short note at the top saying what to write. The model only ever learns one skill: read a note and a text, then write an answer.</aside>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Why is text-to-text useful?” One architecture, one loss and one decoding procedure for every task, so you can mix tasks in one training run (multi-task training) and add a new task by writing data, not code. The price: outputs are free text, so a classifier can produce an invalid label, and a regression becomes a coarse classification.</aside>
+
+<h2>The architecture: two stacks and a bridge</h2>
+<p>Figure 1 shows the whole model. Read it from the bottom left to the top right.</p>
+<ol><li>The input tokens are looked up in the embedding table (<a href="../foundations/embeddings-turning-token-ids-into-vectors.html">session 11</a>) and pass through the <b>encoder</b>: \(N\) identical blocks, each with <b>bidirectional self-attention</b> (every input token can see every other input token) and a feed-forward network (FFN). The result is one vector per input token, \(H_{\text{enc}} \in \R^{n \times d}\). This is the encoder’s full output; nothing is squeezed into one vector.</li>
+<li>The <b>decoder</b> also has \(N\) blocks. Each block has <b>three</b> sublayers instead of two: causal self-attention over the target tokens written so far, then <b>cross-attention</b> to \(H_{\text{enc}}\), then an FFN.</li>
+<li>The last decoder vector at each position goes through the output layer (in T5 the same matrix as the input embedding table, see weight tying in <a href="../foundations/embeddings-turning-token-ids-into-vectors.html">session 11</a>) and a softmax gives the next-token probabilities.</li></ol>
+<figure class="fig" id="ed-arch"><div class="fig-body"><div class="scroll-x"><svg id="ed-arch-svg" viewBox="0 0 660 430" role="img" aria-label="Diagram of an encoder–decoder transformer. The encoder output feeds the cross-attention sublayer of every decoder block."></svg></div></div>
+<figcaption><b>Figure 1.</b> The encoder–decoder transformer, as used by T5 and BART. Left: the encoder reads the corrupted input once. Right: the decoder writes the target. The orange and green arrows carry the encoder output \(H_{\text{enc}}\); inside every decoder block it becomes the keys (orange) and values (green) of cross-attention, while the queries (blue) come from the decoder itself. The same \(H_{\text{enc}}\) goes to all \(N\) decoder blocks.</figcaption></figure>
+<h3>Cross-attention, precisely</h3>
+<p>Cross-attention is ordinary scaled dot-product attention (<a href="../transformers/scaled-dot-product-attention-the-math-and.html">session 17</a>) with one twist: the queries and the keys/values come from <b>different sequences</b>. Let \(S \in \R^{m \times d}\) be the decoder’s hidden states after its self-attention sublayer (one row per target position). Then:</p>
+<div class="eq">\[ Q = S\,W_Q, \quad K = H_{\text{enc}}\,W_K, \quad V = H_{\text{enc}}\,W_V, \qquad \operatorname{CrossAttn}(S, H_{\text{enc}}) = \softmax\!\Big(\frac{Q K^\top}{\sqrt{d_k}}\Big)\, V \tag{24.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(S\)</dt><dd>decoder states, shape \(m \times d\): “what the writer needs now”. They give the <b>queries</b>.</dd>
+<dt>\(H_{\text{enc}}\)</dt><dd>the final encoder output, shape \(n \times d\): “what the reader understood”. It gives the <b>keys</b> and <b>values</b>.</dd>
+<dt>\(W_Q, W_K, W_V\)</dt><dd>learned projection matrices of this decoder block, each \(d \times d\) when all heads are put side by side. Each decoder block has its own.</dd>
+<dt>\(QK^\top\)</dt><dd>an \(m \times n\) score matrix: target positions by source positions. It is not square, and it has <b>no causal mask</b>, because the whole input is known from the start.</dd>
+<dt>\(d_k\)</dt><dd>the size of one head’s query and key vectors (64 in T5-Base)</dd></dl>
+<p>Two facts follow from the shapes. Every row of the softmax is a probability distribution over the \(n\) input tokens: for each target position, the decoder decides where in the input to read. And \(K\) and \(V\) depend only on the encoder output, so during generation they are computed <b>once per input</b> and reused at every step. We will use this in the section on inference.</p>
+<p>A full decoder block, in the pre-norm form that T5 uses (<a href="../transformers/the-residual-stream-and-normalization.html">session 22</a>), is three residual updates:</p>
+<div class="eq">\[ \begin{aligned} S' &= S + \operatorname{SelfAttn}_{\text{causal}}\big(\operatorname{Norm}(S)\big) \\ S'' &= S' + \operatorname{CrossAttn}\big(\operatorname{Norm}(S'),\ H_{\text{enc}}\big) \\ S''' &= S'' + \operatorname{FFN}\big(\operatorname{Norm}(S'')\big) \end{aligned} \tag{24.3} \]</div>
+<p>The encoder block is the same without the middle line, and with a self-attention that has no causal mask. Note that \(H_{\text{enc}}\) is the output of the <b>last</b> encoder block, already normalized; every decoder block reads the same \(H_{\text{enc}}\), not the encoder layer at the same depth. [Certain]</p>
+<h3>T5’s small changes to the 2017 transformer</h3>
+<p>T5 follows the original transformer (<a href="../transformers/the-full-transformer-and-its-three-families.html">session 23</a>) closely, with a few changes the paper lists [Certain]:</p>
+<ul><li><b>Pre-norm without bias.</b> Layer normalization is applied to the <b>input</b> of each sublayer. It only rescales the activations and has no additive bias; the code does not subtract the mean either, so it is what is now called RMSNorm.</li>
+<li><b>Relative position bias.</b> There are no position vectors added to the embeddings. Instead, each attention head adds a learned <b>scalar</b> to each attention logit, chosen by the distance between query and key (Shaw et al., 2018 introduced relative positions; T5 simplified them to one number):</li></ul>
+<div class="eq">\[ a_{ij} = \mathbf{q}_i \cdot \mathbf{k}_j + b_{h,\ \operatorname{bucket}(j - i)} \tag{24.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(a_{ij}\)</dt><dd>the attention logit of query \(i\) for key \(j\), before the softmax</dd>
+<dt>\(b_{h,\cdot}\)</dt><dd>a learned table of 32 numbers for head \(h\). The table is shared by all layers of the stack; each head has its own. [Certain]</dd>
+<dt>\(\operatorname{bucket}(j - i)\)</dt><dd>maps the offset to one of 32 buckets: small offsets get their own bucket, larger ones share buckets whose ranges grow logarithmically up to 128; every offset beyond 128 falls in the last bucket. [Certain]</dd></dl>
+<p>Two details surprise people. First, T5 does <b>not</b> divide by \(\sqrt{d_k}\): the scale is folded into the initialization of the weights, and the Hugging Face code sets the scaling factor to 1.0. [Certain] Second, cross-attention in T5 has no position bias at all: the decoder finds positions in the input only through the content of \(H_{\text{enc}}\), which already carries the encoder’s position information. [Likely]</p>
+<div class="worked"><div class="wt">Worked example: counting T5-Base</div>
+<p>T5-Base has \(d = 768\), \(d_{ff} = 3072\), 12 heads of size 64, 12 encoder blocks and 12 decoder blocks, and a vocabulary of 32,128 rows (32,000 SentencePiece pieces, 100 sentinels, padded to a multiple of 128). [Certain, from the paper and the public config.]</p>
+<p>Encoder block: attention \(4d^2 = 2{,}359{,}296\) plus FFN \(2 d\, d_{ff} = 4{,}718{,}592\), so \(7{,}077{,}888\). Twelve blocks: 84.9 M.<br>Decoder block: two attentions \(8d^2 = 4{,}718{,}592\) plus FFN, so \(9{,}437{,}184\). Twelve blocks: 113.2 M.<br>Shared embedding: \(32{,}128 \times 768 = 24{,}674{,}304\).</p>
+<p>Total: \(222{,}855{,}168\), plus 48,384 norm scales and position biases \(= 222{,}903{,}552\), the “about 220 million” of the paper. Cross-attention alone is \(12 \times 4d^2 = 28.3\) M, about 12.7% of the model; the paper rounds this to “about 10%”.</p></div>
+
+<h2>Span corruption and sentinel tokens</h2>
+<p>To pretrain without labels, we need a task that can be made from raw text. T5 uses a <b>denoising</b> objective: damage the input, and train the model to undo the damage. The specific damage is <b>span corruption</b>:</p>
+<ol><li>Choose about 15% of the tokens to drop, grouped into short runs called <b>spans</b> (on average 3 tokens long).</li>
+<li>In the input, replace each span by one <b>sentinel token</b>. Sentinels are special tokens added to the vocabulary that mean “something is missing here”; each span in one example gets a different sentinel. T5 writes them as <code>&lt;X&gt;</code>, <code>&lt;Y&gt;</code>, <code>&lt;Z&gt;</code> in the paper; in the released vocabulary they are <code>&lt;extra_id_0&gt;</code> to <code>&lt;extra_id_99&gt;</code>. [Certain]</li>
+<li>The target is <b>only the dropped spans</b>, each one introduced by the same sentinel that replaced it in the input, plus one final sentinel to mark the end.</li></ol>
+<p>The paper’s example [Certain]: from “Thank you for inviting me to your party last week.” it drops “for inviting” and “last”:</p>
+<div class="tblw"><table class="tb"><tbody>
+<tr><th>Encoder input</th><td><code>Thank you &lt;X&gt; me to your party &lt;Y&gt; week .</code></td></tr>
+<tr><th>Decoder target</th><td><code>&lt;X&gt; for inviting &lt;Y&gt; last &lt;Z&gt;</code></td></tr></tbody></table></div>
+<p>The sentinel does two jobs. In the input it marks the place of the hole, so the encoder knows where text is missing. In the target it says <b>which</b> hole the next tokens belong to, so the decoder never has to repeat the parts of the sentence it already sees. Why not just mark every dropped token with the same <code>[MASK]</code> and predict the full sentence, as in BERT? Because then the decoder must copy the 85% of tokens that were never damaged. That costs compute and teaches little.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Span corruption is a cloze test with numbered blanks: “Thank you ___(1)___ me to your party ___(2)___ week.” The answer sheet does not repeat the whole text. It just says “(1) for inviting, (2) last”. The numbers are the sentinels.</aside>
+<h3>How long are the input and the target?</h3>
+<p>Let the original text have \(n\) tokens, a corruption rate \(r\) and a mean span length \(\mu\). T5’s code first fixes the number of noise tokens and spans, then splits them at random:</p>
+<div class="eq">\[ N = \operatorname{round}(r\,n), \qquad S = \operatorname{round}(N / \mu) \tag{24.5} \]</div>
+<div class="eq">\[ |\tilde{\mathbf{x}}| = n - N + S, \qquad |\mathbf{y}| = N + S + 1 \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\)</dt><dd>the number of dropped (noise) tokens</dd>
+<dt>\(S\)</dt><dd>the number of spans, so also the number of sentinels in the input</dd>
+<dt>\(\tilde{\mathbf{x}}\)</dt><dd>the corrupted input: the \(n - N\) kept tokens plus one sentinel per span</dd>
+<dt>\(\mathbf{y}\)</dt><dd>the target: the \(N\) dropped tokens, one sentinel before each span, and one final token. (The paper ends with a last sentinel; the released code ends with <code>&lt;/s&gt;</code> and also adds <code>&lt;/s&gt;</code> to the input. [Likely]) Add 1 to each length if you count the end token.</dd></dl>
+<p>The loss is formula (24.1) applied to this pair: the decoder predicts the target tokens, sentinels included, given the corrupted input:</p>
+<div class="eq">\[ \mathcal{L}_{\text{span}} = -\sum_{t=1}^{|\mathbf{y}|} \log p_\theta\big(y_t \mid y_{\lt t},\ \tilde{\mathbf{x}}\big) \tag{24.6} \]</div>
+<div class="worked"><div class="wt">Worked example: why T5 targets are 114 tokens long</div>
+<p>T5 trains with encoder inputs of 512 tokens. How much raw text does that need? Try \(n = 568\), \(r = 0.15\), \(\mu = 3\): \(N = \operatorname{round}(85.2) = 85\) noise tokens, \(S = \operatorname{round}(28.3) = 28\) spans.</p>
+<p>Input: \(568 - 85 + 28 = 511\), plus the end token: <b>512</b>. Target: \(85 + 28 + 1 = 114\) (here the last token is the end token). So 568 raw tokens give a full 512-token input and a <b>114-token</b> target. These are exactly the lengths the Hugging Face T5 pretraining script computes. [Certain]</p>
+<p>Compare a BERT-style objective that reconstructs the full text: the decoder would process all 568 tokens. Span corruption cuts the decoder’s work to \(114/568 \approx 20\%\), and the decoder self-attention, which is quadratic in target length, shrinks even more.</p></div>
+<figure class="fig" id="ed-span"><div class="fig-body">
+<div class="controls"><span class="seg" id="ed-span-mode"><button type="button" data-m="paper" aria-pressed="true">Paper example</button><button type="button" data-m="rand" aria-pressed="false">Random spans</button></span><button type="button" class="btn" id="ed-span-seed">New sample</button></div>
+<div class="controls"><label class="sl">Corruption rate \(r\) <input type="range" id="ed-span-r" min="0.05" max="0.5" step="0.05" value="0.15"><output id="ed-span-rv">0.15</output></label><label class="sl">Mean span \(\mu\) <input type="range" id="ed-span-mu" min="1" max="6" step="1" value="3"><output id="ed-span-muv">3</output></label></div>
+<div class="ed-lbl">Original text (click tokens to drop or keep them)</div>
+<div class="ed-toks" id="ed-span-src" role="group" aria-label="Original tokens"></div>
+<div class="ed-lbl">Encoder input \(\tilde{\mathbf{x}}\)</div><div class="ed-seq" id="ed-span-in"></div>
+<div class="ed-lbl">Decoder target \(\mathbf{y}\)</div><div class="ed-seq" id="ed-span-out"></div>
+<div class="readout" id="ed-span-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> A span corruption builder. A two-sentence text of 21 tokens (one word = one token here). “Paper example” drops the same words as Figure 2 of the T5 paper. “Random spans” uses T5’s procedure: fix \(N\) and \(S\) by formula (24.5), then split the noise tokens and the kept tokens into \(S\) random pieces each and interleave them (seeded, so “New sample” is repeatable). Sentinels are drawn filled.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Crossed-out tokens are dropped. Each run of dropped tokens becomes one sentinel in the encoder input and reappears, after the same sentinel, in the target. The readout counts the lengths and compares the target with a BERT-style target that rebuilds all 21 tokens. Click “for” and “inviting”: two neighbors share one sentinel. Click a lonely word: it costs a whole sentinel for one token, so many short spans make both sequences longer. Raise \(\mu\) at fixed \(r\): fewer spans, so fewer sentinels and shorter sequences. Raise \(r\) to 0.5: the target grows toward the size of the input, and the paper found such high rates hurt GLUE and SQuAD.</p></details></figure>
+<h3>What the T5 paper found about objectives</h3>
+<p>T5 compared many objectives with everything else fixed (a T5-Base-sized model, 34 B pretraining tokens). Some of the numbers, all from the paper’s validation sets [Certain]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Objective</th><th>Target</th><th>GLUE</th><th>CNN/DM (ROUGE-2)</th><th>SuperGLUE</th></tr></thead><tbody>
+<tr><td>Prefix language modeling</td><td>second half of the text</td><td>80.69</td><td>18.94</td><td>65.27</td></tr>
+<tr><td>BERT-style (15%, with random tokens)</td><td>full original text</td><td>82.96</td><td>19.17</td><td>69.85</td></tr>
+<tr><td>Deshuffling</td><td>full original text</td><td>73.17</td><td>18.59</td><td>58.47</td></tr>
+<tr><td>Replace corrupted spans (i.i.d. 15%)</td><td>dropped tokens + sentinels</td><td>83.28</td><td>19.24</td><td>71.36</td></tr>
+<tr><td>Span corruption, mean span 3</td><td>dropped spans + sentinels</td><td>83.49</td><td>19.62</td><td>72.53</td></tr></tbody></table></div>
+<p>The lesson of the paper: <b>denoising beats plain language modeling and deshuffling</b> for this setup, and the many denoising variants are close to each other. Their advice was to choose among them mostly by cost, and span corruption is the cheapest because it gives the shortest sequences. [Certain] The corruption rate mattered little between 10% and 25%; 50% hurt GLUE and SQuAD. [Certain]</p>
+<aside class="note numbers side"><span class="nt">Real numbers</span>T5 pretraining: 2<sup>19</sup> = 524,288 steps, 128 sequences of 512 tokens per batch (about 65,536 tokens), so about 2<sup>35</sup> ≈ 34 B tokens from C4, a cleaned Common Crawl corpus of about 750 GB. [Certain] The final T5 models went up to 11 B parameters and trained much longer.</aside>
+
+<h2>How the decoder uses cross-attention at every step</h2>
+<p>The decoder works differently in training and at inference, and many bugs live in the gap between the two.</p>
+<h3>Training: teacher forcing, all steps at once</h3>
+<p>In training we know the whole target. We feed the decoder the target <b>shifted right by one</b>, with a start token in front, and ask it to predict the unshifted target at every position in parallel. This is called <b>teacher forcing</b>:</p>
+<div class="eq">\[ \mathbf{y}^{\text{in}} = (\,s,\ y_1,\ y_2,\ \dots,\ y_{m-1}\,), \qquad \text{position } t \text{ predicts } y_t \tag{24.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(s\)</dt><dd>the decoder start token. In T5 it is the padding token (ID 0); in BART it is <code>&lt;/s&gt;</code> (ID 2). [Certain, from the public configs]</dd>
+<dt>\(\mathbf{y}^{\text{in}}\)</dt><dd>what the decoder reads. The causal mask makes position \(t\) see only \(s, y_1, \dots, y_{t-1}\), so it cannot cheat by looking at \(y_t\).</dd></dl>
+<p>All \(m\) positions run in one forward pass: the encoder runs once on \(\tilde{\mathbf{x}}\), the decoder runs once on \(\mathbf{y}^{\text{in}}\), and cross-attention (24.2) is one \(m \times n\) matrix product per head.</p>
+<h3>Inference: encode once, then decode step by step</h3>
+<p>At inference we do not know the target. We run the encoder <b>once</b>. Then we generate: start with \(s\), predict \(y_1\), append it, predict \(y_2\), and so on until <code>&lt;/s&gt;</code>. At step \(t\) only one new query row is computed in each decoder block. Two caches make this fast (<a href="../inference/index.html#row-the-kv-cache" title="The KV cache (planned)">session 80</a>):</p>
+<ul><li>The <b>self-attention cache</b> stores the keys and values of the target tokens so far. It grows by one row per step, exactly like a decoder-only model’s KV cache.</li>
+<li>The <b>cross-attention cache</b> stores \(K = H_{\text{enc}} W_K\) and \(V = H_{\text{enc}} W_V\) for every decoder block. It is computed at the first step and never changes, because the input never changes.</li></ul>
+<div class="eq">\[ M_{\text{cross}} = 2 \cdot L_{\text{dec}} \cdot n \cdot d \cdot b \ \text{ bytes}, \qquad M_{\text{self}}(t) = 2 \cdot L_{\text{dec}} \cdot t \cdot d \cdot b \ \text{ bytes} \tag{24.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2\)</dt><dd>one tensor for keys and one for values</dd>
+<dt>\(L_{\text{dec}}\)</dt><dd>the number of decoder blocks: each has its own \(W_K, W_V\), so its own cache</dd>
+<dt>\(n\), \(t\)</dt><dd>the input length, and the number of target tokens generated so far</dd>
+<dt>\(d\), \(b\)</dt><dd>the width (all heads together) and the bytes per number (2 for bfloat16)</dd></dl>
+<div class="worked"><div class="wt">Worked example: one attention step, and Whisper’s cross-attention cache</div>
+<p><b>One step by hand.</b> Take one head with \(d_k = 2\). The decoder query is \(\mathbf{q} = (1, 2)\). Three encoder positions have keys \((1, 0), (0, 1), (1, 1)\) and values \((1, 0), (0, 1), (2, 2)\). Scores \(\mathbf{q}\cdot\mathbf{k}_j/\sqrt{2}\): \(0.707,\ 1.414,\ 2.121\). Softmax: \(0.140,\ 0.284,\ 0.576\) (they sum to 1). Output: \(0.140\,(1,0) + 0.284\,(0,1) + 0.576\,(2,2) = (1.292,\ 1.436)\). The decoder read mostly from the third input position.</p>
+<p><b>A real cache.</b> Whisper large-v3 has 32 decoder blocks of width 1,280, and its encoder turns 30 seconds of audio into 1,500 positions. [Certain, from the config] By formula (24.8), the cross-attention cache is \(2 \times 32 \times 1{,}500 \times 1{,}280 = 122{,}880{,}000\) numbers, which is <b>245.8 MB</b> in 16-bit, per audio clip, before a single word is written. Its decoder writes at most 448 tokens, so the self-attention cache can never be larger than \(448/1500 \approx 30\%\) of the cross cache. For Whisper small (12 blocks, width 768) it is 55.3 MB.</p></div>
+<figure class="fig" id="ed-xattn"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="ed-xattn-prev">◀ Back</button><button type="button" class="btn primary" id="ed-xattn-play">Play</button><button type="button" class="btn" id="ed-xattn-next">Next ▶</button><span id="ed-xattn-lab" style="font:600 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="ed-xattn-svg" viewBox="0 0 704 300" role="img" aria-label="Cross-attention weights of the decoder over the encoder tokens at each generation step"></svg></div>
+<div class="readout" id="ed-xattn-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Decoding “translate English to German: That is good .” → “Das ist gut . &lt;/s&gt;” one step at a time. Top: the 9 encoder outputs (encoded once). Bottom: the decoder tokens; the blue box is the current query. The orange lines and bars show one head’s cross-attention weights over the input. The scores are set by hand to look like a trained model; the softmax and all counts are computed live.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Press Next. At each step the newest decoder token sends one query to all 9 encoder positions; the thicker the line, the larger the weight. The weights in every step sum to 1. Writing “Das” reads mostly from “That”, writing “gut” from “good”: this is the <b>alignment</b> that Bahdanau attention discovered (<a href="../foundations/before-transformers-rnn-lstm-seq2seq-and-the.html">session 7</a>). At the last step the weights spread out, because ending the sentence does not depend on one word. Watch the cache counts in the readout: the cross-attention K/V rows stay at 9 per block from the first step to the last, while the self-attention cache grows by one per step.</p></details></figure>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Does cross-attention need a causal mask?” No. Causal masks stop a position from seeing <b>future target</b> tokens. The input is fully known before decoding starts, so every target position may read every input position. (It does need a <b>padding</b> mask over the input when inputs in a batch have different lengths; see <a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a>.)</aside>
+
+<h2>BART: corrupt the text, then rebuild it</h2>
+<p>BART (Lewis et al., 2019) uses the same encoder–decoder shape, with a different philosophy. It calls itself a <b>denoising autoencoder</b>: corrupt a document with some noising function, feed it to a bidirectional encoder, and train a left-to-right decoder to write the <b>full original document</b>. [Certain]</p>
+<div class="eq">\[ \mathcal{L}_{\text{BART}} = -\sum_{t=1}^{n} \log p_\theta\big(x_t \mid x_{\lt t},\ g(\mathbf{x})\big) \tag{24.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(g(\mathbf{x})\)</dt><dd>the corrupted document: the encoder input. \(g\) is a random noising function.</dd>
+<dt>\(x_t\)</dt><dd>token \(t\) of the <b>original</b> document. The target is the clean text, all \(n\) tokens, not only the damaged parts.</dd></dl>
+<p>Because the target is always the full clean text, BART can use <b>any</b> damage, even damage that changes the length or the order. The paper tries five noising functions [Certain]:</p>
+<ul><li><b>Token masking</b>: replace random tokens with <code>&lt;mask&gt;</code>, as in BERT.</li>
+<li><b>Token deletion</b>: delete random tokens. Now the model must also find <b>where</b> something is missing.</li>
+<li><b>Text infilling</b>: choose spans whose lengths come from a Poisson distribution with \(\lambda = 3\) and replace each span with a <b>single</b> <code>&lt;mask&gt;</code>. A span of length 0 inserts a <code>&lt;mask&gt;</code> where nothing is missing. The model must learn how many tokens each mask hides.</li>
+<li><b>Sentence permutation</b>: split the document at full stops and shuffle the sentences.</li>
+<li><b>Document rotation</b>: pick a random token and rotate the document so it starts there. The model must find the true start.</li></ul>
+<div class="eq">\[ P(\ell = k) = \frac{\lambda^k e^{-\lambda}}{k!}, \qquad \lambda = 3:\quad P(0) = 0.050,\ P(1) = 0.149,\ P(2) = P(3) = 0.224 \tag{24.10} \]</div>
+<p>So about 5% of the sampled “spans” are empty insertions, and spans of length 2 and 3 are the most common. Text infilling is close to T5’s span corruption; the difference is the target. T5 writes only the missing pieces after numbered sentinels. BART writes the whole document after one kind of <code>&lt;mask&gt;</code>, so its decoder also practices fluent copying, which helps tasks like summarization where the output reuses much of the input.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>BART is a restorer of damaged manuscripts. Sometimes words are smudged (masking), sometimes torn out with no trace (deletion), sometimes a whole torn strip hides an unknown number of words (infilling), sometimes the pages are in the wrong order (permutation). Whatever the damage, the restorer always hands back a clean, complete copy.</aside>
+<figure class="fig" id="ed-bart"><div class="fig-body">
+<div class="controls"><span class="seg" id="ed-bart-mode"><button type="button" data-m="mask" aria-pressed="false">Token masking</button><button type="button" data-m="del" aria-pressed="false">Token deletion</button><button type="button" data-m="fill" aria-pressed="true">Text infilling</button><button type="button" data-m="perm" aria-pressed="false">Sentence permutation</button><button type="button" data-m="rot" aria-pressed="false">Document rotation</button><button type="button" data-m="both" aria-pressed="false">Infilling + permutation</button></span></div>
+<div class="controls"><button type="button" class="btn" id="ed-bart-seed">New sample</button><span id="ed-bart-seedv" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="ed-lbl">Encoder input \(g(\mathbf{x})\)</div><div class="ed-seq" id="ed-bart-in"></div>
+<div class="ed-lbl">Decoder target: the original document \(\mathbf{x}\)</div><div class="ed-seq" id="ed-bart-out"></div>
+<div class="readout" id="ed-bart-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> BART’s noising functions on an 18-token document of three sentences. Masking, deletion and infilling damage 30% of the tokens (5 of 18), the rate BART used for its final model. Infilling draws span lengths from Poisson(3), formula (24.10). All randomness is seeded.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The target never changes: it is always the clean document. Only the input changes. Compare the readout lengths: masking keeps the length, deletion shortens it and hides the positions, infilling shortens it and hides how many tokens each <code>&lt;mask&gt;</code> covers. Press “New sample” on infilling a few times: sometimes one <code>&lt;mask&gt;</code> hides all 5 tokens, sometimes three masks hide 1, 2 and 2. Spans are placed so they do not touch, so the hidden counts always add up to 5. A mask that hides 0 tokens (an inserted mask) comes from the 5% of empty spans, so it is rare in a text this short. Permutation and rotation keep every token but break the order; BART found these weak alone. “Infilling + permutation” is BART’s final recipe.</p></details></figure>
+<p>Which noise works best? BART’s ablation, with base-sized models trained for 1 M steps on books and Wikipedia [Certain]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>BART-Base noise</th><th>SQuAD 1.1 F1</th><th>MNLI acc.</th><th>XSum perplexity</th><th>CNN/DM perplexity</th></tr></thead><tbody>
+<tr><td>Token masking</td><td>90.4</td><td>84.1</td><td>7.08</td><td>6.10</td></tr>
+<tr><td>Token deletion</td><td>90.4</td><td>84.1</td><td>6.90</td><td>5.87</td></tr>
+<tr><td>Text infilling</td><td>90.8</td><td>84.0</td><td>6.61</td><td>5.83</td></tr>
+<tr><td>Document rotation</td><td>77.2</td><td>75.3</td><td>17.14</td><td>10.59</td></tr>
+<tr><td>Sentence shuffling</td><td>85.4</td><td>81.5</td><td>10.93</td><td>7.89</td></tr>
+<tr><td>Infilling + shuffling</td><td>90.8</td><td>83.8</td><td>6.62</td><td>5.41</td></tr></tbody></table></div>
+<p>Lower perplexity is better. Infilling is the most consistent; rotation and shuffling alone are poor; deletion beats masking on the generation tasks. The final BART-Large (12 + 12 layers, width 1,024, GPT-2’s byte-level BPE, 160 GB of text) used infilling with 30% of tokens masked plus permutation of all sentences. [Certain] It matched RoBERTa on GLUE and SQuAD and set a new best on summarization: ROUGE-1/2/L of 44.16 / 21.28 / 40.90 on CNN/DailyMail and 45.14 / 22.27 / 37.25 on XSum. [Certain]</p>
+<h3>Using BART and T5 after pretraining</h3>
+<ul><li><b>Generation tasks</b> (summarization, translation, question answering with free answers): fine-tune with formula (24.1) and decode with beam search or sampling (<a href="../inference/index.html#row-decoding-strategies" title="Decoding strategies (planned)">session 79</a>).</li>
+<li><b>Classification with BART</b>: feed the same text to the encoder and the decoder, and put a classifier on the decoder’s final state at the last token, which has seen the whole input. [Certain]</li>
+<li><b>Classification with T5</b>: just generate the label word. No new layers.</li></ul>
+
+<h2>Beyond T5 and BART</h2>
+<p>A few descendants are worth knowing by name, because you will meet their checkpoints:</p>
+<ul><li><b>T5 v1.1 and Flan-T5.</b> T5 v1.1 changed the FFN to a gated GELU (\(d_{ff} = 2048\) at Base) and stopped tying the input and output embeddings. [Certain, from the configs] Flan-T5 (Chung et al., 2022) is T5 instruction-tuned on about 1.8 K tasks; it is a strong, small model for following instructions on one input. [Certain]</li>
+<li><b>mT5</b> (Xue et al., 2020): T5 pretrained on Common Crawl text in 101 languages, with a vocabulary of 250,112 rows. [Certain] A large vocabulary is the price of many scripts (<a href="../foundations/what-is-a-token-subword-tokenization-bpe.html">session 8</a>).</li>
+<li><b>mBART</b>: BART pretrained on many languages, a common start for translation models. [Certain]</li>
+<li><b>UL2</b> (Tay et al., 2022): a <b>mixture of denoisers</b>. It mixes T5-style span corruption with short spans, prefix language modeling, and “extreme” corruption with long spans or high rates, and adds a mode token so the model knows which kind of task it is doing. [Certain] It showed that the objective and the architecture are separate choices.</li></ul>
+
+<h2>Encoder–decoder or decoder-only: cost and masks</h2>
+<p>T5 made a careful comparison that is still the best way to think about the trade-off. Let one stack of \(L\) layers have \(P\) parameters. An encoder–decoder with \(L\) encoder layers and \(L\) decoder layers then has about \(2P\) parameters, but it costs about the same compute as a decoder-only model with only \(L\) layers. The reason: the decoder-only model must push <b>both</b> the input and the output through all its layers, while the encoder–decoder pushes the input only through the encoder and the output only through the decoder. [Certain]</p>
+<p>Let us check this with the counting rules of <a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a> (a matrix–vector product with a \(d \times d\) matrix costs \(2d^2\) FLOPs; attention-score FLOPs are ignored; \(d_{ff} = 4d\)). Per token, a decoder-only layer uses \(12d^2\) weights. An encoder layer also uses \(12d^2\), plus the cross-attention \(K, V\) projections in the decoder are applied to the input tokens (\(2d^2\)). A decoder layer applies \(4d^2\) self-attention, \(2d^2\) for the cross-attention \(Q\) and output projections, and \(8d^2\) FFN to each target token:</p>
+<div class="eq">\[ \begin{aligned} N_{\text{enc-dec}} &\approx 12Ld^2 + 16Ld^2 = 28Ld^2, & C_{\text{enc-dec}} &\approx 2Ld^2\,\big(14\,n + 14\,m\big) \\ N_{\text{dec-only}} &\approx 12Ld^2, & C_{\text{dec-only}} &\approx 2Ld^2\,\big(12\,n + 12\,m\big) \end{aligned} \tag{24.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\)</dt><dd>parameters without embeddings</dd>
+<dt>\(C\)</dt><dd>forward FLOPs of the weight matrices for one (input, target) pair with \(n\) input and \(m\) target tokens</dd>
+<dt>\(L\)</dt><dd>layers per stack: \(L + L\) for the encoder–decoder, \(L\) for the decoder-only model</dd></dl>
+<p>So the encoder–decoder has \(28/12 = 2.33\times\) the parameters (the extra cross-attention makes it more than \(2\times\)) for only \(14/12 = 1.17\times\) the compute. With T5-Base sizes (\(d = 768\), \(L = 12\)) and T5’s lengths (\(n = 512\), \(m = 114\)): 198 M versus 85 M parameters, and 124 versus 106 GFLOPs per example. T5 measured nearly identical step times for the two. [Certain]</p>
+<p>The attention masks show the other half of the story. Write the input and the target as one long sequence. A decoder-only <b>causal LM</b> lets each token see only earlier tokens, even inside the input. An encoder–decoder lets input tokens see each other in both directions, and target tokens see all input tokens plus earlier target tokens. A <b>prefix LM</b> is a single stack with exactly that encoder–decoder visibility pattern (<a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a>). Figure 5 draws all three.</p>
+<figure class="fig" id="ed-cost"><div class="fig-body">
+<div class="controls"><span class="seg" id="ed-cost-arch"><button type="button" data-a="ed" aria-pressed="true">Encoder–decoder (L+L)</button><button type="button" data-a="pre" aria-pressed="false">Prefix LM (L)</button><button type="button" data-a="lm" aria-pressed="false">Causal LM (L)</button></span></div>
+<div class="controls"><label class="sl">Input tokens \(n\) <input type="range" id="ed-cost-n" min="1" max="8" step="1" value="4"><output id="ed-cost-nv">4</output></label><label class="sl">Target tokens \(m\) <input type="range" id="ed-cost-m" min="1" max="6" step="1" value="3"><output id="ed-cost-mv">3</output></label></div>
+<div class="scroll-x" id="ed-cost-grid"></div>
+<div class="ed-leg" id="ed-cost-leg"></div>
+<div class="readout" id="ed-cost-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Who can see whom. Rows are queries, columns are keys, over the input tokens \(x\) followed by the target tokens \(y\). A filled cell means “this row may attend to this column”. The readout counts the visible pairs for the lengths you chose, and gives the parameters and forward GFLOPs of formula (24.11) at T5-Base size (\(d = 768\), \(L = 12\), \(n = 512\), \(m = 114\)), with the scores T5 measured for each architecture trained with its denoising objective (T5 Table 2).</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Start with the encoder–decoder. The top-left block (input sees input) is full: bidirectional encoder self-attention. The bottom-left block is cross-attention: every target row sees every input column. The bottom-right block is a triangle: causal decoder self-attention. The top-right block is empty: the input never sees the target. Now switch to prefix LM: the same cells are filled, but all by one stack of weights. Switch to causal LM: the top-left block becomes a triangle, so early input tokens can no longer see later ones. That one change cost T5 more than 7 GLUE points in its comparison. With \(n = 4\), \(m = 3\), the encoder–decoder has 34 visible pairs and the causal LM 28.</p></details></figure>
+<p>T5’s results for these three, all trained with the same denoising objective [Certain]: encoder–decoder 83.28 GLUE and 19.24 ROUGE-2 on CNN/DM; prefix LM 81.82 and 18.61; causal LM 74.70 and 17.93. Sharing the weights between encoder and decoder (\(P\) parameters) did nearly as well as the full encoder–decoder (82.81 GLUE), while halving the depth to 6+6 layers hurt more (80.88). [Certain]</p>
+<h3>So why did decoder-only win at scale?</h3>
+<p>If encoder–decoders did better at equal compute, why are GPT, Llama and Qwen all decoder-only? A few reasons, the first one measured, the others widely believed [Likely]:</p>
+<ul><li><b>Zero-shot behavior.</b> Wang et al. (2022) trained models of more than 5 B parameters on more than 170 B tokens and found that causal decoder-only models with plain next-token training gave the best zero-shot results right after pretraining, while non-causal models with masked objectives were best only after multitask fine-tuning. [Certain] Chat models are used zero-shot and few-shot, on any task, so this matters.</li>
+<li><b>Every token is a training signal.</b> A causal LM learns from every token of the text; span corruption learns from only about 15% of positions (the target), although it reads all of them.</li>
+<li><b>Simplicity of one stack.</b> One stack, one cache, no split of the context into “input” and “output”. Multi-turn chat has no natural split: yesterday’s output is today’s input. Serving systems, kernels and parallelism tools were built for this shape.</li>
+<li><b>Parameter efficiency at inference.</b> For generation-heavy chat, the decoder does most of the work, and in an encoder–decoder only half of the parameters sit in the decoder.</li></ul>
+
+<h2>When encoder–decoders still win</h2>
+<p>The design is strongest when the input is long, fully known in advance, and the output is shorter and tightly tied to the input:</p>
+<ul><li><b>Speech recognition.</b> Whisper (Radford et al., 2022) is an encoder–decoder trained on 680,000 hours of audio. [Certain] The encoder reads a 30-second log-Mel spectrogram (1,500 positions), and the decoder writes the transcript with cross-attention. The input is not text, so a separate encoder for it is natural; the encoder runs once per 30 seconds while the decoder writes many tokens.</li>
+<li><b>Translation.</b> NLLB-200, Meta’s model for 200 languages, is an encoder–decoder (12 + 12 layers in the 600 M distilled version). [Certain] A bidirectional encoder over the source sentence is a good fit for translation, where word order changes between languages.</li>
+<li><b>Summarization.</b> BART and its descendants were for years the standard fine-tuned summarizers. [Likely] For a fixed, high-volume summarization job, a fine-tuned encoder–decoder of a few hundred million parameters is cheap to serve. [Likely]</li>
+<li><b>OCR and documents.</b> Donut uses an image encoder and a BART-style text decoder to read documents without a separate OCR step; TrOCR uses an image transformer encoder and a text decoder. [Certain] See <a href="../video/index.html#row-document-ai" title="Document AI (planned)">session 218</a>.</li>
+<li><b>Text encoders for generation.</b> Imagen uses a frozen T5-XXL encoder to turn the prompt into vectors for its image model, and Stable Diffusion 3 uses T5-XXL as one of its text encoders. [Certain] Many text-to-video models do the same. [Likely] Only the encoder half is used; the image or video model cross-attends to it.</li>
+<li><b>VLMs with cross-attention.</b> Some VLMs keep the language model frozen and add cross-attention layers that read image features, exactly like formula (24.2) with \(H_{\text{enc}}\) replaced by vision features (<a href="../vision/index.html#row-fusion-early-late-unified-sequence-and-cross" title="Fusion: early, late, unified sequence and cross-attention (planned)">session 179</a>).</li></ul>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>What the encoder–decoder does</th><th>Link</th></tr></thead><tbody>
+<tr><td>Speech-to-text, subtitles</td><td>Audio encoder (Whisper) once per 30 s window; text decoder cross-attends to the 1,500 audio positions</td><td><a href="../vision/index.html#row-audio-and-omni-models" title="Audio and omni models (planned)">session 184</a></td></tr>
+<tr><td>Machine translation</td><td>Bidirectional encoder over the source sentence; decoder with cross-attention writes the target language</td><td><a href="../applications/index.html#row-translation-code-generation-and-dialogue" title="Translation, code generation and dialogue (planned)">session 148</a></td></tr>
+<tr><td>Summarization</td><td>BART / T5 fine-tuned with formula (24.1); the decoder copies and compresses from the encoded document</td><td><a href="../applications/index.html#row-summarization" title="Summarization (planned)">session 147</a></td></tr>
+<tr><td>Video captioning and dense video captioning</td><td>A video encoder turns frames into features; a text decoder writes captions (and time stamps for key moments) with cross-attention to them</td><td><a href="../video/index.html#row-video-llms" title="Video-LLMs (planned)">session 205</a></td></tr>
+<tr><td>Video-RAG and long video question answering</td><td>A small encoder–decoder (for example Flan-T5) summarizes or rewrites transcripts and frame captions into short notes that a retriever indexes</td><td><a href="../video/index.html#row-video-question-answering-and-video-rag" title="Video question answering and Video-RAG (planned)">session 210</a></td></tr>
+<tr><td>Text-to-image and text-to-video generation</td><td>The T5 encoder turns the prompt into a sequence of vectors; the generator cross-attends to them</td><td><a href="../video/index.html#row-text-to-video-retrieval" title="Text-to-video retrieval (planned)">session 208</a></td></tr>
+<tr><td>Document AI and OCR</td><td>Image encoder over the page; text decoder writes the text or a structured output (JSON fields)</td><td><a href="../video/index.html#row-document-ai" title="Document AI (planned)">session 218</a></td></tr>
+<tr><td>Query rewriting, data-to-text, grammar correction</td><td>Short, constrained outputs from a known input: the classic text-to-text shape, served cheaply by a small T5</td><td><a href="../posttraining/index.html#row-sft-in-detail" title="SFT in detail (planned)">session 54</a></td></tr></tbody></table></div>
+
+<h2>Pseudo-code</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: T5 span corruption for one example</div><ol>
+<li><b>input:</b> tokens \(x_1, \dots, x_n\), rate \(r\), mean span \(\mu\), sentinels \(s_0, s_1, \dots\)</li>
+<li>\(N \leftarrow \operatorname{round}(r n)\), \(\ S \leftarrow \max(1, \operatorname{round}(N/\mu))\) <span class="c">// formula (24.5)</span></li>
+<li>split \(N\) into \(S\) random positive parts \(z_1..z_S\); split \(n - N\) into \(S\) parts \(k_1..k_S\)</li>
+<li>mask \(\leftarrow\) \(k_1\) keeps, \(z_1\) drops, \(k_2\) keeps, \(z_2\) drops, … <span class="c">// interleave</span></li>
+<li>\(\tilde{\mathbf{x}} \leftarrow [\,]\), \(\mathbf{y} \leftarrow [\,]\), \(j \leftarrow 0\)</li>
+<li><b>for</b> \(i = 1\) <b>to</b> \(n\) <b>do</b></li>
+<li class="i1"><b>if</b> mask\(_i\) and not mask\(_{i-1}\) <b>then</b> append \(s_j\) to \(\tilde{\mathbf{x}}\) and to \(\mathbf{y}\); \(j \leftarrow j + 1\) <span class="c">// a new span</span></li>
+<li class="i1"><b>if</b> mask\(_i\) <b>then</b> append \(x_i\) to \(\mathbf{y}\) <b>else</b> append \(x_i\) to \(\tilde{\mathbf{x}}\)</li>
+<li>append \(s_j\) (or <code>&lt;/s&gt;</code>) to \(\mathbf{y}\) <span class="c">// end of the target</span></li>
+<li><b>return</b> \((\tilde{\mathbf{x}}, \mathbf{y})\) <span class="c">// train with formula (24.6)</span></li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: greedy generation with an encoder–decoder</div><ol>
+<li><b>input:</b> input tokens \(\mathbf{x}\), start token \(s\), max length \(T\)</li>
+<li>\(H_{\text{enc}} \leftarrow \operatorname{Encoder}(\mathbf{x})\) <span class="c">// once</span></li>
+<li><b>for</b> each decoder block \(l\) <b>do</b> \(K^{\times}_l \leftarrow H_{\text{enc}} W_K^{(l)}\), \(V^{\times}_l \leftarrow H_{\text{enc}} W_V^{(l)}\) <span class="c">// cross cache, formula (24.8)</span></li>
+<li>\(y_0 \leftarrow s\); self-attention caches \(\leftarrow\) empty</li>
+<li><b>for</b> \(t = 1\) <b>to</b> \(T\) <b>do</b></li>
+<li class="i1">\(\mathbf{h} \leftarrow \operatorname{Embed}(y_{t-1})\)</li>
+<li class="i1"><b>for</b> \(l = 1\) <b>to</b> \(L_{\text{dec}}\) <b>do</b></li>
+<li class="i2">\(\mathbf{h} \leftarrow \mathbf{h} + \operatorname{SelfAttn}_l(\mathbf{h};\ \text{cache}_l)\) <span class="c">// append this step’s k, v to cache\(_l\)</span></li>
+<li class="i2">\(\mathbf{h} \leftarrow \mathbf{h} + \operatorname{CrossAttn}_l(\mathbf{h};\ K^{\times}_l, V^{\times}_l)\) <span class="c">// formula (24.2), no causal mask</span></li>
+<li class="i2">\(\mathbf{h} \leftarrow \mathbf{h} + \operatorname{FFN}_l(\mathbf{h})\) <span class="c">// formula (24.3), norms omitted</span></li>
+<li class="i1">\(y_t \leftarrow \argmax \softmax(E\,\mathbf{h})\)</li>
+<li class="i1"><b>if</b> \(y_t =\) <code>&lt;/s&gt;</code> <b>then break</b></li>
+<li><b>return</b> \(y_1, \dots, y_t\)</li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 3: BART text infilling</div><ol>
+<li><b>input:</b> tokens \(x_1..x_n\), mask ratio \(\rho = 0.3\), \(\lambda = 3\)</li>
+<li>budget \(\leftarrow \operatorname{round}(\rho n)\); lengths \(\leftarrow [\,]\)</li>
+<li><b>while</b> sum(lengths) \(\lt\) budget <b>do</b> append \(\ell \sim \operatorname{Poisson}(\lambda)\) <span class="c">// formula (24.10)</span></li>
+<li>shorten the last length so that sum(lengths) = budget</li>
+<li><b>for</b> each \(\ell\) in lengths <b>do</b> pick a random start \(p\); mark \(x_p..x_{p+\ell-1}\) as span \(\ell\) (\(\ell = 0\): insert a mask before \(x_p\))</li>
+<li>\(g(\mathbf{x}) \leftarrow\) the text with every marked run replaced by one <code>&lt;mask&gt;</code></li>
+<li><b>return</b> \((g(\mathbf{x}),\ \mathbf{x})\) <span class="c">// target = full original, formula (24.9)</span></li></ol></div>
+<p>The same ideas in PyTorch. The script builds T5 inputs and targets, checks that cross-attention reuses the same keys and values at every step, and trains a tiny encoder–decoder with span corruption on toy sequences. It runs on a CPU in a few seconds:</p>
+<pre class="code"><span class="kw2">import</span> torch
+<span class="kw2">import</span> torch.nn <span class="kw2">as</span> nn
+<span class="kw2">import</span> torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="cm"># 1) T5 span corruption, formula (24.5)</span>
+<span class="kw2">def</span> span_mask(n, rate=0.15, mean_span=3.0, g=None):
+    n_noise = max(1, round(n * rate))
+    n_spans = max(1, round(n_noise / mean_span))
+    <span class="kw2">def</span> split(total, parts):                       <span class="cm"># random split of `total` into `parts` pieces >= 1</span>
+        cuts = (torch.randperm(total - 1, generator=g)[:parts - 1] + 1).sort().values
+        b = torch.cat([torch.tensor([0]), cuts, torch.tensor([total])])
+        <span class="kw2">return</span> (b[1:] - b[:-1]).tolist()
+    mask = []
+    <span class="kw2">for</span> keep, noise <span class="kw2">in</span> zip(split(n - n_noise, n_spans), split(n_noise, n_spans)):
+        mask += [False] * keep + [True] * noise    <span class="cm"># keep-run, then noise-run, like T5</span>
+    <span class="kw2">return</span> mask
+
+<span class="kw2">def</span> span_corrupt(toks, mask, sentinel):            <span class="cm"># sentinel(k) gives the k-th sentinel</span>
+    inp, tgt, k = [], [], 0
+    <span class="kw2">for</span> i, (t, m) <span class="kw2">in</span> enumerate(zip(toks, mask)):
+        <span class="kw2">if</span> m <span class="kw2">and</span> (i == 0 <span class="kw2">or not</span> mask[i - 1]):      <span class="cm"># a new span starts</span>
+            inp.append(sentinel(k)); tgt.append(sentinel(k)); k += 1
+        (tgt <span class="kw2">if</span> m <span class="kw2">else</span> inp).append(t)
+    tgt.append(sentinel(k))                        <span class="cm"># final sentinel, as in the paper</span>
+    <span class="kw2">return</span> inp, tgt
+
+words = <span class="st">"Thank you for inviting me to your party last week ."</span>.split()
+mask = [w <span class="kw2">in</span> (<span class="st">"for"</span>, <span class="st">"inviting"</span>, <span class="st">"last"</span>) <span class="kw2">for</span> w <span class="kw2">in</span> words]
+inp, tgt = span_corrupt(words, mask, <span class="kw2">lambda</span> k: <span class="st">"&lt;extra_id_%d&gt;"</span> % k)
+print(<span class="st">" "</span>.join(inp))   <span class="cm"># Thank you &lt;extra_id_0&gt; me to your party &lt;extra_id_1&gt; week .</span>
+print(<span class="st">" "</span>.join(tgt))   <span class="cm"># &lt;extra_id_0&gt; for inviting &lt;extra_id_1&gt; last &lt;extra_id_2&gt;</span>
+m = span_mask(568, g=torch.Generator().manual_seed(0))
+print(sum(m), len(span_corrupt(list(range(568)), m, <span class="kw2">lambda</span> k: -1 - k)[0]) + 1)  <span class="cm"># 85 512</span>
+
+<span class="cm"># 2) cross-attention, formula (24.2): queries from the decoder, keys and values from the encoder</span>
+<span class="kw2">class</span> CrossAttention(nn.Module):
+    <span class="kw2">def</span> __init__(self, d, h):
+        super().__init__()
+        self.h, self.dk = h, d // h
+        self.wq, self.wk, self.wv, self.wo = (nn.Linear(d, d, bias=False) <span class="kw2">for</span> _ <span class="kw2">in</span> range(4))
+    <span class="kw2">def</span> split(self, x):                            <span class="cm"># (B, T, d) -> (B, h, T, dk)</span>
+        <span class="kw2">return</span> x.view(x.shape[0], x.shape[1], self.h, self.dk).transpose(1, 2)
+    <span class="kw2">def</span> forward(self, y, kv):                      <span class="cm"># y: (B, Ty, d); kv = (K, V), computed once</span>
+        q = self.split(self.wq(y))
+        a = torch.softmax(q @ kv[0].transpose(-1, -2) / self.dk ** 0.5, dim=-1)  <span class="cm"># (B, h, Ty, Tx)</span>
+        out = (a @ kv[1]).transpose(1, 2).reshape(y.shape)
+        <span class="kw2">return</span> self.wo(out), a
+    <span class="kw2">def</span> encode_kv(self, h_enc):                    <span class="cm"># the cross-attention "KV cache"</span>
+        <span class="kw2">return</span> self.split(self.wk(h_enc)), self.split(self.wv(h_enc))
+
+ca = CrossAttention(d=32, h=4)
+h_enc, y = torch.randn(2, 7, 32), torch.randn(2, 5, 32)   <span class="cm"># Tx = 7 source, Ty = 5 target positions</span>
+kv = ca.encode_kv(h_enc)
+out, a = ca(y, kv)
+print(out.shape, a.shape, torch.allclose(a.sum(-1), torch.ones(2, 4, 5)))  <span class="cm"># (2,5,32) (2,4,5,7) True</span>
+step3, _ = ca(y[:, 3:4], kv)                       <span class="cm"># one decoding step reuses the same K, V</span>
+print(torch.allclose(step3, out[:, 3:4], atol=1e-6))  <span class="cm"># True: no causal mask in cross-attention</span>
+
+<span class="cm"># 3) a tiny encoder-decoder trained with span corruption on toy sequences</span>
+V, n, S0 = 16, 24, 16                             <span class="cm"># 16 ordinary tokens; sentinels are ids 16, 17, ...</span>
+BOS, vocab = 20, 21
+<span class="kw2">def</span> batch(B, g):
+    a = torch.randint(0, V, (B, 1), generator=g); b = torch.randint(1, V, (B, 1), generator=g)
+    x = (a + b * torch.arange(n)) % V             <span class="cm"># x_i = a + i*b (mod 16): spans are predictable</span>
+    X, Y = [], []
+    <span class="kw2">for</span> row <span class="kw2">in</span> x.tolist():
+        mk = span_mask(n, rate=0.25, mean_span=3.0, g=g)       <span class="cm"># 6 noise tokens in 2 spans</span>
+        i, t = span_corrupt(row, mk, <span class="kw2">lambda</span> k: S0 + k)
+        X.append(i); Y.append(t)
+    <span class="kw2">return</span> torch.tensor(X), torch.tensor(Y)        <span class="cm"># (B, 20) and (B, 9)</span>
+
+<span class="kw2">class</span> TinyT5(nn.Module):
+    <span class="kw2">def</span> __init__(self, d=64):
+        super().__init__()
+        self.emb, self.pos = nn.Embedding(vocab, d), nn.Embedding(32, d)
+        self.tf = nn.Transformer(d, 4, 2, 2, 128, dropout=0.0, batch_first=True)
+        self.head = nn.Linear(d, vocab)
+    <span class="kw2">def</span> forward(self, src, tgt_in):
+        e = <span class="kw2">lambda</span> z: self.emb(z) + self.pos(torch.arange(z.shape[1]))
+        causal = nn.Transformer.generate_square_subsequent_mask(tgt_in.shape[1])
+        <span class="kw2">return</span> self.head(self.tf(e(src), e(tgt_in), tgt_mask=causal))
+
+model, g = TinyT5(), torch.Generator().manual_seed(1)
+opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+<span class="kw2">for</span> step <span class="kw2">in</span> range(301):
+    src, tgt = batch(64, g)
+    tgt_in = torch.cat([torch.full((64, 1), BOS), tgt[:, :-1]], 1)  <span class="cm"># teacher forcing: shift right (24.7)</span>
+    loss = F.cross_entropy(model(src, tgt_in).reshape(-1, vocab), tgt.reshape(-1))
+    opt.zero_grad(); loss.backward(); opt.step()
+    <span class="kw2">if</span> step % 100 == 0: print(step, round(loss.item(), 3))
+<span class="cm"># 0 3.161 / 100 1.076 / 200 0.548 / 300 0.386 on our machine (PyTorch 2.8, CPU);</span>
+<span class="cm"># the start is near ln(21) = 3.04, the guess of a model that knows nothing</span></pre>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Forgetting the shift.</b> Feeding the target itself (not shifted right) as the decoder input lets position \(t\) see \(y_t\): the training loss drops to almost zero and generation is garbage. Use the model’s own start token (T5: pad ID 0; BART: <code>&lt;/s&gt;</code> ID 2), formula (24.7).</li>
+<li><b>Putting a causal mask on cross-attention</b>, or forgetting the <b>padding</b> mask over the encoder input. The first hides real input from early target positions; the second lets the decoder read padding vectors.</li>
+<li><b>Recomputing the cross-attention K and V at every step.</b> They depend only on the input. Compute them once per decoder block (Algorithm 2); otherwise each step costs \(O(n d^2)\) extra work per block.</li>
+<li><b>Reusing sentinels wrongly.</b> Each span in an example needs its own sentinel, in the same order in the input and the target. Using one shared mask token with a short target makes the target ambiguous: the model cannot know which hole a piece belongs to.</li>
+<li><b>Fine-tuning T5 without its task prefix, or with a different one.</b> The original T5 checkpoints were trained with a mix of tasks and prefixes like <code>summarize:</code>. Small changes to the prefix can change the output a lot. [Likely]</li>
+<li><b>Counting an L+L encoder–decoder like a 2L-layer GPT for compute.</b> In parameters it is close to 2L layers (a bit more, because of cross-attention); in FLOPs per example it is close to an L-layer model, formula (24.11).</li>
+<li><b>Expecting T5 sentinels in a generation to be text.</b> A pretrained (not fine-tuned) T5 answers in the span-corruption format, <code>&lt;extra_id_0&gt; … &lt;extra_id_1&gt;</code>. Strip or use them; do not show them to users.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What does cross-attention take from the encoder and what from the decoder? What are the shapes?<span class="lvl">basic</span></summary><div class="ans">Queries come from the decoder states \(S \in \R^{m \times d}\) (after the decoder’s self-attention sublayer); keys and values come from the final encoder output \(H_{\text{enc}} \in \R^{n \times d}\), formula (24.2). The score matrix per head is \(m \times n\), not square, with no causal mask (only a padding mask on the input). Each target position gets a softmax distribution over the input positions and returns a weighted sum of input values. Every decoder block has its own \(W_Q, W_K, W_V, W_O\), but all blocks read the same \(H_{\text{enc}}\).</div></details>
+<details class="qa"><summary>Explain T5’s span corruption. Why use sentinel tokens instead of BERT’s [MASK]?<span class="lvl">core</span></summary><div class="ans">Drop about 15% of tokens in spans of mean length 3; replace each span in the input with a unique sentinel (<code>&lt;extra_id_0&gt;</code>, …); the target is only the dropped spans, each after its sentinel, plus an end marker. The sentinels tell the encoder where text is missing and tell the decoder which hole each piece fills, so the target can skip all the unchanged text. With one shared [MASK], a short target would be ambiguous, so you would have to rebuild the full text, which makes the decoder sequence about 5× longer (568 vs 114 tokens in T5’s setting). T5 found the variants perform about the same, so the cheaper one wins.</div></details>
+<details class="qa"><summary>T5 uses 512-token inputs. How long is the target, and how much raw text is used per example?<span class="lvl">core</span></summary><div class="ans">With \(r = 0.15\), \(\mu = 3\), 568 raw tokens give \(N = 85\) noise tokens and \(S = 28\) spans. Input \(= 568 - 85 + 28 + 1 = 512\) (with the end token); target \(= 85 + 28 + 1 = 114\). So each example reads 568 tokens of text, the encoder processes 512 and the decoder only 114 (formula 24.5).</div></details>
+<details class="qa"><summary>How do training and inference differ in an encoder–decoder?<span class="lvl">basic</span></summary><div class="ans">Training uses teacher forcing: the decoder reads the true target shifted right with a start token (24.7), and all positions are predicted in one parallel pass under a causal mask. Inference is autoregressive: run the encoder once, compute the cross-attention K and V once per decoder block, then generate one token per step, feeding back the model’s own previous token and growing a self-attention KV cache. The mismatch (training on true prefixes, testing on own predictions) is called exposure bias.</div></details>
+<details class="qa"><summary>How big is the cross-attention cache of Whisper large-v3 for one 30 s clip?<span class="lvl">advanced</span></summary><div class="ans">Formula (24.8): \(2 \cdot L_{\text{dec}} \cdot n \cdot d \cdot b = 2 \times 32 \times 1500 \times 1280 \times 2\) bytes \(= 245.8\) MB in 16-bit. It is fixed for the whole transcription of that window, and is larger than the self-attention cache, which is at most 448 positions. In batched serving it can be the main memory cost. It is identical for all beams of one input, so an efficient server keeps one copy per input instead of one per beam, and frees it as soon as the window is done. [Likely]</div></details>
+<details class="qa"><summary>What noising functions does BART use, and which worked best?<span class="lvl">core</span></summary><div class="ans">Token masking, token deletion, text infilling (Poisson(3) span lengths, each span replaced by one <code>&lt;mask&gt;</code>, zero-length spans insert a mask), sentence permutation and document rotation. The target is always the full original document (24.9). Text infilling was the most consistent; rotation and permutation alone were poor; deletion beat masking on generation. The final model used infilling with 30% of tokens masked plus permutation of all sentences.</div></details>
+<details class="qa"><summary>Compare T5’s and BART’s pretraining targets. Which is cheaper, and what does each teach the decoder?<span class="lvl">core</span></summary><div class="ans">T5 predicts only the dropped spans with sentinels: short targets (about 20% of the text), cheap, and the decoder learns to fill gaps. BART predicts the full document: targets as long as the text, more expensive, but the decoder also practices writing long fluent text and copying from the input, which suits summarization and other generation tasks. BART’s infilling also hides span length (one mask per span), so the model must decide how many tokens to write; T5’s sentinels hide it too, but the target is not a full sentence.</div></details>
+<details class="qa"><summary>An encoder–decoder with 12+12 layers vs a 12-layer decoder-only model of the same width: parameters and compute?<span class="lvl">advanced</span></summary><div class="ans">Parameters: about \(28Ld^2\) vs \(12Ld^2\), so 2.33× (2× from two stacks plus cross-attention). Compute per (input, target) pair: the decoder-only model runs all \(n + m\) tokens through 12 layers (\(24Ld^2(n + m)\) FLOPs); the encoder–decoder runs the input through 12 encoder layers and the target through 12 decoder layers, \(28Ld^2(n + m)\) FLOPs, only 1.17× (formula 24.11). T5 measured nearly identical step times. So at equal compute, an encoder–decoder has about twice the parameters, and in T5’s tests it scored best.</div></details>
+<details class="qa"><summary>What is a prefix LM, and how does it relate to an encoder–decoder?<span class="lvl">core</span></summary><div class="ans">A single decoder stack whose mask is bidirectional over the input prefix and causal over the target. Its visibility pattern is the same as an encoder–decoder’s (input sees input; target sees all input and earlier target), but one set of weights does both jobs, so it has half the parameters at the same compute. In T5’s comparison it was between the encoder–decoder and the causal LM (81.82 vs 83.28 vs 74.70 GLUE with the denoising objective).</div></details>
+<details class="qa"><summary>If encoder–decoders did better in T5’s study, why are most modern LLMs decoder-only?<span class="lvl">advanced</span></summary><div class="ans">T5’s comparison was about fine-tuning on fixed tasks. For general zero-shot use, Wang et al. (2022) found causal decoder-only models with next-token training best right after pretraining. A causal LM also gets a learning signal from every token, has one stack and one KV cache, handles multi-turn chat without an artificial input/output split, and the tooling grew up around it. Encoder–decoders still win where the input is fixed and long and the output is short and tied to it: speech, translation, summarization, OCR, and as text encoders for generators.</div></details>
+<details class="qa"><summary>Why does T5 not need position embeddings, and how does its relative bias work?<span class="lvl">advanced</span></summary><div class="ans">Each head adds a learned scalar \(b_{h,\operatorname{bucket}(j-i)}\) to its attention logit (24.4). 32 buckets cover offsets: exact buckets for small offsets, log-spaced buckets up to 128, one bucket beyond. The table is shared across layers (one per head), so it adds almost no parameters, and it works for any length because it depends on offsets, not absolute positions. One layer cannot tell offsets beyond 128 apart, but stacked layers can combine local information. Note also that T5 does not scale logits by \(1/\sqrt{d_k}\); this is folded into the weight initialization.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Apply span corruption by hand to “the cat sat on the warm mat today” with dropped tokens “sat on” and “today”. Write the input and the target with <code>&lt;X&gt;, &lt;Y&gt;, &lt;Z&gt;</code>, and give both lengths.</li>
+<li>With \(n = 1000\), \(r = 0.15\) and \(\mu = 3\), compute \(N\), \(S\), the input length and the target length by formula (24.5). How long would the target be with \(\mu = 1\)?</li>
+<li>A decoder query is \(\mathbf{q} = (2, 0)\) and the keys are \((1, 0), (0, 1), (1, 1)\) with \(d_k = 2\) (no other scaling). Compute the cross-attention weights.</li>
+<li>Whisper small has 12 decoder blocks of width 768. Compute its cross-attention cache for one 30-second window in bfloat16.</li>
+<li>Using formula (24.11), how many times more parameters and compute does a 24+24-layer encoder–decoder have than a 24-layer decoder-only model of the same width?</li>
+<li>In BART text infilling with \(\lambda = 3\), what is the chance that a sampled span is empty, and what is the chance that it is longer than 4 tokens?</li>
+<li>In Figure 5, count the visible pairs for \(n = 5\), \(m = 2\) for the encoder–decoder and for the causal LM. Give a general formula for both.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Input: <code>the cat &lt;X&gt; the warm mat &lt;Y&gt;</code> (7 tokens); target: <code>&lt;X&gt; sat on &lt;Y&gt; today &lt;Z&gt;</code> (6 tokens). Check: \(n = 8\), \(N = 3\), \(S = 2\): \(8 - 3 + 2 = 7\) and \(3 + 2 + 1 = 6\). 2. \(N = 150\), \(S = 50\), input \(1000 - 150 + 50 = 900\), target \(150 + 50 + 1 = 201\). With \(\mu = 1\): \(S = 150\), target \(= 301\) and input \(= 1000\): every dropped token costs a sentinel too. 3. Scores \(2/\sqrt2 = 1.414\), \(0\), \(1.414\); softmax: \(0.446, 0.108, 0.446\). 4. \(2 \times 12 \times 1500 \times 768 \times 2\) bytes \(= 55{,}296{,}000\) bytes \(\approx 55.3\) MB. 5. Parameters \(28/12 = 2.33\times\); compute \(14/12 = 1.17\times\), for any \(L\). 6. \(P(0) = e^{-3} = 0.050\); \(P(\ell \gt 4) = 1 - (0.050 + 0.149 + 0.224 + 0.224 + 0.168) = 0.185\). 7. Encoder–decoder: \(n^2 + mn + m(m+1)/2 = 25 + 10 + 3 = 38\). Causal LM: \((n+m)(n+m+1)/2 = 7 \cdot 8/2 = 28\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>T5 writes every task as text in, text out, with a task prefix, and trains all of them with one loss, formula (24.1).</li>
+<li>A decoder block has three sublayers: causal self-attention, cross-attention, FFN (24.3). Cross-attention takes queries from the decoder and keys and values from the final encoder output (24.2), with no causal mask.</li>
+<li>Span corruption drops about 15% of tokens in spans of mean length 3, puts one unique sentinel per span, and predicts only the dropped spans. Targets are short: 114 tokens for a 512-token input (24.5).</li>
+<li>At inference the encoder runs once and its K and V are cached per decoder block (24.8); for Whisper large-v3 that is about 246 MB per 30-second window.</li>
+<li>BART corrupts text (masking, deletion, infilling with Poisson(3) spans, permutation, rotation) and rebuilds the whole document (24.9); infilling plus sentence permutation worked best.</li>
+<li>An L+L encoder–decoder has about 2.3× the parameters of an L-layer decoder-only model for about 1.17× the compute (24.11). Decoder-only won for general chat; encoder–decoders still win for speech, translation, summarization, OCR and as text encoders for generators.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ p_\theta(\mathbf{y} \mid \mathbf{x}) = \prod_{t} p_\theta(y_t \mid y_{\lt t}, \mathbf{x}), \qquad \operatorname{CrossAttn} = \softmax\!\Big(\frac{(S W_Q)(H_{\text{enc}} W_K)^\top}{\sqrt{d_k}}\Big) H_{\text{enc}} W_V \]</div>
+<div class="eq">\[ N = \operatorname{round}(rn),\ \ S = \operatorname{round}(N/\mu),\ \ |\tilde{\mathbf{x}}| = n - N + S,\ \ |\mathbf{y}| = N + S + 1 \]</div>
+<div class="eq">\[ M_{\text{cross}} = 2 L_{\text{dec}}\, n\, d\, b, \qquad N_{\text{enc-dec}} \approx 28Ld^2, \quad C_{\text{enc-dec}} \approx 28Ld^2(n+m) \]</div>
+<h2 class="plain" id="encoder-decoder-in-depth-t5-span-corruption-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Raffel et al. (2019). <a href="https://arxiv.org/abs/1910.10683" target="_blank" rel="noopener">Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer</a></li><li>Lewis et al. (2019). <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">BART: Denoising Sequence-to-Sequence Pre-training for Natural Language Generation, Translation, and Comprehension</a></li><li>Vaswani et al. (2017). <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a></li><li>Raffel et al. (2019). <a href="https://arxiv.org/abs/1910.10683" target="_blank" rel="noopener">Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer</a></li><li>Lewis et al. (2019). <a href="https://arxiv.org/abs/1910.13461" target="_blank" rel="noopener">BART: Denoising Sequence-to-Sequence Pre-training for Natural Language Generation, Translation, and Comprehension</a></li><li>Vaswani et al. (2017). <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a></li><li>Sutskever et al. (2014). <a href="https://arxiv.org/abs/1409.3215" target="_blank" rel="noopener">Sequence to Sequence Learning with Neural Networks</a></li><li>Bahdanau et al. (2014). <a href="https://arxiv.org/abs/1409.0473" target="_blank" rel="noopener">Neural Machine Translation by Jointly Learning to Align and Translate</a></li><li>Devlin et al. (2018). <a href="https://arxiv.org/abs/1810.04805" target="_blank" rel="noopener">BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding</a></li><li>Radford et al. (2022). <a href="https://arxiv.org/abs/2212.04356" target="_blank" rel="noopener">Robust Speech Recognition via Large-Scale Weak Supervision</a></li><li>Shaw, Uszkoreit, Vaswani (2018). <a href="https://arxiv.org/abs/1803.02155" target="_blank" rel="noopener">Self-Attention with Relative Position Representations</a></li><li>Xue et al. (2020). <a href="https://arxiv.org/abs/2010.11934" target="_blank" rel="noopener">mT5: A massively multilingual pre-trained text-to-text transformer</a></li><li>Chung et al. (2022). <a href="https://arxiv.org/abs/2210.11416" target="_blank" rel="noopener">Scaling Instruction-Finetuned Language Models</a></li><li>Tay et al. (2022). <a href="https://arxiv.org/abs/2205.05131" target="_blank" rel="noopener">UL2: Unifying Language Learning Paradigms</a></li><li>Wang et al. (2022). <a href="https://arxiv.org/abs/2204.05832" target="_blank" rel="noopener">What Language Model Architecture and Pretraining Objective Work Best for Zero-Shot Generalization?</a></li><li>NLLB Team (2022). <a href="https://arxiv.org/abs/2207.04672" target="_blank" rel="noopener">No Language Left Behind: Scaling Human-Centered Machine Translation</a></li><li>Kim et al. (2021). <a href="https://arxiv.org/abs/2111.15664" target="_blank" rel="noopener">OCR-free Document Understanding Transformer</a></li><li>Li et al. (2021). <a href="https://arxiv.org/abs/2109.10282" target="_blank" rel="noopener">TrOCR: Transformer-based Optical Character Recognition with Pre-trained Models</a></li><li>Liu et al. (2020). <a href="https://arxiv.org/abs/2001.08210" target="_blank" rel="noopener">Multilingual Denoising Pre-training for Neural Machine Translation</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../transformers/the-full-transformer-and-its-three-families.html"><small>Previous · session 23</small>The full transformer and its three families</a><a class="next" href="../transformers/counting-parameters-flops-and-memory-of-a.html"><small>Next · session 25</small>Counting: parameters, FLOPs and memory of a transformer</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="encoder-decoder-in-depth-t5-span-corruption"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const f3=v=>(Math.abs(v)<5e-5?0:v).toFixed(3);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function shuffle(a,r){for(let i=a.length-1;i>0;i--){const j=Math.floor(r()*(i+1));const t=a[i];a[i]=a[j];a[j]=t;}return a;}
+const chip=(t,cls)=>`<span class="ed-tok${cls?" "+cls:""}">${B.esc(t)}</span>`;
+const LET=["X","Y","Z","A","B","C","D","E","F","G","H","I","J","K"];
+const sent=k=>"<"+(LET[k]||("S"+k))+">";
+
+/* ---------- Figure 1: static architecture diagram ---------- */
+(function(){
+ const svg=$("#ed-arch-svg");if(!svg)return;
+ const box=(x,y,w,h,label,stroke,sw)=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="9" fill="var(--card)" stroke="${stroke||"var(--rule)"}" stroke-width="${sw||1.5}"/><text x="${x+w/2}" y="${y+h/2+5}" text-anchor="middle" class="svgt" font-size="14" font-weight="600">${label}</text>`;
+ const arr=(x1,y1,x2,y2,c,id)=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${c}" stroke-width="2.2" marker-end="url(#ed-ah-${id})"/>`;
+ let g=`<defs>${[["m","var(--muted)"],["q","var(--q)"],["k","var(--k)"],["v","var(--v)"]].map(([n,c])=>`<marker id="ed-ah-${n}" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="${c}"/></marker>`).join("")}</defs>`;
+ // encoder
+ g+=`<rect x="30" y="120" width="260" height="215" rx="14" fill="none" stroke="var(--rule)" stroke-dasharray="5 4"/><text x="42" y="142" class="svgs" font-size="13" font-weight="700">ENCODER × N</text>`;
+ g+=box(55,260,210,46,"Bidirectional self-attention");g+=box(55,168,210,46,"Feed-forward (FFN)");
+ g+=arr(160,260,160,218,"var(--muted)","m");g+=arr(160,168,160,104,"var(--muted)","m");
+ g+=`<text x="160" y="96" text-anchor="middle" class="svgt" font-size="14" font-weight="700">H<tspan font-size="11" dy="3">enc</tspan><tspan dy="-3"> (n × d)</tspan></text>`;
+ g+=arr(160,372,160,310,"var(--muted)","m");
+ g+=`<text x="160" y="392" text-anchor="middle" class="svgm" font-size="12">Thank you &lt;X&gt; me to your party &lt;Y&gt; week .</text><text x="160" y="410" text-anchor="middle" class="svgs" font-size="12">corrupted input x̃, read all at once</text>`;
+ // decoder
+ g+=`<rect x="370" y="105" width="260" height="285" rx="14" fill="none" stroke="var(--rule)" stroke-dasharray="5 4"/><text x="382" y="127" class="svgs" font-size="13" font-weight="700">DECODER × N</text>`;
+ g+=box(395,318,210,46,"Causal self-attention");g+=box(395,232,210,50,"Cross-attention","var(--k)",2.5);g+=box(395,140,210,46,"Feed-forward (FFN)");
+ g+=arr(450,318,450,286,"var(--q)","q");g+=`<text x="442" y="306" text-anchor="end" class="svgt" font-size="12" fill="var(--q)">Q</text>`;
+ g+=arr(500,232,500,190,"var(--muted)","m");
+ g+=arr(500,140,500,78,"var(--muted)","m");
+ g+=box(410,40,180,36,"Linear (tied E) + softmax");
+ g+=`<text x="500" y="24" text-anchor="middle" class="svgm" font-size="12">&lt;X&gt; for inviting &lt;Y&gt; last &lt;Z&gt;</text>`;
+ g+=arr(500,410,500,368,"var(--muted)","m");
+ g+=`<text x="500" y="424" text-anchor="middle" class="svgm" font-size="12">&lt;pad&gt; &lt;X&gt; for inviting &lt;Y&gt; last</text>`;
+ // bridge: H_enc -> K, V of cross-attention
+ g+=`<path d="M210 91 H322 V248 H389" fill="none" stroke="var(--k)" stroke-width="2.4" marker-end="url(#ed-ah-k)"/>`;
+ g+=`<path d="M210 99 H312 V266 H389" fill="none" stroke="var(--v)" stroke-width="2.4" marker-end="url(#ed-ah-v)"/>`;
+ g+=`<text x="345" y="242" text-anchor="middle" class="svgt" font-size="12" font-weight="700" fill="var(--k)">K</text><text x="345" y="284" text-anchor="middle" class="svgt" font-size="12" font-weight="700" fill="var(--v)">V</text>`;
+ g+=`<text x="316" y="200" text-anchor="middle" class="svgs" font-size="11" transform="rotate(-90 300 200)">same H_enc, every block</text>`;
+ svg.innerHTML=g;
+})();
+
+/* ---------- Figure 2: span corruption builder ---------- */
+(function(){
+ const src=$("#ed-span-src");if(!src)return;
+ const T="Thank you for inviting me to your party last week . The food was great and we loved the music .".split(" ");const n=T.length;
+ const rs=$("#ed-span-r"),rv=$("#ed-span-rv"),ms=$("#ed-span-mu"),mv=$("#ed-span-muv"),inEl=$("#ed-span-in"),outEl=$("#ed-span-out"),info=$("#ed-span-info"),seg=$("#ed-span-mode");
+ let mode="paper",seed=1,mask=[];
+ const paper=()=>T.map((w,i)=>i===2||i===3||i===8);
+ function split(total,parts,r){if(parts<=1)return[total];const c=[];for(let i=1;i<total;i++)c.push(i);shuffle(c,r);const cuts=c.slice(0,parts-1).sort((a,b)=>a-b);const b=[0].concat(cuts,[total]);const o=[];for(let i=1;i<b.length;i++)o.push(b[i]-b[i-1]);return o;}
+ function randMask(){const r=rng(seed*7919+11);const rate=+rs.value,mu=+ms.value;let N=Math.max(1,Math.round(rate*n));let S=Math.max(1,Math.round(N/mu));S=Math.min(S,N,n-N);
+  const z=split(N,S,r),k=split(n-N,S,r);const m=[];for(let i=0;i<S;i++){for(let a=0;a<k[i];a++)m.push(false);for(let a=0;a<z[i];a++)m.push(true);}return m;}
+ function build(){const inp=[],tgt=[];let s=0;for(let i=0;i<n;i++){if(mask[i]&&(i===0||!mask[i-1])){inp.push([sent(s),"sent"]);tgt.push([sent(s),"sent"]);s++;}if(mask[i])tgt.push([T[i],""]);else inp.push([T[i],""]);}
+  if(s>0)tgt.push([sent(s),"sent"]);return{inp,tgt,S:s};}
+ function draw(){rv.value=(+rs.value).toFixed(2);mv.value=ms.value;
+  seg.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===mode?"true":"false"));
+  src.innerHTML=T.map((w,i)=>`<button type="button" class="ed-tok" data-i="${i}" aria-pressed="${mask[i]?"true":"false"}">${B.esc(w)}</button>`).join("");
+  const {inp,tgt,S}=build();const N=mask.filter(Boolean).length;
+  inEl.innerHTML=inp.map(c=>chip(c[0],c[1])).join("");outEl.innerHTML=tgt.length?tgt.map(c=>chip(c[0],c[1])).join(""):`<span style="color:var(--muted);font:500 14px var(--sans)">(empty: nothing was dropped)</span>`;
+  const li=inp.length,lt=tgt.length;
+  info.dataset.n=n;info.dataset.noise=N;info.dataset.spans=S;info.dataset.inlen=li;info.dataset.tgtlen=lt;
+  let h=`n = <b>${n}</b> tokens, dropped N = <b>${N}</b> in S = <b>${S}</b> span${S===1?"":"s"}. Encoder input: n − N + S = ${n} − ${N} + ${S} = <b>${li}</b> tokens. Decoder target: N + S + 1 = ${N} + ${S} + 1 = <b>${lt}</b> tokens${N===0?" (here 0, nothing to predict)":""}.`;
+  if(mode==="rand")h+=`<br>Formula (24.5): N = round(${(+rs.value).toFixed(2)} × ${n}) = ${Math.max(1,Math.round(+rs.value*n))}, S = round(N / ${ms.value}) = ${S}${S<Math.round(Math.max(1,Math.round(+rs.value*n))/+ms.value)?" (capped so every span and every kept run has at least one token)":""}.`;
+  h+=`<br>A BERT-style target rebuilds all ${n} tokens; this target is <b>${(100*lt/n).toFixed(0)}%</b> of that. In the T5 vocabulary the sentinels are &lt;extra_id_0&gt;, &lt;extra_id_1&gt;, … (add 1 to each length for the end token &lt;/s&gt;).`;
+  info.innerHTML=h;}
+ src.addEventListener("click",e=>{const b=e.target.closest(".ed-tok");if(!b)return;const i=+b.dataset.i;mask[i]=!mask[i];mode="custom";draw();});
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;mode=b.dataset.m;mask=mode==="paper"?paper():randMask();draw();});
+ const re=()=>{mode="rand";mask=randMask();draw();};
+ rs.addEventListener("input",re);ms.addEventListener("input",re);
+ $("#ed-span-seed").addEventListener("click",()=>{seed++;re();});
+ mask=paper();draw();
+})();
+
+/* ---------- Figure 3: cross-attention stepper ---------- */
+(function(){
+ const svg=$("#ed-xattn-svg");if(!svg)return;const info=$("#ed-xattn-info");
+ const SRC="translate English to German : That is good .".split(" ");
+ const DIN=["<pad>","Das","ist","gut","."],DOUT=["Das","ist","gut",".","</s>"];
+ const SC=[{5:3.0,3:1.5},{6:3.0,5:0.5},{7:3.2,6:0.4},{8:3.0,7:0.6},{8:1.5,7:1.0,3:0.5}];
+ const W=SC.map(s=>B.softmax(SRC.map((_,j)=>s[j]||0)));
+ const X=j=>8+j*77,BW=72,TY=140,DY=240;
+ B.stepper({n:DIN.length,prev:$("#ed-xattn-prev"),next:$("#ed-xattn-next"),play:$("#ed-xattn-play"),label:$("#ed-xattn-lab"),ms:2000,onStep:i=>{
+  const w=W[i];const top=w.indexOf(Math.max(...w));const sum=w.reduce((a,b)=>a+b,0);
+  let g=`<text x="10" y="18" class="svgs" font-size="12" font-weight="700">ENCODER OUTPUTS (computed once)</text>`;
+  const qx=X(i)+BW/2;
+  SRC.forEach((t,j)=>{const cx=X(j)+BW/2;g+=`<line x1="${qx}" y1="${DY-2}" x2="${cx}" y2="${TY+30}" stroke="var(--k)" stroke-width="${(0.6+11*w[j]).toFixed(2)}" opacity="${(0.25+0.75*w[j]).toFixed(2)}" stroke-linecap="round"/>`;});
+  SRC.forEach((t,j)=>{const x=X(j),h=Math.max(2,95*w[j]);
+   g+=`<rect x="${x+14}" y="${TY-6-h}" width="${BW-28}" height="${h.toFixed(1)}" rx="3" fill="var(--k)" opacity="${j===top?1:.55}"/>`;
+   g+=`<text x="${x+BW/2}" y="${TY-10-h}" text-anchor="middle" class="svgm" font-size="11">${w[j].toFixed(2)}</text>`;
+   g+=`<rect x="${x}" y="${TY}" width="${BW}" height="30" rx="7" fill="var(--card)" stroke="${j===top?"var(--k)":"var(--rule)"}" stroke-width="${j===top?2.5:1.2}"/><text x="${x+BW/2}" y="${TY+20}" text-anchor="middle" class="svgm" font-size="12">${B.esc(t)}</text>`;});
+  g+=`<text x="10" y="${DY+52}" class="svgs" font-size="12" font-weight="700">DECODER INPUT (written so far)</text>`;
+  DIN.forEach((t,j)=>{if(j>i)return;const x=X(j),cur=j===i;
+   g+=`<rect x="${x}" y="${DY}" width="${BW}" height="30" rx="7" fill="${cur?"var(--q)":"var(--card)"}" stroke="${cur?"var(--q)":"var(--rule)"}" stroke-width="1.5"/><text x="${x+BW/2}" y="${DY+20}" text-anchor="middle" class="svgm" font-size="13" fill="${cur?"#fff":"var(--ink)"}" style="${cur?"fill:#fff":""}">${B.esc(t)}</text>`;});
+  const px=X(i+1);g+=`<text x="${px+6}" y="${DY+20}" class="svgt" font-size="14" font-weight="700">→ ${B.esc(DOUT[i])}</text>`;
+  svg.innerHTML=g;
+  info.dataset.step=i+1;info.dataset.top=SRC[top];info.dataset.w=w[top].toFixed(3);info.dataset.sum=sum.toFixed(3);info.dataset.cross=SRC.length;info.dataset.self=i+1;
+  info.innerHTML=`Step ${i+1}: query from “${B.esc(DIN[i])}”, the decoder predicts <b>“${B.esc(DOUT[i])}”</b>. Largest cross-attention weight: <b>${w[top].toFixed(3)}</b> on “${B.esc(SRC[top])}”; the 9 weights sum to ${sum.toFixed(3)}.<br>Cross-attention K/V cache: <b>${SRC.length}</b> rows per decoder block (fixed since step 1). Self-attention cache: <b>${i+1}</b> row${i?"s":""} per block (${DIN.slice(0,i+1).map(B.esc).join(", ")}), causal, grows by one per step.`;}});
+})();
+
+/* ---------- Figure 4: BART noising ---------- */
+(function(){
+ const inEl=$("#ed-bart-in");if(!inEl)return;const outEl=$("#ed-bart-out"),info=$("#ed-bart-info"),seg=$("#ed-bart-mode"),sv=$("#ed-bart-seedv");
+ const D="The keeper saves the shot . The crowd cheers loudly . The match ends in a draw .".split(" ");const n=D.length,BUD=Math.round(0.3*n);
+ let mode="fill",seed=2;
+ function poisson(r,lam){const L=Math.exp(-lam);let k=0,p=1;do{k++;p*=r();}while(p>L);return k-1;}
+ const sentences=t=>{const s=[];let c=[];t.forEach(w=>{c.push(w);if(w==="."){s.push(c);c=[];}});if(c.length)s.push(c);return s;};
+ function perm(t,r){const S=sentences(t);let idx=S.map((_,i)=>i),tries=0;do{idx=shuffle(S.map((_,i)=>i),r);tries++;}while(idx.every((v,i)=>v===i)&&tries<20);
+  const out=[];idx.forEach((si,pos)=>S[si].forEach(w=>out.push({t:w,c:si!==pos?"moved":""})));return out;}
+ function fill(toks,r){const m=toks.length;const L=[];let s=0;while(s<BUD){const l=poisson(r,3);L.push(l);s+=l;}L[L.length-1]-=s-BUD;
+  const mark=new Array(m).fill(-1),ins=new Array(m+1).fill(0);
+  L.forEach((l,k)=>{if(l===0){ins[Math.floor(r()*m)]++;return;}
+   for(let tr=0;tr<40;tr++){const p=Math.floor(r()*(m-l+1));let ok=true;for(let q=Math.max(0,p-1);q<Math.min(m,p+l+1);q++)if(mark[q]>=0)ok=false;if(ok){for(let q=p;q<p+l;q++)mark[q]=k;break;}}});
+  const out=[],hid=[];for(let i=0;i<m;i++){for(let a=0;a<ins[i];a++){out.push({t:"<mask>",c:"msk"});hid.push(0);}
+   if(mark[i]>=0){if(i===0||mark[i-1]<0){out.push({t:"<mask>",c:"msk"});hid.push(1);}else hid[hid.length-1]++;}else out.push(toks[i]);}
+  for(let a=0;a<ins[m];a++){out.push({t:"<mask>",c:"msk"});hid.push(0);}
+  return{out,hid,lens:L};}
+ function noise(){const r=rng(seed*104729+mode.length*31);const base=D.map(w=>({t:w,c:""}));
+  if(mode==="mask"){const idx=shuffle(D.map((_,i)=>i),r).slice(0,BUD);const out=base.map((o,i)=>idx.includes(i)?{t:"<mask>",c:"msk"}:o);return{out,hid:idx.map(()=>1),note:"Masking keeps the length, so the model knows where each missing token was and that exactly one token is missing at each &lt;mask&gt;."};}
+  if(mode==="del"){const idx=shuffle(D.map((_,i)=>i),r).slice(0,BUD);return{out:base.filter((o,i)=>!idx.includes(i)),hid:[],note:`Deletion removes ${BUD} tokens and leaves no trace; the model must find where text is missing.`};}
+  if(mode==="fill"){const f=fill(base,r);return{out:f.out,hid:f.hid,lens:f.lens,note:"Each &lt;mask&gt; hides a whole span; the model must also decide how many tokens to write for it."};}
+  if(mode==="perm"){return{out:perm(D,r),hid:[],note:"All tokens are kept, but the sentences (highlighted when moved) are in a new order; the decoder must restore the order."};}
+  if(mode==="rot"){const k=1+Math.floor(r()*(n-1));const out=D.slice(k).concat(D.slice(0,k)).map((w,i)=>({t:w,c:i===0?"moved":""}));return{out,hid:[],note:`The document is rotated to start at token ${k+1} (“${B.esc(D[k])}”, highlighted); the model must find the true start.`};}
+  const p=perm(D,r);const f=fill(p,r);return{out:f.out,hid:f.hid,lens:f.lens,note:"BART’s final recipe: shuffle the sentences, then apply text infilling to 30% of the tokens."};}
+ function draw(){seg.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.m===mode?"true":"false"));
+  const z=noise();inEl.innerHTML=z.out.map(o=>chip(o.t,o.c)).join("");outEl.innerHTML=D.map(w=>chip(w,"")).join("")+chip("</s>","eos");
+  const masks=z.out.filter(o=>o.t==="<mask>").length;sv.textContent=`seed ${seed}`;
+  info.dataset.inlen=z.out.length;info.dataset.tgtlen=n;info.dataset.masks=masks;info.dataset.hidden=(z.hid||[]).join(",");
+  let h=`Encoder input: <b>${z.out.length}</b> tokens. Target: always the original <b>${n}</b> tokens (plus &lt;/s&gt;). &lt;mask&gt; tokens: <b>${masks}</b>.`;
+  if(mode==="fill"||mode==="both")h+=`<br>Poisson(3) span lengths drawn: ${z.lens.join(", ")} (sum ${BUD}). Tokens hidden by each &lt;mask&gt;, left to right: <b>${z.hid.join(", ")}</b>${z.hid.includes(0)?" (a 0 is an inserted mask)":""}.`;
+  h+=`<br>${z.note}`;info.innerHTML=h;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;mode=b.dataset.m;draw();});
+ $("#ed-bart-seed").addEventListener("click",()=>{seed++;draw();});
+ draw();
+})();
+
+/* ---------- Figure 5: masks and cost ---------- */
+(function(){
+ const grid=$("#ed-cost-grid");if(!grid)return;const ns=$("#ed-cost-n"),nv=$("#ed-cost-nv"),msl=$("#ed-cost-m"),mv=$("#ed-cost-mv"),info=$("#ed-cost-info"),leg=$("#ed-cost-leg"),seg=$("#ed-cost-arch");
+ let arch="ed";const d=768,L=12,NX=512,NY=114;
+ const COL={es:"var(--v)",cr:"var(--k)",ds:"var(--q)"};
+ const LEG={ed:[["es","encoder self-attention (bidirectional)"],["cr","cross-attention (target reads input)"],["ds","decoder self-attention (causal)"]],
+  pre:[["es","prefix part: bidirectional"],["cr","target reads prefix"],["ds","target part: causal"]],
+  lm:[["es","input part: causal only"],["cr","target reads input"],["ds","target part: causal"]]};
+ const T5={ed:[83.28,19.24],pre:[81.82,18.61],lm:[74.70,17.93]};
+ function kind(i,j,n){const qi=i<n,kj=j<n;if(qi&&kj){if(arch==="lm"&&j>i)return null;return"es";}if(qi&&!kj)return null;if(!qi&&kj)return"cr";return j<=i?"ds":null;}
+ function draw(){const n=+ns.value,m=+msl.value;nv.value=n;mv.value=m;
+  seg.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.a===arch?"true":"false"));
+  const lab=k=>k<n?`x${k+1}`:`y${k-n+1}`;let h=`<table class="ed-grid" aria-label="Attention visibility matrix"><tr><th></th>${Array.from({length:n+m},(_,j)=>`<th>${lab(j)}</th>`).join("")}</tr>`;let cnt=0;
+  for(let i=0;i<n+m;i++){h+=`<tr><th>${lab(i)}</th>`;for(let j=0;j<n+m;j++){const k=kind(i,j,n);if(k)cnt++;const sep=(j===n?"border-left:2px solid var(--ink2);":"")+(i===n?"border-top:2px solid var(--ink2);":"");
+    h+=`<td style="${k?`background:color-mix(in srgb,${COL[k]} 70%,var(--card));`:""}${sep}" title="${lab(i)} → ${lab(j)}: ${k?"visible":"hidden"}"></td>`;}h+="</tr>";}
+  grid.innerHTML=h+"</table>";
+  leg.innerHTML=LEG[arch].map(([k,t])=>`<span><i style="background:${COL[k]}"></i>${t}</span>`).join("")+`<span><i style="background:var(--paper2);border:1px solid var(--rule)"></i>hidden</span>`;
+  const P=(arch==="ed"?28:12)*L*d*d,C=2*L*d*d*(arch==="ed"?14:12)*(NX+NY);
+  const formula=arch==="ed"?`n² + mn + m(m+1)/2 = ${n*n} + ${m*n} + ${m*(m+1)/2}`:arch==="pre"?`n² + mn + m(m+1)/2 = ${n*n} + ${m*n} + ${m*(m+1)/2}`:`(n+m)(n+m+1)/2 = ${(n+m)}·${(n+m+1)}/2`;
+  info.dataset.pairs=cnt;info.dataset.params=(P/1e6).toFixed(1);info.dataset.gflops=(C/1e9).toFixed(1);
+  info.innerHTML=`Visible (query, key) pairs: <b>${cnt}</b> = ${formula}.<br>At T5-Base size, formula (24.11): <b>${(P/1e6).toFixed(1)} M</b> non-embedding parameters${arch==="ed"?" in two stacks":" in one stack"}, <b>${(C/1e9).toFixed(1)} GFLOPs</b> forward per (512-token input, 114-token target) pair.<br>T5 Table 2 (denoising objective): GLUE <b>${T5[arch][0].toFixed(2)}</b>, CNN/DM ROUGE-2 <b>${T5[arch][1].toFixed(2)}</b>.`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;arch=b.dataset.a;draw();});
+ ns.addEventListener("input",draw);msl.addEventListener("input",draw);
+ draw();
+})();
+})();
+</script></body></html>

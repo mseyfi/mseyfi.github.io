@@ -1,0 +1,504 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Training recipe and stability · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 36</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="training-recipe-and-stability">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="training-recipe-and-stability" data-session="training-recipe-and-stability" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">36</span><span>Track 3: Pretraining and scale · session 6 of 22</span></div><h1 class="chap-title">Training recipe and stability</h1><p class="chap-sub">A large training run is a long chain of small risks. This session explains the recipe that makes runs work: how to initialize the weights so signals keep their size, how to shape the learning rate over time, what causes loss spikes and how to stop them, and how μP lets you tune settings on a small model and reuse them on a big one.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 4 and 22 (optimization and AdamW, the residual stream and normalization); Session 35 (scaling laws) helps</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why initialization variance must depend on width, and why the popular std 0.02 is only right for one width</li><li>How scaled residual initialization keeps the residual stream from growing with depth</li><li>Warmup, cosine, warmup-stable-decay and multi-step schedules, and why decaying the learning rate lowers the loss</li><li>The main causes of loss spikes: Adam after a quiet period, growing attention logits, drifting output logits, bad batches</li><li>The fixes and when each one helps: gradient clipping, lower β₂ and learning rate, z-loss, QK-norm, restart and skip</li><li>μP: why the best learning rate moves with width in standard practice, the μP scaling rules, and the μTransfer workflow</li><li>The real recipes of Llama 3, OLMo 2, PaLM and DeepSeek LLM, with their numbers</li></ul></div></header><style>
+.tr-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.tr-grid input[type=range]{width:100%}
+.tr-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.tr-leg span::before{content:"";display:inline-block;width:18px;height:4px;border-radius:2px;margin-right:6px;vertical-align:3px;background:var(--c)}
+.tr-row{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-bottom:8px;font:500 14px var(--sans);color:var(--ink2)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A pretraining run of a large model costs millions of dollars and runs for weeks or months. Most of the time, it does not fail because the architecture is wrong. It fails because the loss suddenly jumps up (a <b>loss spike</b>), turns into NaN, or slowly stops improving. The <b>training recipe</b> is the set of choices that prevents this: how the weights start, how the learning rate changes over time, and what guards are in place when something goes wrong.</p>
+<p>In <a href="../foundations/optimization-backprop-adamw.html">session 4</a> you met AdamW, warmup, cosine decay and gradient clipping. In <a href="../transformers/the-residual-stream-and-normalization.html">session 22</a> you saw Pre-LN, QK-norm and z-loss as architecture choices. In <a href="../pretraining/index.html#row-scaling-laws" title="Scaling laws (planned)">session 35</a> you learned how to choose model size and token count. This session puts these pieces together into one recipe and asks three practical questions:</p>
+<ol><li><b>How should the weights start?</b> If the initial weights are too large or too small, signals explode or vanish before training even begins.</li>
+<li><b>How should the learning rate change over time?</b> The schedule decides both the speed of progress and the final loss.</li>
+<li><b>How do we keep a long run stable, and how do we pick the learning rate for a model we can afford to train only once?</b> Here we meet loss spikes and their fixes, and μP, a way to tune on a small model and copy the settings to a big one.</li></ol>
+<p>The problem is real even for the best teams. For PaLM 540B, Google reports that the loss spiked “roughly 20 times during training, despite the fact that gradient clipping was enabled”, and the spikes did not happen in the smaller models. [Certain] Their fix was simple and expensive: restart from a checkpoint about 100 steps before the spike and skip about 200 to 500 data batches. [Certain] Two years later, the Llama 3 team wrote that their 405B recipe “observed few loss spikes and did not require interventions”. [Certain] The difference between these two stories is mostly the recipe.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “Your loss spiked at step 80,000. What do you do?”, “Why is std 0.02 used for initialization?”, “What is z-loss?”, “Why does QK-norm help?”, “What is μP and why would you use it?”, “Cosine or WSD?”. Each is answered below with numbers you can check.</aside>
+
+<h2>The recipe at a glance</h2>
+<p>Before the details, here are real recipes from published papers. Every number in this table is taken from the paper named in the first column. [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model</th><th>Optimizer and learning rate</th><th>Schedule</th><th>Stability choices</th></tr></thead><tbody>
+<tr><td>Llama 2 7B</td><td>AdamW, \(\beta = (0.9, 0.95)\), \(\varepsilon = 10^{-5}\), weight decay 0.1, peak \(3\times10^{-4}\)</td><td>2,000 warmup steps, cosine to 10% of peak</td><td>Clipping at 1.0, Pre-LN with RMSNorm</td></tr>
+<tr><td>Llama 3 405B</td><td>AdamW, peak \(8\times10^{-5}\)</td><td>8,000 warmup steps, cosine to \(8\times10^{-7}\) over 1,200,000 steps</td><td>Batch grows from 4M to 8M to 16M tokens during training</td></tr>
+<tr><td>OLMo 2 7B</td><td>AdamW, peak \(3\times10^{-4}\), \(\varepsilon = 10^{-8}\)</td><td>2,000 warmup steps, cosine, then a linear decay to 0 at the end</td><td>Init std 0.02 everywhere, QK-norm, norm after each sub-layer, z-loss, no weight decay on embeddings</td></tr>
+<tr><td>PaLM 540B</td><td>Adafactor (no factorization), \(10^{-2}\) for 10,000 steps</td><td>Then decay as \(1/\sqrt{k}\) at step \(k\)</td><td>\(\beta_2 = 1 - k^{-0.8}\), clipping at 1.0, z-loss \(10^{-4}\), restart-and-skip for spikes</td></tr>
+<tr><td>DeepSeek LLM</td><td>AdamW</td><td>2,000 warmup steps, then a step down to 31.6% of peak after 80% of tokens and to 10% after 90%</td><td>Multi-step schedule so the first phase can be reused</td></tr></tbody></table></div>
+<p>You can already see a pattern. Almost everyone uses AdamW with \(\beta_2\) around 0.95, a short warmup, a decay at the end, clipping at 1.0, and some guard against growing logits. The rest of the session explains why each piece is there.</p>
+
+<h2>Initialization: keep signals the right size</h2>
+<p>Training starts from random weights. The question is: random <b>how large</b>? Think of one linear layer \(\mathbf{y} = W\mathbf{x}\) with input size \(n\) (the <b>fan-in</b>). Each output is a sum of \(n\) products \(W_{ij} x_j\). If the weights are independent with mean 0 and variance \(\sigma^2\), the variances add up:</p>
+<div class="eq">\[ \operatorname{Var}(y_i) = n\,\sigma^2 \operatorname{Var}(x_j) \tag{36.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n\)</dt><dd>fan-in: the number of inputs of the layer (the width \(d\) for most transformer matrices)</dd>
+<dt>\(\sigma\)</dt><dd>the standard deviation used to draw each weight at the start</dd>
+<dt>\(\operatorname{Var}(x_j)\)</dt><dd>the variance of one input coordinate</dd></dl>
+<p>So each layer multiplies the variance by \(n\sigma^2\), and the standard deviation (std) by \(\sigma\sqrt{n}\). A ReLU sets half of the values to zero and halves the variance, so for a ReLU layer the std factor is \(\sigma\sqrt{n/2}\). After \(L\) layers without residual connections or normalization:</p>
+<div class="eq">\[ \operatorname{std}(\mathbf{x}_L) = \operatorname{std}(\mathbf{x}_0)\,\big(c\,\sigma\sqrt{n}\big)^{L}, \qquad c = 1 \text{ (linear)},\ \ c = \tfrac{1}{\sqrt 2} \text{ (ReLU)} \tag{36.2} \]</div>
+<p>A factor even a little above 1 explodes; a little below 1 vanishes. The classic fix is to choose \(\sigma\) so that the factor is exactly 1: \(\sigma = 1/\sqrt{n}\) for linear or tanh layers (LeCun or Xavier style) and \(\sigma = \sqrt{2/n}\) for ReLU (He initialization). Both are “fan-in” rules: the std <b>shrinks as the layer gets wider</b>.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A chain of loudspeakers, each one feeding the next. If each speaker amplifies by 1.3, after 32 speakers the sound is deafening; at 0.7, it is silent. Initialization sets the volume knob of every speaker before the music starts.</aside>
+<figure class="fig" id="tr-init"><div class="fig-body">
+<div class="tr-row">Initial std: <span class="seg" id="tr-init-type"><button type="button" data-v="002" aria-pressed="true">0.02 (fixed)</button><button type="button" data-v="lecun" aria-pressed="false">1/√n</button><button type="button" data-v="he" aria-pressed="false">√(2/n)</button></span></div>
+<div class="tr-row">Activation: <span class="seg" id="tr-init-act"><button type="button" data-v="lin" aria-pressed="true">none (linear)</button><button type="button" data-v="relu" aria-pressed="false">ReLU</button><button type="button" data-v="tanh" aria-pressed="false">tanh</button></span></div>
+<div class="tr-grid"><label for="tr-init-n">Width n</label><input type="range" id="tr-init-n" min="6" max="9" step="1" value="9"><output id="tr-init-nv"></output></div>
+<svg id="tr-init-svg" viewBox="0 0 640 260" role="img" aria-label="Standard deviation of the activations at each of 32 layers, on a log scale"></svg>
+<div class="tr-leg"><span style="--c:var(--q)">measured std (live simulation)</span><span style="--c:var(--k)">prediction of formula (36.2)</span></div>
+<div class="readout" id="tr-init-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> A stack of 32 random \(n \times n\) layers with no residual connections and no normalization. A batch of 4 random inputs with std 1 is pushed through, and the std of the activations is measured after each layer (log scale, clipped at \(10^{\pm 12}\)). Weights are drawn with a fixed seed.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with the fixed std 0.02 and width 512. Each layer multiplies the std by \(0.02\sqrt{512} = 0.45\), so the signal vanishes: after 32 layers it is about \(10^{-11}\). Now choose \(1/\sqrt{n}\): the line is flat at 1 for every width. Switch the activation to ReLU: with \(1/\sqrt{n}\) the signal now shrinks by \(1/\sqrt 2\) per layer, and \(\sqrt{2/n}\) (He) fixes it. With tanh the signal cannot explode, because tanh is bounded, but it can still shrink. The dashed line is formula (36.2); the dots are the real simulation, and they agree closely.</p></details></figure>
+<h3>Why the popular std 0.02 depends on width</h3>
+<p>GPT-2, Megatron-LM, nanoGPT and OLMo 2 draw most weights from a normal distribution with std 0.02. [Certain for GPT-2 code and OLMo 2] This is a fixed number, not a fan-in rule. Formula (36.1) tells us when it is “right”: \(n \sigma^2 = 1\) means \(n = 1/0.02^2 = 2{,}500\). For a width of 768 (GPT-2 small) the variance factor per layer is 0.31; for 8,192 it is 3.28.</p>
+<div class="worked"><div class="wt">Worked example: std 0.02 at different widths</div>
+<p>Variance factor per layer \(n\sigma^2\) with \(\sigma = 0.02\): width 768 gives \(768 \times 0.0004 = 0.307\); width 4,096 gives 1.638; width 8,192 gives 3.277. The std factors are \(\sqrt{\cdot}\): 0.554, 1.280 and 1.810. In a plain stack of 32 such layers, the std would be multiplied by \(0.554^{32} \approx 6 \times 10^{-9}\) at width 768 and by \(1.81^{32} \approx 1.8 \times 10^{8}\) at width 8,192. The fan-in rule \(1/\sqrt{n}\) would use 0.036 and 0.011 instead.</p></div>
+<p>So why does std 0.02 work in practice? Because a transformer is <b>not</b> a plain stack. Every sub-layer reads a <b>normalized</b> copy of the residual stream (Pre-LN), so the input to each layer has size about 1 no matter what came before; and the residual connection keeps the signal alive even if a sub-layer’s output is small. The normalization layers hide most of the width effect at initialization. But they do not hide it during training: the <b>updates</b> still depend on width, and that is the problem μP solves at the end of this session.</p>
+<h3>Scaled residual initialization</h3>
+<p>The residual stream is a sum. Each of the \(L\) blocks adds two edits (attention and MLP), so after \(L\) blocks there are \(2L\) edits. If the edits are roughly independent at initialization, their variances add:</p>
+<div class="eq">\[ \operatorname{Var}(\mathbf{h}_L) \approx \operatorname{Var}(\mathbf{h}_0) + \sum_{l=1}^{2L} \operatorname{Var}(\mathbf{f}_l), \qquad \sigma_{\text{out}} = \frac{\sigma}{\sqrt{2L}} \tag{36.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{h}_0, \mathbf{h}_L\)</dt><dd>the residual stream after the embedding, and after the last block</dd>
+<dt>\(\mathbf{f}_l\)</dt><dd>the edit that sub-layer \(l\) adds to the stream</dd>
+<dt>\(\sigma_{\text{out}}\)</dt><dd>the init std of the <b>output</b> projection of each sub-layer (attention output and MLP down-projection)</dd></dl>
+<p>If every edit has the same variance \(v\), the stream variance grows to \(\operatorname{Var}(\mathbf{h}_0) + 2Lv\): it grows linearly with depth. GPT-2 fixes this by scaling the weights of the residual layers at initialization by \(1/\sqrt{N}\), where \(N\) is the number of residual layers. [Certain] Since variance scales with the square of std, each edit then has variance proportional to \(1/(2L)\), and their sum stays the same for any depth. nanoGPT uses \(0.02/\sqrt{2L}\) for these projections: 0.0041 for 12 layers and 0.0025 for 32 layers. [Likely] OLMo 2 found that plain std 0.02 for all weights gave fewer gradient spikes than its earlier scaled scheme. [Certain] So this is a choice to test, not a law.</p>
+<p>Two more details matter. <b>Embeddings</b> feed the stream directly, so their size sets \(\operatorname{Var}(\mathbf{h}_0)\); PaLM used std 1 for the input embeddings and scaled the output logits by \(1/\sqrt{d}\), because it ties the input and output embeddings. [Certain] And <b>zero-initialized</b> output projections (used in some recipes) make every block start as the identity function; the model then grows its edits during training. [Likely]</p>
+
+<h2>Learning-rate schedules, revisited</h2>
+<p>You know the shapes from <a href="../foundations/optimization-backprop-adamw.html">session 4</a>: linear <b>warmup</b> (formula 4.11), then <b>cosine</b> decay (formula 4.12). Here we add two newer shapes and, more importantly, explain <b>why decay lowers the loss</b>.</p>
+<h3>Warmup-stable-decay and multi-step</h3>
+<p>Cosine needs the total number of steps \(T\) in advance. If you later want to train longer, the learning rate has already gone down, and you cannot simply continue. <b>Warmup-stable-decay (WSD)</b>, introduced with MiniCPM, keeps the learning rate at its peak for most of training, then decays it over a short final phase. [Certain] With warmup length \(W\) and decay start \(S\):</p>
+<div class="eq">\[ \eta(t) = \begin{cases} \eta_{\max}\, t / W, & t \lt W \\ \eta_{\max}, & W \le t \lt S \\ \eta_{\max}\, \big(1 - \frac{t - S}{T - S}\big), & S \le t \le T \end{cases} \tag{36.4} \]</div>
+<p>The decay here is linear to 0; other decay shapes (exponential, square root, cosine) are also used. [Likely] The big advantage: you can save a checkpoint anywhere in the stable phase, and later either continue training from it or run a short decay to get a finished model. One long run can then produce finished models for several token budgets, which is exactly what you want for the scaling-law fits in <a href="../pretraining/index.html#row-scaling-laws" title="Scaling laws (planned)">session 35</a>. DeepSeek LLM used a related <b>multi-step</b> schedule: after 2,000 warmup steps, the learning rate drops to 31.6% of the peak after 80% of the tokens, and to 10% after 90%. [Certain] They report that the final performance “is essentially consistent with that of a cosine scheduler”, and that the first phase can be reused when they train longer. [Certain] (31.6% is about \(1/\sqrt{10}\).)</p>
+<h3>Why decaying the learning rate lowers the loss</h3>
+<p>Stochastic gradients are noisy. Even at the bottom of the valley, each step jumps by a random amount, so the weights bounce around the minimum instead of sitting on it. The size of this bouncing depends on the learning rate. For one direction with curvature \(\lambda\) and gradient noise with std \(\sigma\), plain SGD settles into a cloud whose average loss is exactly</p>
+<div class="eq">\[ \E[\text{loss}] = \frac{\eta\,\sigma^2}{2\,(2 - \eta\lambda)} \approx \frac{\eta\,\sigma^2}{4} \quad \text{when } \eta\lambda \ll 1 \tag{36.5} \]</div>
+<p>This is the <b>noise floor</b>. It is proportional to \(\eta\): halve the learning rate, and the floor halves. A high learning rate makes fast progress along the flat directions but sits on a high floor; a low one sits on a low floor but makes slow progress. A schedule gets the best of both: high early (progress), low at the end (floor). This also explains the strange shape of WSD loss curves: the loss is <b>worse</b> than cosine during the stable phase, then drops sharply during the decay. The drop is the floor going down. Figure 2 shows this on a toy problem.</p>
+<figure class="fig" id="tr-wsd"><div class="fig-body">
+<div class="tr-grid">
+<label for="tr-wsd-d">WSD decay length</label><input type="range" id="tr-wsd-d" min="5" max="50" step="1" value="20"><output id="tr-wsd-dv"></output>
+<label for="tr-wsd-s">Gradient noise σ</label><input type="range" id="tr-wsd-s" min="0.02" max="0.3" step="0.01" value="0.1"><output id="tr-wsd-sv"></output></div>
+<svg id="tr-wsd-svg" viewBox="0 0 640 322" role="img" aria-label="Loss curves and learning-rate curves for constant, cosine and WSD schedules"></svg>
+<div class="tr-leg"><span style="--c:var(--muted)">constant</span><span style="--c:var(--q)">cosine to 0</span><span style="--c:var(--k)">warmup-stable-decay</span></div>
+<div class="readout" id="tr-wsd-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> SGD on a noisy quadratic with 40 directions whose curvatures \(\lambda\) range from 0.001 to 1, for 3,000 steps with peak learning rate 1 and 30 warmup steps. All three schedules see exactly the same noise (fixed seed). Top: the true loss (log scale). Bottom: the learning rate as a fraction of the peak.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With the defaults (noise 0.1, decay over the last 20%), the constant schedule (grey) ends at 0.119: it stops improving once it reaches its noise floor. Cosine (blue) ends at 0.088. WSD (orange) ends at 0.057. Just before its decay starts (step 2,400), WSD is at 0.135 while cosine is already at 0.095: WSD looks worse for most of the run, then drops quickly during the decay. WSD wins here because it spends more steps at the peak, which helps the flat directions (small \(\lambda\)) make progress. Now raise the noise to 0.2: the noise floor matters more, and cosine (0.157) now beats WSD (0.198 with 20% decay). Lower the noise to 0.05 and even the constant schedule beats cosine. The best schedule is a balance between progress and noise floor (formula 36.5). This is a toy: real LLM losses are not quadratic. In real runs, WSD with a decay phase of roughly 10 to 20% is reported to match cosine. [Likely]</p></details></figure>
+<h3>How long should warmup be?</h3>
+<p>Warmup protects the first steps, when Adam’s second-moment estimate is based on very few gradients and the weights are far from any good region. Real runs use a small fraction of the total: Llama 2 used 2,000 of about 500,000 steps (0.4%), and Llama 3 405B used 8,000 of 1,200,000 (0.67%). [Certain] Longer warmup is a common first fix for early instability, and Wortsman et al. found that warmup makes small models less sensitive to the choice of learning rate. [Likely]</p>
+
+<h2>Loss spikes: what they are and where they come from</h2>
+<p>A <b>loss spike</b> is a sudden jump of the training loss, often by a large amount, within a few steps. Sometimes the loss comes back down by itself in a few hundred steps; sometimes it never fully recovers; sometimes it becomes NaN. Spikes become more common in larger models, at higher learning rates, and late in training. The main known causes are these:</p>
+<ol><li><b>Adam after a quiet period.</b> If the gradients of some weights are tiny for a long time, Adam’s second moment \(\mathbf{v}\) becomes tiny too. When a large gradient then arrives, the update \(\hat m / \sqrt{\hat v}\) is suddenly large. Molybog et al. argue that, in large runs, Adam can enter a state where the update has a large norm and is almost uncorrelated with the descent direction, which leads to divergence. [Certain]</li>
+<li><b>Growing attention logits.</b> As \(W_Q\) and \(W_K\) grow during training, the attention scores grow with the square of their size; softmax becomes almost one-hot, its gradient vanishes, and training becomes unstable. This was the problem in ViT-22B, fixed with QK-norm. [Certain]</li>
+<li><b>Drifting output logits.</b> Cross-entropy does not care if all output logits shift by the same amount, so they can drift to very large values, where low-precision numbers lose accuracy. [Likely] z-loss fixes this.</li>
+<li><b>Data.</b> Some batches are unusual (long runs of repeated tokens, for example). OLMo 2 removed documents with 32 or more repeated n-grams and masked such sequences in the loss, because they caused gradient spikes. [Certain] But PaLM found that the same batches did <b>not</b> cause a spike when trained from an earlier checkpoint: spikes come from a bad batch <b>and</b> a sensitive model state together. [Certain]</li></ol>
+<aside class="note analogy side"><span class="nt">Analogy</span>A driver who goes fast on a smooth highway for hours slowly relaxes their grip. Then a single pothole sends the car off the road. The pothole (an odd batch) is not dangerous by itself; the relaxed grip (a fragile model state, a tiny Adam \(\mathbf{v}\), very large logits) is what makes it dangerous.</aside>
+<h3>Cause 1 in numbers: Adam after a quiet period</h3>
+<p>Suppose a weight sees a gradient of 0.01 for thousands of steps. Then \(m \approx 0.01\) and \(v \approx 0.01^2\), and each update is about \(\eta\) (Adam normalizes). Now a burst arrives: the gradient jumps to \(g_1 \gg 0.01\). On the first step of the burst, \(m \approx (1-\beta_1) g_1\) and \(v \approx (1-\beta_2) g_1^2\), so</p>
+<div class="eq">\[ \frac{|\Delta\theta|}{\eta} = \frac{|\hat m|}{\sqrt{\hat v}} \;\longrightarrow\; \frac{1 - \beta_1}{\sqrt{1 - \beta_2}} \quad \text{as } g_1 / g_0 \to \infty \tag{36.6} \]</div>
+<p>With \(\beta_1 = 0.9\): the limit is 3.16 for \(\beta_2 = 0.999\), 1.00 for \(\beta_2 = 0.99\), and 0.45 for \(\beta_2 = 0.95\). If the burst lasts several steps, \(m\) catches up with the new gradient faster than \(v\) does (because \(\beta_1\) forgets faster than \(\beta_2\)), and the steps get even bigger. This is one clear reason why large runs use \(\beta_2 = 0.95\) instead of the default 0.999. Note what formula (36.6) does <b>not</b> contain: the size of the gradient. Adam divides by the gradient’s own size, so global-norm clipping, which only rescales the gradient, helps less than you might expect.</p>
+<figure class="fig" id="tr-adam"><div class="fig-body">
+<div class="tr-row">β₂: <span class="seg" id="tr-adam-b2"><button type="button" data-v="0.95" aria-pressed="false">0.95</button><button type="button" data-v="0.99" aria-pressed="false">0.99</button><button type="button" data-v="0.999" aria-pressed="true">0.999</button></span></div>
+<div class="tr-row">Clip each gradient at: <span class="seg" id="tr-adam-clip"><button type="button" data-v="off" aria-pressed="true">off</button><button type="button" data-v="10" aria-pressed="false">10× normal</button><button type="button" data-v="2" aria-pressed="false">2× normal</button></span></div>
+<div class="tr-grid">
+<label for="tr-adam-g">Burst size</label><input type="range" id="tr-adam-g" min="1" max="3" step="0.1" value="2"><output id="tr-adam-gv"></output>
+<label for="tr-adam-k">Burst length (steps)</label><input type="range" id="tr-adam-k" min="1" max="50" step="1" value="10"><output id="tr-adam-kv"></output></div>
+<svg id="tr-adam-svg" viewBox="0 0 640 230" role="img" aria-label="Adam update size around a gradient burst"></svg>
+<div class="readout" id="tr-adam-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Adam (\(\beta_1 = 0.9\), with bias correction, \(\varepsilon = 10^{-8}\)) on one weight. The gradient is 0.01 for 5,000 steps, then jumps to the burst size (as a multiple of 0.01) for the chosen number of steps, then returns to 0.01. The curve is the update size divided by \(\eta\); the dashed line is a normal step. The shaded area is the burst.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>With the defaults (\(\beta_2 = 0.999\), burst ×100 for 10 steps), the largest step is about 6.5 times a normal step, and the weight moves more than twice as far as it normally would over the window. Switch to \(\beta_2 = 0.95\): the largest step is about 1.03, because \(\mathbf{v}\) adapts within about 20 steps. Now go back to 0.999 and change the burst size: ×10 gives a peak of 4.9, ×100 and ×1000 both give 6.5. Above a certain size, the size of the gradient no longer matters, as formula (36.6) says. Clipping at 10× the normal size only turns the burst into a ×10 burst: the peak is still 4.9. Only clipping very close to the normal size (2×) brings it down to 1.6, and in a real model you cannot clip that tightly without slowing all of training. The lesson: for Adam, lower \(\beta_2\) and a lower learning rate are stronger fixes than clipping.</p></details></figure>
+<p>Two related details. First, the Adam \(\varepsilon\) matters when gradients are tiny: if \(\sqrt{\hat v}\) falls near \(\varepsilon\), the update shrinks. Wortsman et al. report that a too-large \(\varepsilon\) can make updates too small in large models, and OLMo 2 lowered \(\varepsilon\) from \(10^{-5}\) to \(10^{-8}\). [Certain for OLMo 2] Second, PaLM chose \(\beta_2 = 1 - k^{-0.8}\) (growing toward 1 with the step \(k\)) because “rare embedding tokens can have poorly estimated second moments over shorter windows”. [Certain] Rare tokens are exactly the “quiet” weights of formula (36.6).</p>
+
+<h3>Causes 2 and 3: logits that grow</h3>
+<p><b>Output logits.</b> The cross-entropy loss only depends on differences between logits, so the model can add the same number to all logits without changing the loss. Nothing stops this drift. But numbers stored in BF16 have only 8 significant bits, so large values are coarse: between 256 and 512, BF16 can only represent every second integer, and between 512 and 1,024 only every fourth. Large logits lose the small differences that carry the prediction. <b>z-loss</b> adds a small penalty that keeps the log of the softmax normalizer near 0:</p>
+<div class="eq">\[ \mathcal{L} = \mathcal{L}_{\text{CE}} + \alpha \,(\log Z)^2, \qquad Z = \sum_{j=1}^{|V|} e^{z_j} \tag{36.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(z_j\)</dt><dd>the output logit of vocabulary entry \(j\)</dd>
+<dt>\(Z\)</dt><dd>the softmax normalizer; \(\log Z\) is the log-sum-exp of the logits</dd>
+<dt>\(\alpha\)</dt><dd>a small weight; PaLM used \(10^{-4}\) [Certain]</dd></dl>
+<p>Its gradient is easy to read. Since \(\partial \log Z / \partial z_i = p_i\) (the softmax probability):</p>
+<div class="eq">\[ \frac{\partial}{\partial z_i}\, \alpha (\log Z)^2 = 2\alpha \,\log Z \; p_i \tag{36.8} \]</div>
+<p>When \(\log Z \gt 0\), every logit is pushed down, the likely ones most; when \(\log Z \lt 0\), they are pushed up. The cross-entropy gradient \(p_i - y_i\) sums to zero over the vocabulary, so it can never move the average logit; the z-loss gradient sums to \(2\alpha \log Z\), so it moves exactly the part that cross-entropy ignores.</p>
+<figure class="fig" id="tr-z"><div class="fig-body">
+<div class="tr-grid"><label for="tr-z-s">Shift added to all logits</label><input type="range" id="tr-z-s" min="0" max="1200" step="1" value="0"><output id="tr-z-sv"></output></div>
+<div class="scroll-x"><svg id="tr-z-svg" viewBox="0 0 640 300" role="img" aria-label="Five logits as bars, with their BF16-rounded values"></svg></div>
+<div class="tr-leg"><span style="--c:var(--q)">logit in FP32 (target is the dark bar)</span><span style="--c:var(--k)">the same logit stored in BF16</span></div>
+<div class="readout" id="tr-z-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Five output logits \((3, 1, 0.5, -1, -2)\) plus a common shift. The first one is the correct next token. The cross-entropy in exact arithmetic does not change with the shift; the z-loss does. The orange marks show each logit after rounding to BF16 (round to nearest even).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At shift 0, \(\log Z = 3.217\), the cross-entropy is 0.2171 and the z-loss is about 0.001. Move the shift to 50: cross-entropy is still 0.2171, but the z-loss is 0.283, so its gradient (formula 36.8) pulls the logits back. Move to 1,000: BF16 can only store multiples of 4 there, so the logits become 1004, 1000, 1000, 1000, 1000, and the computed cross-entropy is 0.0707, which is wrong. The model’s prediction has been damaged by rounding alone. In real code, the loss is computed in FP32, but logits and activations may pass through BF16 before that; <a href="../pretraining/index.html#row-numbers-on-gpus-fp32-tf32-fp16-bf16" title="Numbers on GPUs: FP32, TF32, FP16, BF16, FP8 and mixed precision (planned)">session 37</a> covers the number formats in detail.</p></details></figure>
+<p><b>Attention logits.</b> The score between query \(\mathbf{q}_i\) and key \(\mathbf{k}_j\) is \(\mathbf{q}_i \cdot \mathbf{k}_j / \sqrt{d_h}\). If \(W_Q\) and \(W_K\) both grow by a factor \(g\), the scores grow by \(g^2\) (<a href="../transformers/the-residual-stream-and-normalization.html">session 22</a>). <b>QK-norm</b> applies RMSNorm to each head’s query and key before the dot product:</p>
+<div class="eq">\[ s_{ij} = \frac{(\mathbf{g}_q \odot \hat{\mathbf{q}}_i) \cdot (\mathbf{g}_k \odot \hat{\mathbf{k}}_j)}{\sqrt{d_h}}, \qquad \hat{\mathbf{q}} = \frac{\mathbf{q}}{\operatorname{rms}(\mathbf{q})},\ \ \hat{\mathbf{k}} = \frac{\mathbf{k}}{\operatorname{rms}(\mathbf{k})} \tag{36.9} \]</div>
+<p>Now the scores depend only on the <b>directions</b> of \(\mathbf{q}\) and \(\mathbf{k}\) and on the learned gain vectors \(\mathbf{g}_q, \mathbf{g}_k\), which grow slowly. The growth of \(W_Q, W_K\) no longer reaches the softmax. QK-norm was key for ViT-22B [Certain] and is used in OLMo 2 [Certain] and Qwen3 [Certain]. Wortsman et al. showed that attention-logit growth and output-logit drift both appear in <b>small</b> models trained at high learning rates, and that QK-layernorm and z-loss fix them there too, so you can study these problems cheaply. [Certain]</p>
+
+<h3>The fixes, and when each one helps</h3>
+<div class="tblw"><table class="tb"><thead><tr><th>Fix</th><th>What it does</th><th>Helps against</th><th>Cost</th></tr></thead><tbody>
+<tr><td>Global-norm gradient clipping (1.0)</td><td>Caps the length of the gradient (formula 4.13)</td><td>Rare huge gradients; mainly protects \(\mathbf{m}\) and SGD-like updates</td><td>Almost free; weak against Adam’s \(\hat m / \sqrt{\hat v}\) (Figure 3)</td></tr>
+<tr><td>Lower \(\beta_2\) (0.95)</td><td>\(\mathbf{v}\) follows gradient changes within about 20 steps</td><td>Adam after a quiet period (formula 36.6)</td><td>Noisier step sizes</td></tr>
+<tr><td>Lower peak learning rate, longer warmup</td><td>Smaller steps everywhere</td><td>Almost every cause</td><td>Slower training; the safest first fix</td></tr>
+<tr><td>z-loss (\(\alpha \approx 10^{-4}\))</td><td>Keeps \(\log Z\) near 0 (formula 36.7)</td><td>Output logit drift</td><td>Negligible</td></tr>
+<tr><td>QK-norm</td><td>Normalizes \(\mathbf{q}, \mathbf{k}\) per head (formula 36.9)</td><td>Attention logit growth, entropy collapse</td><td>A small extra norm per layer; part of the architecture, so decide before training</td></tr>
+<tr><td>No weight decay on embeddings, careful \(\varepsilon\)</td><td>Keeps embedding norms healthy; avoids tiny or frozen updates</td><td>Slow drifts that end in spikes [Likely]</td><td>Free</td></tr>
+<tr><td>Restart and skip</td><td>Go back about 100 steps before the spike, skip the next few hundred batches</td><td>A spike that happened anyway (PaLM)</td><td>Lost compute; needs frequent checkpoints and a deterministic data loader</td></tr></tbody></table></div>
+<div class="algo"><div class="algo-h">Algorithm 1: what to do when the loss spikes in a large run</div><ol>
+<li><b>watch</b> every step: loss, pre-clip gradient norm, max attention logit per layer, mean \(\log Z\), update-to-weight ratio per layer</li>
+<li><b>if</b> the loss jumps and does not return within a few hundred steps, or becomes NaN:</li>
+<li>&nbsp;&nbsp;find the first step where the gradient norm or a logit statistic started to rise <span class="c">// often well before the loss</span></li>
+<li>&nbsp;&nbsp;reload the checkpoint from before that point (PaLM: about 100 steps before the spike)</li>
+<li>&nbsp;&nbsp;skip the batches around the spike (PaLM: about 200 to 500) <span class="c">// needs a loader where batch = f(step)</span></li>
+<li>&nbsp;&nbsp;<b>if</b> it spikes again: lower the learning rate (for example by 10 to 30%) or lower \(\beta_2\) from here on</li>
+<li>&nbsp;&nbsp;<b>if</b> attention logits grow: QK-norm (next run) or soft-capping; <b>if</b> \(\log Z\) drifts: add z-loss</li>
+<li><b>record</b> every intervention in the run log, so the result can be reproduced</li></ol></div>
+
+<h2>μP: tune small, train big</h2>
+<p>The biggest model in a project is usually trained <b>once</b>. You cannot sweep its learning rate. The usual hope is: sweep on a small model and reuse the best value. In the standard parameterization (SP, what PyTorch does by default) this does not work, because the best learning rate <b>moves</b> as the model gets wider. Figure 1 of the μP paper shows this for transformers trained with Adam: in standard practice the optimum shifts with width, while in μP it stays in place. [Certain] You can see the same effect in the small experiment at the end of the code section: in SP the best Adam learning rate falls from \(2^{-7}\) at width 64 to \(2^{-12}\) at width 1,024.</p>
+<h3>Why the best learning rate moves</h3>
+<p>Take one hidden layer \(\mathbf{h} = W\mathbf{x}\) with width \(n\), entries of \(\mathbf{x}\) of size about 1, and \(W\) initialized with variance \(1/n\), so the entries of \(\mathbf{h}\) also have size about 1. Look at the very first Adam step. With bias correction, the first update of every weight is exactly \(-\eta \operatorname{sign}(g)\). The gradient is \(\partial L / \partial W = \delta\, \mathbf{x}^\top\), where the column vector \(\delta = \partial L/\partial \mathbf{h}\) comes from above (from formula 4.4), so \(\operatorname{sign}(g_{ij}) = \operatorname{sign}(\delta_i)\operatorname{sign}(x_j)\). For the same input, the change of \(\mathbf{h}\) is</p>
+<div class="eq">\[ \Delta h_i = -\eta \operatorname{sign}(\delta_i) \sum_{j=1}^{n} |x_j|, \qquad \frac{|\Delta h_i|}{\operatorname{rms}(\mathbf{h})} \approx \eta\, n \sqrt{2/\pi} \approx 0.8\, \eta\, n \tag{36.10} \]</div>
+<p>(For a standard normal \(x_j\), the average of \(|x_j|\) is \(\sqrt{2/\pi} = 0.798\).) Every one of the \(n\) terms pushes \(h_i\) in the same direction, because the update is built from \(\mathbf{x}\) itself. So the change grows <b>linearly with width</b>, while \(\mathbf{h}\) itself stays the same size. A learning rate that changes \(\mathbf{h}\) by 20% at width 256 changes it by 1,300% at width 16,384. To keep the relative change the same, the learning rate of hidden matrices must scale like \(1/n\). That is the core of μP for Adam.</p>
+<figure class="fig" id="tr-mup"><div class="fig-body">
+<div class="tr-grid">
+<label for="tr-mup-n">Width n</label><input type="range" id="tr-mup-n" min="6" max="14" step="1" value="12"><output id="tr-mup-nv"></output>
+<label for="tr-mup-lr">Base learning rate η</label><input type="range" id="tr-mup-lr" min="-14" max="-6" step="1" value="-10"><output id="tr-mup-lrv"></output></div>
+<svg id="tr-mup-svg" viewBox="0 0 640 260" role="img" aria-label="Relative change of a hidden layer after one Adam step, versus width, for SP and muP"></svg>
+<div class="tr-leg"><span style="--c:var(--muted)">standard parameterization (same η at every width)</span><span style="--c:var(--k)">μP (hidden η scaled by 256/n)</span><span style="--c:var(--q)">chosen width</span></div>
+<div class="readout" id="tr-mup-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> One hidden layer of width \(n\) with init variance \(1/n\) and a random input \(\mathbf{x}\) with standard normal entries. After one Adam step, \(|\Delta h| / |h|\) is computed exactly from formula (36.10); \(\operatorname{rms}(\mathbf{h})\) is measured on 256 random rows of \(W\). Both axes are log scale. The μP base width is 256, so both curves meet there.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>The grey line rises with slope 1 on the log-log plot: doubling the width doubles the relative change. At width 256 with \(\eta \approx 10^{-3}\), the change is about 0.2; at width 16,384, it is about 12, which means the layer’s output is destroyed in one step. The orange line (μP) is flat: the change is the same at every width. Now change the base \(\eta\): both lines move up or down together, but only the orange one keeps its shape. This is why the best \(\eta\) found at width 256 is still the best at width 16,384 in μP.</p></details></figure>
+<h3>The μP rules</h3>
+<p>The μP paper (Tensor Programs V) gives the full rules for every type of parameter. Here is its Table 3 for Adam, with fan-in \(n\). [Certain] Parameters are grouped by how many of their dimensions grow with width: <b>input weights</b> (embeddings, the first layer; only the output side grows), <b>hidden weights</b> (both sides grow), and <b>output weights</b> (the unembedding; only the input side grows).</p>
+<div class="tblw"><table class="tb"><thead><tr><th></th><th>Input weights and all biases</th><th>Hidden weights</th><th>Output weights</th></tr></thead><tbody>
+<tr><td>Init variance, μP</td><td>\(1/n\)</td><td>\(1/n\)</td><td>\(1/n^2\) (SP: \(1/n\))</td></tr>
+<tr><td>Adam learning rate, μP</td><td>\(\eta\) (no scaling)</td><td>\(\eta/n\) (SP: \(\eta\))</td><td>\(\eta/n\) (SP: \(\eta\))</td></tr>
+<tr><td>SGD learning rate, μP</td><td>\(\eta \cdot n_{\text{out}}\) (SP: \(\eta\))</td><td>\(\eta\)</td><td>\(\eta/n\) (SP: \(\eta\))</td></tr></tbody></table></div>
+<p>For transformers there is one more change: the attention score uses \(1/d_h\) instead of \(1/\sqrt{d_h}\). [Certain] In practice, the rules are written relative to a <b>base width</b> \(n_0\) (the proxy model), so at the base width μP and SP agree in learning rates:</p>
+<div class="eq">\[ \eta_{\text{hidden}}(n) = \eta_{\text{base}} \cdot \frac{n_0}{n}, \qquad \sigma^2_{\text{out}}(n) \propto \frac{1}{n^2}, \qquad s_{ij} = \frac{\mathbf{q}_i \cdot \mathbf{k}_j}{d_h} \tag{36.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n_0\)</dt><dd>the width of the small proxy model on which you tuned (the base width)</dd>
+<dt>\(\eta_{\text{base}}\)</dt><dd>the best learning rate found by the sweep on the proxy</dd>
+<dt>\(\sigma^2_{\text{out}}\)</dt><dd>the init variance of the output (unembedding) layer; the paper also gives an equivalent version with a \(1/n\) multiplier on the output logits (its Table 8), which works with tied embeddings</dd></dl>
+<aside class="note analogy side"><span class="nt">Analogy</span>A recipe for one cake does not work for a wedding cake if you just multiply the oven temperature. You must scale each part by the right rule: flour by the number of guests, baking time by the thickness. μP is the list of scaling rules that keeps a model “cooked the same way” at every width.</aside>
+<div class="algo"><div class="algo-h">Algorithm 2: μTransfer, tune on a proxy and copy to the target</div><ol>
+<li>write the target model in μP (formula 36.11 and the table), with a base width \(n_0\)</li>
+<li>build a proxy: the same model with width \(n_0\) (often a few hundred), same depth or shallower, trained on fewer tokens</li>
+<li><b>for</b> each candidate setting (learning rate, init scale, output multiplier, warmup, …): train the proxy and record the loss</li>
+<li>pick the best setting; check that it is stable at 2 or 3 widths between \(n_0\) and the target <span class="c">// the optimum should not move</span></li>
+<li>train the target with the same settings; μP rescales the hidden and output learning rates by \(n_0/n\) automatically</li></ol></div>
+<p><b>What transfers and what does not.</b> The paper lists learning rate, initialization scale, and parameter multipliers as transferable across width; across depth, batch size, training time and sequence length, transfer was checked only empirically on transformers. Regularization settings such as dropout and weight decay do <b>not</b> transfer. [Certain] The headline result: by transferring from a 40M-parameter proxy, they beat the published numbers of the 6.7B GPT-3 model, with a tuning cost of only 7% of the total pretraining cost. [Certain] Cerebras-GPT and several later model families report using μP; many large labs do not say whether they use it. [Likely]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>μP is about <b>width</b>. It does not by itself make depth transfer work, and it does not tell you how many tokens to train on (that is <a href="../pretraining/index.html#row-scaling-laws" title="Scaling laws (planned)">session 35</a>). Also, a μP implementation is easy to get subtly wrong: a single layer with SP scaling breaks the transfer. The standard test is a “coordinate check”: train a few steps at several widths and check that activation sizes do not grow with width.</aside>
+
+<h2>The recipe in code</h2>
+<p>The first program builds a small GPT-style model with the stable recipe: std 0.02 init with scaled residual projections (formula 36.3), QK-norm (36.9), a loss with z-loss (36.7), AdamW with \(\beta_2 = 0.95\), no decay on 1-D parameters and embeddings, and clipping. It then reproduces the Adam burst of Figure 3 with <code>torch.optim.Adam</code>. It needs PyTorch 2.4 or newer (for <code>nn.RMSNorm</code>).</p>
+<pre class="code"><span class="kw2">import</span> math, torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="cm"># 1) Initialization: std 0.02 everywhere, residual output projections scaled by 1/sqrt(2L)</span>
+<span class="kw2">class</span> Block(nn.Module):
+    <span class="kw2">def</span> __init__(self, d, n_head, qk_norm=True):
+        super().__init__()
+        self.h, self.dh = n_head, d // n_head
+        self.n1, self.n2 = nn.RMSNorm(d), nn.RMSNorm(d)
+        self.qkv, self.proj = nn.Linear(d, 3 * d, bias=False), nn.Linear(d, d, bias=False)
+        self.up, self.down = nn.Linear(d, 4 * d, bias=False), nn.Linear(4 * d, d, bias=False)
+        self.qn = nn.RMSNorm(self.dh) <span class="kw2">if</span> qk_norm <span class="kw2">else</span> nn.Identity()   <span class="cm"># QK-norm, formula (36.9)</span>
+        self.kn = nn.RMSNorm(self.dh) <span class="kw2">if</span> qk_norm <span class="kw2">else</span> nn.Identity()
+    <span class="kw2">def</span> forward(self, x):
+        B, T, d = x.shape
+        q, k, v = self.qkv(self.n1(x)).view(B, T, 3, self.h, self.dh).unbind(2)
+        q, k = self.qn(q), self.kn(k)                       <span class="cm"># normalize each head's q and k</span>
+        a = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
+        x = x + self.proj(a.transpose(1, 2).reshape(B, T, d))
+        <span class="kw2">return</span> x + self.down(F.gelu(self.up(self.n2(x))))
+
+<span class="kw2">class</span> TinyLM(nn.Module):
+    <span class="kw2">def</span> __init__(self, vocab=1000, d=128, n_head=4, L=4):
+        super().__init__()
+        self.emb = nn.Embedding(vocab, d)
+        self.blocks = nn.ModuleList([Block(d, n_head) <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)])
+        self.norm, self.head = nn.RMSNorm(d), nn.Linear(d, vocab, bias=False)
+        <span class="kw2">for</span> name, p <span class="kw2">in</span> self.named_parameters():             <span class="cm"># formulas (36.1) and (36.3)</span>
+            <span class="kw2">if</span> p.ndim == 2:
+                std = 0.02 / math.sqrt(2 * L) <span class="kw2">if</span> name.endswith(("proj.weight", "down.weight")) <span class="kw2">else</span> 0.02
+                nn.init.normal_(p, mean=0.0, std=std)
+    <span class="kw2">def</span> forward(self, idx):
+        x = self.emb(idx)
+        <span class="kw2">for</span> b <span class="kw2">in</span> self.blocks: x = b(x)
+        <span class="kw2">return</span> self.head(self.norm(x))
+
+<span class="cm"># 2) Loss with z-loss, formula (36.7); computed in FP32</span>
+<span class="kw2">def</span> lm_loss(logits, targets, z_alpha=1e-4):
+    logits = logits.float()
+    logz = torch.logsumexp(logits, dim=-1)                  <span class="cm"># log Z for every position</span>
+    ce = (logz - logits.gather(-1, targets[..., None]).squeeze(-1)).mean()
+    <span class="kw2">return</span> ce + z_alpha * (logz ** 2).mean(), ce, logz.mean()
+
+model = TinyLM()
+idx = torch.randint(0, 1000, (8, 33))
+logits = model(idx[:, :-1])
+loss, ce, logz = lm_loss(logits, idx[:, 1:])
+print(f"CE {ce.item():.3f} (ln 1000 = {math.log(1000):.3f}), mean log Z {logz.item():.3f}")
+print("check: CE equals F.cross_entropy:", torch.allclose(ce, F.cross_entropy(logits.reshape(-1, 1000), idx[:, 1:].reshape(-1))))
+
+<span class="cm"># 3) One step of the stable recipe: AdamW (beta2 0.95), no decay on 1-D params and embeddings, clipping at 1.0</span>
+decay   = [p <span class="kw2">for</span> n, p <span class="kw2">in</span> model.named_parameters() <span class="kw2">if</span> p.ndim == 2 <span class="kw2">and</span> "emb" <span class="kw2">not in</span> n]
+nodecay = [p <span class="kw2">for</span> n, p <span class="kw2">in</span> model.named_parameters() <span class="kw2">if</span> p.ndim &lt; 2 <span class="kw2">or</span> "emb" <span class="kw2">in</span> n]
+opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1}, {"params": nodecay, "weight_decay": 0.0}],
+                        lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+opt.zero_grad(set_to_none=True); loss.backward()
+gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+opt.step()
+print(f"grad norm before clipping {gnorm.item():.3f}")
+
+<span class="cm"># 4) The Adam burst toy of Figure 3: 5000 quiet steps (g = 0.01), then 10 steps with g = 1</span>
+<span class="kw2">for</span> b2 <span class="kw2">in</span> (0.95, 0.999):
+    w = torch.zeros(1, requires_grad=True)
+    o = torch.optim.Adam([w], lr=1.0, betas=(0.9, b2), eps=1e-8)
+    sizes = []
+    <span class="kw2">for</span> t <span class="kw2">in</span> range(5050):
+        w.grad = torch.tensor([1.0 <span class="kw2">if</span> 5000 &lt;= t &lt; 5010 <span class="kw2">else</span> 0.01])
+        before = w.item(); o.step(); sizes.append(abs(w.item() - before))
+    print(f"beta2 = {b2}: largest update during the burst = {max(sizes[5000:]):.2f} x lr")</pre>
+<p>Output with PyTorch 2.8 on CPU:</p>
+<pre class="code">CE 6.935 (ln 1000 = 6.908), mean log Z 6.929
+check: CE equals F.cross_entropy: True
+grad norm before clipping 2.983
+beta2 = 0.95: largest update during the burst = 1.03 x lr
+beta2 = 0.999: largest update during the burst = 6.51 x lr</pre>
+<p>The initial cross-entropy is close to \(\ln 1000 = 6.908\), which is what a well-initialized model should give: with small weights, the output is almost uniform over the 1,000 tokens. But \(\log Z \approx 6.93\), far from 0, so the z-loss starts working from step one. The last two lines match Figure 3 (1.03 and 6.51).</p>
+<p>The second program is a small μP experiment: a 3-layer MLP trained with Adam on a fixed random regression task, at widths 64, 256 and 1,024, for 10 learning rates. In μP mode, the output layer is initialized with variance \(1/n^2\) and the hidden and output learning rates are divided by \(n / 64\) (base width 64).</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+torch.manual_seed(0)
+D_IN, BASE = 32, 64                       <span class="cm"># proxy (base) width = 64</span>
+teacher = torch.nn.Sequential(torch.nn.Linear(D_IN, 256), torch.nn.Tanh(), torch.nn.Linear(256, 1))
+X = torch.randn(4096, D_IN)
+<span class="kw2">with</span> torch.no_grad(): Y = teacher(X) * 3
+
+<span class="kw2">def</span> make(width, mup):
+    torch.manual_seed(1)
+    l1, l2, l3 = torch.nn.Linear(D_IN, width), torch.nn.Linear(width, width), torch.nn.Linear(width, 1)
+    <span class="kw2">for</span> l <span class="kw2">in</span> (l1, l2, l3):                 <span class="cm"># init variance 1/fan_in for input and hidden</span>
+        torch.nn.init.normal_(l.weight, std=l.in_features ** -0.5); torch.nn.init.zeros_(l.bias)
+    <span class="kw2">if</span> mup:
+        torch.nn.init.normal_(l3.weight, std=1.0 / l3.in_features)   <span class="cm"># output: variance 1/fan_in^2</span>
+    <span class="kw2">return</span> l1, l2, l3
+
+<span class="kw2">def</span> train(width, lr, mup, steps=300):
+    l1, l2, l3 = make(width, mup)
+    m = width / BASE
+    groups = [{"params": l1.parameters(), "lr": lr},
+              {"params": [l2.weight], "lr": lr / m <span class="kw2">if</span> mup <span class="kw2">else</span> lr},  <span class="cm"># hidden: lr / width</span>
+              {"params": [l2.bias], "lr": lr},
+              {"params": [l3.weight], "lr": lr / m <span class="kw2">if</span> mup <span class="kw2">else</span> lr},  <span class="cm"># output: lr / width</span>
+              {"params": [l3.bias], "lr": lr}]
+    opt = torch.optim.Adam(groups)
+    g = torch.Generator().manual_seed(2)
+    <span class="kw2">for</span> t <span class="kw2">in</span> range(steps):
+        idx = torch.randint(0, 4096, (128,), generator=g)
+        h = torch.relu(l2(torch.relu(l1(X[idx]))))
+        loss = ((l3(h) - Y[idx]) ** 2).mean()
+        <span class="kw2">if not</span> torch.isfinite(loss): <span class="kw2">return</span> float("nan")
+        opt.zero_grad(); loss.backward(); opt.step()
+    <span class="kw2">with</span> torch.no_grad():
+        <span class="kw2">return</span> ((l3(torch.relu(l2(torch.relu(l1(X))))) - Y) ** 2).mean().item()
+
+lrs = [2.0 ** k <span class="kw2">for</span> k <span class="kw2">in</span> range(-13, -3)]
+<span class="kw2">for</span> mup <span class="kw2">in</span> (False, True):
+    print("muP" <span class="kw2">if</span> mup <span class="kw2">else</span> "SP ")
+    <span class="kw2">for</span> width <span class="kw2">in</span> (64, 256, 1024):
+        res = [train(width, lr, mup) <span class="kw2">for</span> lr <span class="kw2">in</span> lrs]
+        best = min(range(len(lrs)), key=<span class="kw2">lambda</span> i: res[i] <span class="kw2">if</span> res[i] == res[i] <span class="kw2">else</span> 1e9)
+        print(f"  width {width:5d}: best log2(lr) = {int(math.log2(lrs[best]))}, loss {res[best]:.4f}")</pre>
+<p>Output (about one minute on a laptop CPU):</p>
+<pre class="code">SP
+  width    64: best log2(lr) = -7, loss 0.0090
+  width   256: best log2(lr) = -9, loss 0.0089
+  width  1024: best log2(lr) = -12, loss 0.0047
+muP
+  width    64: best log2(lr) = -5, loss 0.0090
+  width   256: best log2(lr) = -7, loss 0.0047
+  width  1024: best log2(lr) = -7, loss 0.0046</pre>
+<p>In SP, the best learning rate falls by a factor of \(2^5 = 32\) when the width grows by 16, close to the \(1/n\) of formula (36.10). In μP it stays at \(2^{-7}\) for widths 256 and 1,024. At width 64 the μP curve is almost flat between \(2^{-7}\) (loss 0.010) and \(2^{-5}\) (0.009), so the argmin is noisy there. A small toy, one seed: treat it as an illustration, not a benchmark. Adding width 4,096 (which takes about ten times longer) moved the SP optimum to \(2^{-14}\), the edge of the grid, while μP stayed at \(2^{-7}\).</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Recipe parts that matter most</th><th>Why</th></tr></thead><tbody>
+<tr><td>LLM pretraining at scale</td><td>AdamW with \(\beta_2 = 0.95\), short warmup, cosine or WSD, clipping 1.0, QK-norm, z-loss, frequent checkpoints</td><td>One run, months long; a spike costs days of compute</td></tr>
+<tr><td>Planning a model family (scaling-law sweeps)</td><td>WSD or multi-step schedules; μP for learning-rate transfer</td><td>One stable-phase run gives many finished models; tuned settings carry over across sizes</td></tr>
+<tr><td>Continued pretraining (new language, code, long context)</td><td>Re-warmup from a low learning rate, then decay again; a WSD stable-phase checkpoint is the best start [Likely]</td><td>A cosine-finished model has a tiny learning rate; jumping back to the peak causes a spike</td></tr>
+<tr><td>Vision transformers and VLM encoders</td><td>QK-norm (ViT-22B), careful warmup, low learning rate for the pretrained encoder</td><td>Attention-logit growth was first a large-ViT problem</td></tr>
+<tr><td>Video models (action recognition, video retrieval, key-moment detection)</td><td>Very long token sequences per clip; QK-norm and z-loss as for LLMs; often a frozen or low-learning-rate image encoder [Likely]</td><td>Many tokens per sample means large attention logits and noisy, memory-limited small batches</td></tr>
+<tr><td>Mixture-of-Experts models</td><td>Router z-loss on the router logits, plus the same recipe [Likely]</td><td>Router logits drift like output logits; see <a href="../transformers/index.html#row-mixture-of-experts-moe" title="Mixture of Experts (MoE) (planned)">session 29</a></td></tr>
+<tr><td>Fine-tuning and RL</td><td>Much lower peak learning rate, short warmup, clipping</td><td>The model is already good; big steps cause forgetting or collapse</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Copying “std 0.02” without checking the width.</b> It equals the fan-in rule only near width 2,500. It works in Pre-LN transformers because the norms hide it, but it is not a universal constant. If you remove norms or change the architecture, recheck formula (36.1).</li>
+<li><b>Forgetting the residual scaling when adding depth.</b> Without it, the stream variance grows with \(2L\) (formula 36.3), and deeper models are harder to train.</li>
+<li><b>Tuning the learning rate on a small SP model and using it on a big one.</b> In SP the optimum moves down with width (Figure 5 and the code output); the big model will be unstable. Either use μP or fit how the best learning rate scales with size.</li>
+<li><b>Relying on clipping alone.</b> Clipping at 1.0 did not prevent PaLM’s spikes. For Adam, the update size is set by \(\hat m/\sqrt{\hat v}\), which clipping barely changes (Figure 3).</li>
+<li><b>Resuming a finished cosine run at the peak learning rate.</b> The sudden jump causes a spike. Re-warm up, or keep a stable-phase (WSD) checkpoint for later continuation.</li>
+<li><b>No deterministic data order.</b> Restart-and-skip needs to know exactly which batches came before the spike. Make the batch a function of the step number, as PaLM did.</li>
+<li><b>Looking only at the loss.</b> The gradient norm, the max attention logit and the mean \(\log Z\) usually start to rise well before the loss spikes. Log them from step one.</li>
+<li><b>Half-implementing μP.</b> One layer left in SP (often the output layer or the attention scaling) silently breaks transfer. Run a coordinate check before trusting the transfer.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why does initialization variance need to depend on width?<span class="lvl">basic</span></summary><div class="ans">Each output of a linear layer is a sum of \(n\) terms, so its variance is \(n\sigma^2\) times the input variance (formula 36.1). To keep signals the same size through many layers, \(n\sigma^2\) should be about 1, which means \(\sigma = 1/\sqrt{n}\) (or \(\sqrt{2/n}\) with ReLU). A fixed \(\sigma\) such as 0.02 is only right near width 2,500; at width 768 the variance shrinks by 0.31 per layer, at 8,192 it grows by 3.28. In a plain stack of 32 layers these factors become \(10^{-8}\) to \(10^{8}\) changes in std.</div></details>
+<details class="qa"><summary>Why do GPT-style models scale the output projection of each block by \(1/\sqrt{2L}\)?<span class="lvl">core</span></summary><div class="ans">The residual stream is the embedding plus \(2L\) edits (attention and MLP in each of \(L\) blocks). At init, the edit variances add, so the stream variance grows like \(1 + 2Lv\). Scaling the std of each sub-layer’s output projection by \(1/\sqrt{2L}\) makes each edit’s variance proportional to \(1/(2L)\), so the total is independent of depth. GPT-2 introduced this; nanoGPT uses \(0.02/\sqrt{2L}\). It is a default, not a law: OLMo 2 found plain 0.02 everywhere worked better for them.</div></details>
+<details class="qa"><summary>Cosine vs warmup-stable-decay: which and why?<span class="lvl">core</span></summary><div class="ans">Both work; final quality is similar when tuned. Cosine needs the total step count in advance and gives smooth loss curves. WSD holds the peak and decays only at the end, so a stable-phase checkpoint can be continued or quickly “finished” with a short decay; one run can serve several token budgets, which is useful for scaling-law work and continued pretraining. Its loss looks worse than cosine until the decay, then drops quickly, because decay lowers the noise floor (formula 36.5). DeepSeek LLM’s multi-step schedule has the same reuse benefit and matched cosine.</div></details>
+<details class="qa"><summary>Why does lowering the learning rate at the end reduce the loss so much?<span class="lvl">core</span></summary><div class="ans">With noisy gradients the weights never sit exactly at a minimum; they bounce in a cloud whose average excess loss is about \(\eta\sigma^2/4\) per direction for SGD (formula 36.5). That floor is proportional to the learning rate. Decaying \(\eta\) shrinks the cloud and the loss drops, even if the model is not learning anything “new” in that phase. That is why the loss falls fast during the decay of WSD.</div></details>
+<details class="qa"><summary>Your loss spiked at step 80,000 of a large run. What do you do?<span class="lvl">core</span></summary><div class="ans">First, look at the logs before the spike: gradient norm, max attention logit per layer, mean \(\log Z\), update-to-weight ratios. If the loss does not recover, reload a checkpoint from before the first sign of trouble (PaLM went back about 100 steps), skip the batches around the spike (PaLM skipped 200 to 500), and continue. If it repeats, lower the learning rate or \(\beta_2\) from that point. If attention logits were growing, plan QK-norm for the next run; if \(\log Z\) was drifting, add z-loss. Keep a deterministic data loader and frequent checkpoints so this is possible, and record every intervention.</div></details>
+<details class="qa"><summary>Why does gradient clipping not prevent all loss spikes with Adam?<span class="lvl">advanced</span></summary><div class="ans">Adam’s update is \(\hat m/\sqrt{\hat v}\): it divides the gradient by its own running size. Clipping rescales the gradient, but the ratio barely changes. After a long quiet period, a burst of large gradients produces steps up to \((1-\beta_1)/\sqrt{1-\beta_2}\) times normal on the first step (3.16 for \(\beta_2 = 0.999\)), and more if the burst lasts, because \(\mathbf{m}\) catches up faster than \(\mathbf{v}\). In the toy of Figure 3, a 10-step burst gives steps of 6.5 times normal with \(\beta_2 = 0.999\) and 1.03 with 0.95. So lower \(\beta_2\) and a lower learning rate are stronger fixes; PaLM had clipping on and still saw about 20 spikes.</div></details>
+<details class="qa"><summary>What is z-loss, and what exactly does its gradient do?<span class="lvl">core</span></summary><div class="ans">z-loss adds \(\alpha(\log Z)^2\) to the loss, where \(Z\) is the softmax normalizer of the output logits; PaLM used \(\alpha = 10^{-4}\). Cross-entropy is invariant to adding a constant to all logits, so the logits can drift to large values where BF16 is coarse. The z-loss gradient is \(2\alpha \log Z\, p_i\) on logit \(i\) (formula 36.8); it sums to \(2\alpha\log Z\), so it moves the average logit back toward \(\log Z = 0\), the one direction cross-entropy cannot see. It is cheap and does not change the model’s predictions.</div></details>
+<details class="qa"><summary>How does QK-norm stop attention entropy collapse?<span class="lvl">core</span></summary><div class="ans">Attention scores are \(\mathbf{q}\cdot\mathbf{k}/\sqrt{d_h}\); if \(W_Q\) and \(W_K\) grow by \(g\), the scores grow by \(g^2\), softmax becomes one-hot, its gradients vanish and training becomes unstable. QK-norm applies RMSNorm to each head’s \(\mathbf{q}\) and \(\mathbf{k}\) (formula 36.9), so the scores depend only on their directions and on slowly-learned gains. Weight growth in \(W_Q, W_K\) no longer reaches the softmax. Used in ViT-22B, OLMo 2 and Qwen3.</div></details>
+<details class="qa"><summary>What is μP, and why does the best learning rate move with width without it?<span class="lvl">advanced</span></summary><div class="ans">In standard parameterization, an Adam step changes each weight by about \(\eta\). For a hidden layer, the update is aligned with the input, so the \(n\) small changes add up coherently: \(|\Delta h|/|h| \approx 0.8\,\eta n\) after the first step (formula 36.10). Wider layers therefore need a proportionally smaller learning rate, and the optimum shifts. μP (Maximal Update Parameterization) rescales per-layer learning rates and inits so updates have the same effect at every width: for Adam, hidden and output learning rates scale as \(1/n\), the output layer’s init variance as \(1/n^2\), and attention uses \(1/d_h\). Then the best settings found on a small proxy transfer to the large model (μTransfer).</div></details>
+<details class="qa"><summary>Which hyperparameters transfer with μP, and which do not?<span class="lvl">advanced</span></summary><div class="ans">Across width: learning rate, init scales, and parameter multipliers (for example the output-logit multiplier) transfer with theoretical support. Transfer across depth, batch size, training length and sequence length was validated only empirically, on transformers. Regularization settings such as dropout and weight decay do not transfer. μP also does not choose model size or token count; that is the job of scaling laws. The paper’s headline: tuning on a 40M proxy beat published GPT-3 6.7B numbers with tuning cost 7% of pretraining.</div></details>
+<details class="qa"><summary>Why do large runs use \(\beta_2 = 0.95\) rather than 0.999, and what did PaLM do instead?<span class="lvl">advanced</span></summary><div class="ans">\(\beta_2 = 0.999\) averages squared gradients over about 1,000 steps, so when gradients suddenly grow, \(\hat v\) lags and updates become several times too large (formula 36.6, Figure 3). 0.95 averages over about 20 steps and adapts quickly. PaLM used Adafactor with \(\beta_2 = 1 - k^{-0.8}\), which starts low and rises toward 1, because rare embedding tokens have poorly estimated second moments over short windows; it balances quick adaptation early with a long memory later.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A plain linear stack of width 2,048 uses std 0.02. By what factor does the std change per layer, and after 24 layers?</li>
+<li>A GPT-style model has 24 blocks. With the GPT-2/nanoGPT rule, what init std do the attention output and MLP down-projections get?</li>
+<li>A WSD run has 100,000 steps, peak \(3 \times 10^{-4}\), and decays linearly to 0 over the last 20%. What is the learning rate at step 90,000?</li>
+<li>Using formula (36.6), what is the largest first-step burst update (in units of \(\eta\)) for \(\beta_1 = 0.9\), \(\beta_2 = 0.98\)?</li>
+<li>During training, the mean \(\log Z\) is 20. With \(\alpha = 10^{-4}\), what is the z-loss, and what is the sum of its gradient over all logits?</li>
+<li>On a μP proxy of width 256, the best hidden learning rate is \(2^{-7}\). What hidden learning rate and output-layer init std does the width-4,096 target use?</li>
+<li>A logit of about 200 is stored in BF16. What is the spacing between representable numbers there? (BF16 has 8 significant bits.)</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Variance factor \(2048 \times 0.02^2 = 0.819\), std factor \(\sqrt{0.819} = 0.905\); after 24 layers \(0.905^{24} \approx 0.091\): the signal shrinks to about 9%. 2. \(2L = 48\) residual layers: \(0.02/\sqrt{48} = 0.00289\). 3. The decay starts at step 80,000 and lasts 20,000 steps; at 90,000 we are halfway: \(3 \times 10^{-4} \times 0.5 = 1.5 \times 10^{-4}\). 4. \(0.1/\sqrt{0.02} = 0.707\). 5. z-loss \(= 10^{-4} \times 400 = 0.04\); gradient sum \(2 \times 10^{-4} \times 20 = 0.004\), pushing the logits down. 6. Hidden learning rate \(2^{-7} \times 256/4096 = 4.88 \times 10^{-4}\); output init variance \(\propto 1/n^2\), so std \(1/4096 = 2.44 \times 10^{-4}\) (up to the constant multiplier tuned on the proxy). 7. 200 is in \([128, 256)\), so the spacing is \(2^{7-7} = 1\): only whole numbers can be stored.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Initialization variance must scale like \(1/n\) to keep signals the same size (36.1, 36.2). Std 0.02 equals that only near width 2,500; Pre-LN hides the difference at init. Scaled residual init (36.3) keeps the stream from growing with depth.</li>
+<li>Warmup protects the first steps; decay lowers the noise floor, which is proportional to \(\eta\) (36.5). WSD (36.4) and multi-step schedules match cosine and let you reuse or extend runs.</li>
+<li>Loss spikes come from fragile model states plus unusual batches: Adam after a quiet period (36.6), growing attention logits, drifting output logits.</li>
+<li>Fixes: \(\beta_2 = 0.95\) and a lower learning rate (strong), z-loss (36.7, 36.8) for output logits, QK-norm (36.9) for attention logits, clipping (weak against Adam), and restart-and-skip as a last resort.</li>
+<li>In standard parameterization, Adam updates change hidden layers by about \(0.8\,\eta n\) (36.10), so the best learning rate moves with width. μP (36.11) rescales learning rates and inits per layer type so the best settings found on a small proxy transfer to the big model.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \operatorname{Var}(y) = n\sigma^2\operatorname{Var}(x), \quad \sigma_{\text{out}} = \frac{\sigma}{\sqrt{2L}}, \quad \E[\text{loss}] \approx \frac{\eta\sigma^2}{4}, \quad \frac{|\Delta\theta|}{\eta} \to \frac{1-\beta_1}{\sqrt{1-\beta_2}} \]</div>
+<div class="eq">\[ \mathcal{L} = \mathcal{L}_{\text{CE}} + \alpha(\log Z)^2, \quad \frac{|\Delta h|}{|h|} \approx 0.8\,\eta\, n, \quad \eta_{\text{hidden}}(n) = \eta_{\text{base}}\frac{n_0}{n} \]</div>
+<h2 class="plain" id="training-recipe-and-stability-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Yang et al. (2022). <a href="https://arxiv.org/abs/2203.03466" target="_blank" rel="noopener">Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Stanford (2025). <a href="https://stanford-cs336.github.io/" target="_blank" rel="noopener">CS336: Language Modeling from Scratch (course)</a></li><li>Yang et al. (2022). <a href="https://arxiv.org/abs/2203.03466" target="_blank" rel="noopener">Tensor Programs V: Tuning Large Neural Networks via Zero-Shot Hyperparameter Transfer</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Stanford (2025). <a href="https://stanford-cs336.github.io/" target="_blank" rel="noopener">CS336: Language Modeling from Scratch (course)</a></li><li>Chowdhery et al. (2022). <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">PaLM: Scaling Language Modeling with Pathways</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Team OLMo (Walsh et al.) (2024). <a href="https://arxiv.org/abs/2501.00656" target="_blank" rel="noopener">2 OLMo 2 Furious</a></li><li>Wortsman et al. (2023). <a href="https://arxiv.org/abs/2309.14322" target="_blank" rel="noopener">Small-scale proxies for large-scale Transformer training instabilities</a></li><li>Molybog et al. (2023). <a href="https://arxiv.org/abs/2304.09871" target="_blank" rel="noopener">A Theory on Adam Instability in Large-Scale Machine Learning</a></li><li>Dehghani et al. (2023). <a href="https://arxiv.org/abs/2302.05442" target="_blank" rel="noopener">Scaling Vision Transformers to 22 Billion Parameters</a></li><li>Henry, Dachapally, Pawar, Chen (2020). <a href="https://arxiv.org/abs/2010.04245" target="_blank" rel="noopener">Query-Key Normalization for Transformers</a></li><li>Radford et al. (2019). <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener">Language Models are Unsupervised Multitask Learners</a></li><li>Hu et al. (2024). <a href="https://arxiv.org/abs/2404.06395" target="_blank" rel="noopener">MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies</a></li><li>DeepSeek-AI (2024). <a href="https://arxiv.org/abs/2401.02954" target="_blank" rel="noopener">DeepSeek LLM: Scaling Open-Source Language Models with Longtermism</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">Llama 2: Open Foundation and Fine-Tuned Chat Models</a></li><li>Xiong et al. (2020). <a href="https://arxiv.org/abs/2002.04745" target="_blank" rel="noopener">On Layer Normalization in the Transformer Architecture</a></li></ol><nav class="pn" aria-label="Previous and next session"><span class="prev"><small>Previous · session 35, planned</small>Scaling laws</span><span class="next"><small>Next · session 37, planned</small>Numbers on GPUs: FP32, TF32, FP16, BF16, FP8 and mixed precision</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="training-recipe-and-stability"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+function seg(el,cb){const bs=[...el.querySelectorAll("button")];bs.forEach(b=>b.addEventListener("click",()=>{bs.forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);}));return()=>bs.find(b=>b.getAttribute("aria-pressed")==="true").dataset.v;}
+const sci=(v,d=2)=>{if(!Number.isFinite(v))return"∞";if(v===0)return"0";const e=Math.floor(Math.log10(Math.abs(v)));if(e>=-2&&e<4)return v.toFixed(Math.max(0,d+1-Math.max(0,e+1))).replace(/\.?0+$/,"")||"0";return(v/10**e).toFixed(d)+"×10<sup>"+e+"</sup>";};
+const fx=(v,d=3)=>v.toFixed(d).replace("-","−");
+const store=R.__tr={};
+/* ---------- Figure 1: activation size through a deep plain stack ---------- */
+(function(){
+ const svg=$("#tr-init-svg");if(!svg)return;const info=$("#tr-init-info"),W=$("#tr-init-n");
+ let init="002",act="lin";
+ const gI=seg($("#tr-init-type"),v=>{init=v;draw();}),gA=seg($("#tr-init-act"),v=>{act=v;draw();});
+ const L=32,Bt=4;
+ function sim(n){const sigma=init==="002"?0.02:init==="lecun"?1/Math.sqrt(n):Math.sqrt(2/n);
+  const g=gauss(rng(1234+n));let x=new Float64Array(Bt*n);for(let i=0;i<x.length;i++)x[i]=g();
+  const std=a=>{let s=0;for(let i=0;i<a.length;i++)s+=a[i]*a[i];return Math.sqrt(s/a.length);};
+  const out=[std(x)];const w=new Float64Array(n);
+  for(let l=0;l<L;l++){const y=new Float64Array(Bt*n);
+   for(let i=0;i<n;i++){for(let j=0;j<n;j++)w[j]=sigma*g();
+    for(let b=0;b<Bt;b++){let s=0;const o=b*n;for(let j=0;j<n;j++)s+=w[j]*x[o+j];y[o+i]=act==="lin"?s:act==="relu"?(s>0?s:0):Math.tanh(s);}}
+   x=y;out.push(std(x));}
+  return{out,sigma};}
+ function draw(){const n=2**(+W.value);$("#tr-init-nv").value=n;const {out,sigma}=sim(n);
+  const c=act==="relu"?Math.SQRT1_2:1;const gain=sigma*Math.sqrt(n)*c;
+  const X=l=>50+l*(570/L),Y=v=>{const lv=Math.max(-12,Math.min(12,Math.log10(Math.max(v,1e-300))));return 114-lv*8.6;};
+  let g=`<line x1="50" x2="620" y1="${Y(1)}" y2="${Y(1)}" stroke="var(--rule)" stroke-dasharray="4 4"/>`;
+  [-12,-8,-4,0,4,8,12].forEach(e=>{g+=`<text x="44" y="${Y(10**e)+4}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">10${e===0?"⁰":e>0?sup(e):"⁻"+sup(-e)}</text><line x1="48" x2="52" y1="${Y(10**e)}" y2="${Y(10**e)}" stroke="var(--muted)"/>`;});
+  [0,8,16,24,32].forEach(l=>{g+=`<text x="${X(l)}" y="238" font-size="11" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">${l}</text>`;});
+  g+=`<text x="335" y="252" font-size="12" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">layer</text>`;
+  g+=`<polyline points="${out.map((v,l)=>X(l)+","+Y(v).toFixed(1)).join(" ")}" fill="none" stroke="var(--q)" stroke-width="2.6"/>`+out.map((v,l)=>`<circle cx="${X(l)}" cy="${Y(v).toFixed(1)}" r="2.6" fill="var(--q)"/>`).join("");
+  if(act!=="tanh"){g+=`<polyline points="${out.map((_,l)=>X(l)+","+Y(out[0]*gain**l).toFixed(1)).join(" ")}" fill="none" stroke="var(--k)" stroke-width="2" stroke-dasharray="6 5"/>`;}
+  svg.innerHTML=g;const last=out[L];store.init={n,init,act,last,pred:act==="tanh"?null:out[0]*gain**L,gain};
+  info.innerHTML=`Width n = ${n}, init std σ = ${sigma.toFixed(4)}, so n·σ² = ${(n*sigma*sigma).toFixed(3)}. `+
+   (act==="tanh"?`Std after layer 32: <b>${sci(last)}</b> (tanh: no simple formula; it saturates near 1 or shrinks toward 0).`:
+   `Per-layer gain σ√n${act==="relu"?"/√2":""} = ${gain.toFixed(3)}. Std after layer 32: measured <b>${sci(last)}</b>, formula (36.2) predicts ${sci(out[0]*gain**L)}.`);}
+ function sup(k){return String(k).split("").map(ch=>"⁰¹²³⁴⁵⁶⁷⁸⁹"[+ch]).join("");}
+ W.addEventListener("input",draw);draw();
+})();
+/* ---------- Figure 2: schedules on a noisy quadratic ---------- */
+(function(){
+ const svg=$("#tr-wsd-svg");if(!svg)return;const info=$("#tr-wsd-info"),DF=$("#tr-wsd-d"),NS=$("#tr-wsd-s");
+ const T=3000,Wm=30,D=40,lam=[...Array(D)].map((_,i)=>10**(-3+3*i/(D-1)));
+ function lr(kind,t,dfrac){if(t<Wm)return(t+1)/Wm;const p=(t-Wm)/(T-Wm);
+  if(kind==="const")return 1;if(kind==="cos")return 0.5*(1+Math.cos(Math.PI*p));
+  const ds=T-Math.round(dfrac*T);return t<ds?1:Math.max(0,1-(t-ds)/(T-ds));}
+ function run(kind,dfrac,sig){const g=gauss(rng(2024));const x=Float64Array.from(lam,l=>1/Math.sqrt(l));const loss=[];
+  for(let t=0;t<T;t++){const e=lr(kind,t,dfrac);let L=0;for(let i=0;i<D;i++){const gr=lam[i]*x[i]+sig*g();x[i]-=e*gr;}
+   for(let i=0;i<D;i++)L+=0.5*lam[i]*x[i]*x[i];loss.push(L);}return loss;}
+ function draw(){const dfrac=+DF.value/100,sig=+NS.value;$("#tr-wsd-dv").value=DF.value+"%";$("#tr-wsd-sv").value=sig.toFixed(2);
+  const ks=[["const","var(--muted)"],["cos","var(--q)"],["wsd","var(--k)"]];const res={};ks.forEach(([k])=>res[k]=run(k,dfrac,sig));
+  const X=t=>50+t*(570/T),lo=-2,hi=1.4,Y=v=>{const l=Math.log10(Math.max(v,1e-9));return 18+(hi-Math.max(lo,Math.min(hi,l)))/(hi-lo)*172;};
+  const YL=v=>300-v*70;
+  let g="";[-2,-1,0,1].forEach(e=>{g+=`<line x1="50" x2="620" y1="${Y(10**e)}" y2="${Y(10**e)}" stroke="var(--rule)" stroke-width="0.8"/><text x="44" y="${Y(10**e)+4}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">${10**e>=1?10**e:(10**e).toString()}</text>`;});
+  g+=`<text x="50" y="12" font-size="12" fill="var(--muted)" font-family="var(--sans)">loss (log scale)</text><text x="50" y="222" font-size="12" fill="var(--muted)" font-family="var(--sans)">learning rate ÷ peak</text>`;
+  g+=`<line x1="50" x2="620" y1="${YL(0)}" y2="${YL(0)}" stroke="var(--rule)"/>`;
+  ks.forEach(([k,c])=>{const L=res[k];let p="";for(let t=0;t<T;t+=6)p+=X(t).toFixed(1)+","+Y(L[t]).toFixed(1)+" ";p+=X(T-1)+","+Y(L[T-1]).toFixed(1);
+   g+=`<polyline points="${p}" fill="none" stroke="${c}" stroke-width="${k==="const"?1.6:2.2}"/>`;
+   let q="";for(let t=0;t<T;t+=10)q+=X(t).toFixed(1)+","+YL(lr(k,t,dfrac)).toFixed(1)+" ";q+=X(T-1)+","+YL(lr(k,T-1,dfrac)).toFixed(1);
+   g+=`<polyline points="${q}" fill="none" stroke="${c}" stroke-width="1.8" opacity="0.9"/>`;});
+  [0,1000,2000,3000].forEach(t=>{g+=`<text x="${X(t)}" y="316" font-size="11" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">${t}</text>`;});
+  svg.innerHTML=g;const ds=T-Math.round(dfrac*T);const f=k=>res[k][T-1];
+  store.wsd={dfrac,sig,const:f("const"),cos:f("cos"),wsd:f("wsd"),wsdBefore:res.wsd[ds-1],cosAtDs:res.cos[ds-1]};
+  info.innerHTML=`Final loss after ${T} steps: constant <b>${f("const").toFixed(4)}</b>, cosine <b>${f("cos").toFixed(4)}</b>, WSD <b>${f("wsd").toFixed(4)}</b>. `+
+   `Just before the WSD decay starts (step ${ds}), WSD is at ${res.wsd[ds-1].toFixed(4)} while cosine is at ${res.cos[ds-1].toFixed(4)}: WSD looks worse until it decays.`;}
+ DF.addEventListener("input",draw);NS.addEventListener("input",draw);draw();
+})();
+/* ---------- Figure 3: Adam after a quiet period ---------- */
+(function(){
+ const svg=$("#tr-adam-svg");if(!svg)return;const info=$("#tr-adam-info"),SZ=$("#tr-adam-g"),KL=$("#tr-adam-k");
+ let b2=0.999,clip="off";seg($("#tr-adam-b2"),v=>{b2=+v;draw();});seg($("#tr-adam-clip"),v=>{clip=v;draw();});
+ const Q=5000,g0=0.01,AFT=40,PRE=15;
+ function sim(g1,K){let m=0,v=0;const out=[];const c=clip==="off"?Infinity:(+clip)*g0;
+  for(let t=1;t<=Q+K+AFT;t++){let g=(t>Q&&t<=Q+K)?g1:g0;if(Math.abs(g)>c)g=Math.sign(g)*c;
+   m=0.9*m+0.1*g;v=b2*v+(1-b2)*g*g;const u=(m/(1-0.9**t))/(Math.sqrt(v/(1-b2**t))+1e-8);if(t>Q-PRE)out.push(u);}return out;}
+ function draw(){const fac=10**(+SZ.value),K=+KL.value,g1=g0*fac;$("#tr-adam-gv").value="×"+Math.round(fac);$("#tr-adam-kv").value=K;
+  const u=sim(g1,K);const n=u.length;const mx=Math.max(...u),top=Math.max(2,Math.ceil(mx+0.5));
+  const X=i=>50+i*(570/(n-1)),Y=v=>200-v/top*180;
+  let g=`<rect x="${X(PRE)}" y="20" width="${X(PRE+K-1)-X(PRE)+3}" height="180" fill="var(--k-soft)"/>`;
+  for(let k=0;k<=top;k+=top>8?2:1)g+=`<line x1="50" x2="620" y1="${Y(k)}" y2="${Y(k)}" stroke="var(--rule)" stroke-width="0.8"/><text x="44" y="${Y(k)+4}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">${k}</text>`;
+  g+=`<line x1="50" x2="620" y1="${Y(1)}" y2="${Y(1)}" stroke="var(--muted)" stroke-dasharray="5 4"/>`;
+  g+=`<polyline points="${u.map((v,i)=>X(i).toFixed(1)+","+Y(v).toFixed(1)).join(" ")}" fill="none" stroke="var(--k)" stroke-width="2.4"/>`;
+  g+=`<text x="${X(PRE)+4}" y="34" font-size="12" fill="var(--ink2)" font-family="var(--sans)">burst</text><text x="50" y="222" font-size="12" fill="var(--muted)" font-family="var(--sans)">steps around the burst (${n} steps shown)</text>`;
+  svg.innerHTML=g;const win=u.slice(PRE);const tot=win.reduce((a,b)=>a+b,0);
+  store.adam={b2,clip,g1,K,max:mx,total:tot,steps:win.length};
+  info.innerHTML=`Update size in units of η. Normal steps are 1.00. Largest step during the burst: <b>${mx.toFixed(2)}</b>. `+
+   `Total movement over the ${win.length} steps from the burst on: <b>${tot.toFixed(1)}</b> (a steady gradient would give ${win.length}). One-step limit (1 − β₁)/√(1 − β₂) = ${(0.1/Math.sqrt(1-b2)).toFixed(2)}.`;}
+ SZ.addEventListener("input",draw);KL.addEventListener("input",draw);draw();
+})();
+/* ---------- Figure 4: z-loss and BF16 logits ---------- */
+(function(){
+ const svg=$("#tr-z-svg");if(!svg)return;const info=$("#tr-z-info"),SH=$("#tr-z-s");
+ const base=[3,1,0.5,-1,-2];const f32=new Float32Array(1),u32=new Uint32Array(f32.buffer);
+ function bf16(x){f32[0]=x;let b=u32[0];const lsb=(b>>>16)&1;b=(b+0x7FFF+lsb)>>>0;u32[0]=(b&0xFFFF0000)>>>0;return f32[0];}
+ const lse=z=>{const M=Math.max(...z);return M+Math.log(z.reduce((a,v)=>a+Math.exp(v-M),0));};
+ function draw(){const s=+SH.value;$("#tr-z-sv").value=s;const z=base.map(v=>v+s),zb=z.map(bf16);
+  const L=lse(z),Lb=lse(zb),ce=L-z[0],ceb=Lb-zb[0],a=1e-4,zl=a*L*L,p0=Math.exp(z[0]-L),gz=2*a*L*p0;
+  const sp=2**(Math.floor(Math.log2(Math.max(Math.abs(z[0]),1e-30)))-7);
+  const X=i=>90+i*110,Y=v=>170-(v-s)*28;
+  let g=`<line x1="40" x2="620" y1="${Y(s)}" y2="${Y(s)}" stroke="var(--rule)"/><text x="636" y="${Y(s)-6}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">shift = ${s}</text>`;
+  base.forEach((v,i)=>{const h=v*28;g+=`<rect x="${X(i)-22}" y="${h>=0?Y(z[i]):Y(s)}" width="44" height="${Math.abs(h)}" rx="4" fill="${i===0?"var(--q)":"var(--q-soft)"}" stroke="var(--q)"/>`;
+   const yb=Y(zb[i]);g+=`<line x1="${X(i)-30}" x2="${X(i)+30}" y1="${Math.max(10,Math.min(250,yb))}" y2="${Math.max(10,Math.min(250,yb))}" stroke="var(--k)" stroke-width="3"/>`;
+   g+=`<text x="${X(i)}" y="274" font-size="12" text-anchor="middle" fill="var(--ink2)" font-family="var(--mono)">${z[i].toFixed(1)}</text><text x="${X(i)}" y="292" font-size="12" text-anchor="middle" fill="var(--k)" font-family="var(--mono)">${zb[i]}</text>`;});
+  g+=`<text x="40" y="274" font-size="11" fill="var(--muted)" font-family="var(--sans)">FP32</text><text x="40" y="292" font-size="11" fill="var(--k)" font-family="var(--sans)">BF16</text>`;
+  svg.innerHTML=g;store.z={s,logZ:L,ce,ceb,zl,gz,sp};
+  info.innerHTML=`log Z = <b>${L.toFixed(3)}</b>. Cross-entropy for the target (first bar): <b>${ce.toFixed(4)}</b> in FP32, <b>${ceb.toFixed(4)}</b> with the logits stored in BF16 (rounding step ${sp} at this size). `+
+   `z-loss with α = 10<sup>−4</sup>: <b>${zl.toFixed(6)}</b>; it pushes every logit down with gradient 2α·log Z·p<sub>i</sub> (${gz.toFixed(6)} on the target).`;}
+ SH.addEventListener("input",draw);draw();
+})();
+/* ---------- Figure 5: one Adam step, SP vs muP ---------- */
+(function(){
+ const svg=$("#tr-mup-svg");if(!svg)return;const info=$("#tr-mup-info"),WN=$("#tr-mup-n"),LR=$("#tr-mup-lr");
+ const N0=256,ROWS=256,cache={};
+ function stats(k){if(cache[k])return cache[k];const n=2**k,g=gauss(rng(900+k));const x=new Float64Array(n);let ab=0;for(let j=0;j<n;j++){x[j]=g();ab+=Math.abs(x[j]);}
+  let hh=0;for(let r=0;r<ROWS;r++){let s=0;const sd=1/Math.sqrt(n);for(let j=0;j<n;j++)s+=sd*g()*x[j];hh+=s*s;}
+  return cache[k]={n,ab,rms:Math.sqrt(hh/ROWS)};}
+ function ratio(k,eta,mode){const st=stats(k);const e=mode==="mup"?eta*N0/st.n:eta;return e*st.ab/st.rms;}
+ function draw(){const k=+WN.value,eta=2**(+LR.value);$("#tr-mup-nv").value=2**k;$("#tr-mup-lrv").value="2^"+LR.value+" = "+eta.toExponential(1);
+  const X=kk=>60+(kk-6)*(560/8),Y=v=>{const l=Math.log10(Math.max(v,1e-4));return 210-(Math.max(-3,Math.min(2,l))+3)/5*190;};
+  let g="";[-3,-2,-1,0,1,2].forEach(e=>{g+=`<line x1="60" x2="620" y1="${Y(10**e)}" y2="${Y(10**e)}" stroke="var(--rule)" stroke-width="${e===0?1.4:0.8}"/><text x="54" y="${Y(10**e)+4}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">${10**e}</text>`;});
+  for(let kk=6;kk<=14;kk+=2)g+=`<text x="${X(kk)}" y="232" font-size="11" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">${2**kk}</text>`;
+  g+=`<text x="340" y="250" font-size="12" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">width n</text>`;
+  [["sp","var(--muted)"],["mup","var(--k)"]].forEach(([m,c])=>{const pts=[];for(let kk=6;kk<=14;kk++)pts.push([X(kk),Y(ratio(kk,eta,m))]);
+   g+=`<polyline points="${pts.map(p=>p[0]+","+p[1].toFixed(1)).join(" ")}" fill="none" stroke="${c}" stroke-width="2.4"/>`+pts.map(p=>`<circle cx="${p[0]}" cy="${p[1].toFixed(1)}" r="3.4" fill="${c}"/>`).join("");});
+  const rs=ratio(k,eta,"sp"),rm=ratio(k,eta,"mup");g+=`<line x1="${X(k)}" x2="${X(k)}" y1="20" y2="212" stroke="var(--q)" stroke-dasharray="4 4"/>`;
+  svg.innerHTML=g;const st=stats(k);store.mup={n:st.n,eta,sp:rs,mup:rm,meanAbs:st.ab/st.n,rms:st.rms};
+  info.innerHTML=`Width ${st.n}: the hidden vector h has rms <b>${st.rms.toFixed(3)}</b>. After one Adam step with η = ${eta.toExponential(1)}, every entry of h moves by η·Σ|x<sub>j</sub>|. `+
+   `Relative change |Δh|/|h|: standard parameterization <b>${rs.toFixed(3)}</b>, μP (hidden η scaled by ${N0}/${st.n}) <b>${rm.toFixed(3)}</b>.`;}
+ WN.addEventListener("input",draw);LR.addEventListener("input",draw);draw();
+})();
+})();
+</script></body></html>

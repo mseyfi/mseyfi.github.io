@@ -1,0 +1,477 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Counting: parameters, FLOPs and memory of a transformer · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../transformers/index.html">Attention and transformers</a><span class="sep">/</span><span>Session 25</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="counting-parameters-flops-and-memory-of-a">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="counting-parameters-flops-and-memory-of-a" data-session="counting-parameters-flops-and-memory-of-a" style="--tc:var(--t2)"><header class="chap-head"><div class="chap-kicker"><span class="num">25</span><span>Track 2: Attention and transformers · session 10 of 15</span></div><h1 class="chap-title">Counting: parameters, FLOPs and memory of a transformer</h1><p class="chap-sub">Before you train or serve a model, you can predict its size, its compute bill and its memory needs with a few lines of arithmetic. This session builds those formulas from one matrix multiplication: about 12·d² parameters per layer, 2N FLOPs per token forward, 6N per token in training, plus an attention term that grows with context. We then estimate an 8B model by hand and check the result against its real config file.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 4, 11, 19 and 21 to 23 (backprop and AdamW memory, embeddings, multi-head attention, the FFN, the full transformer)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why a matrix multiplication of shapes (m × k) and (k × n) costs 2mkn FLOPs, and why every other count follows from this</li><li>Parameters per layer: attention 4d², FFN 8d², so about 12·L·d² plus the embedding tables, and how GQA and SwiGLU change the constants</li><li>Forward cost of about 2N FLOPs per token, training cost of about 6N per token, so C ≈ 6ND for a whole run</li><li>The attention term 4·L·T·d per token, which grows with context length and passes the weight FLOPs near T = 6d</li><li>Memory: bytes per parameter, 16 bytes per parameter for AdamW training, activation memory, and the KV cache</li><li>How to turn a FLOP count into GPU-days with model FLOPs utilization (MFU)</li><li>A full worked example: Llama 3 8B estimated by hand and checked against its config.json</li></ul></div></header><style>
+.cp-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px;margin-top:10px}
+.cp-card{background:var(--paper2);border-radius:10px;padding:8px 12px;font:500 14px/1.4 var(--sans);color:var(--ink2)}
+.cp-card b{display:block;font:700 17px var(--mono);color:var(--ink)}
+.cp-tab{font:500 14px/1.5 var(--mono);border-collapse:collapse;width:100%;margin-top:8px}
+.cp-tab td{padding:3px 8px;border-bottom:1px solid var(--rule)}
+.cp-tab td:last-child{text-align:right}
+.cp-tab tr.on td{background:color-mix(in srgb,var(--tc) 16%,var(--card));font-weight:700}
+.cp-tab tr.sum td{font-weight:700;border-top:2px solid var(--muted)}
+.cp-sel{font:600 14px var(--sans);padding:4px 8px;border-radius:8px;border:1px solid var(--rule);background:var(--card);color:var(--ink)}
+.article pre.code,.article code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Before anyone trains or serves a large model, they ask three questions. How many numbers (parameters) does it have? How much arithmetic (FLOPs) does it need? How much GPU memory does it need? You can answer all three on one sheet of paper, from the model’s config file and a few rules. This session gives you those rules.</p>
+<p>The rules are short. A transformer layer of width \(d\) has about \(12d^2\) parameters. A forward pass costs about \(2N\) floating-point operations (FLOPs) per token, where \(N\) is the number of parameters. Training costs about \(6N\) per token, so a whole training run on \(D\) tokens costs about \(6ND\). Attention adds an extra term that grows with the context length. Memory is bytes per parameter, plus activations, plus (at inference) the KV cache.</p>
+<ul><li><b>Planning.</b> A team with 1,024 GPUs and one month must pick a model size and a token count that fit. The formula \(C \approx 6ND\) does that in one line. Scaling laws (<a href="../pretraining/index.html#row-scaling-laws" title="Scaling laws (planned)">session 35</a>) are written in exactly these units.</li>
+<li><b>Debugging.</b> If your training run reaches 15% of the GPU’s peak speed, is that bad? You can only tell if you know how many FLOPs one step should take. This ratio is called MFU (<a href="../pretraining/index.html#row-distributed-checkpoints-fault-tolerance-and-mfu" title="Distributed checkpoints, fault tolerance and MFU (planned)">session 51</a>).</li>
+<li><b>Serving.</b> Will an 8B model with 32 users at 8k context fit on one 80 GB GPU? Weights plus KV cache tells you in a minute (<a href="../inference/index.html#row-the-kv-cache" title="The KV cache (planned)">session 80</a>).</li>
+<li><b>Interviews.</b> “How many parameters does Llama 3 8B have, from its config?”, “Why 6N?”, “How much memory to fine-tune a 7B model with Adam?”, “When does attention dominate the compute?”. These are among the most common LLM interview questions. By the end you can answer each one with a formula and a number.</li></ul>
+<aside class="note analogy side"><span class="nt">Analogy</span>A builder can estimate the cost of a house from its floor area before drawing a single wall: so many euros per square meter, plus extra for the roof. Here the “floor area” is \(d^2\) per layer, the price per square meter is 12 parameters, and the roof is the embedding table. The estimate is not exact, but it is within a few percent, and it is fast.</aside>
+<p>In <a href="../transformers/the-full-transformer-and-its-three-families.html">Session 23</a> we put the pieces together into one block and one stack. In <a href="../transformers/encoder-decoder-in-depth-t5-span-corruption.html">Session 24</a> we saw a second family with cross-attention. Now we count everything inside a decoder-only stack. The next session, <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">Session 26</a>, uses these counts to explain why MQA, GQA and MLA exist: they shrink the KV cache that we measure here.</p>
+
+<h2>The one rule behind all counts: a matrix multiply</h2>
+<p>Almost all compute in a transformer is matrix multiplication. So we start there. Take \(A\) with shape \(m \times k\) and \(B\) with shape \(k \times n\). Each of the \(m \cdot n\) entries of \(AB\) is a dot product of length \(k\): \(k\) multiplications and \(k\) additions (strictly \(k-1\), but we round). One multiplication plus one addition is called a <b>multiply-add</b>, and we count it as <b>2 FLOPs</b>:</p>
+<div class="eq">\[ \mathrm{FLOPs}(A B) = 2\,m\,k\,n, \qquad A \in \R^{m \times k},\; B \in \R^{k \times n} \tag{25.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>FLOP</dt><dd>one floating-point operation: one addition or one multiplication. “FLOPs” (lower-case s) is a count; “FLOP/s” is a speed (operations per second).</dd>
+<dt>\(m\)</dt><dd>the number of rows of the input. For a linear layer applied to a batch, \(m\) is the number of tokens.</dd>
+<dt>\(k\)</dt><dd>the shared (inner) size that is summed over</dd>
+<dt>\(n\)</dt><dd>the number of output columns</dd></dl>
+<p>Now apply it to a linear layer \(\mathbf{y} = \mathbf{x} W\) with \(W \in \R^{d_{\text{in}} \times d_{\text{out}}}\), on one token. Here \(m = 1\), so the cost is \(2\, d_{\text{in}}\, d_{\text{out}}\). But \(d_{\text{in}} \cdot d_{\text{out}}\) is exactly the number of weights in \(W\). So:</p>
+<p style="text-align:center"><b>Each weight of a linear layer costs 2 FLOPs per token in the forward pass: one multiply and one add.</b></p>
+<p>This single sentence explains the “2N” rule later. Everything that is not a matrix multiply (softmax, normalization, activation functions, adding residuals) costs a few FLOPs per <i>number in the activation</i>, not per weight. With \(d\) in the thousands, these are small, and we ignore them. [Certain] They still take time on a GPU, because they read and write memory; that is a different story (<a href="../inference/index.html#row-why-inference-is-slow-three-root-causes" title="Why inference is slow: three root causes and the roofline (planned)">session 82</a>).</p>
+<div class="worked"><div class="wt">Worked example: one projection</div>
+<p>Take \(d = 4096\) and the query projection \(W_Q \in \R^{4096 \times 4096}\). It has \(4096^2 = 16{,}777{,}216\) weights. For one token the forward cost is \(2 \times 16{,}777{,}216 = 33{,}554{,}432\) FLOPs, about 33.6 MFLOPs. For a batch of 8 sequences of 4,096 tokens (\(m = 32{,}768\)) it is \(2 \times 32{,}768 \times 4096 \times 4096 \approx 1.10 \times 10^{12}\) FLOPs: about one second of work at 1 TFLOP/s, or about one millisecond on a modern GPU.</p></div>
+
+<h2>Counting parameters</h2>
+<h3>One block, the classic way</h3>
+<p>Recall the decoder block from <a href="../transformers/the-full-transformer-and-its-three-families.html">session 23</a>: a normalization, multi-head attention, a residual add, another normalization, the feed-forward network (FFN), another residual add. We count the weights of each part, with model width \(d\).</p>
+<p><b>Attention.</b> There are four matrices: \(W_Q, W_K, W_V\) project the input to queries, keys and values, and \(W_O\) projects the concatenated heads back to width \(d\) (<a href="../transformers/multi-head-attention.html">session 19</a>). With \(h\) heads of size \(d_h = d/h\), each projection is \(d \times d\) in total, no matter how many heads. So:</p>
+<div class="eq">\[ N_{\text{attn}} = \underbrace{d^2}_{W_Q} + \underbrace{d^2}_{W_K} + \underbrace{d^2}_{W_V} + \underbrace{d^2}_{W_O} = 4d^2 \tag{25.2} \]</div>
+<p>The number of heads does not change the count. Splitting \(d\) into heads only changes how the numbers are grouped, not how many there are. [Certain]</p>
+<p><b>FFN.</b> The classic FFN (<a href="../transformers/the-feed-forward-network-mlp-inside-each.html">session 21</a>) goes up from \(d\) to \(d_{\text{ff}} = 4d\), applies an activation, and comes back down: two matrices of size \(d \times 4d\):</p>
+<div class="eq">\[ N_{\text{ffn}} = \underbrace{d \cdot 4d}_{\text{up}} + \underbrace{4d \cdot d}_{\text{down}} = 8d^2 \tag{25.3} \]</div>
+<p><b>Normalization.</b> Each LayerNorm has a scale and a shift vector (\(2d\) numbers); an RMSNorm has only a scale (\(d\) numbers). These are tiny: \(2d\) to \(4d\) per block against \(12d^2\). Biases, where models have them, are also of size \(d\) or \(4d\). We ignore all of them in the estimate.</p>
+<p>So one block has \(4d^2 + 8d^2 = 12d^2\) weights. A stack of \(L\) blocks has:</p>
+<div class="eq">\[ N \;\approx\; 12\,L\,d^2 \;+\; \underbrace{|V|\,d}_{\text{input table}} \;+\; \underbrace{|V|\,d}_{\text{output layer, if untied}} \tag{25.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(L\)</dt><dd>the number of transformer blocks (layers)</dd>
+<dt>\(d\)</dt><dd>the model width: the length of the vector each token carries through the residual stream (<code>hidden_size</code> in a config file)</dd>
+<dt>\(12 L d^2\)</dt><dd>the <b>non-embedding</b> parameters: \(4d^2\) attention plus \(8d^2\) FFN, in each of \(L\) blocks. Kaplan et al. (2020) use exactly this count, \(N \approx 12\, n_{\text{layer}}\, d_{\text{model}}^2\). [Certain]</dd>
+<dt>\(|V|\)</dt><dd>the vocabulary size. The input table and the output layer each have \(|V| \cdot d\) numbers. With weight tying they are the same matrix, counted once (<a href="../foundations/embeddings-turning-token-ids-into-vectors.html">session 11</a>).</dd></dl>
+<aside class="note interview side"><span class="nt">Interview tip</span>Say it in one breath: “Per layer, attention is 4d² (Q, K, V, O), the FFN is 8d² (up and down with a 4× expansion), so 12d² per layer, times L, plus |V|·d for each embedding table.” Then give a sanity check: GPT-2 small has \(12 \times 12 \times 768^2 = 84.9\) M block weights plus a 38.6 M tied table, about 124 M.</aside>
+<div class="worked"><div class="wt">Worked example: GPT-2 small, exactly</div>
+<p>GPT-2 small has \(L = 12\), \(d = 768\), \(|V| = 50{,}257\), a learned position table of 1,024 rows, and tied embeddings. [Certain] It also has biases on every linear layer and LayerNorms with scale and shift.</p>
+<p>Attention per block: \(4d^2 + 4d = 2{,}362{,}368\) (weights plus biases). FFN per block: \(8d^2 + 4d + d = 4{,}722{,}432\). Two LayerNorms: \(4d = 3{,}072\). One block: \(7{,}087{,}872\). Twelve blocks: \(85{,}054{,}464\). Token table: \(50{,}257 \times 768 = 38{,}597{,}376\). Position table: \(1{,}024 \times 768 = 786{,}432\). Final LayerNorm: \(1{,}536\). <b>Total: 124,439,808</b>, the famous “124M”.</p>
+<p>The quick estimate: \(12 L d^2 = 84{,}934{,}656\) plus the two tables gives 124,318,464. It misses only the biases and norms: 0.1%.</p></div>
+
+<h3>Modern blocks: GQA and SwiGLU change the constants</h3>
+<p>Models from 2023 on, like Llama 3, Mistral and Qwen, change two parts of the block. The “12” moves a little, so it is worth knowing why.</p>
+<ul><li><b>Grouped-query attention (GQA).</b> The model keeps \(h\) query heads but only \(h_{kv}\) key/value heads, shared by groups of query heads (<a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>). Then \(W_K\) and \(W_V\) are \(d \times h_{kv} d_h\) instead of \(d \times d\). Llama 3 8B has \(h = 32\) and \(h_{kv} = 8\), so \(W_K\) and \(W_V\) are each a quarter of \(d^2\). [Certain]</li>
+<li><b>SwiGLU FFN.</b> A gated FFN has three matrices instead of two: a gate and an “up” matrix, both \(d \times d_{\text{ff}}\), and a “down” matrix \(d_{\text{ff}} \times d\) (Shazeer, 2020). That is \(3\, d\, d_{\text{ff}}\) weights. To keep the classic \(8d^2\), designers pick \(d_{\text{ff}} \approx \tfrac{8}{3} d\). Llama 2 7B uses \(d_{\text{ff}} = 11{,}008 \approx 2.69d\). Llama 3 8B uses a larger \(d_{\text{ff}} = 14{,}336 = 3.5d\). [Certain]</li>
+<li><b>No biases, RMSNorm.</b> The Llama family has no biases in its linear layers and uses RMSNorm (\(d\) numbers each, two per block, plus one at the end). [Certain]</li></ul>
+<p>The general count per block becomes:</p>
+<div class="eq">\[ N_{\text{block}} = \underbrace{2\,d\,(h\,d_h)}_{W_Q,\;W_O} + \underbrace{2\,d\,(h_{kv}\,d_h)}_{W_K,\;W_V} + \underbrace{3\,d\,d_{\text{ff}}}_{\text{SwiGLU}} + \underbrace{2d}_{\text{two RMSNorms}} \tag{25.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(h, d_h\)</dt><dd>the number of query heads and the size of one head; usually \(h \cdot d_h = d\)</dd>
+<dt>\(h_{kv}\)</dt><dd>the number of key/value heads. \(h_{kv} = h\) is classic multi-head attention, \(h_{kv} = 1\) is multi-query attention, anything in between is GQA.</dd>
+<dt>\(d_{\text{ff}}\)</dt><dd>the inner width of the FFN (<code>intermediate_size</code> in a config file)</dd></dl>
+<p>For Llama 3 8B: attention is \(2d^2 + 2 \cdot d \cdot d/4 = 2.5 d^2\) and the FFN is \(3 \times 3.5 d^2 = 10.5 d^2\). So the block has about \(13 d^2\), not \(12 d^2\). GQA saved \(1.5d^2\) in attention, and the bigger FFN spent \(2.5d^2\) more. This is why the quick rule \(12Ld^2\) is about 8% low for Llama 3 blocks. A full count is in the worked example below and in Figure 5.</p>
+<figure class="fig" id="cp-par"><div class="fig-body">
+<div class="controls"><span class="seg" id="cp-par-pre"><button type="button" data-p="gpt2" aria-pressed="false">GPT-2 small</button><button type="button" data-p="l2" aria-pressed="false">Llama 2 7B</button><button type="button" data-p="l3" aria-pressed="true">Llama 3 8B</button><button type="button" data-p="mis" aria-pressed="false">Mistral 7B</button><button type="button" data-p="l70" aria-pressed="false">Llama 3 70B</button></span></div>
+<div class="controls"><label class="sl">Layers \(L\) <input type="range" id="cp-par-L" min="1" max="96" step="1" value="32"><output id="cp-par-Lv">32</output></label><label class="sl">Width \(d\) <input type="range" id="cp-par-d" min="0" max="7" step="1" value="5"><output id="cp-par-dv">4,096</output></label></div>
+<div class="controls"><label class="sl">KV heads \(h_{kv}\) <input type="range" id="cp-par-kv" min="0" max="7" step="1" value="3"><output id="cp-par-kvv">8</output></label><label class="sl"><input type="checkbox" id="cp-par-t"> Tie input and output tables</label></div>
+<div class="scroll-x"><svg id="cp-par-svg" viewBox="0 0 640 150" role="img" aria-label="Stacked bar showing where the parameters of a transformer are"></svg></div>
+<div class="readout" id="cp-par-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> A parameter calculator. Each preset loads a real model’s configuration (from its public config file). The bar splits all parameters into attention, FFN, norms and biases, and the embedding tables. When you change \(d\), the head size and the ratio \(d_{\text{ff}}/d\) of the preset are kept. The readout compares the exact count with the quick estimate \(12Ld^2 + \) tables.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with Llama 3 8B: the exact total is 8,030,261,248, and the quick estimate is 7.49 B, 6.7% low, because the SwiGLU FFN is wider than the classic \(8d^2\). Now move the KV heads slider from 8 up to 32 (full multi-head attention): attention grows from \(2.5d^2\) to \(4d^2\) per layer, and the model gains 805 M parameters. Pick GPT-2 small: the embeddings are almost a third of the model, and the estimate is within 0.1%. Pick Llama 3 70B: the embeddings shrink to 3% of the total. In large models, the \(L d^2\) term is everything.</p></details></figure>
+<p>Three lessons from the calculator:</p>
+<ol><li><b>Width matters more than depth.</b> Doubling \(L\) doubles the block parameters; doubling \(d\) multiplies them by 4.</li>
+<li><b>Embeddings matter in small models only.</b> They grow like \(|V| d\), blocks like \(L d^2\). For GPT-2 small they are 31% of the weights; for Llama 3 70B they are 3%.</li>
+<li><b>Config names differ.</b> The same numbers appear as <code>hidden_size</code>, <code>n_embd</code> or <code>d_model</code>; <code>intermediate_size</code> or <code>n_inner</code>; <code>num_key_value_heads</code>. Read them carefully, and check whether <code>tie_word_embeddings</code> is true.</li></ol>
+
+<h2>Counting FLOPs: 2N forward, 6N for training</h2>
+<h3>Forward: 2 FLOPs per weight per token</h3>
+<p>From formula (25.1), every weight used in a matrix multiply costs 2 FLOPs per token. Almost every weight in a transformer is used in exactly one matrix multiply per token. So:</p>
+<div class="eq">\[ C_{\text{forward}} \approx 2N \ \text{FLOPs per token} \tag{25.6} \]</div>
+<p>Two details. First, the input embedding is a lookup, not a multiply, so it costs 0 FLOPs. Strictly, \(N\) here should be the weights used in matrix multiplies: everything minus the input table (for tied models, the table is used once, as the output layer). Kaplan et al. drop all embeddings and use the non-embedding count. [Certain] Second, attention itself has a part that is <i>not</i> a weight: the scores \(QK^\top\) and the weighted sum with \(V\). That part grows with context, and gets its own section below.</p>
+<h3>Backward: twice the forward</h3>
+<p>For a linear layer \(Y = XW\), the backward pass (<a href="../foundations/optimization-backprop-adamw.html">session 4</a>) needs two products, each as large as the forward one:</p>
+<div class="eq">\[ \underbrace{\frac{\partial \mathcal{L}}{\partial X} = \frac{\partial \mathcal{L}}{\partial Y}\, W^\top}_{\text{to pass the gradient back: } 2N} \qquad \underbrace{\frac{\partial \mathcal{L}}{\partial W} = X^\top\, \frac{\partial \mathcal{L}}{\partial Y}}_{\text{to update the weights: } 2N} \tag{25.7} \]</div>
+<p>The first product sends the gradient to the earlier layers. The second gives the gradient of the weights. Each costs 2 FLOPs per weight per token, the same as the forward. So the backward pass costs \(4N\), and one training step costs \(2N + 4N = 6N\) per token. For a whole run on \(D\) tokens:</p>
+<div class="eq">\[ C_{\text{train}} \approx 6\,N\,D \tag{25.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(C_{\text{train}}\)</dt><dd>the total training compute in FLOPs</dd>
+<dt>\(N\)</dt><dd>the number of parameters (strictly, those used in matrix multiplies)</dd>
+<dt>\(D\)</dt><dd>the number of training tokens processed (tokens seen, counting repeats)</dd>
+<dt>\(6\)</dt><dd>2 for the forward pass plus 4 for the backward pass. Kaplan et al. define \(C \approx 6N\) per training token this way, and Chinchilla uses \(6ND\). [Certain]</dd></dl>
+<aside class="note watch side"><span class="nt">Watch out</span>Activation checkpointing (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>) runs part of the forward pass a second time during backward. The hardware then does up to about \(8N\) per token, but the “useful” compute is still \(6N\). MFU is defined with \(6N\), so recomputation lowers your MFU; a second metric, HFU (hardware FLOPs utilization), counts the recomputed work. [Certain]</aside>
+<div class="worked"><div class="wt">Worked example: what Llama 3 8B cost to train</div>
+<p>\(N = 8.03 \times 10^9\) parameters, trained on more than 15 trillion tokens (Llama 3 paper). [Certain] So \(C \approx 6 \times 8.03 \times 10^9 \times 15 \times 10^{12} = 7.23 \times 10^{23}\) FLOPs.</p>
+<p>An H100 SXM GPU has a peak of about 989 TFLOP/s for dense BF16 matrix multiplies (NVIDIA’s datasheet gives 1,979 “with sparsity”, which is twice the dense number). [Certain] Real training reaches perhaps 40% of peak; Meta reports 38% to 43% for Llama 3 405B. [Likely] At 40%: \(7.23 \times 10^{23} / (0.4 \times 989 \times 10^{12}) = 1.83 \times 10^{9}\) GPU-seconds \(\approx\) 507,000 GPU-hours, or about 21 days on 1,024 GPUs.</p>
+<p>Compare GPT-3: \(6 \times 175 \times 10^9 \times 300 \times 10^9 = 3.15 \times 10^{23}\) FLOPs. The GPT-3 paper reports 3,640 petaflop/s-days, which is \(3.14 \times 10^{23}\). [Likely] So the 8B model of 2024 used more than twice the compute of the 175B model of 2020, because it saw 50 times more tokens.</p></div>
+<p>To turn FLOPs into time, divide by the speed you actually reach:</p>
+<div class="eq">\[ \text{time} = \frac{6\,N\,D}{n_{\text{GPU}} \cdot P_{\text{peak}} \cdot \mathrm{MFU}} \tag{25.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n_{\text{GPU}}\)</dt><dd>the number of GPUs</dd>
+<dt>\(P_{\text{peak}}\)</dt><dd>the peak FLOP/s of one GPU for your number format (dense, not “with sparsity”)</dd>
+<dt>MFU</dt><dd><b>model FLOPs utilization</b>: the useful FLOP/s you reach (from the formula, not from the hardware counter) divided by the peak. The PaLM paper defined it. [Certain] 35% to 55% is typical for large dense training. [Likely]</dd></dl>
+<figure class="fig" id="cp-train"><div class="fig-body">
+<div class="controls"><span class="seg" id="cp-train-pre"><button type="button" data-p="l3" aria-pressed="true">Llama 3 8B, 15T</button><button type="button" data-p="g3" aria-pressed="false">GPT-3 175B, 300B</button><button type="button" data-p="ch" aria-pressed="false">Chinchilla 70B, 1.4T</button></span></div>
+<div class="controls"><label class="sl">Parameters \(N\) <input type="range" id="cp-train-n" min="0" max="12" step="1" value="5"><output id="cp-train-nv">8.03 B</output></label><label class="sl">Tokens \(D\) <input type="range" id="cp-train-dd" min="0" max="10" step="1" value="8"><output id="cp-train-dv">15 T</output></label></div>
+<div class="controls"><label class="sl">GPUs <input type="range" id="cp-train-g" min="0" max="7" step="1" value="3"><output id="cp-train-gv">1,024</output></label><label class="sl">MFU <input type="range" id="cp-train-m" min="10" max="60" step="5" value="40"><output id="cp-train-mv">40%</output></label><span class="seg" id="cp-train-hw"><button type="button" data-h="a100" aria-pressed="false">A100 (312 TFLOP/s)</button><button type="button" data-h="h100" aria-pressed="true">H100 (989 TFLOP/s)</button></span></div>
+<div class="cp-grid" id="cp-train-cards"></div>
+<div class="readout" id="cp-train-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> From \(6ND\) to calendar days, formula (25.9). Peak numbers are dense BF16 matrix-multiply speeds from NVIDIA’s datasheets (A100: 312 TFLOP/s; H100 SXM: 989 TFLOP/s). The time ignores restarts, evaluation and data loading.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>The first card is the compute \(6ND\). The others turn it into GPU-hours and days. With the Llama 3 8B preset on 1,024 H100s at 40% MFU you get about 21 days. Switch to A100: the same run takes about 3.2 times longer, because 989/312 = 3.17. Change MFU from 40% to 20%: the days double. This is why engineers fight for every percent of MFU: at this scale, 10 points of MFU are weeks of a large cluster.</p></details></figure>
+
+<h2>The attention term grows with context</h2>
+<p>The \(2N\) rule counts weights. But attention also multiplies activations with activations: the scores \(S = QK^\top\) and the output \(SV\) (<a href="../transformers/scaled-dot-product-attention-the-math-and.html">session 17</a>). These products have no weights, so \(2N\) misses them. Their size depends on how many tokens each query looks at.</p>
+<p>Take one query token in a sequence of \(T\) tokens, in one layer. Its score against all \(T\) keys is \(T\) dot products of length \(d_h\), for each of the \(h\) heads: \(2 \cdot T \cdot h d_h = 2Td\) FLOPs. The weighted sum of the \(T\) values costs the same again. So per token, per layer, attention adds \(4Td\), and over \(L\) layers:</p>
+<div class="eq">\[ C_{\text{attn}} = 4\,L\,T\,d \ \text{FLOPs per token (forward)}, \qquad 12\,L\,T\,d \ \text{(training)} \tag{25.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(T\)</dt><dd>the context length: the number of keys each query attends to</dd>
+<dt>\(d\)</dt><dd>here, \(h \cdot d_h\), the total query width (equal to the model width in most models)</dd>
+<dt>\(4\)</dt><dd>2 FLOPs per multiply-add, times 2 products (\(QK^\top\) and \(SV\))</dd>
+<dt>\(12\)</dt><dd>3 times the forward (forward plus a backward twice as large). PaLM writes the training cost per token as \(6N + 12LHQT\), with \(H\) heads of size \(Q\). [Certain]</dd></dl>
+<p>Two remarks. With a causal mask, token \(t\) only looks at \(t\) keys, so on average half of the score matrix is masked. A kernel that skips masked blocks (FlashAttention does this, <a href="../inference/index.html#row-attention-operator-1-flashattention-1-2-and" title="Attention operator 1: FlashAttention 1, 2 and 3 (planned)">session 124</a>) does about half of (25.10). Kaplan et al. use \(2LTd\) for this reason; PaLM counts the full \(4LTd\). [Certain] And GQA does not reduce these FLOPs: every query head still computes its own scores. GQA reduces the memory of K and V, not the arithmetic.</p>
+<p>Now compare the two terms. With \(N \approx 12Ld^2\):</p>
+<div class="eq">\[ \frac{C_{\text{attn}}}{C_{\text{forward}}} = \frac{4LTd}{2 \cdot 12 L d^2} = \frac{T}{6d} \tag{25.11} \]</div>
+<p>So attention-score FLOPs equal the weight FLOPs when \(T = 6d\): about 24,600 tokens for \(d = 4096\). Below that, the weights dominate; above it, attention does. With the causal saving the crossover moves to \(T = 12d\), which matches Kaplan’s remark that the context term is small when \(d_{\text{model}} \gg n_{\text{ctx}}/12\). [Certain] Note that the term is quadratic in \(T\) for a whole sequence (\(T\) tokens times \(4LTd\) each) but only linear in \(T\) per token.</p>
+<figure class="fig" id="cp-flop"><div class="fig-body">
+<div class="controls"><span class="seg" id="cp-flop-pre"><button type="button" data-p="gpt2" aria-pressed="false">GPT-2 small</button><button type="button" data-p="l3" aria-pressed="true">Llama 3 8B</button><button type="button" data-p="l70" aria-pressed="false">Llama 3 70B</button></span></div>
+<div class="controls"><label class="sl">Context \(T\) <input type="range" id="cp-flop-T" min="9" max="20" step="1" value="13"><output id="cp-flop-Tv">8,192</output></label><label class="sl"><input type="checkbox" id="cp-flop-c"> Causal kernel skips the masked half</label></div>
+<div class="scroll-x"><svg id="cp-flop-svg" viewBox="0 0 640 270" role="img" aria-label="Share of forward FLOPs spent on attention scores as a function of context length"></svg></div>
+<div class="readout" id="cp-flop-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Forward FLOPs per token, split into weight FLOPs (\(2N\), with \(N\) the weights used in matrix multiplies, so without the input table) and attention-score FLOPs (\(4LTd\), formula 25.10). The curve is the attention share for every context length from 512 to about one million tokens (log scale); the dot is the chosen \(T\).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>For Llama 3 8B at 8,192 tokens, attention is about 22% of the forward FLOPs. At 32,768 tokens it is more than half, and at about one million tokens it is 97%. Tick the causal box: every share drops, because the masked half is skipped, and the 50% point moves twice as far to the right. Switch to GPT-2 small (\(d = 768\)): the curve moves left; at its own context of 1,024 tokens, attention is already about 13% of the FLOPs in this count. Wide models push the crossover to longer contexts, because weight FLOPs grow like \(d^2\) and attention FLOPs only like \(d\).</p></details></figure>
+<aside class="note numbers side"><span class="nt">Real numbers</span>A video VLM that feeds 64 frames of 256 visual tokens each into an 8B language model has \(T = 16{,}384\) tokens. The prefill costs about \(2 \times 7.50 \times 10^9 \times 16{,}384 \approx 2.46 \times 10^{14}\) weight FLOPs plus \(4 L d T^2 \approx 1.41 \times 10^{14}\) attention FLOPs (full count). Attention is already more than a third of the work, before any text is added. This is one reason video models compress or drop frame tokens.</aside>
+
+<h2>Counting memory</h2>
+<p>FLOPs tell you how long. Memory tells you whether it runs at all. Memory comes in four parts: weights, gradients and optimizer states (training only), activations (training), and the KV cache (inference).</p>
+<h3>Weights and optimizer states</h3>
+<p>Each parameter takes 2 bytes in BF16 or FP16, 4 bytes in FP32, 1 byte in INT8 or FP8 (<a href="../pretraining/index.html#row-numbers-on-gpus-fp32-tf32-fp16-bf16" title="Numbers on GPUs: FP32, TF32, FP16, BF16, FP8 and mixed precision (planned)">session 37</a>). Llama 3 8B in BF16 is \(8.03 \times 10^9 \times 2 = 16.1\) GB (15.0 GiB). For training with AdamW in mixed precision, <a href="../foundations/optimization-backprop-adamw.html">session 4</a> showed 16 bytes per parameter:</p>
+<div class="eq">\[ M_{\text{train states}} = \big(\underbrace{2}_{\text{BF16 weights}} + \underbrace{2}_{\text{BF16 grads}} + \underbrace{4}_{\text{FP32 master}} + \underbrace{4 + 4}_{\text{Adam } m,\, v}\big)\, N = 16N \ \text{bytes} \tag{25.12} \]</div>
+<p>That is 128 GB for an 8B model and about 1.13 TB for a 70B model, before a single activation. [Certain for the arithmetic; the exact byte layout varies between frameworks.] This is the memory that ZeRO and FSDP split across GPUs (<a href="../pretraining/index.html#row-zero-stages-1-2-and-3" title="ZeRO stages 1, 2 and 3 (planned)">session 45</a>).</p>
+<h3>Activations</h3>
+<p>Backpropagation needs the inputs of every layer, saved from the forward pass. This memory grows with batch size \(b\) and sequence length \(s\), not with \(N\). Korthikanti et al. (2022) count it for a GPT-style block, stored in 16-bit, with no parallelism:</p>
+<div class="eq">\[ M_{\text{act}} \approx L \cdot s\,b\,d\left(34 + \frac{5\,h\,s}{d}\right) \ \text{bytes} \tag{25.13} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(s, b\)</dt><dd>sequence length and micro-batch size (sequences per step on one GPU)</dd>
+<dt>\(34\, s b d\)</dt><dd>the inputs of the linear layers, norms, the GELU and the dropout masks: about 34 bytes per number of the residual stream, per layer</dd>
+<dt>\(5 h s \cdot s b\)</dt><dd>the attention score matrices: \(h\) heads of \(s \times s\), stored before and after softmax and for dropout. This is the part that grows like \(s^2\).</dd></dl>
+<p>The paper also shows that recomputing only the attention core in the backward pass (“selective recomputation”) removes the \(5hs/d\) term. FlashAttention has the same effect, because it never stores the score matrix. [Certain] The constant 34 is for the GPT-style block of the paper (4× GELU FFN, dropout); a Llama-style block has a different constant. [Likely]</p>
+<div class="worked"><div class="wt">Worked example: activations of a 7B-sized model</div>
+<p>Take \(L = 32\), \(d = 4096\), \(h = 32\), \(s = 4096\), \(b = 1\). Per layer: \(4096 \times 1 \times 4096 \times (34 + 5 \times 32 \times 4096/4096) = 16{,}777{,}216 \times 194 = 3.25\) GB. For 32 layers: 104 GB, for one sequence! Without the score matrices (FlashAttention or selective recomputation): \(16{,}777{,}216 \times 34 = 0.57\) GB per layer, 18.3 GB in total. The score matrices were 82% of the activations.</p></div>
+<h3>The KV cache at inference</h3>
+<p>At inference there are no gradients and no optimizer. But to generate token \(t+1\), every layer needs the keys and values of all earlier tokens. We keep them in the <b>KV cache</b> (<a href="../inference/index.html#row-the-kv-cache" title="The KV cache (planned)">session 80</a>). For each token, each layer stores one key and one value vector per KV head:</p>
+<div class="eq">\[ M_{\text{KV}} = 2 \cdot L \cdot h_{kv} \cdot d_h \cdot T \cdot b \cdot \text{bytes} \tag{25.14} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2\)</dt><dd>one key and one value</dd>
+<dt>\(h_{kv} d_h\)</dt><dd>the width of K (and of V). With GQA this is smaller than \(d\): for Llama 3 8B, \(8 \times 128 = 1024\).</dd>
+<dt>\(T, b\)</dt><dd>tokens per sequence (prompt plus generated) and the number of sequences in the batch</dd>
+<dt>bytes</dt><dd>2 for BF16, 1 for an 8-bit cache (<a href="../inference/index.html#row-kv-cache-quantization-kivi-and-kvquant" title="KV-cache quantization: KIVI and KVQuant (planned)">session 110</a>)</dd></dl>
+<p>For Llama 3 8B in BF16: \(2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes = 128 KiB per token. An 8,192-token conversation needs 1 GiB; 32 such users need 32 GiB, twice the weights. With full multi-head attention (\(h_{kv} = 32\)) it would be four times more: 512 KiB per token. This is the whole motivation of <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>.</p>
+<figure class="fig" id="cp-mem"><div class="fig-body">
+<div class="controls"><span class="seg" id="cp-mem-mode"><button type="button" data-m="train" aria-pressed="true">Training (AdamW)</button><button type="button" data-m="inf" aria-pressed="false">Inference (BF16)</button></span></div>
+<div class="controls"><label class="sl">Batch \(b\) <input type="range" id="cp-mem-b" min="0" max="7" step="1" value="0"><output id="cp-mem-bv">1</output></label><label class="sl">Sequence length <input type="range" id="cp-mem-s" min="9" max="17" step="1" value="12"><output id="cp-mem-sv">4,096</output></label><label class="sl"><input type="checkbox" id="cp-mem-f" checked> FlashAttention (no stored scores)</label></div>
+<div class="scroll-x"><svg id="cp-mem-svg" viewBox="0 0 640 170" role="img" aria-label="Stacked bar of GPU memory for Llama 3 8B, with a line at 80 GB"></svg></div>
+<div class="readout" id="cp-mem-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Memory of Llama 3 8B on one GPU, without any sharding. Training: 16 bytes per parameter (25.12) plus activations from formula (25.13), with Llama 3’s \(L = 32\), \(d = 4096\), \(h = 32\); the GPT-style constant 34 makes the activation part an approximation. Inference: BF16 weights plus the KV cache (25.14). The dashed line is one 80 GB GPU.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>In training mode, even with batch 1 the bar is far past 80 GB: the 128 GB of weights, gradients and Adam states alone do not fit. That is why full fine-tuning of an 8B model needs several GPUs with sharding, or LoRA. Untick FlashAttention: at 4,096 tokens the activations jump from 18 GB to 104 GB. Switch to inference: the 16 GB of weights fit easily; now raise the batch to 32 and the length to 8,192: the KV cache (32 GiB) is twice the weights. At inference, memory is about the cache, not the model.</p></details></figure>
+<h3>Decode is limited by memory, not FLOPs</h3>
+<p>One more count connects FLOPs and memory. When generating one token for one user, the GPU must read all 16.1 GB of weights to do \(2N \approx 16\) GFLOPs. That is about 1 FLOP per byte read. An H100 SXM can do 989 TFLOP/s but read only about 3.35 TB/s from its memory, so it needs about 295 FLOPs per byte to be busy. [Certain for the datasheet numbers] At batch 1, decode is limited by memory speed: at best \(3.35 \times 10^{12} / 16.06 \times 10^9 \approx 209\) tokens per second. Batching many users reuses each weight read for many tokens, which is why serving systems batch (<a href="../inference/index.html#row-why-inference-is-slow-three-root-causes" title="Why inference is slow: three root causes and the roofline (planned)">session 82</a>).</p>
+
+<h2>Worked example: estimate an 8B model, then check its config</h2>
+<p>Here is the full exercise that interviewers like. You are given only this config (the real fields of Llama 3 8B’s <code>config.json</code> [Certain]):</p>
+<pre class="code">{ <span class="st">"hidden_size"</span>: 4096, <span class="st">"intermediate_size"</span>: 14336, <span class="st">"num_hidden_layers"</span>: 32,
+  <span class="st">"num_attention_heads"</span>: 32, <span class="st">"num_key_value_heads"</span>: 8,
+  <span class="st">"vocab_size"</span>: 128256, <span class="st">"tie_word_embeddings"</span>: false, <span class="st">"max_position_embeddings"</span>: 8192 }</pre>
+<div class="worked"><div class="wt">Worked example: Llama 3 8B in three steps</div>
+<p><b>Step 1, the quick estimate.</b> \(12 L d^2 = 12 \times 32 \times 4096^2 = 6.44\) B. Two untied tables: \(2 \times 128{,}256 \times 4096 = 1.05\) B. Estimate: 7.49 B.</p>
+<p><b>Step 2, the exact count.</b> Head size \(d_h = 4096/32 = 128\); K/V width \(8 \times 128 = 1024\). Per layer: \(W_Q\) and \(W_O\): \(2 \times 4096^2 = 33{,}554{,}432\). \(W_K\) and \(W_V\): \(2 \times 4096 \times 1024 = 8{,}388{,}608\). FFN: \(3 \times 4096 \times 14{,}336 = 176{,}160{,}768\). Two RMSNorms: 8,192. One layer: <b>218,112,000</b>. Times 32: 6,979,584,000. Plus two tables of 525,336,576 and the final norm of 4,096: <b>8,030,261,248</b>.</p>
+<p><b>Step 3, check.</b> The published name is “8B”, and the exact count matches the parameter count of the released checkpoint (the PyTorch code below builds the same shapes and gets the same number). [Certain] The quick estimate was 6.7% low; we now know why: the FFN is \(10.5d^2\) instead of \(8d^2\), partly paid back by GQA (\(2.5d^2\) instead of \(4d^2\)).</p>
+<p><b>Consequences.</b> Forward: \(2 \times 7.50\) B \(\approx 15.0\) GFLOPs per token for the weights (the 525 M input table is a lookup). Training: about \(6 \times 7.50\) B \(\approx 45\) GFLOPs per token. Memory: 16.1 GB in BF16, 128 GB for AdamW training states, 128 KiB of KV cache per token.</p></div>
+<figure class="fig" id="cp-step"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="cp-step-prev">Back</button><button type="button" class="btn primary" id="cp-step-play">Play</button><button type="button" class="btn" id="cp-step-next">Next</button><span id="cp-step-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><table class="cp-tab" id="cp-step-tab"></table></div>
+<div class="readout" id="cp-step-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Counting Llama 3 8B from its config, one line at a time. Each step adds one group of weights and shows the formula, the count for that group, and the running total. The last steps turn the count into FLOPs and memory.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Press Next. The highlighted row is the group being added; the readout shows the formula with the config values filled in. Watch the running total: after one layer it is only 0.74 B (most of it the embedding table), after all 32 layers it is 7.50 B, and the output layer brings it to 8,030,261,248. The last two steps reuse the count: \(2N\) and \(6N\) FLOPs per token, and the bytes for weights, Adam and the KV cache.</p></details></figure>
+
+<h2>Pseudo-code</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: count parameters from a config</div><ol>
+<li><b>input:</b> \(d, L, h, h_{kv}, d_{\text{ff}}, |V|\), tied, gated, biases</li>
+<li>\(d_h \leftarrow d / h\)</li>
+<li>\(a \leftarrow 2 d (h d_h) + 2 d (h_{kv} d_h)\) <span class="c">// Q, O and K, V, formula (25.5)</span></li>
+<li><b>if</b> gated <b>then</b> \(f \leftarrow 3 d d_{\text{ff}}\) <b>else</b> \(f \leftarrow 2 d d_{\text{ff}}\) <span class="c">// SwiGLU or classic FFN</span></li>
+<li>\(n \leftarrow\) norm and bias sizes (a few times \(d\) per block)</li>
+<li>\(N_{\text{blocks}} \leftarrow L \cdot (a + f + n)\)</li>
+<li>\(N_{\text{emb}} \leftarrow |V| d\) <b>if</b> tied <b>else</b> \(2 |V| d\) <span class="c">// formula (25.4)</span></li>
+<li><b>return</b> \(N_{\text{blocks}} + N_{\text{emb}} +\) final norm</li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: compute and memory budget for a training run</div><ol>
+<li><b>input:</b> \(N\), tokens \(D\), context \(T\), \(L, d\), GPUs \(n\), peak \(P\), MFU \(u\)</li>
+<li>\(c \leftarrow 6N + 12 L T d\) <span class="c">// FLOPs per token, (25.8) and (25.10)</span></li>
+<li>\(C \leftarrow c \cdot D\)</li>
+<li>days \(\leftarrow C / (n \cdot P \cdot u) / 86{,}400\) <span class="c">// formula (25.9)</span></li>
+<li>states \(\leftarrow 16 N\) bytes <span class="c">// formula (25.12); divide by \(n\) with ZeRO-3 or FSDP</span></li>
+<li>activations \(\leftarrow L \cdot s b d \cdot (34 + 5 h s / d)\) bytes <span class="c">// (25.13); drop the second term with FlashAttention</span></li>
+<li><b>if</b> states / \(n\) + activations \(\gt\) GPU memory <b>then</b> shard more, lower \(b\), or recompute activations</li>
+<li><b>return</b> \(C\), days, memory per GPU</li></ol></div>
+<p>The same counts in PyTorch. The model is a small Llama-style decoder (RMSNorm, GQA, SwiGLU, untied output). PyTorch’s <code>FlopCounterMode</code> counts the FLOPs of every matrix multiply, so we can check formulas (25.5), (25.6), (25.7) and (25.10) exactly:</p>
+<pre class="code"><span class="kw2">import</span> torch
+<span class="kw2">import</span> torch.nn <span class="kw2">as</span> nn
+<span class="kw2">import</span> torch.nn.functional <span class="kw2">as</span> F
+<span class="kw2">from</span> torch.utils.flop_counter <span class="kw2">import</span> FlopCounterMode
+torch.manual_seed(0)
+
+<span class="kw2">class</span> Block(nn.Module):                      <span class="cm"># Llama-style: RMSNorm, GQA attention, SwiGLU</span>
+    <span class="kw2">def</span> __init__(s, d, h, kv, ff):
+        super().__init__()
+        s.h, s.kv, s.dh = h, kv, d // h
+        s.n1, s.n2 = nn.RMSNorm(d), nn.RMSNorm(d)
+        s.q = nn.Linear(d, h * s.dh, bias=<span class="kw2">False</span>)
+        s.k = nn.Linear(d, kv * s.dh, bias=<span class="kw2">False</span>)
+        s.v = nn.Linear(d, kv * s.dh, bias=<span class="kw2">False</span>)
+        s.o = nn.Linear(h * s.dh, d, bias=<span class="kw2">False</span>)
+        s.gate = nn.Linear(d, ff, bias=<span class="kw2">False</span>)
+        s.up = nn.Linear(d, ff, bias=<span class="kw2">False</span>)
+        s.down = nn.Linear(ff, d, bias=<span class="kw2">False</span>)
+    <span class="kw2">def</span> forward(s, x):
+        B, T, d = x.shape
+        a = s.n1(x)
+        q = s.q(a).view(B, T, s.h, s.dh).transpose(1, 2)
+        k = s.k(a).view(B, T, s.kv, s.dh).transpose(1, 2).repeat_interleave(s.h // s.kv, 1)
+        v = s.v(a).view(B, T, s.kv, s.dh).transpose(1, 2).repeat_interleave(s.h // s.kv, 1)
+        att = (q @ k.transpose(-1, -2)) / s.dh ** 0.5          <span class="cm"># (B, h, T, T): 2*T*T*d FLOPs</span>
+        mask = torch.ones(T, T, dtype=torch.bool).tril()
+        att = att.masked_fill(~mask, float(<span class="st">"-inf"</span>)).softmax(-1)
+        y = (att @ v).transpose(1, 2).reshape(B, T, d)          <span class="cm"># another 2*T*T*d FLOPs</span>
+        x = x + s.o(y)
+        b = s.n2(x)
+        <span class="kw2">return</span> x + s.down(F.silu(s.gate(b)) * s.up(b))
+
+<span class="kw2">class</span> LM(nn.Module):
+    <span class="kw2">def</span> __init__(s, V, d, L, h, kv, ff):
+        super().__init__()
+        s.emb = nn.Embedding(V, d)
+        s.blocks = nn.ModuleList(Block(d, h, kv, ff) <span class="kw2">for</span> _ <span class="kw2">in</span> range(L))
+        s.norm = nn.RMSNorm(d)
+        s.head = nn.Linear(d, V, bias=<span class="kw2">False</span>)                   <span class="cm"># untied output layer</span>
+    <span class="kw2">def</span> forward(s, ids):
+        x = s.emb(ids)
+        <span class="kw2">for</span> blk <span class="kw2">in</span> s.blocks:
+            x = blk(x)
+        <span class="kw2">return</span> s.head(s.norm(x))
+
+<span class="kw2">def</span> count_formula(V, d, L, h, kv, ff):                      <span class="cm"># formula (25.5) plus tables</span>
+    dh = d // h
+    per_layer = 2 * d * d + 2 * d * kv * dh + 3 * d * ff + 2 * d
+    <span class="kw2">return</span> L * per_layer + d + 2 * V * d
+
+<span class="cm"># 1) parameter count: real modules vs formula</span>
+cfg = dict(V=1000, d=256, L=4, h=8, kv=2, ff=704)
+m = LM(**cfg)
+n = sum(p.numel() <span class="kw2">for</span> p <span class="kw2">in</span> m.parameters())
+print(n, count_formula(**cfg))                              <span class="cm"># 3332352 3332352</span>
+
+<span class="cm"># 2) FLOPs of one forward and one forward+backward vs 2N and 6N</span>
+B, T = 2, 128
+ids = torch.randint(0, cfg[<span class="st">"V"</span>], (B, T))
+N_mm = n - cfg[<span class="st">"V"</span>] * cfg[<span class="st">"d"</span>] - (2 * cfg[<span class="st">"L"</span>] + 1) * cfg[<span class="st">"d"</span>]   <span class="cm"># weights used in matmuls</span>
+attn = 4 * cfg[<span class="st">"L"</span>] * T * cfg[<span class="st">"d"</span>]                          <span class="cm"># QK^T and AV per token, full T x T</span>
+<span class="kw2">with</span> FlopCounterMode(display=<span class="kw2">False</span>) <span class="kw2">as</span> fc:
+    m(ids)
+fwd = fc.get_total_flops() / (B * T)
+print(fwd, 2 * N_mm + attn)                                 <span class="cm"># 6672384.0 6672384</span>
+<span class="kw2">with</span> FlopCounterMode(display=<span class="kw2">False</span>) <span class="kw2">as</span> fc:
+    m(ids).float().logsumexp(-1).mean().backward()
+print(fc.get_total_flops() / (B * T), 3 * (2 * N_mm + attn))  <span class="cm"># 20017152.0 20017152: exactly 3x</span>
+
+<span class="cm"># 3) Llama 3 8B on the meta device: shapes only, no memory is allocated</span>
+<span class="kw2">with</span> torch.device(<span class="st">"meta"</span>):
+    big = LM(V=128256, d=4096, L=32, h=32, kv=8, ff=14336)
+print(sum(p.numel() <span class="kw2">for</span> p <span class="kw2">in</span> big.parameters()))             <span class="cm"># 8030261248</span></pre>
+<p>Notice that <code>FlopCounterMode</code> counts the full \(T \times T\) score matrix even with a mask: masking does not skip any multiply in this plain code. Only a causal-aware kernel saves the half. The printed values were produced with PyTorch 2.8 on CPU.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>Which count</th><th>Link</th></tr></thead><tbody>
+<tr><td>Choosing model size and token count for a budget</td><td>\(C = 6ND\) with a scaling law; Chinchilla found about 20 tokens per parameter compute-optimal [Certain]</td><td><a href="../pretraining/index.html#row-scaling-laws" title="Scaling laws (planned)">session 35</a></td></tr>
+<tr><td>Measuring training efficiency</td><td>MFU = (tokens/s × \(6N\)) / peak; HFU adds recomputation</td><td><a href="../pretraining/index.html#row-distributed-checkpoints-fault-tolerance-and-mfu" title="Distributed checkpoints, fault tolerance and MFU (planned)">session 51</a></td></tr>
+<tr><td>Fitting training on GPUs</td><td>16 bytes per parameter (25.12) plus activations (25.13); decides ZeRO stage, FSDP, checkpointing</td><td><a href="../pretraining/index.html#row-memory-math-for-training" title="Memory math for training (planned)">session 38</a></td></tr>
+<tr><td>Serving capacity planning</td><td>Weights + KV cache (25.14) per user; decides batch size and how many users per GPU</td><td><a href="../inference/index.html#row-inference-metrics-latency-memory-and-throughput" title="Inference metrics: latency, memory and throughput (planned)">session 81</a></td></tr>
+<tr><td>Long-context and video VLMs</td><td>The attention term \(4LTd\) per token: with thousands of visual tokens per clip, attention becomes a large share of prefill (video QA, Video-RAG over long recordings)</td><td><a href="../transformers/what-context-means-and-how-to-make.html">session 28</a></td></tr>
+<tr><td>Video retrieval and fingerprinting at scale</td><td>Encoder cost per clip = \(2N\) × tokens per clip; multiply by hours of video per day to size the indexing fleet</td><td><a href="../video/index.html#row-text-to-video-retrieval" title="Text-to-video retrieval (planned)">session 208</a></td></tr>
+<tr><td>Choosing attention variants and quantization</td><td>KV-cache bytes per token for MHA vs GQA vs MLA; bytes per weight for INT8/INT4</td><td><a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a></td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Counting the number of heads in the parameter count.</b> \(W_Q\) is \(d \times d\) whatever \(h\) is. Heads change the grouping, not the size. Only \(h_{kv}\) (GQA) changes the count of \(W_K\) and \(W_V\).</li>
+<li><b>Forgetting the untied output layer.</b> Llama 3 8B has two 525 M tables. Count one and you get 7.5 B, not 8.03 B.</li>
+<li><b>Using 8d² for a SwiGLU FFN.</b> A gated FFN has three matrices: \(3 d\, d_{\text{ff}}\). Read <code>intermediate_size</code> from the config.</li>
+<li><b>Mixing FLOPs and FLOP/s, or using the “with sparsity” peak.</b> Datasheets often print the 2:4-sparse number, which is twice the dense one. Your MFU will look twice as bad as it is, or your time estimate twice as optimistic.</li>
+<li><b>Saying 2N per token for training.</b> Training is 6N: forward 2N plus backward 4N. And 8N of hardware work with full activation recomputation.</li>
+<li><b>Ignoring the attention term at long context.</b> At \(T = 6d\) it equals the weight FLOPs (full count). For a 128k-context run with \(d = 4096\), it is the larger part.</li>
+<li><b>Thinking GQA reduces attention FLOPs.</b> It reduces the K/V projection weights and the KV cache. Every query head still computes \(T\) scores.</li>
+<li><b>Confusing GB and GiB.</b> 16.06 GB is 14.96 GiB. Tools print both; a 7% gap matters when you are close to the limit.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>How many FLOPs is a matrix multiply of an (m × k) matrix and a (k × n) matrix?<span class="lvl">basic</span></summary><div class="ans">\(2mkn\): there are \(mn\) outputs, each a dot product of length \(k\), which is \(k\) multiplications and about \(k\) additions. For a linear layer on one token (\(m = 1\)) this is 2 FLOPs per weight, which is where the \(2N\) rule comes from.</div></details>
+<details class="qa"><summary>Derive the parameter count of one transformer layer with width d.<span class="lvl">basic</span></summary><div class="ans">Attention: \(W_Q, W_K, W_V, W_O\), each \(d \times d\): \(4d^2\). FFN with 4× expansion: \(d \times 4d\) up and \(4d \times d\) down: \(8d^2\). Total \(12d^2\), plus a few vectors of size \(d\) for norms and biases. The number of heads does not matter. A model has about \(12Ld^2\) plus \(|V|d\) per embedding table.</div></details>
+<details class="qa"><summary>Count the parameters of Llama 3 8B from its config.<span class="lvl">core</span></summary><div class="ans">\(d = 4096\), \(L = 32\), \(h = 32\), \(h_{kv} = 8\), \(d_{\text{ff}} = 14{,}336\), \(|V| = 128{,}256\), untied. \(d_h = 128\). Per layer: Q and O \(2 \times 4096^2 = 33.55\) M; K and V \(2 \times 4096 \times 1024 = 8.39\) M; SwiGLU \(3 \times 4096 \times 14{,}336 = 176.16\) M; norms 8,192. Layer: 218,112,000; ×32 = 6.98 B. Tables \(2 \times 525.3\) M = 1.05 B. Final norm 4,096. Total 8,030,261,248. The \(12Ld^2\) rule gives 6.44 B for the blocks, 8% low, because the FFN is \(10.5d^2\) and GQA attention is \(2.5d^2\).</div></details>
+<details class="qa"><summary>Why does training cost about 6N FLOPs per token?<span class="lvl">core</span></summary><div class="ans">Forward: each weight is used in one multiply-add per token, 2 FLOPs, so \(2N\). Backward: for \(Y = XW\) we need \(\partial L/\partial X = (\partial L/\partial Y) W^\top\) to continue backprop and \(\partial L/\partial W = X^\top (\partial L/\partial Y)\) for the update; each is the same size as the forward, so \(4N\). Total \(6N\), and \(6ND\) for \(D\) tokens. Not counted: attention scores (\(12LTd\) per token in training), elementwise operations, and recomputation from activation checkpointing.</div></details>
+<details class="qa"><summary>When does attention dominate the FLOPs of a transformer?<span class="lvl">core</span></summary><div class="ans">Per token, the score and value products cost \(4LTd\) forward (full count), against about \(2N \approx 24Ld^2\) for the weights. The ratio is \(T/(6d)\), so they are equal at \(T = 6d\) (about 24.6k tokens for \(d = 4096\)), or \(T = 12d\) if the kernel skips the causal-masked half. Above that, attention dominates. For Llama 3 8B at 8k tokens attention is about 22% of forward FLOPs; at 32k, more than half.</div></details>
+<details class="qa"><summary>Estimate the training compute and time for an 8B model on 15T tokens.<span class="lvl">core</span></summary><div class="ans">\(6 \times 8.03 \times 10^9 \times 15 \times 10^{12} = 7.2 \times 10^{23}\) FLOPs. One H100 at 989 TFLOP/s dense BF16 and 40% MFU does \(3.96 \times 10^{14}\) FLOP/s, so about \(1.83 \times 10^9\) GPU-seconds = 507k GPU-hours; on 1,024 GPUs about 21 days. State your MFU assumption; it changes the answer linearly.</div></details>
+<details class="qa"><summary>How much GPU memory do you need to fully fine-tune a 7B model with AdamW?<span class="lvl">core</span></summary><div class="ans">States: 16 bytes per parameter (BF16 weights 2, BF16 gradients 2, FP32 master 4, Adam m and v 4 + 4), so 112 GB for 7B, before activations. Activations add \(L\,s b d\,(34 + 5hs/d)\) bytes for a GPT-style block (about 18 GB at 4k tokens, batch 1, with FlashAttention; about 104 GB without). It does not fit on one 80 GB GPU: use ZeRO-3 or FSDP across GPUs, 8-bit optimizer states, activation checkpointing, or LoRA.</div></details>
+<details class="qa"><summary>How big is the KV cache of Llama 3 8B, and how does GQA change it?<span class="lvl">core</span></summary><div class="ans">\(2 \times L \times h_{kv} \times d_h \times\) bytes per token \(= 2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes = 128 KiB in BF16. At 8k tokens, 1 GiB per sequence; 32 sequences need 32 GiB, twice the weights. With full MHA (\(h_{kv} = 32\)) it would be 512 KiB per token, four times more. GQA cuts cache memory and bandwidth by \(h/h_{kv}\) but not the attention FLOPs.</div></details>
+<details class="qa"><summary>Why is single-user decoding slow even though it needs only about 16 GFLOPs per token?<span class="lvl">advanced</span></summary><div class="ans">Each decode step must read every weight from GPU memory (16 GB in BF16 for 8B) to do \(2N\) FLOPs: about 1 FLOP per byte. An H100 needs about 295 FLOPs per byte (989 TFLOP/s ÷ 3.35 TB/s) to be compute-bound. So decode at batch 1 is memory-bound: at most about 209 tokens/s from bandwidth alone. Batching \(b\) users reuses each weight read \(b\) times and raises the FLOPs per byte, until the KV-cache reads start to dominate.</div></details>
+<details class="qa"><summary>What are MFU and HFU, and why can activation checkpointing make MFU drop?<span class="lvl">advanced</span></summary><div class="ans">MFU = achieved useful FLOP/s ÷ peak FLOP/s, where useful FLOPs per token are fixed by the model: \(6N + 12LTd\) (the PaLM definition). HFU counts the FLOPs the hardware actually ran, including recomputed forward passes. Full activation checkpointing adds about one more forward (\(2N\)), so the GPU does about \(8N\) per token. The step takes longer for the same useful work, so MFU falls while HFU may stay high. MFU is the fair number to compare across systems.</div></details>
+<details class="qa"><summary>Why are embedding parameters often left out of scaling-law counts?<span class="lvl">advanced</span></summary><div class="ans">The input embedding is a lookup and costs no FLOPs; its size depends on the tokenizer, not on model capacity in the usual sense. Kaplan et al. found cleaner power laws using non-embedding parameters \(N \approx 12Ld^2\). In small models embeddings can be a quarter or more of all weights, so including them distorts the curves. The output layer does cost \(2|V|d\) FLOPs per token, so compute counts should include it when it matters.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A model has \(d = 2048\), \(L = 24\), classic attention and a 4× GELU FFN, \(|V| = 50{,}000\), tied. Estimate its parameter count.</li>
+<li>Estimate the training compute of GPT-3 (175 B parameters, 300 B tokens). Compare it with Chinchilla (70 B parameters, 1.4 T tokens).</li>
+<li>Llama 2 7B has \(L = 32\), \(h = h_{kv} = 32\), \(d_h = 128\). What is its KV cache per token in BF16? For one 4,096-token sequence?</li>
+<li>For a model with \(d = 4096\), what is the ratio of attention-score FLOPs to weight FLOPs at \(T = 32{,}768\), using (25.11)? What share of the forward FLOPs is attention?</li>
+<li>How much memory do the AdamW training states of a 1 B model need? Of a 70 B model?</li>
+<li>In Figure 4 (training, FlashAttention on), what happens to the activation memory when you double the sequence length? And with FlashAttention off?</li>
+<li>Show that a SwiGLU FFN with \(d_{\text{ff}} = \tfrac{8}{3}d\) has the same parameter count as a classic FFN with \(d_{\text{ff}} = 4d\).</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(12 \times 24 \times 2048^2 = 1{,}207{,}959{,}552\) plus one table \(50{,}000 \times 2048 = 102{,}400{,}000\): about 1.31 B. 2. GPT-3: \(6 \times 175 \times 10^9 \times 300 \times 10^9 = 3.15 \times 10^{23}\) FLOPs. Chinchilla: \(6 \times 70 \times 10^9 \times 1.4 \times 10^{12} = 5.88 \times 10^{23}\), almost twice as much, for a model 2.5 times smaller. 3. \(2 \times 32 \times 32 \times 128 \times 2 = 524{,}288\) bytes = 512 KiB per token; 4,096 tokens = 2 GiB. 4. \(T/(6d) = 32{,}768 / 24{,}576 = 1.33\); share \(1.33/2.33 = 57\%\). (With the exact Llama 3 8B weight count, Figure 3 shows 53%.) 5. \(16 \times 10^9\) bytes = 16 GB; \(16 \times 70 \times 10^9 = 1.12\) TB. 6. With FlashAttention only the \(34sbd\) term is left, so it doubles (linear in \(s\)). Without it, the \(5hs^2b\) term grows four times, so the total grows by more than 2× and approaches 4× at long lengths. 7. Classic: \(2 \cdot d \cdot 4d = 8d^2\). SwiGLU: \(3 \cdot d \cdot \tfrac{8}{3}d = 8d^2\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Every count starts from one rule: a matrix multiply of \((m \times k)(k \times n)\) costs \(2mkn\) FLOPs (25.1), so each weight costs 2 FLOPs per token.</li>
+<li>Parameters: attention \(4d^2\) plus FFN \(8d^2\), so \(N \approx 12Ld^2\) plus \(|V|d\) per embedding table (25.4). GQA and SwiGLU move the 12 (Llama 3 8B has about \(13d^2\) per layer); the exact count is 8,030,261,248.</li>
+<li>Compute: about \(2N\) per token forward (25.6), \(6N\) per token in training (25.7, 25.8), so \(C \approx 6ND\). Time = \(6ND / (n \cdot P \cdot \mathrm{MFU})\) (25.9).</li>
+<li>Attention scores add \(4LTd\) per token forward (25.10). They match the weight FLOPs at \(T = 6d\) (25.11), or \(12d\) with causal skipping.</li>
+<li>Memory: 2 bytes per parameter for BF16 weights, 16 for AdamW training (25.12), activations that grow with \(s\) and \(s^2\) (25.13), and a KV cache of \(2Lh_{kv}d_h\) values per token (25.14).</li>
+<li>Decode at batch 1 is limited by memory bandwidth, not FLOPs: about 1 FLOP per byte of weights read.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \mathrm{FLOPs}(AB) = 2mkn, \qquad N \approx 12 L d^2 + |V| d\,(1 \text{ or } 2) \]</div>
+<div class="eq">\[ C_{\text{fwd}} \approx 2N + 4LTd, \qquad C_{\text{train}} \approx (6N + 12LTd)\, D \approx 6ND \]</div>
+<div class="eq">\[ M_{\text{train}} \approx 16N + L\,sbd\left(34 + \tfrac{5hs}{d}\right), \qquad M_{\text{KV}} = 2 L h_{kv} d_h T b \cdot \text{bytes} \]</div>
+<h2 class="plain" id="counting-parameters-flops-and-memory-of-a-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Kaplan et al. (2020). <a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener">Scaling Laws for Neural Language Models</a></li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Stanford (2025). <a href="https://stanford-cs336.github.io/" target="_blank" rel="noopener">CS336: Language Modeling from Scratch (course)</a></li><li>Hoffmann et al. (2022). <a href="https://arxiv.org/abs/2203.15556" target="_blank" rel="noopener">Training Compute-Optimal Large Language Models</a></li><li>Chowdhery et al. (2022). <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">PaLM: Scaling Language Modeling with Pathways</a></li><li>Brown et al. (2020). <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener">Language Models are Few-Shot Learners</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Meta (mirrored by Unsloth) (2024). <a href="https://huggingface.co/unsloth/llama-3-8b/blob/main/config.json" target="_blank" rel="noopener">Llama 3 8B config.json on Hugging Face</a></li><li>Korthikanti et al. (2022). <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">Reducing Activation Recomputation in Large Transformer Models</a></li><li>Ainslie et al. (2023). <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</a></li><li>Shazeer (2020). <a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noopener">GLU Variants Improve Transformer</a></li><li>Rajbhandari et al. (2019). <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>Micikevicius et al. (2017). <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Mixed Precision Training</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../transformers/encoder-decoder-in-depth-t5-span-corruption.html"><small>Previous · session 24</small>Encoder–decoder in depth: T5 span corruption, sentinel tokens, BART denoising</a><a class="next" href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html"><small>Next · session 26</small>Attention variants 1: MHA, MQA, GQA, MLA and the KV cache</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="counting-parameters-flops-and-memory-of-a"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const comma=n=>Math.round(n).toLocaleString("en-US");
+const big=n=>n>=1e9?(n/1e9).toFixed(2)+" B":n>=1e6?(n/1e6).toFixed(1)+" M":comma(n);
+const sci=x=>{if(!(x>0))return"0";const e=Math.floor(Math.log10(x));const m=x/Math.pow(10,e);return m.toFixed(2)+" × 10<sup>"+e+"</sup>";};
+const pct=x=>(100*x).toFixed(1)+"%";
+const segSet=(seg,attr,val)=>seg.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset[attr]===val?"true":"false"));
+
+/* Real configurations (public config.json files). dh = head size, ff = intermediate size. */
+const CFG={
+ gpt2:{n:"GPT-2 small",V:50257,d:768,L:12,dh:64,kv:12,ff:3072,gated:false,tied:true,bias:true,pos:1024,ln:true},
+ l2:{n:"Llama 2 7B",V:32000,d:4096,L:32,dh:128,kv:32,ff:11008,gated:true,tied:false,bias:false,pos:0,ln:false},
+ l3:{n:"Llama 3 8B",V:128256,d:4096,L:32,dh:128,kv:8,ff:14336,gated:true,tied:false,bias:false,pos:0,ln:false},
+ mis:{n:"Mistral 7B",V:32000,d:4096,L:32,dh:128,kv:8,ff:14336,gated:true,tied:false,bias:false,pos:0,ln:false},
+ l70:{n:"Llama 3 70B",V:128256,d:8192,L:80,dh:128,kv:8,ff:28672,gated:true,tied:false,bias:false,pos:0,ln:false}};
+function count(c){const h=c.d/c.dh,q=h*c.dh,kvw=c.kv*c.dh,d=c.d;
+ const attnW=2*d*q+2*d*kvw,ffnW=(c.gated?3:2)*d*c.ff;
+ const extra=(c.bias?(q+2*kvw+d)+(c.ff+d):0)+(c.ln?4*d:2*d);
+ const blocks=c.L*(attnW+ffnW+extra),fin=c.ln?2*d:d;
+ const emb=c.V*d*(c.tied?1:2)+c.pos*d;
+ const mm=c.L*(attnW+ffnW)+c.V*d; /* weights used in matrix multiplies: blocks + output layer */
+ return{attn:c.L*attnW,ffn:c.L*ffnW,small:c.L*extra+fin,emb,total:blocks+fin+emb,est:12*c.L*d*d+emb,mm,h};}
+
+/* ---------- Figure 1: parameter calculator ---------- */
+(function(){
+ const svg=$("#cp-par-svg");if(!svg)return;const sL=$("#cp-par-L"),sd=$("#cp-par-d"),skv=$("#cp-par-kv"),st=$("#cp-par-t"),oL=$("#cp-par-Lv"),od=$("#cp-par-dv"),okv=$("#cp-par-kvv"),info=$("#cp-par-info"),seg=$("#cp-par-pre");
+ const DO=[512,768,1024,2048,3072,4096,5120,8192],KO=[1,2,4,8,12,16,32,64];let cur="l3";
+ function draw(){const p=CFG[cur];const d=DO[+sd.value];const h=d/p.dh;let kv=KO[+skv.value];if(kv>h){kv=h;}
+  const c=Object.assign({},p,{L:+sL.value,d,ff:Math.round(p.ff/p.d*d),kv,tied:st.checked});
+  oL.value=c.L;od.value=comma(d);okv.value=kv+(kv===h?" (= h, MHA)":kv===1?" (MQA)":"");
+  const r=count(c);const same=(c.L===p.L&&d===p.d&&kv===p.kv&&c.tied===p.tied);
+  const parts=[["attention",r.attn,"var(--q)"],["FFN",r.ffn,"var(--k)"],["norms, biases",r.small,"var(--muted)"],["embeddings",r.emb,"var(--v)"]];
+  const x0=20,w=600;let x=x0,g="";
+  parts.forEach(([n,v,col])=>{const ww=w*v/r.total;g+=`<rect x="${x.toFixed(1)}" y="34" width="${Math.max(0,ww).toFixed(1)}" height="40" fill="${col}" opacity=".85"><title>${n}: ${comma(v)}</title></rect>`;x+=ww;});
+  g+=`<rect x="${x0}" y="34" width="${w}" height="40" rx="6" fill="none" stroke="var(--rule)"/>`;
+  g+=`<text x="${x0}" y="22" class="svgt" font-size="13.5" font-weight="700">${B.esc(p.n)}${same?" (real configuration)":" (modified)"}: ${comma(r.total)} parameters</text>`;
+  parts.forEach(([n,v,col],i)=>{const lx=x0+i*152;g+=`<rect x="${lx}" y="94" width="12" height="12" rx="2" fill="${col}"/><text x="${lx+18}" y="104" class="svgs" font-size="12.5">${n}</text><text x="${lx+18}" y="122" class="svgt" font-size="12.5" font-weight="700">${big(v)} · ${pct(v/r.total)}</text>`;});
+  svg.innerHTML=g;
+  const err=(r.est-r.total)/r.total;
+  info.dataset.total=String(r.total);info.dataset.est=String(r.est);
+  const perL=(r.attn+r.ffn)/c.L/(d*d);
+  info.innerHTML=`Exact count: <b>${comma(r.total)}</b>. Per layer: attention ${(r.attn/c.L/(d*d)).toFixed(2)}d², FFN ${(r.ffn/c.L/(d*d)).toFixed(2)}d² (total <b>${perL.toFixed(2)}d²</b>, the quick rule says 12d²).<br>Quick estimate 12Ld² + tables = ${comma(r.est)}: <b>${err>=0?"+":"−"}${Math.abs(100*err).toFixed(1)}%</b> off. Config: L = ${c.L}, d = ${comma(d)}, h = ${h}, h<sub>kv</sub> = ${kv}, d<sub>ff</sub> = ${comma(c.ff)}${c.gated?" (SwiGLU, 3 matrices)":" (classic, 2 matrices)"}, |V| = ${comma(c.V)}, ${c.tied?"tied":"untied"}. BF16 size: ${(2*r.total/1e9).toFixed(2)} GB.`;}
+ function load(k){cur=k;const p=CFG[k];sL.value=p.L;sd.value=DO.indexOf(p.d);skv.value=KO.indexOf(p.kv);st.checked=p.tied;segSet(seg,"p",k);draw();}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(b)load(b.dataset.p);});
+ [sL,sd,skv].forEach(s=>s.addEventListener("input",draw));st.addEventListener("change",draw);load("l3");
+})();
+
+/* ---------- Figure 2: 6ND to days ---------- */
+(function(){
+ const cards=$("#cp-train-cards");if(!cards)return;const sn=$("#cp-train-n"),sD=$("#cp-train-dd"),sg=$("#cp-train-g"),sm=$("#cp-train-m"),on=$("#cp-train-nv"),oD=$("#cp-train-dv"),og=$("#cp-train-gv"),om=$("#cp-train-mv"),info=$("#cp-train-info"),pre=$("#cp-train-pre"),hw=$("#cp-train-hw");
+ const NO=[0.125,0.35,1,1.5,3,8.03,13,34,70,175,405,540,1000],DD=[0.1,0.3,0.5,1,1.4,2,5,10,15,30,100],GO=[8,64,256,1024,2048,4096,8192,16384];
+ const HW={a100:{n:"A100",p:312e12},h100:{n:"H100 SXM",p:989e12}};let hwk="h100";
+ const PRE={l3:[5,8],g3:[9,1],ch:[8,4]};
+ function draw(){const N=NO[+sn.value]*1e9,D=DD[+sD.value]*1e12,G=GO[+sg.value],u=+sm.value/100,P=HW[hwk].p;
+  on.value=NO[+sn.value]+" B";oD.value=DD[+sD.value]+" T";og.value=comma(G);om.value=sm.value+"%";
+  const C=6*N*D,gs=C/(P*u),gh=gs/3600,days=gs/G/86400;
+  cards.innerHTML=`<div class="cp-card">compute 6ND<b>${sci(C)}</b>FLOPs</div><div class="cp-card">GPU-hours<b>${comma(gh)}</b>at ${(P*u/1e12).toFixed(0)} TFLOP/s each</div><div class="cp-card">wall-clock<b>${days.toFixed(1)} days</b>on ${comma(G)} × ${HW[hwk].n}</div><div class="cp-card">tokens per parameter<b>${(D/N).toFixed(0)}</b>Chinchilla-optimal ≈ 20</div>`;
+  info.dataset.c=C.toExponential(3);info.dataset.days=days.toFixed(1);
+  info.innerHTML=`C = 6 × ${NO[+sn.value]} × 10<sup>9</sup> × ${DD[+sD.value]} × 10<sup>12</sup> = <b>${sci(C)}</b> FLOPs. Time = C / (${comma(G)} GPUs × ${(P/1e12).toFixed(0)} TFLOP/s × ${sm.value}%) = <b>${days.toFixed(1)} days</b>${days>365?` (${(days/365).toFixed(1)} years)`:""}.`;}
+ pre.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const v=PRE[b.dataset.p];sn.value=v[0];sD.value=v[1];segSet(pre,"p",b.dataset.p);draw();});
+ hw.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;hwk=b.dataset.h;segSet(hw,"h",hwk);draw();});
+ [sn,sD].forEach(s=>s.addEventListener("input",()=>{segSet(pre,"p","");draw();}));[sg,sm].forEach(s=>s.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: attention share of forward FLOPs vs context ---------- */
+(function(){
+ const svg=$("#cp-flop-svg");if(!svg)return;const sT=$("#cp-flop-T"),oT=$("#cp-flop-Tv"),cz=$("#cp-flop-c"),info=$("#cp-flop-info"),seg=$("#cp-flop-pre");let cur="l3";
+ function parts(c,T,causal){const r=count(c);const w=2*r.mm,a=4*c.L*T*r.h*c.dh*(causal?0.5:1);return{w,a,s:a/(w+a),r};}
+ function draw(){const c=CFG[cur],T=Math.pow(2,+sT.value),causal=cz.checked;oT.value=comma(T);
+  const x0=60,x1=610,y0=230,y1=20;const X=l=>x0+(l-9)/(20-9)*(x1-x0),Y=s=>y0-s*(y0-y1);
+  let g="";[0,0.25,0.5,0.75,1].forEach(s=>{g+=`<line x1="${x0}" y1="${Y(s)}" x2="${x1}" y2="${Y(s)}" stroke="var(--rule)" ${s===0.5?'stroke-dasharray="5 4"':''}/><text x="${x0-8}" y="${Y(s)+4}" text-anchor="end" class="svgs" font-size="12">${s*100}%</text>`;});
+  [9,11,13,15,17,20].forEach(l=>{const t=Math.pow(2,l);g+=`<text x="${X(l)}" y="${y0+18}" text-anchor="middle" class="svgs" font-size="12">${t>=1048576?"1M":t>=1024?(t/1024)+"k":t}</text>`;});
+  g+=`<text x="${(x0+x1)/2}" y="${y0+36}" text-anchor="middle" class="svgs" font-size="12">context length T (log scale)</text>`;
+  let pth="";for(let i=0;i<=110;i++){const l=9+i*0.1;const s=parts(c,Math.pow(2,l),causal).s;pth+=(i?"L":"M")+X(l).toFixed(1)+" "+Y(s).toFixed(1);}
+  g+=`<path d="${pth}" fill="none" stroke="var(--tc)" stroke-width="3"/>`;
+  const p=parts(c,T,causal);const l=+sT.value;
+  g+=`<line x1="${X(l)}" y1="${y0}" x2="${X(l)}" y2="${Y(p.s)}" stroke="var(--muted)" stroke-dasharray="3 3"/><circle cx="${X(l)}" cy="${Y(p.s)}" r="7" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;
+  const Tx=p.w/(4*c.L*p.r.h*c.dh*(causal?0.5:1));
+  if(Tx>=512&&Tx<=1048576){const lx=Math.log2(Tx);g+=`<circle cx="${X(lx)}" cy="${Y(0.5)}" r="4" fill="var(--q)"/><text x="${X(lx)+8}" y="${Y(0.5)-8}" class="svgs" font-size="12" fill="var(--q)" stroke="var(--card)" stroke-width="4" paint-order="stroke">50% at T ≈ ${comma(Tx)}</text>`;}
+  g+=`<text x="${x0+6}" y="${y1+12}" class="svgt" font-size="13" font-weight="700">${B.esc(c.n)}: attention share of forward FLOPs</text>`;
+  svg.innerHTML=g;info.dataset.share=(100*p.s).toFixed(1);
+  info.innerHTML=`Per token at T = ${comma(T)}: weights 2N = <b>${(p.w/1e9).toFixed(2)} GFLOPs</b> (N = ${big(p.r.mm)} weights in matrix multiplies), attention 4LTd${causal?" × ½":""} = <b>${(p.a/1e9).toFixed(2)} GFLOPs</b>. Attention share: <b>${pct(p.s)}</b>. Equal at T ≈ ${comma(Tx)} (about ${(Tx/c.d).toFixed(1)}d).`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;cur=b.dataset.p;segSet(seg,"p",cur);draw();});
+ sT.addEventListener("input",draw);cz.addEventListener("change",draw);draw();
+})();
+
+/* ---------- Figure 4: memory of Llama 3 8B ---------- */
+(function(){
+ const svg=$("#cp-mem-svg");if(!svg)return;const sb=$("#cp-mem-b"),ss=$("#cp-mem-s"),fl=$("#cp-mem-f"),ob=$("#cp-mem-bv"),os=$("#cp-mem-sv"),info=$("#cp-mem-info"),seg=$("#cp-mem-mode");
+ const N=8030261248,L=32,d=4096,h=32,kv=8,dh=128;let mode="train";
+ function draw(){const b=Math.pow(2,+sb.value),s=Math.pow(2,+ss.value);ob.value=b;os.value=comma(s);fl.disabled=mode!=="train";
+  let parts;
+  if(mode==="train"){const act=L*s*b*d*(34+(fl.checked?0:5*h*s/d));parts=[["BF16 weights",2*N,"var(--q)"],["BF16 grads",2*N,"var(--k)"],["FP32 master",4*N,"var(--v)"],["Adam m, v",8*N,"var(--muted)"],["activations",act,"var(--tc)"]];}
+  else{const kvb=2*L*kv*dh*s*b*2;parts=[["BF16 weights",2*N,"var(--q)"],["KV cache",kvb,"var(--tc)"]];}
+  const tot=parts.reduce((a,p)=>a+p[1],0);const scale=Math.max(tot,80e9)*1.04;const x0=20,w=600,X=v=>x0+w*v/scale;
+  let g="",x=x0;parts.forEach(([n,v,col])=>{const ww=w*v/scale;g+=`<rect x="${x.toFixed(1)}" y="40" width="${ww.toFixed(1)}" height="38" fill="${col}" opacity=".85"><title>${n}: ${(v/1e9).toFixed(1)} GB</title></rect>`;x+=ww;});
+  g+=`<line x1="${X(80e9)}" y1="28" x2="${X(80e9)}" y2="90" stroke="var(--ink)" stroke-width="2" stroke-dasharray="5 4"/><text x="${Math.min(X(80e9),600)}" y="22" text-anchor="middle" class="svgs" font-size="12">80 GB GPU</text>`;
+  g+=`<text x="${x0}" y="22" class="svgt" font-size="13" font-weight="700">total ${(tot/1e9).toFixed(1)} GB</text>`;
+  parts.forEach(([n,v,col],i)=>{const lx=x0+i*122;g+=`<rect x="${lx}" y="108" width="12" height="12" rx="2" fill="${col}"/><text x="${lx+17}" y="118" class="svgs" font-size="12">${n}</text><text x="${lx+17}" y="136" class="svgt" font-size="12" font-weight="700">${(v/1e9).toFixed(1)} GB</text>`;});
+  svg.innerHTML=g;info.dataset.total=(tot/1e9).toFixed(1);
+  const fit=tot<=80e9;
+  info.innerHTML=mode==="train"?`Training, batch ${b} × ${comma(s)} tokens: states 16N = <b>${(16*N/1e9).toFixed(1)} GB</b>, activations L·sbd·(34${fl.checked?"":" + 5hs/d"}) = <b>${(parts[4][1]/1e9).toFixed(1)} GB</b>. Total <b>${(tot/1e9).toFixed(1)} GB</b>: ${fit?"fits":"does not fit"} on one 80 GB GPU${fit?"":`; with ZeRO-3 or FSDP over 8 GPUs the states are ${(2*N/1e9).toFixed(1)} GB per GPU`}.`
+   :`Inference, ${b} sequence${b>1?"s":""} × ${comma(s)} tokens: weights <b>${(2*N/1e9).toFixed(1)} GB</b>, KV cache 2·L·h<sub>kv</sub>·d<sub>h</sub>·2 bytes = 128 KiB per token → <b>${(parts[1][1]/2**30).toFixed(2)} GiB</b> (${(parts[1][1]/1e9).toFixed(1)} GB). Total <b>${(tot/1e9).toFixed(1)} GB</b>: ${fit?"fits":"does not fit"} on one 80 GB GPU.`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;mode=b.dataset.m;segSet(seg,"m",mode);draw();});
+ [sb,ss].forEach(s=>s.addEventListener("input",draw));fl.addEventListener("change",draw);draw();
+})();
+
+/* ---------- Figure 5: Llama 3 8B, one line at a time ---------- */
+(function(){
+ const tab=$("#cp-step-tab");if(!tab)return;const info=$("#cp-step-info");
+ const d=4096,L=32,V=128256,ff=14336,kvw=8*128;
+ const qo=2*d*d,kvp=2*d*kvw,fn=3*d*ff,nm=2*d,layer=qo+kvp+fn+nm,emb=V*d,total=2*emb+L*layer+d,mm=total-emb-(2*L+1)*d,est=12*L*d*d+2*emb;
+ const rows=[["input table","|V|·d",emb,emb],["W_Q, W_O (one layer)","2·d·d",qo,emb+qo],["W_K, W_V (one layer)","2·d·(h_kv·d_h)",kvp,emb+qo+kvp],["SwiGLU FFN (one layer)","3·d·d_ff",fn,emb+qo+kvp+fn],["2 RMSNorms (one layer)","2·d",nm,emb+layer],["31 more layers","31 × "+comma(layer),31*layer,emb+L*layer],["final norm + output layer","d + |V|·d",d+emb,total]];
+ const S=[{k:-1,t:`Config: d = 4,096, L = 32, h = 32, h<sub>kv</sub> = 8, so d<sub>h</sub> = 128 and the K/V width is 8 × 128 = 1,024; d<sub>ff</sub> = 14,336; |V| = 128,256; tie_word_embeddings = false. Press Next to count.`},
+  {k:0,t:`Input embedding: 128,256 × 4,096 = <b>${comma(emb)}</b>. A lookup: it costs no FLOPs.`},
+  {k:1,t:`Query and output projections: 2 × 4,096 × 4,096 = <b>${comma(qo)}</b> per layer. The 32 heads do not change this.`},
+  {k:2,t:`Key and value projections with GQA: 2 × 4,096 × 1,024 = <b>${comma(kvp)}</b>, a quarter of full MHA.`},
+  {k:3,t:`SwiGLU: gate, up and down, 3 × 4,096 × 14,336 = <b>${comma(fn)}</b>. This is 10.5d², the biggest part of the layer.`},
+  {k:4,t:`Two RMSNorm scales: 2 × 4,096 = ${comma(nm)}. One layer is <b>${comma(layer)}</b> ≈ ${(layer/(d*d)).toFixed(2)}d². Running total after one layer: ${big(emb+layer)}.`},
+  {k:5,t:`All 32 layers: 32 × ${comma(layer)} = ${comma(L*layer)}. Running total: <b>${comma(emb+L*layer)}</b>.`},
+  {k:6,t:`Final RMSNorm (4,096) and the untied output layer (${comma(emb)}). <b>Total: ${comma(total)}</b>, the “8B”.`},
+  {k:6,t:`Check: the quick estimate 12Ld² + 2|V|d = ${comma(est)} is ${(100*(total-est)/total).toFixed(1)}% low. The reason: FFN 10.5d² instead of 8d², GQA attention 2.5d² instead of 4d².`},
+  {k:6,t:`FLOPs: the ${big(mm)} weights in matrix multiplies give 2N = <b>${(2*mm/1e9).toFixed(1)} GFLOPs</b> per token forward and 6N = <b>${(6*mm/1e9).toFixed(1)} GFLOPs</b> per token in training, plus 4LTd = ${(4*L*8192*d/1e9).toFixed(1)} GFLOPs of attention at T = 8,192.`},
+  {k:6,t:`Memory: BF16 weights 2N = <b>${(2*total/1e9).toFixed(2)} GB</b>; AdamW training states 16N = <b>${(16*total/1e9).toFixed(1)} GB</b>; KV cache 2 × 32 × 1,024 × 2 bytes = <b>128 KiB per token</b>, 1 GiB for 8,192 tokens.`}];
+ function draw(i){const st=S[i];
+  tab.innerHTML=`<tr><td><b>group</b></td><td><b>formula</b></td><td><b>count</b></td><td><b>running total</b></td></tr>`+rows.map((r,j)=>j>st.k?"":`<tr class="${j===st.k&&i<=7?"on":""}"><td>${r[0]}</td><td>${r[1]}</td><td>${comma(r[2])}</td><td>${comma(r[3])}</td></tr>`).join("")+(st.k>=6?`<tr class="sum"><td>total</td><td></td><td></td><td>${comma(total)}</td></tr>`:"");
+  info.dataset.run=String(st.k<0?0:rows[st.k][3]);info.innerHTML=st.t;}
+ B.stepper({n:S.length,prev:$("#cp-step-prev"),next:$("#cp-step-next"),play:$("#cp-step-play"),label:$("#cp-step-lab"),ms:2600,onStep:draw});
+})();
+})();
+</script></body></html>

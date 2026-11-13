@@ -1,0 +1,463 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>GPU architecture for ML · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 42</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="gpu-architecture-for-ml">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="gpu-architecture-for-ml" data-session="gpu-architecture-for-ml" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">42</span><span>Track 3: Pretraining and scale · session 12 of 22</span></div><h1 class="chap-title">GPU architecture for ML</h1><p class="chap-sub">A GPU is thousands of small arithmetic units fed by a memory system that is much slower than the arithmetic. This session opens the box: streaming multiprocessors, warps and tensor cores, then registers, shared memory, L2 and HBM. With the roofline model and arithmetic intensity you will predict whether an operation is limited by compute or by memory, and with MFU you will measure how much of the GPU a training run really uses.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 25 and 37 (counting FLOPs and memory; number formats on GPUs)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How a GPU is built: streaming multiprocessors (SMs), warps of 32 threads, CUDA cores and tensor cores</li><li>Why GPUs run many warps at once: hiding memory latency by switching between warps</li><li>The memory hierarchy: registers, shared memory (SRAM), L2 cache and HBM or GDDR, with real sizes and speeds for H100, A100 and RTX 4090</li><li>Arithmetic intensity and the roofline: how to tell if an operation is compute-bound or memory-bound</li><li>Why a matrix multiplication needs about 345 rows (tokens) on an H100 to become compute-bound, and why batch-1 decoding is memory-bound</li><li>How tiling in shared memory raises the arithmetic intensity of a matrix multiplication</li><li>Model FLOPs utilization (MFU): how to compute it, what real runs reach (PaLM 46.2%, Llama 3 405B 38 to 43%), and why the definition matters</li></ul></div></header><style>
+.ga-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.ga-grid input[type=range]{width:100%}
+.ga-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.ga-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+#ga-arch-svg text,#ga-roof-svg text,#ga-lat-svg text,#ga-tile-svg text,#ga-mfu-svg text{font-family:var(--sans)}
+.ga-pt{cursor:pointer}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">An H100 GPU can do about 989 trillion floating-point operations (FLOPs) per second in BF16, but it can only read about 3.35 trillion bytes per second from its main memory. [Certain] That gap, about 295 FLOPs for every byte, decides almost everything about how fast your model trains and runs.</p>
+<p>In <a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a> you learned to count FLOPs, and you turned FLOPs into GPU-days with a number called MFU. In <a href="../pretraining/index.html#row-numbers-on-gpus-fp32-tf32-fp16-bf16" title="Numbers on GPUs: FP32, TF32, FP16, BF16, FP8 and mixed precision (planned)">session 37</a> you saw why BF16 and FP8 are faster than FP32. This session explains the machine underneath. Why is a large matrix multiplication fast, but a LayerNorm or a softmax slow per FLOP? Why does generating one token at a time use less than 1% of the GPU’s arithmetic? Why are FlashAttention and kernel fusion so important? The answers all come from two facts: how the GPU is built, and how its memory works.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “What is a warp?”, “What is the difference between shared memory and HBM?”, “Is this operation compute-bound or memory-bound?”, “What is the ridge point of an H100?”, “How do you compute MFU, and what is a good value?”. Every one is answered with numbers below.</aside>
+<p>You do not need to write CUDA to use this knowledge. Choosing a batch size, deciding whether to fuse two operations, reading a profiler trace, and estimating the cost of a training run all need the same mental model. Writing kernels comes later, in <a href="../inference/index.html#row-gpu-kernels-1-cuda-basics-for-ml" title="GPU kernels 1: CUDA basics for ML engineers (planned)">session 85</a> and <a href="../inference/index.html#row-gpu-kernels-2-write-kernels-in-the" title="GPU kernels 2: write kernels in the Triton language (planned)">session 86</a>.</p>
+
+<h2>A GPU is a throughput machine</h2>
+<p>A CPU has a few large cores. Each core is built to finish <b>one</b> stream of instructions as fast as possible: big caches, branch prediction, out-of-order execution. A GPU makes the opposite choice. It has many small, simple cores and very little control logic per core. It is slow at any single task but fast at doing the <b>same</b> operation on millions of numbers at once. We say a CPU is built for <b>latency</b> (time for one task) and a GPU for <b>throughput</b> (tasks finished per second).</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A CPU is a few expert chefs, each cooking a full dish quickly. A GPU is a huge kitchen with thousands of helpers who can only chop, but all chop at the same moment. For a banquet where every dish needs the same 10 million onions chopped, the big kitchen wins easily. For one complex dish, the chef wins.</aside>
+<p>Deep learning is almost all banquet work. A transformer layer is mostly large matrix multiplications plus simple element-by-element operations (adds, GELU, normalization). All of these apply the same rule to many numbers. That is why GPUs, not CPUs, train models.</p>
+
+<h2>Streaming multiprocessors, warps and threads</h2>
+<p>The GPU chip is divided into many identical units called <b>streaming multiprocessors (SMs)</b>. The H100 SXM has 132 SMs, the A100 has 108, and the RTX 4090 has 128. [Certain] Each SM is a small processor of its own, with its own arithmetic units, its own fast memory and its own schedulers. All SMs share the large L2 cache and the main memory.</p>
+<h3>The programming model: threads, blocks, grid</h3>
+<p>When you launch work on a GPU, you launch a <b>kernel</b>: one function that many <b>threads</b> run at the same time, each on a different piece of the data. Threads are grouped into <b>thread blocks</b> (often 128 to 1024 threads). The whole launch is a <b>grid</b> of blocks. Each block runs on one SM from start to finish, and threads of the same block can share data through the SM’s fast memory. Blocks cannot talk to each other cheaply, so different blocks should do independent work (for example, different tiles of the output matrix).</p>
+<h3>Warps</h3>
+<p>The hardware does not run threads one by one. It runs them in groups of 32 called <b>warps</b>. [Certain] All 32 threads of a warp execute the <b>same instruction</b> at the same moment, each on its own data. NVIDIA calls this SIMT (single instruction, multiple threads). Two consequences matter for ML:</p>
+<ul>
+<li><b>Divergence.</b> If threads in one warp take different branches of an <code>if</code>, the warp runs both branches one after the other, with some threads switched off. Work that follows one path for all 32 threads is faster.</li>
+<li><b>Coalescing.</b> When the 32 threads read 32 neighboring numbers, the hardware merges this into a few wide memory transactions. Scattered reads waste bandwidth. This is why memory layout (contiguous tensors, which dimension is last) affects speed.</li></ul>
+<p>An H100 SM can hold up to 64 warps (2,048 threads) at the same time. [Certain] It is divided into four parts (sub-partitions), each with its own warp scheduler. [Likely] Every clock cycle, each scheduler picks one warp that is ready and issues its next instruction.</p>
+<h3>CUDA cores and tensor cores</h3>
+<p>Each SM has two kinds of arithmetic units. <b>CUDA cores</b> do ordinary scalar math: one FP32 add or multiply per lane. <b>Tensor cores</b> do a small matrix multiply-accumulate in one instruction: \(D = A B + C\) on small tiles (for example, a few 16 × 8 or 16 × 16 blocks), with low-precision inputs (FP16, BF16, FP8) and an FP32 accumulator. The H100 has 4 tensor cores per SM, 528 in total. [Certain]</p>
+<p>The difference in speed is huge. On the H100 SXM, ordinary FP32 math peaks at 67 TFLOP/s, while dense BF16 on the tensor cores peaks at 989 TFLOP/s, about 14.8 times more. [Certain] So in practice, only matrix multiplications can reach the GPU’s headline number. Everything else (softmax, normalization, activation functions, residual adds) runs on the CUDA cores at a much lower peak, and as we will see, it is usually limited by memory anyway.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Spec sheets often show tensor-core numbers “with sparsity”, which are twice the dense numbers (1,979 instead of 989 TFLOP/s for H100 BF16). That speed needs a special 2:4 sparse weight pattern. For normal training and MFU, always use the <b>dense</b> number. [Certain]</aside>
+<p>Figure 1 walks from the full chip down to one warp, and then follows the data of one matrix multiplication on its way from main memory to a tensor core.</p>
+<figure class="fig" id="ga-arch"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="ga-arch-prev">Back</button><button type="button" class="btn primary" id="ga-arch-play">Play</button><button type="button" class="btn" id="ga-arch-next">Next</button><span id="ga-arch-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="ga-arch-svg" viewBox="0 0 780 330" role="img" aria-label="Diagram of a GPU: streaming multiprocessors, L2 cache and HBM, then the inside of one SM"></svg></div>
+<div class="readout" id="ga-arch-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Inside an H100 SXM, step by step. The chip has 132 SMs that share a 50 MB L2 cache and 80 GB of HBM3. Each SM has four sub-partitions with a warp scheduler, registers, CUDA cores and a tensor core, plus up to 228 KB of shared memory.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Step through with Next. The colors follow the data: orange for the big, slow memory (HBM), blue for the fast memory close to the arithmetic (shared memory and registers), and green for the units that compute. The last steps show a tile of a matrix moving from HBM through L2 and shared memory into registers, where the tensor core uses it many times. That reuse is the whole trick of fast GPU code.</p></details></figure>
+
+<h2>Hiding latency with many warps</h2>
+<p>A read from HBM takes hundreds of clock cycles to come back. [Likely] A CPU would try to avoid this wait with big caches. A GPU instead <b>hides</b> the wait: when one warp is waiting for memory, the scheduler simply issues an instruction from another warp that is ready. If there are enough warps, the arithmetic units never sit idle.</p>
+<p>A simple model shows how many warps are enough. Say each warp computes for \(c\) cycles, then waits \(\ell\) cycles for memory, again and again. One scheduler can keep busy only if, during one warp’s wait, other warps have enough compute to fill it:</p>
+<div class="eq">\[ U \approx \min\!\left(1,\ \frac{W\, c}{c + \ell}\right) \tag{42.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(U\)</dt><dd>utilization: the fraction of cycles in which the scheduler issues useful work</dd>
+<dt>\(W\)</dt><dd>number of warps that the scheduler can choose from</dd>
+<dt>\(c\)</dt><dd>cycles of compute a warp does before it needs new data from memory</dd>
+<dt>\(\ell\)</dt><dd>memory latency: cycles until the data arrives</dd></dl>
+<p>So you need about \(W \ge (c + \ell)/c\) warps. With \(c = 10\) and \(\ell = 90\), that is 10 warps. The fraction of the SM’s warp slots that are filled is called <b>occupancy</b>. Each warp needs registers and shared memory, and the SM has a fixed amount of both, so a kernel that uses many registers per thread can fit fewer warps. This is a real trade-off for kernel writers. Formula (42.1) is a teaching model, not an exact law. [Certain] Real kernels also hide latency inside one warp, by starting the next memory loads before they need them (prefetching, pipelining).</p>
+<figure class="fig" id="ga-lat"><div class="fig-body">
+<div class="ga-grid">
+<label for="ga-lat-w">Warps \(W\)</label><input type="range" id="ga-lat-w" min="1" max="16" step="1" value="4"><output id="ga-lat-wv"></output>
+<label for="ga-lat-c">Compute cycles \(c\)</label><input type="range" id="ga-lat-c" min="2" max="30" step="1" value="10"><output id="ga-lat-cv"></output>
+<label for="ga-lat-l">Memory latency \(\ell\)</label><input type="range" id="ga-lat-l" min="10" max="200" step="5" value="90"><output id="ga-lat-lv"></output></div>
+<div class="scroll-x"><svg id="ga-lat-svg" viewBox="0 0 640 300" role="img" aria-label="Timeline of warps computing and waiting for memory"></svg></div>
+<div class="ga-leg"><span style="--c:var(--v)">computing (issuing)</span><span style="--c:var(--k-soft)">waiting for memory</span><span style="--c:var(--rule)">ready but not chosen</span></div>
+<div class="readout" id="ga-lat-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> One warp scheduler with \(W\) warps, simulated cycle by cycle. Each warp computes for \(c\) cycles, then waits \(\ell\) cycles for memory. The bottom row shows whether the scheduler did useful work in each cycle.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With 1 warp, the scheduler is idle most of the time: it waits with the warp. Add warps and the gaps fill in, until the bottom row is solid and utilization reaches 100%. The readout compares the simulation with formula (42.1). Then raise the latency: you need more warps for the same utilization. Raise the compute per load (\(c\)): you need fewer. A kernel that does more math per byte loaded is easier to keep busy. The next sections turn this idea into the roofline.</p></details></figure>
+
+<h2>The memory hierarchy</h2>
+<p>A GPU has several levels of memory. The closer a level is to the arithmetic units, the faster and the smaller it is. The table gives the numbers for an H100 SXM.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Level</th><th>Where</th><th>Size (H100 SXM)</th><th>Who can see it</th><th>Speed</th></tr></thead><tbody>
+<tr><td><b>Registers</b></td><td>inside each SM sub-partition</td><td>256 KB per SM (65,536 registers of 32 bits); about 33 MB in total</td><td>one thread</td><td>fastest; read every cycle</td></tr>
+<tr><td><b>Shared memory (SRAM) / L1</b></td><td>inside each SM</td><td>256 KB per SM combined, of which up to 228 KB can be shared memory</td><td>all threads of one block</td><td>very fast, a few tens of cycles [Likely]</td></tr>
+<tr><td><b>L2 cache</b></td><td>on the chip, shared by all SMs</td><td>50 MB</td><td>all SMs</td><td>faster than HBM; hundreds of cycles [Likely]</td></tr>
+<tr><td><b>HBM3</b> (main GPU memory)</td><td>stacks next to the chip</td><td>80 GB</td><td>everything; the host copies data here</td><td>3.35 TB/s; hundreds of cycles of latency [Likely]</td></tr></tbody></table></div>
+<p>The sizes and the HBM bandwidth are from NVIDIA’s Hopper documentation and H100 product page. [Certain] Shared memory is <b>SRAM</b> (static RAM) on the chip. The programmer controls it directly: a kernel says “load this tile into shared memory”, and all threads of the block can then read it many times. That makes it the main tool for <b>reuse</b>. HBM (high-bandwidth memory) is DRAM stacked next to the GPU die; it is large but far away. Consumer GPUs use <b>GDDR</b> memory instead, which is cheaper and slower: the RTX 4090 has 24 GB of GDDR6X at 1,008 GB/s and a 72 MB L2 cache. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Registers are the tools in your hand. Shared memory is your workbench. L2 is the store room on your floor. HBM is the warehouse across town: huge, but every trip takes time, and the road (bandwidth) has a fixed width. Good work brings a box from the warehouse once and uses everything in it at the bench before the next trip.</aside>
+<div class="worked"><div class="wt">Worked example: how long does it take just to read the weights?</div>
+<p>Llama 3 8B has about 8.03 billion parameters. In BF16 (2 bytes each), the weights are \(8.03 \times 10^9 \times 2 = 16.06\) GB. Reading them once from HBM at 3.35 TB/s takes \(16.06 / 3350 = 4.79\) ms.</p>
+<p>When a chatbot generates text for one user, every new token needs all the weights once. So even with infinitely fast arithmetic, one H100 cannot produce more than about \(1 / 4.79\ \text{ms} \approx 209\) tokens per second for one user. Memory, not compute, sets this limit. Reading the whole 80 GB of HBM takes 23.9 ms.</p></div>
+
+<h2>Arithmetic intensity</h2>
+<p>Every operation does some FLOPs and moves some bytes between HBM and the chip. Their ratio is the <b>arithmetic intensity</b>:</p>
+<div class="eq">\[ I = \frac{F}{Q} \quad \left[\frac{\text{FLOP}}{\text{byte}}\right] \tag{42.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(F\)</dt><dd>the number of floating-point operations the kernel does (a multiply-add counts as 2)</dd>
+<dt>\(Q\)</dt><dd>the number of bytes it reads from and writes to HBM (main memory)</dd>
+<dt>\(I\)</dt><dd>arithmetic intensity: how much math is done for each byte of memory traffic</dd></dl>
+<p>Three examples, all in BF16 (2 bytes per number):</p>
+<ul>
+<li><b>Elementwise add</b> \(z = x + y\) on \(n\) numbers: \(n\) FLOPs; read \(2n\) numbers, write \(n\), so \(6n\) bytes. \(I = 1/6 \approx 0.167\). Very low.</li>
+<li><b>Normalization, softmax, GELU</b>: a few FLOPs per number, but each number is read and written once. \(I\) is around 1 or a bit more. [Likely]</li>
+<li><b>Matrix multiplication</b> \((M \times K)\) times \((K \times N)\): \(2MKN\) FLOPs (from Session 25), and the bytes for the three matrices:</li></ul>
+<div class="eq">\[ I_{\text{GEMM}} = \frac{2MKN}{2\,(MK + KN + MN)} = \frac{MKN}{MK + KN + MN} \tag{42.3} \]</div>
+<p>For square matrices with \(M = K = N = n\), this is \(n/3\): it grows with size. A big matrix multiplication reuses each loaded number many times, because each number of \(A\) meets a whole row of \(B\). That is why it is special.</p>
+<p>A case that matters a lot for LLMs: a linear layer with a \(d \times d\) weight, applied to \(M\) tokens (so \(K = N = d\)). Formula (42.3) becomes</p>
+<div class="eq">\[ I = \frac{M d}{2M + d} \tag{42.4} \]</div>
+<p>When \(M\) is small this is about \(M\) FLOPs per byte; when \(M\) is large it approaches \(d/2\). With \(d = 4096\): one token (\(M = 1\)) gives \(I \approx 1.0\); 64 tokens give 62; 4,096 tokens give 1,365. The number of tokens in the batch, not the size of the model, sets the intensity of the weight matrices.</p>
+
+<h2>The roofline model</h2>
+<p>An operation needs time for its math and time for its memory traffic. If the GPU overlaps the two perfectly, the time is set by the slower one. This is the <b>roofline model</b> (Williams, Waterman and Patterson, 2009):</p>
+<div class="eq">\[ t \ \ge\ \max\!\left(\frac{F}{P},\ \frac{Q}{B}\right) \tag{42.5} \]</div>
+<p>Divide the FLOPs by this time and you get the best speed the operation can reach:</p>
+<div class="eq">\[ \text{attainable FLOP/s} = \min\big(P,\ I \cdot B\big), \qquad I^{*} = \frac{P}{B} \tag{42.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P\)</dt><dd>peak compute of the GPU in FLOP/s, for the number format you use (dense BF16: 989 TFLOP/s on H100 SXM)</dd>
+<dt>\(B\)</dt><dd>memory bandwidth in bytes per second (3.35 TB/s on H100 SXM)</dd>
+<dt>\(I^{*}\)</dt><dd>the <b>ridge point</b>: the intensity where the two limits meet</dd></dl>
+<p>On a log-log plot, \(I \cdot B\) is a sloped line and \(P\) is a flat line: together they look like a roof. An operation with \(I \lt I^{*}\) sits under the slope: it is <b>memory-bound</b>, and a faster memory would make it faster, faster arithmetic would not. An operation with \(I \gt I^{*}\) sits under the flat part: it is <b>compute-bound</b>.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>GPU</th><th>Dense BF16 peak \(P\)</th><th>Memory bandwidth \(B\)</th><th>Ridge point \(I^{*}\)</th></tr></thead><tbody>
+<tr><td>H100 SXM (HBM3)</td><td>989 TFLOP/s</td><td>3.35 TB/s</td><td>295 FLOP/byte</td></tr>
+<tr><td>A100 SXM 80 GB (HBM2e)</td><td>312 TFLOP/s</td><td>2.039 TB/s</td><td>153 FLOP/byte</td></tr>
+<tr><td>RTX 4090 (GDDR6X)</td><td>165.2 TFLOP/s (FP32 accumulate)</td><td>1.008 TB/s</td><td>164 FLOP/byte</td></tr></tbody></table></div>
+<p>The peaks and bandwidths are NVIDIA’s published numbers (H100 and A100 product pages list them “with sparsity”, which we halve; the 4090 number is from the Ada whitepaper). [Certain] Notice the trend: compute grew faster than bandwidth from A100 to H100, so the ridge point moved up. Newer GPUs need even more reuse per byte to be compute-bound.</p>
+<div class="worked"><div class="wt">Worked example: three operations on an H100</div>
+<p><b>Add two BF16 vectors of \(2^{27}\) numbers</b> (134 million). Bytes: \(6 \times 2^{27} = 805\) MB, so memory time is \(805 / 3.35 \times 10^{6} = 240\) µs. Even on the slow FP32 units (67 TFLOP/s), the math takes 2 µs. Memory-bound by more than 100×.</p>
+<p><b>Square matrix multiplication with \(n = 8192\)</b>. FLOPs: \(2 \times 8192^3 = 1.10 \times 10^{12}\). Bytes: \(3 \times 8192^2 \times 2 = 403\) MB. \(I = 2731\), far above 295. Math takes 1.11 ms, memory 0.12 ms: compute-bound.</p>
+<p><b>A \(4096 \times 4096\) linear layer</b>. By formula (42.4), it reaches the ridge point when \(M d / (2M + d) = 295.2\), so \(M = 295.2 \times 4096 / (4096 - 590.4) \approx 345\). With fewer than about 345 tokens in the batch, this layer is memory-bound on an H100. On an A100 the same layer needs only about 165 tokens.</p></div>
+<figure class="fig wide" id="ga-roof"><div class="fig-body">
+<div class="controls"><span class="seg" id="ga-roof-hw"><button type="button" data-h="h100" aria-pressed="true">H100 SXM</button><button type="button" data-h="a100" aria-pressed="false">A100 SXM</button><button type="button" data-h="4090" aria-pressed="false">RTX 4090</button></span></div>
+<div class="ga-grid" style="margin-top:8px">
+<label for="ga-roof-m">Tokens \(M\) in the batch</label><input type="range" id="ga-roof-m" min="0" max="14" step="0.25" value="6"><output id="ga-roof-mv"></output></div>
+<div class="scroll-x"><svg id="ga-roof-svg" viewBox="0 0 760 360" role="img" aria-label="Roofline plot of attainable TFLOP/s against arithmetic intensity, with operations as points"></svg></div>
+<div class="ga-leg"><span style="--c:var(--k)">memory roof \(I \cdot B\)</span><span style="--c:var(--v)">compute roof \(P\)</span><span style="--c:var(--q)">the linear layer with \(M\) tokens</span></div>
+<div class="readout" id="ga-roof-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> The roofline (formula 42.6) on log-log axes, with real peak numbers. The blue point is a \(4096 \times 4096\) BF16 linear layer applied to \(M\) tokens (formula 42.4). Gray points are fixed operations; click any of them.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Move the slider. At \(M = 1\) (decoding one token for one user) the point sits far down the sloped roof: about 3.3 TFLOP/s, 0.3% of the peak. As \(M\) grows the point climbs the slope, passes the ridge near \(M = 345\) on the H100, and then stays on the flat roof. Switch to the A100: its ridge is lower, so the same layer becomes compute-bound earlier, but its flat roof is also much lower. Elementwise operations never get close to the ridge. They can only get faster by moving fewer bytes, which is what kernel fusion does.</p></details></figure>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Why is LLM decoding memory-bound?” At batch size 1, each weight is read from HBM and used for one multiply-add per token: \(I \approx 1\) FLOP per byte in BF16, about 300 times below the H100 ridge point. Batching many users, quantizing the weights (fewer bytes), and speculative decoding (more tokens per weight read) all raise the useful work per byte. See <a href="../inference/index.html#row-why-inference-is-slow-three-root-causes" title="Why inference is slow: three root causes and the roofline (planned)">session 82</a>.</aside>
+
+<h2>Tiling: how a matrix multiplication reaches the roof</h2>
+<p>Formula (42.3) assumes each number crosses the HBM boundary only once. A naive kernel does not achieve that. If each thread computes one output \(C_{ij}\) and reads its row of \(A\) and column of \(B\) straight from global memory, it moves \(2K\) numbers for \(2K\) FLOPs: \(I = 0.5\) FLOP per byte in BF16, as bad as an elementwise op.</p>
+<p>The fix is <b>tiling</b>. A thread block computes a \(b_M \times b_N\) tile of \(C\). It walks along \(K\) in steps of \(b_K\). At each step it loads a \(b_M \times b_K\) slice of \(A\) and a \(b_K \times b_N\) slice of \(B\) into shared memory, and then every thread reuses those numbers many times from shared memory and registers. The tensor cores consume the tiles.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: tiled matrix multiplication \(C = AB\) on one thread block</div><ol>
+<li><b>input:</b> \(A \in \R^{M \times K}\), \(B \in \R^{K \times N}\) in HBM; tile sizes \(b_M, b_N, b_K\); this block’s tile index \((i, j)\)</li>
+<li>\(\text{acc} \leftarrow 0\) <span class="c">// a \(b_M \times b_N\) FP32 accumulator, held in registers</span></li>
+<li><b>for</b> \(k = 0, b_K, 2b_K, \dots \lt K\) <b>do</b></li>
+<li class="i1">load \(A[i b_M : (i+1) b_M,\ k : k + b_K]\) into shared memory <span class="c">// coalesced reads</span></li>
+<li class="i1">load \(B[k : k + b_K,\ j b_N : (j+1) b_N]\) into shared memory</li>
+<li class="i1">synchronize the block <span class="c">// wait until both tiles are complete</span></li>
+<li class="i1">\(\text{acc} \leftarrow \text{acc} + A_{\text{tile}} B_{\text{tile}}\) <span class="c">// tensor-core MMA instructions, operands from shared memory and registers</span></li>
+<li class="i1">synchronize the block <span class="c">// before the tiles are overwritten</span></li>
+<li>write \(\text{acc}\) (converted to BF16) to \(C[i b_M : (i+1) b_M,\ j b_N : (j+1) b_N]\)</li></ol></div>
+<p>Count the traffic. The block does \(2 b_M b_N K\) FLOPs and loads \((b_M + b_N) K\) numbers. So the intensity against global memory is</p>
+<div class="eq">\[ I_{\text{tile}} = \frac{2\, b_M b_N K}{2\,(b_M + b_N) K} = \frac{b_M\, b_N}{b_M + b_N} \tag{42.7} \]</div>
+<p>Larger tiles mean more reuse: square tiles of 16 give 8 FLOP/byte, 128 give 64, and 128 × 256 gives 85. The limit on tile size is the fast memory: the accumulator must fit in registers and the input tiles in shared memory. Neighboring blocks read the same rows of \(A\) and columns of \(B\), so many of these loads hit the 50 MB L2 cache instead of HBM; the real HBM traffic is lower than formula (42.7) suggests. [Certain] Production kernels (cuBLAS, CUTLASS) add more tricks: several tiles in flight at once so loads overlap with math, and on Hopper, a dedicated copy engine (the Tensor Memory Accelerator) and tiles shared across neighboring SMs. [Likely]</p>
+<figure class="fig" id="ga-tile"><div class="fig-body">
+<div class="ga-grid">
+<label for="ga-tile-bm">Tile rows \(b_M\)</label><input type="range" id="ga-tile-bm" min="3" max="8" step="1" value="7"><output id="ga-tile-bmv"></output>
+<label for="ga-tile-bn">Tile columns \(b_N\)</label><input type="range" id="ga-tile-bn" min="3" max="8" step="1" value="7"><output id="ga-tile-bnv"></output>
+<label for="ga-tile-bk">Tile depth \(b_K\)</label><input type="range" id="ga-tile-bk" min="4" max="7" step="1" value="6"><output id="ga-tile-bkv"></output></div>
+<div class="scroll-x"><svg id="ga-tile-svg" viewBox="0 0 640 270" role="img" aria-label="Output matrix split into tiles, with the input slices one tile needs"></svg></div>
+<div class="readout" id="ga-tile-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Tiling a BF16 matrix multiplication with \(M = N = K = 4096\). Each output tile (blue) needs a strip of \(A\) and a strip of \(B\) (orange). The readout gives the global-memory traffic, the intensity from formula (42.7), and the shared memory that one pair of input tiles uses on an H100 (up to 228 KB per SM).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Start with tiles of 8 × 8: the kernel loads the inputs 512 times over, and the intensity is only 4 FLOP/byte. Grow the tiles and the traffic falls in proportion. Watch the shared-memory line: big tiles with a large \(b_K\) stop fitting, and a kernel that wants two or three tiles in flight (to overlap loads with math) needs two or three times that amount. Tile shape is a balance between reuse and fitting in fast memory.</p></details></figure>
+<aside class="note analogy side"><span class="nt">Analogy</span>Tiling is like a group of students sharing one copy of a textbook chapter on the table, instead of each student walking to the library for every page. The bigger the table, the more students can share one trip.</aside>
+<p>The same idea, applied to attention, is FlashAttention: it computes attention in tiles held in shared memory and never writes the large \(T \times T\) score matrix to HBM. [Certain] You will see it in <a href="../inference/index.html#row-attention-operator-1-flashattention-1-2-and" title="Attention operator 1: FlashAttention 1, 2 and 3 (planned)">session 124</a>. Kernel <b>fusion</b> is the same idea for elementwise chains: do GELU, bias add and dropout in one kernel, so the data crosses HBM once instead of three times (<a href="../pretraining/index.html#row-making-training-fast-compile-cuda-graphs-fused" title="Making training fast: compile, CUDA graphs, fused kernels, profiling (planned)">session 50</a>).</p>
+
+<h2>MFU: how much of the GPU you really use</h2>
+<p>The roofline tells you the best case for one operation. For a full training run we want one number that says how close the whole system comes to the peak. That number is <b>model FLOPs utilization (MFU)</b>, introduced in the PaLM paper. [Certain]</p>
+<div class="eq">\[ \text{MFU} = \frac{\text{tokens per second} \times F_{\text{token}}}{n_{\text{GPU}} \times P} \tag{42.8} \]</div>
+<p>Here \(F_{\text{token}}\) is the number of FLOPs that the <b>model</b> needs per training token, from the formula, not from a hardware counter. The PaLM paper uses</p>
+<div class="eq">\[ F_{\text{token}} = 6N + 12\, L\, d\, T \tag{42.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\)</dt><dd>number of parameters (without the embedding table is the usual choice; the difference is small for big models)</dd>
+<dt>\(6N\)</dt><dd>forward (2N) plus backward (4N) for the weight matrices, from <a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a></dd>
+<dt>\(12 L d T\)</dt><dd>the attention score and value matmuls, forward and backward; \(L\) layers, model width \(d\), sequence length \(T\)</dd>
+<dt>\(n_{\text{GPU}}\), \(P\)</dt><dd>number of GPUs and the dense peak FLOP/s of one GPU</dd></dl>
+<p>MFU counts only useful model FLOPs. If you use activation checkpointing, the GPU recomputes parts of the forward pass, but those FLOPs do <b>not</b> count in MFU. A second number, <b>hardware FLOPs utilization (HFU)</b>, counts them. For PaLM 540B on 6,144 TPU v4 chips: MFU 46.2%, HFU 57.8%. [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Run</th><th>Hardware</th><th>MFU</th><th>Source</th></tr></thead><tbody>
+<tr><td>GPT-3 175B</td><td>V100</td><td>21.3%</td><td>PaLM paper, Table 3 [Certain]</td></tr>
+<tr><td>Megatron-Turing NLG 530B</td><td>2,240 A100</td><td>30.2%</td><td>PaLM paper, Table 3 [Certain]</td></tr>
+<tr><td>PaLM 540B</td><td>6,144 TPU v4</td><td>46.2%</td><td>PaLM paper [Certain]</td></tr>
+<tr><td>Llama 3 405B</td><td>8,192 to 16,384 H100</td><td>38 to 43% (380 to 430 TFLOP/s per GPU)</td><td>Llama 3 paper, Table 4 [Certain]</td></tr></tbody></table></div>
+<p>Check the Llama 3 numbers yourself: \(430 / 989 = 43.5\%\) and \(380 / 989 = 38.4\%\). Even the best large runs use less than half of the peak. Where does the rest go? Memory-bound operations (normalization, softmax, elementwise), communication between GPUs that is not hidden behind compute (<a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">session 43</a>), pipeline bubbles, small matmuls that do not fill all 132 SMs, data loading, and kernels that never reach the roof.</p>
+<div class="worked"><div class="wt">Worked example: MFU of an 8B model on H100s</div>
+<p>You train Llama 3 8B (\(N = 8.03 \times 10^9\), \(L = 32\), \(d = 4096\)) with sequences of \(T = 8192\) tokens and measure 8,000 tokens per second per H100.</p>
+<p>Only \(6N\): \(6 \times 8.03 \times 10^9 = 4.82 \times 10^{10}\) FLOPs per token, so \(8000 \times 4.82 \times 10^{10} = 385\) TFLOP/s per GPU, and MFU \(= 385 / 989 = 39.0\%\).</p>
+<p>With attention: \(12 \times 32 \times 4096 \times 8192 = 1.29 \times 10^{10}\) more, 27% on top of \(6N\). Now \(F_{\text{token}} = 6.11 \times 10^{10}\) and MFU \(= 49.4\%\).</p>
+<p>Same run, same speed, two MFU numbers. Always say which formula you used. With long sequences the attention term is large; for Llama 3 405B at \(T = 8192\) it adds only 8%, because \(d = 16384\) makes \(6N\) much bigger.</p></div>
+<figure class="fig" id="ga-mfu"><div class="fig-body">
+<div class="controls"><span class="seg" id="ga-mfu-model"><button type="button" data-m="8b" aria-pressed="true">Llama 3 8B</button><button type="button" data-m="70b" aria-pressed="false">Llama 3 70B</button><button type="button" data-m="405b" aria-pressed="false">Llama 3 405B</button></span><span class="seg" id="ga-mfu-hw"><button type="button" data-h="h100" aria-pressed="true">H100</button><button type="button" data-h="a100" aria-pressed="false">A100</button></span></div>
+<div class="ga-grid" style="margin-top:8px">
+<label for="ga-mfu-tps">Tokens/s per GPU</label><input type="range" id="ga-mfu-tps" min="0" max="100" step="1" value="60"><output id="ga-mfu-tpsv"></output>
+<label for="ga-mfu-t">Sequence length \(T\)</label><input type="range" id="ga-mfu-t" min="10" max="17" step="1" value="13"><output id="ga-mfu-tv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="ga-mfu-att" checked> Count attention FLOPs (\(12LdT\))</label></div>
+<svg id="ga-mfu-svg" viewBox="0 0 640 150" role="img" aria-label="Bar showing achieved TFLOP/s against the GPU peak"></svg>
+<div class="readout" id="ga-mfu-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> An MFU calculator built on formulas (42.8) and (42.9). Model shapes are from the Llama 3 configs (8B: 32 layers, width 4096; 70B: 80 and 8192; 405B: 126 and 16384). The bar shows the achieved model TFLOP/s per GPU against the dense BF16 peak.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Pick Llama 3 405B, H100, \(T = 8192\), and set about 163 tokens per second per GPU: the MFU is about 43%, the Llama 3 paper’s best value. Turn off the attention term and the same throughput gives a lower MFU. Switch to the A100: the same tokens per second would mean a much higher MFU, often above 100%, which is impossible. That is a quick sanity check for any reported throughput.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 2: diagnose a slow training step with the roofline and MFU</div><ol>
+<li><b>input:</b> a model (\(N, L, d\)), sequence length \(T\), measured tokens per second, GPU peak \(P\) and bandwidth \(B\)</li>
+<li>compute MFU with formulas (42.8) and (42.9) <span class="c">// state whether attention is included</span></li>
+<li><b>if</b> MFU \(\gt 1\) <b>then</b> the throughput or the FLOP formula is wrong <b>stop</b></li>
+<li>profile one step; group the kernel time into matmul, attention, elementwise and normalization, communication, idle</li>
+<li><b>for each</b> large kernel <b>do</b></li>
+<li class="i1">estimate \(F\) and \(Q\); \(I \leftarrow F / Q\); compare with \(I^{*} = P / B\) <span class="c">// formula (42.6)</span></li>
+<li class="i1"><b>if</b> \(I \lt I^{*}\) <b>then</b> reduce bytes: fuse kernels, use FlashAttention, lower precision</li>
+<li class="i1"><b>else</b> raise compute efficiency: larger matmul shapes, dimensions multiple of 64, BF16 or FP8 tensor cores</li>
+<li><b>if</b> much time is communication or idle <b>then</b> overlap communication with compute, change parallelism, check data loading</li>
+<li>re-measure tokens per second and MFU</li></ol></div>
+
+<h2>In code</h2>
+<p>The script computes the roofline for the linear layer of Figure 3, then measures your own device: the matmul speed (compute) and the speed of an elementwise add (memory bandwidth). It runs on a CPU too (in FP32); the measured numbers depend on the machine, the analytic ones do not.</p>
+<pre class="code"><span class="kw2">import</span> time, torch
+
+<span class="cm"># 1) arithmetic intensity and the roofline, formulas (42.2) to (42.6)</span>
+PEAK, BW = 989e12, 3.35e12                  <span class="cm"># H100 SXM: dense BF16 FLOP/s, HBM bytes/s</span>
+<span class="kw2">def</span> roofline(flops, nbytes, peak=PEAK, bw=BW):
+    I = flops / nbytes                      <span class="cm"># FLOP per byte</span>
+    t = max(flops / peak, nbytes / bw)      <span class="cm"># best possible time, formula (42.5)</span>
+    <span class="kw2">return</span> I, flops / t, "compute" <span class="kw2">if</span> I &gt; peak / bw <span class="kw2">else</span> "memory"
+
+<span class="kw2">def</span> gemm(M, K, N, b=2):                     <span class="cm"># (M x K) @ (K x N), b bytes per number</span>
+    <span class="kw2">return</span> 2 * M * K * N, b * (M * K + K * N + M * N)
+
+<span class="kw2">for</span> M <span class="kw2">in</span> [1, 64, 345, 4096]:
+    I, perf, bound = roofline(*gemm(M, 4096, 4096))
+    print(f"M={M:5d}  I={I:7.1f} FLOP/B  best={perf/1e12:6.1f} TFLOP/s  {bound}-bound")
+n = 2**27                                   <span class="cm"># elementwise z = x + y in BF16</span>
+print("add:", round(roofline(n, 3 * 2 * n)[0], 3))   <span class="cm"># 0.167 FLOP per byte</span>
+
+<span class="cm"># 2) measure what your own device really does (numbers depend on the machine)</span>
+dev = "cuda" <span class="kw2">if</span> torch.cuda.is_available() <span class="kw2">else</span> "cpu"
+dt = torch.bfloat16 <span class="kw2">if</span> dev == "cuda" <span class="kw2">else</span> torch.float32
+torch.manual_seed(0)
+<span class="kw2">def</span> timeit(fn, reps=10):
+    fn()                                    <span class="cm"># warm-up (kernel selection, caches)</span>
+    <span class="kw2">if</span> dev == "cuda": torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(reps): fn()
+    <span class="kw2">if</span> dev == "cuda": torch.cuda.synchronize()   <span class="cm"># GPU work is asynchronous</span>
+    <span class="kw2">return</span> (time.perf_counter() - t0) / reps
+
+S = 4096 <span class="kw2">if</span> dev == "cuda" <span class="kw2">else</span> 1024
+a, b = torch.randn(S, S, device=dev, dtype=dt), torch.randn(S, S, device=dev, dtype=dt)
+t = timeit(<span class="kw2">lambda</span>: a @ b)
+print(f"{dev} matmul {S}^3: {2*S**3/t/1e12:.2f} TFLOP/s")
+x, y = torch.randn(n // 8, device=dev, dtype=dt), torch.randn(n // 8, device=dev, dtype=dt)
+t = timeit(<span class="kw2">lambda</span>: x + y)
+print(f"{dev} add: {3 * x.numel() * x.element_size() / t / 1e9:.1f} GB/s")
+
+<span class="cm"># 3) MFU, formulas (42.8) and (42.9)</span>
+<span class="kw2">def</span> mfu(tok_per_s_per_gpu, N, L, d, T, peak=PEAK, attention=True):
+    per_tok = 6 * N + (12 * L * d * T <span class="kw2">if</span> attention <span class="kw2">else</span> 0)
+    <span class="kw2">return</span> tok_per_s_per_gpu * per_tok / peak
+print("8B, 8000 tok/s/GPU:", round(mfu(8000, 8.03e9, 32, 4096, 8192, attention=False), 3),
+      round(mfu(8000, 8.03e9, 32, 4096, 8192), 3))   <span class="cm"># 0.39 and 0.494</span></pre>
+<p>The first part prints: \(M = 1\) gives \(I = 1.0\) and 3.3 TFLOP/s (memory-bound); \(M = 64\) gives 62.1 and 207.9; \(M = 345\) gives 295.3 and the full 989 (compute-bound); \(M = 4096\) gives 1365.3. On a real H100, a large BF16 matmul typically measures well above half of the peak and the add measures most of the 3.35 TB/s. [Likely] Never time GPU code without <code>torch.cuda.synchronize()</code>: kernel launches return immediately, and you would time only the launch.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What the GPU model tells you</th></tr></thead><tbody>
+<tr><td>LLM pretraining</td><td>Large matmuls are compute-bound; MFU of 35 to 50% is good at scale [Likely]. Lost time is in memory-bound ops and communication.</td></tr>
+<tr><td>LLM decoding (chat serving)</td><td>Batch 1 is memory-bound (\(I \approx 1\)); throughput grows almost for free with batch size until the ridge (about 345 tokens per weight read on H100). This is why continuous batching and weight quantization exist (<a href="../inference/index.html#row-batching-basics-and-the-latency-throughput-trade" title="Batching basics and the latency–throughput trade-off (planned)">session 84</a>).</td></tr>
+<tr><td>Prefill of a long prompt</td><td>Thousands of tokens at once: compute-bound, like training. Prefill and decode have opposite bottlenecks, which motivates splitting them onto different GPUs (<a href="../inference/index.html#row-distributed-serving-and-prefill-decode-disaggregation" title="Distributed serving and prefill–decode disaggregation (planned)">session 137</a>).</td></tr>
+<tr><td>Attention kernels</td><td>FlashAttention tiles attention in shared memory to avoid HBM traffic for the \(T \times T\) matrix.</td></tr>
+<tr><td>Video classification and action recognition</td><td>A video model with many frames produces many tokens per clip, so the matmuls are large and compute-bound; decoding the video and moving frames to the GPU can become the bottleneck instead [Likely].</td></tr>
+<tr><td>Video retrieval and fingerprinting at scale</td><td>Embedding millions of frames is a large-batch, compute-bound job; the nearest-neighbor search over embeddings is a matmul with a small query batch, often memory-bound.</td></tr>
+<tr><td>Choosing a GPU</td><td>Compare peak FLOP/s, bandwidth and memory size against your workload: a consumer RTX 4090 has a similar ridge point to an A100 but only 24 GB of GDDR6X.</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Using the sparse peak.</b> MFU against 1,979 TFLOP/s instead of 989 looks half as good, and comparisons with papers become wrong.</li>
+<li><b>Timing without synchronizing.</b> CUDA calls are asynchronous; without <code>torch.cuda.synchronize()</code> (or CUDA events) you measure the launch, not the work. Also skip the first call (warm-up).</li>
+<li><b>Thinking more FLOPs always means more time.</b> A memory-bound op runs at the bandwidth limit; removing FLOPs from it changes nothing. Removing bytes does.</li>
+<li><b>Odd matrix shapes.</b> Dimensions that are not multiples of 8, 16 or 64 can waste tensor-core tiles or fall back to slower paths. A vocabulary of 50,257 is often padded to 50,304 for this reason. [Likely]</li>
+<li><b>Comparing MFU numbers with different formulas.</b> With or without the attention term, with or without embeddings: the same run can show 39% or 49%.</li>
+<li><b>Confusing MFU and HFU.</b> Recomputed activations (checkpointing) raise HFU but not MFU. MFU is the honest measure of useful work.</li>
+<li><b>Too little work for 132 SMs.</b> A small matmul makes fewer tiles than there are SMs; most of the GPU idles. Larger batches or fusing small ops into bigger ones helps.</li>
+<li><b>Ignoring the format.</b> An FP32 matmul without TF32 runs on CUDA cores at 67 TFLOP/s, not on the tensor cores. Use BF16 autocast (or enable TF32).</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is a warp, and why does it matter for performance?<span class="lvl">basic</span></summary><div class="ans">A warp is a group of 32 threads that the GPU schedules together; all 32 execute the same instruction at the same time on different data (SIMT). It matters in two ways: if threads in a warp take different branches, both branches run one after the other (divergence); and if the 32 threads read neighboring addresses, the reads combine into a few wide transactions (coalescing). Code that keeps warps uniform and reads memory contiguously is faster.</div></details>
+<details class="qa"><summary>What is an SM? How many does an H100 have?<span class="lvl">basic</span></summary><div class="ans">A streaming multiprocessor is one of the GPU’s identical processing units, with its own schedulers, registers, shared memory, CUDA cores and tensor cores. A thread block runs on one SM. The H100 SXM has 132 SMs with 4 tensor cores each (528 total); the A100 has 108. Work must be split into at least as many blocks as there are SMs, and usually many more, to keep the whole chip busy.</div></details>
+<details class="qa"><summary>Explain the GPU memory hierarchy with numbers.<span class="lvl">core</span></summary><div class="ans">From fast and small to slow and large, for H100 SXM: registers (256 KB per SM, private to a thread), shared memory / L1 (256 KB per SM combined, up to 228 KB shared, visible to one block and managed by the programmer), L2 cache (50 MB, shared by all SMs), and HBM3 (80 GB at 3.35 TB/s). Fast kernels load data from HBM once into shared memory or registers and reuse it many times there.</div></details>
+<details class="qa"><summary>What is arithmetic intensity? Give it for an elementwise add and a square matmul in BF16.<span class="lvl">core</span></summary><div class="ans">Arithmetic intensity is FLOPs divided by bytes moved to and from main memory. Elementwise add: 1 FLOP per element, 6 bytes (two 2-byte reads, one write), so 1/6 FLOP per byte. A square \(n \times n\) matmul: \(2n^3\) FLOPs and \(3 \cdot 2n^2\) bytes, so \(n/3\) FLOP per byte, which is 2,731 for \(n = 8192\). The matmul reuses each number about \(n\) times; the add uses each number once.</div></details>
+<details class="qa"><summary>What is the roofline model? What is the ridge point of an H100?<span class="lvl">core</span></summary><div class="ans">The roofline says attainable performance is \(\min(P, I \cdot B)\): either the peak compute or the intensity times the bandwidth, whichever is lower. The ridge point \(I^* = P/B\) separates memory-bound from compute-bound operations. For H100 SXM in dense BF16: \(989 / 3.35 \approx 295\) FLOP per byte. For the A100 it is about 153.</div></details>
+<details class="qa"><summary>Why is batch-1 LLM decoding memory-bound, and how do we fix it?<span class="lvl">core</span></summary><div class="ans">For one token, each weight is read from HBM once and used for one multiply-add: about 1 FLOP per byte in BF16, roughly 300 times below the H100 ridge. The speed limit is weight bytes divided by bandwidth: about 4.8 ms per token for an 8B model. Fixes raise the work per byte read: batch many requests (each weight read serves many tokens), quantize weights to 8 or 4 bits (fewer bytes), and speculative decoding (verify several tokens per pass). The KV cache adds more bytes per token, which grouped-query attention reduces.</div></details>
+<details class="qa"><summary>How many tokens must a 4096 × 4096 linear layer see to be compute-bound on an H100?<span class="lvl">advanced</span></summary><div class="ans">Intensity is \(Md/(2M + d)\) in BF16. Setting it equal to 295.2 with \(d = 4096\) gives \(M = 295.2 \cdot 4096/(4096 - 590.4) \approx 345\) tokens. Below that the layer is memory-bound. On the A100 (ridge 153) the threshold is about 165 tokens. This is one reason inference servers batch requests and why the best batch size grows on newer GPUs.</div></details>
+<details class="qa"><summary>Why does tiling make a matrix multiplication fast?<span class="lvl">core</span></summary><div class="ans">A naive kernel reads a row and a column from global memory for every output element: 0.5 FLOP per byte in BF16. With tiling, a block loads a \(b_M \times b_K\) slice of \(A\) and a \(b_K \times b_N\) slice of \(B\) into shared memory and reuses each loaded number \(b_N\) or \(b_M\) times, so the intensity against global memory becomes \(b_M b_N/(b_M + b_N)\) (64 for 128 × 128 tiles). L2 hits between neighboring blocks lower the real HBM traffic further. Tile size is limited by registers and shared memory per SM.</div></details>
+<details class="qa"><summary>Define MFU. How is it different from HFU, and what values are typical?<span class="lvl">core</span></summary><div class="ans">MFU = (tokens per second × model FLOPs per token) / (number of GPUs × dense peak FLOP/s), with model FLOPs from a formula such as \(6N + 12LdT\). HFU also counts FLOPs the hardware actually does but the model does not need, such as recomputation for activation checkpointing. PaLM 540B reached 46.2% MFU and 57.8% HFU; Llama 3 405B reported 38 to 43% MFU on H100s; GPT-3 was about 21%.</div></details>
+<details class="qa"><summary>Your 8B run reports 60% MFU on H100. Your colleague’s reports 45% at the same speed. How?<span class="lvl">advanced</span></summary><div class="ans">The definitions differ. Typical causes: one counts the attention term \(12LdT\) and the other does not (at \(T = 8192\) this term is 27% of \(6N\) for an 8B model); one includes embedding parameters in \(N\); one uses a different peak (sparse vs dense, or a different GPU variant such as H100 PCIe); or one counts recomputed FLOPs (that is HFU, not MFU). Agree on the formula, then compare.</div></details>
+<details class="qa"><summary>Why do GPUs need many warps per SM? What limits that number?<span class="lvl">advanced</span></summary><div class="ans">Memory reads take hundreds of cycles. While one warp waits, the scheduler issues instructions from another, so with enough warps the arithmetic units stay busy: roughly \(W \ge (c + \ell)/c\) warps for \(c\) compute cycles per \(\ell\) cycles of latency. The number of resident warps is limited by registers per thread, shared memory per block and the hardware maximum (64 warps per SM on H100). A kernel using many registers can run fewer warps (lower occupancy), and must hide latency with prefetching instead.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>What is the arithmetic intensity of \(y = \text{GELU}(x)\) in BF16 if GELU costs about 8 FLOPs per element? Is it memory-bound on an A100?</li>
+<li>A 70B model in BF16 is served at batch size 1 on one GPU with 3.35 TB/s (ignore that it does not fit in 80 GB). What is the best possible time per token?</li>
+<li>Compute the ridge point of an RTX 4090 and say whether a \(2048 \times 2048 \times 2048\) BF16 matmul is compute-bound on it.</li>
+<li>For a \(d = 8192\) linear layer, how many tokens are needed to reach the H100 ridge point?</li>
+<li>A kernel uses tiles with \(b_M = 128\), \(b_N = 64\). What is its intensity against global memory? By how much does it beat 64 × 64 tiles?</li>
+<li>Llama 3 70B (\(L = 80\), \(d = 8192\), \(N = 70.6 \times 10^9\)) trains at 1,000 tokens per second per H100 with \(T = 8192\). Compute the MFU with and without the attention term.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. 8 FLOPs per 4 bytes (read 2, write 2): \(I = 2\). The A100 ridge is 153, so it is strongly memory-bound. 2. Weights: \(70 \times 10^9 \times 2 = 140\) GB; \(140 / 3350\) s \(= 41.8\) ms per token, so at most about 24 tokens per second. 3. \(165.2 / 1.008 = 164\) FLOP/byte. The matmul has \(I = 2048/3 = 683\): compute-bound. 4. \(M = 295.2 \times 8192/(8192 - 590.4) = 318\) tokens. 5. \(128 \cdot 64/192 = 42.7\) FLOP/byte versus 32: 1.33 times better. 6. \(6N = 4.24 \times 10^{11}\), \(12LdT = 6.44 \times 10^{10}\). Without attention: \(1000 \times 4.24\times10^{11} / 989\times10^{12} = 42.8\%\); with: \(4.88 \times 10^{11}\) per token, \(49.3\%\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A GPU is many SMs (132 on H100), each running warps of 32 threads in lockstep; tensor cores do small matrix multiply-accumulates and give about 15 times the FP32 throughput on H100.</li>
+<li>The scheduler hides memory latency by switching between warps (42.1); occupancy is limited by registers and shared memory.</li>
+<li>Memory goes from registers and shared memory (KB per SM, fast) to L2 (50 MB) to HBM (80 GB, 3.35 TB/s). Fast kernels load once and reuse on the chip.</li>
+<li>Arithmetic intensity (42.2) and the roofline (42.5, 42.6) tell you whether an operation is memory-bound or compute-bound; the H100 ridge is about 295 FLOP per byte.</li>
+<li>Elementwise ops and batch-1 decoding are memory-bound; large matmuls are compute-bound once \(M\) is above about 345 on H100 (42.4); tiling (42.7) is how matmuls reach the roof.</li>
+<li>MFU (42.8, 42.9) measures useful work against the dense peak. Good large runs reach about 40 to 46%; always state the FLOP formula you used.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ I = \frac{F}{Q}, \quad \text{perf} = \min(P,\ I B), \quad I^{*} = \frac{P}{B}, \quad I_{\text{GEMM}} = \frac{MKN}{MK + KN + MN} \]</div>
+<div class="eq">\[ I_{\text{tile}} = \frac{b_M b_N}{b_M + b_N}, \quad \text{MFU} = \frac{\text{tok/s} \cdot (6N + 12LdT)}{n_{\text{GPU}}\, P} \]</div>
+<h2 class="plain" id="gpu-architecture-for-ml-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">CUDA C++ Programming Guide</a></li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li><li>Chowdhery et al. (2022). <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">PaLM: Scaling Language Modeling with Pathways</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>NVIDIA (2022). <a href="https://developer.nvidia.com/blog/nvidia-hopper-architecture-in-depth/" target="_blank" rel="noopener">NVIDIA Hopper Architecture In-Depth (technical blog)</a></li><li>NVIDIA (docs). <a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener">NVIDIA H100 Tensor Core GPU: product specifications</a></li><li>NVIDIA (docs). <a href="https://www.nvidia.com/en-us/data-center/a100/" target="_blank" rel="noopener">NVIDIA A100 Tensor Core GPU: product specifications</a></li><li>NVIDIA (2022). <a href="https://images.nvidia.com/aem-dam/Solutions/geforce/ada/nvidia-ada-gpu-architecture.pdf" target="_blank" rel="noopener">NVIDIA Ada GPU Architecture (whitepaper, RTX 4090 specifications)</a></li></ol><nav class="pn" aria-label="Previous and next session"><span class="prev"><small>Previous · session 41, planned</small>measure memory, accumulation and checkpointing</span><a class="next" href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html"><small>Next · session 43</small>Collective communication: all-reduce, reduce-scatter, all-gather</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="gpu-architecture-for-ml"]');if(!R)return;
+const $=s=>R.querySelector(s),$$=s=>Array.from(R.querySelectorAll(s));
+const fmt=(v,d)=>Number(v).toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
+function seg(el,attr,cb){if(!el)return;el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b||!el.contains(b))return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+const segVal=(el,attr)=>{const b=el&&el.querySelector('button[aria-pressed="true"]');return b?b.dataset[attr]:null;};
+const GPU={h100:{name:"H100 SXM",P:989,BW:3.35},a100:{name:"A100 SXM",P:312,BW:2.039},"4090":{name:"RTX 4090",P:165.2,BW:1.008}};
+
+/* ---------- Figure 1: anatomy stepper ---------- */
+(function(){
+ const svg=$("#ga-arch-svg");if(!svg)return;const info=$("#ga-arch-info");
+ const S=[
+  {hl:["chip"],t:"The whole H100 SXM chip. Each small square is one <b>streaming multiprocessor (SM)</b>: <b>132</b> of them. All SMs share the <b>50 MB L2 cache</b> (the band in the middle) and the <b>80 GB of HBM3</b> memory in stacks next to the chip, read at <b>3.35 TB/s</b>."},
+  {hl:["sm","zoom"],t:"Zoom into one SM (right). It is a small processor of its own: four <b>sub-partitions</b>, and a block of on-chip memory (256 KB) shared by them, used as <b>L1 cache</b> and as <b>shared memory</b> (up to 228 KB). A thread block runs on one SM."},
+  {hl:["part"],t:"One sub-partition: a <b>warp scheduler</b> that issues one instruction per cycle, a slice of the <b>register file</b> (256 KB per SM in total, so about 64 KB here), <b>CUDA cores</b> for ordinary FP32 and integer math, and one <b>tensor core</b> (4 per SM, 528 on the chip)."},
+  {hl:["warp"],t:"The scheduler works on <b>warps</b>: groups of <b>32 threads</b> that execute the same instruction at the same time, each on its own data. An SM can keep up to <b>64 warps</b> (2,048 threads) resident and switches between them to hide memory latency (Figure 2)."},
+  {hl:["path","hbm"],path:1,t:"Follow one tile of a matrix multiplication. It starts in <b>HBM</b> (large, far away), passes through the <b>L2 cache</b> into the SM’s <b>shared memory</b>. This trip is the expensive part: 3.35 TB/s shared by all 132 SMs."},
+  {hl:["path","fast"],path:2,t:"From shared memory, threads move pieces into <b>registers</b>, and the <b>tensor core</b> multiplies them, accumulating in FP32. Each number brought from HBM is used many times on the chip before the next tile arrives. That reuse is what lets a matmul run near 989 TFLOP/s."}];
+ const C={hbm:"var(--k)",fast:"var(--q)",comp:"var(--v)"};
+ function box(x,y,w,h,label,opt){opt=opt||{};const on=opt.on;const col=opt.col||"var(--muted)";
+  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="${opt.rx||6}" fill="${on?(opt.fill||"var(--card)"):"var(--card)"}" stroke="${on?col:"var(--rule)"}" stroke-width="${on?2.4:1.2}"/>`+(label?`<text x="${x+w/2}" y="${y+h/2+(opt.dy||4.5)}" text-anchor="middle" font-size="${opt.fs||12}" font-weight="${on?700:500}" fill="${on?"var(--ink)":"var(--muted)"}">${label}</text>`:"");}
+ function draw(k){const st=S[k];const h=new Set(st.hl);let g="";
+  g+=`<defs><marker id="ga-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--tc)"/></marker></defs>`;
+  // chip
+  g+=box(14,14,356,236,"",{on:h.has("chip"),col:"var(--tc)",rx:10});
+  const cw=22,chh=14,gx=5,gy=4,x0=24,y0=24;let idx=0;
+  for(let r=0;r<11;r++)for(let c=0;c<12;c++){const yy=r<6?y0+r*(chh+gy):y0+6*(chh+gy)+30+(r-6)*(chh+gy);const xx=x0+c*(cw+gx);
+   const isSel=(r===1&&c===2);const on=h.has("chip")||(isSel&&(h.has("sm")||h.has("part")||h.has("warp")||h.has("path")));
+   g+=`<rect x="${xx}" y="${yy}" width="${cw}" height="${chh}" rx="3" fill="${isSel&&!h.has("chip")&&on?"var(--v-soft)":(h.has("chip")?"var(--v-soft)":"var(--paper2)")}" stroke="${on?"var(--v)":"var(--rule)"}" stroke-width="${isSel&&on?2.2:1}"/>`;idx++;}
+  const l2y=y0+6*(chh+gy)+2;
+  g+=box(24,l2y,318,24,"L2 cache · 50 MB",{on:h.has("chip")||h.has("path"),col:"var(--tc)",fs:12.5,dy:4.5});
+  // HBM stacks
+  for(let i=0;i<5;i++)g+=box(24+i*65,268,58,42,i===2?"HBM3":"",{on:h.has("chip")||h.has("hbm"),col:C.hbm,fill:"var(--k-soft)"});
+  g+=`<text x="192" y="326" text-anchor="middle" font-size="11.5" fill="var(--muted)">80 GB HBM3 · 3.35 TB/s</text>`;
+  // zoom lines
+  const zon=h.has("zoom")||h.has("part")||h.has("warp")||h.has("path");
+  if(zon){g+=`<path d="M${x0+2*(cw+gx)+cw} ${y0+1*(chh+gy)} L 404 18 M${x0+2*(cw+gx)+cw} ${y0+1*(chh+gy)+chh} L 404 250" stroke="var(--v)" stroke-width="1" stroke-dasharray="4 4" fill="none"/>`;}
+  // SM zoom
+  g+=box(404,14,366,236,"",{on:zon,col:"var(--v)",rx:10});
+  g+=`<text x="414" y="31" font-size="12.5" font-weight="700" fill="${zon?"var(--ink)":"var(--muted)"}">One SM</text>`;
+  const pw=170,ph=88;
+  for(let p=0;p<4;p++){const px=414+(p%2)*(pw+8),py=38+Math.floor(p/2)*(ph+6);const on=h.has("part")&&p===0||h.has("warp")&&p===0||h.has("fast")&&p===0;
+   g+=box(px,py,pw,ph,"",{on:on||(zon&&h.has("zoom")),col:"var(--v)"});
+   g+=box(px+6,py+6,pw-12,18,"warp scheduler",{on:on&&!h.has("fast"),col:"var(--tc)",fs:11,dy:4});
+   g+=box(px+6,py+28,pw-12,18,"registers · 64 KB",{on:on&&!h.has("warp")||(h.has("fast")&&p===0),col:C.fast,fill:"var(--q-soft)",fs:11,dy:4});
+   g+=box(px+6,py+50,(pw-18)/2,32,"CUDA cores",{on:on&&!h.has("fast")&&!h.has("warp"),col:C.comp,fs:10.5,dy:4});
+   g+=box(px+12+(pw-18)/2,py+50,(pw-18)/2,32,"tensor core",{on:on&&!h.has("warp")||(h.has("fast")&&p===0),col:C.comp,fill:"var(--v-soft)",fs:10.5,dy:4});}
+  g+=box(414,226-2,350,22,"shared memory / L1 · 256 KB (up to 228 KB shared)",{on:zon&&(h.has("zoom")||h.has("path")),col:C.fast,fill:"var(--q-soft)",fs:11.5,dy:4});
+  // warp strip
+  const won=h.has("warp");
+  g+=`<text x="414" y="276" font-size="12" font-weight="${won?700:500}" fill="${won?"var(--ink)":"var(--muted)"}">a warp = 32 threads, one instruction</text>`;
+  for(let i=0;i<32;i++)g+=`<rect x="${414+i*11}" y="284" width="9" height="20" rx="2" fill="${won?"var(--v-soft)":"var(--paper2)"}" stroke="${won?"var(--v)":"var(--rule)"}"/>`;
+  if(won)g+=`<text x="590" y="322" text-anchor="middle" font-size="11.5" fill="var(--ink2)">all lanes: acc = A·B + acc</text>`;
+  // data path
+  if(st.path===1)g+=`<path d="M192 268 C 192 262, 200 258, 210 ${l2y+24}" stroke="var(--tc)" stroke-width="2.6" fill="none" marker-end="url(#ga-ah)" stroke-dasharray="7 5"/><path d="M300 ${l2y+12} C 360 ${l2y+12}, 380 236, 410 236" stroke="var(--tc)" stroke-width="2.6" fill="none" marker-end="url(#ga-ah)" stroke-dasharray="7 5"/>`;
+  if(st.path===2)g+=`<path d="M500 224 C 500 200, 500 150, 500 ${38+28+18+2}" stroke="var(--tc)" stroke-width="2.6" fill="none" marker-end="url(#ga-ah)" stroke-dasharray="7 5"/><path d="M560 ${38+46} C 560 ${38+50}, 548 ${38+50}, 545 ${38+52}" stroke="var(--tc)" stroke-width="2.6" fill="none" marker-end="url(#ga-ah)"/>`;
+  svg.innerHTML=g;info.innerHTML=st.t;}
+ B.stepper({n:S.length,prev:$("#ga-arch-prev"),next:$("#ga-arch-next"),play:$("#ga-arch-play"),label:$("#ga-arch-lab"),ms:3200,onStep:draw});
+})();
+
+/* ---------- Figure 2: latency hiding ---------- */
+(function(){
+ const svg=$("#ga-lat-svg");if(!svg)return;const W=$("#ga-lat-w"),Cc=$("#ga-lat-c"),Lt=$("#ga-lat-l"),info=$("#ga-lat-info");
+ function sim(nw,c,l,T){const left=new Array(nw).fill(c),until=new Array(nw).fill(0);let cur=-1;const busy=new Uint8Array(T);const st=[];for(let i=0;i<nw;i++)st.push(new Uint8Array(T));
+  for(let t=0;t<T;t++){for(let i=0;i<nw;i++)if(until[i]===t&&left[i]===0)left[i]=c;
+   if(cur<0||left[cur]===0||until[cur]>t){cur=-1;let best=-1,bt=Infinity;for(let i=0;i<nw;i++){if(left[i]>0&&until[i]<=t){if(until[i]<bt){bt=until[i];best=i;}}}cur=best;}
+   for(let i=0;i<nw;i++)st[i][t]=(i===cur)?1:(left[i]===0?2:3);
+   if(cur>=0){busy[t]=1;left[cur]--;if(left[cur]===0){until[cur]=t+1+l;}}}
+  return{busy,st};}
+ function draw(){const nw=+W.value,c=+Cc.value,l=+Lt.value;$("#ga-lat-wv").textContent=nw;$("#ga-lat-cv").textContent=c;$("#ga-lat-lv").textContent=l;
+  const T=4000,show=200;const r=sim(nw,c,l,T);let b=0;for(let t=1000;t<T;t++)b+=r.busy[t];const U=b/(T-1000);const Uf=Math.min(1,nw*c/(c+l));
+  const x0=60,wpx=570,cw=wpx/show,top=12,rowH=Math.min(14,200/nw);let g="";
+  const col={1:"var(--v)",2:"var(--k-soft)",3:"var(--rule)"};
+  for(let i=0;i<nw;i++){const y=top+i*rowH;g+=`<text x="${x0-6}" y="${y+rowH*0.75}" text-anchor="end" font-size="${Math.min(11,rowH)}" fill="var(--muted)">warp ${i}</text>`;
+   let s=0;while(s<show){const v=r.st[i][s];let e=s;while(e<show&&r.st[i][e]===v)e++;g+=`<rect x="${(x0+s*cw).toFixed(2)}" y="${(y+1).toFixed(2)}" width="${((e-s)*cw).toFixed(2)}" height="${Math.max(1,rowH-2).toFixed(2)}" fill="${col[v]}"/>`;s=e;}}
+  const by=top+nw*rowH+14;g+=`<text x="${x0-6}" y="${by+11}" text-anchor="end" font-size="11" font-weight="700" fill="var(--ink2)">issue</text>`;
+  let s=0;while(s<show){const v=r.busy[s];let e=s;while(e<show&&r.busy[e]===v)e++;g+=`<rect x="${(x0+s*cw).toFixed(2)}" y="${by}" width="${((e-s)*cw).toFixed(2)}" height="14" fill="${v?"var(--v)":"var(--paper2)"}" stroke="${v?"none":"var(--rule)"}" stroke-width="0.6"/>`;s=e;}
+  for(let t=0;t<=show;t+=50)g+=`<text x="${x0+t*cw}" y="${by+30}" text-anchor="middle" font-size="10.5" fill="var(--muted)">${t}</text>`;
+  g+=`<text x="${x0+wpx/2}" y="${by+44}" text-anchor="middle" font-size="11" fill="var(--muted)">clock cycle (first 200 shown)</text>`;
+  svg.setAttribute("viewBox",`0 0 640 ${Math.max(150,by+52)}`);svg.innerHTML=g;
+  const need=Math.ceil((c+l)/c);
+  info.innerHTML=`Simulated utilization: <b>${fmt(100*U,1)}%</b> · formula (42.1): <b>${fmt(100*Uf,1)}%</b>. To keep this scheduler always busy you need about (c + ℓ)/c = <b>${need}</b> warps${nw>=need?" — you have enough.":"; add more warps or more compute per load."}`;}
+ [W,Cc,Lt].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: roofline ---------- */
+(function(){
+ const svg=$("#ga-roof-svg");if(!svg)return;const M=$("#ga-roof-m"),info=$("#ga-roof-info"),hw=$("#ga-roof-hw");
+ const d=4096;let sel=null;
+ const OPS=[{id:"add",I:1/6,lab:"add (x + y)",txt:"Elementwise add in BF16: 1 FLOP per 6 bytes, I = 0.167. It runs on the CUDA cores, but that hardly matters: it is limited by bandwidth."},
+  {id:"gelu",I:2,lab:"GELU",txt:"GELU at about 8 FLOPs per element, 4 bytes per element (read and write in BF16): I ≈ 2. Memory-bound on every GPU here. Fusing it into the matmul before it removes its HBM traffic."},
+  {id:"mm",I:8192/3,lab:"matmul 8192³",txt:"A square BF16 matmul with n = 8192: I = n/3 ≈ 2,731 FLOP/byte, far above the ridge. Compute-bound: only the tensor cores’ peak limits it."}];
+ const X=I=>70+(Math.log10(I)+1.5)/(4+1.5)*660,Y=p=>320-(Math.log10(p)+1)/(3.5+1)*300;
+ function draw(){const g0=GPU[segVal(hw,"h")||"h100"];const P=g0.P,BW=g0.BW,Is=P/BW;
+  const m=Math.max(1,Math.round(Math.pow(2,+M.value)));$("#ga-roof-mv").textContent=m.toLocaleString("en-US");
+  let g="";
+  for(let e=-1;e<=4;e++){const x=X(Math.pow(10,e));g+=`<line x1="${x}" y1="20" x2="${x}" y2="320" stroke="var(--rule)" stroke-width="0.7"/><text x="${x}" y="338" text-anchor="middle" font-size="12" fill="var(--muted)">${e<0?"0.1":Math.pow(10,e).toLocaleString("en-US")}</text>`;}
+  for(let e=-1;e<=3;e++){const y=Y(Math.pow(10,e));g+=`<line x1="70" y1="${y}" x2="730" y2="${y}" stroke="var(--rule)" stroke-width="0.7"/><text x="62" y="${y+4}" text-anchor="end" font-size="12" fill="var(--muted)">${e<0?"0.1":Math.pow(10,e).toLocaleString("en-US")}</text>`;}
+  g+=`<text x="400" y="356" text-anchor="middle" font-size="12.5" fill="var(--ink2)">arithmetic intensity I (FLOP per byte, log scale)</text><text x="16" y="170" transform="rotate(-90 16 170)" text-anchor="middle" font-size="12.5" fill="var(--ink2)">TFLOP/s (log)</text>`;
+  // other GPUs faint
+  Object.keys(GPU).forEach(k=>{const q=GPU[k];if(q===g0)return;const xs=Math.pow(10,-1.5),is=q.P/q.BW;g+=`<path d="M${X(xs)} ${Y(xs*q.BW)} L ${X(is)} ${Y(q.P)} L 730 ${Y(q.P)}" fill="none" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="4 4" opacity="0.7"/><text x="726" y="${Y(q.P)-5}" text-anchor="end" font-size="11" fill="var(--muted)">${q.name}</text>`;});
+  const xs=Math.pow(10,-1.5);
+  g+=`<path d="M${X(xs)} ${Y(xs*BW)} L ${X(Is)} ${Y(P)}" stroke="var(--k)" stroke-width="3" fill="none"/><path d="M${X(Is)} ${Y(P)} L 730 ${Y(P)}" stroke="var(--v)" stroke-width="3" fill="none"/>`;
+  g+=`<line x1="${X(Is)}" y1="${Y(P)}" x2="${X(Is)}" y2="320" stroke="var(--tc)" stroke-dasharray="3 4"/><text x="${X(Is)+5}" y="312" font-size="11.5" fill="var(--tc)" font-weight="700">ridge ${fmt(Is,0)}</text>`;
+  g+=`<text x="${X(Is)+8}" y="${Y(P)-8}" font-size="12" font-weight="700" fill="var(--v)">${g0.name}: ${fmt(P,1).replace(".0","")} TFLOP/s</text>`;
+  OPS.forEach(o=>{const p=Math.min(P,o.I*BW);const on=sel===o.id;g+=`<g class="ga-pt" data-op="${o.id}"><circle cx="${X(o.I)}" cy="${Y(p)}" r="${on?8:6.5}" fill="${on?"var(--ink2)":"var(--muted)"}" stroke="var(--card)" stroke-width="2"/><text x="${X(o.I)+(o.id==="mm"?-10:10)}" y="${Y(p)+(o.id==="add"?20:-12)}" text-anchor="${o.id==="mm"?"end":"start"}" font-size="12" fill="var(--ink2)">${o.lab}</text></g>`;});
+  const I=m*d/(2*m+d),pa=Math.min(P,I*BW);const ms=Is*d/(d-2*Is);
+  g+=`<circle cx="${X(I)}" cy="${Y(pa)}" r="8" fill="var(--q)" stroke="var(--card)" stroke-width="2"/><text x="${X(I)}" y="${Y(pa)+24}" text-anchor="middle" font-size="12" font-weight="700" fill="var(--q)">M = ${m.toLocaleString("en-US")}</text>`;
+  svg.innerHTML=g;
+  svg.querySelectorAll(".ga-pt").forEach(el=>el.addEventListener("click",()=>{sel=el.dataset.op;draw();}));
+  let t=`<b>${g0.name}</b>, linear layer 4096 × 4096 with <b>M = ${m.toLocaleString("en-US")}</b> token${m===1?"":"s"}: I = <b>${fmt(I,1)}</b> FLOP/byte, best speed <b>${fmt(pa,1)}</b> TFLOP/s = <b>${fmt(100*pa/P,1)}%</b> of the peak → <b>${I<Is?"memory-bound":"compute-bound"}</b>. Ridge point ${fmt(Is,0)} FLOP/byte, reached at M ≈ ${fmt(ms,0)}.`;
+  if(sel){const o=OPS.find(z=>z.id===sel);t+=`<br>${o.txt} Best speed here: ${fmt(Math.min(P,o.I*BW),2)} TFLOP/s.`;}
+  info.innerHTML=t;}
+ M.addEventListener("input",draw);seg(hw,"h",draw);draw();
+})();
+
+/* ---------- Figure 4: tiling ---------- */
+(function(){
+ const svg=$("#ga-tile-svg");if(!svg)return;const BM=$("#ga-tile-bm"),BN=$("#ga-tile-bn"),BK=$("#ga-tile-bk"),info=$("#ga-tile-info");
+ const n=4096,S=160;
+ function draw(){const bm=2**+BM.value,bn=2**+BN.value,bk=2**+BK.value;$("#ga-tile-bmv").textContent=bm;$("#ga-tile-bnv").textContent=bn;$("#ga-tile-bkv").textContent=bk;
+  const sc=S/n,ti=1,tj=2;const ax=20,bx=230,cx=450,y0=60;let g="";
+  const mat=(x,lab,sub)=>`<rect x="${x}" y="${y0}" width="${S}" height="${S}" fill="var(--paper2)" stroke="var(--rule)"/><text x="${x+S/2}" y="${y0-26}" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">${lab}</text><text x="${x+S/2}" y="${y0-10}" text-anchor="middle" font-size="11" fill="var(--muted)">${sub}</text>`;
+  g+=mat(ax,"A","M × K = 4096 × 4096")+mat(bx,"B","K × N = 4096 × 4096")+mat(cx,"C","M × N, tile grid");
+  g+=`<text x="${ax+S+25}" y="${y0+S/2+6}" text-anchor="middle" font-size="20" fill="var(--muted)">×</text><text x="${bx+S+30}" y="${y0+S/2+6}" text-anchor="middle" font-size="20" fill="var(--muted)">=</text>`;
+  const gh=n/bm,gw=n/bn;
+  if(gh<=64)for(let i=1;i<gh;i++)g+=`<line x1="${cx}" x2="${cx+S}" y1="${y0+i*bm*sc}" y2="${y0+i*bm*sc}" stroke="var(--rule)" stroke-width="0.6"/>`;
+  if(gw<=64)for(let j=1;j<gw;j++)g+=`<line y1="${y0}" y2="${y0+S}" x1="${cx+j*bn*sc}" x2="${cx+j*bn*sc}" stroke="var(--rule)" stroke-width="0.6"/>`;
+  const th=Math.max(2.5,bm*sc),tw=Math.max(2.5,bn*sc),kw=Math.max(2.5,bk*sc);
+  g+=`<rect x="${cx+tj*bn*sc}" y="${y0+ti*bm*sc}" width="${tw}" height="${th}" fill="var(--q)" />`;
+  g+=`<rect x="${ax}" y="${y0+ti*bm*sc}" width="${S}" height="${th}" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/><rect x="${ax+3*kw}" y="${y0+ti*bm*sc}" width="${kw}" height="${th}" fill="var(--k)"/>`;
+  g+=`<rect x="${bx+tj*bn*sc}" y="${y0}" width="${tw}" height="${S}" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/><rect x="${bx+tj*bn*sc}" y="${y0+3*kw}" width="${tw}" height="${kw}" fill="var(--k)"/>`;
+  g+=`<text x="320" y="${y0+S+28}" text-anchor="middle" font-size="11.5" fill="var(--ink2)">dark orange: the b_K slice in shared memory now · light orange: all slices this tile needs</text>`;
+  svg.innerHTML=g;
+  const flops=2*n**3,traffic=2*n**3*(1/bm+1/bn),minB=3*n*n*2,I=bm*bn/(bm+bn);
+  const smem=(bm*bk+bk*bn)*2,acc=bm*bn*4,stages=Math.floor(228*1024/smem);
+  const kb=v=>v<1024?v+" bytes":fmt(v/1024,0)+" KB";
+  info.innerHTML=`Tiles: <b>${(gh*gw).toLocaleString("en-US")}</b> blocks. Global-memory reads: <b>${fmt(traffic/1e9,2)} GB</b> (the inputs are read ${fmt(traffic/(2*n*n*2),0)} times over; the minimum for A, B and C is ${fmt(minB/1e6,0)} MB). Intensity (42.7): <b>${fmt(I,1)}</b> FLOP/byte. `+
+   `Shared memory for one A tile + one B tile: <b>${kb(smem)}</b> → ${stages>=1?`<b>${stages>99?"more than 99":stages}</b> such pairs fit in 228 KB`:`<b>does not fit</b> in 228 KB`}. FP32 accumulator for the output tile: ${kb(acc)} of registers${acc>256*1024?" — <b>more than the 256 KB register file of one SM</b>":""}.`;}
+ [BM,BN,BK].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 5: MFU calculator ---------- */
+(function(){
+ const svg=$("#ga-mfu-svg");if(!svg)return;const TPS=$("#ga-mfu-tps"),TT=$("#ga-mfu-t"),ATT=$("#ga-mfu-att"),info=$("#ga-mfu-info"),ms=$("#ga-mfu-model"),hs=$("#ga-mfu-hw");
+ const MOD={"8b":{name:"Llama 3 8B",N:8.03e9,L:32,d:4096},"70b":{name:"Llama 3 70B",N:70.6e9,L:80,d:8192},"405b":{name:"Llama 3 405B",N:405e9,L:126,d:16384}};
+ const VAL=[10,20,50,100,120,150,163,200,300,400,500,700,1000,1500,2000,3000,4000,5000,6000,8000,10000,12000,15000,20000,30000,50000];
+ TPS.max=VAL.length-1;TPS.value=VAL.indexOf(8000);
+ function draw(){const m=MOD[segVal(ms,"m")||"8b"],hw=GPU[segVal(hs,"h")||"h100"];const tps=VAL[+TPS.value],T=2**+TT.value;
+  $("#ga-mfu-tpsv").textContent=tps.toLocaleString("en-US");$("#ga-mfu-tv").textContent=T.toLocaleString("en-US");
+  const f6=6*m.N,fa=12*m.L*m.d*T,ft=f6+(ATT.checked?fa:0);const ach=tps*ft/1e12,mfu=ach/hw.P;
+  const x0=20,w=600,full=Math.max(hw.P,ach)*1.05,sx=v=>x0+v/full*w;let g="";
+  g+=`<rect x="${x0}" y="30" width="${sx(hw.P)-x0}" height="40" rx="6" fill="var(--paper2)" stroke="var(--v)" stroke-width="1.5"/>`;
+  g+=`<rect x="${x0}" y="30" width="${Math.max(1,sx(ach)-x0)}" height="40" rx="6" fill="${mfu>1?"var(--bad)":"var(--q)"}" opacity="0.85"/>`;
+  g+=`<line x1="${sx(hw.P)}" x2="${sx(hw.P)}" y1="20" y2="80" stroke="var(--v)" stroke-width="2"/><text x="${sx(hw.P)}" y="96" text-anchor="${mfu>0.85?"end":"middle"}" font-size="12" fill="var(--v)" font-weight="700">peak ${fmt(hw.P,0)}</text>`;
+  g+=`<text x="${Math.min(sx(ach)+6,520)}" y="${mfu>0.6?20:55}" font-size="12.5" font-weight="700" fill="var(--ink)">${fmt(ach,0)} TFLOP/s</text>`;
+  g+=`<text x="${x0}" y="125" font-size="12" fill="var(--muted)">achieved model TFLOP/s per GPU = tokens/s × F_token</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`${m.name} on ${hw.name}: F<sub>token</sub> = 6N${ATT.checked?" + 12LdT":""} = <b>${(ft/1e9).toLocaleString("en-US",{maximumFractionDigits:1})} GFLOP</b> per token (the attention term is ${fmt(100*fa/f6,1)}% of 6N at T = ${T.toLocaleString("en-US")}). Achieved: <b>${fmt(ach,1)}</b> TFLOP/s per GPU → MFU = <b>${fmt(100*mfu,1)}%</b>.`+(mfu>1?` <b>Above 100%: this throughput is impossible on this GPU</b>; the number or the FLOP formula is wrong.`:mfu>0.6?" Higher than any large run reported so far; check the measurement.":"");}
+ [TPS,TT,ATT].forEach(e=>e.addEventListener("input",draw));seg(ms,"m",draw);seg(hs,"h",draw);draw();
+})();
+})();
+</script></body></html>

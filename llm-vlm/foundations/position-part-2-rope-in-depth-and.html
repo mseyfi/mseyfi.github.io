@@ -1,0 +1,451 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Position, part 2: RoPE in depth, and a first look at 2D and 3D RoPE · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../foundations/index.html">Foundations</a><span class="sep">/</span><span>Session 14</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="position-part-2-rope-in-depth-and">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="position-part-2-rope-in-depth-and" data-session="position-part-2-rope-in-depth-and" style="--tc:var(--t1)"><header class="chap-head"><div class="chap-kicker"><span class="num">14</span><span>Track 1: Foundations · session 14 of 15</span></div><h1 class="chap-title">Position, part 2: RoPE in depth, and a first look at 2D and 3D RoPE</h1><p class="chap-sub">Rotary position embedding (RoPE) does not add a position vector to the token. It rotates the query and the key by an angle that grows with the position, so the attention score between two tokens depends only on how far apart they are. This session builds RoPE from one 2D rotation to a full head, explains the frequencies and the base, and then shows how the same trick gives positions to image patches (2D RoPE) and to video tokens (M-RoPE in Qwen2-VL).</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 2, 11 and 13 (vectors and dot products, embeddings, absolute and relative positions)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why rotating the query and the key, instead of adding a position vector, makes the score depend only on the distance m − n</li><li>The 2D rotation, the complex-number view, and the block-diagonal rotation for a full head</li><li>Frequencies θ_i = b^(−2i/d): which dimension pairs see short distances and which see long ones, and what the base b changes</li><li>How RoPE is implemented in practice (cos/sin cache, rotate_half) and the interleaved vs half-split layout bug</li><li>Why RoPE does not extrapolate by itself past the training length, and where context extension starts</li><li>2D RoPE for image patches: half the dimensions see the row, half see the column</li><li>M-RoPE for video in Qwen2-VL: (time, height, width) position IDs, and how text, images and video share one sequence</li></ul></div></header><style>
+[data-session="position-part-2-rope-in-depth-and"] code,[data-session="position-part-2-rope-in-depth-and"] pre.code,.rp-seq{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.rp-seq{display:flex;flex-wrap:wrap;gap:6px;justify-content:center;margin:6px 0 10px}
+.rp-cell{min-width:58px;border:1.5px solid var(--rule);border-radius:8px;background:var(--card);padding:4px 5px;text-align:center;font:600 12px/1.35 var(--mono);color:var(--ink);transition:opacity .25s,border-color .25s,background .25s}
+.rp-cell .w{display:block;font:600 11.5px var(--sans);color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:92px}
+.rp-cell.txt{border-color:var(--v)}
+.rp-cell.img{border-color:var(--q)}
+.rp-cell.vid{border-color:var(--k)}
+.rp-cell.off{opacity:.18}
+.rp-cell.cur{background:color-mix(in srgb,var(--tc) 16%,var(--card));box-shadow:inset 0 0 0 2px var(--tc)}
+.rp-grid{display:grid;gap:3px;max-width:340px;margin:0 auto}
+.rp-grid button{aspect-ratio:1;border:0;border-radius:4px;cursor:pointer;font:600 10.5px var(--mono);color:#fff;padding:0}
+.rp-grid button.sel{outline:3px solid var(--ink);outline-offset:-3px}
+.rp-leg{display:flex;justify-content:center;gap:14px;flex-wrap:wrap;font:500 13px var(--sans);color:var(--muted);margin-top:6px}
+.rp-leg i{display:inline-block;width:12px;height:12px;border-radius:3px;margin-right:5px;vertical-align:-1px}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Almost every open LLM you will meet in practice, Llama, Qwen, Mistral, Gemma, DeepSeek, uses the same method to tell attention where each token is: <b>rotary position embedding</b>, or <b>RoPE</b>. It was introduced by Su et al. in the RoFormer paper (2021). [Certain] Most VLMs use it too, and the Qwen-VL family stretches it to images and video.</p>
+<p>In <a href="../foundations/position-part-1-why-order-needs-help.html">session 13</a> we saw the problem. Self-attention compares every query with every key, and that comparison does not care about order: without help, “dog bites man” and “man bites dog” look the same. We saw two kinds of fixes. <b>Absolute</b> methods add a position vector to each token (sinusoidal or learned). <b>Relative</b> methods change the attention score with a term that depends on the distance between the two tokens (T5 buckets, ALiBi). RoPE gets the best of both:</p>
+<ul><li><b>It is applied like an absolute method.</b> Each query and each key is changed using only its own position \(m\). Nothing about pairs is stored, so it works with a KV cache and fast attention kernels without any change to them.</li>
+<li><b>It behaves like a relative method.</b> After the change, the score between a query at position \(m\) and a key at position \(n\) depends only on the distance \(m - n\), not on \(m\) and \(n\) themselves.</li>
+<li><b>It costs almost nothing.</b> No learned parameters, a few multiplications per number, and it never touches the values.</li></ul>
+<p>The trick is a rotation. This session builds it from one pair of numbers up to a full attention head, explains the frequencies and the “base” (why Llama 3 uses 500,000 instead of 10,000), and then takes a first look at 2D RoPE for image patches and M-RoPE for video, which we meet again in the vision and video tracks.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Think of a clock with many hands, each turning at its own speed. Every token sets the clock to its own position. To compare two tokens, attention only looks at the <i>angle between</i> their hands, never at the absolute time. So “3 o’clock vs 5 o’clock” gives the same answer as “9 vs 11”: two hours apart.</aside>
+<p>Interviewers ask about RoPE often, because the answer shows whether you understand attention at the level of dot products: “Prove that RoPE gives relative positions”, “Why rotate the query and the key but not the value?”, “What does the base do?”, “Why does a model break past its training length?”, “How would you give positions to image patches?”. By the end of this session you can answer each one with a formula and a small example.</p>
+
+<h2>The core idea: rotate, do not add</h2>
+<h3>What goes wrong with adding</h3>
+<p>The original transformer adds a position vector \(\mathbf{p}_m\) to the token embedding \(\mathbf{x}_m\). The query and key are then \(W_q(\mathbf{x}_m + \mathbf{p}_m)\) and \(W_k(\mathbf{x}_n + \mathbf{p}_n)\). If you expand their dot product, you get four terms: content with content, content with position, position with content, and position with position. Only some parts of the last term depend on \(m - n\) in a clean way, and the cross terms mix “what” and “where” in a way the model has to untangle. We would like a change that gives a score of the form “content of the query, content of the key, and their distance”, and nothing else.</p>
+<h3>One pair of numbers</h3>
+<p>Start with the smallest case: a query and a key with only two numbers each, \(\mathbf{q}, \mathbf{k} \in \R^2\). Think of each as an arrow in the plane. A <b>rotation</b> by angle \(\varphi\) turns an arrow around the origin without changing its length. In matrix form:</p>
+<div class="eq">\[ R(\varphi) = \begin{pmatrix} \cos\varphi & -\sin\varphi \\ \sin\varphi & \cos\varphi \end{pmatrix} \tag{14.1} \]</div>
+<p>RoPE picks a fixed angle step \(\theta\) and rotates the query of the token at position \(m\) by \(m\theta\), and the key of the token at position \(n\) by \(n\theta\):</p>
+<div class="eq">\[ \mathbf{q}_m = R(m\theta)\, W_q \mathbf{x}_m, \qquad \mathbf{k}_n = R(n\theta)\, W_k \mathbf{x}_n \tag{14.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{x}_m\)</dt><dd>the hidden vector of the token at position \(m\) (no position added to it)</dd>
+<dt>\(W_q, W_k\)</dt><dd>the usual learned query and key projections</dd>
+<dt>\(m, n\)</dt><dd>positions of the query token and the key token: 0, 1, 2, …</dd>
+<dt>\(\theta\)</dt><dd>a fixed angle per position step (in radians). It is not learned.</dd>
+<dt>\(R(m\theta)\)</dt><dd>rotation by \(m\) times \(\theta\): the further along the sequence, the more the arrow is turned</dd></dl>
+<p>Now compute the attention score. Write \(\mathbf{q} = W_q\mathbf{x}_m\) and \(\mathbf{k} = W_k\mathbf{x}_n\) for the vectors before rotation. Two facts about rotations do all the work: the transpose of a rotation is the rotation backwards, \(R(\alpha)^\top = R(-\alpha)\), and two rotations add their angles, \(R(\alpha)R(\beta) = R(\alpha + \beta)\). So:</p>
+<div class="eq">\[ \mathbf{q}_m^\top \mathbf{k}_n = \mathbf{q}^\top R(m\theta)^\top R(n\theta)\, \mathbf{k} = \mathbf{q}^\top R\big((n - m)\theta\big)\, \mathbf{k} \tag{14.3} \]</div>
+<p>This is the whole idea. The positions \(m\) and \(n\) only appear as the difference \(n - m\). Move both tokens forward by 100 positions and the score does not change. The model still sees the content (through \(\mathbf{q}\) and \(\mathbf{k}\)) and the distance (through the angle), and nothing else. [Certain]</p>
+<h3>The same thing with complex numbers</h3>
+<p>A pair of real numbers \((a, b)\) can be written as one complex number \(a + ib\). Rotating by \(\varphi\) is then just multiplying by \(e^{i\varphi} = \cos\varphi + i\sin\varphi\). And the dot product of two 2D vectors is the real part of one times the conjugate of the other. Write \(\tilde q = q_1 + i q_2\) and \(\tilde k = k_1 + i k_2\). Then:</p>
+<div class="eq">\[ \mathbf{q}_m^\top \mathbf{k}_n = \operatorname{Re}\!\left[\tilde q\, e^{i m\theta}\; \overline{\tilde k\, e^{i n\theta}}\right] = \operatorname{Re}\!\left[\tilde q\, \overline{\tilde k}\; e^{i (m - n)\theta}\right] \tag{14.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\tilde q, \tilde k\)</dt><dd>the query pair and the key pair, each written as one complex number</dd>
+<dt>\(\overline{z}\)</dt><dd>the complex conjugate of \(z\) (flip the sign of the imaginary part)</dd>
+<dt>\(e^{i\varphi}\)</dt><dd>a complex number of length 1 at angle \(\varphi\): multiplying by it rotates by \(\varphi\)</dd>
+<dt>\(\operatorname{Re}[\cdot]\)</dt><dd>the real part</dd></dl>
+<p>The RoFormer paper derives RoPE in this complex form, and Meta’s original Llama code implements it with complex multiplication. [Certain] It is the same as (14.3): the score is the length of \(\tilde q\) times the length of \(\tilde k\) times the cosine of (the angle between them plus \((m - n)\theta\)).</p>
+<div class="worked"><div class="wt">Worked example: the shift does not matter</div>
+<p>Take \(\mathbf{q} = (1, 0)\), \(\mathbf{k} = (0, 1)\) and \(\theta = 0.5\). Before rotation \(\mathbf{q}\cdot\mathbf{k} = 0\). With \(R(\varphi)\mathbf{k} = (-\sin\varphi, \cos\varphi)\), formula (14.3) gives \(\mathbf{q}_m^\top\mathbf{k}_n = -\sin\big((n - m)\theta\big) = \sin\big((m - n)\theta\big)\).</p>
+<ul><li>\(m = 2, n = 1\): \(\sin(0.5) = 0.479\).</li>
+<li>\(m = 5, n = 4\): again distance 1, again \(0.479\).</li>
+<li>\(m = 1, n = 2\): distance \(-1\), so \(\sin(-0.5) = -0.479\). RoPE knows the <i>sign</i> of the distance, not only its size. A query can tell a key one step behind from a key one step ahead.</li></ul></div>
+<figure class="fig" id="rp-rot"><div class="fig-body">
+<div class="controls"><label class="sl">query position m <input type="range" id="rp-rot-m" min="0" max="20" step="1" value="5"><output id="rp-rot-mv">5</output></label><label class="sl">key position n <input type="range" id="rp-rot-n" min="0" max="20" step="1" value="2"><output id="rp-rot-nv">2</output></label><label class="sl">θ <input type="range" id="rp-rot-t" min="0.1" max="1.0" step="0.05" value="0.4"><output id="rp-rot-tv">0.40</output></label><button type="button" class="btn primary" id="rp-rot-shift">Shift both by +3</button><button type="button" class="btn" id="rp-rot-reset">Reset</button></div>
+<div class="scroll-x"><svg id="rp-rot-svg" viewBox="0 0 640 360" role="img" aria-label="A query arrow and a key arrow rotated by their positions"></svg></div>
+<div class="readout" id="rp-rot-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> RoPE in two dimensions. The faint arrows are the query \(\mathbf{q} = (0.9, 0.3)\) and the key \(\mathbf{k} = (0.5, 0.8)\) before rotation. The solid arrows are \(\mathbf{q}_m = R(m\theta)\mathbf{q}\) (blue) and \(\mathbf{k}_n = R(n\theta)\mathbf{k}\) (orange). The readout shows the score \(\mathbf{q}_m^\top\mathbf{k}_n\).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Move the two position sliders. Both arrows turn, but the score only changes when the <i>distance</i> \(m - n\) changes. Press “Shift both by +3” a few times: the arrows swing around the circle together, the angle between them stays the same, and the score stays at the same value (0.781 for \(m - n = 3\) and \(\theta = 0.4\)). Set \(m = n\): the two arrows are turned by the same amount, so the score equals the unrotated dot product \(\mathbf{q}\cdot\mathbf{k} = 0.69\). Swap \(m\) and \(n\) (for example 2 and 5): the score changes to −0.281, because the distance changed sign. Changing \(\theta\) changes how fast the arrows turn per position.</p></details></figure>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Why is RoPE relative?” Write one line: \((R_m\mathbf{q})^\top(R_n\mathbf{k}) = \mathbf{q}^\top R_m^\top R_n \mathbf{k} = \mathbf{q}^\top R_{n-m}\mathbf{k}\), because rotations are orthogonal and their angles add. Then say what follows: positions are applied one token at a time (cache friendly), but the score only sees the distance.</aside>
+
+<h2>From one pair to a full head</h2>
+<h3>Many pairs, many speeds</h3>
+<p>A real attention head has \(d\) numbers per query and key (for Llama 3 8B, \(d = 128\)). [Certain] RoPE cuts the vector into \(d/2\) pairs and rotates each pair in its own plane, with its own angle step \(\theta_i\). The steps follow the same geometric sequence as the sinusoidal positions of the original transformer:</p>
+<div class="eq">\[ \theta_i = b^{-2i/d}, \qquad i = 0, 1, \dots, \tfrac{d}{2} - 1 \tag{14.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(i\)</dt><dd>the index of a pair of dimensions (pair 0 is the first two numbers, and so on)</dd>
+<dt>\(b\)</dt><dd>the <b>base</b>, a fixed number: 10,000 in RoFormer and Llama 2, 500,000 in Llama 3, 1,000,000 in Qwen2 and Qwen2-VL [Certain, from the model configs]</dd>
+<dt>\(\theta_i\)</dt><dd>the angle (in radians) that pair \(i\) turns per position. Pair 0 has \(\theta_0 = 1\); the last pair turns very slowly.</dd></dl>
+<p>The full rotation for position \(m\) is a <b>block-diagonal</b> matrix: \(d/2\) small \(2 \times 2\) rotations on the diagonal and zeros everywhere else. Because each block is a rotation, the whole matrix is a rotation too: it keeps lengths (\(\lVert R_m \mathbf{q}\rVert = \lVert\mathbf{q}\rVert\)), and \(R_m^\top R_n = R_{n-m}\) still holds block by block.</p>
+<div class="eq">\[ R_m = \begin{pmatrix} R(m\theta_0) & & \\ & \ddots & \\ & & R(m\theta_{d/2-1}) \end{pmatrix}, \qquad \mathbf{q}_m^\top\mathbf{k}_n = \sum_{i=0}^{d/2-1} \operatorname{Re}\!\left[\tilde q_i\, \overline{\tilde k_i}\; e^{i(m-n)\theta_i}\right] \tag{14.6} \]</div>
+<p>So the score is a sum of \(d/2\) terms, one per pair. Each term is a cosine wave in the distance \(m - n\), with its own speed \(\theta_i\) and with an amplitude and phase set by the content (\(\tilde q_i \overline{\tilde k_i}\)). The model learns \(W_q\) and \(W_k\), so it learns which pairs to use and how. A head that wants to look at the previous token can put its weight on fast pairs; a head that wants to match a word 2,000 tokens back can use slow pairs, which hardly change over short distances.</p>
+<h3>Where RoPE sits in a layer</h3>
+<ul><li>RoPE is applied in <b>every attention layer</b>, after the query and key projections and before the dot product. Nothing is added to the token embedding at the bottom of the network. [Certain]</li>
+<li>Only <b>queries and keys</b> are rotated. Values are not: the position should change <i>who attends to whom</i>, not the content that is copied. [Certain]</li>
+<li>Each head uses the same \(\theta_i\). With grouped-query attention (<a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>), the shared keys are rotated once.</li>
+<li>Some models rotate only part of each head: GPT-NeoX rotates 25% of the dimensions and leaves the rest without position. [Likely]</li></ul>
+<h3>The fast way to compute it</h3>
+<p>Nobody builds the \(d \times d\) matrix \(R_m\). Since each block only mixes two numbers, the rotation is two element-wise products. Real code uses the <b>half-split</b> layout: pair \(i\) is made of dimension \(i\) and dimension \(i + d/2\) (not dimensions \(2i\) and \(2i+1\)). With that layout:</p>
+<div class="eq">\[ \operatorname{RoPE}(\mathbf{x}, m) = \mathbf{x} \odot \cos(m\boldsymbol{\theta}) + \operatorname{rotate\_half}(\mathbf{x}) \odot \sin(m\boldsymbol{\theta}), \qquad \operatorname{rotate\_half}(\mathbf{x}_{1}, \mathbf{x}_{2}) = (-\mathbf{x}_{2}, \mathbf{x}_{1}) \tag{14.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\odot\)</dt><dd>element-wise product</dd>
+<dt>\(\boldsymbol{\theta}\)</dt><dd>the \(d\) angle steps \((\theta_0, \dots, \theta_{d/2-1}, \theta_0, \dots, \theta_{d/2-1})\): each step written twice, once for each half</dd>
+<dt>\(\mathbf{x}_1, \mathbf{x}_2\)</dt><dd>the first and the second half of \(\mathbf{x}\), each of length \(d/2\)</dd></dl>
+<p>The tables \(\cos(m\boldsymbol\theta)\) and \(\sin(m\boldsymbol\theta)\) for all positions are computed once and cached. The half-split layout is the one in GPT-NeoX and in Hugging Face’s Llama code; the paper and Meta’s original code use the <b>interleaved</b> layout (pairs \((2i, 2i+1)\)). [Certain] The two are the same RoPE up to a fixed reordering of the dimensions, and because \(W_q\) and \(W_k\) are learned, a model trained in one layout works in the other only if you also reorder the rows of \(W_q\) and \(W_k\). Hugging Face’s conversion script for Llama does exactly this permutation. [Likely] Getting the layout wrong does not crash: it gives a model that runs and produces nonsense.</p>
+<div class="worked"><div class="wt">Worked example: a 4-dimensional head</div>
+<p>Let \(d = 4\) (two pairs) and, to keep numbers simple, \(b = 100\). Then \(\theta_0 = 100^0 = 1\) and \(\theta_1 = 100^{-2/4} = 0.1\). Take \(\mathbf{q} = (1, 0, 1, 0)\) and \(\mathbf{k} = (0, 1, 1, 0)\) in interleaved pairs. As complex numbers: \(\tilde q_0 = 1, \tilde k_0 = i\) and \(\tilde q_1 = 1, \tilde k_1 = 1\). Before rotation, \(\mathbf{q}\cdot\mathbf{k} = 1\).</p>
+<p>Query at \(m = 3\), key at \(n = 1\), so \(m - n = 2\). Pair 0: \(\operatorname{Re}[1 \cdot (-i)\, e^{2i}] = \sin 2 = 0.909\). Pair 1: \(\operatorname{Re}[e^{0.2i}] = \cos 0.2 = 0.980\). The score (14.6) is \(0.909 + 0.980 = 1.889\).</p>
+<p>Move to \(m = 10\), \(n = 8\): still distance 2, still \(1.889\) (the code below checks this). Pair 0 turns a full radian per step, so it changes a lot from one distance to the next. Pair 1 turns ten times slower; at distance 2 it has hardly moved from its unrotated value 1.</p></div>
+
+<h2>Frequencies, wavelengths and the base</h2>
+<h3>Long and short wavelengths</h3>
+<p>Pair \(i\) turns by \(\theta_i\) per position, so it comes back to where it started after \(2\pi/\theta_i\) positions. That number is its <b>wavelength</b>:</p>
+<div class="eq">\[ \lambda_i = \frac{2\pi}{\theta_i} = 2\pi\, b^{2i/d} \tag{14.8} \]</div>
+<p>For \(d = 128\) and \(b = 10{,}000\), the wavelengths go from \(2\pi \approx 6.28\) tokens for pair 0 up to about 54,410 tokens for pair 63. With \(b = 500{,}000\) (Llama 3) the longest wavelength is about 2.56 million tokens. Each step to the next pair multiplies the wavelength by the same factor \(b^{2/d}\) (1.155 for \(b = 10{,}000\)), so on a log scale the wavelengths form a straight line.</p>
+<ul><li><b>Fast pairs</b> (small \(i\), short wavelength) turn many full circles inside a sentence. They can tell distance 3 from distance 4 very sharply, but after a few tokens their angle “wraps around”, so on their own they cannot tell distance 4 from distance 10.</li>
+<li><b>Slow pairs</b> (large \(i\), long wavelength) change little between neighbors but keep turning steadily over thousands of tokens. They tell “near” from “far”.</li>
+<li>Together they work like the hands of a clock: seconds, minutes, hours. Many readings combined give a unique and smooth code for each distance.</li></ul>
+<p>Here is a fact that matters later. If the training length is \(L\), the pairs with \(\lambda_i \gt L\) never complete even one full turn during training. The model only ever sees part of their circle. For \(d = 128\), \(b = 10{,}000\) and \(L = 4{,}096\) (Llama 2), that is 18 of the 64 pairs. Past \(L\), those pairs reach angles the model has never seen. This is a main reason why a RoPE model does not work well beyond its training length without extra tricks (<a href="../transformers/what-context-means-and-how-to-make.html">session 28</a>). [Likely]</p>
+<figure class="fig" id="rp-wave"><div class="fig-body">
+<div class="controls"><span class="seg" id="rp-wave-b"><button type="button" data-v="10000" aria-pressed="true">b = 10,000</button><button type="button" data-v="500000" aria-pressed="false">b = 500,000</button><button type="button" data-v="1000000" aria-pressed="false">b = 1,000,000</button></span><label class="sl">training length L = 2^ <input type="range" id="rp-wave-L" min="9" max="17" step="1" value="12"><output id="rp-wave-Lv">12</output></label></div>
+<div class="scroll-x"><svg id="rp-wave-svg" viewBox="0 0 640 330" role="img" aria-label="Wavelength of each RoPE dimension pair on a log scale, with the training length as a horizontal line"></svg></div>
+<div class="readout" id="rp-wave-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The wavelength \(\lambda_i = 2\pi b^{2i/d}\) of each of the 64 dimension pairs of a head with \(d = 128\), on a log scale. The dashed line is the training length \(L\). Orange bars are pairs that never complete one full turn within \(L\) tokens.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Each bar is one pair. Its height is the number of tokens it needs for one full turn. All bases start at the same place, \(2\pi \approx 6.28\) tokens for pair 0, because \(\theta_0 = 1\) for every base. A larger base makes the line steeper, so the slow pairs get much slower. Move the slider for \(L\): with \(b = 10{,}000\) and \(L = 4{,}096\), 18 pairs are orange. With \(b = 500{,}000\) and \(L = 8{,}192\) (Llama 3 pretraining before its long-context stage), 29 pairs are orange. At \(L = 131{,}072\) (2^17), no pair is orange for \(b = 10{,}000\), but 15 still are for \(b = 500{,}000\).</p></details></figure>
+<h3>Why the base matters</h3>
+<p>The base \(b\) sets how slow the slowest pair is. If the longest wavelength is shorter than the context, the slowest pairs wrap around inside the context and two far-apart distances can look alike. A larger base keeps more pairs “monotone” over the whole context, which helps the model tell a token 10,000 back from one 50,000 back. The Llama 3 paper says it raised the base to 500,000 because this helps longer contexts. [Certain] Qwen2-VL uses 1,000,000. [Certain]</p>
+<p>The price: with a larger base, fewer pairs are fast, so there is a little less resolution for short distances (compare b = 10,000 and b = 1,000,000 in Figure 2: pair 1 has wavelength 7.26 vs 7.80, and the middle pairs differ much more). In practice, models with a large base do well on short text too, so this cost seems small. [Likely]</p>
+<p>Changing the base or the position scale <i>after</i> training is the starting point of context extension: position interpolation divides every position by a factor, “NTK-aware” scaling raises the base, and YaRN treats fast and slow pairs differently. [Certain] Llama 3.1’s config has a <code>rope_scaling</code> entry of type <code>llama3</code> with factor 8 and an original length of 8,192, which is one such scheme. [Certain] We study these methods in <a href="../transformers/what-context-means-and-how-to-make.html">session 28</a>.</p>
+<h3>Does the score decay with distance?</h3>
+<p>The RoFormer paper shows a “long-term decay” property: an upper bound on the score that tends to get smaller as \(|m - n|\) grows. [Certain] A simple way to see it: take \(\tilde q_i = \tilde k_i = 1\) for every pair (query and key with the same content). Then every term of (14.6) is a cosine, and the average is</p>
+<div class="eq">\[ s(\Delta) = \frac{2}{d} \sum_{i=0}^{d/2-1} \cos(\Delta\, \theta_i), \qquad \Delta = m - n \tag{14.9} \]</div>
+<p>At \(\Delta = 0\) every cosine is 1, so \(s = 1\). As \(\Delta\) grows, the fast pairs point in many different directions and cancel, and only the slow pairs still add up. For \(d = 128\) and \(b = 10{,}000\): \(s(10) = 0.669\), \(s(100) = 0.477\), \(s(1000) = 0.159\). Two warnings. First, the decay is not smooth: the curve wiggles and is not monotone. Second, it only describes this special “same content” case. For a random query and key the expected score is zero at every distance, and a trained head can learn \(W_q, W_k\) that put weight on slow pairs and attend far away with no penalty. So think of it as a <b>mild bias toward nearby tokens</b>, not a rule. [Certain]</p>
+<figure class="fig" id="rp-decay"><div class="fig-body">
+<div class="controls"><span class="seg" id="rp-decay-b"><button type="button" data-v="10000" aria-pressed="true">b = 10,000</button><button type="button" data-v="500000" aria-pressed="false">b = 500,000</button><button type="button" data-v="1000000" aria-pressed="false">b = 1,000,000</button></span><label class="sl">distance Δ <input type="range" id="rp-decay-D" min="0" max="4000" step="10" value="100"><output id="rp-decay-Dv">100</output></label></div>
+<div class="scroll-x"><svg id="rp-decay-svg" viewBox="0 0 640 300" role="img" aria-label="Average RoPE score for identical query and key as a function of distance"></svg></div>
+<div class="readout" id="rp-decay-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> The score \(s(\Delta)\) of formula (14.9) for a query and key with the same content in every pair, \(d = 128\), for distances 0 to 4,000 (the x-axis is on a square-root scale, so short distances get more room). The dot marks the distance chosen with the slider.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At distance 0 the score is 1 for every base. It drops fast in the first few tokens, as the fast pairs fall out of step, then drops slowly. With \(b = 10{,}000\) the curve is near zero by \(\Delta = 4{,}000\) (0.008). With \(b = 500{,}000\) it is still 0.245 there, because more pairs are still slow enough to agree. The wiggles show the curve is not monotone: for example at \(\Delta = 100\), \(b = 1{,}000{,}000\) gives 0.586, slightly below \(b = 500{,}000\) (0.611). Remember that this is one special pair of vectors, not what a trained head does.</p></details></figure>
+
+<h2>A first look at 2D RoPE for images</h2>
+<p>A vision transformer cuts an image into a grid of patches (<a href="../foundations/embeddings-turning-token-ids-into-vectors.html">session 11</a> showed the patch embedding). Each patch has <i>two</i> coordinates: a row \(h\) and a column \(w\). The simplest idea is to read the patches in raster order (row by row) and use 1D RoPE on the index \(m = h \cdot W + w\), where \(W\) is the number of columns. That works badly: the patch just below is \(W\) steps away in raster order, while the last patch of one row and the first of the next are neighbors, even though they sit on opposite sides of the image.</p>
+<p><b>2D RoPE</b> fixes this. Split the dimension pairs of each head into two halves. The first half is rotated by the row, the second half by the column:</p>
+<div class="eq">\[ R_{(h,w)} = \begin{pmatrix} R^{(d/2)}_{h} & 0 \\ 0 & R^{(d/2)}_{w} \end{pmatrix}, \qquad \mathbf{q}_{(h,w)}^\top \mathbf{k}_{(h',w')} = f\big(\mathbf{q}, \mathbf{k},\, h - h',\, w - w'\big) \tag{14.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(R^{(d/2)}_{h}\)</dt><dd>the block-diagonal RoPE rotation of (14.6) for a vector of \(d/2\) numbers, at position \(h\)</dd>
+<dt>\((h, w)\), \((h', w')\)</dt><dd>row and column of the query patch and of the key patch</dd>
+<dt>\(f\)</dt><dd>some function: the point is that the score depends only on the row offset and the column offset</dd></dl>
+<p>The same proof as (14.3) works on each half, so the score depends only on the 2D offset \((h - h', w - w')\). Moving an object across the image does not change how its patches attend to each other. Qwen2-VL removed the absolute position embeddings of its ViT and used 2D RoPE instead, which lets one encoder handle images of any size. [Certain] Because RoPE needs no learned table, a new image size needs no interpolation of position embeddings, which is a known pain point with learned ViT positions. [Likely]</p>
+<figure class="fig" id="rp-2d"><div class="fig-body">
+<div class="controls"><span class="seg" id="rp-2d-mode"><button type="button" data-v="2d" aria-pressed="true">2D RoPE (row, column)</button><button type="button" data-v="1d" aria-pressed="false">1D RoPE on raster order</button></span></div>
+<div class="rp-grid" id="rp-2d-grid" role="group" aria-label="8 by 8 grid of image patches; click a patch to make it the query"></div>
+<div class="rp-leg"><span><i style="background:var(--q)"></i>high score</span><span><i style="background:var(--paper2);border:1px solid var(--rule)"></i>about zero</span><span><i style="background:var(--k)"></i>negative</span></div>
+<div class="readout" id="rp-2d-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Scores from one query patch (outlined) to every patch of an 8×8 image, for a head with \(d = 32\) and base 100, when the query and all keys have the same content (\(\tilde q_i = \tilde k_i = 1\), as in formula 14.9). Only the position changes the score. Color strength grows with the square of the score, to make differences easier to see. Click any patch to make it the query.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>In 2D mode the bright area is a round blob around the query: the patch to the right and the patch below get the same score (0.957 for the default query), because both are one step away. Click another patch: the blob moves with it and keeps its shape. That is translation invariance from (14.10). Switch to 1D raster mode: the bright area becomes a horizontal stripe, the patch below the query drops to 0.401 (it is 8 steps away in raster order) while the patch to the right stays high (0.932). Click a patch at the end of a row and see that the first patch of the next row looks “near”.</p></details></figure>
+
+<h2>A first look at M-RoPE for video</h2>
+<h3>Three coordinates in one sequence</h3>
+<p>A VLM mixes text tokens and visual tokens in one sequence. A video token has three coordinates: time \(t\) (which frame), row \(h\) and column \(w\). Qwen2-VL’s <b>multimodal RoPE (M-RoPE)</b> gives every token a position triple \((t, h, w)\) and splits the frequency pairs of each head into three groups: one group is rotated by \(t\), one by \(h\), one by \(w\). [Certain] In the released Qwen2-VL-7B config the split is <code>mrope_section = [16, 24, 24]</code>: of the 64 pairs of a 128-dimensional head, 16 see time, 24 see the row and 24 see the column. [Certain, from config.json] In the Hugging Face code the time group gets the fastest frequencies and the width group the slowest. [Likely]</p>
+<p>The rules for the triples, from the Qwen2-VL paper: [Certain]</p>
+<ul><li><b>Text</b>: all three components are equal, \((m, m, m)\). Then every group rotates by the same \(m\), and M-RoPE is exactly ordinary 1D RoPE. A text-only prompt behaves like a normal LLM.</li>
+<li><b>Image</b>: the time ID is constant; the row and column IDs follow the patch position in the grid.</li>
+<li><b>Video</b>: like an image for each frame, and the time ID goes up by one for each frame step.</li>
+<li><b>The next part</b> of the sequence starts at the largest ID used so far plus one.</li></ul>
+<p>Written as a formula, for a visual block that starts at offset \(s\):</p>
+<div class="eq">\[ \text{text: } (m, m, m), \qquad \text{visual token (frame } f, \text{ row } r, \text{ column } c\text{): } (s + f,\; s + r,\; s + c) \tag{14.11} \]</div>
+<div class="eq">\[ s_{\text{next}} = 1 + \max\big(\text{all IDs used so far}\big) \tag{14.12} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(m\)</dt><dd>the usual running position of a text token</dd>
+<dt>\(s\)</dt><dd>the start offset of a visual block: one more than the largest ID before it</dd>
+<dt>\(f, r, c\)</dt><dd>frame step, row and column of the visual token inside its block, each counted from 0 (after Qwen2-VL merges 2×2 patches and 2 frames into one token)</dd></dl>
+<p>One nice result: an image of \(H \times W\) tokens uses only \(\max(H, W)\) position steps, not \(H \cdot W\). A 448×448 image in Qwen2-VL becomes 32×32 patches of 14 pixels, merged 2×2 into 16×16 = 256 tokens. [Certain] With 1D positions it would push the next text 256 steps further; with M-RoPE only 16. Long videos use much less of the position range, so the model meets fewer of the angles it never saw in training.</p>
+<div class="worked"><div class="wt">Worked example: position IDs for text, image, text, video, text</div>
+<p>The sequence is: <code>Describe</code>, <code>&lt;|vision_start|&gt;</code>, an image of 2×3 tokens, <code>&lt;|vision_end|&gt;</code>, <code>and</code>, <code>&lt;|vision_start|&gt;</code>, a video of 3 frame steps of 2×2 tokens, <code>&lt;|vision_end|&gt;</code>, <code>?</code>.</p>
+<ul><li>Text at positions 0 and 1: \((0,0,0)\), \((1,1,1)\).</li>
+<li>The image starts at \(s = 2\): rows 2 to 3 and columns 2 to 4, time fixed at 2. First token \((2,2,2)\), last token \((2,3,4)\). The largest ID is 4.</li>
+<li>The next text starts at 5: \((5,5,5)\), \((6,6,6)\), \((7,7,7)\).</li>
+<li>The video starts at \(s = 8\): time 8 to 10, rows 8 to 9, columns 8 to 9. First token \((8,8,8)\), last token \((10,9,9)\). The largest ID is 10.</li>
+<li>The final text gets \((11,11,11)\) and \((12,12,12)\).</li></ul>
+<p>The sequence has 25 tokens but its largest position is only 12. The code below prints the same IDs. Figure 5 steps through it.</p></div>
+<figure class="fig" id="rp-mrope"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="rp-mrope-prev">Back</button><button type="button" class="btn primary" id="rp-mrope-play">Play</button><button type="button" class="btn" id="rp-mrope-next">Next</button><span id="rp-mrope-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="rp-seq" id="rp-mrope-seq" aria-label="Tokens with their (t, h, w) position IDs"></div>
+<div class="rp-leg"><span><i style="background:var(--v)"></i>text</span><span><i style="background:var(--q)"></i>image</span><span><i style="background:var(--k)"></i>video</span></div>
+<div class="readout" id="rp-mrope-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> M-RoPE position IDs \((t, h, w)\) for a sequence of text, one image (2×3 tokens) and one video (3 frame steps of 2×2 tokens), following the rules of formulas (14.11) and (14.12). Each step adds one part of the sequence.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Each box is one token, with its three IDs written as t, h, w. Step through the five parts. Text tokens have three equal numbers. Inside the image, t stays fixed while h follows the row and w the column. Inside the video, t also counts the frame steps. After each visual block, the next text starts at one more than the largest ID so far (5 after the image, 11 after the video), not at the token count. The readout compares the largest position with the number of tokens.</p></details></figure>
+<p>This is a preview. The details differ between models: Qwen2.5-VL ties the time ID to real seconds instead of frame count, so videos sampled at different frame rates get consistent times [Likely], and later work changes how the frequencies are split between the three axes [Likely]. We return to these in <a href="../vision/index.html#row-case-studies-2-qwen2-5-vl-internvl" title="Case studies 2: Qwen2.5-VL, InternVL, PaliGemma and Gemma, SmolVLM (planned)">session 182</a> and <a href="../video/index.html#row-video-llms" title="Video-LLMs (planned)">session 205</a>.</p>
+
+<h2>Pseudo-code</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: RoPE in one attention layer (half-split layout)</div><ol>
+<li><b>input:</b> hidden states \(X \in \R^{T \times d_{\text{model}}}\), positions \(m_1, \dots, m_T\), head size \(d\), base \(b\)</li>
+<li><b>once:</b> \(\theta_i \leftarrow b^{-2i/d}\) for \(i = 0, \dots, d/2 - 1\) <span class="c">// formula (14.5), in float32</span></li>
+<li><b>once:</b> for every position \(m\): \(C_m \leftarrow \cos(m\boldsymbol\theta)\), \(S_m \leftarrow \sin(m\boldsymbol\theta)\), each \(\boldsymbol\theta\) written twice <span class="c">// the cos/sin cache</span></li>
+<li>\(Q \leftarrow X W_q\), \(K \leftarrow X W_k\), \(V \leftarrow X W_v\), split into heads</li>
+<li><b>for</b> each token \(t\) and each head <b>do</b></li>
+<li class="i1">\(\mathbf{q} \leftarrow \mathbf{q} \odot C_{m_t} + \operatorname{rotate\_half}(\mathbf{q}) \odot S_{m_t}\) <span class="c">// formula (14.7)</span></li>
+<li class="i1">\(\mathbf{k} \leftarrow \mathbf{k} \odot C_{m_t} + \operatorname{rotate\_half}(\mathbf{k}) \odot S_{m_t}\) <span class="c">// V is not rotated</span></li>
+<li>store rotated \(K\) and \(V\) in the KV cache</li>
+<li><b>return</b> \(\softmax(QK^\top/\sqrt{d} + \text{mask})\,V\) <span class="c">// score depends only on \(m - n\), formula (14.6)</span></li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: M-RoPE position IDs for a mixed sequence</div><ol>
+<li><b>input:</b> list of parts: text of length \(n\), or a visual block of \(F \times H \times W\) tokens</li>
+<li>\(s \leftarrow 0\); ids \(\leftarrow [\,]\)</li>
+<li><b>for</b> each part <b>do</b></li>
+<li class="i1"><b>if</b> text <b>then for</b> \(j = 0\) <b>to</b> \(n - 1\): append \((s + j, s + j, s + j)\); \(s \leftarrow s + n\)</li>
+<li class="i1"><b>else for</b> \(f, r, c\) in frame, row, column order: append \((s + f, s + r, s + c)\) <span class="c">// formula (14.11)</span></li>
+<li class="i2">\(s \leftarrow 1 + \max(\text{all IDs so far})\) <span class="c">// formula (14.12): \(s\) grows by \(\max(F, H, W)\)</span></li>
+<li><b>return</b> ids <span class="c">// pair group “t” rotates by the 1st ID, “h” by the 2nd, “w” by the 3rd</span></li></ol></div>
+<p>The same ideas in PyTorch. Each block checks one claim from this session; the printed values are from a real run.</p>
+<pre class="code"><span class="kw2">import</span> torch, math
+torch.manual_seed(0)
+
+<span class="cm"># 1) frequencies and the cos/sin cache, formulas (14.5) and (14.7)</span>
+<span class="kw2">def</span> rope_cache(T, d, base=10000.0):
+    inv_freq = base ** (-torch.arange(0, d, 2, dtype=torch.float32) / d)   <span class="cm"># theta_i, (d/2,)</span>
+    ang = torch.arange(T, dtype=torch.float32)[:, None] * inv_freq[None]  <span class="cm"># m * theta_i, (T, d/2)</span>
+    ang = torch.cat([ang, ang], dim=-1)                                   <span class="cm"># (T, d) for the half-split layout</span>
+    <span class="kw2">return</span> ang.cos(), ang.sin()
+
+<span class="kw2">def</span> rotate_half(x):
+    x1, x2 = x.chunk(2, dim=-1)
+    <span class="kw2">return</span> torch.cat([-x2, x1], dim=-1)
+
+<span class="kw2">def</span> apply_rope(x, cos, sin):                 <span class="cm"># x: (..., T, d)</span>
+    <span class="kw2">return</span> x * cos + rotate_half(x) * sin     <span class="cm"># formula (14.7)</span>
+
+<span class="cm"># 2) the score depends only on m - n, formula (14.6)</span>
+d, T = 64, 512
+cos, sin = rope_cache(T, d)
+q, k = torch.randn(d), torch.randn(d)
+<span class="kw2">def</span> score(m, n):
+    qm = apply_rope(q, cos[m], sin[m]); kn = apply_rope(k, cos[n], sin[n])
+    <span class="kw2">return</span> (qm @ kn).item()
+print(round(score(10, 3), 3), round(score(310, 303), 3))   <span class="cm"># -12.777 -12.777: distance 7 in both</span>
+
+<span class="cm"># 3) norms do not change: RoPE is a rotation</span>
+print(torch.allclose(apply_rope(q, cos[100], sin[100]).norm(), q.norm()))  <span class="cm"># True</span>
+
+<span class="cm"># 4) the worked example: d = 4, base 100, q = (1,0,1,0), k = (0,1,1,0) in interleaved pairs</span>
+<span class="kw2">def</span> rope_interleaved(x, m, base):
+    d = x.shape[-1]; out = x.clone()
+    <span class="kw2">for</span> i <span class="kw2">in</span> range(d // 2):
+        a = m * base ** (-2 * i / d); c, s = math.cos(a), math.sin(a)
+        out[2*i]   = c * x[2*i] - s * x[2*i+1]
+        out[2*i+1] = s * x[2*i] + c * x[2*i+1]
+    <span class="kw2">return</span> out
+qw, kw = torch.tensor([1., 0., 1., 0.]), torch.tensor([0., 1., 1., 0.])
+<span class="kw2">for</span> m, n <span class="kw2">in</span> [(3, 1), (10, 8)]:
+    print(m, n, round((rope_interleaved(qw, m, 100) @ rope_interleaved(kw, n, 100)).item(), 3))  <span class="cm"># 1.889 both</span>
+
+<span class="cm"># 5) interleaved and half-split are the same RoPE up to a fixed permutation of dimensions</span>
+perm = torch.cat([torch.arange(0, d, 2), torch.arange(1, d, 2)])  <span class="cm"># (x0,x2,...,x1,x3,...)</span>
+x = torch.randn(d)
+a = rope_interleaved(x, 37, 10000.0)[perm]
+b = apply_rope(x[perm], cos[37], sin[37])
+print(torch.allclose(a, b, atol=1e-5))     <span class="cm"># True</span>
+
+<span class="cm"># 6) 2D RoPE for an image patch at (row h, column w), formula (14.10)</span>
+<span class="kw2">def</span> rope_2d(x, h, w, base=10000.0):
+    half = x.shape[-1] // 2
+    ch, sh = rope_cache(h + 1, half, base); cw, sw = rope_cache(w + 1, half, base)
+    <span class="kw2">return</span> torch.cat([apply_rope(x[:half], ch[h], sh[h]), apply_rope(x[half:], cw[w], sw[w])])
+s1 = rope_2d(q, 2, 5) @ rope_2d(k, 3, 7)
+s2 = rope_2d(q, 10, 1) @ rope_2d(k, 11, 3)   <span class="cm"># same offset (1, 2)</span>
+print(torch.allclose(s1, s2, atol=1e-4))   <span class="cm"># True</span>
+
+<span class="cm"># 7) M-RoPE position IDs (t, h, w), formulas (14.11) and (14.12), Algorithm 2</span>
+<span class="kw2">def</span> mrope_ids(segments):
+    ids, start = [], 0
+    <span class="kw2">for</span> kind, size <span class="kw2">in</span> segments:
+        <span class="kw2">if</span> kind == <span class="st">"text"</span>:
+            <span class="kw2">for</span> j <span class="kw2">in</span> range(size): ids.append((start + j,) * 3)
+            start += size
+        <span class="kw2">else</span>:                                <span class="cm"># (frames, height, width) after patch merging</span>
+            F, H, W = size
+            <span class="kw2">for</span> f <span class="kw2">in</span> range(F):
+                <span class="kw2">for</span> r <span class="kw2">in</span> range(H):
+                    <span class="kw2">for</span> c <span class="kw2">in</span> range(W): ids.append((start + f, start + r, start + c))
+            start = max(max(p) <span class="kw2">for</span> p <span class="kw2">in</span> ids) + 1
+    <span class="kw2">return</span> ids
+ids = mrope_ids([(<span class="st">"text"</span>, 2), (<span class="st">"image"</span>, (1, 2, 3)), (<span class="st">"text"</span>, 3), (<span class="st">"image"</span>, (3, 2, 2)), (<span class="st">"text"</span>, 2)])
+print(len(ids), ids[2], ids[7], ids[8], ids[11], ids[-1])
+<span class="cm"># 25 (2, 2, 2) (2, 3, 4) (5, 5, 5) (8, 8, 8) (12, 12, 12)</span>
+
+<span class="cm"># 8) bfloat16 cannot hold large positions exactly: compute angles in float32</span>
+print(torch.tensor([10001.0, 10033.0]).to(torch.bfloat16).tolist())   <span class="cm"># [9984.0, 10048.0]</span></pre>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>Which RoPE</th><th>What it gives</th></tr></thead><tbody>
+<tr><td>Decoder LLMs (Llama 2 and 3, Qwen2, Mistral and many others)</td><td>1D RoPE in every layer, base 10,000 to 1,000,000</td><td>Relative positions with no learned table; works with the KV cache and fused attention kernels</td></tr>
+<tr><td>Long-context models (Llama 3.1 at 128K tokens, for example)</td><td>1D RoPE with a larger base and a scaling rule (<code>rope_scaling</code>)</td><td>Extends the usable context after pretraining; see <a href="../transformers/what-context-means-and-how-to-make.html">session 28</a></td></tr>
+<tr><td>Vision encoders for any image size (Qwen2-VL ViT)</td><td>2D RoPE on (row, column)</td><td>No position table to resize; attention depends on the 2D offset between patches</td></tr>
+<tr><td>Image and document VLMs (Qwen2-VL, Qwen2.5-VL)</td><td>M-RoPE with \((t, h, w)\) IDs</td><td>Text keeps normal 1D RoPE; an image uses only \(\max(H, W)\) position steps</td></tr>
+<tr><td>Video question answering, video classification and action recognition</td><td>M-RoPE, time ID per frame step</td><td>The model can tell frame order and temporal distance between visual tokens</td></tr>
+<tr><td>Key-moment detection and temporal grounding (“when does the goal happen?”)</td><td>M-RoPE with time IDs tied to seconds (Qwen2.5-VL) [Likely]</td><td>Time IDs map to real time, so the model can answer with timestamps</td></tr>
+<tr><td>Long-video understanding and Video-RAG</td><td>M-RoPE; compact position use</td><td>Many frames fit in a smaller position range, which reduces the out-of-range angle problem</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Mixing the interleaved and half-split layouts.</b> Loading weights trained with pairs \((2i, 2i+1)\) into code that rotates \((i, i + d/2)\), or the reverse, gives a model that runs and outputs garbage. Check which layout the checkpoint expects (or permute \(W_q, W_k\)).</li>
+<li><b>Rotating the values, or rotating the input embedding.</b> RoPE goes on queries and keys, in every layer, after the projection. Rotating \(V\) mixes position into the copied content; rotating only once at the bottom loses the relative property after the first layer.</li>
+<li><b>Wrong positions with a KV cache or with padding.</b> During generation the new token’s position is the number of tokens already in the cache, not 0. With left padding in a batch, positions must skip the pad tokens (use <code>position_ids</code>), or each sequence sees shifted angles. [Certain]</li>
+<li><b>Computing angles in bfloat16 or float16.</b> bfloat16 keeps only 8 significant bits: near 10,000 the gap between numbers is 64, so position 10,001 becomes 9,984. Compute \(m\theta_i\), cos and sin in float32, then cast.</li>
+<li><b>Using a different base at inference than in training.</b> The base is part of the model. Changing it (or <code>rope_scaling</code>) without matching fine-tuning shifts every angle the model has learned.</li>
+<li><b>Believing RoPE “extrapolates” to any length.</b> The score is relative, but slow pairs meet angles past the training length that they never saw (Figure 2). Quality usually drops past the training length without a scaling method.</li>
+<li><b>Treating long-term decay as a guarantee.</b> Formula (14.9) is one special case. Trained heads attend far away when they need to; do not argue that RoPE models “cannot” look back.</li>
+<li><b>Using raster-order 1D positions for image patches.</b> Neighbors above and below become far apart, and row ends look adjacent to the next row (Figure 4). Use 2D RoPE or 2D positions.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What does RoPE do, in two sentences?<span class="lvl">basic</span></summary><div class="ans">RoPE splits each query and key into pairs of numbers and rotates pair \(i\) by the angle \(m\theta_i\), where \(m\) is the token’s position and \(\theta_i = b^{-2i/d}\). Because rotations preserve dot products up to the difference of angles, the attention score between positions \(m\) and \(n\) depends only on the content and on \(m - n\) (formula 14.6), while each token is processed using only its own position.</div></details>
+<details class="qa"><summary>Prove that the RoPE score depends only on the relative position.<span class="lvl">core</span></summary><div class="ans">With \(\mathbf{q}_m = R_m\mathbf{q}\) and \(\mathbf{k}_n = R_n\mathbf{k}\): \(\mathbf{q}_m^\top\mathbf{k}_n = \mathbf{q}^\top R_m^\top R_n\mathbf{k}\). Each \(R_m\) is block-diagonal with \(2 \times 2\) rotations \(R(m\theta_i)\). A rotation is orthogonal, \(R(\alpha)^\top = R(-\alpha)\), and angles add, \(R(-\alpha)R(\beta) = R(\beta - \alpha)\). So \(R_m^\top R_n = R_{n-m}\) and the score is \(\mathbf{q}^\top R_{n-m}\mathbf{k}\) (formula 14.3). In complex form, each pair gives \(\operatorname{Re}[\tilde q_i\overline{\tilde k_i}e^{i(m-n)\theta_i}]\).</div></details>
+<details class="qa"><summary>Why rotate the query and the key but not the value?<span class="lvl">core</span></summary><div class="ans">Position should decide <i>which</i> tokens attend to each other, and that is decided by \(\mathbf{q}\cdot\mathbf{k}\). The value is the content that gets copied into the output; rotating it would mix the absolute position of the source token into the content, and the relative property would not hold for the output. Also the rotation of a value would not cancel against anything, so the output would depend on absolute positions.</div></details>
+<details class="qa"><summary>How is RoPE different from adding sinusoidal position vectors?<span class="lvl">basic</span></summary><div class="ans">Both use the same geometric frequencies. Sinusoidal positions are <i>added</i> once to the input embedding, so the score contains cross terms of content and position and only partly depends on distance. RoPE <i>multiplies</i> (rotates) queries and keys in every layer, so the score is exactly a function of content and \(m - n\). RoPE has no parameters, never touches values, and the position signal does not fade through the residual stream because it is re-applied in each layer.</div></details>
+<details class="qa"><summary>What is the base \(b\), and why did Llama 3 raise it to 500,000?<span class="lvl">core</span></summary><div class="ans">The base sets the frequencies \(\theta_i = b^{-2i/d}\) and so the wavelengths \(2\pi b^{2i/d}\) (formula 14.8). The fastest pair always has wavelength \(2\pi\); the base decides how slow the slowest pair is: about 54K tokens for \(b = 10{,}000\) and \(d = 128\), about 2.56M for \(b = 500{,}000\). A larger base keeps more pairs from wrapping around inside a long context, so far distances stay distinguishable. The Llama 3 paper reports that the larger base helps long contexts. The cost is slightly less resolution for short distances.</div></details>
+<details class="qa"><summary>Which dimensions of a RoPE head handle short distances, and which handle long ones?<span class="lvl">core</span></summary><div class="ans">The first pairs (small \(i\)) have \(\theta_i\) near 1 and wavelengths of a few tokens: they separate nearby distances sharply but wrap around quickly. The last pairs have tiny \(\theta_i\) and wavelengths of tens of thousands of tokens or more: they change slowly and encode coarse, long-range distance. In the half-split layout, pair \(i\) is dimensions \(i\) and \(i + d/2\), so the “fast” dimensions are at the start of each half.</div></details>
+<details class="qa"><summary>Does RoPE let a model work past its training length? Why or why not?<span class="lvl">core</span></summary><div class="ans">Not by itself. The score is relative, but relative distances larger than the training length \(L\) were never seen. For pairs with wavelength longer than \(L\) (18 of 64 for \(b = 10{,}000\), \(d = 128\), \(L = 4{,}096\)), the angles past \(L\) are new, and attention patterns break, so perplexity usually rises sharply. Fixes change the positions or frequencies: position interpolation (divide \(m\) by a factor), NTK-aware scaling (raise the base), YaRN (treat fast and slow pairs differently), usually with some long-context fine-tuning.</div></details>
+<details class="qa"><summary>How does RoPE interact with the KV cache?<span class="lvl">core</span></summary><div class="ans">Each key is rotated with its own absolute position when it is computed, and the rotated key is stored in the cache. The new query is rotated with its own position (the current cache length). Because \(R_m^\top R_n = R_{n-m}\), the scores come out relative, with no need to re-rotate old keys. This is why RoPE fits the cache so well, unlike schemes that need a pair-wise bias table. One consequence: if you drop or move tokens in the cache (for example in StreamingLLM-style eviction), the stored rotations still carry the old positions, which you must handle.</div></details>
+<details class="qa"><summary>Two RoPE implementations give different outputs for the same checkpoint. What is the likely cause?<span class="lvl">advanced</span></summary><div class="ans">The pair layout. The paper and Meta’s original code rotate interleaved pairs \((2i, 2i+1)\); GPT-NeoX and Hugging Face Llama code rotate \((i, i + d/2)\) with <code>rotate_half</code>. They are the same up to a permutation of dimensions, so a checkpoint works in the other layout only if the rows of \(W_q\) and \(W_k\) are permuted. Other causes to check: a different base or <code>rope_scaling</code>, partial rotary (only a fraction of dims rotated), positions starting at a different offset, or angles computed in low precision.</div></details>
+<details class="qa"><summary>How would you give positions to image patches? Why not flatten and use 1D RoPE?<span class="lvl">core</span></summary><div class="ans">Use 2D RoPE: split each head’s pairs into two halves, rotate one by the row index and one by the column index (formula 14.10). Then the score depends on the 2D offset, so it is translation invariant and treats up and down like left and right. Flattened raster order puts the patch below \(W\) steps away and makes the end of one row look adjacent to the start of the next (Figure 4: the patch below drops from 0.957 to 0.401). 2D RoPE also needs no learned table, so it handles any image size, which is why Qwen2-VL’s ViT uses it.</div></details>
+<details class="qa"><summary>Explain M-RoPE in Qwen2-VL. What happens to text-only input?<span class="lvl">advanced</span></summary><div class="ans">Each token gets a triple \((t, h, w)\). The frequency pairs of a head are split into three groups (16, 24, 24 of 64 pairs in Qwen2-VL-7B), rotated by \(t\), \(h\) and \(w\). Text tokens use \((m, m, m)\), so all groups rotate by the same \(m\) and it is exactly 1D RoPE: text-only behavior matches a normal LLM. Image tokens keep \(t\) fixed and use their row and column; video tokens also increase \(t\) per frame step. Each new part starts at one more than the largest ID so far, so an \(H \times W\) image only uses \(\max(H, W)\) positions. Qwen2.5-VL later ties the time ID to real seconds.</div></details>
+<details class="qa"><summary>RoFormer claims “long-term decay”. Is the attention of a RoPE model forced to be local?<span class="lvl">advanced</span></summary><div class="ans">No. The property is an upper bound that tends to shrink with distance, and the clean example (formula 14.9) assumes the query and key have the same content in every pair; then fast pairs cancel and the score drops (0.669 at distance 10, 0.159 at 1,000 for \(b = 10{,}000\), \(d = 128\)). The curve is not even monotone. For random vectors the expected score is zero at every distance, and a trained head can put its weight on slow pairs to attend far away. So it is a mild locality bias, not a hard rule.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>For \(d = 128\) and \(b = 10{,}000\), compute \(\theta_0\), \(\theta_{63}\) and the wavelength \(\lambda_{63}\).</li>
+<li>In 2D with \(\mathbf{q} = (1, 0)\), \(\mathbf{k} = (0, 1)\) and \(\theta = 0.5\), compute the RoPE score for \((m, n) = (2, 1)\), \((5, 4)\) and \((1, 2)\).</li>
+<li>Show that RoPE does not change the length of a query vector. Why does this matter for the softmax temperature?</li>
+<li>Write the M-RoPE IDs for: 3 text tokens, then an image of 2×2 tokens, then 1 text token.</li>
+<li>Qwen2-VL turns a 448×448 image into how many tokens? How many position steps does it use with M-RoPE, and how many with plain 1D positions?</li>
+<li>Using Figure 2, how many of the 64 pairs never complete a full turn for \(b = 500{,}000\) and \(L = 8{,}192\)? What about \(b = 10{,}000\) and \(L = 32{,}768\)?</li>
+<li>A position ID of 10,001 is stored in bfloat16. What value does the model actually use, and what is the angle error for pair 0?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(\theta_0 = 10{,}000^0 = 1\). \(\theta_{63} = 10{,}000^{-126/128} \approx 1.155 \times 10^{-4}\). \(\lambda_{63} = 2\pi/\theta_{63} \approx 54{,}410\) tokens. 2. The score is \(\sin((m - n)\theta)\): \(\sin 0.5 = 0.479\) for both \((2,1)\) and \((5,4)\), and \(-0.479\) for \((1,2)\). 3. \(\lVert R_m\mathbf{q}\rVert^2 = \mathbf{q}^\top R_m^\top R_m\mathbf{q} = \mathbf{q}^\top\mathbf{q}\), since \(R_m^\top R_m = I\). So RoPE never makes scores bigger or smaller on average; the \(1/\sqrt{d}\) scaling and the softmax temperature stay valid at every position. 4. Text: \((0,0,0), (1,1,1), (2,2,2)\). Image starts at 3: \((3,3,3), (3,3,4), (3,4,3), (3,4,4)\); largest ID 4. Text: \((5,5,5)\). 5. \(448/14 = 32\), so 32×32 = 1,024 patches, merged 2×2 into 16×16 = 256 tokens. With M-RoPE the next part starts 16 steps later; with 1D positions, 256 steps later. 6. 29 pairs for \(b = 500{,}000\), \(L = 8{,}192\); 4 pairs for \(b = 10{,}000\), \(L = 32{,}768\). 7. Near 10,000, bfloat16 numbers are 64 apart, so 10,001 becomes 9,984: an error of 17 positions, which for pair 0 (\(\theta_0 = 1\)) is 17 radians, almost three full turns. The model sees a completely wrong fast-pair angle. Compute positions and angles in float32.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>RoPE rotates each pair of query and key dimensions by \(m\theta_i\) (14.2, 14.6). Because rotations are orthogonal and angles add, the score depends only on the content and on \(m - n\) (14.3).</li>
+<li>It is applied per token (cache friendly, no parameters), in every layer, to queries and keys only.</li>
+<li>Frequencies \(\theta_i = b^{-2i/d}\) (14.5) give wavelengths from \(2\pi\) up to \(2\pi b^{(d-2)/d}\) (14.8): fast pairs resolve short distances, slow pairs encode long ones. A larger base (500,000 in Llama 3, 1,000,000 in Qwen2-VL) makes the slow pairs slower.</li>
+<li>Pairs whose wavelength is longer than the training length never complete a turn in training; past that length they meet new angles, which is why RoPE models need scaling methods to go longer.</li>
+<li>Implementation: a float32 cos/sin cache and <code>x·cos + rotate_half(x)·sin</code> (14.7). Interleaved and half-split layouts differ by a permutation; mixing them silently breaks a model.</li>
+<li>2D RoPE gives image patches a score that depends on the row and column offset (14.10). M-RoPE gives every token \((t, h, w)\) IDs (14.11, 14.12); text keeps plain 1D RoPE, and visual blocks use few position steps.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \mathbf{q}_m = R_m\mathbf{q},\quad \mathbf{k}_n = R_n\mathbf{k},\quad \mathbf{q}_m^\top\mathbf{k}_n = \mathbf{q}^\top R_{n-m}\,\mathbf{k} \]</div>
+<div class="eq">\[ \theta_i = b^{-2i/d},\qquad \lambda_i = 2\pi\, b^{2i/d},\qquad \operatorname{RoPE}(\mathbf{x}, m) = \mathbf{x}\odot\cos(m\boldsymbol\theta) + \operatorname{rotate\_half}(\mathbf{x})\odot\sin(m\boldsymbol\theta) \]</div>
+<div class="eq">\[ \text{M-RoPE: text } (m, m, m),\quad \text{visual } (s+f,\ s+r,\ s+c),\quad s_{\text{next}} = 1 + \max(\text{IDs}) \]</div>
+<h2 class="plain" id="position-part-2-rope-in-depth-and-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Su et al. (2021). <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">RoFormer: Enhanced Transformer with Rotary Position Embedding</a></li><li>Xiao &amp; Zhu, <a href="https://github.com/NiuTrans/NLPBook" target="_blank" rel="noopener"><i>NLP: Neural Networks and Large Language Models</i></a>, chapter 6: Transformers</li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Su et al. (2021). <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">RoFormer: Enhanced Transformer with Rotary Position Embedding</a></li><li>Xiao &amp; Zhu, <a href="https://github.com/NiuTrans/NLPBook" target="_blank" rel="noopener"><i>NLP: Neural Networks and Large Language Models</i></a>, chapter 6: Transformers</li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Vaswani et al. (2017). <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Attention Is All You Need</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Bai et al. (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;Qwen2.5-VL Technical Report&amp;quot;" target="_blank" rel="noopener">Qwen2.5-VL Technical Report</a></li><li>Dosovitskiy et al. (2020). <a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener">An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale</a></li><li>Chen et al. (2023). <a href="https://arxiv.org/abs/2306.15595" target="_blank" rel="noopener">Extending Context Window of Large Language Models via Positional Interpolation</a></li><li>Peng et al. (2023). <a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">YaRN: Efficient Context Window Extension of Large Language Models</a></li><li>Black, Biderman, Hallahan, et al. (2022). <a href="https://arxiv.org/abs/2204.06745" target="_blank" rel="noopener">GPT-NeoX-20B: An Open-Source Autoregressive Language Model</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../foundations/position-part-1-why-order-needs-help.html"><small>Previous · session 13</small>Position, part 1: why order needs help; absolute and relative positions</a><a class="next" href="../foundations/lab-embeddings-and-rope-by-hand.html"><small>Next · session 15</small>embeddings and RoPE by hand</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="position-part-2-rope-in-depth-and"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const num=v=>(Math.abs(v)<5e-4?0:v);
+const f3=v=>num(v).toFixed(3).replace("-","−");const f2=v=>num(v).toFixed(2).replace("-","−");
+const comma=n=>Math.round(n).toLocaleString("en-US");
+const avgcos=(D,b,d)=>{let s=0;const h=d/2;for(let i=0;i<h;i++)s+=Math.cos(D*Math.pow(b,-2*i/d));return s/h;};
+function segInit(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segVal=el=>el.querySelector('button[aria-pressed="true"]').dataset.v;
+
+/* ---------- Figure 1: 2D rotation ---------- */
+(function(){
+ const svg=$("#rp-rot-svg");if(!svg)return;
+ const sm=$("#rp-rot-m"),sn=$("#rp-rot-n"),st=$("#rp-rot-t"),om=$("#rp-rot-mv"),on=$("#rp-rot-nv"),ot=$("#rp-rot-tv"),info=$("#rp-rot-info");
+ const q=[0.9,0.3],k=[0.5,0.8];
+ const rot=(x,a)=>[Math.cos(a)*x[0]-Math.sin(a)*x[1],Math.sin(a)*x[0]+Math.cos(a)*x[1]];
+ const O={x:320,y:180},S=150;const P=v=>[O.x+v[0]*S,O.y-v[1]*S];
+ const deg=v=>{let a=Math.atan2(v[1],v[0])*180/Math.PI;return a;};
+ function arrow(v,col,mk,w,op){const p=P(v);return `<line x1="${O.x}" y1="${O.y}" x2="${p[0].toFixed(1)}" y2="${p[1].toFixed(1)}" stroke="${col}" stroke-width="${w}" opacity="${op}" marker-end="url(#rp-ah-${mk})"/>`;}
+ function draw(){const m=+sm.value,n=+sn.value,th=+st.value;om.value=m;on.value=n;ot.value=th.toFixed(2);
+  const qm=rot(q,m*th),kn=rot(k,n*th);const sc=qm[0]*kn[0]+qm[1]*kn[1];
+  let g=`<defs>${[["q","var(--q)"],["k","var(--k)"]].map(([nm,c])=>`<marker id="rp-ah-${nm}" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="${c}"/></marker>`).join("")}</defs>`;
+  g+=`<line x1="120" y1="${O.y}" x2="520" y2="${O.y}" stroke="var(--rule)"/><line x1="${O.x}" y1="15" x2="${O.x}" y2="345" stroke="var(--rule)"/><circle cx="${O.x}" cy="${O.y}" r="${S}" fill="none" stroke="var(--rule)" stroke-dasharray="3 5"/>`;
+  g+=arrow(q,"var(--q)","q",2,0.3)+arrow(k,"var(--k)","k",2,0.3);
+  /* arc between rotated vectors */
+  const a1=Math.atan2(qm[1],qm[0]),a2=Math.atan2(kn[1],kn[0]);let da=a2-a1;while(da>Math.PI)da-=2*Math.PI;while(da<-Math.PI)da+=2*Math.PI;
+  const r0=50,pa=[O.x+r0*Math.cos(a1),O.y-r0*Math.sin(a1)],pb=[O.x+r0*Math.cos(a1+da),O.y-r0*Math.sin(a1+da)];
+  g+=`<path d="M${pa[0].toFixed(1)} ${pa[1].toFixed(1)} A${r0} ${r0} 0 0 ${da>0?0:1} ${pb[0].toFixed(1)} ${pb[1].toFixed(1)}" fill="none" stroke="var(--tc)" stroke-width="2.5"/>`;
+  g+=arrow(qm,"var(--q)","q",3.5,1)+arrow(kn,"var(--k)","k",3.5,1);
+  const pq=P(qm),pk=P(kn);
+  g+=`<text x="${(pq[0]+(qm[0]>=0?8:-8)).toFixed(1)}" y="${(pq[1]-8).toFixed(1)}" text-anchor="${qm[0]>=0?"start":"end"}" class="svgt" font-size="15" font-weight="700" fill="var(--q)" stroke="var(--card)" stroke-width="4" paint-order="stroke">q at m=${m}</text>`;
+  g+=`<text x="${(pk[0]+(kn[0]>=0?8:-8)).toFixed(1)}" y="${(pk[1]+18).toFixed(1)}" text-anchor="${kn[0]>=0?"start":"end"}" class="svgt" font-size="15" font-weight="700" fill="var(--k)" stroke="var(--card)" stroke-width="4" paint-order="stroke">k at n=${n}</text>`;
+  g+=`<g class="svgs" font-size="12"><text x="16" y="24">faint: q, k before rotation</text><text x="16" y="42">arc: angle between rotated arrows</text></g>`;
+  svg.innerHTML=g;
+  info.dataset.score=f3(sc);info.dataset.delta=String(m-n);
+  info.innerHTML=`q rotated by m·θ = ${m}×${th.toFixed(2)} = ${(m*th).toFixed(2)} rad; k rotated by n·θ = ${(n*th).toFixed(2)} rad. Distance m − n = <b>${String(m-n).replace("-","−")}</b>.<br>Angle from q<sub>m</sub> to k<sub>n</sub>: ${f2(da*180/Math.PI)}°. Score q<sub>m</sub>ᵀk<sub>n</sub> = <b>${f3(sc)}</b> (unrotated q·k = 0.690).`;}
+ [sm,sn,st].forEach(s=>s.addEventListener("input",draw));
+ $("#rp-rot-shift").addEventListener("click",()=>{if(+sm.value+3>20||+sn.value+3>20){const d=Math.min(+sm.value,+sn.value);sm.value=+sm.value-d;sn.value=+sn.value-d;}else{sm.value=+sm.value+3;sn.value=+sn.value+3;}draw();});
+ $("#rp-rot-reset").addEventListener("click",()=>{sm.value=5;sn.value=2;st.value=0.4;draw();});
+ draw();
+})();
+
+/* ---------- Figure 2: wavelengths ---------- */
+(function(){
+ const svg=$("#rp-wave-svg");if(!svg)return;const seg=$("#rp-wave-b"),sl=$("#rp-wave-L"),out=$("#rp-wave-Lv"),info=$("#rp-wave-info");
+ const d=128,H=d/2;const X0=58,X1=625,Y0=20,Y1=290;const ymin=0,ymax=7;
+ const Y=v=>Y1-(Math.log10(v)-ymin)/(ymax-ymin)*(Y1-Y0);
+ function draw(){const b=+segVal(seg),Lp=+sl.value,L=Math.pow(2,Lp);out.value=Lp;
+  const lam=[];for(let i=0;i<H;i++)lam.push(2*Math.PI*Math.pow(b,2*i/d));
+  const bw=(X1-X0)/H;let g="";
+  for(let e=ymin;e<=ymax;e++){const y=Y(Math.pow(10,e));g+=`<line x1="${X0}" y1="${y.toFixed(1)}" x2="${X1}" y2="${y.toFixed(1)}" stroke="var(--rule)" stroke-width="0.6"/><text x="${X0-6}" y="${(y+4).toFixed(1)}" text-anchor="end" class="svgs" font-size="11">10<tspan dy="-5" font-size="9">${e}</tspan></text>`;}
+  let orange=0;
+  lam.forEach((v,i)=>{const long=v>L;if(long)orange++;const y=Y(v);g+=`<rect x="${(X0+i*bw+1).toFixed(1)}" y="${y.toFixed(1)}" width="${(bw-2).toFixed(1)}" height="${(Y1-y).toFixed(1)}" fill="${long?"var(--k)":"var(--q)"}" opacity="${long?0.95:0.7}"><title>pair ${i}: ${comma(v)} tokens</title></rect>`;});
+  const yl=Y(L);g+=`<line x1="${X0}" y1="${yl.toFixed(1)}" x2="${X1}" y2="${yl.toFixed(1)}" stroke="var(--ink)" stroke-width="2" stroke-dasharray="6 4"/><text x="${X0+6}" y="${(yl-6).toFixed(1)}" class="svgt" font-size="13" font-weight="700" fill="var(--ink)" stroke="var(--card)" stroke-width="4" paint-order="stroke">L = ${comma(L)}</text>`;
+  g+=`<line x1="${X0}" y1="${Y1}" x2="${X1}" y2="${Y1}" stroke="var(--muted)"/>`;
+  [0,16,32,48,63].forEach(i=>{g+=`<text x="${(X0+i*bw+bw/2).toFixed(1)}" y="${Y1+16}" text-anchor="middle" class="svgs" font-size="11">${i}</text>`;});
+  g+=`<text x="${(X0+X1)/2}" y="${Y1+32}" text-anchor="middle" class="svgs" font-size="12">pair index i (fast → slow)</text><text x="14" y="${(Y0+Y1)/2}" transform="rotate(-90 14 ${(Y0+Y1)/2})" text-anchor="middle" class="svgs" font-size="12">wavelength (tokens, log)</text>`;
+  svg.setAttribute("viewBox","0 0 640 330");svg.innerHTML=g;
+  info.dataset.orange=String(orange);info.dataset.longest=String(Math.round(lam[H-1]));
+  info.innerHTML=`Base b = ${comma(b)}, d = 128. Shortest wavelength: ${lam[0].toFixed(2)} tokens (pair 0). Longest: <b>${comma(lam[H-1])}</b> tokens (pair 63). Step factor b<sup>2/d</sup> = ${Math.pow(b,2/d).toFixed(3)}.<br>Training length L = 2<sup>${Lp}</sup> = ${comma(L)}: <b>${orange}</b> of 64 pairs never complete a full turn; ${H-orange} pairs turn at least once.`;}
+ segInit(seg,draw);sl.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: long-term decay ---------- */
+(function(){
+ const svg=$("#rp-decay-svg");if(!svg)return;const seg=$("#rp-decay-b"),sl=$("#rp-decay-D"),out=$("#rp-decay-Dv"),info=$("#rp-decay-info");
+ const d=128,DM=4000;const X0=55,X1=625,Y0=18,Y1=255;const ylo=-0.2,yhi=1;
+ const X=D=>X0+Math.sqrt(D/DM)*(X1-X0);const Y=v=>Y1-(v-ylo)/(yhi-ylo)*(Y1-Y0);
+ function draw(){const b=+segVal(seg),D=+sl.value;out.value=D;
+  let g="";[-0.2,0,0.2,0.4,0.6,0.8,1].forEach(v=>{const y=Y(v);g+=`<line x1="${X0}" y1="${y.toFixed(1)}" x2="${X1}" y2="${y.toFixed(1)}" stroke="var(--rule)" stroke-width="${v===0?1.2:0.6}"/><text x="${X0-6}" y="${(y+4).toFixed(1)}" text-anchor="end" class="svgs" font-size="11">${v.toFixed(1).replace("-","−")}</text>`;});
+  [0,10,100,500,1000,2000,4000].forEach(t=>{const x=X(t);g+=`<line x1="${x.toFixed(1)}" y1="${Y1}" x2="${x.toFixed(1)}" y2="${Y1+5}" stroke="var(--muted)"/><text x="${x.toFixed(1)}" y="${Y1+18}" text-anchor="middle" class="svgs" font-size="11">${comma(t)}</text>`;});
+  g+=`<text x="${(X0+X1)/2}" y="${Y1+36}" text-anchor="middle" class="svgs" font-size="12">distance Δ = m − n (square-root scale)</text>`;
+  const pts=[];const N=500;for(let j=0;j<=N;j++){const t=DM*Math.pow(j/N,2);pts.push([X(t),Y(avgcos(t,b,d))]);}
+  g+=`<polyline points="${pts.map(p=>p[0].toFixed(1)+","+p[1].toFixed(1)).join(" ")}" fill="none" stroke="var(--q)" stroke-width="2"/>`;
+  const s=avgcos(D,b,d);g+=`<circle cx="${X(D).toFixed(1)}" cy="${Y(s).toFixed(1)}" r="6" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;
+  svg.innerHTML=g;
+  info.dataset.s=f3(s);
+  info.innerHTML=`b = ${comma(b)}, d = 128. s(${comma(D)}) = <b>${f3(s)}</b>. Reference points: s(10) = ${f3(avgcos(10,b,d))}, s(100) = ${f3(avgcos(100,b,d))}, s(1,000) = ${f3(avgcos(1000,b,d))}, s(4,000) = ${f3(avgcos(4000,b,d))}.`;}
+ segInit(seg,draw);sl.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 4: 2D RoPE vs raster 1D ---------- */
+(function(){
+ const grid=$("#rp-2d-grid");if(!grid)return;const seg=$("#rp-2d-mode"),info=$("#rp-2d-info");
+ const G=8,d=32,b=100;let qh=3,qw=3;
+ grid.style.gridTemplateColumns=`repeat(${G},1fr)`;
+ let html="";for(let h=0;h<G;h++)for(let w=0;w<G;w++)html+=`<button type="button" data-h="${h}" data-w="${w}" aria-label="patch row ${h}, column ${w}"></button>`;grid.innerHTML=html;
+ const sc=(mode,dh,dw)=>mode==="2d"?0.5*(avgcos(dh,b,d/2)+avgcos(dw,b,d/2)):avgcos(dh*G+dw,b,d);
+ function col(v){const p=Math.round(Math.pow(Math.min(1,Math.abs(v)),2)*100);return v>=0?`color-mix(in srgb,var(--q) ${p}%,var(--paper2))`:`color-mix(in srgb,var(--k) ${p}%,var(--paper2))`;}
+ function draw(){const mode=segVal(seg);
+  grid.querySelectorAll("button").forEach(bt=>{const h=+bt.dataset.h,w=+bt.dataset.w;const v=sc(mode,h-qh,w-qw);bt.style.background=col(v);bt.title=`(${h}, ${w}): ${f3(v)}`;const isq=h===qh&&w===qw;bt.classList.toggle("sel",isq);bt.textContent=isq?"Q":"";bt.style.color=isq?"var(--card)":"";});
+  const right=qw+1<G?sc(mode,0,1):null,below=qh+1<G?sc(mode,1,0):null;
+  info.dataset.right=right===null?"none":f3(right);info.dataset.below=below===null?"none":f3(below);
+  const nextRow=(qw===G-1&&qh+1<G)?`<br>This query ends a row. In raster order the first patch of the next row is distance 1: score ${f3(sc("1d",1,-(G-1)))} in 1D mode vs ${f3(sc("2d",1,-(G-1)))} in 2D mode.`:"";
+  info.innerHTML=`${mode==="2d"?"2D RoPE: 8 pairs see the row, 8 pairs see the column.":"1D RoPE on raster index m = 8·h + w (16 pairs)."} Query patch (row ${qh}, column ${qw}).<br>Score to the patch on the right: <b>${right===null?"none":f3(right)}</b>; to the patch below: <b>${below===null?"none":f3(below)}</b>.${nextRow}`;}
+ grid.addEventListener("click",e=>{const bt=e.target.closest("button");if(!bt)return;qh=+bt.dataset.h;qw=+bt.dataset.w;draw();});
+ segInit(seg,draw);draw();
+})();
+
+/* ---------- Figure 5: M-RoPE position IDs ---------- */
+(function(){
+ const seq=$("#rp-mrope-seq");if(!seq)return;const info=$("#rp-mrope-info");
+ const parts=[{k:"text",w:["Describe","<|vision_start|>"]},{k:"img",F:1,H:2,W:3},{k:"text",w:["<|vision_end|>","and","<|vision_start|>"]},{k:"vid",F:3,H:2,W:2},{k:"text",w:["<|vision_end|>","?"]}];
+ const toks=[];let s=0,mx=-1;
+ parts.forEach((p,pi)=>{const st=s;
+  if(p.k==="text"){p.w.forEach((w,j)=>{toks.push({p:pi,cls:"txt",w,id:[s+j,s+j,s+j]});});s+=p.w.length;mx=s-1;}
+  else{for(let f=0;f<p.F;f++)for(let r=0;r<p.H;r++)for(let c=0;c<p.W;c++){toks.push({p:pi,cls:p.k,w:p.k==="img"?`img r${r} c${c}`:`frame ${f} r${r} c${c}`,id:[st+f,st+r,st+c]});}
+   toks.forEach(t=>{if(t.p===pi)mx=Math.max(mx,...t.id);});s=mx+1;}
+  p.start=st;p.maxAfter=mx;p.count=toks.length;});
+ seq.innerHTML=toks.map((t,i)=>`<div class="rp-cell ${t.cls}" data-i="${i}"><span class="w">${B.esc(t.w)}</span>${t.id.join(",")}</div>`).join("");
+ const cells=[...seq.querySelectorAll(".rp-cell")];
+ const desc=["Text tokens: the three IDs are equal, (m, m, m), so M-RoPE acts like 1D RoPE.","Image of 2×3 tokens starts at s = 2: t stays 2, h runs over rows 2 to 3, w over columns 2 to 4.","Text starts at 1 + max ID = 5, not at the token count 8.","Video of 3 frame steps × 2×2 tokens starts at s = 8: t runs 8 to 10, h and w run 8 to 9.","Final text starts at 1 + max ID = 11."];
+ const st=B.stepper({n:parts.length,prev:$("#rp-mrope-prev"),next:$("#rp-mrope-next"),play:$("#rp-mrope-play"),label:$("#rp-mrope-lab"),ms:2400,onStep:i=>{
+  cells.forEach((c,j)=>{const t=toks[j];c.classList.toggle("off",t.p>i);c.classList.toggle("cur",t.p===i);});
+  const p=parts[i];info.dataset.maxid=String(p.maxAfter);info.dataset.n=String(p.count);
+  const first=toks.find(t=>t.p===i),last=[...toks].reverse().find(t=>t.p===i);
+  info.innerHTML=`${desc[i]}<br>This part: first IDs (${first.id.join(", ")}), last IDs (${last.id.join(", ")}).<br>Tokens so far: <b>${p.count}</b>. Largest position ID so far: <b>${p.maxAfter}</b>.`;}});
+})();
+})();
+</script></body></html>

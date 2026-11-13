@@ -1,0 +1,388 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Gradient accumulation and gradient checkpointing · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 39</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="gradient-accumulation-and-gradient-checkpointing">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="gradient-accumulation-and-gradient-checkpointing" data-session="gradient-accumulation-and-gradient-checkpointing" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">39</span><span>Track 3: Pretraining and scale · session 9 of 22</span></div><h1 class="chap-title">Gradient accumulation and gradient checkpointing</h1><p class="chap-sub">Two tricks let you train with a batch, or a model, that does not fit in GPU memory. Gradient accumulation runs many small batches and takes one optimizer step, so you get a large batch with the memory of a small one. Gradient checkpointing throws most activations away in the forward pass and recomputes them in the backward pass, so you trade about one extra forward pass for a large cut in activation memory.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 1.5 to 2 hours, exercises 1 to 1.5 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 4, 25 and 38 (backprop and AdamW, counting FLOPs and memory, memory math for training)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why gradient accumulation gives the same gradient as one big batch, and how to compute the effective batch size in sequences and in tokens</li><li>How to scale the loss across micro-batches, and the token-count trap that silently changed the gradients of many fine-tuning runs in 2024</li><li>Where accumulation is not exactly the same as a big batch: normalization over the batch, data-parallel synchronization, numerics</li><li>Gradient (activation) checkpointing: keep only the block inputs, recompute the rest in the backward pass</li><li>The memory and compute trade-off: the square-root rule of Chen et al., and why one checkpoint per transformer block is usually best</li><li>Selective recomputation (Korthikanti et al.): recompute only the attention core, for a few percent of extra compute</li><li>How to use both in PyTorch and Hugging Face, and how to check that the gradients did not change</li></ul></div></header><style>
+.ga-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.ga-grid input[type=range]{width:100%}
+.ga-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.ga-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c);border:1.5px solid var(--b,transparent)}
+.ga-mb{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:10px;margin:6px 0 10px}
+@media(max-width:620px){.ga-mb{grid-template-columns:repeat(2,minmax(0,1fr))}}
+.ga-mb .c{background:var(--paper2);border-radius:10px;padding:8px 10px;font:500 14px var(--sans)}
+.ga-mb .c b{font-family:var(--mono)}
+.ga-mb input[type=range]{width:100%}
+pre.code,code{font-variant-ligatures:none}
+[data-session="gradient-accumulation-and-gradient-checkpointing"] code{overflow-wrap:anywhere}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../pretraining/index.html#row-memory-math-for-training" title="Memory math for training (planned)">session 38</a> we added up the bytes of one training step and saw that they often do not fit. Two parts of the bill grow with the work you do: the activations grow with the batch size and with the sequence length. This session gives you the two standard tools that attack exactly that part, without buying more GPUs.</p>
+<p><b>Gradient accumulation</b> solves the batch problem. The recipe says “4 million tokens per step”, but your GPU can hold the activations of only 8,192 tokens. So you run many small batches, add up their gradients, and take one optimizer step at the end. <b>Gradient checkpointing</b> (also called <b>activation checkpointing</b> or <b>activation recomputation</b>) solves the depth and length problem. It keeps only a few activations during the forward pass and recomputes the others when the backward pass needs them. You pay with extra compute, about one more forward pass.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “Is gradient accumulation exactly the same as a bigger batch?”, “How do you scale the loss?”, “What does gradient checkpointing cost, in memory and in time?”, “What is selective recomputation?”. Each one has a short, exact answer below.</aside>
+<p>Both tools are everywhere. Llama 2 was trained with a global batch of about 4 million tokens per step [Certain], far more than one GPU can hold, so the batch is split across GPUs and, when needed, across accumulation steps. Hugging Face <code>Trainer</code> has the flags <code>gradient_accumulation_steps</code> and <code>gradient_checkpointing</code>; Megatron-LM, DeepSpeed and PyTorch FSDP all support both. [Certain] And a small mistake in the first one, the <b>token-count trap</b>, changed the gradients of many fine-tuning runs until it was found and fixed in October 2024. [Certain]</p>
+
+<h2>Gradient accumulation: one big batch, in pieces</h2>
+<p>Recall from <a href="../foundations/optimization-backprop-adamw.html">session 4</a> that the mini-batch gradient is an average of per-example gradients. A <b>micro-batch</b> is the batch that actually goes through the GPU in one forward and backward pass. The <b>global batch</b> (or <b>effective batch</b>) is the set of examples that together produce one optimizer step. Accumulation makes the global batch \(K\) times larger than the micro-batch:</p>
+<ol><li>Run forward and backward on micro-batch 1. PyTorch <b>adds</b> the new gradient into each parameter’s <code>.grad</code> buffer.</li>
+<li>Do the same for micro-batches 2, 3, …, \(K\). Do not call <code>optimizer.step()</code> and do not zero the gradients in between.</li>
+<li>After micro-batch \(K\): clip, call <code>optimizer.step()</code>, then <code>zero_grad()</code>.</li></ol>
+<aside class="note analogy side"><span class="nt">Analogy</span>You want the average height of 1,000 people, but your room holds only 100. You measure ten groups of 100, write down each group’s total, and divide the sum of the totals by 1,000 at the end. You never needed a room for 1,000 people. The answer is the same.</aside>
+<p>With data parallelism on \(N_{\text{dp}}\) GPUs (<a href="../pretraining/index.html#row-data-parallelism-ddp" title="Data parallelism (DDP) (planned)">session 44</a>), each GPU processes its own micro-batches and the gradients are averaged across GPUs before the step. So the effective batch is:</p>
+<div class="eq">\[ B_{\text{eff}} = b \cdot K \cdot N_{\text{dp}} \ \text{sequences}, \qquad T_{\text{eff}} = b \cdot K \cdot N_{\text{dp}} \cdot s \ \text{tokens} \tag{39.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(b\)</dt><dd>micro-batch size: sequences per forward pass on one GPU</dd>
+<dt>\(K\)</dt><dd>number of accumulation steps (micro-batches per optimizer step)</dd>
+<dt>\(N_{\text{dp}}\)</dt><dd>number of data-parallel copies of the model (often the number of GPUs)</dd>
+<dt>\(s\)</dt><dd>sequence length in tokens (for packed sequences, every token is real)</dd></dl>
+<p>Only \(b\) and \(s\) decide the activation memory on one GPU. \(K\) and \(N_{\text{dp}}\) change the batch the optimizer sees, not the memory. That is the whole point.</p>
+<div class="worked"><div class="wt">Worked example: a 4-million-token batch on 64 GPUs</div>
+<p>Take the Llama 2 setting: sequences of \(s = 4{,}096\) tokens and about 4 million tokens per step. \(4{,}194{,}304 / 4{,}096 = 1{,}024\) sequences per step. Say you have 64 GPUs and each one fits a micro-batch of \(b = 2\) sequences. Then one round of all GPUs covers \(2 \times 64 = 128\) sequences, so you need \(K = 1{,}024 / 128 = 8\) accumulation steps. With 128 GPUs you would need \(K = 4\); with 512 GPUs and \(b = 2\), no accumulation at all.</p></div>
+
+<h3>Why the gradient is exactly the same</h3>
+<p>The gradient is a linear operation: the gradient of a sum is the sum of the gradients. Split a batch of \(B\) examples into \(K\) micro-batches \(\mathcal{B}_1, \dots, \mathcal{B}_K\) of equal size \(B/K\). Then</p>
+<div class="eq">\[ \nabla_\theta \frac{1}{B}\sum_{i=1}^{B} \ell_i \;=\; \sum_{k=1}^{K} \nabla_\theta \Big( \frac{1}{K} \cdot \underbrace{\frac{K}{B} \sum_{i \in \mathcal{B}_k} \ell_i}_{\text{mean loss of micro-batch } k} \Big) \tag{39.2} \]</div>
+<p>In words: if each micro-batch computes its <b>mean</b> loss, divide it by \(K\) before <code>backward()</code>. The <code>.grad</code> buffers then hold exactly the full-batch gradient after \(K\) micro-batches. Forget the \(1/K\) and the gradient is \(K\) times too large. With Adam this is partly hidden (Adam divides by \(\sqrt{\hat v}\), which also grows), but gradient clipping, the \(\varepsilon\) term and weight decay all see a different scale, so the run is not the run you designed.</p>
+<p>Figure 1 shows the gradient buffer of a tiny linear model filling up, micro-batch by micro-batch.</p>
+<figure class="fig" id="ga-acc"><div class="fig-body">
+<div class="controls"><span class="seg" id="ga-acc-k"><button type="button" data-v="1" aria-pressed="false">K = 1</button><button type="button" data-v="2" aria-pressed="false">K = 2</button><button type="button" data-v="4" aria-pressed="true">K = 4</button><button type="button" data-v="8" aria-pressed="false">K = 8</button></span>
+<label class="sl"><input type="checkbox" id="ga-acc-div" checked> divide each loss by K</label></div>
+<div class="controls"><button type="button" class="btn" id="ga-acc-prev">Back</button><button type="button" class="btn primary" id="ga-acc-play">Play</button><button type="button" class="btn" id="ga-acc-next">Next</button><span id="ga-acc-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<svg id="ga-acc-svg" viewBox="0 0 640 270" role="img" aria-label="Bars of a six-component gradient buffer filling up over K micro-batches, compared with the full-batch gradient"></svg>
+<div class="ga-leg"><span style="--c:var(--q)">.grad buffer now</span><span style="--c:transparent;--b:var(--tc)">full-batch gradient (target)</span><span style="--c:var(--k)">contribution of the latest micro-batch</span></div>
+<div class="readout" id="ga-acc-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Gradient accumulation on a linear model with 6 weights and a batch of 32 examples (seeded data). Each step runs one micro-batch of \(32/K\) examples and adds its gradient into the buffer. After \(K\) steps the buffer equals the full-batch gradient, up to rounding.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>The outlined boxes are the gradient of one big batch of 32. The blue bars are what <code>.grad</code> holds now. Press Next: each micro-batch adds its orange piece. After the last one, the readout shows the largest difference to the target: about \(10^{-16}\), which is floating-point rounding. Now untick “divide each loss by K” and step again: the final buffer is exactly \(K\) times the target. Try \(K = 8\): the bars overshoot by 8×.</p></details></figure>
+
+<h3>What accumulation does not give you for free</h3>
+<p>Formula (39.2) holds when the loss is a plain sum or average over examples. Three things can break it:</p>
+<ul>
+<li><b>Normalization over the batch.</b> BatchNorm computes a mean and variance over the micro-batch, so 8 micro-batches of 4 are not one batch of 32. Transformers use LayerNorm or RMSNorm, which work per token, so LLMs are safe. [Certain] Vision backbones with BatchNorm are not.</li>
+<li><b>Losses that compare examples inside the batch.</b> A contrastive loss like CLIP’s (<a href="../vision/index.html#row-clip-learning-images-and-text-together" title="CLIP: learning images and text together (planned)">session 166</a>) scores every image against every text in the batch. Accumulation does not give you more negatives; you need tricks such as gradient caching instead. [Certain]</li>
+<li><b>Different numbers of tokens per micro-batch.</b> This is the most common one in LLM work, and it gets its own section next.</li></ul>
+<p>Small differences also come from rounding (sums in a different order), from dropout masks (different random numbers), and from the data order. These are noise, not bias. [Certain]</p>
+
+<h2>Scaling the loss: the token-count trap</h2>
+<p>For language models the loss is an average over <b>tokens</b>, not over sequences. When the sequences are padded, only the real (non-padding) tokens count: their labels are real token ids, and the padding positions get the label −100, which <code>cross_entropy</code> ignores. The correct loss for one optimizer step is the sum over all real tokens in all \(K\) micro-batches, divided by their total number:</p>
+<div class="eq">\[ \mathcal{L}_{\text{step}} = \frac{1}{N_{\text{tot}}} \sum_{k=1}^{K} \sum_{t \in \mathcal{B}_k} \ell_t, \qquad N_{\text{tot}} = \sum_{k=1}^{K} n_k \tag{39.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\ell_t\)</dt><dd>the cross-entropy of one real token \(t\)</dd>
+<dt>\(n_k\)</dt><dd>the number of real tokens in micro-batch \(k\)</dd>
+<dt>\(N_{\text{tot}}\)</dt><dd>the number of real tokens in the whole optimizer step (on all GPUs)</dd></dl>
+<p>The natural code does something else. Each micro-batch calls <code>cross_entropy(..., reduction="mean")</code>, which divides by its own \(n_k\), and then the result is divided by \(K\):</p>
+<div class="eq">\[ \mathcal{L}_{\text{naive}} = \frac{1}{K} \sum_{k=1}^{K} \frac{1}{n_k} \sum_{t \in \mathcal{B}_k} \ell_t \quad\Rightarrow\quad \text{weight of one token in } \mathcal{B}_k = \frac{1}{K\, n_k} \tag{39.4} \]</div>
+<p>In the correct loss every token has weight \(1/N_{\text{tot}}\). In the naive loss, a token in a short micro-batch counts much more than a token in a long one. The two agree only when all \(n_k\) are equal, which is true for packed pretraining data and false for padded fine-tuning data with sequences of very different lengths.</p>
+<div class="worked"><div class="wt">Worked example: one long and one short micro-batch</div>
+<p>Micro-batch A has 1,000 real tokens with mean loss 2.0. Micro-batch B has 10 real tokens with mean loss 5.0. The naive loss is \((2.0 + 5.0)/2 = 3.5\). The correct loss is \((1{,}000 \times 2.0 + 10 \times 5.0)/1{,}010 = 2{,}050/1{,}010 = 2.030\). The 10 tokens of B have half of the total weight in the naive loss (0.5) instead of \(10/1{,}010 = 0.0099\): each of them counts \(0.5/0.0099 = 50.5\) times too much. The gradient follows the same wrong weights.</p></div>
+<p>This is exactly the bug that Hugging Face described in its blog post “Fixing Gradient Accumulation” (October 16, 2024): the Trainer averaged the loss per micro-batch, so training with accumulation gave different (higher) losses than the same batch without it. The fix: compute the loss with <code>reduction="sum"</code> and divide by the number of real tokens in the whole accumulation step. [Certain] Explore it in Figure 2.</p>
+<figure class="fig" id="ga-trap"><div class="fig-body">
+<div class="ga-mb" id="ga-trap-mb"></div>
+<svg id="ga-trap-svg" viewBox="0 0 640 230" role="img" aria-label="Weight of one token in each micro-batch under the naive and the correct loss"></svg>
+<div class="ga-leg"><span style="--c:var(--k)">naive: weight of one token = 1/(K·n<sub>k</sub>)</span><span style="--c:var(--q)">correct: 1/N<sub>tot</sub> for every token</span></div>
+<div class="readout" id="ga-trap-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Four micro-batches (\(K = 4\)) with fixed mean losses 2.0, 2.5, 3.0 and 4.5 per token. Change how many real tokens each one has. The bars show the weight that one token of each micro-batch gets in the loss (log scale). The readout compares the two losses.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With the default counts (500, 480, 60 and 8 tokens), the naive loss is 3.000 and the correct one is 2.305. The 8 tokens of micro-batch 4 have high loss and get 32.75 times their fair weight, so they pull the naive loss up. Now set all four counts equal: the two bars of each micro-batch become the same height and the two losses agree. That is why packed pretraining (every micro-batch full) does not suffer from the trap, while padded instruction tuning does.</p></details></figure>
+<h3>The same trap across GPUs</h3>
+<p>Data parallelism averages the gradients over the \(N_{\text{dp}}\) GPUs. If every GPU divides by its own token count, you get the same mean-of-means error, now across GPUs. The fix: before the backward passes, all-reduce (sum) the real-token count over all micro-batches and all GPUs to get \(N_{\text{tot}}\). Each GPU then uses \(\text{sum of its token losses} \times N_{\text{dp}} / N_{\text{tot}}\); the factor \(N_{\text{dp}}\) cancels the averaging that DDP does. [Certain for the arithmetic]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Logging is affected too. If you log the average of the \(K\) micro-batch means, your loss curve is the naive loss even when your gradient is correct. Log \(\sum \ell_t / N_{\text{tot}}\).</aside>
+
+<h3>The cost of accumulation</h3>
+<p>Accumulation adds no FLOPs: \(K\) micro-batches of size \(b\) cost the same as one batch of size \(Kb\) would. It costs <b>time</b> in another way: the \(K\) micro-batches run one after another, so the step takes \(K\) times longer, and small micro-batches can use the GPU less efficiently than large ones. With data parallelism, you should not all-reduce the gradients after every micro-batch, only after the last one. DDP’s <code>no_sync()</code> context manager skips the communication for the first \(K - 1\) micro-batches. [Certain] With ZeRO-2/3 or FSDP the gradients are sharded, so frameworks usually reduce after every micro-batch anyway, or keep an extra unsharded buffer. [Likely] Gradients are often accumulated in FP32 even when the backward pass runs in BF16, because adding many small BF16 numbers loses precision (<a href="../pretraining/index.html#row-numbers-on-gpus-fp32-tf32-fp16-bf16" title="Numbers on GPUs: FP32, TF32, FP16, BF16, FP8 and mixed precision (planned)">session 37</a>). [Likely]</p>
+<div class="algo"><div class="algo-h">Algorithm 1: one optimizer step with gradient accumulation (token-correct)</div><ol>
+<li><b>input:</b> micro-batches \(\mathcal{B}_1, \dots, \mathcal{B}_K\) on each of \(N_{\text{dp}}\) GPUs, optimizer, clip value \(c\)</li>
+<li>\(N_{\text{tot}} \leftarrow \text{all\_reduce\_sum}\big(\sum_k n_k\big)\) <span class="c">// real tokens in the whole step, all GPUs</span></li>
+<li><b>for</b> \(k = 1, \dots, K\) <b>do</b></li>
+<li class="i1">\(S_k \leftarrow \sum_{t \in \mathcal{B}_k} \ell_t\) <span class="c">// forward, cross-entropy with reduction = sum</span></li>
+<li class="i1">backward of \(S_k \cdot N_{\text{dp}} / N_{\text{tot}}\), with gradient sync only if \(k = K\) <span class="c">// .grad adds up; formula (39.3)</span></li>
+<li><b>end for</b></li>
+<li>clip the global gradient norm to \(c\); <code>optimizer.step()</code>; <code>scheduler.step()</code>; zero the gradients</li>
+<li>log \(\sum_k S_k / N_{\text{tot}}\) (summed over GPUs) as the step loss</li></ol></div>
+
+<h2>Gradient checkpointing: forget now, recompute later</h2>
+<p>Backpropagation needs values from the forward pass. For \(Y = XW\), the weight gradient is \(X^\top G\), so \(X\) must still be in memory when the backward pass reaches this layer (<a href="../foundations/optimization-backprop-adamw.html">session 4</a>, formula 4.4). Normally PyTorch saves every such tensor during the forward pass and frees it during the backward pass. The peak, just before the backward pass starts, holds the saved tensors of <b>every</b> layer. For a GPT-style block, Korthikanti et al. count them:</p>
+<div class="eq">\[ M_{\text{layer}} = s\,b\,d \left( 34 + \frac{5\,h\,s}{d} \right) \ \text{bytes (16-bit activations)} \tag{39.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(s, b, d, h\)</dt><dd>sequence length, micro-batch size, model width, number of attention heads</dd>
+<dt>\(34\,sbd\)</dt><dd>inputs of the linear layers, norms, GELU and dropout masks</dd>
+<dt>\(5\,h s^2 b\)</dt><dd>the attention scores, softmax output and its dropout mask: the part that grows with \(s^2\)</dd></dl>
+<p>(This is formula 25.13 of <a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a>, written for one layer.) <b>Gradient checkpointing</b> keeps only a few tensors, the <b>checkpoints</b>, and drops the rest. In the backward pass, when a dropped tensor is needed, it runs the forward pass of that part again, starting from the nearest checkpoint. The usual choice for transformers is one checkpoint per block: keep only the block input, a tensor of \(s \times b \times d\) numbers (\(2sbd\) bytes in BF16).</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>You hike a long trail and must later walk back the same way, reading every signpost in reverse order. You could photograph every signpost (a lot of storage). Or you photograph only one signpost per kilometer, and on the way back you walk each kilometer forward again from its photo to see the signposts in between. Less storage, more walking.</aside>
+<p>With one checkpoint per block, the peak memory is the \(L\) stored block inputs plus the full activations of the one block that is being recomputed:</p>
+<div class="eq">\[ M_{\text{full ckpt}} \approx 2\,s\,b\,d\,L \;+\; M_{\text{layer}} \tag{39.6} \]</div>
+<p>Korthikanti et al. write the first term, \(2sbdL\), as the memory of “full activation recomputation”. [Certain] The second term is the working space of one block, which we add because it is also in memory at the peak.</p>
+<div class="worked"><div class="wt">Worked example: a 7B-sized model at 4,096 tokens</div>
+<p>Take \(L = 32\), \(d = 4{,}096\), \(h = 32\), \(s = 4{,}096\), \(b = 1\) (the shape of Llama 2 7B and Llama 3 8B, with the GPT-style constant 34 as an approximation). Here \(sbd = 16{,}777{,}216\).</p>
+<p>No checkpointing: \(16{,}777{,}216 \times (34 + 5 \times 32) = 3.25\) GB per layer, 104.2 GB for 32 layers. Not storing the score matrices (FlashAttention, or selective recomputation): \(16{,}777{,}216 \times 34 = 0.57\) GB per layer, 18.3 GB in total. One checkpoint per block: \(2 \times 16{,}777{,}216 \times 32 = 1.07\) GB of block inputs, plus 0.57 GB for the block being recomputed: 1.64 GB. That is 63 times less than no checkpointing, and 11 times less than FlashAttention alone.</p></div>
+<p>Figure 3 runs the whole schedule on a small network of 8 layers, so you can watch memory rise and fall.</p>
+<figure class="fig wide" id="ga-ck"><div class="fig-body">
+<div class="controls"><span class="seg" id="ga-ck-c"><button type="button" data-v="0" aria-pressed="false">No checkpointing</button><button type="button" data-v="1" aria-pressed="true">Every layer</button><button type="button" data-v="2" aria-pressed="false">Every 2 layers</button><button type="button" data-v="4" aria-pressed="false">Every 4 layers</button></span></div>
+<div class="controls"><span class="seg" id="ga-ck-r"><button type="button" data-v="16" aria-pressed="true">Transformer block (inside = 16 × input)</button><button type="button" data-v="1" aria-pressed="false">Simple layer (inside = 1 × input)</button></span></div>
+<div class="ga-grid"><label for="ga-ck-t">Moment in the step</label><input type="range" id="ga-ck-t" min="0" max="10" step="1" value="0"><output id="ga-ck-tv"></output></div>
+<div class="scroll-x"><svg id="ga-ck-svg" viewBox="0 0 760 300" role="img" aria-label="Which activations are stored for each of 8 layers at the chosen moment, and memory over the whole step"></svg></div>
+<div class="ga-leg"><span style="--c:var(--q)">stored layer input (checkpoint or saved)</span><span style="--c:var(--k)">stored inside activations</span><span style="--c:var(--v)">memory over time</span></div>
+<div class="readout" id="ga-ck-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> One forward and backward pass through 8 layers. Each layer’s input is 1 unit of memory; its inside activations (what backprop needs besides the input) are 16 units for a transformer-like block or 1 unit for a simple layer. Move the slider through the step. The curve below is memory over time; the dot is the chosen moment.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Start with “No checkpointing”: memory climbs to 136 units at the end of the forward pass and falls during the backward pass. Click “Every layer”: the forward pass stores only 8 inputs; in the backward pass each layer is recomputed just before it is needed, so the peak is 24 units, and the count of layer forwards goes from 8 to 16. “Every 2 layers” and “Every 4 layers” store fewer checkpoints but must rebuild bigger segments: the peaks are 37 and 69. Now switch to “Simple layer”: every layer gives 9, every 2 layers gives 7, every 4 gives 9. When the inside of a layer is small, the best segment length is about \(\sqrt{8} \approx 2.8\); when the inside is large, checkpoint every layer.</p></details></figure>
+
+<h3>How many checkpoints? The square-root rule</h3>
+<p>Chen et al. (2016) asked how to place checkpoints in a chain of \(n\) layers. Put one checkpoint every \(c\) layers. Let \(I\) be the size of one checkpoint (a layer input) and \(A\) the full saved size of one layer. At the peak you hold \(n/c\) checkpoints and one rebuilt segment of \(c\) layers:</p>
+<div class="eq">\[ M(c) \approx \frac{n}{c}\, I + c\, A, \qquad c^{*} = \sqrt{\frac{n\, I}{A}}, \qquad M(c^{*}) = 2\sqrt{n\, I\, A} \tag{39.7} \]</div>
+<p>The first term falls with \(c\), the second grows; setting the derivative \(-nI/c^2 + A\) to zero gives \(c^*\). When \(I\) and \(A\) are similar (a chain of simple layers), \(c^* \approx \sqrt{n}\) and memory grows only as \(\sqrt{n}\) instead of \(n\). That is the result of Chen et al.: \(O(\sqrt{n})\) memory for the cost of one extra forward pass; they trained a 1,000-layer residual network with memory going from 48 GB to 7 GB, for about 30% more running time. [Certain]</p>
+<p>For a transformer block, the inside is much larger than the input. In units of \(sbd\) bytes with FlashAttention: \(I = 2\), \(A = 34\), \(n = 32\). Then \(c^* = \sqrt{32 \times 2 / 34} = 1.37\). Checking whole numbers: \(c = 1\) gives \(64 + 34 = 98\), \(c = 2\) gives \(32 + 68 = 100\), \(c = 4\) gives \(16 + 136 = 152\). So one checkpoint per block is the best choice, which is why every framework offers exactly that. [Certain for the arithmetic]</p>
+
+<h2>The cost: about one extra forward pass</h2>
+<p>Recomputation runs the forward pass of every checkpointed segment a second time. In FLOPs per token, training normally costs \(2N\) (forward) \(+ 4N\) (backward) \(= 6N\) (<a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a>). With full recomputation:</p>
+<div class="eq">\[ \underbrace{2N}_{\text{forward}} + \underbrace{2N}_{\text{recompute}} + \underbrace{4N}_{\text{backward}} = 8N, \qquad \frac{8N}{6N} = 1.33 \tag{39.8} \]</div>
+<p>So the GPU does about 33% more matrix work. The attention-score FLOPs scale the same way (forward, recompute, backward in the ratio 1 : 1 : 2), so the ratio stays at 4/3 for any sequence length. In measured time the overhead is usually 30–40%, the range Korthikanti et al. quote; they measured 36% per layer for their 530B and 1T models. [Certain] This is also why <b>MFU</b> falls with recomputation: the recomputed FLOPs are real work for the hardware but not “useful” model FLOPs (<a href="../pretraining/index.html#row-distributed-checkpoints-fault-tolerance-and-mfu" title="Distributed checkpoints, fault tolerance and MFU (planned)">session 51</a>).</p>
+
+<h3>Selective recomputation</h3>
+<p>Look again at formula (39.5). The \(5hs/d\) part (the attention scores and softmax) is most of the memory at long sequence lengths: 160 out of 194 units in the worked example, 82%. But it is cheap to recompute: the scores \(QK^\top\) and the product with \(V\) are a small share of the FLOPs when \(s\) is not much larger than \(d\). The linear layers are the reverse: little memory each, most of the FLOPs. Korthikanti et al. therefore recompute <b>only the attention core</b> (\(QK^\top\), softmax, softmax dropout, and the product with \(V\)) and store everything else. [Certain] This removes the \(5hs/d\) term and costs only the attention-score forward again, about \(4\,s\,d\) FLOPs per token per layer:</p>
+<div class="eq">\[ \frac{\text{FLOPs with selective}}{\text{FLOPs without}} = \frac{72\,d + 16\,s}{72\,d + 12\,s} \quad \text{(per token per layer, } 12d^2 \text{ weights per layer)} \tag{39.9} \]</div>
+<p>At \(s = d = 4{,}096\) this is \(88/84 = 1.048\), about 5% more FLOPs in this simple count. The paper reports 2.7% extra FLOPs for GPT-3 175B and 1.6% for the 530B model (their \(d\) is much larger than \(s\)), and, together with sequence parallelism, 29–32% higher throughput than full recomputation. [Certain]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>“FlashAttention already does selective recomputation.” True in effect: FlashAttention never stores the \(s \times s\) score matrix; its backward pass recomputes the scores block by block from \(Q\), \(K\) and the saved softmax statistics. [Certain] So with FlashAttention the \(5hs/d\) term is gone already, and the remaining choice is between storing the \(34\,sbd\) and full block checkpointing.</aside>
+<p>Figure 4 puts the formulas together for the 7B-sized shape. You pick the length, the micro-batch and the strategy; it gives the activation memory and the extra compute.</p>
+<figure class="fig" id="ga-cost"><div class="fig-body">
+<div class="ga-grid">
+<label for="ga-cost-s">Sequence length s</label><input type="range" id="ga-cost-s" min="9" max="15" step="1" value="12"><output id="ga-cost-sv"></output>
+<label for="ga-cost-b">Micro-batch b</label><input type="range" id="ga-cost-b" min="0" max="4" step="1" value="0"><output id="ga-cost-bv"></output></div>
+<svg id="ga-cost-svg" viewBox="0 0 640 250" role="img" aria-label="Activation memory and compute overhead of three recomputation strategies"></svg>
+<div class="readout" id="ga-cost-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Activation memory (bars, GB, formulas 39.5 and 39.6) and FLOPs relative to no recomputation (labels, formulas 39.8 and 39.9) for \(L = 32\), \(d = 4{,}096\), \(h = 32\). “Selective” stores everything except the attention core. “Full” stores one input per block. The dashed line is 80 GB, the size of one large GPU; the weights and optimizer states of <a href="../pretraining/index.html#row-memory-math-for-training" title="Memory math for training (planned)">session 38</a> come on top.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At \(s = 4{,}096\), \(b = 1\): 104 GB, 18.3 GB and 1.6 GB, with 1.00×, 1.05× and 1.33× the FLOPs. Push \(s\) to 32,768: without recomputation the score matrices need thousands of GB; selective recomputation brings it to 146 GB at 1.19× the FLOPs (the attention core is no longer cheap); full recomputation needs 13.2 GB. Raise \(b\) instead: every bar scales linearly with \(b\), and the FLOP ratios do not change. This is where accumulation and checkpointing meet: checkpointing lets you raise \(b\); accumulation lets you keep \(b\) small.</p></details></figure>
+
+<h2>Using both in practice</h2>
+<div class="algo"><div class="algo-h">Algorithm 2: a block-checkpointed forward and backward pass</div><ol>
+<li><b>input:</b> blocks \(f_1, \dots, f_L\), input \(x_0\)</li>
+<li><b>for</b> \(i = 1, \dots, L\) <b>do</b> <span class="c">// forward, no internal activations saved</span></li>
+<li class="i1">save \(x_{i-1}\) (and the random-number state, for dropout); \(x_i \leftarrow f_i(x_{i-1})\) without saving anything inside \(f_i\)</li>
+<li><b>end for</b>; compute the loss from \(x_L\) and its gradient \(g_L = \partial \mathcal{L} / \partial x_L\)</li>
+<li><b>for</b> \(i = L, \dots, 1\) <b>do</b> <span class="c">// backward</span></li>
+<li class="i1">restore the random-number state; recompute \(x_i = f_i(x_{i-1})\), this time saving the internal activations</li>
+<li class="i1">backprop through \(f_i\): \(g_{i-1} \leftarrow\) input gradient, add the weight gradients into <code>.grad</code></li>
+<li class="i1">free the internal activations of \(f_i\) and the checkpoint \(x_{i-1}\)</li>
+<li><b>end for</b></li></ol></div>
+<p>In PyTorch this is <code>torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)</code>. The non-reentrant version is the one PyTorch recommends, and by default it saves and restores the random-number state so that dropout makes the same mask both times (<code>preserve_rng_state=True</code>). [Certain] In Hugging Face Transformers, <code>model.gradient_checkpointing_enable()</code> wraps every decoder layer this way; the KV cache must be off during training (<code>use_cache=False</code>), and the library warns and turns it off for you. [Likely]</p>
+<p>The code below checks three claims on a tiny 6-layer model, on the CPU, in about a second: correct accumulation equals the big batch, the naive version does not, and checkpointing gives the same gradients with fewer saved activations. It measures saved activations with <code>saved_tensors_hooks</code>, which sees every tensor that autograd stores for the backward pass.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+<span class="kw2">from</span> torch.utils.checkpoint <span class="kw2">import</span> checkpoint
+torch.manual_seed(0)
+V, D, NL, T = 50, 64, 6, 16                     <span class="cm"># vocab, width, layers, max length</span>
+
+<span class="kw2">class</span> Block(nn.Module):                          <span class="cm"># pre-norm MLP block with a residual</span>
+    <span class="kw2">def</span> __init__(s):
+        super().__init__(); s.n = nn.LayerNorm(D)
+        s.f = nn.Sequential(nn.Linear(D, 4 * D), nn.GELU(), nn.Linear(4 * D, D))
+    <span class="kw2">def</span> forward(s, x): <span class="kw2">return</span> x + s.f(s.n(x))
+
+<span class="kw2">class</span> TinyLM(nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__(); s.emb = nn.Embedding(V, D)
+        s.blocks = nn.ModuleList(Block() <span class="kw2">for</span> _ <span class="kw2">in</span> range(NL)); s.out = nn.Linear(D, V)
+    <span class="kw2">def</span> forward(s, x, ckpt=False):
+        h = s.emb(x)
+        <span class="kw2">for</span> b <span class="kw2">in</span> s.blocks:                       <span class="cm"># checkpoint = keep only the block input</span>
+            h = checkpoint(b, h, use_reentrant=False) <span class="kw2">if</span> ckpt <span class="kw2">else</span> b(h)
+        <span class="kw2">return</span> s.out(h)
+
+<span class="cm"># 4 micro-batches of 2 sequences each; real lengths differ a lot, the rest is padding</span>
+lens = [[16, 14], [3, 2], [15, 16], [4, 1]]
+batches = []
+<span class="kw2">for</span> pair <span class="kw2">in</span> lens:
+    x = torch.randint(0, V, (2, T)); y = torch.randint(0, V, (2, T))
+    <span class="kw2">for</span> i, n <span class="kw2">in</span> enumerate(pair): y[i, n:] = -100     <span class="cm"># -100 = ignored by cross_entropy</span>
+    batches.append((x, y))
+model = TinyLM()
+params = list(model.parameters())
+<span class="kw2">def</span> grads(): <span class="kw2">return</span> torch.cat([p.grad.flatten() <span class="kw2">for</span> p <span class="kw2">in</span> params])
+
+<span class="cm"># (1) reference: all 8 sequences in ONE batch, mean over all real tokens</span>
+model.zero_grad()
+X = torch.cat([b[0] <span class="kw2">for</span> b <span class="kw2">in</span> batches]); Y = torch.cat([b[1] <span class="kw2">for</span> b <span class="kw2">in</span> batches])
+F.cross_entropy(model(X).flatten(0, 1), Y.flatten(), ignore_index=-100).backward()
+g_ref = grads().clone()
+
+<span class="cm"># (2) correct accumulation: sum of token losses / total real tokens of the WHOLE step</span>
+n_total = sum((y != -100).sum() <span class="kw2">for</span> _, y <span class="kw2">in</span> batches)
+model.zero_grad()
+<span class="kw2">for</span> x, y <span class="kw2">in</span> batches:
+    loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten(), ignore_index=-100, reduction=<span class="st">"sum"</span>)
+    (loss / n_total).backward()                  <span class="cm"># .grad adds up across micro-batches</span>
+print(<span class="st">"correct  :"</span>, (grads() - g_ref).abs().max().item())          <span class="cm"># about 3e-8: rounding only</span>
+
+<span class="cm"># (3) the token-count trap: mean per micro-batch, then divide by K</span>
+model.zero_grad()
+<span class="kw2">for</span> x, y <span class="kw2">in</span> batches:
+    loss = F.cross_entropy(model(x).flatten(0, 1), y.flatten(), ignore_index=-100)
+    (loss / len(batches)).backward()
+print(<span class="st">"naive    :"</span>, (grads() - g_ref).abs().max().item(), <span class="st">"norm ratio"</span>,
+      (grads().norm() / g_ref.norm()).item())    <span class="cm"># about 0.15 and 1.42: a different gradient</span>
+
+<span class="cm"># (4) checkpointing: same gradients, fewer saved activations</span>
+<span class="kw2">def</span> saved_bytes(ckpt):
+    total = [0]
+    <span class="kw2">def</span> pack(t): total[0] += t.numel() * t.element_size(); <span class="kw2">return</span> t
+    model.zero_grad()
+    <span class="kw2">with</span> torch.autograd.graph.saved_tensors_hooks(pack, <span class="kw2">lambda</span> t: t):
+        loss = F.cross_entropy(model(X, ckpt).flatten(0, 1), Y.flatten(), ignore_index=-100)
+    loss.backward()
+    <span class="kw2">return</span> total[0], grads().clone()
+b0, g0 = saved_bytes(False); b1, g1 = saved_bytes(True)
+print(<span class="st">"saved KB :"</span>, b0 // 1024, b1 // 1024, (g0 - g1).abs().max().item())   <span class="cm"># 2793 288 0.0</span></pre>
+<p>With PyTorch 2.8 on a CPU this prints a difference of about \(3 \times 10^{-8}\) for the correct accumulation, about 0.15 (and a gradient norm 1.42 times too large) for the naive one, and 2,793 KB versus 288 KB of saved tensors with checkpointing, with identical gradients. [Certain: we ran it] The naive gradient is too large here because the two short micro-batches (5 and 5 real tokens) get the same weight as the long ones (30 and 31 tokens).</p>
+<p>Other ways to save activation memory, all covered later: offloading activations to CPU memory, sequence parallelism, which splits the \(34\,sbd\) part across tensor-parallel GPUs (<a href="../pretraining/index.html#row-tensor-parallelism-and-sequence-parallelism" title="Tensor parallelism and sequence parallelism (planned)">session 48</a>), and lower-precision activations. In <a href="../pretraining/index.html#row-lab-measure-memory-accumulation-and-checkpointing" title="measure memory, accumulation and checkpointing (planned)">session 41</a> you measure all of this on a real GPU.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical use</th><th>Why</th></tr></thead><tbody>
+<tr><td>LLM pretraining (millions of tokens per step)</td><td>Data parallelism first; accumulation for the rest of the global batch; selective or full recomputation depending on length</td><td>The batch is set by the training recipe, not by the GPU; packed sequences make the token-count trap disappear</td></tr>
+<tr><td>Full fine-tuning on one node</td><td>Micro-batch 1–4, accumulation 8–64, checkpointing on [Likely]</td><td>Weights and Adam states already fill most of the memory (<a href="../pretraining/index.html#row-memory-math-for-training" title="Memory math for training (planned)">session 38</a>)</td></tr>
+<tr><td>SFT with padded chat data</td><td>Accumulation with token-sum normalization (39.3)</td><td>Lengths vary a lot; the naive loss over-weights short answers (<a href="../posttraining/index.html#row-sft-in-detail" title="SFT in detail (planned)">session 54</a>)</td></tr>
+<tr><td>LoRA and QLoRA on a single consumer GPU</td><td>Checkpointing almost always on, plus accumulation [Likely]</td><td>Frozen weights are small in 4-bit, so activations become the biggest part (<a href="../posttraining/index.html#row-qlora-and-training-with-quantized-weights" title="QLoRA and training with quantized weights (planned)">session 58</a>)</td></tr>
+<tr><td>Long-context training (32k tokens and more)</td><td>FlashAttention plus full block checkpointing, often with context parallelism</td><td>Even \(34\,sbd\) per layer is too much at long \(s\)</td></tr>
+<tr><td>Video models: action recognition, video classification, video-text retrieval</td><td>Checkpointing in the video backbone; accumulation for classification losses</td><td>Many frames make very long token sequences; but a contrastive retrieval loss needs real in-batch negatives, so accumulation alone does not help it</td></tr>
+<tr><td>VLM fine-tuning (image or video tokens + text)</td><td>Checkpointing in both the vision encoder and the LLM; token-correct loss over text tokens only</td><td>Image and video tokens make sequences long, and the number of text tokens per sample varies (<a href="../vision/index.html#row-batching-and-masking-for-multimodal-sequences" title="Batching and masking for multimodal sequences (planned)">session 188</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Forgetting the \(1/K\).</b> The gradient becomes \(K\) times too large; clipping and weight decay now act differently, and the learning rate you tuned is wrong.</li>
+<li><b>The token-count trap.</b> Averaging per micro-batch and then over micro-batches (39.4) when the micro-batches have different numbers of real tokens. Use <code>reduction="sum"</code> and divide by the total real-token count of the whole step, on all GPUs.</li>
+<li><b>Calling <code>optimizer.step()</code> or the scheduler every micro-batch.</b> The step and the learning-rate schedule count optimizer steps, not micro-batches. Also: clip the gradient once, after the last micro-batch.</li>
+<li><b>Syncing gradients every micro-batch in DDP.</b> Correct but slow; use <code>no_sync()</code> for the first \(K - 1\) micro-batches.</li>
+<li><b>Assuming accumulation works with BatchNorm or contrastive losses.</b> Batch statistics and in-batch negatives depend on the micro-batch, not on the effective batch.</li>
+<li><b>Checkpointing with dropout but without restoring the random state.</b> The recomputed forward then uses a different dropout mask and the gradients are wrong. PyTorch’s default (<code>preserve_rng_state=True</code>) handles it; custom recomputation code must too.</li>
+<li><b>Checkpointing a block whose forward has side effects</b> (it updates a counter, a cache, or a running statistic). The side effect happens twice. Keep the KV cache off in training.</li>
+<li><b>Expecting checkpointing to help the weights.</b> It only reduces activation memory. If weights, gradients and optimizer states do not fit, you need sharding, 8-bit states or LoRA instead.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is gradient accumulation, and what is the effective batch size?<span class="lvl">basic</span></summary><div class="ans">You run \(K\) micro-batches through forward and backward, let the gradients add up in the <code>.grad</code> buffers, and call <code>optimizer.step()</code> once at the end. The optimizer sees the gradient of all \(K\) micro-batches together. The effective batch is \(b \cdot K \cdot N_{\text{dp}}\) sequences, or that times \(s\) in tokens (39.1). Memory depends only on the micro-batch \(b\).</div></details>
+<details class="qa"><summary>Is accumulation exactly equivalent to a larger batch?<span class="lvl">core</span></summary><div class="ans">For losses that are plain averages over examples or tokens, yes, up to floating-point rounding, because the gradient is linear (39.2), provided you normalize correctly: divide by the total count of the whole step. It is not equivalent with BatchNorm (statistics are per micro-batch), with in-batch contrastive losses (fewer negatives), or when you average per micro-batch while the micro-batches contain different numbers of tokens. Dropout masks and data order differ as well, but that is only noise.</div></details>
+<details class="qa"><summary>Explain the token-count trap with numbers.<span class="lvl">core</span></summary><div class="ans">Micro-batch A has 1,000 real tokens with mean loss 2.0; B has 10 with mean loss 5.0. Mean of means: 3.5. True per-token mean: \(2{,}050 / 1{,}010 = 2.03\). Each token of B got weight 0.05 instead of 0.00099, 50.5 times too much. Fix: <code>reduction="sum"</code> and divide by the total number of real tokens across all micro-batches (and all GPUs). Hugging Face fixed this in its Trainer in October 2024.</div></details>
+<details class="qa"><summary>How does the token-count trap appear with data parallelism, and how do you fix it?<span class="lvl">advanced</span></summary><div class="ans">DDP averages gradients over GPUs. If each GPU normalizes by its own token count, the result is a mean of per-GPU means, the same bias. All-reduce the real-token count first to get \(N_{\text{tot}}\), have each GPU backprop \(\text{(sum of its token losses)} \cdot N_{\text{dp}} / N_{\text{tot}}\), so that DDP’s division by \(N_{\text{dp}}\) leaves exactly \(\sum \ell_t / N_{\text{tot}}\).</div></details>
+<details class="qa"><summary>What does gradient checkpointing store, and what does it recompute?<span class="lvl">basic</span></summary><div class="ans">It stores only chosen tensors, usually the input of every transformer block (\(2sbd\) bytes in BF16), and drops the internal activations. During the backward pass, each block’s forward is run again from its stored input, this time keeping the internals, and then the block is backpropagated and its internals freed. Peak memory is about \(2sbdL\) plus one block’s activations (39.6).</div></details>
+<details class="qa"><summary>What does full checkpointing cost in compute and time?<span class="lvl">core</span></summary><div class="ans">One extra forward pass: \(2N + 2N + 4N = 8N\) FLOPs per token instead of \(6N\), 33% more (39.8). Measured slowdowns are typically 30–40%. MFU drops because recomputed FLOPs do not count as useful model FLOPs, while hardware FLOPs utilization can stay high.</div></details>
+<details class="qa"><summary>Derive the square-root rule. Why do transformers usually checkpoint every block instead?<span class="lvl">advanced</span></summary><div class="ans">With a checkpoint every \(c\) of \(n\) layers, the peak is \(M(c) \approx (n/c) I + cA\). Minimizing gives \(c^* = \sqrt{nI/A}\) and \(M^* = 2\sqrt{nIA}\); for similar \(I\) and \(A\) that is \(O(\sqrt{n})\) memory (Chen et al. 2016). In a transformer block, the saved inside activations are much larger than the block input (\(A = 34\), \(I = 2\) in units of \(sbd\) bytes), so for 32 layers \(c^* = 1.37\): one checkpoint per block (98 units) beats every two blocks (100) and every four (152).</div></details>
+<details class="qa"><summary>What is selective activation recomputation?<span class="lvl">advanced</span></summary><div class="ans">From Korthikanti et al. (2022): recompute only the attention core (\(QK^\top\), softmax, softmax dropout, attention times \(V\)), store everything else. That part is most of the activation memory at long sequences (the \(5hs/d\) term of 39.5) but a small share of FLOPs, so it removes the \(s^2\) memory for about 2–3% extra FLOPs at GPT-3 scale (2.7% for 175B, 1.6% for 530B). FlashAttention gets the same effect inside its kernel.</div></details>
+<details class="qa"><summary>Your 7B fine-tune runs out of memory. In what order do you try accumulation, checkpointing and other options?<span class="lvl">core</span></summary><div class="ans">First see which part is too big (<a href="../pretraining/index.html#row-memory-math-for-training" title="Memory math for training (planned)">session 38</a>). If it is the activations: lower the micro-batch and raise \(K\) to keep the effective batch (no extra compute), turn on FlashAttention, then turn on block checkpointing (about 33% more compute). If the states (16 bytes per parameter, 112 GB for 7B) do not fit, neither tool helps: you need ZeRO/FSDP sharding, 8-bit optimizer states, CPU offload, or LoRA/QLoRA.</div></details>
+<details class="qa"><summary>Why must recomputation restore the random-number state?<span class="lvl">core</span></summary><div class="ans">Dropout draws a random mask in the forward pass. If the recomputed forward draws a different mask, the activations used in the backward pass are not the ones that produced the loss, and the gradient is wrong. PyTorch’s checkpoint saves the RNG state with the checkpoint and restores it before recomputing (<code>preserve_rng_state=True</code> by default).</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>You want 2 million tokens per step with sequences of 8,192 tokens, 32 GPUs and a micro-batch of 1. How many accumulation steps do you need?</li>
+<li>Three micro-batches have 200, 50 and 750 real tokens and mean losses 3.0, 4.0 and 2.0. Compute the naive loss (39.4) and the correct loss (39.3).</li>
+<li>In the same example, by what factor is one token of the 50-token micro-batch over-weighted by the naive loss?</li>
+<li>With formula (39.7), \(n = 64\) simple layers and \(I = A\): what segment length is best, and how much memory (in units of \(I\)) do you need, compared with no checkpointing?</li>
+<li>For \(L = 32\), \(d = 4{,}096\), \(s = 8{,}192\), \(b = 1\): how much memory do the stored block inputs (\(2sbdL\)) take in BF16?</li>
+<li>Use formula (39.9) to compute the FLOP overhead of selective recomputation at \(d = 4{,}096\) and \(s = 16{,}384\).</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(2{,}097{,}152 / 8{,}192 = 256\) sequences per step; one round of all GPUs gives \(1 \times 32 = 32\); \(K = 256/32 = 8\). 2. Naive: \((3.0 + 4.0 + 2.0)/3 = 3.0\). Correct: \((600 + 200 + 1{,}500)/1{,}000 = 2.3\). 3. Naive weight \(1/(3 \times 50) = 0.00667\); correct weight \(1/1{,}000 = 0.001\): 6.67 times too much. 4. \(c^* = \sqrt{64} = 8\); \(M = 64/8 + 8 = 16\) units versus \(64\) without checkpointing (4 times less), for one extra forward pass. 5. \(2 \times 8{,}192 \times 4{,}096 \times 32 = 2{,}147{,}483{,}648\) bytes = 2.15 GB (2 GiB). 6. \((72 \times 4{,}096 + 16 \times 16{,}384)/(72 \times 4{,}096 + 12 \times 16{,}384) = 557{,}056/491{,}520 = 1.133\): about 13% more FLOPs, because at long sequences the attention core is no longer cheap.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Gradient accumulation runs \(K\) micro-batches and steps once; the effective batch is \(b K N_{\text{dp}}\) sequences (39.1), and memory depends only on \(b\).</li>
+<li>Because the gradient is linear, accumulation equals the big batch (39.2), if the loss is normalized by the total count of the whole step.</li>
+<li>For tokens with padding, use the sum of token losses divided by the step’s real-token count (39.3); the mean of micro-batch means (39.4) over-weights short micro-batches. Do the same across GPUs.</li>
+<li>Checkpointing keeps only block inputs and recomputes the rest in the backward pass: memory goes from \(L \cdot sbd(34 + 5hs/d)\) to about \(2sbdL\) plus one block (39.5, 39.6), 104 GB to 1.6 GB in the 7B example.</li>
+<li>The price is one extra forward pass: \(8N\) instead of \(6N\) FLOPs, 33% (39.8). Selective recomputation of the attention core costs only a few percent (39.9).</li>
+<li>The square-root rule (39.7) says checkpoint every \(\sqrt{n}\) layers for simple chains; for transformer blocks, one checkpoint per block is best.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ T_{\text{eff}} = bKN_{\text{dp}}s, \qquad \mathcal{L}_{\text{step}} = \frac{1}{N_{\text{tot}}}\sum_{k}\sum_{t \in \mathcal{B}_k}\ell_t \]</div>
+<div class="eq">\[ M_{\text{full ckpt}} \approx 2sbdL + sbd\Big(34 + \frac{5hs}{d}\Big), \qquad M(c) \approx \frac{n}{c}I + cA, \qquad \text{FLOPs: } 6N \to 8N \]</div>
+<h2 class="plain" id="gradient-accumulation-and-gradient-checkpointing-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Chen et al. (2016). <a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener">Training Deep Nets with Sublinear Memory Cost</a></li><li>Korthikanti et al. (2022). <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">Reducing Activation Recomputation in Large Transformer Models</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Chen et al. (2016). <a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener">Training Deep Nets with Sublinear Memory Cost</a></li><li>Korthikanti et al. (2022). <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">Reducing Activation Recomputation in Large Transformer Models</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">Llama 2: Open Foundation and Fine-Tuned Chat Models</a></li><li>Rajbhandari et al. (2019). <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>Hugging Face (Transformers team) (2024). <a href="https://huggingface.co/blog/gradient_accumulation" target="_blank" rel="noopener">Fixing Gradient Accumulation</a></li></ol><nav class="pn" aria-label="Previous and next session"><span class="prev"><small>Previous · session 38, planned</small>Memory math for training</span><a class="next" href="../pretraining/evaluating-base-models.html"><small>Next · session 40</small>Evaluating base models</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const R=document.querySelector('[data-session="gradient-accumulation-and-gradient-checkpointing"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){return()=>{const u=Math.max(1e-12,r()),v=r();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);};}
+const segInit=(el,cb)=>{el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});};
+const fmtE=v=>v===0?"0":v.toExponential(1).replace("e-","×10^−").replace(/\^(−?\d+)/,"<sup>$1</sup>");
+
+/* ---------- Figure 1: accumulation buffer ---------- */
+(function(){
+ const svg=$("#ga-acc-svg");if(!svg)return;const info=$("#ga-acc-info"),lab=$("#ga-acc-lab"),dv=$("#ga-acc-div");
+ const P=6,Nn=32,g=gauss(rng(39));const X=[],Y=[];const wt=[0.8,-0.5,0.3,1.0,-0.9,0.4],w=[0,0,0,0,0,0];
+ for(let i=0;i<Nn;i++){const x=Array.from({length:P},()=>g());X.push(x);Y.push(x.reduce((a,v,j)=>a+v*wt[j],0)+0.3*g());}
+ const gradOf=(lo,hi)=>{const G=new Array(P).fill(0);for(let i=lo;i<hi;i++){const e=X[i].reduce((a,v,j)=>a+v*w[j],0)-Y[i];for(let j=0;j<P;j++)G[j]+=X[i][j]*e;}return G.map(v=>v/(hi-lo));};
+ const full=gradOf(0,Nn);let K=4,i=0,timer=null;
+ function state(k){const m=Nn/K;const buf=new Array(P).fill(0);let last=null;for(let q=0;q<k;q++){const gq=gradOf(q*m,(q+1)*m).map(v=>dv.checked?v/K:v);for(let j=0;j<P;j++)buf[j]+=gq[j];last=gq;}return{buf,last};}
+ function draw(){const {buf,last}=state(i);const top=Math.max(...full.map(Math.abs))*(dv.checked?1.25:K*1.1);const sc=105/top,Y0=130;
+  let s=`<line x1="40" y1="${Y0}" x2="620" y2="${Y0}" stroke="var(--muted)"/>`;
+  for(let j=0;j<P;j++){const cx=90+j*92;const bh=buf[j]*sc,fh=full[j]*sc;
+   s+=`<rect x="${cx-22}" y="${Math.min(Y0,Y0-bh)}" width="44" height="${Math.abs(bh)}" rx="3" fill="var(--q)" opacity=".85"/>`;
+   if(last&&i>0){const lh=last[j]*sc,base=Y0-(buf[j]-last[j])*sc;s+=`<rect x="${cx-8}" y="${Math.min(base,base-lh)}" width="16" height="${Math.abs(lh)}" rx="2" fill="var(--k)"/>`;}
+   s+=`<rect x="${cx-26}" y="${Math.min(Y0,Y0-fh)}" width="52" height="${Math.abs(fh)}" rx="3" fill="none" stroke="var(--tc)" stroke-width="2.2" stroke-dasharray="5 3"/>`;
+   s+=`<text x="${cx}" y="262" text-anchor="middle" class="svgs" font-size="12.5">w${j+1}: ${buf[j].toFixed(3)}</text>`;}
+  s+=`<text x="40" y="18" class="svgs" font-size="12.5">micro-batch size ${Nn/K}, ${i} of ${K} micro-batches done</text>`;svg.innerHTML=s;
+  lab.textContent=`Step ${i} of ${K}`;$("#ga-acc-prev").disabled=i===0;$("#ga-acc-next").disabled=i===K;
+  let t;if(i===0)t=`Buffer is zero (after <code>zero_grad()</code>). Each of the ${K} micro-batches has ${Nn/K} examples.`;
+  else if(i<K)t=`After micro-batch ${i}: the buffer holds ${i}/${K} of the way. No optimizer step yet.`;
+  else{const d=Math.max(...buf.map((v,j)=>Math.abs(v-full[j])));const ratio=buf[0]/full[0];
+   t=dv.checked?`All ${K} micro-batches done: max |buffer − full-batch gradient| = <b>${fmtE(d)}</b> (rounding only). Now clip, <code>optimizer.step()</code>, <code>zero_grad()</code>.`:
+   `All ${K} micro-batches done without dividing by K: buffer = <b>${ratio.toFixed(2)} ×</b> the full-batch gradient.`;}
+  info.innerHTML=t;}
+ const stop=()=>{if(timer){clearInterval(timer);timer=null;$("#ga-acc-play").textContent="Play";}};
+ $("#ga-acc-prev").addEventListener("click",()=>{stop();i=Math.max(0,i-1);draw();});
+ $("#ga-acc-next").addEventListener("click",()=>{stop();i=Math.min(K,i+1);draw();});
+ $("#ga-acc-play").addEventListener("click",()=>{if(timer){stop();return;}if(i===K)i=0;draw();$("#ga-acc-play").textContent="Pause";timer=setInterval(()=>{if(i>=K){stop();return;}i++;draw();},1100);});
+ segInit($("#ga-acc-k"),v=>{stop();K=+v;i=0;draw();});dv.addEventListener("change",draw);draw();
+})();
+
+/* ---------- Figure 2: token-count trap ---------- */
+(function(){
+ const svg=$("#ga-trap-svg");if(!svg)return;const box=$("#ga-trap-mb"),info=$("#ga-trap-info");
+ const Lm=[2.0,2.5,3.0,4.5],N=[500,480,60,8];
+ box.innerHTML=N.map((n,k)=>`<div class="c"><label for="ga-trap-n${k}">Micro-batch ${k+1}</label><br>mean loss <b>${Lm[k].toFixed(1)}</b><br>real tokens <b id="ga-trap-v${k}">${n}</b><input type="range" id="ga-trap-n${k}" min="1" max="512" step="1" value="${n}"></div>`).join("");
+ const lg=v=>Math.log10(v),Y=v=>200-(lg(v)+4)/4*180;
+ function draw(){for(let k=0;k<4;k++){N[k]=+$("#ga-trap-n"+k).value;$("#ga-trap-v"+k).textContent=N[k];}
+  const K=4,Nt=N.reduce((a,v)=>a+v,0);const naive=Lm.reduce((a,v)=>a+v,0)/K,corr=Lm.reduce((a,v,k)=>a+v*N[k],0)/Nt;
+  let s="";[1,0.1,0.01,0.001,0.0001].forEach(v=>{s+=`<line x1="60" y1="${Y(v)}" x2="630" y2="${Y(v)}" stroke="var(--rule)"/><text x="54" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${v>=0.01?v:v.toExponential(0)}</text>`;});
+  let worst=0,wk=0;
+  for(let k=0;k<4;k++){const cx=130+k*140,wn=1/(K*N[k]),wc=1/Nt;const r=wn/wc;if(r>worst){worst=r;wk=k;}
+   s+=`<rect x="${cx-34}" y="${Y(wn)}" width="30" height="${200-Y(wn)}" rx="3" fill="var(--k)"/><rect x="${cx+4}" y="${Y(wc)}" width="30" height="${200-Y(wc)}" rx="3" fill="var(--q)"/>`;
+   s+=`<text x="${cx}" y="218" text-anchor="middle" class="svgs" font-size="12.5">mb ${k+1}: ×${r.toFixed(2)}</text>`;}
+  svg.innerHTML=s;
+  info.innerHTML=`Naive loss (mean of 4 means): <b>${naive.toFixed(3)}</b>. Correct loss (sum ÷ ${Nt} tokens): <b>${corr.toFixed(3)}</b>. Most over-weighted: micro-batch ${wk+1}, each token counts <b>${worst.toFixed(2)}×</b> its fair weight. ${Math.abs(naive-corr)<5e-4?"The two losses agree.":""}`;}
+ for(let k=0;k<4;k++)$("#ga-trap-n"+k).addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: checkpointing timeline ---------- */
+(function(){
+ const svg=$("#ga-ck-svg");if(!svg)return;const T=$("#ga-ck-t"),info=$("#ga-ck-info");const n=8;let c=1,r=16,ev=[];
+ function build(){ev=[];const inp=new Array(n+1).fill(0),ins=new Array(n+1).fill(0);let fw=0;
+  const snap=t=>{const m=inp.reduce((a,v)=>a+v,0)+r*ins.reduce((a,v)=>a+v,0);ev.push({inp:inp.slice(),ins:ins.slice(),m,t,fw});};
+  snap("Start of the step: nothing stored yet.");
+  for(let i=1;i<=n;i++){fw++;if(c===0){inp[i]=1;ins[i]=1;snap(`Forward layer ${i}: save its input and its inside activations.`);}
+   else if((i-1)%c===0){inp[i]=1;snap(`Forward layer ${i}: save only its input (a checkpoint); inside activations are thrown away.`);}
+   else snap(`Forward layer ${i}: save nothing.`);}
+  if(c===0){for(let i=n;i>=1;i--){inp[i]=0;ins[i]=0;snap(`Backward layer ${i}: use its saved tensors, then free them.`);}}
+  else{for(let s0=n-c+1;s0>=1;s0-=c){const e=s0+c-1;for(let j=s0;j<=e;j++){inp[j]=1;ins[j]=1;fw++;}
+    snap(`Recompute layers ${s0}–${e} from the checkpoint at layer ${s0}, saving everything this time.`.replace(`layers ${s0}–${s0}`,`layer ${s0}`));
+    for(let j=e;j>=s0;j--){inp[j]=0;ins[j]=0;snap(`Backward layer ${j}, then free its tensors${j===s0?" and the checkpoint":""}.`);}}}
+  T.max=ev.length-1;if(+T.value>ev.length-1)T.value=ev.length-1;}
+ function draw(){const k=+T.value,e=ev[k];$("#ga-ck-tv").value=`${k} / ${ev.length-1}`;const peak=Math.max(...ev.map(x=>x.m));
+  const ref=n*(1+r);const u=110/(1+r);let s="";
+  for(let i=1;i<=n;i++){const x=40+(i-1)*88;s+=`<rect x="${x}" y="10" width="70" height="${(1+r)*u+2}" rx="4" fill="none" stroke="var(--rule)"/>`;
+   if(e.ins[i])s+=`<rect x="${x+3}" y="${12}" width="64" height="${r*u-1}" rx="3" fill="var(--k)" opacity=".85"/>`;
+   if(e.inp[i])s+=`<rect x="${x+3}" y="${12+r*u}" width="64" height="${u}" rx="2" fill="var(--q)"/>`;
+   s+=`<text x="${x+35}" y="${(1+r)*u+28}" text-anchor="middle" class="svgs" font-size="12">layer ${i}</text>`;}
+  const gx=j=>40+j*(690/(ev.length-1)),gy=m=>290-m/ref*120;
+  s+=`<line x1="40" y1="290" x2="730" y2="290" stroke="var(--muted)"/><text x="36" y="${gy(ref)+4}" text-anchor="end" class="svgs" font-size="11">${ref}</text><text x="36" y="294" text-anchor="end" class="svgs" font-size="11">0</text>`;
+  s+=`<line x1="40" y1="${gy(ref)}" x2="730" y2="${gy(ref)}" stroke="var(--rule)" stroke-dasharray="4 4"/>`;
+  s+=`<polyline points="${ev.map((x,j)=>gx(j).toFixed(1)+","+gy(x.m).toFixed(1)).join(" ")}" fill="none" stroke="var(--v)" stroke-width="2.5"/><circle cx="${gx(k)}" cy="${gy(e.m)}" r="6" fill="var(--v)" stroke="var(--card)" stroke-width="2"/>`;
+  svg.innerHTML=s;
+  info.innerHTML=`${e.t} Memory now: <b>${e.m}</b> units. Peak for this setting: <b>${peak}</b> units (no checkpointing: ${ref}). Layer forwards so far: <b>${e.fw}</b>${c?` (of ${2*n})`:` (of ${n})`}.`;}
+ segInit($("#ga-ck-c"),v=>{c=+v;build();draw();});segInit($("#ga-ck-r"),v=>{r=+v;build();draw();});
+ T.addEventListener("input",draw);build();draw();
+})();
+
+/* ---------- Figure 4: memory vs compute for a 7B-sized shape ---------- */
+(function(){
+ const svg=$("#ga-cost-svg");if(!svg)return;const S=$("#ga-cost-s"),Bb=$("#ga-cost-b"),info=$("#ga-cost-info");const L=32,d=4096,h=32;
+ const gb=v=>v>=1000?Math.round(v).toLocaleString("en-US"):v>=100?v.toFixed(0):v.toFixed(1);
+ function draw(){const s=2**(+S.value),b=2**(+Bb.value);$("#ga-cost-sv").value=s.toLocaleString("en-US");$("#ga-cost-bv").value=b;
+  const sbd=s*b*d;const none=L*sbd*(34+5*h*s/d)/1e9,sel=L*sbd*34/1e9,full=(2*sbd*L+sbd*34)/1e9;
+  const f0=72*d+12*s,fs=(72*d+16*s)/f0,ff=(96*d+16*s)/f0;
+  const X=v=>170+(Math.log10(v)+1)/6*440;let g="";
+  [0.1,1,10,100,1000,10000,100000].forEach(v=>{g+=`<line x1="${X(v)}" y1="20" x2="${X(v)}" y2="200" stroke="var(--rule)"/><text x="${X(v)}" y="218" text-anchor="middle" class="svgs" font-size="11.5">${v>=1?v.toLocaleString("en-US"):v}</text>`;});
+  g+=`<line x1="${X(80)}" y1="14" x2="${X(80)}" y2="204" stroke="var(--bad)" stroke-width="2" stroke-dasharray="6 4"/><text x="${X(80)+4}" y="14" class="svgs" font-size="11">80 GB</text>`;
+  [["No recomputation",none,1,"var(--k)"],["Selective",sel,fs,"var(--q)"],["Full (per block)",full,ff,"var(--v)"]].forEach(([nm,v,f,col],j)=>{const y=34+j*58;
+   g+=`<text x="160" y="${y+20}" text-anchor="end" class="svgs" font-size="13">${nm}</text><rect x="${X(0.1)}" y="${y}" width="${Math.max(2,X(v)-X(0.1))}" height="30" rx="4" fill="${col}" opacity=".85"/>`;
+   g+=`<text x="${Math.min(X(v)+6,560)}" y="${y+20}" class="svgs" font-size="12.5" font-weight="700">${gb(v)} GB · ${f.toFixed(2)}×</text>`;});
+  g+=`<text x="390" y="240" text-anchor="middle" class="svgs" font-size="12.5">activation memory (GB, log scale) · FLOPs relative to no recomputation</text>`;svg.innerHTML=g;
+  info.innerHTML=`s = ${s.toLocaleString("en-US")}, b = ${b}: no recomputation <b>${gb(none)} GB</b> (1.00×), selective <b>${gb(sel)} GB</b> (${fs.toFixed(2)}×), full <b>${gb(full)} GB</b> (${ff.toFixed(2)}×). The score matrices are ${(100*(none-sel)/none).toFixed(0)}% of the activations without recomputation.`;}
+ [S,Bb].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>
