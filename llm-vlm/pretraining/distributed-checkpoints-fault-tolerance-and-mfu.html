@@ -1,0 +1,601 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Distributed checkpoints, fault tolerance and MFU · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 51</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="distributed-checkpoints-fault-tolerance-and-mfu">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="distributed-checkpoints-fault-tolerance-and-mfu" data-session="distributed-checkpoints-fault-tolerance-and-mfu" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">51</span><span>Track 3: Pretraining and scale · session 21 of 22</span></div><h1 class="chap-title">Distributed checkpoints, fault tolerance and MFU</h1><p class="chap-sub">A pretraining run on thousands of GPUs stops every few hours: a GPU dies, a link hangs, a chip computes a wrong number. This session shows how to save and load a model that is split over many GPUs, how often to save, how to restart (also on a different number of GPUs), how to catch silent data corruption, and how to compute and read MFU, the number that says how much of the GPU’s speed becomes useful training.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 42, 43 and 46 (GPU architecture, collective communication, FSDP); session 38 (memory math) helps</span></div><div class="learn"><h3>What you will learn</h3><ul><li>What a training checkpoint must contain to resume exactly, and why it is about 12 bytes per parameter (847 GB for a 70B model)</li><li>How sharded checkpoints (PyTorch DCP) save in parallel, commit safely, and reshard at load time onto a different number of GPUs</li><li>How asynchronous checkpoints hide the write behind training, and what they cost in CPU memory</li><li>Why a 16,384-GPU job fails every 2 to 3 hours, with the real Llama 3 and Meta cluster numbers, and how crashes, hangs, stragglers and silent data corruption differ</li><li>Young’s formula for the best checkpoint interval, and why the restart cost often matters more</li><li>How to compute MFU correctly (which N, which peak, attention, recomputation), and how to read it together with ETTR (goodput)</li><li>When communication can hide behind compute: the minimum tokens per GPU for FSDP, b_min = (P u / B)(F − 1)/F</li></ul></div></header><style>
+[data-session="distributed-checkpoints-fault-tolerance-and-mfu"] code,[data-session="distributed-checkpoints-fault-tolerance-and-mfu"] pre.code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+[data-session="distributed-checkpoints-fault-tolerance-and-mfu"] :not(pre)>code{overflow-wrap:anywhere}
+[data-session="distributed-checkpoints-fault-tolerance-and-mfu"] svg text:not([font-family]){font-family:var(--sans)}
+.dc-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.dc-grid input[type=range]{width:100%}
+.dc-grid output{font:600 14px var(--mono);min-width:84px;text-align:right}
+.dc-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.dc-leg span::before{content:"";display:inline-block;width:16px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px;background:var(--c);border:1px solid var(--muted)}
+.dc-lab{font:500 14px var(--sans);color:var(--muted)}
+.dc-rank{cursor:pointer}
+.dc-rank:focus{outline:none}
+.dc-rank:focus rect.dc-hit{stroke:var(--tc);stroke-width:2.6}
+@media (max-width:560px){.dc-grid{grid-template-columns:1fr auto}.dc-grid label{grid-column:1 / -1}}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A large pretraining run is not one long program that starts and ends. It is a chain of many short runs, cut by crashes, hangs and maintenance. During 54 days of Llama 3 405B pretraining on up to 16,384 H100 GPUs, Meta saw 466 job interruptions: 47 planned and 419 unexpected. That is one unexpected stop about every 3.1 hours. [Certain] Still, they spent more than 90% of the time on useful training. [Certain]</p>
+<p>That 90% does not happen by luck. It needs three things, and they are the topic of this session:</p>
+<ul><li><b>Distributed checkpoints.</b> A checkpoint is a saved copy of the full training state. With thousands of GPUs, each GPU holds only a piece of the state (<a href="../pretraining/fsdp-version-1.html">session 46</a>, <a href="../pretraining/fsdp2-per-parameter-sharding-with-dtensor.html">session 47</a>). Saving and loading must also be split over all GPUs, and you must be able to load on a different number of GPUs than you saved on.</li>
+<li><b>Fault tolerance.</b> Find a failure fast, remove the bad machine, restart, and lose as little work as possible. This includes the hardest failure: <i>silent data corruption</i>, where a chip computes a wrong number and reports no error.</li>
+<li><b>MFU (model FLOPs utilization).</b> When the job runs, how much of the GPU’s peak speed becomes useful training? You met the formula in <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>. Here you learn to compute it correctly, to read it, and to raise it by <b>overlapping communication with compute</b>.</li></ul>
+<p>These three ideas are linked by one number. The useful work you get from a cluster is roughly</p>
+<div class="eq">\[ \text{useful FLOPs} = \underbrace{n_{\text{GPU}}\, P\, t_{\text{wall}}}_{\text{what you pay for}} \times \underbrace{\mathrm{MFU}}_{\text{speed while running}} \times \underbrace{\mathrm{ETTR}}_{\text{fraction of time running}} \tag{51.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n_{\text{GPU}}, P\)</dt><dd>number of GPUs, and the dense peak FLOP/s of one GPU (989 TFLOP/s for an H100 in BF16 [Certain])</dd>
+<dt>\(t_{\text{wall}}\)</dt><dd>wall-clock time: the time on the clock on the wall, including all stops</dd>
+<dt>MFU</dt><dd>model FLOPs utilization: useful model FLOP/s divided by peak FLOP/s, measured while the job runs</dd>
+<dt>ETTR</dt><dd>effective training time ratio: the time spent on useful training divided by the wall-clock time. Also called <b>goodput</b> (good + throughput). Meta’s Llama 3 paper calls it “effective training time”.</dd></dl>
+<p>Checkpoints and fault tolerance raise ETTR. Overlap raises MFU. A run with 45% MFU and 70% ETTR does less work than a run with 40% MFU and 95% ETTR.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “How do you checkpoint a model sharded over 1,024 GPUs?”, “How often should you checkpoint?”, “What must be in a checkpoint to resume exactly?”, “What is silent data corruption, and how do you catch it?”, “How do you compute MFU, and is 40% good?”, “When can FSDP hide its communication?”. Each is answered below with numbers.</aside>
+
+<h2>What a checkpoint must contain</h2>
+<p>A checkpoint is useful only if training can continue from it <b>as if nothing had happened</b>. Saving only the weights is not enough. You need everything that changes during training:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Part</th><th>Why it is needed</th><th>Size (mixed-precision AdamW)</th></tr></thead><tbody>
+<tr><td>Model weights (FP32 master copy)</td><td>the model itself</td><td>4 bytes per parameter</td></tr>
+<tr><td>Optimizer state (Adam \(m\) and \(v\))</td><td>without it, Adam starts again with zero momentum and a wrong step size; the loss usually jumps</td><td>8 bytes per parameter</td></tr>
+<tr><td>Step counter and LR scheduler state</td><td>the learning rate depends on the step (<a href="../foundations/optimization-backprop-adamw.html">session 4</a>)</td><td>a few bytes</td></tr>
+<tr><td>Data loader position</td><td>without it you train on the same data twice, or skip data</td><td>small</td></tr>
+<tr><td>Random number generator states (per rank)</td><td>dropout masks and data shuffling must continue the same sequence</td><td>small</td></tr>
+<tr><td>Loss scaler (FP16 only), config, code version</td><td>to rebuild the exact same run</td><td>small</td></tr></tbody></table></div>
+<p>The gradients are <b>not</b> saved: you checkpoint between steps, when the gradients are empty. So a full training checkpoint has about 12 bytes per parameter, not the 16 bytes of training memory from <a href="../pretraining/memory-math-for-training.html">session 38</a>:</p>
+<div class="eq">\[ S_{\text{ckpt}} \approx \Psi\,(b_{\text{w}} + b_{\text{opt}}) = 12\,\Psi \ \text{bytes}, \qquad S_{\text{rank}} = \frac{S_{\text{ckpt}}}{W} \tag{51.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\Psi\)</dt><dd>number of parameters</dd>
+<dt>\(b_{\text{w}}, b_{\text{opt}}\)</dt><dd>bytes per parameter for the weights (4 in FP32) and for the optimizer state (8 for Adam’s \(m\) and \(v\) in FP32)</dd>
+<dt>\(W\)</dt><dd>world size: the number of ranks (GPU processes) that share the state. With full sharding each rank holds and saves \(1/W\).</dd></dl>
+<div class="worked"><div class="wt">Worked example: how big is a Llama 3 70B checkpoint?</div>
+<p>From the Llama 3 70B config (vocabulary 128,256, width 8,192, 80 layers, MLP width 28,672, 8 key-value heads of size 128), the model has 70,553,706,496 parameters.</p>
+<p>Training checkpoint: \(12 \times 70.55 \times 10^9 = 846.6\) GB. A weights-only export in BF16 (2 bytes per parameter) is 141.1 GB: six times smaller, but you cannot resume training from it.</p>
+<p>On 1,024 GPUs with full sharding, each rank saves \(846.6 / 1024 = 0.83\) GB. Suppose the shared file system can absorb 200 GB/s in total (an assumption; real systems vary a lot). If every rank writes in parallel, the save takes about \(846.6 / 200 = 4.2\) s. If instead rank 0 gathers everything and writes one file at 2 GB/s (also an assumption), the save takes \(846.6 / 2 = 423\) s, about 7 minutes, and rank 0 needs 847 GB of CPU memory to hold it.</p></div>
+
+<h2>Sharded checkpoints: save in parallel</h2>
+<p>The simple way to checkpoint is <code>torch.save(model.state_dict())</code> on rank 0. With a sharded model, this means: gather every shard to rank 0 (huge communication and memory), then write one big file with one process (slow). The worked example showed 7 minutes for 70B. At 405B it is worse, and during that time all other GPUs wait.</p>
+<p>A <b>sharded</b> (or distributed) checkpoint does the opposite: <b>every rank writes only the pieces it already owns</b>, at the same time, to its own file. One small extra file, the <b>metadata</b>, records where every piece of every tensor lives. PyTorch’s <b>Distributed Checkpoint</b> (DCP, <code>torch.distributed.checkpoint</code>) works this way. It “produces multiple files per checkpoint, with at least one per rank”, plus a global <code>.metadata</code> file. [Certain] On disk a single-rank DCP checkpoint looks like <code>.metadata</code> and <code>__0_0.distcp</code> (checked with PyTorch 2.8). [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A library moves to a new building. The slow way: every reader carries their books to one librarian, who packs them all into one huge box. The fast way: every reader packs their own books into their own box at the same time, and the librarian writes one index card: “box 7 holds chapters 12 to 19 of book A”. In the new building, each reader takes only the boxes the index says they need.</aside>
+<p>Two details make it safe and fast:</p>
+<ul><li><b>Plan first, then write.</b> Before writing, the ranks agree on a <b>save plan</b>: which rank writes which piece. This matters for replicated tensors. With data parallelism, many ranks hold the same full copy; only one of them should write it. DCP removes such duplicates in its planning step. [Certain]</li>
+<li><b>Commit at the end.</b> A crash during a save must never leave a half-written checkpoint that looks valid. The metadata file is written last, after all ranks report success. A common pattern: write into <code>step-N.tmp/</code> and rename it to <code>step-N/</code> only when complete. On restart, a folder without metadata is ignored. [Likely]</li></ul>
+<div class="algo"><div class="algo-h">Algorithm 1: sharded save of one checkpoint (seen from rank \(r\) of \(W\))</div><ol>
+<li><b>input:</b> the local state dict of rank \(r\) (its shards of weights and optimizer state), step \(N\)</li>
+<li>build a local plan: list every local piece as (tensor name, global offset, length) <span class="c">// no data yet</span></li>
+<li>gather all local plans to rank 0; rank 0 removes duplicates (replicated tensors are written once) and sends back a final plan</li>
+<li>write my pieces from the final plan to my own file in <code>step-N.tmp/</code> <span class="c">// all ranks in parallel</span></li>
+<li>barrier: wait until every rank reports success</li>
+<li>rank 0 writes <code>.metadata</code> (for every tensor: global shape, and which file holds which piece) and renames the folder to <code>step-N/</code> <span class="c">// the commit</span></li>
+<li>delete old checkpoints, but keep the last \(k\) complete ones</li></ol></div>
+
+<h3>Loading on a different number of GPUs: resharding</h3>
+<p>You will often load a checkpoint on a different layout than you saved it: a node died and you restart on fewer nodes, you move from 256 to 512 GPUs, you change from FSDP to FSDP plus tensor parallelism, or you load a pretraining checkpoint for fine-tuning on 8 GPUs. DCP handles this “load-time resharding”, which “enables saving in one cluster topology and loading into another”. [Certain]</p>
+<p>The trick is that the metadata talks about <b>global</b> positions, not ranks. For a 1-D sharded tensor of \(n\) elements, saved by \(W\) ranks and loaded by \(W'\) ranks:</p>
+<div class="eq">\[ \text{new rank } r' \text{ needs } \Big[\, r'\tfrac{n}{W'},\ (r'+1)\tfrac{n}{W'} \Big), \qquad \text{it reads file } k \iff \max(\ell_{r'}, \ell_k) \lt \min(h_{r'}, h_k) \tag{51.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n\)</dt><dd>number of elements in the (flattened) tensor</dd>
+<dt>\(W, W'\)</dt><dd>number of ranks at save time and at load time</dd>
+<dt>\([\ell_k, h_k)\)</dt><dd>the global range stored in saved file \(k\) (from the metadata); \([\ell_{r'}, h_{r'})\) is the range new rank \(r'\) needs</dd>
+<dt>\(\max(\ell_{r'}, \ell_k) \lt \min(h_{r'}, h_k)\)</dt><dd>the two ranges overlap; the overlap is exactly the part to copy</dd></dl>
+<p>Loading is <b>in place</b>: you first build the model on the new layout (each rank allocates its own new shards, empty), and DCP fills those tensors from the files. [Certain] So the load needs no extra copy of the model in memory. Try it in Figure 1.</p>
+<figure class="fig wide" id="dc-reshard"><div class="fig-body">
+<div class="controls"><span class="dc-lab">Saved on W =</span><span class="seg" id="dc-rs-w"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="3" aria-pressed="false">3</button><button type="button" data-v="4" aria-pressed="true">4</button><button type="button" data-v="6" aria-pressed="false">6</button><button type="button" data-v="8" aria-pressed="false">8</button></span></div>
+<div class="controls"><span class="dc-lab">Loaded on W′ =</span><span class="seg" id="dc-rs-w2"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="3" aria-pressed="true">3</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="6" aria-pressed="false">6</button><button type="button" data-v="8" aria-pressed="false">8</button></span></div>
+<div class="scroll-x"><svg id="dc-rs-svg" viewBox="0 0 780 272" role="img" aria-label="Saved files on top, new ranks below, with lines showing which saved pieces each new rank reads"></svg></div>
+<div class="readout" id="dc-rs-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Load-time resharding of one tensor with 24 elements. Top: the files written by the \(W\) saving ranks, each holding one contiguous range. Bottom: the \(W'\) new ranks and the range each one needs. Click (or Tab to and press Enter on) a new rank to see which files it reads and which slices it copies, by formula (51.3).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with 4 → 3. Each old file holds 6 elements; each new rank needs 8. New rank 1 needs elements 8 to 15, so it reads elements 8 to 11 from file 1 and 12 to 15 from file 2. Every new rank reads 2 files, and no element is read twice. Now pick 4 → 8: each new rank reads half of one file. Pick 4 → 1: the single rank reads all 4 files (this is how you turn a sharded checkpoint into one file). Pick 4 → 4: every rank reads exactly its own file; this is the fast common case of a restart on the same layout. Real DCP does the same per tensor and also for 2-D pieces (for example, column shards from tensor parallelism).</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 2: resharded load (seen from new rank \(r'\) of \(W'\))</div><ol>
+<li><b>input:</b> checkpoint folder <code>step-N/</code>; the model and optimizer already built on the new layout (empty local shards)</li>
+<li>read <code>.metadata</code>: for every tensor, its global shape and the list of saved pieces (file, global offset, length)</li>
+<li><b>for</b> every local shard I own, with global range \([\ell, h)\):</li>
+<li>&nbsp;&nbsp;<b>for</b> every saved piece \([\ell_k, h_k)\) of the same tensor: <b>if</b> they overlap (51.3), read the overlap from file \(k\) and copy it into my shard <span class="c">// in place</span></li>
+<li>restore step counter, scheduler, data loader position and RNG states <span class="c">// the non-tensor state</span></li>
+<li>check: every element of every local shard was written exactly once</li></ol></div>
+<aside class="note watch side"><span class="nt">Watch out</span>Resharding the <b>tensors</b> is solved by DCP. Resharding the <b>data loader</b> is your job. If 512 ranks each read their own slice of the data stream and you restart on 256 ranks, “rank 17’s position” no longer means anything. Store the data position as a global number (for example, the number of sequences consumed so far), so any layout can continue from it. [Likely]</aside>
+
+<h2>Asynchronous checkpoints: hide the save behind training</h2>
+<p>Even a parallel save stops training. A <b>synchronous</b> save copies the state from GPU to CPU memory and writes it to storage while all GPUs wait. An <b>asynchronous</b> save splits the work in two:</p>
+<ol><li><b>Staging</b> (blocking, short): copy the state from GPU memory into CPU memory. Training must wait for this, because the next optimizer step will change the weights.</li>
+<li><b>Writing</b> (in the background, long): a background thread writes the CPU copy to storage while the GPUs already train the next steps.</li></ol>
+<p>This is overlap again: slow I/O runs while the GPUs compute. PyTorch’s <code>dcp.async_save</code> works this way: it copies the state dict to staging storage (CPU memory by default) and then “calls the save in a separate thread”. [Certain] torchtitan reports that async checkpointing cuts the checkpoint overhead by 5 to 15 times compared with synchronous DCP, for Llama 3.1 8B. [Certain] Its option <code>async_mode</code> takes <code>"disabled"</code>, <code>"async"</code> or <code>"async_with_pinned_mem"</code>. [Certain] Pinned (page-locked) CPU memory makes the GPU-to-CPU copy faster, but it is a scarce resource and the buffer stays allocated between saves. [Certain]</p>
+<p>Two costs: CPU memory (each rank needs a CPU copy of its share; the PyTorch tutorial warns that memory grows by “checkpoint_size_per_rank X number_of_ranks” on a host [Certain]), and a limit on frequency: a new save cannot start before the previous write has finished. Figure 2 shows both.</p>
+<figure class="fig wide" id="dc-async"><div class="fig-body">
+<div class="controls"><span class="seg" id="dc-as-mode"><button type="button" data-v="sync" aria-pressed="false">Synchronous</button><button type="button" data-v="async" aria-pressed="true">Asynchronous</button></span></div>
+<div class="dc-grid">
+<label for="dc-as-s">Checkpoint size per rank</label><input type="range" id="dc-as-s" min="0.1" max="8" step="0.01" value="0.83"><output id="dc-as-sv"></output>
+<label for="dc-as-d">GPU → CPU copy speed</label><input type="range" id="dc-as-d" min="1" max="25" step="0.5" value="2"><output id="dc-as-dv"></output>
+<label for="dc-as-w">Storage write speed per rank</label><input type="range" id="dc-as-w" min="0.05" max="2" step="0.05" value="0.2"><output id="dc-as-wv"></output>
+<label for="dc-as-k">Checkpoint every k steps</label><input type="range" id="dc-as-k" min="1" max="10" step="1" value="5"><output id="dc-as-kv"></output></div>
+<div class="scroll-x"><svg id="dc-as-svg" viewBox="0 0 780 170" role="img" aria-label="Timeline of 20 training steps with checkpoint stalls and background writes"></svg></div>
+<div class="dc-leg"><span style="--c:var(--q)">training step (5 s)</span><span style="--c:var(--k)">GPU stalled by checkpoint</span><span style="--c:var(--v-soft)">background write</span></div>
+<div class="readout" id="dc-as-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Twenty training steps of 5 s each, with a checkpoint every \(k\) steps. Synchronous: the GPUs stall for the copy and the full write. Asynchronous: the GPUs stall only for the copy to CPU; the write runs in the background, and the next checkpoint must wait if the previous write is not done. The defaults are the 70B example on 1,024 GPUs (0.83 GB per rank); the speeds are assumptions, change them.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With the defaults, a synchronous checkpoint stalls the GPUs for 0.42 s + 4.15 s = 4.57 s, which is 18.3% of the training time when you save every 5 steps. Asynchronous: only the 0.42 s copy is a stall, 1.7% overhead, about 11 times less. Now set k = 1 (a save after every step) and lower the write speed to 0.1 GB/s: the 8.3 s write is longer than a 5 s step, so each new save waits for the previous one, and the async advantage shrinks. Then raise the GPU → CPU speed (pinned memory): the stall falls further. Async pays off when the write fits between two saves.</p></details></figure>
+<p>Some teams go further and keep checkpoints <b>in memory</b>. Gemini’s training kept “redundant in-memory copies of the model state”, so that after a hardware failure it could “rapidly recover directly from an intact model replica”; this raised the goodput of the largest job from 85% to 97%. [Certain] The idea: with data parallelism, another replica already holds the same weights; reading them over the network is much faster than reading 800 GB from a file system.</p>
+
+<h2>Failures at scale</h2>
+<p>Why do big jobs fail so often? Because a synchronous training job is a chain: if any one of 16,384 GPUs, or any cable, switch or host between them, stops, all the others soon wait at the next collective. As Meta wrote, “a single GPU failure may require a restart of the entire job”. [Certain] If each component fails rarely and independently, the job’s <b>mean time to failure</b> (MTTF) shrinks in proportion to the number of components:</p>
+<div class="eq">\[ M_{\text{job}} = \frac{1}{N_{\text{nodes}}\; r_f}, \qquad \text{for example } \frac{24\ \text{h}}{2048 \times 6.5 / 1000} = 1.80\ \text{h} \tag{51.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(M_{\text{job}}\)</dt><dd>mean time between failures of the whole job</dd>
+<dt>\(N_{\text{nodes}}\)</dt><dd>number of nodes (machines) in the job; 8 GPUs per node, so 16,384 GPUs are 2,048 nodes</dd>
+<dt>\(r_f\)</dt><dd>failure rate of one node, per day. Meta measured 6.50 failures per 1,000 node-days on its RSC-1 research cluster. [Certain]</dd></dl>
+<p>With that rate, Meta’s reliability study projects an MTTF of 1.8 hours for a 16,384-GPU job and 0.23 hours (14 minutes) for a 131,072-GPU job; it observed 7.9 hours for 1,024-GPU jobs. [Certain] The Llama 3 numbers agree in size: 419 unexpected interruptions in 54 days is \(54 \times 24 / 419 = 3.09\) hours between unexpected stops. [Certain] Turned around: one GPU slot (GPU plus its share of host and network) fails on average only once every \(3.09 \times 16{,}384\) hours \(\approx 5.8\) years. Each part is reliable. The job is not.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Cause (Llama 3 405B, 54 days)</th><th>Share of the 419 unexpected interruptions</th></tr></thead><tbody>
+<tr><td>Faulty GPU</td><td>30.1%</td></tr>
+<tr><td>GPU HBM3 memory</td><td>17.2%</td></tr>
+<tr><td>Software bug</td><td>12.9%</td></tr>
+<tr><td>Network switch or cable</td><td>8.4%</td></tr>
+<tr><td>Unplanned host maintenance</td><td>7.6%</td></tr>
+<tr><td>GPU SRAM memory; GPU system processor</td><td>4.5%; 4.1%</td></tr>
+<tr><td>NCCL watchdog timeouts (cause unknown)</td><td>1.7%</td></tr>
+<tr><td>Silent data corruption</td><td>1.4% (6 events)</td></tr></tbody></table></div>
+<p>From Table 5 of the Llama 3 paper. [Certain] About 78% of the unexpected interruptions were confirmed or suspected hardware issues, and GPU issues alone were 58.7%. Only three needed significant manual work; automation handled the rest. [Certain] (The paper prints 148 interruptions for “Faulty GPU” next to 30.1%; 148 / 419 is 35.3%, so one of the two numbers has a typo. The category percentages add up to the 58.7% only with 30.1%.)</p>
+<p>Failures come in four kinds, from easy to hard:</p>
+<ul><li><b>Crash.</b> A process dies (a GPU “falls off the bus”, out of memory, a Python exception). The launcher sees it at once.</li>
+<li><b>Hang.</b> A rank stops making progress, for example a stalled NVLink transfer. Everyone else waits forever in the next collective. PyTorch’s NCCL process group has a <b>watchdog</b> with a timeout: by default 10 minutes for NCCL (30 for other backends), after which the collective is aborted and the process crashes. [Certain] Ten minutes of 16,384 idle GPUs is expensive, so large teams lower it and add heartbeats. [Likely]</li>
+<li><b>Straggler.</b> One slow GPU (overheating, throttled clock, a bad link) slows down thousands of others, because every collective waits for the slowest rank. Nothing crashes. Llama 3’s team noted that “even a single straggler can slow down thousands of other GPUs”. [Certain]</li>
+<li><b>Silent data corruption.</b> The hardware returns a wrong number with no error. The job continues, maybe with a damaged model. Its own section is below.</li></ul>
+
+<h2>How often to checkpoint</h2>
+<p>Checkpoint too rarely, and each failure throws away hours of work. Checkpoint too often, and you spend your time saving. Let \(\tau\) be the time between checkpoints. Each checkpoint stalls training for \(\delta\). When a failure comes, you lose the work since the last checkpoint (on average half an interval, \(\tau/2\)) plus the restart time \(R\) (find the failure, get a replacement node, start the processes, load the checkpoint). Failures arrive every \(M\) on average. The fraction of wall time wasted is then, to first order,</p>
+<div class="eq">\[ w(\tau) = \underbrace{\frac{\delta}{\tau}}_{\text{saving}} + \underbrace{\frac{R + \tau/2}{M}}_{\text{failures}}, \qquad \mathrm{ETTR} \approx 1 - w(\tau) \tag{51.5} \]</div>
+<p>The first term falls with \(\tau\), the second grows. Setting the derivative \(-\delta/\tau^2 + 1/(2M)\) to zero gives <b>Young’s formula</b> (1974): [Certain]</p>
+<div class="eq">\[ \tau^{*} = \sqrt{2\,\delta\,M}, \qquad w(\tau^{*}) = \sqrt{\frac{2\,\delta}{M}} + \frac{R}{M} \tag{51.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\tau, \tau^{*}\)</dt><dd>the checkpoint interval, and its best value</dd>
+<dt>\(\delta\)</dt><dd>how long one checkpoint <i>stalls</i> training. For an async save this is only the staging time.</dd>
+<dt>\(M\)</dt><dd>mean time between failures of the job, formula (51.4)</dd>
+<dt>\(R\)</dt><dd>restart cost: detection, rescheduling, process start-up, checkpoint load, warm-up (for example, <code>torch.compile</code> again)</dd></dl>
+<p>Two lessons hide in (51.6). The waste grows only with the <b>square root</b> of the stall \(\delta\), so making saves 100 times cheaper makes the best waste 10 times smaller. And the restart cost \(R\) does not depend on \(\tau\) at all: no checkpoint interval can fix a slow restart. The formula is a first-order estimate; it is good when \(\tau\) and \(\delta\) are much smaller than \(M\). Daly (2006) gives a more exact version. [Certain]</p>
+<div class="worked"><div class="wt">Worked example: the Llama 3 failure rate</div>
+<p>Take \(M = 3.09\) h \(= 11{,}135\) s (the Llama 3 rate of unexpected stops) and a restart cost \(R = 10\) min \(= 600\) s (an assumption).</p>
+<p><b>Synchronous saves</b>, \(\delta = 60\) s: \(\tau^{*} = \sqrt{2 \times 60 \times 11{,}135} = 1{,}156\) s \(\approx 19\) min. Waste \(= \sqrt{120 / 11{,}135} + 600/11{,}135 = 10.4\% + 5.4\% = 15.8\%\).</p>
+<p><b>Async saves</b>, \(\delta = 5\) s: \(\tau^{*} = \sqrt{2 \times 5 \times 11{,}135} = 334\) s \(\approx 5.6\) min. Waste \(= 3.0\% + 5.4\% = 8.4\%\).</p>
+<p>Now the restart cost is the larger part. To beat 90% ETTR, as Llama 3 did, you need cheap saves <i>and</i> fast restarts. That is exactly what Meta says they worked on: “we reduced job startup and checkpointing time”. [Certain] And note what a bad choice costs: saving every 3 hours with \(\delta = 60\) s gives \(w = 54\%\) by (51.5) (the formula is rough there, but the message is clear).</p></div>
+<figure class="fig" id="dc-young"><div class="fig-body">
+<div class="dc-grid">
+<label for="dc-yg-n">GPUs in the job</label><input type="range" id="dc-yg-n" min="7" max="17" step="1" value="14"><output id="dc-yg-nv"></output>
+<label for="dc-yg-r">Node failures per 1,000 node-days</label><input type="range" id="dc-yg-r" min="0.5" max="15" step="0.5" value="6.5"><output id="dc-yg-rv"></output>
+<label for="dc-yg-d">Stall per checkpoint δ</label><input type="range" id="dc-yg-d" min="0" max="12" step="1" value="8"><output id="dc-yg-dv"></output>
+<label for="dc-yg-R">Restart cost R</label><input type="range" id="dc-yg-R" min="0" max="60" step="1" value="10"><output id="dc-yg-Rv"></output>
+<label for="dc-yg-t">Checkpoint interval τ</label><input type="range" id="dc-yg-t" min="0" max="108" step="1" value="72"><output id="dc-yg-tv"></output></div>
+<div class="controls"><button type="button" class="btn primary" id="dc-yg-best">Set τ to Young’s optimum</button></div>
+<svg id="dc-yg-svg" viewBox="0 0 640 250" role="img" aria-label="Wasted fraction of time against checkpoint interval, with the optimum marked"></svg>
+<div class="dc-leg"><span style="--c:var(--k)">saving: δ/τ</span><span style="--c:var(--v)">lost work + restart: (R + τ/2)/M</span><span style="--c:var(--ink)">total waste</span></div>
+<div class="readout" id="dc-yg-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> The checkpoint interval trade-off, formulas (51.4) to (51.6), with 8 GPUs per node. The horizontal axis is the interval \(\tau\) on a log scale (1 minute to 8 hours). The dot is your choice; the ring is Young’s optimum.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The defaults are a 16,384-GPU job at Meta’s measured failure rate: MTTF 1.80 h. Saving every hour with a 60 s stall wastes 38.6%. Press the button: τ* is 14.7 min and the waste drops to 22.8%. Now set δ to 5 s (async): the optimum moves to 4.2 min and the waste to 13.2%, most of it the 10 min restart. Set R to 2 min and you are near 6%. Slide the GPUs to 131,072: MTTF falls to 13.5 min, and even good settings waste a lot. That is why the biggest jobs need in-memory checkpoints and very fast restarts, or training that continues without the failed part.</p></details></figure>
+
+<h2>Restart and elastic training</h2>
+<p>Most frameworks handle a failure with <b>stop everything and restart from the last checkpoint</b>. It sounds crude, but it is simple and correct. The work is in making each stage fast:</p>
+<figure class="fig wide" id="dc-loop"><div class="fig-body">
+<div class="scroll-x"><svg id="dc-loop-svg" viewBox="0 0 780 250" role="img" aria-label="The failure recovery loop: detect, localize, replace, restart, load, resume">
+<defs><marker id="dc-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted)"/></marker></defs>
+<g font-size="13">
+<rect x="20" y="30" width="170" height="78" rx="10" fill="var(--q-soft)" stroke="var(--q)"/><text x="105" y="54" text-anchor="middle" font-weight="700" fill="var(--ink)">1. Train</text><text x="105" y="74" text-anchor="middle" fill="var(--ink2)" font-size="12">save every τ (async)</text><text x="105" y="92" text-anchor="middle" fill="var(--ink2)" font-size="12">health metrics, heartbeats</text>
+<rect x="215" y="30" width="170" height="78" rx="10" fill="var(--k-soft)" stroke="var(--k)"/><text x="300" y="54" text-anchor="middle" font-weight="700" fill="var(--ink)">2. Detect</text><text x="300" y="74" text-anchor="middle" fill="var(--ink2)" font-size="12">crash, NCCL timeout,</text><text x="300" y="92" text-anchor="middle" fill="var(--ink2)" font-size="12">NaN loss, slow steps</text>
+<rect x="410" y="30" width="170" height="78" rx="10" fill="var(--k-soft)" stroke="var(--k)"/><text x="495" y="54" text-anchor="middle" font-weight="700" fill="var(--ink)">3. Localize</text><text x="495" y="74" text-anchor="middle" fill="var(--ink2)" font-size="12">flight recorder dumps,</text><text x="495" y="92" text-anchor="middle" fill="var(--ink2)" font-size="12">node health checks</text>
+<rect x="605" y="30" width="155" height="78" rx="10" fill="var(--v-soft)" stroke="var(--v)"/><text x="682" y="54" text-anchor="middle" font-weight="700" fill="var(--ink)">4. Replace</text><text x="682" y="74" text-anchor="middle" fill="var(--ink2)" font-size="12">cordon bad node,</text><text x="682" y="92" text-anchor="middle" fill="var(--ink2)" font-size="12">take a hot spare</text>
+<rect x="410" y="150" width="170" height="78" rx="10" fill="var(--v-soft)" stroke="var(--v)"/><text x="495" y="174" text-anchor="middle" font-weight="700" fill="var(--ink)">5. Restart</text><text x="495" y="194" text-anchor="middle" fill="var(--ink2)" font-size="12">rendezvous, new ranks,</text><text x="495" y="212" text-anchor="middle" fill="var(--ink2)" font-size="12">process groups, compile</text>
+<rect x="215" y="150" width="170" height="78" rx="10" fill="var(--q-soft)" stroke="var(--q)"/><text x="300" y="174" text-anchor="middle" font-weight="700" fill="var(--ink)">6. Load</text><text x="300" y="194" text-anchor="middle" fill="var(--ink2)" font-size="12">latest complete step-N,</text><text x="300" y="212" text-anchor="middle" fill="var(--ink2)" font-size="12">reshard if layout changed</text>
+<rect x="20" y="150" width="170" height="78" rx="10" fill="none" stroke="var(--rule)" stroke-dasharray="5 4"/><text x="105" y="174" text-anchor="middle" font-weight="700" fill="var(--ink)">Lost: τ/2 + R</text><text x="105" y="194" text-anchor="middle" fill="var(--ink2)" font-size="12">work since last save</text><text x="105" y="212" text-anchor="middle" fill="var(--ink2)" font-size="12">plus steps 2 to 6</text>
+</g>
+<g stroke="var(--muted)" stroke-width="1.8" fill="none" marker-end="url(#dc-arr)"><path d="M190 69 H212"/><path d="M385 69 H407"/><path d="M580 69 H602"/><path d="M682 108 V189 H583"/><path d="M410 189 H388"/><path d="M300 150 V129 H105 V111"/></g>
+</svg></div>
+</div><figcaption><b>Figure 4.</b> The failure recovery loop. Steps 2 to 6 together are the restart cost \(R\) of formula (51.5). Every minute saved here is worth as much as a minute of saved checkpoint stall per failure.</figcaption></figure>
+<ul><li><b>Detect.</b> Crashes are seen at once. Hangs are seen by the watchdog timeout. Slow steps and NaN losses need your own monitoring.</li>
+<li><b>Localize.</b> Which of 16,384 GPUs is the culprit? PyTorch’s <b>NCCL flight recorder</b> keeps the last collectives of every rank in a ring buffer and dumps them on a timeout; the rank that never entered the collective is the suspect. Llama 3 used it heavily. [Certain]</li>
+<li><b>Replace and restart.</b> Keep a few <b>hot spare</b> nodes ready, so a restart does not wait for a repair. The launcher forms a new group by <b>rendezvous</b>: the surviving and new workers meet at a known address, get new ranks, and build the process groups again.</li></ul>
+<p><b>Elastic training</b> goes one step further: the job may continue with a <i>different</i> number of nodes. PyTorch’s launcher supports it with <code>torchrun --nnodes=MIN:MAX --max-restarts=K</code>. Its behavior is still stop-and-restart: “On failures or membership changes ALL surviving workers are killed immediately”, a new worker group is formed with new <code>RANK</code> and <code>WORLD_SIZE</code>, and your script must reload its last checkpoint. [Certain] That is why resharding matters: the new world size is different.</p>
+<p>Changing the number of data-parallel ranks changes the math of training, not just the layout. If each rank keeps its micro-batch, the global batch shrinks, and the learning rate and schedule that were tuned for the old batch are now wrong. The usual fix is to keep the <b>global batch fixed</b> and change gradient accumulation (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>): with \(B_{\text{global}} = W \cdot b \cdot A\), losing ranks means more accumulation steps \(A\) per optimizer step. The run becomes slower but stays the same run. [Likely]</p>
+<div class="algo"><div class="algo-h">Algorithm 3: a fault-tolerant training loop</div><ol>
+<li><b>input:</b> checkpoint folder, interval \(\tau\) (in steps), target global batch \(B\)</li>
+<li>join the rendezvous; get rank \(r\) and world size \(W\); build the model and optimizer sharded over \(W\)</li>
+<li>\(A \leftarrow B / (W \cdot b)\) <span class="c">// keep the global batch fixed when \(W\) changes</span></li>
+<li><b>if</b> a complete checkpoint exists: load the newest one with resharding (Algorithm 2); <b>else</b> initialize from a seed</li>
+<li><b>loop:</b> wait for the previous async write if a new save is due; run one optimizer step; log loss, gradient norm, step time</li>
+<li>&nbsp;&nbsp;<b>if</b> the loss is NaN or a health check fails: stop and let the launcher restart from the last good checkpoint</li>
+<li>&nbsp;&nbsp;<b>if</b> step mod \(\tau = 0\): async save (Algorithm 1), staging only blocks</li>
+<li>on any crash or timeout, the launcher kills all workers, replaces the bad node, and starts again at line 2</li></ol></div>
+<aside class="note analogy side"><span class="nt">Analogy</span>A long-distance relay race on a track with many runners holding one rope. If one runner falls, everybody must stop. The team marks the position on the track every lap (checkpoint). When someone falls, a reserve runner (hot spare) takes the place, the team walks back to the last mark, and runs again. A fast team does not fall less; it marks often and restarts quickly.</aside>
+<p>Stop-and-restart is not the only design. Newer systems try to keep the healthy part of the job running: for example, when one data-parallel replica fails, the others continue for a few steps with a smaller batch while it rejoins. PyTorch’s <code>torchft</code> project explores this per-step fault tolerance. [Likely] It is still less common than plain restarts in large pretraining. [Speculation]</p>
+
+<h2>Silent data corruption</h2>
+<p><b>Silent data corruption</b> (SDC) means the hardware gives a wrong result and raises no error: no crash, no ECC alarm, no exception. A defective core may compute a wrong multiply once in a billion operations, often only at a certain temperature or voltage. In a training run, a wrong number in one GPU’s gradient gets all-reduced into everyone’s weights. The job continues, but the model may be damaged, or a loss spike appears hours later with no visible cause.</p>
+<p>How common is it? Meta’s fleet study “Silent Data Corruptions at Scale” found hundreds of defective CPUs among hundreds of thousands of machines. [Certain] For Gemini, Google wrote that “we can expect SDC events to impact training every week or two”. [Certain] In Llama 3’s 54 days, 6 interruptions were attributed to SDC. [Certain] Rare per chip, but certain for a large job.</p>
+<p>Detection tools, from cheap to expensive:</p>
+<ul><li><b>Watch the training signals.</b> Sudden spikes in the loss or the gradient norm, or NaN and Inf values. Cheap, but it cannot tell a hardware error from a normal loss spike (<a href="../pretraining/training-recipe-and-stability.html">session 36</a>).</li>
+<li><b>Compare replicas.</b> With data parallelism, all replicas should hold <b>bit-identical</b> weights after each step: they apply the same averaged gradient to the same weights. A checksum of the parameters, compared across replicas from time to time, catches a replica that drifted. [Likely]</li>
+<li><b>Deterministic replay.</b> If the training step is deterministic, you can run the same step again (on the same or other hardware) and compare the result bit by bit. A mismatch points to a faulty device. Gemini’s team detected and removed faulty hardware with techniques “that exploit deterministic replay”, plus “proactive SDC scanners on idle machines”. [Certain]</li>
+<li><b>Scan machines.</b> Run known computations with known answers on idle or suspect nodes, and remove nodes that fail.</li></ul>
+<p>A checkpoint policy helps too: keep several older checkpoints, not only the latest. If corruption is found late, you need a checkpoint from <i>before</i> it happened.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Deterministic replay needs a deterministic step. Atomic adds in some kernels, non-deterministic reduction orders and data loading with random timing break bitwise equality. Teams that rely on replay must pay for determinism (and test it, like the bit-exact resume in the code below).</aside>
+
+<h2>MFU: how to compute it correctly</h2>
+<p>Recall from <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>: MFU is the model’s useful FLOP/s divided by the peak. For one GPU, in a data-parallel job,</p>
+<div class="eq">\[ \mathrm{MFU} = \frac{\text{tokens/s per GPU} \times F_{\text{token}}}{P}, \qquad F_{\text{token}} = 6\,N_{\text{ne}} + 12\,L\,d\,T \tag{51.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(F_{\text{token}}\)</dt><dd>useful training FLOPs per token: forward plus backward, from the model shape, not from a hardware counter</dd>
+<dt>\(N_{\text{ne}}\)</dt><dd>the parameters that do matrix multiplications: all parameters <b>minus the input embedding table</b> (a lookup does no FLOPs). The output head stays in.</dd>
+<dt>\(12\,L\,d\,T\)</dt><dd>attention scores and the weighted sum of values, forward and backward, for \(L\) layers of width \(d\) and sequence length \(T\)</dd>
+<dt>\(P\)</dt><dd>the dense peak of one GPU for the data type you train in (989 TFLOP/s BF16 for H100 SXM)</dd></dl>
+<p>The details are conventions, and they change the answer, so say which ones you use. torchtitan, for example, excludes the embedding table from \(N\), counts attention as \(12 L d T\) without halving it for the causal mask, and does not count the extra matmul that FlashAttention recomputes in the backward pass. [Certain] Recomputed FLOPs (activation checkpointing) count in <b>HFU</b> (hardware FLOPs utilization), never in MFU.</p>
+<div class="worked"><div class="wt">Worked example: one measurement, three MFU numbers</div>
+<p>You train Llama 3 8B on H100s with \(T = 8{,}192\). Each GPU processes 2 sequences per step (16,384 tokens), and one step takes 2.0 s: 8,192 tokens/s per GPU.</p>
+<p><b>Only \(6N\) with all 8,030,261,248 parameters:</b> \(6N = 4.82 \times 10^{10}\), so \(8{,}192 \times 4.82 \times 10^{10} / 989 \times 10^{12} = 39.9\%\).</p>
+<p><b>torchtitan convention:</b> \(N_{\text{ne}} = 8{,}030{,}261{,}248 - 128{,}256 \times 4{,}096 = 7{,}504{,}924{,}672\). Attention: \(12 \times 32 \times 4{,}096 \times 8{,}192 = 1.29 \times 10^{10}\). \(F_{\text{token}} = 4.50 \times 10^{10} + 1.29 \times 10^{10} = 5.79 \times 10^{10}\), and MFU \(= 48.0\%\).</p>
+<p><b>\(6N\) with all parameters plus attention:</b> 50.6%. Same job, same speed, 40% to 51%. Before you compare your MFU with a paper, check the formula. torchtitan reports 33% to 42% MFU for Llama 3.1 8B on 8 or 128 H100s without Float8. [Certain]</p></div>
+<h3>How to read an MFU number</h3>
+<ul><li><b>It is a ratio, so check both parts.</b> Use the dense peak, never the “with sparsity” number, and the peak of the data type you really use. With FP8 matmuls the right peak is unclear (some layers run in BF16), and torchtitan does not report MFU for Float8 runs because “the definition of MFU under such scenario is not well-defined”. [Certain] Compare tokens per second instead.</li>
+<li><b>MFU is measured while running.</b> It says nothing about the hours lost to failures. Combine it with ETTR (51.1): 40% MFU × 90% ETTR = 36% of the paid compute becomes training.</li>
+<li><b>Big runs are in the 35–50% range, not 80%.</b> PaLM 540B reached 46.2%, Llama 3 405B 38% to 43% (<a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>). [Certain] If you see 70% for a dense model, suspect the formula; if you see 15%, look for exposed communication, small micro-batches, or a slow data loader.</li>
+<li><b>MFU is per configuration.</b> Short sequences, small models and small micro-batches give lower MFU because matmuls are smaller and fixed costs weigh more. Report it with model, sequence length, batch per GPU and number of GPUs.</li></ul>
+<div class="algo"><div class="algo-h">Algorithm 4: measure MFU (and HFU) in a real job</div><ol>
+<li><b>input:</b> model shape \((N_{\text{ne}}, L, d)\), sequence length \(T\), peak \(P\), GPUs \(n\)</li>
+<li>\(F_{\text{token}} \leftarrow 6 N_{\text{ne}} + 12 L d T\) <span class="c">// state the convention</span></li>
+<li>skip the first steps (compile, warm-up); then time \(K\) steps with <code>torch.cuda.synchronize()</code> before reading the clock</li>
+<li>tokens/s per GPU \(\leftarrow\) (tokens in \(K\) global batches, padding excluded) / (time \(\times\, n\))</li>
+<li>MFU \(\leftarrow\) tokens/s per GPU \(\times F_{\text{token}} / P\)</li>
+<li>HFU \(\leftarrow\) the same with the FLOPs actually run (add recomputed forward passes)</li>
+<li>log both every few hundred steps; a drop in MFU over time means stragglers, thermal throttling or a slower data loader</li></ol></div>
+
+<h2>Overlapping communication with compute</h2>
+<p>Where does MFU go? A big part is communication that the GPU waits for. <a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">Session 43</a> and <a href="../pretraining/fsdp-version-1.html">session 46</a> showed the mechanism: run collectives on a second CUDA stream, and start them early enough. Here is the question that decides whether it works: <b>is each transfer shorter than the compute it hides behind?</b></p>
+<div class="eq">\[ T_{\text{step}} = T_{\text{comp}} + T_{\text{exposed}}, \qquad T_{\text{exposed}} \approx \sum_i \max\big(0,\ t^{\text{comm}}_i - t^{\text{comp}}_i\big) + t_{\text{first}} + t_{\text{last}} \tag{51.8} \]</div>
+<p>Take FSDP with \(F\) GPUs. Before block \(i\) runs, its weights (\(\psi\) parameters, 2 bytes each in BF16) are all-gathered. While that happens, block \(i-1\) computes on the \(b\) tokens that this GPU holds. The all-gather takes \(2\psi\,(F-1)/(F B)\) seconds at bus bandwidth \(B\); the forward matmuls take \(2\psi b/(P u)\) seconds at compute efficiency \(u\). The transfer is hidden when</p>
+<div class="eq">\[ \frac{2\psi}{B}\cdot\frac{F-1}{F} \le \frac{2\psi\, b}{P\,u} \quad\Longleftrightarrow\quad b \ \ge\ b_{\min} = \frac{P\,u}{B}\cdot\frac{F-1}{F} \tag{51.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(b\)</dt><dd>tokens per GPU per micro-step (micro-batch size × sequence length)</dd>
+<dt>\(B\)</dt><dd>bus bandwidth per GPU for this collective (for example, about 50 GB/s for one 400 Gb/s network card per GPU)</dd>
+<dt>\(u\)</dt><dd>the fraction of peak that the matmuls reach while they run</dd>
+<dt>\(\psi\)</dt><dd>parameters of one block. It cancels out: the condition does not depend on model size.</dd></dl>
+<p>The backward pass gives the same condition: twice the compute (\(4\psi b\)) and twice the transfers (all-gather and reduce-scatter). With \(P = 989\) TFLOP/s, \(u = 0.6\), \(B = 50\) GB/s and \(F = 64\), you need \(b \ge 11{,}700\) tokens per GPU. Below that, FSDP is <b>communication-bound</b>: more GPUs with smaller batches each will not train faster. This is the same kind of “compute per byte” argument as the roofline in <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>, applied to the network; the scaling book <i>How to Scale Your Model</i> uses it for every parallelism. [Likely] Figure 5 runs the full schedule.</p>
+<figure class="fig" id="dc-ovl"><div class="fig-body">
+<div class="controls"><label class="sl"><input type="checkbox" id="dc-ov-on" checked> Overlap (prefetch next all-gather)</label></div>
+<div class="dc-grid">
+<label for="dc-ov-b">Tokens per GPU per step b</label><input type="range" id="dc-ov-b" min="0" max="16" step="1" value="10"><output id="dc-ov-bv"></output>
+<label for="dc-ov-B">Bus bandwidth per GPU B</label><input type="range" id="dc-ov-B" min="0" max="6" step="1" value="2"><output id="dc-ov-Bv"></output>
+<label for="dc-ov-u">Matmul efficiency u</label><input type="range" id="dc-ov-u" min="0.3" max="0.9" step="0.05" value="0.6"><output id="dc-ov-uv"></output></div>
+<svg id="dc-ov-svg" viewBox="0 0 640 250" role="img" aria-label="MFU against tokens per GPU, with and without overlap"></svg>
+<div class="dc-leg"><span style="--c:var(--q)">MFU with overlap</span><span style="--c:var(--k)">MFU without overlap</span><span style="--c:var(--muted)">b_min, formula (51.9)</span></div>
+<div class="readout" id="dc-ov-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> A schedule simulation of one FSDP training step for Llama 3 8B (32 blocks of 218.1M parameters, \(T = 8192\)) on 64 H100s. Forward: all-gather each block before it runs; backward: all-gather and reduce-scatter per block, all on one communication stream. The curves show MFU (torchtitan convention) against \(b\); the dot is the current setting. Embedding and head communication, the optimizer step and data loading are ignored.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Defaults: \(b = 16{,}384\), 50 GB/s, \(u = 0.6\). With overlap the step takes 1.625 s for 1.599 s of compute: MFU 59.1%, close to the 60% ceiling set by \(u\). Uncheck overlap: 0.82 s of communication is exposed and MFU falls to 39.6%. Turn overlap back on and slide \(b\) down to 4,096: now each all-gather (8.6 ms) is longer than a block’s forward (4.2 ms), and MFU falls to 29%. Change the bandwidth to 450 GB/s (NVLink-class) and the curve stays near 58% down to about 1,000 tokens. The knee sits a little to the left of the \(b_{\min}\) line: (51.9) counts only the weight matmuls, but attention adds compute (it needs no gathered weights) that also hides transfers. So (51.9) is a safe, slightly pessimistic bound.</p></details></figure>
+<p>Overlap appears in every part of a training system:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>What is hidden</th><th>Behind what</th><th>Mechanism</th></tr></thead><tbody>
+<tr><td>DDP gradient all-reduce</td><td>the rest of the backward pass</td><td>gradient buckets that start as soon as they are full (<a href="../pretraining/data-parallelism-ddp.html">session 44</a>)</td></tr>
+<tr><td>FSDP all-gather / reduce-scatter</td><td>the previous / next block’s compute</td><td>prefetching, formula (51.9)</td></tr>
+<tr><td>Tensor-parallel all-gather and reduce-scatter</td><td>pieces of the same matmul</td><td>split the matmul into chunks; torchtitan’s async TP raised Llama 3.1 70B on 256 H100s from 897 to 1,010 tokens/s per GPU (+12.6%), on top of compile and Float8 [Certain]</td></tr>
+<tr><td>Pipeline sends between stages</td><td>other micro-batches</td><td>1F1B and interleaved schedules (<a href="../pretraining/pipeline-context-and-expert-parallelism-3d-and.html">session 49</a>)</td></tr>
+<tr><td>Checkpoint writes</td><td>the next training steps</td><td>async save (Figure 2)</td></tr>
+<tr><td>Data loading and host-to-device copies</td><td>the current step</td><td>loader workers, prefetching, pinned memory, non-blocking copies</td></tr></tbody></table></div>
+<p>Overlap is not free. Communication kernels use some SMs and memory bandwidth, so the compute next to them runs a bit slower; and prefetching holds more data in memory at once. [Likely] The only way to see if overlap really happens is a profiler trace (<a href="../pretraining/making-training-fast-compile-cuda-graphs-fused.html">session 50</a>, <a href="../pretraining/lab-ddp-vs-fsdp2-and-reading-a.html">session 52</a>).</p>
+
+<h2>The code: sharded save, resharded load, exact resume</h2>
+<p>This program runs on a CPU in under a second and needs only PyTorch. Part 1 and 2 are a tiny version of Algorithms 1 and 2: four “ranks” each save their slice of a flat parameter vector, plus a metadata file and an atomic rename; then three new “ranks” load it by reading only the overlapping pieces. Part 3 shows why the optimizer and RNG states belong in a checkpoint: a crash-and-resume run matches an uninterrupted run bit for bit, and a weights-only resume does not.</p>
+<pre class="code"><span class="kw2">import</span> json, os, shutil, torch, torch.nn <span class="kw2">as</span> nn
+
+torch.manual_seed(0)
+ROOT = <span class="st">"ckpt_demo"</span>; shutil.rmtree(ROOT, ignore_errors=<span class="kw2">True</span>)
+
+<span class="kw2">def</span> make_model():
+    torch.manual_seed(0)
+    <span class="kw2">return</span> nn.Sequential(nn.Linear(8, 16), nn.GELU(), nn.Linear(16, 4))
+
+<span class="kw2">def</span> flat(model):                      <span class="cm"># one long vector, like a FlatParameter</span>
+    <span class="kw2">return</span> torch.cat([p.detach().reshape(-1) <span class="kw2">for</span> p <span class="kw2">in</span> model.parameters()])
+
+<span class="kw2">def</span> shard_range(n, world, rank):      <span class="cm"># equal slices, last one may be shorter</span>
+    size = -(-n // world)             <span class="cm"># ceil(n / world)</span>
+    lo = min(rank * size, n); hi = min(lo + size, n)
+    <span class="kw2">return</span> lo, hi
+
+<span class="cm"># ---- 1. save: each of W "ranks" writes only its own slice ----</span>
+<span class="kw2">def</span> save_sharded(vec, world, step):
+    d = f<span class="st">"{ROOT}/step-{step}.tmp"</span>; os.makedirs(d)
+    files = []
+    <span class="kw2">for</span> r <span class="kw2">in</span> range(world):            <span class="cm"># in a real job these run in parallel</span>
+        lo, hi = shard_range(vec.numel(), world, r)
+        torch.save(vec[lo:hi].clone(), f<span class="st">"{d}/rank{r}.pt"</span>)
+        files.append({<span class="st">"file"</span>: f<span class="st">"rank{r}.pt"</span>, <span class="st">"lo"</span>: lo, <span class="st">"hi"</span>: hi})
+    json.dump({<span class="st">"numel"</span>: vec.numel(), <span class="st">"files"</span>: files}, open(f<span class="st">"{d}/.metadata"</span>, <span class="st">"w"</span>))
+    os.rename(d, f<span class="st">"{ROOT}/step-{step}"</span>)   <span class="cm"># commit: the folder appears only when complete</span>
+    <span class="kw2">return</span> f<span class="st">"{ROOT}/step-{step}"</span>
+
+<span class="cm"># ---- 2. load on a DIFFERENT world size: read only overlapping pieces ----</span>
+<span class="kw2">def</span> load_resharded(path, world, rank):
+    meta = json.load(open(f<span class="st">"{path}/.metadata"</span>))
+    lo, hi = shard_range(meta[<span class="st">"numel"</span>], world, rank)
+    out, reads = torch.empty(hi - lo), []
+    <span class="kw2">for</span> f <span class="kw2">in</span> meta[<span class="st">"files"</span>]:
+        a, b = max(lo, f[<span class="st">"lo"</span>]), min(hi, f[<span class="st">"hi"</span>])
+        <span class="kw2">if</span> a &lt; b:                     <span class="cm"># this saved file overlaps my new slice</span>
+            piece = torch.load(f<span class="st">"{path}/{f['file']}"</span>)
+            out[a - lo:b - lo] = piece[a - f[<span class="st">"lo"</span>]:b - f[<span class="st">"lo"</span>]]
+            reads.append(f[<span class="st">"file"</span>])
+    <span class="kw2">return</span> out, reads
+
+model = make_model(); vec = flat(model)
+path = save_sharded(vec, world=4, step=100)
+parts = []
+<span class="kw2">for</span> r <span class="kw2">in</span> range(3):
+    piece, reads = load_resharded(path, world=3, rank=r)
+    print(f<span class="st">"new rank {r} of 3 reads {reads}"</span>)
+    parts.append(piece)
+print(<span class="st">"numel"</span>, vec.numel(), <span class="st">"resharded 4 -&gt; 3 equal:"</span>, torch.equal(torch.cat(parts), vec))
+
+<span class="cm"># ---- 3. exact resume: model + optimizer + RNG + step must all be saved ----</span>
+<span class="kw2">def</span> batch(gen):
+    x = torch.randn(32, 8, generator=gen); <span class="kw2">return</span> x, x[:, :4].sin()
+
+<span class="kw2">def</span> train(model, opt, gen, steps):
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(steps):
+        x, y = batch(gen)
+        loss = nn.functional.mse_loss(model(x), y)
+        opt.zero_grad(); loss.backward(); opt.step()
+    <span class="kw2">return</span> loss.item()
+
+<span class="kw2">def</span> fresh():
+    m = make_model()
+    o = torch.optim.AdamW(m.parameters(), lr=1e-2, weight_decay=0.1)
+    g = torch.Generator().manual_seed(1)
+    <span class="kw2">return</span> m, o, g
+
+m, o, g = fresh(); train(m, o, g, 6); straight = flat(m)
+
+m, o, g = fresh(); train(m, o, g, 3)
+torch.save({<span class="st">"model"</span>: m.state_dict(), <span class="st">"optim"</span>: o.state_dict(),
+            <span class="st">"rng"</span>: g.get_state(), <span class="st">"step"</span>: 3}, f<span class="st">"{ROOT}/full.pt"</span>)
+<span class="kw2">del</span> m, o, g                           <span class="cm"># the job "crashes"</span>
+m, o, g = fresh()
+ck = torch.load(f<span class="st">"{ROOT}/full.pt"</span>)
+m.load_state_dict(ck[<span class="st">"model"</span>]); o.load_state_dict(ck[<span class="st">"optim"</span>]); g.set_state(ck[<span class="st">"rng"</span>])
+train(m, o, g, 6 - ck[<span class="st">"step"</span>])
+print(<span class="st">"resume is bit-exact:"</span>, torch.equal(flat(m), straight))
+
+m, o, g = fresh(); train(m, o, g, 3)
+m2 = make_model(); m2.load_state_dict(m.state_dict())           <span class="cm"># forgot optimizer + RNG</span>
+o2 = torch.optim.AdamW(m2.parameters(), lr=1e-2, weight_decay=0.1)
+g2 = torch.Generator().manual_seed(1)
+train(m2, o2, g2, 3)
+print(<span class="st">"weights-only resume is exact:"</span>, torch.equal(flat(m2), straight),
+      <span class="st">" max diff %.4f"</span> % (flat(m2) - straight).abs().max().item())
+
+<span class="cm"># new rank 0 of 3 reads ['rank0.pt', 'rank1.pt']</span>
+<span class="cm"># new rank 1 of 3 reads ['rank1.pt', 'rank2.pt']</span>
+<span class="cm"># new rank 2 of 3 reads ['rank2.pt', 'rank3.pt']</span>
+<span class="cm"># numel 212 resharded 4 -&gt; 3 equal: True</span>
+<span class="cm"># resume is bit-exact: True</span>
+<span class="cm"># weights-only resume is exact: False  max diff 0.0342</span></pre>
+<p>With a real sharded model, you do not write this yourself: you use DCP. It also works in a single process (no process group), which is handy for tests and for converting checkpoints. This was run with PyTorch 2.8:</p>
+<pre class="code"><span class="kw2">import</span> os, shutil, torch, torch.nn <span class="kw2">as</span> nn
+<span class="kw2">import</span> torch.distributed.checkpoint <span class="kw2">as</span> dcp
+
+torch.manual_seed(0)
+model = nn.Sequential(nn.Linear(8, 16), nn.GELU(), nn.Linear(16, 4))
+opt = torch.optim.AdamW(model.parameters(), lr=1e-2)
+model(torch.randn(4, 8)).sum().backward(); opt.step()        <span class="cm"># create Adam states</span>
+
+shutil.rmtree(<span class="st">"dcp_ckpt"</span>, ignore_errors=<span class="kw2">True</span>)
+state = {<span class="st">"model"</span>: model.state_dict(), <span class="st">"optim"</span>: opt.state_dict()}
+dcp.save(state, checkpoint_id=<span class="st">"dcp_ckpt/step-1"</span>)               <span class="cm"># no process group: one rank</span>
+print(sorted(os.listdir(<span class="st">"dcp_ckpt/step-1"</span>)))
+
+model2 = nn.Sequential(nn.Linear(8, 16), nn.GELU(), nn.Linear(16, 4))
+target = {<span class="st">"model"</span>: model2.state_dict()}                        <span class="cm"># load IN PLACE into these tensors</span>
+dcp.load(target, checkpoint_id=<span class="st">"dcp_ckpt/step-1"</span>)
+print(all(torch.equal(a, b) <span class="kw2">for</span> a, b <span class="kw2">in</span> zip(model.state_dict().values(), model2.state_dict().values())))
+
+<span class="cm"># ['.metadata', '__0_0.distcp']</span>
+<span class="cm"># True</span></pre>
+<p>In a real FSDP2 job, the state dict holds <code>DTensor</code> shards, and the same two calls save and load in parallel on all ranks. Use <code>get_state_dict</code> / <code>set_state_dict</code> from <code>torch.distributed.checkpoint.state_dict</code> to get model and optimizer state dicts that can be resharded. [Certain] To make one file for inference, convert with <code>python -m torch.distributed.checkpoint.format_utils dcp_to_torch step-N/ model.pt</code>. [Certain]</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What matters most</th><th>Typical choice</th></tr></thead><tbody>
+<tr><td>Pretraining an LLM on thousands of GPUs</td><td>ETTR and MFU at once</td><td>sharded async checkpoints every few minutes to tens of minutes, hot spares, flight recorder, MFU logging [Likely]</td></tr>
+<tr><td>Fine-tuning on one 8-GPU node</td><td>simple, portable checkpoints</td><td>DCP during training, one safetensors file at the end for serving</td></tr>
+<tr><td>Changing the cluster mid-run (more nodes arrive, a rack fails)</td><td>loading on a new layout</td><td>DCP resharding; keep the global batch fixed with accumulation</td></tr>
+<tr><td>Vision-language model training (vision encoder + LLM)</td><td>parts with different sharding; frozen parts</td><td>save only the trainable parts often; the frozen vision tower is saved once</td></tr>
+<tr><td>Video models (video classification, action recognition, video-text retrieval encoders for Video-RAG)</td><td>long sequences of frame tokens; data loading is often the bottleneck</td><td>overlap decoding and loading with compute; checkpoint the data position as a global sample index, because video datasets are huge and expensive to replay [Likely]</td></tr>
+<tr><td>Long RL or post-training runs</td><td>several models (policy, reference, reward) in one job</td><td>one checkpoint per model plus the shared step and data state</td></tr>
+<tr><td>Comparing training systems or hardware</td><td>a fair speed number</td><td>MFU with a stated formula, or tokens/s per GPU for FP8 runs</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Saving only the weights.</b> The resume then starts Adam from zero and repeats or skips data. The code above shows the drift. Save optimizer, scheduler, step, data position and RNG states.</li>
+<li><b>Gathering the full state to rank 0 for every save.</b> It is slow, it can run rank 0 out of CPU memory, and all other GPUs wait. Save sharded; gather only once at the end for export.</li>
+<li><b>No atomic commit.</b> A crash during a save leaves a broken “latest” checkpoint, and the restart crashes too. Write the metadata last, rename at the end, and keep the last few complete checkpoints.</li>
+<li><b>Choosing the checkpoint interval by habit</b> (“every 1,000 steps”). Compute it from (51.6) with your real stall time and failure rate, and recompute when the job grows.</li>
+<li><b>Ignoring the restart cost.</b> If a restart takes 20 minutes (scheduling, compile, loading), no checkpoint interval saves you. Measure \(R\) and work on it.</li>
+<li><b>Storing per-rank data positions</b> and then changing the world size. Store a global position.</li>
+<li><b>Reporting MFU without the formula</b>, with the sparse peak, or counting recomputation. The same run can be 40% or 51% (worked example above).</li>
+<li><b>Assuming overlap happens.</b> If \(b \lt b_{\min}\) (51.9), or a collective is waited on too early, communication is exposed. Check the trace.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why not just call torch.save on rank 0 for a model sharded over 1,024 GPUs?<span class="lvl">basic</span></summary><div class="ans">Rank 0 would have to gather all shards first: for a 70B model with Adam that is about 847 GB (12 bytes per parameter) through one process and one network link, needing that much CPU memory, and then write it alone. That takes minutes while 1,023 GPUs wait. A sharded checkpoint lets every rank write its own 0.83 GB in parallel, plus a small metadata file, so the time is set by the total storage bandwidth (seconds), not by one writer.</div></details>
+<details class="qa"><summary>What must a checkpoint contain so that training resumes exactly?<span class="lvl">basic</span></summary><div class="ans">The FP32 master weights, the optimizer state (Adam’s \(m\) and \(v\)), the step counter and LR scheduler state, the data loader position, the RNG states of every rank, the loss scaler for FP16, and the config. Not the gradients: you save between steps. Without the optimizer state Adam restarts with zero moments and a wrong bias correction, and the loss usually jumps. Without the data position you repeat or skip data. Without RNG states dropout and shuffling differ. A good test: resume from a checkpoint and compare with an uninterrupted run; with deterministic kernels they should match bit for bit.</div></details>
+<details class="qa"><summary>How does load-time resharding work?<span class="lvl">core</span></summary><div class="ans">The checkpoint metadata describes every saved piece by its global position in the tensor (offsets and lengths), not by rank. At load time, you first build the model on the new layout; each new rank knows the global range of each of its shards. For every saved piece that overlaps that range, it reads exactly the overlap and copies it into its shard in place (formula 51.3). Example: 24 elements saved on 4 ranks (6 each), loaded on 3 (8 each): new rank 1 needs 8 to 15, so it reads 8 to 11 from file 1 and 12 to 15 from file 2. DCP does this per tensor, also for 2-D pieces from tensor parallelism. Non-tensor state like the data position must be stored in a layout-independent way.</div></details>
+<details class="qa"><summary>How often should you checkpoint?<span class="lvl">core</span></summary><div class="ans">Balance saving cost against lost work. The waste fraction is \(\delta/\tau + (R + \tau/2)/M\), with stall \(\delta\), interval \(\tau\), restart cost \(R\) and job MTTF \(M\). The minimum is at Young’s \(\tau^{*} = \sqrt{2\delta M}\), with waste \(\sqrt{2\delta/M} + R/M\). Example: \(M = 3.09\) h (Llama 3), \(\delta = 60\) s gives \(\tau^{*} \approx 19\) min and about 10.4% waste from saving and lost work, plus \(R/M\). Since \(M\) shrinks as the job grows, recompute the interval when you scale up, and make saves cheaper (async) because the waste grows with \(\sqrt{\delta}\).</div></details>
+<details class="qa"><summary>Why does a 16,384-GPU job fail every few hours if each GPU is reliable?<span class="lvl">basic</span></summary><div class="ans">Synchronous training needs every component at every step, so one failure anywhere stops the job. With independent failures, the job’s failure rate is the sum of the parts’ rates: \(M_{\text{job}} = 1/(N_{\text{nodes}} r_f)\). Meta measured 6.5 failures per 1,000 node-days; 2,048 nodes give 13.3 failures per day, an MTTF of 1.8 h. Llama 3 saw an unexpected interruption every 3.1 h on average. That corresponds to each GPU slot failing only about once every 5.8 years.</div></details>
+<details class="qa"><summary>What is asynchronous checkpointing, and what does it cost?<span class="lvl">core</span></summary><div class="ans">The save is split into a short blocking stage (copy the state from GPU to CPU memory, because the next optimizer step will change it) and a long background write from CPU memory to storage while training continues. The stall drops from copy + write to copy only; torchtitan reports 5 to 15 times less checkpoint overhead for Llama 3.1 8B. Costs: CPU memory for a full copy of each rank’s share (pinned memory is faster but scarce), and a new save cannot start before the previous write finishes, which limits how often you can save.</div></details>
+<details class="qa"><summary>What is silent data corruption, and how do you detect it in training?<span class="lvl">advanced</span></summary><div class="ans">Hardware that returns a wrong result without any error signal, for example a defective core that miscomputes rarely. In data-parallel training the wrong value is all-reduced into all replicas. Detection: monitor loss and gradient-norm spikes and NaNs (cheap but ambiguous); compare checksums of the weights across data-parallel replicas, which should be bit-identical; deterministic replay of a step to compare results bit for bit, as Gemini did; and proactive test workloads on idle nodes. Keep several old checkpoints so you can roll back to before the corruption. Gemini expected an SDC event every week or two; Llama 3 had 6 SDC interruptions in 54 days.</div></details>
+<details class="qa"><summary>A node dies and you restart on fewer GPUs. What changes besides the sharding?<span class="lvl">advanced</span></summary><div class="ans">The data-parallel size \(W\) changes, so if each rank keeps its micro-batch, the global batch changes, and the tuned learning rate and schedule no longer fit. Keep the global batch fixed by raising gradient accumulation: \(A = B/(W b)\). The step becomes slower but the optimization is the same. Also: the data position must be global so the new ranks can split the remaining data; RNG states per rank no longer map one to one, so exact bitwise reproducibility is usually lost; and the tensor-parallel or pipeline sizes may need to stay the same if the model does not fit otherwise. torchrun’s elastic mode (<code>--nnodes=MIN:MAX</code>) kills all workers and restarts them with new ranks, so the script must reload and reshard.</div></details>
+<details class="qa"><summary>How do you compute MFU, and which choices change the number?<span class="lvl">core</span></summary><div class="ans">MFU = tokens/s per GPU × useful FLOPs per token ÷ dense peak FLOP/s of the GPU. Useful FLOPs per token are usually \(6N + 12LdT\). Choices: whether \(N\) includes the embedding table (torchtitan excludes it), whether attention is counted and whether it is halved for the causal mask, which peak (dense, not sparse; BF16 vs FP8), and that recomputation is excluded (that is HFU). For Llama 3 8B at 8,192 tokens/s per H100, the same run is 39.9% with \(6N\) only, 48.0% with torchtitan’s convention and 50.6% with \(6N\) plus attention. Always state the formula.</div></details>
+<details class="qa"><summary>MFU, HFU, tokens per second, ETTR: which one would you report, and when?<span class="lvl">advanced</span></summary><div class="ans">MFU measures how well the running job uses the GPU for useful model math; it is fair across systems if the formula is stated. HFU counts all FLOPs run, including recomputation, so it measures the kernels, not the training efficiency. Tokens per second is the raw speed; use it when the peak is unclear (FP8, mixed precision per layer) or when comparing the same model and hardware. ETTR (goodput) measures the fraction of wall time spent on useful training, including failures and restarts. The total useful work is peak × time × MFU × ETTR, so a cluster report should give MFU and ETTR together.</div></details>
+<details class="qa"><summary>When can FSDP hide its communication completely?<span class="lvl">advanced</span></summary><div class="ans">When each block’s all-gather takes no longer than the compute it overlaps. All-gather time is \(2\psi (F-1)/(F B)\) (BF16), the forward of one block is \(2\psi b/(P u)\), so the condition is \(b \ge (P u/B)(F-1)/F\), independent of model size. The backward gives the same condition (twice the compute, twice the transfers). With an H100 at \(u = 0.6\) and 50 GB/s per GPU you need about 11,700 tokens per GPU per micro-step; with NVLink-class 450 GB/s about 1,300. Below it, adding GPUs with smaller per-GPU batches makes the job communication-bound; use hybrid sharding, larger micro-batches, or other parallelism.</div></details>
+<details class="qa"><summary>A 4,096-GPU job hangs with no error. How do you debug it?<span class="lvl">core</span></summary><div class="ans">A hang usually means one rank never entered a collective that all others are waiting in. The NCCL watchdog will abort after its timeout (10 min by default in PyTorch). Before or at the timeout, dump the NCCL flight recorder of every rank: it lists the last collectives with sequence numbers, so the rank that is behind or stuck stands out. Then look at that rank: Python stack (py-spy), GPU health (XID errors, ECC, NVLink status), its node’s network. Common causes are a failed GPU or link, a rank that took a different code path (a data-dependent branch that skips a collective), or a deadlock in the data loader. Remove the bad node, restart from the last checkpoint, and if it is a code path bug, fix it so all ranks call the same collectives in the same order.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A 13B model is trained with AdamW in mixed precision. How large is a full training checkpoint, and how large is a BF16 weights-only export? How much does each of 256 ranks write?</li>
+<li>A tensor of 30 elements was saved by 5 ranks and is loaded by 3. Which elements does new rank 1 need, and which files and slices does it read?</li>
+<li>A 4,096-GPU job (8 GPUs per node) runs on a cluster with 6.5 node failures per 1,000 node-days. Compute the job MTTF, Young’s interval for a 30 s stall, and the waste with a 5 min restart cost.</li>
+<li>In exercise 3, by what factor must the stall shrink to halve the \(\sqrt{2\delta/M}\) part of the waste?</li>
+<li>Your Llama 3 8B run (\(T = 8192\)) on H100s reaches 5,645 tokens/s per GPU. Compute MFU with torchtitan’s convention (\(F_{\text{token}} = 5.79 \times 10^{10}\)).</li>
+<li>Using (51.9) with \(P = 989\) TFLOP/s, \(u = 0.5\) and \(F = 64\): what is \(b_{\min}\) at 25 GB/s? If you train with \(T = 4096\), how many sequences per GPU per micro-step do you need?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(12 \times 13 \times 10^9 = 156\) GB for training, \(2 \times 13 \times 10^9 = 26\) GB for the BF16 export. Each of 256 ranks writes \(156/256 = 0.61\) GB. 2. Old files hold 6 elements each: [0,6), [6,12), [12,18), [18,24), [24,30). New rank 1 needs [10,20). It reads elements 10 to 11 from file 1, 12 to 17 from file 2 (all of it) and 18 to 19 from file 3. 3. 512 nodes × 6.5/1000 = 3.33 failures per day, so \(M = 7.21\) h \(= 25{,}962\) s. \(\tau^{*} = \sqrt{2 \times 30 \times 25{,}962} = 1{,}248\) s \(\approx 20.8\) min. Waste \(= \sqrt{60/25{,}962} + 300/25{,}962 = 4.8\% + 1.2\% = 6.0\%\). 4. The term grows with \(\sqrt{\delta}\), so the stall must shrink 4 times (30 s to 7.5 s). 5. \(5{,}645 \times 5.79 \times 10^{10} / 989 \times 10^{12} = 33.1\%\) (torchtitan’s FSDP-only baseline on 128 GPUs in its Table 2 is 5,645 tokens/s, and its paper gives 33% to 42% MFU, so this fits if their \(T\) is 8,192 [Likely]). 6. \(b_{\min} = 989 \times 10^{12} \times 0.5 / 25 \times 10^9 \times 63/64 = 19{,}471\) tokens, so 5 sequences of 4,096 tokens (20,480 tokens) per GPU per micro-step.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Useful work = peak × time × MFU × ETTR (51.1). Checkpoints and fast restarts raise ETTR; overlap raises MFU.</li>
+<li>A training checkpoint holds weights, optimizer state, step, scheduler, data position and RNG states: about 12 bytes per parameter (51.2), 847 GB for a 70B model.</li>
+<li>Sharded checkpoints write every rank’s pieces in parallel plus a metadata file written last; the metadata uses global positions, so any layout can load any checkpoint by reading the overlaps (51.3).</li>
+<li>Async saves stall only for the GPU-to-CPU copy; the write runs in the background (5 to 15 times less overhead in torchtitan).</li>
+<li>Job MTTF falls in proportion to the number of nodes (51.4): about 1.8 h at 16,384 GPUs. Young’s interval \(\sqrt{2\delta M}\) (51.6) balances saving against lost work; the restart cost adds \(R/M\) on top.</li>
+<li>Silent data corruption is rare per chip but certain at scale; catch it with replica checksums, deterministic replay and scanners, and keep older checkpoints.</li>
+<li>State your MFU formula (51.7). FSDP can hide its communication only if each GPU has at least \(b_{\min} = (Pu/B)(F-1)/F\) tokens per micro-step (51.9).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ S_{\text{ckpt}} \approx 12\Psi, \quad M_{\text{job}} = \frac{1}{N_{\text{nodes}} r_f}, \quad \tau^{*} = \sqrt{2\delta M} \]</div>
+<div class="eq">\[ \mathrm{ETTR} \approx 1 - \frac{\delta}{\tau} - \frac{R + \tau/2}{M}, \quad \mathrm{MFU} = \frac{\text{tok/s/GPU} \cdot (6N_{\text{ne}} + 12LdT)}{P}, \quad b_{\min} = \frac{Pu}{B}\cdot\frac{F-1}{F} \]</div>
+<h2 class="plain" id="distributed-checkpoints-fault-tolerance-and-mfu-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>PyTorch (code). <a href="https://github.com/pytorch/torchtitan" target="_blank" rel="noopener">torchtitan: reference large-scale training with FSDP2</a></li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>PyTorch (code). <a href="https://github.com/pytorch/torchtitan" target="_blank" rel="noopener">torchtitan: reference large-scale training with FSDP2</a></li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Liang et al. (2024). <a href="https://arxiv.org/abs/2410.06511" target="_blank" rel="noopener">TorchTitan: One-stop PyTorch native solution for production ready LLM pre-training</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/docs/stable/distributed.checkpoint.html" target="_blank" rel="noopener">Distributed Checkpoint (torch.distributed.checkpoint): save, load, async_save, get_state_dict, format_utils</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/tutorials/recipes/distributed_async_checkpoint_recipe.html" target="_blank" rel="noopener">Asynchronous Saving with Distributed Checkpoint (DCP) (recipe)</a></li><li>Kokolis et al. (2024). <a href="https://arxiv.org/abs/2410.21680" target="_blank" rel="noopener">Revisiting Reliability in Large-Scale Machine Learning Research Clusters</a></li><li>Gemini Team, Google (2023). <a href="https://arxiv.org/abs/2312.11805" target="_blank" rel="noopener">Gemini: A Family of Highly Capable Multimodal Models</a></li><li>Dixit et al. (2021). <a href="https://arxiv.org/abs/2102.11245" target="_blank" rel="noopener">Silent Data Corruptions at Scale</a></li><li>Young (1974). <a href="https://scholar.google.com/scholar?q=&amp;quot;A first order approximation to the optimum checkpoint interval&amp;quot;" target="_blank" rel="noopener">A first order approximation to the optimum checkpoint interval</a></li><li>Daly (2006). <a href="https://scholar.google.com/scholar?q=&amp;quot;A higher order estimate of the optimum checkpoint interval for restart dumps&amp;quot;" target="_blank" rel="noopener">A higher order estimate of the optimum checkpoint interval for restart dumps</a></li><li>Chowdhery et al. (2022). <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">PaLM: Scaling Language Modeling with Pathways</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/docs/stable/elastic/run.html" target="_blank" rel="noopener">torchrun (Elastic Launch): elastic nnodes MIN:MAX, max-restarts, rendezvous</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../pretraining/making-training-fast-compile-cuda-graphs-fused.html"><small>Previous · session 50</small>Making training fast: compile, CUDA graphs, fused kernels, profiling</a><a class="next" href="../pretraining/lab-ddp-vs-fsdp2-and-reading-a.html"><small>Next · session 52</small>DDP vs FSDP2 and reading a profile</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="distributed-checkpoints-fault-tolerance-and-mfu"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const esc=s=>(B&&B.esc)?B.esc(String(s)):String(s);
+function seg(el,cb){if(!el)return;el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b||!el.contains(b))return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segVal=el=>{const b=el&&el.querySelector('button[aria-pressed="true"]');return b?b.dataset.v:null;};
+const COL=[["var(--q)","var(--q-soft)"],["var(--k)","var(--k-soft)"],["var(--v)","var(--v-soft)"]];
+const pct=(v,d)=>(100*v).toFixed(d===undefined?1:d)+"%";
+const fmtT=s=>s<60?s.toFixed(s<10?1:0)+" s":s<3600?(s/60).toFixed(1)+" min":(s/3600).toFixed(2)+" h";
+
+/* ---------- Figure 1: load-time resharding ---------- */
+(function(){
+ const svg=$("#dc-rs-svg");if(!svg)return;const info=$("#dc-rs-info");
+ const n=24;let W=4,W2=3,sel=1;
+ const ranges=w=>{const a=[];for(let r=0;r<w;r++)a.push([r*n/w,(r+1)*n/w]);return a;};
+ function plan(){const old=ranges(W),nw=ranges(W2);
+  return nw.map(([l,h])=>{const reads=[];old.forEach(([lk,hk],k)=>{const a=Math.max(l,lk),b=Math.min(h,hk);if(a<b)reads.push({k,a,b});});return {l,h,reads};});}
+ function draw(){
+  if(sel>=W2)sel=0;
+  const P=plan(),old=ranges(W);const x0=40,cw=29,yo=46,yn=196,ch=26;let g="";
+  g+=`<text x="${x0}" y="22" font-size="13" fill="var(--muted)">saved files (W = ${W}), ${n/W} element${n/W===1?"":"s"} each</text>`;
+  old.forEach(([l,h],k)=>{const c=COL[k%3];
+   for(let e=l;e<h;e++)g+=`<rect x="${x0+e*cw}" y="${yo}" width="${cw-3}" height="${ch}" rx="3" fill="${c[1]}" stroke="${c[0]}" stroke-width="1.2"/><text x="${x0+e*cw+(cw-3)/2}" y="${yo+17}" text-anchor="middle" font-size="11" fill="var(--ink2)">${e}</text>`;
+   g+=`<text x="${x0+(l+h)/2*cw-1.5}" y="${yo+ch+16}" text-anchor="middle" font-size="12" fill="var(--ink)" font-family="var(--mono)">file ${k}</text>`;});
+  /* links for the selected new rank */
+  P[sel].reads.forEach(({k,a,b})=>{const c=COL[k%3][0];const xa=x0+a*cw,xb=x0+b*cw-3;
+   g+=`<path d="M${xa} ${yo+ch+22} L${xa} ${yn-6} M${xb} ${yo+ch+22} L${xb} ${yn-6}" stroke="${c}" stroke-width="1.4" stroke-dasharray="4 3" fill="none"/>`;
+   g+=`<rect x="${xa}" y="${yo+ch+24}" width="${xb-xa}" height="${yn-yo-ch-32}" fill="${COL[k%3][1]}" opacity=".45"/>`;
+   g+=`<text x="${(xa+xb)/2}" y="${(yo+ch+yn)/2+8}" text-anchor="middle" font-size="11.5" fill="var(--ink)">${a}–${b-1}</text>`;});
+  g+=`<text x="${x0}" y="${yn+ch+44}" font-size="13" fill="var(--muted)">new ranks (W′ = ${W2}), ${n/W2} element${n/W2===1?"":"s"} each; click one</text>`;
+  P.forEach(({l,h},r)=>{const on=r===sel;
+   g+=`<g class="dc-rank" data-r="${r}" tabindex="0" role="button" aria-label="new rank ${r}"><rect class="dc-hit" x="${x0+l*cw-3}" y="${yn-4}" width="${(h-l)*cw+3}" height="${ch+8}" rx="5" fill="${on?"var(--paper2)":"transparent"}" stroke="${on?"var(--tc)":"var(--rule)"}" stroke-width="${on?2.2:1}"/>`;
+   for(let e=l;e<h;e++){const k=Math.floor(e/(n/W));const c=COL[k%3];g+=`<rect x="${x0+e*cw}" y="${yn}" width="${cw-3}" height="${ch}" rx="3" fill="${on?c[1]:"var(--paper)"}" stroke="${on?c[0]:"var(--muted)"}" stroke-width="1"/><text x="${x0+e*cw+(cw-3)/2}" y="${yn+17}" text-anchor="middle" font-size="11" fill="var(--ink2)">${e}</text>`;}
+   g+=`<text x="${x0+(l+h)/2*cw-1.5}" y="${yn+ch+20}" text-anchor="middle" font-size="12" fill="${on?"var(--ink)":"var(--muted)"}" font-weight="${on?700:500}">rank ${r}</text></g>`;});
+  svg.innerHTML=g;
+  const s=P[sel];const tot=P.reduce((a,p)=>a+p.reads.length,0);
+  info.innerHTML=`New rank <b>${sel}</b> of ${W2} needs elements <b>${s.l}–${s.h-1}</b>. It reads <b>${s.reads.length}</b> file${s.reads.length===1?"":"s"}: `+s.reads.map(({k,a,b})=>`file ${k} elements ${a}–${b-1}`).join(", ")+`. All ${W2} new ranks together open ${tot} file piece${tot===1?"":"s"} and read each of the ${n} elements exactly once.`;
+  R.dataset.dcRs=`${W}>${W2} r${sel}:`+s.reads.map(({k,a,b})=>`${k}[${a},${b})`).join("+")+` tot=${tot}`;
+ }
+ svg.addEventListener("click",e=>{const t=e.target.closest(".dc-rank");if(!t)return;sel=+t.dataset.r;draw();});
+ svg.addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const t=e.target.closest(".dc-rank");if(!t)return;e.preventDefault();sel=+t.dataset.r;draw();const m=svg.querySelector(`.dc-rank[data-r="${sel}"]`);if(m)m.focus();});
+ seg($("#dc-rs-w"),v=>{W=+v;draw();});seg($("#dc-rs-w2"),v=>{W2=+v;sel=Math.min(sel,W2-1);draw();});draw();
+})();
+
+/* ---------- Figure 2: sync vs async checkpoint timeline ---------- */
+(function(){
+ const svg=$("#dc-as-svg");if(!svg)return;const info=$("#dc-as-info");
+ const S=$("#dc-as-s"),D=$("#dc-as-d"),Wr=$("#dc-as-w"),K=$("#dc-as-k"),M=$("#dc-as-mode");
+ const TS=5,NS=20;
+ function sim(mode,s,d2h,w,k){let t=0,wend=0,stall=0;const ev=[];
+  for(let i=1;i<=NS;i++){ev.push({type:"step",a:t,b:t+TS});t+=TS;
+   if(i%k===0){if(mode==="sync"){const dt=s/d2h+s/w;ev.push({type:"stall",a:t,b:t+dt});t+=dt;stall+=dt;}
+    else{const wait=Math.max(0,wend-t),dt=wait+s/d2h;ev.push({type:"stall",a:t,b:t+dt});t+=dt;stall+=dt;ev.push({type:"write",a:t,b:t+s/w});wend=t+s/w;}}}
+  return {t,stall,ev,over:stall/(NS*TS),wend};}
+ function draw(){
+  const s=+S.value,d=+D.value,w=+Wr.value,k=+K.value,mode=segVal(M)||"async";
+  $("#dc-as-sv").textContent=s.toFixed(2)+" GB";$("#dc-as-dv").textContent=d.toFixed(1)+" GB/s";$("#dc-as-wv").textContent=w.toFixed(2)+" GB/s";$("#dc-as-kv").textContent=k;
+  const r=sim(mode,s,d,w,k),o=sim(mode==="sync"?"async":"sync",s,d,w,k);
+  const tmax=Math.max(r.t,r.wend,NS*TS);const x0=20,X=t=>x0+t/tmax*740;let g="";
+  g+=`<text x="${x0}" y="20" font-size="12.5" fill="var(--muted)">GPU (compute stream)</text>`;
+  g+=`<text x="${x0}" y="104" font-size="12.5" fill="var(--muted)">background writer thread</text>`;
+  r.ev.forEach(e=>{const xa=X(e.a),wd=Math.max(1.2,X(e.b)-xa);
+   if(e.type==="step")g+=`<rect x="${xa.toFixed(1)}" y="30" width="${Math.max(1,wd-1).toFixed(1)}" height="36" rx="3" fill="var(--q)" opacity=".8"/>`;
+   else if(e.type==="stall")g+=`<rect x="${xa.toFixed(1)}" y="30" width="${wd.toFixed(1)}" height="36" rx="3" fill="var(--k)"/>`;
+   else g+=`<rect x="${xa.toFixed(1)}" y="112" width="${wd.toFixed(1)}" height="26" rx="3" fill="var(--v-soft)" stroke="var(--v)"/>`;});
+  for(let t=0;t<=tmax+1e-9;t+=tmax>400?100:tmax>150?50:20){g+=`<line x1="${X(t)}" y1="150" x2="${X(t)}" y2="155" stroke="var(--muted)"/><text x="${X(t)}" y="167" text-anchor="middle" font-size="11" fill="var(--muted)">${t} s</text>`;}
+  g+=`<line x1="${x0}" y1="150" x2="${X(tmax)}" y2="150" stroke="var(--rule)"/>`;
+  svg.innerHTML=g;
+  const per=s/d+(mode==="sync"?s/w:0);
+  info.innerHTML=`${mode==="sync"?"Synchronous":"Asynchronous"}: each checkpoint stalls the GPUs for <b>${per.toFixed(2)} s</b> (copy ${(s/d).toFixed(2)} s${mode==="sync"?` + write ${(s/w).toFixed(2)} s`:`; write ${(s/w).toFixed(2)} s in the background`}). Total stall over ${NS} steps: <b>${r.stall.toFixed(2)} s</b>, overhead <b>${pct(r.over)}</b> of the ${NS*TS} s of training. The ${mode==="sync"?"asynchronous":"synchronous"} mode would give ${pct(o.over)}${mode==="async"&&r.stall>0?`, ${(o.stall/r.stall).toFixed(1)}× more`:""}.`+(mode==="async"&&s/w>k*TS?` The write (${(s/w).toFixed(1)} s) is longer than the ${k*TS} s between saves, so new saves wait.`:"");
+  R.dataset.dcAs=`${mode} stall=${r.stall.toFixed(2)} over=${(100*r.over).toFixed(2)}`;
+ }
+ [S,D,Wr,K].forEach(x=>x.addEventListener("input",draw));seg(M,draw);draw();
+})();
+
+/* ---------- Figure 3: Young's checkpoint interval ---------- */
+(function(){
+ const svg=$("#dc-young-svg")||$("#dc-yg-svg");if(!svg)return;const info=$("#dc-yg-info");
+ const N=$("#dc-yg-n"),RF=$("#dc-yg-r"),Dl=$("#dc-yg-d"),RR=$("#dc-yg-R"),Tt=$("#dc-yg-t");
+ const DL=[1,2,5,10,15,20,30,45,60,90,120,180,300];
+ Dl.max=DL.length-1;Dl.value=DL.indexOf(60);
+ const tauOf=i=>60*60*Math.pow(2,(i-72)/12);  /* seconds */
+ Tt.min=0;Tt.max=108;Tt.value=72;
+ let tau=tauOf(72);
+ const waste=(t,d,Rs,M)=>d/t+(Rs+t/2)/M;
+ function draw(){
+  const gpus=Math.pow(2,+N.value),rf=+RF.value,d=DL[+Dl.value],Rs=60*(+RR.value);
+  const M=86400/(gpus/8*rf/1000),ts=Math.sqrt(2*d*M);
+  $("#dc-yg-nv").textContent=gpus.toLocaleString("en-US");$("#dc-yg-rv").textContent=rf.toFixed(1);$("#dc-yg-dv").textContent=d+" s";$("#dc-yg-Rv").textContent=(+RR.value)+" min";$("#dc-yg-tv").textContent=fmtT(tau);
+  const x0=58,x1=620,y0=20,y1=200,tmin=tauOf(0),tmax=tauOf(108);
+  const X=t=>x0+(Math.log(t/tmin)/Math.log(tmax/tmin))*(x1-x0);
+  const wv=[];for(let i=0;i<=200;i++){const t=tmin*Math.pow(tmax/tmin,i/200);wv.push([t,d/t,(Rs+t/2)/M,waste(t,d,Rs,M)]);}
+  const ymax=Math.min(1,Math.max(0.2,Math.ceil(Math.min(1,waste(ts,d,Rs,M)*2.5)*10)/10));
+  const Y=v=>y1-Math.min(v,ymax*1.2)/ymax*(y1-y0);let g="";
+  for(let k=0;k<=4;k++){const v=ymax*k/4;g+=`<line x1="${x0}" y1="${Y(v)}" x2="${x1}" y2="${Y(v)}" stroke="var(--rule)" stroke-width="${k?0.6:1}"/><text x="${x0-6}" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${(100*v).toFixed(0)}%</text>`;}
+  [[60,"1 min"],[600,"10 min"],[3600,"1 h"],[4*3600,"4 h"]].forEach(([t,l])=>{g+=`<line x1="${X(t)}" y1="${y1}" x2="${X(t)}" y2="${y1+5}" stroke="var(--muted)"/><text x="${X(t)}" y="${y1+18}" text-anchor="middle" font-size="11" fill="var(--muted)">${l}</text>`;});
+  g+=`<text x="${(x0+x1)/2}" y="${y1+38}" text-anchor="middle" font-size="12" fill="var(--muted)">checkpoint interval τ (log scale)</text>`;
+  const line=(j,c,wd)=>`<polyline fill="none" stroke="${c}" stroke-width="${wd}" points="${wv.map(p=>X(p[0]).toFixed(1)+","+Y(p[j]).toFixed(1)).join(" ")}"/>`;
+  g+=`<defs><clipPath id="dc-yg-clip"><rect x="${x0}" y="${y0-2}" width="${x1-x0}" height="${y1-y0+4}"/></clipPath></defs><g clip-path="url(#dc-yg-clip)">`+line(1,"var(--k)",1.6)+line(2,"var(--v)",1.6)+line(3,"var(--ink)",2.6)+"</g>";
+  const wc=waste(tau,d,Rs,M),wb=waste(ts,d,Rs,M);
+  if(ts>=tmin&&ts<=tmax)g+=`<circle cx="${X(ts)}" cy="${Y(wb)}" r="7" fill="none" stroke="var(--ink)" stroke-width="2"/>`;
+  g+=`<circle cx="${X(tau)}" cy="${Y(Math.min(wc,ymax))}" r="5" fill="var(--tc)" stroke="var(--paper)" stroke-width="1.5"/>`;
+  svg.innerHTML=g;
+  const e=Math.max(0,1-wc);
+  info.innerHTML=`Job MTTF <b>${fmtT(M)}</b> (${(gpus/8).toLocaleString("en-US")} nodes, ${(86400/M).toFixed(1)} failures per day). Your τ = ${fmtT(tau)}: waste <b>${pct(Math.min(1,wc))}</b> = ${pct(d/tau)} saving + ${pct((tau/2)/M)} lost work + ${pct(Rs/M)} restart, ETTR ≈ <b>${pct(e)}</b>. Young’s optimum τ* = √(2δM) = <b>${fmtT(ts)}</b> with waste ${pct(Math.min(1,wb))}.`+(wc>0.5?" The first-order formula is rough here (τ is not small compared with M).":"");
+  R.dataset.dcYg=`M=${(M/3600).toFixed(3)}h tau*=${ts.toFixed(0)}s w=${(100*wc).toFixed(2)} wbest=${(100*wb).toFixed(2)}`;
+ }
+ Tt.addEventListener("input",()=>{tau=tauOf(+Tt.value);draw();});
+ [N,RF,Dl,RR].forEach(x=>x.addEventListener("input",draw));
+ $("#dc-yg-best").addEventListener("click",()=>{const gpus=Math.pow(2,+N.value),M=86400/(gpus/8*(+RF.value)/1000);tau=Math.min(tauOf(108),Math.max(tauOf(0),Math.sqrt(2*DL[+Dl.value]*M)));Tt.value=Math.round(72+12*Math.log2(tau/3600));draw();});
+ draw();
+})();
+
+/* ---------- Figure 5: overlap and MFU ---------- */
+(function(){
+ const svg=$("#dc-ov-svg");if(!svg)return;const info=$("#dc-ov-info");
+ const ON=$("#dc-ov-on"),Bb=$("#dc-ov-b"),BW=$("#dc-ov-B"),U=$("#dc-ov-u");
+ const BV=[512,768,1024,1536,2048,3072,4096,6144,8192,12288,16384,24576,32768,49152,65536,98304,131072];
+ const BWV=[12.5,25,50,100,200,450,900];
+ const P=989e12,Nne=7504924672,L=32,d=4096,T=8192,F=64;
+ const Ftok=6*Nne+12*L*d*T,psi=2*d*d+2*d*1024+3*d*14336+2*d;
+ function sim(b,Bw,u,ov){const Tc=b*Ftok/(P*u),tf=Tc/(3*L),tb=2*tf,ta=2*psi*(F-1)/F/Bw;
+  if(!ov)return {t:Tc+3*L*ta,Tc,ta,tf};
+  let comm=ta,comp=0;let ag=new Array(L+2);ag[1]=ta;
+  for(let i=1;i<=L;i++){const s=Math.max(comp,ag[i]);if(i<L){comm=Math.max(comm,s)+ta;ag[i+1]=comm;}comp=s+tf;}
+  comm=Math.max(comm,comp)+ta;ag=new Array(L+2);ag[L]=comm;
+  for(let i=L;i>=1;i--){const s=Math.max(comp,ag[i]);if(i>1){comm=Math.max(comm,s)+ta;ag[i-1]=comm;}comp=s+tb;comm=Math.max(comm,comp)+ta;}
+  return {t:Math.max(comp,comm),Tc,ta,tf};}
+ const mfu=(b,r)=>b*Ftok/(r.t*P);
+ function draw(){
+  const b=BV[+Bb.value],Bw=BWV[+BW.value]*1e9,u=+U.value,ov=ON.checked;
+  $("#dc-ov-bv").textContent=b.toLocaleString("en-US");$("#dc-ov-Bv").textContent=BWV[+BW.value]+" GB/s";$("#dc-ov-uv").textContent=u.toFixed(2);
+  const x0=56,x1=620,y0=16,y1=196,lb0=Math.log(512),lb1=Math.log(131072);
+  const X=v=>x0+(Math.log(v)-lb0)/(lb1-lb0)*(x1-x0),Y=v=>y1-v/0.9*(y1-y0);let g="";
+  for(let k=0;k<=9;k+=3){const v=k/10;g+=`<line x1="${x0}" y1="${Y(v)}" x2="${x1}" y2="${Y(v)}" stroke="var(--rule)" stroke-width="${k?0.6:1}"/><text x="${x0-6}" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${k*10}%</text>`;}
+  [512,2048,8192,32768,131072].forEach(v=>{g+=`<line x1="${X(v)}" y1="${y1}" x2="${X(v)}" y2="${y1+5}" stroke="var(--muted)"/><text x="${X(v)}" y="${y1+18}" text-anchor="middle" font-size="11" fill="var(--muted)">${v.toLocaleString("en-US")}</text>`;});
+  g+=`<text x="${(x0+x1)/2}" y="${y1+38}" text-anchor="middle" font-size="12" fill="var(--muted)">tokens per GPU per step b (log scale)</text>`;
+  g+=`<line x1="${x0}" y1="${Y(u)}" x2="${x1}" y2="${Y(u)}" stroke="var(--muted)" stroke-dasharray="2 4"/><text x="${x1}" y="${Y(u)-5}" text-anchor="end" font-size="11" fill="var(--muted)">ceiling u = ${u.toFixed(2)}</text>`;
+  const bmin=P*u/Bw*(F-1)/F;
+  if(bmin>=512&&bmin<=131072)g+=`<line x1="${X(bmin)}" y1="${y0}" x2="${X(bmin)}" y2="${y1}" stroke="var(--muted)" stroke-width="1.4" stroke-dasharray="5 4"/><text x="${X(bmin)+5}" y="${y0+12}" font-size="11" fill="var(--muted)">b_min</text>`;
+  [[true,"var(--q)"],[false,"var(--k)"]].forEach(([o,c])=>{const pts=[];for(let i=0;i<=80;i++){const v=Math.exp(lb0+(lb1-lb0)*i/80);pts.push(X(v).toFixed(1)+","+Y(mfu(v,sim(v,Bw,u,o))).toFixed(1));}
+   g+=`<polyline fill="none" stroke="${c}" stroke-width="${o===ov?2.8:1.4}" opacity="${o===ov?1:0.6}" points="${pts.join(" ")}"/>`;});
+  const r=sim(b,Bw,u,ov),m=mfu(b,r);
+  g+=`<circle cx="${X(b)}" cy="${Y(m)}" r="6" fill="${ov?"var(--q)":"var(--k)"}" stroke="var(--paper)" stroke-width="2"/>`;
+  svg.innerHTML=g;
+  info.innerHTML=`Step: <b>${r.t.toFixed(3)} s</b> = ${r.Tc.toFixed(3)} s compute + <b>${(r.t-r.Tc).toFixed(3)} s</b> exposed communication. One block: forward ${(1000*r.tf).toFixed(1)} ms, all-gather ${(1000*r.ta).toFixed(1)} ms${r.ta>r.tf?" (longer than the compute it should hide behind)":""}. MFU <b>${pct(m)}</b> (ceiling ${pct(u,0)}). b_min by (51.9) = ${Math.round(bmin).toLocaleString("en-US")} tokens.`;
+  R.dataset.dcOv=`b=${b} B=${BWV[+BW.value]} ov=${ov} t=${r.t.toFixed(4)} mfu=${(100*m).toFixed(2)}`;
+ }
+ [Bb,BW,U].forEach(x=>x.addEventListener("input",draw));ON.addEventListener("change",draw);draw();
+})();
+})();
+</script></body></html>

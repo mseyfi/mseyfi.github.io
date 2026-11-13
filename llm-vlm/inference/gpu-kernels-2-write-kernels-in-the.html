@@ -1,0 +1,472 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>GPU kernels 2: write kernels in the Triton language · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 86</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="gpu-kernels-2-write-kernels-in-the">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="gpu-kernels-2-write-kernels-in-the" data-session="gpu-kernels-2-write-kernels-in-the" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">86</span><span>Track 5: LLM inference and serving · session 9 of 65</span></div><h1 class="chap-title">GPU kernels 2: write kernels in the Triton language</h1><p class="chap-sub">Triton is a Python-like language for writing GPU kernels. You describe what one program does with a whole block of data, and the compiler handles threads, memory moves and synchronization. In this session you write a vector add, a fused softmax and an RMSNorm kernel, autotune their block sizes, compare them with PyTorch eager and torch.compile, and learn not to confuse the Triton language with NVIDIA's Triton Inference Server.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises and code 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 42 and 85 (GPU architecture, CUDA basics); Session 22 for RMSNorm</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The Triton programming model: a grid of programs, each working on a block of data with tl.arange, masks and pointer arithmetic</li><li>Why Triton is easier than CUDA: what the compiler does for you, and what you still decide</li><li>How to count the bytes an eager softmax moves (8MN + 4M elements) and why one fused kernel moves only 2MN</li><li>How to write a fused softmax and an RMSNorm kernel, and what to do when a row does not fit in one block (online softmax)</li><li>What BLOCK_SIZE, num_warps and num_stages control, and how triton.autotune picks them</li><li>How to benchmark a kernel fairly against PyTorch eager and torch.compile, and how to judge it with effective bandwidth</li><li>The name trap: the Triton language (a kernel compiler) is not the Triton Inference Server (a serving system)</li></ul></div></header><style>
+[data-session="gpu-kernels-2-write-kernels-in-the"] pre.code,[data-session="gpu-kernels-2-write-kernels-in-the"] code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.tk-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px;justify-content:center}
+.tk-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c);border:1px solid var(--muted)}
+.tk-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.tk-grid input[type=range]{width:100%}
+.tk-lab{font:500 14px var(--sans);color:var(--muted)}
+.tk-cell{cursor:pointer}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../inference/gpu-kernels-1-cuda-basics-for-ml.html">session 85</a> you saw that most operations in an LLM, apart from the big matrix multiplications, are limited by memory traffic, not by math. The fix is <b>fusion</b>: do several steps in one kernel, so the data travels from GPU memory (HBM) to the chip only once. But writing fused kernels in CUDA C++ is slow work: you manage threads, shared memory, synchronization and memory alignment by hand. <b>Triton</b> is a language that removes most of that work.</p>
+<p>Triton is a Python-like language and compiler for GPU kernels. You write a Python function, decorate it with <code>@triton.jit</code>, and Triton compiles it to GPU machine code. It was introduced by Tillet, Kung and Cox in 2019 and is now developed by OpenAI and a community of contributors. [Certain] It runs on NVIDIA GPUs and also on AMD GPUs. [Certain] It matters to you for three reasons:</p>
+<ul><li><b>torch.compile writes Triton.</b> When you call <code>torch.compile</code> on a GPU model, its backend (TorchInductor) generates Triton kernels for the fused element-wise and reduction parts (<a href="../pretraining/making-training-fast-compile-cuda-graphs-fused.html">session 50</a>). [Certain] To read what the compiler made, you must read Triton.</li>
+<li><b>Real systems ship hand-written Triton kernels.</b> Liger Kernel is a set of Triton kernels for LLM training (RMSNorm, RoPE, SwiGLU, cross-entropy). Its paper reports about 20% more training throughput and about 60% less GPU memory than the Hugging Face versions, on average. [Certain, numbers from the Liger paper] vLLM and other serving engines use Triton kernels too, for example for mixture-of-experts layers. [Likely]</li>
+<li><b>Interviews ask for it.</b> “Write a fused softmax in Triton”, “Why is the fused version faster?”, “What is BLOCK_SIZE?”, “Is Triton the same as Triton Inference Server?” are common questions for ML systems roles.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>The best answers about kernels always start with bytes. “The eager softmax reads and writes the matrix about 8 times; the fused kernel reads it once and writes it once; so it can be up to 4 times faster on a memory-bound GPU.” This session teaches you to make that argument with numbers.</aside>
+<p>The plan: first the programming model (blocks, not threads). Then a first kernel (vector add). Then two real LLM kernels: fused softmax and RMSNorm. Then autotuning, fair benchmarks against PyTorch eager and torch.compile, and the name trap at the end.</p>
+
+<h2>The programming model: blocks of data, not single threads</h2>
+<p>In CUDA you write the code for <b>one thread</b>. Each thread handles one element (or a few), and you think about warps, shared memory and barriers yourself. In Triton you write the code for <b>one program</b>, and a program handles a whole <b>block</b> of elements at once. A program is roughly one CUDA thread block. [Certain] Inside it, Triton decides how to spread the block over threads and warps.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>CUDA is like giving orders to every worker on a building site, one by one: “you carry brick 17, then wait for the others”. Triton is like giving orders to team leaders: “team 3, move pallet 3”. How the team splits the pallet among its workers is the team leader’s job. You think in pallets (blocks), not in bricks (elements).</aside>
+<p>Three ideas are enough to start:</p>
+<ol><li><b>The grid.</b> You launch many copies of the same program. Each copy asks <code>tl.program_id(0)</code> for its number, called <code>pid</code>. For \(n\) elements and a block of size \(B\), you need</li></ol>
+<div class="eq">\[ G = \left\lceil \frac{n}{B} \right\rceil \tag{86.1} \]</div>
+<p>programs. With \(n = 1{,}000\) and \(B = 256\), that is \(G = 4\) programs, and they cover \(4 \times 256 = 1{,}024\) slots, 24 more than needed.</p>
+<ol start="2"><li><b>Offsets and masks.</b> Each program builds a vector of indices with <code>tl.arange(0, B)</code> and shifts it to its own part of the data. Slots past the end are switched off with a <b>mask</b>:</li></ol>
+<div class="eq">\[ \mathbf{o} = \mathrm{pid} \cdot B + (0, 1, \dots, B - 1), \qquad \mathbf{m} = (\mathbf{o} \lt n) \tag{86.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathrm{pid}\)</dt><dd>the number of this program, from 0 to \(G - 1\)</dd>
+<dt>\(B\)</dt><dd>the block size; in Triton it must be a power of two and known at compile time (<code>tl.constexpr</code>)</dd>
+<dt>\(\mathbf{o}\)</dt><dd>a vector of \(B\) element offsets: which elements this program touches</dd>
+<dt>\(\mathbf{m}\)</dt><dd>a vector of \(B\) true/false values: true where the offset is inside the data</dd></dl>
+<ol start="3"><li><b>Pointers and block loads.</b> A tensor argument arrives as a pointer to its first element. <code>x_ptr + offs</code> is a block of \(B\) pointers. <code>tl.load(x_ptr + offs, mask=mask, other=0.0)</code> reads all of them at once and puts <code>other</code> where the mask is false. <code>tl.store</code> writes a block back. Math such as <code>+</code>, <code>tl.exp</code>, <code>tl.max</code> and <code>tl.sum</code> works on whole blocks, like NumPy.</li></ol>
+
+<p>Figure 1 shows the grid, the offsets and the mask. Click any slot to see which program owns it and whether it is masked.</p>
+<figure class="fig wide" id="tk-grid"><div class="fig-body">
+<div class="tk-grid">
+<label for="tk-grid-n">Number of elements \(n\)</label><input type="range" id="tk-grid-n" min="1" max="64" step="1" value="50"><output id="tk-grid-nv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="tk-lab">BLOCK_SIZE \(B\):</span><span class="seg" id="tk-grid-b"><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="false">8</button><button type="button" data-v="16" aria-pressed="true">16</button><button type="button" data-v="32" aria-pressed="false">32</button></span></div>
+<div class="scroll-x"><svg id="tk-grid-svg" viewBox="0 0 700 300" role="img" aria-label="Elements of a vector split into programs of BLOCK_SIZE slots, with masked slots at the end"></svg></div>
+<div class="tk-leg"><span style="--c:var(--q-soft)">active slot (mask true)</span><span style="--c:var(--paper2)">masked slot (mask false, no load or store)</span><span style="--c:var(--k-soft)">selected slot</span></div>
+<div class="readout" id="tk-grid-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The Triton grid for a 1-D kernel. Each row is one program. Program \(\mathrm{pid}\) owns offsets \(\mathrm{pid} \cdot B\) to \(\mathrm{pid} \cdot B + B - 1\) (formula 86.2). Only the last program can have masked slots.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Change \(n\) and watch the number of rows: it is always \(\lceil n/B \rceil\) (formula 86.1). The grey slots at the end are the price of a fixed, power-of-two block: they exist in the program but the mask turns their loads and stores off. Bigger blocks mean fewer programs but more waste in the last one. For a real vector of a million elements, the waste is tiny; for a softmax row of 5,000 columns padded to 8,192, it is not (see Figure 3).</p></details></figure>
+
+<h2>Your first kernel: vector add</h2>
+<p>Here is the whole idea in pseudo-code. Each program adds one block.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: vector add, the code of one Triton program</div><ol>
+<li><b>input:</b> pointers <code>x_ptr</code>, <code>y_ptr</code>, <code>out_ptr</code>, length \(n\), compile-time block size \(B\)</li>
+<li>\(\mathrm{pid} \leftarrow\) <code>tl.program_id(0)</code> <span class="c">// which block am I?</span></li>
+<li>\(\mathbf{o} \leftarrow \mathrm{pid} \cdot B +\) <code>tl.arange(0, B)</code>; \(\;\mathbf{m} \leftarrow \mathbf{o} \lt n\) <span class="c">// formula (86.2)</span></li>
+<li>\(\mathbf{x} \leftarrow\) load(<code>x_ptr</code> \(+ \mathbf{o}\), mask \(\mathbf{m}\)); \(\;\mathbf{y} \leftarrow\) load(<code>y_ptr</code> \(+ \mathbf{o}\), mask \(\mathbf{m}\)) <span class="c">// one block read each</span></li>
+<li>store(<code>out_ptr</code> \(+ \mathbf{o}\), \(\mathbf{x} + \mathbf{y}\), mask \(\mathbf{m}\))</li>
+<li><b>host:</b> launch the kernel on a grid of \(\lceil n/B \rceil\) programs (formula 86.1)</li></ol></div>
+<p>In Triton this is almost line by line the same:</p>
+<pre class="code"><span class="kw2">import</span> torch, triton
+<span class="kw2">import</span> triton.language <span class="kw2">as</span> tl
+
+<span class="kw2">@triton.jit</span>
+<span class="kw2">def</span> add_kernel(x_ptr, y_ptr, out_ptr, n, BLOCK: tl.constexpr):
+    pid = tl.program_id(0)                       <span class="cm"># which program am I?</span>
+    offs = pid * BLOCK + tl.arange(0, BLOCK)     <span class="cm"># formula (86.2)</span>
+    mask = offs &lt; n
+    x = tl.load(x_ptr + offs, mask=mask)
+    y = tl.load(y_ptr + offs, mask=mask)
+    tl.store(out_ptr + offs, x + y, mask=mask)
+
+<span class="kw2">def</span> add(x, y):
+    out = torch.empty_like(x)
+    n = x.numel()
+    grid = (triton.cdiv(n, 1024),)               <span class="cm"># formula (86.1)</span>
+    add_kernel[grid](x, y, out, n, BLOCK=1024)   <span class="cm"># tensors become pointers</span>
+    <span class="kw2">return</span> out</pre>
+<p>Three details to notice. First, <code>add_kernel[grid](...)</code> is the launch: the square brackets hold the grid, the round ones the arguments. Second, <code>BLOCK</code> is a <code>tl.constexpr</code>: Triton compiles a separate version of the kernel for each value, so the shapes of all blocks are known when the code is compiled. Third, there is no thread index anywhere. You never wrote <code>threadIdx.x</code>.</p>
+<div class="worked"><div class="wt">Worked example: how fast can vector add be?</div>
+<p>Add two FP32 vectors of \(n = 2^{20} = 1{,}048{,}576\) elements. The kernel reads two vectors and writes one: \(3 \times 4 \times 2^{20} = 12.6\) MB. An H100 SXM reads about 3.35 TB/s from HBM. [Certain, NVIDIA datasheet] So the kernel cannot take less than \(12.6\ \text{MB} / 3.35\ \text{TB/s} \approx 3.8\ \mu s\). It does only one addition per 12 bytes, so the math units are nearly idle: this kernel is purely memory-bound. A good Triton vector add should come close to this limit on large inputs; on tiny inputs, the launch overhead (a few microseconds) dominates. [Likely]</p></div>
+
+<h2>What the compiler does for you, and what you still decide</h2>
+<p>The Triton paper calls its unit of work a <b>tile</b>: a block of data that a program loads, computes on, and stores. [Certain] Because the compiler sees whole tiles, not single threads, it can make many low-level choices that a CUDA programmer makes by hand.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Job</th><th>In CUDA C++</th><th>In Triton</th></tr></thead><tbody>
+<tr><td>Split work over threads and warps</td><td>You, with <code>threadIdx</code>, <code>blockIdx</code></td><td>Compiler; you only choose <code>num_warps</code></td></tr>
+<tr><td>Coalesced memory access (neighbouring threads read neighbouring addresses)</td><td>You arrange the indexing</td><td>Compiler, from the block layout</td></tr>
+<tr><td>Shared memory and barriers (<code>__syncthreads</code>)</td><td>You allocate and synchronize</td><td>Compiler, for reductions and for <code>tl.dot</code></td></tr>
+<tr><td>Tensor cores for matrix multiply</td><td>You use special instructions or libraries</td><td>Compiler, when you call <code>tl.dot</code> on blocks</td></tr>
+<tr><td>Software pipelining (load the next tile while computing this one)</td><td>You write double buffering</td><td>Compiler; you choose <code>num_stages</code></td></tr>
+<tr><td>Which data each program handles; block sizes; what to fuse</td><td>You</td><td><b>Still you</b></td></tr></tbody></table></div>
+<p>So Triton does not make design free. You still choose the grid, the block sizes and the order of loads, and you still have to count bytes. What disappears is the error-prone bookkeeping. The price: a little less control than CUDA for the very last few percent of speed. The fastest attention kernels on the newest GPUs (FlashAttention-3) are still written in CUDA. [Certain]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Two numbers you set are easy to confuse. <code>BLOCK</code> is a number of <b>elements</b> (data). <code>num_warps</code> is a number of warps of 32 <b>threads</b> (workers) that share that block. A program with <code>BLOCK=4096</code> and <code>num_warps=4</code> uses 128 threads, and each thread holds 32 elements.</aside>
+
+<h2>Fused softmax: count the bytes first</h2>
+<p>Softmax over each row of an \(M \times N\) matrix (for example, attention scores, or logits over a vocabulary) is, with the max subtracted for numerical stability (<a href="../foundations/math-vectors-matrices-softmax.html">session 2</a>):</p>
+<div class="eq">\[ \softmax(\mathbf{x})_j = \frac{e^{x_j - m}}{\sum_{k=1}^{N} e^{x_k - m}}, \qquad m = \max_k x_k \tag{86.3} \]</div>
+<p>Write it in PyTorch the plain way, one operation per line, and each line becomes one kernel that reads its inputs from HBM and writes its output back:</p>
+<pre class="code">x_max = x.max(dim=1)[0]            <span class="cm"># read MN,     write M</span>
+z = x - x_max[:, None]             <span class="cm"># read MN + M, write MN</span>
+num = torch.exp(z)                 <span class="cm"># read MN,     write MN</span>
+den = num.sum(dim=1)               <span class="cm"># read MN,     write M</span>
+out = num / den[:, None]           <span class="cm"># read MN + M, write MN</span></pre>
+<aside class="note analogy side"><span class="nt">Analogy</span>A cook who walks to the fridge (HBM) for every step: take the vegetables out, wash them, put them back; take them out, cut them, put them back. The fused kernel takes them out once, does all the steps on the counter (registers), and puts the finished dish away once.</aside>
+<p>Add the columns. The eager version reads \(5MN + 2M\) elements and writes \(3MN + 2M\). [Certain, the same count is in the Triton tutorial] A fused kernel loads each row once, keeps it on the chip (in registers), does all five steps there, and writes the result once:</p>
+<div class="eq">\[ \text{eager: } (5MN + 2M) + (3MN + 2M) = 8MN + 4M, \qquad \text{fused: } MN + MN = 2MN \tag{86.4} \]</div>
+<p>For large \(N\), the ratio is about \(8MN / 2MN = 4\). When a kernel is memory-bound, its time is at least its bytes divided by the bandwidth:</p>
+<div class="eq">\[ t \;\ge\; \frac{\text{bytes moved}}{\text{HBM bandwidth}} \tag{86.5} \]</div>
+<p>So a fused softmax can be up to about 4 times faster, and that is what the Triton tutorial measures against the naive version. [Certain, from the tutorial; the exact speed depends on the GPU] It also wins a little against <code>torch.softmax</code>, which is already a single fused kernel but is written for any shape and layout. [Certain, as stated in the tutorial]</p>
+<div class="worked"><div class="wt">Worked example: softmax over 8,192 rows of 4,096 FP32 scores</div>
+<p>\(M = 8{,}192\), \(N = 4{,}096\), 4 bytes per element. Eager: \((8MN + 4M) \times 4 = 1{,}073.9\) MB. Fused: \(2MN \times 4 = 268.4\) MB. Ratio: 4.0. At 3.35 TB/s (formula 86.5), the lower bounds are \(320.6\ \mu s\) for eager and \(80.1\ \mu s\) for fused. The eager version also launches 5 kernels instead of 1.</p></div>
+<p>Figure 2 walks through the five eager kernels and then the fused one, with the bytes each moves.</p>
+<figure class="fig wide" id="tk-soft"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="tk-soft-prev">Back</button><button type="button" class="btn primary" id="tk-soft-play">Play</button><button type="button" class="btn" id="tk-soft-next">Next</button><span id="tk-soft-lab" class="tk-lab"></span></div>
+<div class="tk-grid" style="margin-top:8px">
+<label for="tk-soft-m">Rows \(M\)</label><input type="range" id="tk-soft-m" min="0" max="7" step="1" value="5"><output id="tk-soft-mv"></output>
+<label for="tk-soft-n">Columns \(N\)</label><input type="range" id="tk-soft-n" min="0" max="7" step="1" value="4"><output id="tk-soft-nv"></output></div>
+<div class="controls" style="margin-top:6px"><span class="tk-lab">Element type:</span><span class="seg" id="tk-soft-dt"><button type="button" data-v="4" aria-pressed="true">FP32 (4 bytes)</button><button type="button" data-v="2" aria-pressed="false">BF16 (2 bytes)</button></span></div>
+<div class="scroll-x"><svg id="tk-soft-svg" viewBox="0 0 720 270" role="img" aria-label="Five eager softmax kernels and one fused kernel with the bytes each moves to and from HBM"></svg></div>
+<div class="tk-leg"><span style="--c:var(--q)">bytes read from HBM</span><span style="--c:var(--k)">bytes written to HBM</span></div>
+<div class="readout" id="tk-soft-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Memory traffic of softmax, eager versus fused. The bars at the bottom add up all bytes so far (formula 86.4). Times are lower bounds at the 3.35 TB/s of an H100 SXM (formula 86.5); real kernels reach a fraction of that.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Step through the eager kernels: each one reads a full \(M \times N\) matrix, and three of them also write one. The intermediate tensors <code>z</code> and <code>num</code> exist only to be read again by the next kernel. Step 6 is the fused kernel: one read, one write, and the intermediates never leave the chip. Change \(N\): the ratio stays close to 4 because the \(4M\) term is small next to \(8MN\). BF16 halves every number but not the ratio.</p></details></figure>
+
+<h3>The fused softmax kernel</h3>
+<p>One program handles one row. This works when a full row fits in one block (up to some tens of thousands of columns; see Figure 3).</p>
+<div class="algo"><div class="algo-h">Algorithm 2: fused softmax, the code of one program (one row)</div><ol>
+<li><b>input:</b> pointers to input and output, row stride, \(N\) columns, block size \(B \ge N\) (a power of two)</li>
+<li>\(r \leftarrow\) <code>tl.program_id(0)</code> <span class="c">// the row this program owns</span></li>
+<li>\(\mathbf{o} \leftarrow (0, \dots, B - 1)\); \(\;\mathbf{m} \leftarrow \mathbf{o} \lt N\)</li>
+<li>\(\mathbf{x} \leftarrow\) load(row \(r\) at \(\mathbf{o}\), mask \(\mathbf{m}\), other \(= -\infty\)) <span class="c">// masked slots give e^(−∞) = 0</span></li>
+<li>\(m \leftarrow \max(\mathbf{x})\); \(\;\mathbf{e} \leftarrow \exp(\mathbf{x} - m)\); \(\;s \leftarrow \sum \mathbf{e}\) <span class="c">// all in registers</span></li>
+<li>store(row \(r\) at \(\mathbf{o}\), \(\mathbf{e} / s\), mask \(\mathbf{m}\)) <span class="c">// the only write</span></li>
+<li><b>host:</b> \(B \leftarrow\) next power of two \(\ge N\); launch \(M\) programs</li></ol></div>
+<p>Look at line 4. The fill value for masked slots must not change the answer. For a max and a sum of exponentials, \(-\infty\) is right: it never wins the max and \(e^{-\infty} = 0\) adds nothing. For a plain sum, the right fill is 0. Choosing the wrong <code>other</code> is a classic bug (see Common mistakes).</p>
+<pre class="code"><span class="kw2">@triton.jit</span>
+<span class="kw2">def</span> softmax_kernel(out_ptr, in_ptr, in_stride, out_stride, n_cols, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs &lt; n_cols
+    x = tl.load(in_ptr + row * in_stride + offs, mask=mask, other=-float(<span class="st">"inf"</span>))
+    x = x - tl.max(x, axis=0)                     <span class="cm"># formula (86.3), stable</span>
+    num = tl.exp(x)
+    den = tl.sum(num, axis=0)
+    tl.store(out_ptr + row * out_stride + offs, num / den, mask=mask)
+
+<span class="kw2">def</span> softmax(x):
+    M, N = x.shape
+    out = torch.empty_like(x)
+    BLOCK = triton.next_power_of_2(N)             <span class="cm"># the whole row in one block</span>
+    softmax_kernel[(M,)](out, x, x.stride(0), out.stride(0), N, BLOCK=BLOCK, num_warps=8)
+    <span class="kw2">return</span> out</pre>
+<p>The official tutorial adds one more idea: instead of launching \(M\) programs, it launches only as many as fit on the GPU at once and lets each one loop over several rows (a “persistent” kernel). It picks that count from the kernel’s register and shared-memory use and the number of SMs. [Certain, from the tutorial]</p>
+
+<h3>When a row does not fit: online softmax</h3>
+<p>For a vocabulary of 128,000 logits, one block would need 131,072 slots, which is too many registers (Figure 3). Then the program must loop over the row in chunks. The problem: the max \(m\) is not known until the end. The <b>online softmax</b> trick keeps a running max \(m\) and a running sum \(\ell\), and rescales the sum whenever the max grows:</p>
+<div class="eq">\[ m' = \max\big(m,\ \max_{j \in \text{chunk}} x_j\big), \qquad \ell' = \ell \, e^{m - m'} + \sum_{j \in \text{chunk}} e^{x_j - m'} \tag{86.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(m, \ell\)</dt><dd>the max and the sum of \(e^{x - m}\) over all chunks seen so far; start at \(m = -\infty\), \(\ell = 0\)</dd>
+<dt>\(m', \ell'\)</dt><dd>the same values after adding one more chunk</dd>
+<dt>\(e^{m - m'}\)</dt><dd>a correction factor (at most 1) that re-expresses the old sum relative to the new max</dd></dl>
+<p>After the last chunk, \(\ell\) equals the true denominator. A second pass writes \(e^{x_j - m} / \ell\). This costs one extra read of the row but no extra intermediate tensor. The same trick, applied to attention scores, is the heart of FlashAttention (<a href="../inference/index.html#row-attention-operator-1-flashattention-1-2-and" title="Attention operator 1: FlashAttention 1, 2 and 3 (planned)">session 124</a>).</p>
+<div class="worked"><div class="wt">Worked example: online softmax on (1, 3, 2, 5) in chunks of 2</div>
+<p>Chunk 1 = (1, 3): \(m = 3\), \(\ell = e^{-2} + e^{0} = 1.1353\). Chunk 2 = (2, 5): \(m' = 5\), \(\ell' = 1.1353 \cdot e^{3 - 5} + e^{2-5} + e^{0} = 1.2034\). Computing directly, \(\sum_k e^{x_k - 5} = 1.2034\): the same. The softmax is (0.0152, 0.1125, 0.0414, 0.8310).</p></div>
+
+<h2>An RMSNorm kernel</h2>
+<p>Every block of Llama-style models normalizes its input with RMSNorm (<a href="../transformers/the-residual-stream-and-normalization.html">session 22</a>). For a row \(\mathbf{x} \in \R^{N}\) with a learned gain \(\mathbf{w}\):</p>
+<div class="eq">\[ \mathrm{RMSNorm}(\mathbf{x})_j = \frac{x_j}{\sqrt{\frac{1}{N}\sum_{k=1}^{N} x_k^2 + \varepsilon}} \; w_j \tag{86.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\)</dt><dd>the hidden size (4,096 for Llama 3 8B)</dd>
+<dt>\(\varepsilon\)</dt><dd>a small constant such as \(10^{-5}\), so we never divide by zero</dd>
+<dt>\(w_j\)</dt><dd>the learned gain for feature \(j\), shared by all rows</dd></dl>
+<p>The plain PyTorch line <code>x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * w</code> launches about six kernels (square, mean, add, rsqrt, two multiplies). Count them like the softmax, with all tensors in one element type: they read \(4MN + 3M + N\) elements and write \(3MN + 3M\). A fused kernel reads the row and \(\mathbf{w}\) once and writes once: \(2MN + N\). That is about 3.5 times less traffic.</p>
+<div class="worked"><div class="wt">Worked example: RMSNorm for 8,192 tokens of a 4,096-wide model in BF16</div>
+<p>\(M = 8{,}192\), \(N = 4{,}096\), 2 bytes. Eager: \((7MN + 6M + N) \times 2 = 469.9\) MB, at least \(140.3\ \mu s\) on an H100. Fused: \((2MN + N) \times 2 = 134.2\) MB, at least \(40.1\ \mu s\). Ratio 3.5. Real code is often worse for eager, because it also casts BF16 to FP32 and back, which adds two more full passes.</p></div>
+<div class="algo"><div class="algo-h">Algorithm 3: RMSNorm with a loop over chunks, the code of one program (one row)</div><ol>
+<li><b>input:</b> pointers to \(\mathbf{x}\), \(\mathbf{w}\), output; row stride; \(N\); \(\varepsilon\); tunable block size \(B\) (can be smaller than \(N\))</li>
+<li>\(r \leftarrow\) <code>tl.program_id(0)</code>; \(\;\mathbf{a} \leftarrow\) zeros(\(B\)) in FP32 <span class="c">// accumulator</span></li>
+<li><b>for</b> start \(= 0, B, 2B, \dots \lt N\): load chunk \(\mathbf{x}_c\) (mask, other \(= 0\)), cast to FP32, \(\mathbf{a} \leftarrow \mathbf{a} + \mathbf{x}_c^2\)</li>
+<li>\(\rho \leftarrow 1 / \sqrt{\sum \mathbf{a} / N + \varepsilon}\) <span class="c">// formula (86.7); save ρ for the backward pass if training</span></li>
+<li><b>for</b> start \(= 0, B, 2B, \dots \lt N\): load \(\mathbf{x}_c\) and \(\mathbf{w}_c\), store \(\mathbf{x}_c \cdot \rho \cdot \mathbf{w}_c\) cast to the output type</li>
+<li><b>host:</b> launch \(M\) programs; let the autotuner choose \(B\) and <code>num_warps</code></li></ol></div>
+<p>The second loop reads the row again. For \(N = 4{,}096\) in BF16 a row is only 8 KB, so the second read usually hits the on-chip L2 cache rather than HBM. [Likely] If \(B \ge N\), there is one chunk, and you can keep the row in registers and skip the second load completely.</p>
+
+<h2>Block size, warps and autotuning</h2>
+<p>Three numbers decide how a Triton kernel runs, and you choose all three:</p>
+<ul><li><b>BLOCK_SIZE</b> (a <code>tl.constexpr</code>): how many elements one program works on at a time.</li>
+<li><b>num_warps</b>: how many warps (groups of 32 threads) run one program. More warps means fewer elements per thread.</li>
+<li><b>num_stages</b>: how many tiles ahead the compiler loads in loops (software pipelining). More stages hide memory latency but use more shared memory. It mostly matters for matrix multiplication loops.</li></ul>
+<p>A useful first estimate: in a kernel that keeps one block of FP32 values in registers, each thread holds</p>
+<div class="eq">\[ e = \frac{B}{32 \cdot \texttt{num\_warps}} \ \text{ values, so at least } e \text{ registers of 32 bits per thread} \tag{86.8} \]</div>
+<p>On an H100, an SM has 65,536 registers of 32 bits and a thread can use at most 255. [Certain, CUDA programming guide] If a thread needs more, the compiler <b>spills</b> values to slow local memory, and the kernel slows down a lot. If threads need many registers, fewer warps fit on an SM at once, and there are fewer warps to hide memory latency (<a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>). The real register count is higher than \(e\): addresses, indices and temporaries need registers too. So formula (86.8) is a lower bound, good for spotting obviously bad choices. Figure 3 applies it.</p>
+<figure class="fig" id="tk-reg"><div class="fig-body">
+<div class="tk-grid">
+<label for="tk-reg-n">Row length \(N\)</label><input type="range" id="tk-reg-n" min="0" max="11" step="1" value="5"><output id="tk-reg-nv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="tk-lab">num_warps:</span><span class="seg" id="tk-reg-w"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="4" aria-pressed="true">4</button><button type="button" data-v="8" aria-pressed="false">8</button><button type="button" data-v="16" aria-pressed="false">16</button><button type="button" data-v="32" aria-pressed="false">32</button></span></div>
+<svg id="tk-reg-svg" viewBox="0 0 640 250" role="img" aria-label="Bars for wasted slots, registers per thread and warps per SM for a one-row-per-program kernel"></svg>
+<div class="readout" id="tk-reg-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> A one-row-per-program kernel (like Algorithm 2) with \(B = \) next power of two \(\ge N\), on an H100 (65,536 registers per SM, at most 255 per thread, at most 64 warps per SM). The register bar counts only the row data (formula 86.8), so real kernels use more; the warps bar is an upper bound.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Start at \(N = 4{,}096\) and 4 warps: 32 values per thread, fine. Move to \(N = 32{,}768\): with 4 warps each thread would need 256 values, above the 255 limit, so it spills; with 16 warps it is 64. This is why long rows need more warps, or a chunked loop like Algorithm 3. Now try \(N = 5{,}000\): the block becomes 8,192 and 39% of the slots are masked. Because these effects interact and depend on the GPU, the practical answer is to measure, which is what the autotuner does.</p></details></figure>
+<h3>triton.autotune</h3>
+<p>The autotuner is a decorator. You give it a list of <code>triton.Config</code> candidates (block sizes, <code>num_warps</code>, <code>num_stages</code>) and a <code>key</code>: a list of argument names. The first time the kernel is called with a new value of the key arguments, Triton runs every candidate, times it, and caches the fastest for that key. [Certain, Triton API docs]</p>
+<pre class="code"><span class="kw2">@triton.autotune</span>(
+    configs=[triton.Config({<span class="st">"BLOCK"</span>: b}, num_warps=w)
+             <span class="kw2">for</span> b <span class="kw2">in</span> (256, 512, 1024, 2048) <span class="kw2">for</span> w <span class="kw2">in</span> (2, 4, 8)],
+    key=[<span class="st">"n_cols"</span>],                              <span class="cm"># re-tune when the row length changes</span>
+)
+<span class="kw2">@triton.jit</span>
+<span class="kw2">def</span> rmsnorm_kernel(out_ptr, x_ptr, w_ptr, stride, n_cols, eps, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    x_row = x_ptr + row * stride
+    acc = tl.zeros([BLOCK], dtype=tl.float32)
+    <span class="kw2">for</span> start <span class="kw2">in</span> range(0, n_cols, BLOCK):         <span class="cm"># pass 1: sum of squares</span>
+        offs = start + tl.arange(0, BLOCK)
+        x = tl.load(x_row + offs, mask=offs &lt; n_cols, other=0.0).to(tl.float32)
+        acc += x * x
+    rstd = tl.rsqrt(tl.sum(acc, axis=0) / n_cols + eps)      <span class="cm"># formula (86.7)</span>
+    <span class="kw2">for</span> start <span class="kw2">in</span> range(0, n_cols, BLOCK):         <span class="cm"># pass 2: normalize and scale</span>
+        offs = start + tl.arange(0, BLOCK)
+        m = offs &lt; n_cols
+        x = tl.load(x_row + offs, mask=m, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + offs, mask=m, other=0.0).to(tl.float32)
+        tl.store(out_ptr + row * stride + offs, (x * rstd * w).to(out_ptr.dtype.element_ty), mask=m)
+
+<span class="kw2">def</span> rmsnorm(x, w, eps=1e-5):
+    M, N = x.shape
+    out = torch.empty_like(x)
+    rmsnorm_kernel[(M,)](out, x, w, x.stride(0), N, eps)   <span class="cm"># BLOCK comes from the chosen config</span>
+    <span class="kw2">return</span> out</pre>
+<p>Three practical points. (1) The first call is slow: it compiles and times 12 configs. Never include it in a benchmark. (2) A good <code>key</code> lists the arguments that change the best choice (here the row length), but not ones that change every call, or the kernel re-tunes all the time. (3) If a kernel writes into one of its inputs, every trial run changes that input again; the autotuner has <code>reset_to_zero</code> and <code>restore_value</code> options for this. [Certain, Triton API docs]</p>
+
+<h2>Compare with PyTorch eager and torch.compile</h2>
+<p>You now have three ways to run the same RMSNorm:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Way</th><th>What runs on the GPU</th><th>Strength</th><th>Weakness</th></tr></thead><tbody>
+<tr><td>PyTorch eager</td><td>One pre-built kernel per operation (about 6 for RMSNorm)</td><td>No compile step; easy to debug</td><td>Every intermediate goes through HBM; many launches</td></tr>
+<tr><td><code>torch.compile</code></td><td>Inductor fuses the chain and generates a Triton kernel [Certain]</td><td>One line of code; also fuses the operations around it</td><td>Compile time; graph breaks; the kernel it writes may not be the best possible</td></tr>
+<tr><td>Hand-written Triton</td><td>Your kernel</td><td>Full control: layout, fusion with neighbours, a custom backward</td><td>You own correctness, the backward pass and the tuning</td></tr></tbody></table></div>
+<p>For a simple element-wise and reduction chain like RMSNorm or softmax, torch.compile often produces a kernel close to a good hand-written one, because it generates Triton itself. [Likely] Hand-written kernels win when the fusion crosses boundaries the compiler does not cross, for example a cross-entropy fused with the final matrix multiply so the full logits tensor is never stored (one of Liger’s kernels), or attention (FlashAttention). [Likely]</p>
+<h3>How to benchmark fairly</h3>
+<p>GPU calls are asynchronous: Python returns before the kernel ends. Timing with <code>time.time()</code> around a call measures almost nothing. Use CUDA events or <code>triton.testing.do_bench</code>, which warms up, repeats the call and synchronizes. Then judge the result with the <b>effective bandwidth</b>: the minimum bytes the operation must move, divided by the measured time:</p>
+<div class="eq">\[ \mathrm{BW}_{\mathrm{eff}} = \frac{\text{minimum bytes}}{t_{\text{measured}}}, \qquad \text{efficiency} = \frac{\mathrm{BW}_{\mathrm{eff}}}{\mathrm{BW}_{\mathrm{peak}}} \tag{86.9} \]</div>
+<p>Use the <b>minimum</b> bytes (for softmax, \(2MN\) elements) for all three versions, not the bytes each one actually moved. Then the number tells you how close each version is to the best possible on this GPU. A memory-bound kernel that reaches 80–90% of the peak bandwidth is very good; that is roughly the best that well-tuned kernels reach in practice. [Likely] The softmax plot in the Triton tutorial is drawn exactly this way, in GB/s. Figure 4 is the calculator: enter a time you measured, read the efficiency, and see where the kernel sits on the roofline.</p>
+<figure class="fig" id="tk-bw"><div class="fig-body">
+<div class="controls"><span class="tk-lab">Kernel:</span><span class="seg" id="tk-bw-k"><button type="button" data-v="add" aria-pressed="false">vector add</button><button type="button" data-v="soft" aria-pressed="true">softmax</button><button type="button" data-v="rms" aria-pressed="false">RMSNorm</button></span></div>
+<div class="controls"><span class="tk-lab">GPU:</span><span class="seg" id="tk-bw-g"><button type="button" data-v="h100" aria-pressed="true">H100 SXM</button><button type="button" data-v="a100" aria-pressed="false">A100 80GB SXM</button><button type="button" data-v="4090" aria-pressed="false">RTX 4090</button></span><span class="tk-lab">Type:</span><span class="seg" id="tk-bw-dt"><button type="button" data-v="4" aria-pressed="true">FP32</button><button type="button" data-v="2" aria-pressed="false">BF16</button></span></div>
+<div class="tk-grid" style="margin-top:6px">
+<label for="tk-bw-m">Rows \(M\)</label><input type="range" id="tk-bw-m" min="0" max="7" step="1" value="5"><output id="tk-bw-mv"></output>
+<label for="tk-bw-n">Columns \(N\)</label><input type="range" id="tk-bw-n" min="0" max="7" step="1" value="4"><output id="tk-bw-nv"></output>
+<label for="tk-bw-t">Measured time (µs)</label><input type="range" id="tk-bw-t" min="0" max="100" step="1" value="50"><output id="tk-bw-tv"></output></div>
+<div class="scroll-x"><svg id="tk-bw-svg" viewBox="0 0 640 270" role="img" aria-label="A roofline with the measured kernel as a point, plus effective bandwidth"></svg></div>
+<div class="readout" id="tk-bw-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Effective bandwidth (formula 86.9) and the position on the roofline for a kernel time you enter. Peak HBM bandwidth: H100 SXM 3.35 TB/s, A100 80GB SXM 2.04 TB/s, RTX 4090 1.01 TB/s; dense BF16 tensor-core peaks 989, 312 and 165 TFLOP/s. FLOPs per element are rough counts (add 1, softmax 5, RMSNorm 4). The time is your input, not a measurement of ours.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The dot sits far to the left of the ridge (the corner of the roof): a few FLOPs per element over 4 to 12 bytes per element gives an arithmetic intensity of about 1 FLOP per byte or less, while the H100 ridge is at about 295 FLOP/byte. So these kernels can only be limited by bandwidth, and the right score is GB/s, not FLOP/s. Slide the time down: the readout refuses times faster than the bandwidth allows, because no kernel can beat formula (86.5). If a time you measured seems to do so, you probably forgot to synchronize.</p></details></figure>
+
+<h2>The name trap: Triton is two different things</h2>
+<p>Two well-known projects share the name, and interviewers like to check that you know the difference.</p>
+<div class="tblw"><table class="tb"><thead><tr><th></th><th>Triton (the language)</th><th>Triton Inference Server</th></tr></thead><tbody>
+<tr><td>What it is</td><td>A language and compiler for writing GPU kernels</td><td>A server program that hosts trained models and answers requests</td></tr>
+<tr><td>Who makes it</td><td>Started by Philippe Tillet (Harvard, 2019 paper); developed at OpenAI with a community [Certain]</td><td>NVIDIA [Certain]</td></tr>
+<tr><td>Level</td><td>Inside one operation (softmax, matmul, attention)</td><td>Whole models, HTTP/gRPC endpoints, many users</td></tr>
+<tr><td>You use it to</td><td>Write <code>@triton.jit</code> kernels; read torch.compile output</td><td>Deploy models from TensorRT, PyTorch, ONNX and other back-ends, with dynamic batching [Certain]</td></tr>
+<tr><td>Install</td><td><code>pip install triton</code> (comes with PyTorch on Linux GPUs) [Likely]</td><td>Usually a Docker container from NVIDIA [Likely]</td></tr></tbody></table></div>
+<p>They can even meet: a model served by Triton Inference Server can run kernels written in the Triton language. But they solve different problems at different levels. When someone says “we use Triton”, ask which one. Serving systems are covered in <a href="../inference/index.html#row-the-serving-stack-and-the-life-of" title="The serving stack and the life of a request (planned)">session 133</a>.</p>
+
+<h2>A complete, checkable script</h2>
+<p>The script below checks both kernels against PyTorch and then times eager, torch.compile and Triton. It needs a Linux machine with an NVIDIA or AMD GPU for timing. Without a GPU, Triton’s interpreter mode (<code>TRITON_INTERPRET=1</code>) runs the kernels on the CPU with NumPy, slowly, which is enough to check correctness. [Likely] The random inputs are seeded, so the checks are deterministic.</p>
+<pre class="code"><span class="kw2">import</span> os, torch
+<span class="kw2">if not</span> torch.cuda.is_available():
+    os.environ[<span class="st">"TRITON_INTERPRET"</span>] = <span class="st">"1"</span>          <span class="cm"># CPU interpreter: correctness only</span>
+<span class="kw2">import</span> triton, triton.language <span class="kw2">as</span> tl
+dev = <span class="st">"cuda"</span> <span class="kw2">if</span> torch.cuda.is_available() <span class="kw2">else</span> <span class="st">"cpu"</span>
+torch.manual_seed(0)
+
+<span class="cm"># softmax_kernel / softmax and rmsnorm_kernel / rmsnorm: paste the code from above here</span>
+
+<span class="kw2">def</span> rmsnorm_eager(x, w, eps=1e-5):
+    xf = x.float()
+    <span class="kw2">return</span> (xf * torch.rsqrt(xf.pow(2).mean(-1, keepdim=True) + eps) * w.float()).to(x.dtype)
+
+M, N = (8192, 4096) <span class="kw2">if</span> dev == <span class="st">"cuda"</span> <span class="kw2">else</span> (64, 1000)   <span class="cm"># N not a power of 2: tests the mask</span>
+x = torch.randn(M, N, device=dev)
+w = torch.randn(N, device=dev)
+
+<span class="cm"># 1) correctness</span>
+<span class="kw2">assert</span> torch.allclose(softmax(x), torch.softmax(x, dim=1), atol=1e-6)
+<span class="kw2">assert</span> torch.allclose(rmsnorm(x, w), rmsnorm_eager(x, w), atol=1e-5)
+print(<span class="st">"both kernels match PyTorch"</span>)
+
+<span class="cm"># 2) timing (GPU only): do_bench warms up, repeats and synchronizes; result in ms</span>
+<span class="kw2">if</span> dev == <span class="st">"cuda"</span>:
+    xb, wb = x.bfloat16(), w.bfloat16()
+    compiled = torch.compile(rmsnorm_eager)
+    compiled(xb, wb)                                  <span class="cm"># compile outside the timing</span>
+    min_bytes = (2 * M * N + N) * 2                   <span class="cm"># formula (86.9): read x and w, write out, BF16</span>
+    <span class="kw2">for</span> name, fn <span class="kw2">in</span> [(<span class="st">"eager"</span>, rmsnorm_eager), (<span class="st">"compile"</span>, compiled), (<span class="st">"triton"</span>, rmsnorm)]:
+        ms = triton.testing.do_bench(<span class="kw2">lambda</span>: fn(xb, wb))
+        print(f<span class="st">"{name:8s} {ms * 1e3:8.1f} us   {min_bytes / (ms * 1e-3) / 1e9:7.0f} GB/s"</span>)</pre>
+<p>We do not print expected times here: they depend on the GPU, the driver and the PyTorch and Triton versions. Run it and put your own numbers into Figure 4. What you should see on a recent GPU: the eager version is clearly the slowest (formula 86.4 says by up to about 3.5 times in bytes, more with the casts), and torch.compile and the Triton kernel are close to each other. [Likely]</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Where</th><th>Triton kernels in use</th><th>Why Triton</th></tr></thead><tbody>
+<tr><td>torch.compile (TorchInductor)</td><td>Generated kernels for fused element-wise and reduction chains; Triton matmul templates with <code>max-autotune</code> [Certain]</td><td>One code generator for many fusion patterns</td></tr>
+<tr><td>LLM training libraries (Liger Kernel, Unsloth)</td><td>RMSNorm, RoPE, SwiGLU, fused linear + cross-entropy [Certain for Liger; Likely for Unsloth]</td><td>Fewer bytes and less memory for activations and logits</td></tr>
+<tr><td>LLM serving engines (vLLM, SGLang)</td><td>Fused mixture-of-experts layers, some attention and quantization kernels [Likely]</td><td>Fast to write for new models and new GPUs</td></tr>
+<tr><td>Attention research</td><td>The Triton fused-attention tutorial, FlashAttention-style kernels for new attention variants [Certain for the tutorial]</td><td>Try a new attention idea in days instead of weeks</td></tr>
+<tr><td>Quantized inference</td><td>Matrix multiply with on-the-fly dequantization of 4-bit or 8-bit weights [Likely]</td><td>Decode is memory-bound; reading fewer weight bytes is the whole gain (<a href="../inference/index.html">Track 5</a>)</td></tr>
+<tr><td>Video and VLM pipelines</td><td>Fused frame preprocessing (uint8 to float, resize, mean/std normalize) before a vision encoder; fused norms and softmax inside ViT encoders for video retrieval, action recognition and key-moment detection [Likely]</td><td>Video gives many frames per request, so per-frame memory traffic adds up quickly</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Wrong <code>other</code> value for masked loads.</b> Filling with 0 before a max can give a wrong max when all real values are negative; filling with \(-\infty\) before a plain sum gives NaN. Choose the value that does not change the reduction: \(-\infty\) for max and softmax, 0 for sums.</li>
+<li><b>Forgetting the mask on the store.</b> The load was masked, but an unmasked <code>tl.store</code> writes past the end of the tensor and corrupts other memory, sometimes silently.</li>
+<li><b>Assuming the tensor is contiguous.</b> A transposed or sliced tensor has a different row stride. Pass <code>x.stride(0)</code> (as above) or call <code>.contiguous()</code> first.</li>
+<li><b>A block that is not a power of two, or not a <code>tl.constexpr</code>.</b> <code>tl.arange</code> needs a compile-time power-of-two length. Use <code>triton.next_power_of_2(N)</code> and mask the rest.</li>
+<li><b>Accumulating in BF16 or FP16.</b> Sums of thousands of squares lose precision or overflow in 16-bit. Cast loads to FP32 (<code>.to(tl.float32)</code>), reduce in FP32, cast only the stored result.</li>
+<li><b>Timing without synchronization, or including compile and autotune time.</b> Use <code>triton.testing.do_bench</code> or CUDA events, and call the kernel once before timing.</li>
+<li><b>An autotune <code>key</code> that changes every call</b> (for example the batch size in serving). The kernel re-benchmarks all configs again and again. Key on the shape that really changes the best config, or bucket it.</li>
+<li><b>Writing only the forward pass for training.</b> A Triton kernel is not differentiable by itself. Wrap it in a <code>torch.autograd.Function</code> with a backward kernel (for RMSNorm, save \(\rho\) per row), and test the gradient with <code>torch.autograd.gradcheck</code> in FP64 on small inputs.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is Triton, and how is its programming model different from CUDA?<span class="lvl">basic</span></summary><div class="ans">Triton is a Python-embedded language and compiler for GPU kernels. In CUDA you write code for one thread and manage threads, shared memory, barriers and coalescing yourself. In Triton you write code for one program (about one thread block) that operates on whole blocks of data with vector operations like <code>tl.load</code>, <code>tl.sum</code>, <code>tl.dot</code>. The compiler maps the block to threads and warps, uses shared memory and tensor cores, and pipelines loads. You still choose the grid, block sizes, what to fuse and the memory layout.</div></details>
+<details class="qa"><summary>Is the Triton language the same as Triton Inference Server?<span class="lvl">basic</span></summary><div class="ans">No. The Triton language (from Tillet’s 2019 paper, developed at OpenAI) is a kernel compiler: it works inside one operation. Triton Inference Server is NVIDIA’s model-serving software: it loads models from TensorRT, PyTorch, ONNX and other back-ends and serves requests over HTTP or gRPC with dynamic batching. They work at different levels; a served model could use kernels written in Triton.</div></details>
+<details class="qa"><summary>Why must BLOCK_SIZE be a tl.constexpr and a power of two, and how do you handle sizes that are not?<span class="lvl">core</span></summary><div class="ans">Triton compiles a separate kernel for each constexpr value, so all block shapes are known at compile time; this lets it choose the layout over threads, the register allocation and the vector width. <code>tl.arange</code> requires a power-of-two length. For other sizes, round up with <code>triton.next_power_of_2</code> or loop over chunks, and mask the slots past the end in both loads and stores. The cost is wasted lanes, for example 39% when a 5,000-column row is padded to 8,192.</div></details>
+<details class="qa"><summary>Why is a fused softmax up to about 4 times faster than the naive PyTorch version?<span class="lvl">core</span></summary><div class="ans">Softmax is memory-bound: a few FLOPs per element. The naive version runs five kernels (max, subtract, exp, sum, divide) that together read \(5MN + 2M\) elements and write \(3MN + 2M\), so \(8MN + 4M\) in total. The fused kernel loads each row once into registers, does all steps on chip and writes once: \(2MN\). Time is bounded by bytes over bandwidth, so the ratio is about 4. It also launches 1 kernel instead of 5.</div></details>
+<details class="qa"><summary>Your softmax row has 128,000 columns. What changes in the kernel?<span class="lvl">advanced</span></summary><div class="ans">One block would be 131,072 slots, which needs far more than 255 registers per thread even with 32 warps (131,072 / 1,024 = 128 values per thread, plus temporaries), so it spills or fails. Instead loop over the row in chunks and use online softmax: keep a running max \(m\) and sum \(\ell\), and rescale \(\ell\) by \(e^{m - m'}\) when the max grows. A second pass writes \(e^{x - m}/\ell\). For one very long row you can also split the row over several programs and combine their \((m, \ell)\) pairs in a second small kernel, the same idea as Flash-Decoding.</div></details>
+<details class="qa"><summary>Walk me through an RMSNorm kernel. What precision do you use, and what do you save for the backward pass?<span class="lvl">core</span></summary><div class="ans">One program per row. Load the row (masked, other 0), cast to FP32, sum the squares, compute \(\rho = 1/\sqrt{\text{mean} + \varepsilon}\) with <code>tl.rsqrt</code>, then store \(x \rho w\) cast back to BF16. Accumulating in FP32 avoids precision loss over thousands of terms. For training, store \(\rho\) per row (\(M\) floats) so the backward pass does not need to recompute the reduction; the backward kernel also needs \(x\), \(w\) and must reduce the gradient of \(w\) over all rows.</div></details>
+<details class="qa"><summary>What do num_warps and num_stages control?<span class="lvl">advanced</span></summary><div class="ans"><code>num_warps</code> is how many warps of 32 threads execute one program, so it sets how many elements each thread holds (\(B / (32 \cdot \texttt{num\_warps})\)) and how many registers it needs. Too few warps for a big block causes register spills; too many leaves threads with little work and more synchronization cost in reductions. <code>num_stages</code> sets how many loop iterations ahead the compiler prefetches tiles into shared memory (software pipelining); it hides memory latency in loops like matmul but uses more shared memory, which can lower occupancy.</div></details>
+<details class="qa"><summary>How does triton.autotune work, and what can go wrong?<span class="lvl">core</span></summary><div class="ans">You pass a list of <code>triton.Config</code> objects (meta-parameters such as BLOCK, plus num_warps and num_stages) and a <code>key</code> list of argument names. On the first call with a new key value, Triton benchmarks every config and caches the fastest. Pitfalls: the first call is slow (compile plus timing); a key that changes every call causes constant re-tuning; kernels that modify inputs in place get run many times during tuning, so use <code>reset_to_zero</code> or <code>restore_value</code>; and results tuned on one GPU may not be best on another.</div></details>
+<details class="qa"><summary>When would you write a Triton kernel instead of relying on torch.compile?<span class="lvl">advanced</span></summary><div class="ans">First profile. If torch.compile already fuses the hot chain into one kernel at high effective bandwidth, stop. Write a kernel when (a) the fusion crosses a boundary the compiler will not cross, such as fusing the final matmul with cross-entropy so the logits are never stored, or attention; (b) you need a custom memory layout or a custom backward that saves less memory; (c) graph breaks or dynamic shapes prevent compilation; or (d) you need a new operator, such as a new quantization format. Then compare your kernel against both eager and compiled versions with the same minimum-bytes metric.</div></details>
+<details class="qa"><summary>How do you benchmark a kernel and decide whether it is good?<span class="lvl">core</span></summary><div class="ans">Warm up first (compile, autotune), then time many runs with CUDA events or <code>triton.testing.do_bench</code>, which synchronizes. Compute effective bandwidth = minimum bytes the operation must move divided by time, and compare it with the GPU’s peak (3.35 TB/s on an H100 SXM). For memory-bound kernels, 80–90% of the peak is very good; far less means wasted traffic, poor coalescing, too few programs, or launch overhead on small inputs. For compute-bound kernels such as matmul, compare FLOP/s with the tensor-core peak instead. Test several shapes, including sizes that are not powers of two.</div></details>
+<details class="qa"><summary>Inductor generated a Triton kernel for your model. How do you look at it, and why would you?<span class="lvl">advanced</span></summary><div class="ans">Set <code>TORCH_LOGS="output_code"</code> (or use <code>TORCH_COMPILE_DEBUG=1</code>) to print or save the generated code. [Likely] You see which operations were fused into one kernel, the block sizes it chose and the loads and stores. This shows whether a chain you expected to be fused was split (for example by a graph break or a layout change), and it is a good starting point for a hand-written kernel.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A vector of \(n = 10{,}000\) elements, BLOCK = 1,024. How many programs are launched, and how many slots are masked?</li>
+<li>Count the HBM traffic of the naive softmax for \(M = 1{,}024\), \(N = 32{,}768\) in BF16, and of the fused kernel. What is the ratio?</li>
+<li>A one-row-per-program kernel holds an FP32 row of \(N = 16{,}384\) in registers. What is the smallest <code>num_warps</code> that keeps the row data at or below 255 values per thread? Why would you choose more in practice?</li>
+<li>Run online softmax by hand on \((4, 1, 6)\) in chunks of sizes 2 and 1. Give \(m\) and \(\ell\) after each chunk, and the final probabilities.</li>
+<li>Your fused RMSNorm for \(M = 8{,}192\), \(N = 4{,}096\), BF16, takes 50 µs on an H100 SXM. What is its effective bandwidth and efficiency?</li>
+<li>Rewrite the vector-add kernel so it computes <code>out = a * x + y</code> with a scalar <code>a</code>. Which arguments change and does the byte count change?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(\lceil 10{,}000 / 1{,}024 \rceil = 10\) programs covering 10,240 slots, so 240 masked slots, all in the last program. 2. Eager: \((8MN + 4M) \times 2 = 536.9\) MB; fused: \(2MN \times 2 = 134.2\) MB; ratio 4.0. 3. \(16{,}384 / (32 \cdot w) \le 255\) needs \(w \ge 2.01\), so the smallest power of two is \(w = 4\) (128 values per thread). In practice choose 8 or 16: the real register count is higher than the row alone, and fewer registers per thread let more warps run per SM. 4. Chunk (4, 1): \(m = 4\), \(\ell = 1 + e^{-3} = 1.0498\). Chunk (6): \(m' = 6\), \(\ell' = 1.0498\, e^{-2} + 1 = 1.1421\). Probabilities: \(e^{-2}/1.1421 = 0.1185\), \(e^{-5}/1.1421 = 0.0059\), \(1/1.1421 = 0.8756\). 5. Minimum bytes \((2MN + N) \times 2 = 134.2\) MB; \(134.2\ \text{MB} / 50\ \mu s = 2.68\) TB/s; efficiency \(2.68 / 3.35 = 80\%\). 6. Add an argument <code>a</code> (a plain float, not a pointer) and store <code>a * x + y</code>. The bytes stay \(3n\) elements: the scalar is passed with the launch, so the extra multiply is free on a memory-bound kernel.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A Triton kernel is the code of one program that works on a block of data. Launch \(\lceil n/B \rceil\) programs (86.1); each builds offsets and a mask (86.2) and uses block loads and stores.</li>
+<li>The compiler handles threads, coalescing, shared memory, tensor cores and pipelining. You still choose the grid, BLOCK_SIZE, num_warps, num_stages and what to fuse.</li>
+<li>Count bytes first. Eager softmax moves \(8MN + 4M\) elements, the fused kernel \(2MN\) (86.4); since \(t \ge\) bytes / bandwidth (86.5), fusion can give up to about 4×. RMSNorm: about 3.5×.</li>
+<li>Rows that do not fit in one block use online softmax (86.6), the same trick behind FlashAttention. Accumulate in FP32; mask with values that do not change the reduction.</li>
+<li>Registers per thread are at least \(B / (32 \cdot \texttt{num\_warps})\) (86.8); let <code>triton.autotune</code> measure configs per key, and benchmark against eager and torch.compile with effective bandwidth (86.9).</li>
+<li>The Triton language is a kernel compiler; Triton Inference Server is NVIDIA’s model server. Different things.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ G = \left\lceil \tfrac{n}{B} \right\rceil, \quad \mathbf{o} = \mathrm{pid}\cdot B + (0, \dots, B-1), \quad \mathbf{m} = (\mathbf{o} \lt n) \]</div>
+<div class="eq">\[ \text{softmax bytes: } 8MN + 4M \;\to\; 2MN, \qquad t \ge \frac{\text{bytes}}{\mathrm{BW}}, \qquad \mathrm{BW}_{\mathrm{eff}} = \frac{\text{min bytes}}{t} \]</div>
+<div class="eq">\[ \ell' = \ell\, e^{m - m'} + \sum_{j} e^{x_j - m'}, \qquad \mathrm{RMSNorm}(\mathbf{x})_j = \frac{x_j\, w_j}{\sqrt{\tfrac1N \sum_k x_k^2 + \varepsilon}} \]</div>
+<h2 class="plain" id="gpu-kernels-2-write-kernels-in-the-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>OpenAI and community (docs). <a href="https://triton-lang.org/" target="_blank" rel="noopener">Triton language documentation</a></li><li>Tillet et al. (2019). <a href="https://scholar.google.com/scholar?q=&amp;quot;Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations&amp;quot;" target="_blank" rel="noopener">Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations</a></li><li>OpenAI and community (docs). <a href="https://triton-lang.org/" target="_blank" rel="noopener">Triton language documentation</a></li><li>Tillet et al. (2019). <a href="https://scholar.google.com/scholar?q=&amp;quot;Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations&amp;quot;" target="_blank" rel="noopener">Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations</a></li><li>NVIDIA (code). <a href="https://github.com/triton-inference-server/server" target="_blank" rel="noopener">Triton Inference Server</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">CUDA C++ Programming Guide</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li><li>Ansel et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation&amp;quot;" target="_blank" rel="noopener">PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation</a></li><li>Milakov &amp; Gimelshein (2018). <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noopener">Online normalizer calculation for softmax</a></li><li>Zhang &amp; Sennrich (2019). <a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noopener">Root Mean Square Layer Normalization</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>Hsu, Dai, Kothapalli, Song, Tang, Zhu, Shimizu, Sahni, Ning, Chen (2024). <a href="https://arxiv.org/abs/2410.10989" target="_blank" rel="noopener">Liger Kernel: Efficient Triton Kernels for LLM Training</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Triton developers (docs). <a href="https://triton-lang.org/main/getting-started/tutorials/02-fused-softmax.html" target="_blank" rel="noopener">Triton tutorial: Fused Softmax</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/gpu-kernels-1-cuda-basics-for-ml.html"><small>Previous · session 85</small>GPU kernels 1: CUDA basics for ML engineers</a><span class="next"><small>Next · session 87, planned</small>KV-cached generation, metrics and your GPU’s roofline</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="gpu-kernels-2-write-kernels-in-the"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmtInt=v=>Math.round(v).toLocaleString("en-US");
+const MB=v=>v>0&&v<1e6?(v/1e3).toFixed(1)+" KB":(v/1e6).toFixed(1)+" MB";
+const us=v=>(v*1e6).toFixed(1)+" µs";
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segVal=el=>el.querySelector('button[aria-pressed="true"]').dataset.v;
+const nextPow2=n=>{let p=1;while(p<n)p*=2;return p;};
+const SIZES=[256,512,1024,2048,4096,8192,16384,32768];
+
+/* ---------- Figure 1: grid, offsets, masks ---------- */
+(function(){
+ const svg=$("#tk-grid-svg");if(!svg)return;const NS=$("#tk-grid-n"),BS=$("#tk-grid-b"),info=$("#tk-grid-info");let sel=null;
+ function draw(){const n=+NS.value,b=+segVal(BS);$("#tk-grid-nv").value=n;const G=Math.ceil(n/b);
+  const cw=Math.min(36,580/b),rh=28,top=24,left=104,H=top+G*rh+12;svg.setAttribute("viewBox",`0 0 700 ${H}`);
+  if(sel&&(sel[0]>=G||sel[1]>=b))sel=null;
+  let g=`<text x="${left}" y="16" class="svgs" font-size="12">lane i = 0 … ${b-1} (tl.arange(0, ${b}))</text>`;
+  for(let p=0;p<G;p++){const y=top+p*rh;g+=`<text x="${left-10}" y="${y+18}" text-anchor="end" font-size="13" font-family="var(--mono)" fill="var(--ink)">pid ${p}</text>`;
+   for(let i=0;i<b;i++){const o=p*b+i,act=o<n,isSel=sel&&sel[0]===p&&sel[1]===i;
+    const fill=isSel?"var(--k-soft)":act?"var(--q-soft)":"var(--paper2)";const st=isSel?"var(--k)":act?"var(--q)":"var(--rule)";
+    g+=`<g class="tk-cell" data-p="${p}" data-i="${i}"><rect x="${(left+i*cw).toFixed(1)}" y="${y}" width="${(cw-2).toFixed(1)}" height="${rh-4}" rx="3" fill="${fill}" stroke="${st}" stroke-width="1.2"${act?"":' stroke-dasharray="3 2"'}/>`+
+     (cw>=17?`<text x="${(left+i*cw+(cw-2)/2).toFixed(1)}" y="${y+16}" text-anchor="middle" font-size="${cw>=30?11:9}" font-family="var(--mono)" fill="${act?"var(--ink)":"var(--muted)"}">${o}</text>`:"")+`</g>`;}}
+  svg.innerHTML=g;
+  const slots=G*b,mk=slots-n;
+  let t=`n = <b>${n}</b>, B = <b>${b}</b>: G = ⌈${n}/${b}⌉ = <b>${G}</b> programs, ${slots} slots, ${n} active, <b>${mk}</b> masked (${(100*mk/slots).toFixed(1)}% of slots unused).`;
+  if(sel){const [p,i]=sel,o=p*b+i;t+=` Selected: program ${p}, lane ${i}, offset ${p}·${b} + ${i} = <b>${o}</b>; ${o} ${o<n?"&lt;":"≥"} ${n}, so the mask is <b>${o<n?"true":"false"}</b>${o<n?" (loaded and stored)":" (no load, no store)"}.`;}
+  else t+=" Click a slot to inspect it.";
+  info.innerHTML=t;}
+ svg.addEventListener("click",e=>{const c=e.target.closest(".tk-cell");if(!c)return;sel=[+c.dataset.p,+c.dataset.i];draw();});
+ NS.addEventListener("input",draw);seg(BS,draw);draw();
+})();
+
+/* ---------- Figure 2: softmax traffic, eager vs fused ---------- */
+(function(){
+ const svg=$("#tk-soft-svg");if(!svg)return;const Ms=$("#tk-soft-m"),Nn=$("#tk-soft-n"),DT=$("#tk-soft-dt"),info=$("#tk-soft-info");const BW=3.35e12;let step=0;
+ /* reads and writes in units: [MN coeff, M coeff] */
+ const K=[{n:"x.max(dim=1)",r:[1,0],w:[0,1],t:"Kernel 1 reads the whole matrix to find each row’s max and writes M maxima."},
+  {n:"x − max",r:[1,1],w:[1,0],t:"Kernel 2 reads the matrix again (and the maxima) and writes a full new matrix z."},
+  {n:"exp(z)",r:[1,0],w:[1,0],t:"Kernel 3 reads z and writes another full matrix, num."},
+  {n:"num.sum(dim=1)",r:[1,0],w:[0,1],t:"Kernel 4 reads num to sum each row and writes M sums."},
+  {n:"num / den",r:[1,1],w:[1,0],t:"Kernel 5 reads num (and the sums) once more and writes the output."},
+  {n:"fused kernel",r:[1,0],w:[1,0],t:"The fused kernel: each program loads one row into registers, does max, subtract, exp, sum and divide on chip, and writes the row once. z and num never exist in HBM."}];
+ function bytes(k,M,N,b){return{r:(k.r[0]*M*N+k.r[1]*M)*b,w:(k.w[0]*M*N+k.w[1]*M)*b};}
+ function draw(){const M=SIZES[+Ms.value],N=SIZES[+Nn.value],b=+segVal(DT);$("#tk-soft-mv").value=fmtInt(M);$("#tk-soft-nv").value=fmtInt(N);
+  const bs=K.map(k=>bytes(k,M,N,b));let er=0,ew=0;for(let i=0;i<5;i++){er+=bs[i].r;ew+=bs[i].w;}const eager=er+ew,fused=bs[5].r+bs[5].w;
+  let cr=0,cw=0;for(let i=0;i<Math.min(step+1,5);i++){cr+=bs[i].r;cw+=bs[i].w;}
+  let g="";const bw=104,gap=12,x0=12;
+  K.forEach((k,i)=>{const x=x0+i*(bw+gap)+(i===5?8:0),on=i===step,done=step<5?i<=step&&i<5:i===5;
+   g+=`<rect x="${x}" y="14" width="${bw}" height="84" rx="10" fill="${on?"var(--k-soft)":done?"var(--q-soft)":"var(--card)"}" stroke="${on?"var(--k)":i===5?"var(--tc)":"var(--rule)"}" stroke-width="${on?2.4:1.4}"/>`+
+    `<text x="${x+bw/2}" y="34" text-anchor="middle" font-size="12" font-weight="700" fill="var(--ink)" font-family="var(--mono)">${k.n}</text>`+
+    `<text x="${x+bw/2}" y="56" text-anchor="middle" font-size="12" fill="var(--q)">read ${MB(bs[i].r)}</text>`+
+    `<text x="${x+bw/2}" y="76" text-anchor="middle" font-size="12" fill="var(--k)">write ${MB(bs[i].w)}</text>`+
+    `<text x="${x+bw/2}" y="92" text-anchor="middle" font-size="10.5" fill="var(--muted)">${i<5?"eager kernel "+(i+1):"one launch"}</text>`;});
+  g+=`<line x1="${x0+5*(bw+gap)+2}" y1="10" x2="${x0+5*(bw+gap)+2}" y2="102" stroke="var(--muted)" stroke-dasharray="4 4"/>`;
+  const L=150,W=540,sc=W/eager;
+  const bar=(y,lab,r,w,tot)=>`<text x="${L-8}" y="${y+17}" text-anchor="end" font-size="13" fill="var(--ink)">${lab}</text><rect x="${L}" y="${y}" width="${W}" height="26" rx="5" fill="var(--paper2)"/>`+
+   `<rect x="${L}" y="${y}" width="${(r*sc).toFixed(1)}" height="26" rx="5" fill="var(--q)" opacity=".85"/><rect x="${(L+r*sc).toFixed(1)}" y="${y}" width="${(w*sc).toFixed(1)}" height="26" fill="var(--k)" opacity=".85"/>`+
+   `<text x="${Math.min(L+W-4,L+(r+w)*sc+6).toFixed(1)}" y="${y+44}" text-anchor="${(r+w)*sc>W-120?"end":"start"}" font-size="12.5" fill="var(--ink)" font-family="var(--mono)">${tot>0?MB(tot)+"  (t ≥ "+us(tot/BW)+")":"see step 6"}</text>`;
+  g+=bar(122,"eager so far",cr,cw,cr+cw)+bar(194,"fused",step===5?bs[5].r:0,step===5?bs[5].w:0,step===5?fused:0);
+  g+=`<text x="${L}" y="264" font-size="11.5" class="svgs">bar length is relative to the full eager total (${MB(eager)})</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`${K[step].t} <br>M = ${fmtInt(M)}, N = ${fmtInt(N)}, ${b} bytes: eager reads ${MB(er)} and writes ${MB(ew)}, total <b>${MB(eager)}</b> (t ≥ ${us(eager/BW)}); fused total <b>${MB(fused)}</b> (t ≥ ${us(fused/BW)}). Ratio <b>${(eager/fused).toFixed(3)}</b>, from (8MN + 4M) / 2MN.`;}
+ B.stepper({n:6,prev:$("#tk-soft-prev"),next:$("#tk-soft-next"),play:$("#tk-soft-play"),label:$("#tk-soft-lab"),ms:2400,onStep:i=>{step=i;draw();}});
+ [Ms,Nn].forEach(e=>e.addEventListener("input",draw));seg(DT,draw);
+})();
+
+/* ---------- Figure 3: registers, warps and wasted slots ---------- */
+(function(){
+ const svg=$("#tk-reg-svg");if(!svg)return;const NS=$("#tk-reg-n"),WS=$("#tk-reg-w"),info=$("#tk-reg-info");
+ const NV=[256,512,1000,1024,2048,4096,5000,8192,16384,32768,65536,131072];
+ function draw(){const N=NV[+NS.value],w=+segVal(WS);$("#tk-reg-nv").value=fmtInt(N);
+  const Bk=nextPow2(N),waste=1-N/Bk,th=32*w,e=Bk/th,spill=e>255,regs=Math.max(1,Math.ceil(e));
+  const warpsUB=spill?0:Math.min(64,Math.floor(65536/(32*regs))),progs=Math.floor(warpsUB/w);
+  const L=200,W=400;let g="";
+  const row=(y,lab,val,max,txt,bad,limit,limLab)=>{let s=`<text x="${L-10}" y="${y+18}" text-anchor="end" font-size="13" fill="var(--ink)">${lab}</text><rect x="${L}" y="${y}" width="${W}" height="26" rx="5" fill="var(--paper2)"/>`+
+   `<rect x="${L}" y="${y}" width="${(Math.min(1,val/max)*W).toFixed(1)}" height="26" rx="5" fill="${bad?"var(--bad)":"var(--q)"}" opacity=".85"/>`;
+   if(limit!=null)s+=`<line x1="${(L+limit/max*W).toFixed(1)}" y1="${y-5}" x2="${(L+limit/max*W).toFixed(1)}" y2="${y+31}" stroke="var(--ink)" stroke-width="2" stroke-dasharray="4 3"/><text x="${(L+limit/max*W).toFixed(1)}" y="${y-8}" text-anchor="middle" font-size="11" class="svgs">${limLab}</text>`;
+   return s+`<text x="${L}" y="${y+46}" font-size="12.5" font-family="var(--mono)" fill="var(--ink)">${txt}</text>`;};
+  g+=row(28,"masked slots",waste,1,`${(100*waste).toFixed(1)}% of B = ${fmtInt(Bk)} slots`,waste>0.25,null);
+  g+=row(108,"row values / thread",e,512,`${e<1?e.toFixed(2):fmtInt(e)} values (B / (32 · ${w}))`,spill,255,"255 limit");
+  g+=row(188,"warps per SM (≤)",warpsUB,64,spill?"spills: registers exceed 255 per thread":`${warpsUB} warps = ${progs} programs of ${w} warps`,spill||progs<1,null);
+  svg.innerHTML=g;
+  let t=`N = <b>${fmtInt(N)}</b> → B = next_power_of_2(N) = <b>${fmtInt(Bk)}</b> (${(100*waste).toFixed(1)}% masked). ${w} warps = ${th} threads, so each thread holds <b>${e<1?e.toFixed(2):fmtInt(e)}</b> FP32 values of the row (formula 86.8).`;
+  if(spill)t+=` That is above the 255-register limit: the compiler must <b>spill</b> to local memory. Use more warps or a chunked loop (Algorithm 3).`;
+  else if(e<1)t+=` Some threads have no data at all: too many warps for this block.`;
+  else t+=` Counting only the row, at most <b>${warpsUB}</b> warps fit on one SM (65,536 registers), so at most ${progs} such programs run per SM at once. Real kernels need extra registers, so the true number is lower.`;
+  info.innerHTML=t;}
+ NS.addEventListener("input",draw);seg(WS,draw);draw();
+})();
+
+/* ---------- Figure 4: effective bandwidth and roofline ---------- */
+(function(){
+ const svg=$("#tk-bw-svg");if(!svg)return;const KS=$("#tk-bw-k"),GS=$("#tk-bw-g"),DT=$("#tk-bw-dt"),Ms=$("#tk-bw-m"),Nn=$("#tk-bw-n"),Ts=$("#tk-bw-t"),info=$("#tk-bw-info");
+ const GPU={h100:{n:"H100 SXM",bw:3.35e12,pk:989e12},a100:{n:"A100 80GB SXM",bw:2.039e12,pk:312e12},"4090":{n:"RTX 4090",bw:1.008e12,pk:165e12}};
+ const KER={add:{n:"vector add",fl:1,by:(M,N,b)=>3*M*N*b,f:"3MN"},soft:{n:"softmax",fl:5,by:(M,N,b)=>2*M*N*b,f:"2MN"},rms:{n:"RMSNorm",fl:4,by:(M,N,b)=>(2*M*N+N)*b,f:"2MN + N"}};
+ const lx=v=>Math.log10(v);
+ function draw(){const k=KER[segVal(KS)],gp=GPU[segVal(GS)],b=+segVal(DT),M=SIZES[+Ms.value],N=SIZES[+Nn.value],t=1e-6*Math.pow(10,(+Ts.value)/25);
+  $("#tk-bw-mv").value=fmtInt(M);$("#tk-bw-nv").value=fmtInt(N);$("#tk-bw-tv").value=t*1e6<10?(t*1e6).toFixed(2):fmtInt(t*1e6);
+  const by=k.by(M,N,b),fl=k.fl*M*N,tmin=by/gp.bw,I=fl/by,ok=t>=tmin*0.9999,bwe=by/t,perf=fl/t;
+  /* roofline plot: x from 0.01 to 10000 FLOP/byte, y from 1e9 to 2e15 FLOP/s */
+  const X0=70,X1=610,Y0=225,Y1=20,xl=[-2,4],yl=[9,15.3];
+  const X=v=>X0+(lx(v)-xl[0])/(xl[1]-xl[0])*(X1-X0),Y=v=>Y0-(lx(v)-yl[0])/(yl[1]-yl[0])*(Y0-Y1);
+  let g=`<path d="M${X0} ${Y1} V${Y0} H${X1}" fill="none" stroke="var(--muted)"/>`;
+  [-2,-1,0,1,2,3,4].forEach(p=>g+=`<text x="${X(10**p)}" y="${Y0+16}" text-anchor="middle" class="svgs" font-size="11">${p<0?(10**p).toString():fmtInt(10**p)}</text>`);
+  [[1e9,"1 G"],[1e12,"1 T"],[1e15,"1 P"]].forEach(([v,l])=>g+=`<text x="${X0-6}" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11">${l}</text><line x1="${X0}" y1="${Y(v)}" x2="${X1}" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="2 4"/>`);
+  const ridge=gp.pk/gp.bw,ia=10**xl[0],ib=10**xl[1];
+  g+=`<path d="M${X(ia)} ${Y(ia*gp.bw)} L${X(ridge)} ${Y(gp.pk)} L${X(ib)} ${Y(gp.pk)}" fill="none" stroke="var(--tc)" stroke-width="3"/>`;
+  g+=`<text x="${X(ridge)}" y="${Y(gp.pk)-8}" text-anchor="middle" font-size="11.5" fill="var(--ink)">ridge ≈ ${ridge.toFixed(0)} FLOP/byte</text>`;
+  g+=`<text x="${(X0+X1)/2}" y="${Y0+34}" text-anchor="middle" class="svgs" font-size="12">arithmetic intensity (FLOP per byte, log scale)</text><text x="16" y="${(Y0+Y1)/2}" transform="rotate(-90 16 ${(Y0+Y1)/2})" text-anchor="middle" class="svgs" font-size="12">FLOP/s</text>`;
+  const pp=ok?perf:I*gp.bw;
+  g+=`<line x1="${X(I)}" y1="${Y(pp)}" x2="${X(I)}" y2="${Y(I*gp.bw)}" stroke="var(--k)" stroke-dasharray="3 3"/><circle cx="${X(I)}" cy="${Y(pp)}" r="7" fill="${ok?"var(--k)":"var(--bad)"}" stroke="var(--ink)" stroke-width="1"/>`;
+  g+=`<text x="${X(I)+12}" y="${Y(pp)+4}" font-size="12" fill="var(--ink)">${k.n}: ${(perf/1e12).toFixed(2)} TFLOP/s</text>`;
+  svg.innerHTML=g;
+  let s=`${k.n}, M = ${fmtInt(M)}, N = ${fmtInt(N)}, ${b} bytes, ${gp.n}: minimum bytes ${k.f} elements = <b>${MB(by)}</b>; best possible time ${us(tmin)}. Intensity ≈ ${I.toFixed(3)} FLOP/byte, far below the ridge (${ridge.toFixed(0)}), so memory-bound. `;
+  if(!ok)s+=`<b style="color:var(--bad)">A measured ${us(t)} is impossible</b>: it would need ${(bwe/1e12).toFixed(2)} TB/s, more than the ${(gp.bw/1e12).toFixed(2)} TB/s peak. Check that you synchronized before stopping the clock.`;
+  else s+=`At ${us(t)}: effective bandwidth <b>${(bwe/1e9).toFixed(0)} GB/s</b>, efficiency <b>${(100*bwe/gp.bw).toFixed(1)}%</b> of peak${bwe/gp.bw>0.8?" (very good)":bwe/gp.bw<0.3?" (look for wasted traffic, too few programs or launch overhead)":""}.`;
+  info.innerHTML=s;}
+ [KS,GS,DT].forEach(e=>seg(e,draw));[Ms,Nn,Ts].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

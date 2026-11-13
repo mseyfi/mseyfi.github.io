@@ -1,0 +1,462 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>RL infrastructure · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../posttraining/index.html">Post-training and RL</a><span class="sep">/</span><span>Session 75</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="rl-infrastructure">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="rl-infrastructure" data-session="rl-infrastructure" style="--tc:var(--t4)"><header class="chap-head"><div class="chap-kicker"><span class="num">75</span><span>Track 4: Post-training and RL · session 23 of 25</span></div><h1 class="chap-title">RL infrastructure</h1><p class="chap-sub">An RL step for an LLM is a small distributed system: one engine generates answers, another trains on them, and the new weights must travel back. This session shows why generation is the bottleneck, how weights are synced between trainer and generator on shared or separate GPUs, what asynchronous RL gains and what off-policy drift costs, and what TRL, verl and OpenRLHF are each good for.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 to 2.5 hours, exercises 1 hour)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 66 and 70; helpful: the KV cache, ZeRO and FSDP</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The four phases of an RL step (rollout, scoring, training, weight sync) and how their times add up</li><li>Why decoding is memory-bound and why the long tail of answer lengths leaves GPUs idle, with numbers for a 7B model on an H100</li><li>Why RL libraries use an inference engine such as vLLM or SGLang, and what continuous batching and prefix caching buy</li><li>Weight sync: its cost in bytes and seconds, and colocated (hybrid engine) versus separate GPU placement</li><li>Synchronous versus asynchronous RL, staleness as a delayed feedback loop, and the corrections: behaviour log-probs, decoupled PPO, truncated importance sampling</li><li>Engine mismatch: why vLLM and the trainer give different log-probs for the same weights, and how to check it</li><li>TRL, verl and OpenRLHF: design, engines, backends, and when to choose each</li></ul></div></header><style>
+[data-session="rl-infrastructure"] code,[data-session="rl-infrastructure"] pre,[data-session="rl-infrastructure"] .fig,[data-session="rl-infrastructure"] .fig *{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.ri-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.ri-grid input[type=range]{width:100%}
+.ri-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.ri-leg span::before{content:"";display:inline-block;width:14px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c);border:1px solid var(--muted)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">The last sessions were about <i>what</i> to optimize: PPO (<a href="../posttraining/ppo.html">session 66</a>), GRPO (<a href="../posttraining/grpo-and-rl-with-verifiable-rewards-rlvr.html">session 70</a>), reward models and AI feedback (<a href="../posttraining/safety-alignment-rlaif-and-constitutional-ai.html">session 74</a>). This session is about <i>how to run it fast</i>. An RL step for an LLM is not one big matrix multiply. It is a small distributed system: one part <b>generates</b> answers, one part <b>scores</b> them, one part <b>trains</b> on them, and the new weights must travel back to the generator. If you build it naively, most of your GPUs wait most of the time.</p>
+<p>The authors of OpenRLHF write that the inference (generation) phase “often accounts for over 90% of the total RLHF (or RLVR) runtime”. [Certain] So the main engineering tools of this session all attack generation time or idle time:</p>
+<ul><li><b>A fast inference engine</b> for the rollouts, such as vLLM or SGLang, instead of the training framework’s slow <code>generate()</code>.</li>
+<li><b>Weight sync</b>: after each update, the new weights must be copied from the trainer into the engine. Where the two live (same GPUs or separate GPUs) decides how this copy works and what it costs.</li>
+<li><b>Synchronous versus asynchronous RL</b>: generate the next batch while training on the current one. This removes idle time, but the data is now a little <b>off-policy</b> (generated by an older policy), and the loss must handle that.</li>
+<li><b>Libraries</b>: TRL, verl and OpenRLHF package these choices in different ways. Knowing which does what saves weeks.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>Frequent questions for post-training and infra roles: “Why is rollout the bottleneck in RLHF?”, “Colocated or separate GPUs for the generator?”, “What goes wrong in asynchronous RL and how do you fix it?”, “Why are the log-probs from vLLM not equal to the trainer’s log-probs?”. Each has a numeric answer below.</aside>
+
+<h2>One RL step as a dataflow</h2>
+<p>Take one GRPO or PPO step from <a href="../posttraining/ppo.html">session 66</a> and look at it as a system. There are three kinds of work:</p>
+<ol><li><b>Rollout</b> (generation): sample answers \(y \sim \pi_\theta(\cdot \mid x)\) for a batch of prompts. For GRPO, each prompt is sampled \(G\) times. This is <b>inference</b>: no gradients, token by token, with a KV cache (<a href="../inference/the-kv-cache.html">session 80</a>).</li>
+<li><b>Scoring</b>: compute rewards (a verifier such as unit tests or exact match, or a reward model forward pass), plus the extra log-probs the loss needs: the reference model for the KL term, and the critic values for PPO.</li>
+<li><b>Training</b>: forward and backward passes with the RL loss, then an optimizer step. This is <b>training</b>: big, parallel, sharded with FSDP, ZeRO or Megatron (<a href="../pretraining/zero-stages-1-2-and-3.html">session 45</a>, <a href="../pretraining/tensor-parallelism-and-sequence-parallelism.html">session 48</a>).</li></ol>
+<p>Then a fourth step that does not exist in supervised training: <b>weight sync</b>, which copies the new weights into the generator. We call one set of weights a <b>version</b>; the generator must know which version it is using.</p>
+<p>The two big jobs want very different software. Training wants large parallel matrix multiplies, sharded optimizer states and activation checkpointing. Generation wants a paged KV cache, continuous batching, CUDA graphs and fast sampling kernels (<a href="../inference/index.html#row-memory-management-pagedattention-prefix-caching-radixattention" title="Memory management: PagedAttention, prefix caching, RadixAttention (planned)">session 134</a>, <a href="../inference/index.html#row-batching-continuous-batching-chunked-prefill-split-fuse" title="Batching: continuous batching, chunked prefill, split-fuse (planned)">session 135</a>). No single engine is best at both, so real systems run <b>two engines</b> with two copies of the policy weights and move weights between them.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A restaurant kitchen. The cooks (rollout engine) make dishes, the tasters (reward) score them, and the head chef (trainer) changes the recipe based on the scores. The new recipe card must be copied to every cook (weight sync). If the cooks wait for the chef and the chef waits for the cooks, the kitchen is half empty all day. You can let the cooks keep cooking with yesterday’s card while the chef writes today’s, but then some scores are for an old recipe.</aside>
+<p>For a synchronous step, the times simply add up:</p>
+<div class="eq">\[ T_\text{step} = T_\text{gen} + T_\text{score} + T_\text{train} + T_\text{sync} \tag{75.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(T_\text{gen}\)</dt><dd>time to generate all answers of the batch; it ends when the <b>longest</b> answer ends</dd>
+<dt>\(T_\text{score}\)</dt><dd>time for rewards, reference log-probs and (for PPO) critic values</dd>
+<dt>\(T_\text{train}\)</dt><dd>forward, backward and optimizer step(s) on the batch</dd>
+<dt>\(T_\text{sync}\)</dt><dd>time to copy the new weights into the generator (or to switch the same GPUs from training to generation)</dd></dl>
+<figure class="fig wide" id="ri-loop"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="ri-loop-prev">Back</button><button type="button" class="btn primary" id="ri-loop-play">Play</button><button type="button" class="btn" id="ri-loop-next">Next</button><span id="ri-loop-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="ri-loop-svg" viewBox="0 0 760 330" role="img" aria-label="The RL loop: controller, rollout engine, reward, experience batch, trainer and weight sync"></svg></div>
+<div class="readout" id="ri-loop-info"></div>
+</div><figcaption><b>Figure 1.</b> One synchronous RL step as a dataflow with six phases. The rollout engine and the trainer each hold a copy of the policy. The dashed arrow is the weight sync that closes the loop. The panel on the left shows which resource is busy in each phase; in a synchronous loop only one of them works at a time.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Press Next to walk through the phases, or Play. Watch the “Busy now” list: in phases 1 and 2 only the rollout GPUs work; in phases 4 and 5 only the training GPUs work. If these are different GPUs, each group is idle for a large part of the step. This is the problem that colocation and asynchronous RL (later sections) solve in two different ways.</p></details></figure>
+
+<h2>Why rollout is the bottleneck</h2>
+<p>There are three reasons, and each one has a number behind it.</p>
+<h3>Reason 1: decoding is memory-bound</h3>
+<p>Training processes all tokens of a sequence in parallel; one weight read from GPU memory serves thousands of tokens. Decoding produces <b>one token per sequence per step</b>, and every step must read all the weights from memory again (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>). With \(N\) parameters in bf16 (2 bytes each) and a batch of \(b\) sequences, one decode step does about \(2Nb\) FLOPs and reads at least \(2N\) bytes. Its <b>arithmetic intensity</b> (FLOPs per byte moved) is therefore about</p>
+<div class="eq">\[ I_\text{decode} \approx \frac{2 N b}{2 N + M_\text{KV}} \ \le\ b \quad \text{FLOP/byte} \tag{75.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\)</dt><dd>number of parameters of the policy</dd>
+<dt>\(b\)</dt><dd>number of sequences decoded together (the decode batch)</dd>
+<dt>\(M_\text{KV}\)</dt><dd>bytes of KV cache read in this step; it grows with batch size and context length</dd></dl>
+<p>A GPU is compute-bound only when the intensity is above its <b>ridge point</b>, peak FLOP/s divided by memory bandwidth. For an H100 SXM (989 TFLOP/s dense bf16, half of the 1,979 “with sparsity” on the spec sheet, and 3.35 TB/s) the ridge point is about 295 FLOP/byte. [Certain] So decoding needs a batch of hundreds of sequences just to stop wasting compute, and the KV cache limits how large that batch can be.</p>
+<div class="worked"><div class="wt">Worked example: decode speed of a 7B policy on one H100</div>
+<p>Take \(N = 7 \times 10^9\), so the weights are \(14\) GB. One decode step must read them: \(14 / 3{,}350 = 4.18\) ms at least. With \(b = 1\) that is at most 239 tokens per second, using 0.3% of the GPU’s FLOPs. With \(b = 64\) and a tiny KV cache, the FLOP use rises to 21.7%; with \(b = 256\) to 86.7%.</p>
+<p>Now add the KV cache. Qwen2.5-7B has 28 layers, 4 key-value heads and head size 128 (its config.json), so one token of KV cache is \(2 \times 28 \times 4 \times 128 \times 2 = 57{,}344\) bytes. [Certain] A batch of 256 sequences at an average context of 1,500 tokens holds 22.0 GB of KV cache. One step now reads \(14 + 22.0 = 36.0\) GB and takes at least 10.75 ms: about 23,800 tokens per second, 33.7% of peak FLOPs. At an average context of 8,000 tokens (long reasoning traces) the KV cache would be 117 GB, more than the GPU’s 80 GB, so the batch must shrink, and the throughput falls with it.</p>
+<p>For comparison, training at 40% MFU (<a href="../pretraining/distributed-checkpoints-fault-tolerance-and-mfu.html">session 51</a>) costs \(6N\) FLOPs per token, so one H100 trains on about \(0.4 \times 989 \times 10^{12} / (6 \times 7 \times 10^9) = 9{,}420\) tokens per second. These are best-case bounds; real engines reach less. [Likely]</p></div>
+<p>The point is not that decoding is always slower per token than training. It is that decoding speed depends on <b>batch size and memory</b>, which an RL system must manage actively, and that it is very easy to get a small fraction of this bound with a naive loop.</p>
+<h3>Reason 2: the long tail of answer lengths</h3>
+<p>The answers in one batch have very different lengths. Reasoning models in particular produce some answers that are 10 times longer than the median (<a href="../posttraining/reasoning-models-and-test-time-compute.html">session 72</a>). A synchronous step cannot train until the <b>last</b> answer is done. While the long answers finish, the slots of the short ones are empty. For a group of \(S\) answers decoded together with <b>static batching</b> (start together, end together), the share of slot time that does useful work is</p>
+<div class="eq">\[ U_\text{static} = \frac{\sum_{i=1}^{S} L_i}{S \cdot \max_i L_i} \tag{75.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(L_i\)</dt><dd>length of answer \(i\) in tokens</dd>
+<dt>\(S\)</dt><dd>number of decode slots (sequences that run at the same time)</dd>
+<dt>\(\max_i L_i\)</dt><dd>the longest answer in the group: everyone waits for it</dd></dl>
+<p><b>Continuous batching</b>, the default in vLLM and SGLang, starts a new sequence in a slot as soon as the old one finishes (<a href="../inference/index.html#row-batching-continuous-batching-chunked-prefill-split-fuse" title="Batching: continuous batching, chunked prefill, split-fuse (planned)">session 135</a>). This fills the gaps in the middle of the batch. But it cannot fill the end: when the queue of prompts is empty, the last long answers still run alone. The total time is at least the average work per slot, \(\sum L_i / S\), and at least the longest answer.</p>
+<figure class="fig wide" id="ri-tail"><div class="fig-body">
+<div class="controls"><span class="seg" id="ri-tail-slots"><button type="button" data-v="8" aria-pressed="false">8 slots</button><button type="button" data-v="16" aria-pressed="true">16 slots</button><button type="button" data-v="32" aria-pressed="false">32 slots</button></span>
+<span class="seg" id="ri-tail-cap"><button type="button" data-v="1024" aria-pressed="false">cap 1,024</button><button type="button" data-v="2048" aria-pressed="false">2,048</button><button type="button" data-v="4096" aria-pressed="true">4,096</button><button type="button" data-v="8192" aria-pressed="false">8,192</button></span></div>
+<div class="ri-grid"><label for="ri-tail-s">Spread of lengths \(\sigma\)</label><input type="range" id="ri-tail-s" min="0.2" max="1.2" step="0.1" value="0.8"><output id="ri-tail-sv"></output></div>
+<div class="scroll-x"><svg id="ri-tail-svg" viewBox="0 0 760 345" role="img" aria-label="Gantt chart of 64 answers of different lengths in decode slots, with static batches and with continuous batching"></svg></div>
+<div class="ri-leg"><span style="--c:var(--q)">answer, static batches</span><span style="--c:var(--k)">answer, continuous batching</span><span style="--c:var(--bad)">answer cut at the length cap</span><span style="--c:var(--rule)">idle slot</span></div>
+<div class="readout" id="ri-tail-info"></div>
+</div><figcaption><b>Figure 2.</b> 64 answers with seeded random lengths: log-normal with median 400 tokens and spread \(\sigma\), cut at the cap. Each row is a decode slot. Top: static batches of \(S\) answers, each batch waits for its longest answer, formula (75.3). Bottom: continuous batching, where a free slot takes the next answer at once. The green dashed line is the lower bound \(\sum L_i / S\). Time is counted in decode steps and ignores that a step gets slower with more active slots.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>At the default (16 slots, \(\sigma = 0.8\), cap 4,096) static batching keeps only about a quarter of the slots busy: 10,937 steps for work that needs 2,713.5 at best. Continuous batching halves the time to 5,480 steps, but the bottom panel still ends with a long grey area: one answer hit the cap at 4,096 tokens and runs alone at the end. Lower the cap to 1,024: the tail shrinks and slot use rises, but more answers are cut (red), which changes the RL data (cut answers usually get a zero or a penalty). Set \(\sigma = 0.2\): equal lengths, and both methods are close to the bound.</p></details></figure>
+<p>This is why RL systems use the tricks that follow. Some are pure engineering: generate with large batches across many prompts, use continuous batching, and use <b>prefix caching</b>: all \(G\) answers of a GRPO group share the same prompt, so its KV cache can be computed once and shared (SGLang’s RadixAttention and vLLM’s automatic prefix caching do this). [Likely] Others change the RL algorithm a little: cap the length, stop overly long or repeating answers early, or keep generating the long tail while the trainer already works, which is asynchronous RL.</p>
+<h3>Reason 3: the training framework is a poor generator</h3>
+<p>Calling <code>model.generate()</code> inside a training framework uses static batching, no paged KV cache and often no CUDA graphs. Under FSDP or ZeRO-3 it is worse: the weights are sharded, so every decode step must all-gather every layer’s weights from the other GPUs, for one token per sequence. [Likely] That is why every serious RL library hands generation to an inference engine. TRL’s documentation says it directly: generating with the model’s own <code>generate</code> is the bottleneck, and vLLM is used because it serves completions far faster. [Certain]</p>
+
+<h2>Weight sync and GPU placement</h2>
+<p>Using an inference engine creates a new job. After every optimizer step, the engine’s copy of the weights is out of date. Before the next rollout, the new weights must be copied in. In bf16 the amount of data is \(2N\) bytes, so a lower bound on the sync time is</p>
+<div class="eq">\[ T_\text{sync} \ \ge\ \frac{2N}{\text{BW}_\text{link}} \tag{75.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2N\)</dt><dd>bytes of the policy weights in bf16; with LoRA only the adapter (a few MB) must move</dd>
+<dt>\(\text{BW}_\text{link}\)</dt><dd>bandwidth of the path the weights travel: NVLink inside a node, InfiniBand between nodes, or no copy at all when engine and trainer share GPU memory</dd></dl>
+<p>Real transfers are slower than this bound, because the trainer’s weights are sharded in one layout and the engine needs another (see below). [Likely]</p>
+<div class="worked"><div class="wt">Worked example: how long does a weight sync take?</div>
+<p>A 7B policy is 14 GB in bf16. Over one InfiniBand link at 400 Gb/s (50 GB/s): \(14/50 = 0.28\) s. Over H100 NVLink at 450 GB/s per direction (the 900 GB/s on the spec sheet counts both directions [Likely]): \(14/450 = 0.031\) s. Over PCIe Gen4 x16 at about 32 GB/s: 0.44 s.</p>
+<p>A 70B policy is 140 GB: 2.8 s over one 400 Gb/s link, 0.35 s if eight such links work in parallel (one per GPU), 4.4 s over PCIe Gen4. A 32B policy over one link: 1.28 s.</p>
+<p>Compared with a step of a minute or more, the network sync is small. Saving a checkpoint to disk and reloading it in a separate inference server is the slow way: at a few GB/s of disk bandwidth, a 70B model takes tens of seconds each way. [Likely] Kimi k1.5, which switches the same GPUs between Megatron (training) and vLLM (inference), reports under one minute from training to inference and about ten seconds back. [Certain]</p></div>
+<h3>Two placements</h3>
+<p><b>Colocated</b> (also called a “hybrid engine”): the trainer and the inference engine use the <b>same GPUs</b>, one after the other. During rollout, the trainer’s optimizer states and gradients are moved to CPU memory or freed, and the engine’s KV cache takes the space. During training, the engine is put to sleep and its KV cache is freed. The weight “sync” is a local copy, or a <b>reshard</b>: training might use FSDP across 8 GPUs, while generation wants each 7B model whole on one GPU or tensor-parallel across 2. verl’s 3D-HybridEngine does exactly this resharding of the actor model between training and generation, with “zero memory redundancy” and reduced communication, according to the HybridFlow paper. [Certain] TRL’s default <code>vllm_mode="colocate"</code> runs vLLM inside the trainer process on the same GPUs. [Certain]</p>
+<p><b>Separate</b> (disaggregated): some GPUs run only the engine, others run only the trainer. TRL’s <code>vllm_mode="server"</code> starts a vLLM server on dedicated GPUs; after each optimizer step the trainer streams the updated weights to it over NCCL. [Certain] OpenRLHF uses Ray, a Python framework for running tasks and long-lived workers (“actors”) on a cluster, to place vLLM engines, the actor trainer and the other models on their own GPUs. [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th></th><th>Colocated (hybrid engine)</th><th>Separate GPUs</th></tr></thead><tbody>
+<tr><td>Weight sync</td><td>local copy or reshard in GPU memory; no network</td><td>NCCL broadcast over NVLink or InfiniBand, formula (75.4)</td></tr>
+<tr><td>Memory</td><td>engine and trainer share memory; needs offload and sleep modes</td><td>each side has all of its GPUs’ memory</td></tr>
+<tr><td>Idle time (synchronous)</td><td>none between phases, but the long tail wastes all GPUs</td><td>each group waits while the other works</td></tr>
+<tr><td>Asynchronous training</td><td>not possible: the phases share hardware</td><td>natural: generate batch \(t+1\) while training on batch \(t\)</td></tr>
+<tr><td>Tuning</td><td>one number of GPUs for both jobs</td><td>must balance generation GPUs against training GPUs</td></tr></tbody></table></div>
+<h2>Synchronous versus asynchronous RL</h2>
+<p>With separate GPUs, the obvious fix for idle time is a <b>pipeline</b>: while the trainer trains on batch \(t\), the engine already generates batch \(t+1\) with the previous weights. With \(g\) generation GPUs out of \(G\), and generation and training work \(W_\text{gen}\) and \(W_\text{train}\) in GPU-seconds, the step times are</p>
+<div class="eq">\[ T_\text{sync-sep} = \frac{W_\text{gen}}{g} + \frac{W_\text{train}}{G - g} + T_\text{sync}, \qquad T_\text{async} = \max\!\Big(\frac{W_\text{gen}}{g},\ \frac{W_\text{train}}{G - g}\Big) + T_\text{sync} \tag{75.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(G\), \(g\)</dt><dd>total GPUs, and the number used for generation</dd>
+<dt>\(W_\text{gen}\), \(W_\text{train}\)</dt><dd>GPU-seconds of generation and training work in one step, assuming perfect scaling</dd>
+<dt>\(\max(\cdot,\cdot)\)</dt><dd>in the pipeline, the slower side sets the pace; the best split makes both sides equal</dd></dl>
+<p>The colocated step is \(W_\text{gen}/G + W_\text{train}/G + T_\text{switch}\). With perfect scaling and no long tail, colocation is very hard to beat: all GPUs are always busy. Two effects change this in practice. First, the long tail of Figure 2: in a synchronous step, all generation GPUs wait for the last answer, while an asynchronous engine can fill that time with answers for the next batch. AReaL names exactly this: generation must wait for the longest sequence before training can start, which leaves devices idle. [Certain] Second, spreading generation over all GPUs makes the decode batch per GPU smaller, which makes decoding even more memory-bound (75.2); AReaL also names this. [Certain] Figure 3 models the first effect with a “tail waste” share that only synchronous generation pays.</p>
+<figure class="fig wide" id="ri-place"><div class="fig-body">
+<div class="ri-grid">
+<label for="ri-place-f">Generation share of work</label><input type="range" id="ri-place-f" min="50" max="95" step="5" value="80"><output id="ri-place-fv"></output>
+<label for="ri-place-g">GPUs: generation + training</label><input type="range" id="ri-place-g" min="1" max="7" step="1" value="6"><output id="ri-place-gv"></output>
+<label for="ri-place-s">Sync or switch cost</label><input type="range" id="ri-place-s" min="0" max="20" step="1" value="2"><output id="ri-place-sv"></output>
+<label for="ri-place-w">Tail waste in sync generation</label><input type="range" id="ri-place-w" min="0" max="60" step="5" value="30"><output id="ri-place-wv"></output></div>
+<div class="scroll-x"><svg id="ri-place-svg" viewBox="0 0 760 305" role="img" aria-label="Timelines of three RL steps for colocated, separate synchronous and separate asynchronous placement"></svg></div>
+<div class="ri-leg"><span style="--c:var(--q)">generation</span><span style="--c:var(--k)">training</span><span style="--c:var(--muted)">weight sync or switch</span></div>
+<div class="readout" id="ri-place-info"></div>
+</div><figcaption><b>Figure 3.</b> A toy model of 8 GPUs and 400 GPU-seconds of work per step, using formula (75.5). Work scales perfectly with the number of GPUs. “Tail waste” is the share of generation time lost waiting for the longest answers; it is paid by colocated and separate synchronous generation, but not by the asynchronous engine, which keeps generating for the next batch. The asynchronous row trains on batch \(t\) while generating batch \(t+1\), so its data is one version old (lag 1). The numbers are illustrations, not measurements.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At the default (80% generation, 6 + 2 GPUs, 2 s sync, 30% tail waste) the steps take 69.14 s colocated (72.3% GPU use), 118.19 s separate synchronous (42.3%) and 55.33 s asynchronous (90.4%). Set tail waste to 0: colocated becomes the fastest (52 s, 96.2%), because it never idles. Move the split to 4 + 4: the asynchronous pipeline is now limited by generation and loses its advantage. The best split puts \(80\% \times 8 = 6.4\) GPUs on generation. Separate synchronous is never the best: it pays both the idle time and the sync.</p></details></figure>
+<h3>The price of asynchrony: off-policy data</h3>
+<p>In the pipeline, batch \(t+1\) was generated by weights of version \(t\) or older, but the trainer is at version \(t+1\). The data is <b>off-policy</b>: the policy that generated it (the <b>behaviour policy</b> \(\pi_\text{behav}\)) is not the policy being trained (<a href="../posttraining/policy-learning-words-on-policy-off-policy.html">session 71</a>). We call the version gap the <b>staleness</b> \(k\). Policy-gradient formulas assume \(k = 0\). What happens if we ignore the gap?</p>
+<p>A small model shows the danger clearly. Let the policy be a Gaussian \(a \sim \mathcal{N}(\mu, \sigma^2)\) over one number, with reward \(-(a - c)^2\), so the best \(\mu\) is \(c\). The policy-gradient estimate with a batch-mean baseline, computed with the <b>current</b> \(\mu_t\) but on samples from the stale \(\mu_{t-k}\), has the expected value \(\operatorname{Cov}(R, a)/\sigma^2 = -2(\mu_{t-k} - c)\). The update becomes a <b>delayed</b> feedback loop:</p>
+<div class="eq">\[ \mu_{t+1} = \mu_t - 2\eta\,(\mu_{t-k} - c) \tag{75.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mu_t\)</dt><dd>the policy mean at step \(t\); the trainer’s current weights</dd>
+<dt>\(\mu_{t-k}\)</dt><dd>the mean of the behaviour policy that generated the batch, \(k\) versions old</dd>
+<dt>\(\eta\)</dt><dd>step size (learning rate)</dd>
+<dt>\(c\)</dt><dd>the best action; the gradient points towards it</dd></dl>
+<p>The step is computed from where the policy <i>was</i>, not where it <i>is</i>. It is like steering a car by looking at a photo taken \(k\) seconds ago: at slow speed this works, at high speed you overshoot and swerve. For this kind of linear delay equation, \(x_{t+1} = x_t - a\, x_{t-k}\), there is a classical result (Levin and May, 1976 [Likely]): it is stable exactly when \(0 \lt a \lt 2\sin\frac{\pi}{2(2k+1)}\). With \(a = 2\eta\), the largest safe step size is</p>
+<div class="eq">\[ \eta \ \lt\ \eta_\text{max}(k) = \sin\!\frac{\pi}{2(2k+1)} \tag{75.7} \]</div>
+<p>We checked this numerically with the roots of the characteristic polynomial \(z^{k+1} - z^k + a\): \(\eta_\text{max} = 1\) for \(k = 0\), 0.5 for \(k = 1\), 0.309 for \(k = 2\), 0.174 for \(k = 4\) and 0.092 for \(k = 8\). <b>Staleness shrinks the safe learning rate</b>, roughly in proportion to \(1/k\) for large \(k\). This toy is not an LLM, but the mechanism (a gradient computed from old behaviour) is the same. [Likely]</p>
+<h3>Corrections</h3>
+<p>The standard fix is to treat the stale batch as off-policy data and use <b>importance sampling</b>, as in <a href="../posttraining/ppo.html">session 66</a>. The PPO ratio must use the log-probs of the policy that actually <b>generated</b> the tokens, which the engine returns with each sample. With large staleness the ratio becomes noisy. Hilton, Cobbe and Schulman (2021) proposed to <b>decouple</b> the two roles of \(\pi_{\theta_\text{old}}\) in PPO: the <b>proximal policy</b> \(\pi_\text{prox}\) that anchors the trust region, and the behaviour policy that corrects for off-policy sampling. [Certain] AReaL uses this form, with \(\pi_\text{prox}\) set to the weights just before each update: [Certain]</p>
+<div class="eq">\[ J(\theta) = \E_{a_t \sim \pi_\text{behav}}\!\left[ \sum_t \frac{\pi_\text{prox}(a_t \mid s_t)}{\pi_\text{behav}(a_t \mid s_t)}\, \min\!\Big( u_t\, \hat A_t,\ \operatorname{clip}(u_t, 1-\epsilon, 1+\epsilon)\, \hat A_t \Big) \right], \quad u_t = \frac{\pi_\theta(a_t \mid s_t)}{\pi_\text{prox}(a_t \mid s_t)} \tag{75.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\pi_\text{behav}\)</dt><dd>the (stale) weights that sampled the tokens; their log-probs come from the rollout engine</dd>
+<dt>\(\pi_\text{prox}\)</dt><dd>a recent policy that defines the trust region; in AReaL, the weights just before the update</dd>
+<dt>\(u_t\)</dt><dd>the PPO ratio against the proximal policy; the clip keeps each update small</dd>
+<dt>\(\pi_\text{prox}/\pi_\text{behav}\)</dt><dd>the importance weight that corrects for the staleness; it gets no gradient</dd></dl>
+<p>AReaL also <b>bounds the staleness</b>: generation requests are throttled so that no sample is more than \(\eta\) versions old (they use \(\eta = 4\) for code and \(\eta = 8\) for math), and found that moderate staleness (\(\eta \le 8\)) had minimal impact on final performance, while unbounded staleness was worse even with the decoupled objective. [Certain] (Their \(\eta\) is a staleness bound, not our step size.) Noukhovitch et al. (2024) ran RLHF with a one-step-off pipeline and report about 40% faster training on a LLaMA 3.1 8B chatbot task and about 70% faster on GSM8k with a 1B model, matching the synchronous results; they also found online DPO to be the most robust of the methods they tried to off-policy data. [Certain]</p>
+<figure class="fig wide" id="ri-stale"><div class="fig-body">
+<div class="controls"><span class="seg" id="ri-stale-mode"><button type="button" data-v="naive" aria-pressed="true">No correction</button><button type="button" data-v="is" aria-pressed="false">Importance sampling</button><button type="button" data-v="tis" aria-pressed="false">Truncated IS (C = 2)</button></span></div>
+<div class="ri-grid">
+<label for="ri-stale-k">Staleness \(k\) (versions)</label><input type="range" id="ri-stale-k" min="0" max="8" step="1" value="4"><output id="ri-stale-kv"></output>
+<label for="ri-stale-lr">Step size \(\eta\)</label><input type="range" id="ri-stale-lr" min="0.05" max="0.5" step="0.01" value="0.2"><output id="ri-stale-lrv"></output></div>
+<div class="scroll-x"><svg id="ri-stale-svg" viewBox="0 0 760 330" role="img" aria-label="Policy mean over training steps with stale samples, and the effective sample size of each batch"></svg></div>
+<div class="ri-leg"><span style="--c:var(--q)">policy mean \(\mu_t\), chosen setting</span><span style="--c:var(--muted)">same step size with fresh data (\(k = 0\)), dashed</span><span style="--c:var(--k)">effective sample size</span></div>
+<div class="readout" id="ri-stale-info"></div>
+</div><figcaption><b>Figure 4.</b> Live training of the Gaussian policy of formula (75.6): \(\sigma = 1\), best action \(c = 2\), start at \(\mu = 0\), 64 seeded samples per step drawn from the policy \(k\) versions ago, advantage = reward minus the batch mean. “No correction” uses the samples as if they were fresh; “importance sampling” weights each sample by \(\pi_{\mu_t}(a)/\pi_{\mu_{t-k}}(a)\); “truncated IS” caps that weight at 2. Values outside \([-2, 6]\) are drawn at the edge. The bottom strip shows the effective sample size \((\sum w)^2 / \sum w^2\) of each batch.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At the default (\(k = 4\), \(\eta = 0.2\), no correction) the blue curve overshoots and swings with growing size, because 0.2 is above the limit 0.1736 of (75.7); the dashed grey curve with fresh data converges. Lower \(\eta\) to 0.15: the stale run now converges too, more slowly and with an overshoot. Choose importance sampling: the swing disappears, because the weights turn the stale samples into an estimate for the current policy, but the effective sample size drops to about 5 of 64 in the first steps, so the gradient is noisy. Truncated IS keeps the effective sample size near 29 while still removing most of the swing. Set \(k = 0\): all three modes are identical.</p></details></figure>
+<h3>Off-policy even when synchronous: engine mismatch</h3>
+<p>There is a second, quieter source of off-policy data. The rollout engine and the trainer compute the “same” model with different kernels, different numerical precision and different order of floating-point sums. So even with identical weights, \(\pi_\text{engine}(y_t) \ne \pi_\text{trainer}(y_t)\). Yao et al. (2025) showed that in frameworks such as verl, which use vLLM for rollouts and FSDP for training, this gap “implicitly turns the on-policy RL to be off-policy”, and that for some tokens the two disagree strongly. [Certain] Their fix is <b>truncated importance sampling</b> (TIS): multiply each token’s loss by a capped weight</p>
+<div class="eq">\[ w_t = \min\!\left( \frac{\pi_\text{trainer}(y_t \mid s_t)}{\pi_\text{engine}(y_t \mid s_t)},\ C \right) \tag{75.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\pi_\text{trainer}\)</dt><dd>probability of the sampled token under the trainer’s computation of the old weights (no gradient)</dd>
+<dt>\(\pi_\text{engine}\)</dt><dd>probability the engine actually sampled from, returned with the rollout</dd>
+<dt>\(C\)</dt><dd>the cap; it trades a small bias for bounded variance; values around 2 appear in verl’s examples [Likely]</dd></dl>
+<p>For this to work, the engine must return the log-probs it really sampled from, after temperature and other logit processing. This is why TRL asks vLLM to return “processed” log-probs, which it says is what the importance sampling correction expects. [Certain] A simple health check in any RL system: at staleness 0, compute \(\log \pi_\text{trainer} - \log \pi_\text{engine}\) on the rollout tokens and log its mean and maximum. The code below does this.</p>
+<h3>Partial rollouts</h3>
+<p>Another way to cut the tail is to not wait for it. Kimi k1.5 gives each rollout a fixed output token budget per iteration; an answer that is not finished is stored in a replay buffer and continued in the next iteration, so one long answer is made of segments from several iterations. [Certain] AReaL goes further with <b>interruptible rollouts</b>: when new weights arrive, the engine stops all ongoing generations, loads the new version, recomputes the KV caches and continues the unfinished answers. One answer can therefore contain tokens from different policy versions. [Certain] This works because the loss is per token and each token keeps the behaviour log-prob it was sampled with.</p>
+
+<h2>The algorithms</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: synchronous, colocated RL step (hybrid engine)</div><ol>
+<li><b>input:</b> \(G\) GPUs holding the sharded trainer state; inference engine asleep; prompt batch \(\{x_i\}\); version \(v\)</li>
+<li>offload optimizer state and gradients (or free them); wake the engine; reshard weights version \(v\) into the engine layout <span class="c">// \(T_\text{switch}\)</span></li>
+<li>generate \(G\) answers per prompt with continuous batching; keep tokens and behaviour log-probs <span class="c">// \(T_\text{gen}\), the slow part</span></li>
+<li>put the engine to sleep (free KV cache); reload the trainer state</li>
+<li>score: rewards from verifiers or a reward model; reference log-probs; critic values for PPO <span class="c">// \(T_\text{score}\)</span></li>
+<li>advantages (GAE or group-relative); recompute \(\log \pi_{\theta_\text{old}}\) in the trainer if TIS (75.9) is used</li>
+<li><b>for</b> each mini-batch: PPO/GRPO loss, backward, optimizer step <span class="c">// \(T_\text{train}\)</span></li>
+<li>\(v \leftarrow v + 1\); log reward, KL, clip fraction, mean and max of \(\log\pi_\text{trainer} - \log\pi_\text{engine}\)</li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: asynchronous RL with bounded staleness (separate GPUs)</div><ol>
+<li><b>input:</b> engine workers on \(g\) GPUs; trainer on \(G - g\) GPUs; staleness bound \(k_\text{max}\); a queue between them</li>
+<li><b>engine loop:</b> <b>while</b> training runs:</li>
+<li>&nbsp;&nbsp;<b>wait while</b> the queue holds data that would be more than \(k_\text{max}\) versions old when it is used <span class="c">// throttle</span></li>
+<li>&nbsp;&nbsp;generate a batch with the current engine weights, version \(v_e\); push (tokens, behaviour log-probs, \(v_e\)) to the queue</li>
+<li>&nbsp;&nbsp;<b>if</b> new weights are announced: load them (NCCL broadcast), \(v_e \leftarrow\) new version <span class="c">// optional: interrupt and resume unfinished answers</span></li>
+<li><b>trainer loop:</b> <b>for</b> \(v = 1, 2, \dots\):</li>
+<li>&nbsp;&nbsp;pop a batch; its staleness is \(v - 1 - v_e\); score it, compute advantages</li>
+<li>&nbsp;&nbsp;loss with the ratio against the behaviour log-probs, or the decoupled objective (75.8)</li>
+<li>&nbsp;&nbsp;backward, optimizer step; broadcast the new weights to the engines <span class="c">// \(T_\text{sync}\), (75.4)</span></li>
+<li>&nbsp;&nbsp;log the staleness, the clip fraction and the effective sample size of the batch</li></ol></div>
+<p>The PyTorch code below runs Algorithm 2 on a toy problem, on a CPU, in a few seconds. The “engine” is a separate copy of the policy in bf16 (as an inference engine would have), with its own sampling loop. It returns behaviour log-probs and the weight version with each batch. The trainer computes log-probs in fp32 and uses a GRPO-style group advantage with a PPO clip. The staleness \(k\) is how many batches the engine runs ahead. Everything is deterministic (fixed seeds, single thread of control).</p>
+<pre class="code"><span class="kw2">import</span> copy, collections, torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+V, T, P, G = 8, 6, 16, 4         <span class="cm"># vocab, response length, prompts per step, answers per prompt</span>
+GOOD = 3                          <span class="cm"># the verifier rewards token 3</span>
+
+<span class="kw2">class</span> TinyLM(nn.Module):          <span class="cm"># next-token logits from (previous token, position)</span>
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.tok, s.pos = nn.Embedding(V + 1, 32), nn.Embedding(T, 32)
+        s.mlp = nn.Sequential(nn.Linear(32, 64), nn.Tanh(), nn.Linear(64, V))
+    <span class="kw2">def</span> forward(s, prev):
+        <span class="kw2">return</span> s.mlp(s.tok(prev) + s.pos.weight[<span class="kw2">None</span>, :prev.size(1)])
+
+<span class="kw2">def</span> prev_of(y):                   <span class="cm"># shift right; V is the "start" token</span>
+    <span class="kw2">return</span> torch.cat([torch.full((y.size(0), 1), V), y[:, :-1]], 1)
+
+<span class="kw2">def</span> logp_of(model, y):            <span class="cm"># trainer side: log pi(y_t | y_&lt;t) in fp32</span>
+    lp = F.log_softmax(model(prev_of(y)).float(), -1)
+    <span class="kw2">return</span> lp.gather(-1, y[..., <span class="kw2">None</span>]).squeeze(-1)
+
+@torch.no_grad()
+<span class="kw2">def</span> sample(model, n, gen):        <span class="cm"># token-by-token sampling; returns tokens and their log-probs</span>
+    y, lps = torch.zeros(n, 0, dtype=torch.long), []
+    <span class="kw2">for</span> t <span class="kw2">in</span> range(T):
+        prev = prev_of(torch.cat([y, torch.zeros(n, 1, dtype=torch.long)], 1))
+        logits = model(prev)[:, t].float()
+        nxt = torch.multinomial(F.softmax(logits, -1), 1, generator=gen).squeeze(1)
+        lps.append(F.log_softmax(logits, -1).gather(-1, nxt[:, <span class="kw2">None</span>]).squeeze(1))
+        y = torch.cat([y, nxt[:, <span class="kw2">None</span>]], 1)
+    <span class="kw2">return</span> y, torch.stack(lps, 1)
+
+<span class="kw2">class</span> Engine:                     <span class="cm"># stands in for vLLM or SGLang: a separate bf16 copy</span>
+    <span class="kw2">def</span> __init__(s, policy):
+        s.model, s.version = copy.deepcopy(policy).to(torch.bfloat16).eval(), 0
+    <span class="kw2">def</span> sync(s, policy, version): <span class="cm"># weight sync: trainer -&gt; engine (cast to bf16)</span>
+        s.model.load_state_dict(policy.state_dict()); s.version = version
+    <span class="kw2">def</span> rollout(s, n, gen):
+        y, lp = sample(s.model, n, gen)
+        <span class="kw2">return</span> y, lp, s.version   <span class="cm"># tokens, behaviour log-probs, weight version</span>
+
+<span class="kw2">def</span> run(k, steps=60):             <span class="cm"># k = how many batches the engine runs ahead (staleness)</span>
+    torch.manual_seed(0); gen, ev = torch.Generator().manual_seed(0), torch.Generator().manual_seed(1)
+    policy = TinyLM(); opt = torch.optim.Adam(policy.parameters(), lr=3e-3)
+    engine, queue, clip = Engine(policy), collections.deque(), []
+    <span class="kw2">for</span> step <span class="kw2">in</span> range(steps):
+        <span class="kw2">while</span> len(queue) &lt;= k:    <span class="cm"># producer: keep k batches ready ahead of the trainer</span>
+            queue.append(engine.rollout(P * G, gen))
+        y, beh_lp, ver = queue.popleft()
+        s = (y == GOOD).float().mean(1).view(P, G)                <span class="cm"># verifiable reward</span>
+        adv = ((s - s.mean(1, keepdim=<span class="kw2">True</span>)) / (s.std(1, keepdim=<span class="kw2">True</span>) + 1e-4)).view(-1, 1)
+        new_lp = logp_of(policy, y)
+        ratio = torch.exp(new_lp - beh_lp)                        <span class="cm"># against the BEHAVIOUR policy</span>
+        loss = -torch.min(ratio * adv, ratio.clamp(0.8, 1.2) * adv).mean()
+        opt.zero_grad(); loss.backward(); opt.step()
+        engine.sync(policy, step + 1)                             <span class="cm"># push the new weights</span>
+        clip.append(((ratio.detach() - 1).abs() &gt; 0.2).float().mean().item())
+        <span class="kw2">if</span> k == 0 and step == 0:
+            d = (new_lp.detach() - beh_lp).abs()                  <span class="cm"># same weights, two engines</span>
+            print(f"same version: |logp_trainer - logp_engine| mean {d.mean():.5f} max {d.max():.5f}")
+        <span class="kw2">if</span> step % 20 == 19:
+            yv, _ = sample(policy, 1024, ev)                      <span class="cm"># evaluate the CURRENT policy</span>
+            print(f"k={k} step {step+1}  reward {(yv == GOOD).float().mean():.3f}"
+                  f"  lag {step - ver}  clip frac {sum(clip[-20:]) / 20:.3f}")
+
+<span class="kw2">for</span> k <span class="kw2">in</span> (0, 1, 4):
+    run(k)
+<span class="cm"># Output (CPU, torch 2.8):</span>
+<span class="cm"># same version: |logp_trainer - logp_engine| mean 0.00097 max 0.00435</span>
+<span class="cm"># k=0 step 20  reward 0.961  lag 0  clip frac 0.000</span>
+<span class="cm"># k=0 step 40  reward 0.999  lag 0  clip frac 0.000</span>
+<span class="cm"># k=0 step 60  reward 1.000  lag 0  clip frac 0.000</span>
+<span class="cm"># k=1 step 20  reward 0.935  lag 1  clip frac 0.040</span>
+<span class="cm"># k=1 step 40  reward 0.998  lag 1  clip frac 0.010</span>
+<span class="cm"># k=1 step 60  reward 1.000  lag 1  clip frac 0.000</span>
+<span class="cm"># k=4 step 20  reward 0.538  lag 4  clip frac 0.276</span>
+<span class="cm"># k=4 step 40  reward 0.892  lag 4  clip frac 0.280</span>
+<span class="cm"># k=4 step 60  reward 0.981  lag 4  clip frac 0.064</span></pre>
+<p>Three things to read from this output. First, even at the <b>same</b> weight version, the bf16 engine and the fp32 trainer disagree: the mean gap in log-prob is 0.00097 and the largest 0.00435. That is the engine mismatch of (75.9), small here because the toy model is tiny. Second, with one step of staleness the run is almost as good as synchronous (0.935 versus 0.961 at step 20): the pipeline is nearly free. Third, with \(k = 4\) the clip fraction jumps to about 0.28 and learning per step is much slower (0.538 at step 20): many samples fall outside the trust region of the behaviour policy and give no gradient. In a real system, \(k = 1\) to a few is the usual trade, because the wall-clock gain from overlap is large and the per-step cost is small. [Likely]</p>
+
+<h2>Libraries: TRL, verl, OpenRLHF</h2>
+<p>All three implement the loop above with an inference engine for rollouts. They differ in scale, structure and defaults.</p>
+<div class="tblw"><table class="tb"><thead><tr><th></th><th>TRL (Hugging Face)</th><th>verl (HybridFlow, ByteDance Seed)</th><th>OpenRLHF</th></tr></thead><tbody>
+<tr><td>Design</td><td>Trainer classes on top of Transformers; one script, launched with <code>accelerate</code> or <code>torchrun</code> [Likely]</td><td>a hybrid controller: one central Python program describes the dataflow, while workers run the distributed computation [Certain]</td><td>Ray schedules separate workers for vLLM engines, actor training and the other models [Certain]</td></tr>
+<tr><td>Rollout engine</td><td>vLLM, colocated (default) or as a server on its own GPUs [Certain]</td><td>vLLM, SGLang, TensorRT-LLM [Certain]</td><td>vLLM [Certain]</td></tr>
+<tr><td>Training backend</td><td>Accelerate with DeepSpeed or FSDP, PEFT/LoRA [Likely]</td><td>FSDP, Megatron-LM, and others [Certain]</td><td>DeepSpeed ZeRO, with automatic tensor parallelism and ring-attention sequence parallelism [Certain]</td></tr>
+<tr><td>Weight sync</td><td>NCCL stream to the vLLM server after each optimizer step, or in-process when colocated [Certain]</td><td>3D-HybridEngine reshards the actor between training and generation layouts [Certain]</td><td>model slices sent from the training engines to vLLM [Certain]</td></tr>
+<tr><td>Algorithms</td><td>SFT, DPO, GRPO, RLOO, online DPO, reward modelling, and more [Likely]</td><td>PPO, GRPO, DAPO, and many recipes [Certain]</td><td>PPO, GRPO-style methods, REINFORCE variants, DPO [Likely]</td></tr>
+<tr><td>Async</td><td>no asynchronous pipeline in the docs we read [Likely]</td><td>one-step-off-policy and fully asynchronous trainer recipes [Certain]</td><td>asynchronous training mode [Certain]</td></tr>
+<tr><td>Good for</td><td>one node, small to mid-size models, LoRA, quick experiments, labs like <a href="../posttraining/index.html#row-lab-dpo-on-a-small-model" title="DPO on a small model (planned)">session 76</a> and <a href="../posttraining/index.html#row-lab-grpo-with-a-verifiable-reward" title="GRPO with a verifiable reward (planned)">session 77</a></td><td>large clusters, very large or MoE models (Megatron), many algorithms, research at scale</td><td>multi-node PPO with a separate critic and reward model; clear Ray-based separation of roles</td></tr></tbody></table></div>
+<p>Published speed-ups, each against the baselines chosen in its own paper: HybridFlow reports 1.53× to 20.57× higher throughput than earlier RLHF systems [Certain]; OpenRLHF reports 1.22× to 1.68× speed-ups over other frameworks across model sizes [Certain]; AReaL reports up to 2.77× faster training than synchronous systems with the same number of GPUs [Certain]. Earlier, DeepSpeed-Chat (2023) combined training and inference optimizations in one RLHF system and popularized the colocated “hybrid engine” idea. [Likely] These numbers are not comparable with each other: setups, models and baselines differ.</p>
+<p>How to choose, as a rule of thumb [Likely]: start with TRL on one node, with vLLM colocated, and LoRA if memory is tight. Move to verl or OpenRLHF when the model or the cluster grows, when you need PPO with a separate critic at scale, when you need Megatron for very large models, or when long reasoning rollouts make asynchronous training worth its complexity.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>The infrastructure problem</th><th>Typical choice</th></tr></thead><tbody>
+<tr><td>Reasoning models trained with verifiable rewards (<a href="../posttraining/grpo-and-rl-with-verifiable-rewards-rlvr.html">session 70</a>)</td><td>very long answers, huge length spread, the tail of Figure 2</td><td>large GRPO groups with prefix caching, length caps, partial or interruptible rollouts, asynchronous training with a staleness bound</td></tr>
+<tr><td>Classic PPO-RLHF chat alignment</td><td>four models in memory (<a href="../posttraining/ppo.html">session 66</a>); reward model and critic forward passes</td><td>separate placement (OpenRLHF, verl) or colocation with offloading</td></tr>
+<tr><td>Code agents with unit tests</td><td>the reward is a program run; sandboxes on CPU workers can be slower than generation</td><td>a pool of reward workers in parallel with the trainer; asynchronous scoring [Likely]</td></tr>
+<tr><td>Multi-turn agents with tools</td><td>each episode waits for tool calls; GPUs idle between turns</td><td>server-based asynchronous rollouts (verl lists “server-based asynchronous rollout” for agentic RL [Certain])</td></tr>
+<tr><td>Small models and LoRA on one node</td><td>memory, not throughput</td><td>TRL with colocated vLLM; with LoRA only the adapter needs to be synced</td></tr>
+<tr><td>VLM alignment with images</td><td>image tokens make prompts long; the engine must run the vision encoder too</td><td>an engine with multimodal support; TRL sends images to a separate vLLM endpoint for multimodal prompts [Certain]</td></tr>
+<tr><td>Video-LLMs: video QA, key-moment detection, temporal grounding</td><td>thousands of visual tokens per prompt, so KV cache memory limits the decode batch (75.2) even with short answers</td><td>prefix caching of the shared video prompt across the \(G\) answers; fewer, larger generation GPUs; rewards such as time-span overlap (<a href="../video/index.html#row-video-llms" title="Video-LLMs (planned)">session 205</a>) [Likely]</td></tr>
+<tr><td>Video captioning for retrieval</td><td>the reward is a retrieval score of the caption against the clip, which needs an embedding model on GPU</td><td>the retrieval model as a separate reward worker, scoring in parallel with generation [Speculation]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Generating with the training framework.</b> <code>generate()</code> under FSDP or ZeRO-3 all-gathers the weights at every decode step and uses static batching. Use an inference engine, even on one GPU.</li>
+<li><b>Forgetting the weight sync, or syncing the wrong thing.</b> If the engine keeps the old weights, the run is silently off-policy by more and more versions. Log the engine’s weight version with every batch and assert the staleness you expect. With LoRA, merge or load the adapter in the engine, and check the tied embeddings and renamed layers.</li>
+<li><b>Recomputing the “old” log-probs with the current weights in an asynchronous run.</b> Then the ratio is 1 at the start and the staleness is invisible to the loss. Use the behaviour log-probs from the engine (or the decoupled objective 75.8).</li>
+<li><b>Trusting the engine’s log-probs blindly.</b> They may be computed before temperature scaling, in a different precision, or with different kernels. Check the mean and maximum of \(\log\pi_\text{trainer} - \log\pi_\text{engine}\) at staleness 0; use TIS (75.9) when the gap is large.</li>
+<li><b>Different sampling settings in the engine and the loss.</b> If the engine samples at temperature 0.7 or with top-p, the behaviour policy is that modified distribution, not the raw softmax. The ratio must use the same distribution. [Likely]</li>
+<li><b>Unbounded staleness.</b> A fast engine with a slow trainer builds a long queue of old data. Throttle generation so no sample is more than a few versions old.</li>
+<li><b>Ignoring the long tail.</b> A few answers at the length cap can double the step time. Log the length distribution and the number of cut answers per step, not only the mean length.</li>
+<li><b>Out of memory when switching phases in a colocated setup.</b> The engine’s KV cache reservation (for vLLM, a fraction of GPU memory) plus the trainer’s state must fit, or one of them must be offloaded. Lower the engine’s memory fraction or use its sleep mode. [Likely]</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why is rollout generation usually the bottleneck in RLHF and RLVR?<span class="lvl">basic</span></summary><div class="ans">Generation is sequential: one token per sequence per step, and each step reads all weights and the KV cache from memory, so it is memory-bound (intensity about \(b\) FLOP/byte for a batch of \(b\), against a ridge point of about 295 on an H100). The batch is limited by KV-cache memory. Answers have very different lengths and a synchronous step waits for the longest one, so many slots are idle. Training, by contrast, processes all tokens in parallel at high MFU. OpenRLHF reports that generation often takes over 90% of the runtime.</div></details>
+<details class="qa"><summary>Why not just call <code>model.generate()</code> in the trainer?<span class="lvl">basic</span></summary><div class="ans">It uses static batching (all sequences wait for the longest), a contiguous KV cache that wastes memory and so limits the batch, and usually no CUDA graphs. Under FSDP or ZeRO-3 each decode step must all-gather sharded weights for a single token per sequence. Inference engines such as vLLM and SGLang add a paged KV cache, continuous batching, prefix caching (very useful for GRPO groups that share a prompt), fused kernels and CUDA graphs.</div></details>
+<details class="qa"><summary>What is weight sync, and how long does it take for a 70B model?<span class="lvl">core</span></summary><div class="ans">After each optimizer step, the inference engine’s copy of the policy must be replaced by the new weights. In bf16 that is \(2N\) bytes, 140 GB for 70B. The lower bound is \(2N / \text{BW}\): 2.8 s over one 400 Gb/s InfiniBand link, 0.35 s over eight links in parallel. In practice the trainer’s sharded layout (FSDP or TP×PP) differs from the engine’s layout, so the transfer includes gathering and resharding. Colocated systems avoid the network but must reshard in GPU memory. Going through a checkpoint on disk is much slower.</div></details>
+<details class="qa"><summary>Colocated or separate GPUs for the inference engine: what are the trade-offs?<span class="lvl">core</span></summary><div class="ans">Colocated (hybrid engine): every GPU does both jobs in turn, so there is no idle group and the sync is local; but trainer and engine share memory (offload or sleep modes needed), the switch costs time, and the phases cannot overlap. Separate: each side has full memory and its own parallel layout, and asynchronous pipelining becomes possible; but in a synchronous loop each side idles while the other works, the split must be balanced (about a share \(W_\text{gen}/(W_\text{gen}+W_\text{train})\) of GPUs on generation), and weights travel over the network. TRL defaults to colocated vLLM; OpenRLHF separates roles with Ray; verl supports flexible placement.</div></details>
+<details class="qa"><summary>What is asynchronous RL for LLMs, and what does it cost?<span class="lvl">core</span></summary><div class="ans">The engine generates batch \(t+1\) while the trainer trains on batch \(t\), so both GPU groups stay busy and the step time becomes \(\max(T_\text{gen}, T_\text{train}) + T_\text{sync}\) instead of the sum. The cost: the data is generated by a policy \(k \ge 1\) versions old, so it is off-policy. The gradient is computed from where the policy was, which adds bias and, as in a delayed feedback loop, lowers the safe learning rate (\(\eta_\text{max} = \sin(\pi/(2(2k+1)))\) in the Gaussian toy). Fixes: importance ratios against the behaviour log-probs, the decoupled PPO objective, and a bound on staleness.</div></details>
+<details class="qa"><summary>Explain the decoupled PPO objective used by AReaL.<span class="lvl">advanced</span></summary><div class="ans">Standard PPO uses one old policy for two jobs: the importance correction (samples came from it) and the trust region (do not move far from it). With stale samples these differ. The decoupled form (Hilton et al., 2021) multiplies the clipped PPO term, with ratio \(u = \pi_\theta / \pi_\text{prox}\), by the weight \(\pi_\text{prox} / \pi_\text{behav}\). The proximal policy is recent (AReaL: the weights just before the update), so the clip limits each update; the behaviour policy is whatever sampled the tokens, possibly several versions old, and its weight corrects the off-policy sampling. AReaL combines it with a staleness bound (\(\eta = 4\) or 8).</div></details>
+<details class="qa"><summary>Why are vLLM’s log-probs different from the trainer’s for the same weights, and what do you do about it?<span class="lvl">advanced</span></summary><div class="ans">Different kernels, precision (bf16 vs fp32 softmax, sometimes FP8 or quantized weights in the engine), different reduction orders, and sometimes log-probs taken before temperature or top-p processing. So the sampling distribution is not exactly the one the trainer differentiates, and “on-policy” RL is slightly off-policy. Measure \(\log\pi_\text{trainer} - \log\pi_\text{engine}\) at staleness 0. Ask the engine for processed log-probs (the ones it sampled from). Use truncated importance sampling: weight each token’s loss by \(\min(\pi_\text{trainer}/\pi_\text{engine}, C)\) (Yao et al., 2025).</div></details>
+<details class="qa"><summary>How do partial or interruptible rollouts help with the long tail?<span class="lvl">advanced</span></summary><div class="ans">A synchronous step waits for its longest answer, so the slots of short answers sit idle. Kimi k1.5 caps the tokens per rollout per iteration and continues unfinished answers in the next iteration from a replay buffer. AReaL interrupts generation when new weights arrive, loads them, recomputes the KV cache and continues. Both keep the GPUs busy with new work instead of waiting. The cost is that one answer contains tokens from several policy versions, so each token must keep its own behaviour log-prob for the importance ratio.</div></details>
+<details class="qa"><summary>In a GRPO setup with 8 GPUs, generation is 80% of the work. How would you split them for an asynchronous pipeline?<span class="lvl">core</span></summary><div class="ans">Balance the two sides of (75.5): \(W_\text{gen}/g = W_\text{train}/(G-g)\) gives \(g = 0.8 \times 8 = 6.4\), so 6 or 7 GPUs for generation. With 400 GPU-seconds per step and 6 + 2: generation 53.3 s, training 40 s, so the step is 53.3 s plus sync, and the training GPUs idle about 25% of the time. With 7 + 1, training takes 80 s and becomes the bottleneck. In practice also consider memory (the trainer must fit its sharded states on its GPUs) and parallel layout limits (tensor parallel sizes that divide the number of heads).</div></details>
+<details class="qa"><summary>Which library would you pick for (a) a LoRA GRPO run on one 8-GPU node, (b) PPO with a 70B policy and separate critic on 64 GPUs?<span class="lvl">core</span></summary><div class="ans">(a) TRL: <code>GRPOTrainer</code> with <code>use_vllm=True</code> in colocate mode, or server mode with some GPUs for vLLM; LoRA keeps memory low and only the adapter must be synced. (b) verl or OpenRLHF: both handle multi-node placement of actor, critic, reference and reward models with an inference engine; verl offers a Megatron backend for very large models and resharding with its 3D-HybridEngine; OpenRLHF places roles on GPUs with Ray and trains with DeepSpeed ZeRO. Either way, plan the memory as in <a href="../posttraining/ppo.html">session 66</a> (four models) and measure where the step time goes before tuning.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Four answers are decoded together with static batching. Their lengths are 200, 300, 400 and 1,500 tokens. What share of slot time does useful work, by (75.3)?</li>
+<li>A 32B policy in bf16 is synced over one 400 Gb/s link. What is the lower bound on the sync time? How does it change with LoRA adapters of 100 MB?</li>
+<li>Generation takes 300 GPU-seconds and training 100 GPU-seconds per step on 8 GPUs, with a 2 s sync. Compute the step time for separate synchronous with 6 + 2 GPUs, and for asynchronous with 6 + 2.</li>
+<li>Using (75.7), what is the largest stable step size in the Gaussian toy for staleness \(k = 3\)? Is \(\eta = 0.25\) stable?</li>
+<li>The engine sampled a token with probability 0.10, and the trainer computes 0.30 for the same weights. What is the TIS weight with \(C = 2\)? And if the trainer computes 0.15?</li>
+<li>Why does a GRPO group of \(G = 16\) answers per prompt benefit from prefix caching more than PPO with one answer per prompt?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Useful work \(200 + 300 + 400 + 1500 = 2400\); slot time \(4 \times 1500 = 6000\); \(U = 0.40\). Most of the loss is the one long answer. 2. \(2 \times 32 = 64\) GB; \(64 / 50 = 1.28\) s. With LoRA only the adapter moves: \(0.1 / 50 = 0.002\) s, plus the cost of merging it into the engine’s weights or loading it as an adapter. 3. Synchronous: \(300/6 + 100/2 + 2 = 50 + 50 + 2 = 102\) s. Asynchronous: \(\max(50, 50) + 2 = 52\) s, about twice as fast, with data one version old. 4. \(\eta_\text{max}(3) = \sin(\pi/14) = 0.2225\); \(\eta = 0.25\) is above it, so the uncorrected delayed update is unstable. 5. The ratio is \(0.30/0.10 = 3\), capped at \(C = 2\), so \(w = 2\). With 0.15 the ratio is 1.5, below the cap, so \(w = 1.5\). 6. All 16 answers start from the same prompt, so its KV cache is computed once and shared by 16 sequences; with long prompts (system prompt, documents, images or video frames) this saves a large share of prefill compute and KV memory. PPO with one answer per prompt has nothing to share across sequences except a common system prompt.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>An RL step is a distributed dataflow: rollout, scoring, training, and weight sync (75.1). Generation usually dominates; OpenRLHF reports over 90% of runtime.</li>
+<li>Decoding is memory-bound (75.2) and waits for the longest answer (75.3). Use an inference engine (vLLM, SGLang) with continuous batching and prefix caching, never the trainer’s <code>generate()</code>.</li>
+<li>Weight sync moves \(2N\) bytes per update (75.4): well under a second for 7B on InfiniBand, seconds for 70B; much slower through disk.</li>
+<li>Colocated (hybrid engine) keeps all GPUs busy and syncs locally; separate GPUs allow asynchronous pipelining (75.5) but must be balanced.</li>
+<li>Asynchronous RL trains on data that is \(k\) versions old. Ignoring this is a delayed feedback loop that lowers the safe learning rate (75.6), (75.7); use behaviour log-probs, the decoupled objective (75.8) and a staleness bound.</li>
+<li>Even synchronous RL is slightly off-policy because engine and trainer compute different probabilities; measure the gap and use truncated importance sampling (75.9).</li>
+<li>TRL: simplest, one node, colocated or server vLLM. verl: hybrid controller, FSDP or Megatron, vLLM or SGLang, resharding engine, async recipes. OpenRLHF: Ray, vLLM and DeepSpeed, roles on separate GPUs.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ T_\text{step} = T_\text{gen} + T_\text{score} + T_\text{train} + T_\text{sync}, \qquad I_\text{decode} \approx \frac{2Nb}{2N + M_\text{KV}}, \qquad U_\text{static} = \frac{\sum_i L_i}{S \max_i L_i} \]</div>
+<div class="eq">\[ T_\text{sync} \ge \frac{2N}{\text{BW}_\text{link}}, \qquad T_\text{async} = \max\!\Big(\frac{W_\text{gen}}{g}, \frac{W_\text{train}}{G-g}\Big) + T_\text{sync} \]</div>
+<div class="eq">\[ \mu_{t+1} = \mu_t - 2\eta(\mu_{t-k} - c), \quad \eta_\text{max} = \sin\frac{\pi}{2(2k+1)}, \qquad w_t = \min\!\Big(\frac{\pi_\text{trainer}}{\pi_\text{engine}}, C\Big) \]</div>
+<h2 class="plain" id="rl-infrastructure-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Hugging Face (code). <a href="https://github.com/huggingface/trl" target="_blank" rel="noopener">TRL library</a></li><li>Sheng et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;HybridFlow: A Flexible and Efficient RLHF Framework (verl)&amp;quot;" target="_blank" rel="noopener">HybridFlow: A Flexible and Efficient RLHF Framework (verl)</a></li><li>Hu et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;OpenRLHF: An Easy-to-use, Scalable and High-performance RLHF Framework&amp;quot;" target="_blank" rel="noopener">OpenRLHF: An Easy-to-use, Scalable and High-performance RLHF Framework</a></li><li>Hugging Face (code). <a href="https://github.com/huggingface/trl" target="_blank" rel="noopener">TRL library</a></li><li>Sheng et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;HybridFlow: A Flexible and Efficient RLHF Framework (verl)&amp;quot;" target="_blank" rel="noopener">HybridFlow: A Flexible and Efficient RLHF Framework (verl)</a></li><li>Hu et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;OpenRLHF: An Easy-to-use, Scalable and High-performance RLHF Framework&amp;quot;" target="_blank" rel="noopener">OpenRLHF: An Easy-to-use, Scalable and High-performance RLHF Framework</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Zheng et al. (2023). <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">SGLang: Efficient Execution of Structured Language Model Programs</a></li><li>vLLM project (docs). <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM documentation</a></li><li>Schulman et al. (2017). <a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">Proximal Policy Optimization Algorithms</a></li><li>Shao et al. (2024). <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">DeepSeekMath: Pushing the Limits of Mathematical Reasoning in Open Language Models</a></li><li>Noukhovitch et al. (2024). <a href="https://arxiv.org/abs/2410.18252" target="_blank" rel="noopener">Asynchronous RLHF: Faster and More Efficient Off-Policy RL for Language Models</a></li><li>Fu et al. (2025). <a href="https://arxiv.org/abs/2505.24298" target="_blank" rel="noopener">AReaL: A Large-Scale Asynchronous Reinforcement Learning System for Language Reasoning</a></li><li>Kimi Team (2025). <a href="https://arxiv.org/abs/2501.12599" target="_blank" rel="noopener">Kimi k1.5: Scaling Reinforcement Learning with LLMs</a></li><li>Yao et al. (2023). <a href="https://arxiv.org/abs/2308.01320" target="_blank" rel="noopener">DeepSpeed-Chat: Easy, Fast and Affordable RLHF Training of ChatGPT-like Models at All Scales</a></li><li>Yao, Liu et al. (2025). <a href="https://fengyao.notion.site/off-policy-rl" target="_blank" rel="noopener">Your Efficient RL Framework Secretly Brings You Off-Policy RL Training</a></li><li>Hilton, Cobbe and Schulman (2021). <a href="https://arxiv.org/abs/2110.00641" target="_blank" rel="noopener">Batch size-invariance for policy optimization</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../posttraining/safety-alignment-rlaif-and-constitutional-ai.html"><small>Previous · session 74</small>Safety alignment: RLAIF and Constitutional AI</a><span class="next"><small>Next · session 76, planned</small>DPO on a small model</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="rl-infrastructure"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const T=(x,y,s,o)=>{o=o||{};return `<text x="${x}" y="${y}" font-family="var(--sans)" font-size="${o.fs||12}" ${o.w?`font-weight="${o.w}"`:""} fill="${o.c||"var(--ink)"}" ${o.a?`text-anchor="${o.a}"`:""}>${s}</text>`;};
+
+/* ---------- Figure 1: the RL loop, phase by phase ---------- */
+(function(){
+ const svg=$("#ri-loop-svg");if(!svg)return;const info=$("#ri-loop-info");
+ const box={ctl:[20,120,150,70],eng:[230,20,230,80],rew:[540,20,200,80],buf:[540,200,200,70],trn:[230,200,230,90]};
+ const name={ctl:["Controller","prompts, schedule"],eng:["Rollout engine","vLLM / SGLang, bf16"],rew:["Reward","verifier or reward model"],buf:["Experience batch","tokens, log-probs, rewards"],trn:["Trainer","FSDP / Megatron / DeepSpeed"]};
+ const col={ctl:"var(--muted)",eng:"var(--q)",rew:"var(--v)",buf:"var(--muted)",trn:"var(--k)"};
+ const arrows=[["ctl","eng","prompts x"],["eng","rew","answers y"],["rew","buf","scores"],["buf","trn","batch"],["trn","trn","update"],["trn","eng","weights θ"]];
+ const STEPS=[
+  {on:["ctl","eng"],a:[0],busy:"engine",t:"The controller takes a batch of prompts (for GRPO: each prompt repeated G times) and sends it to the rollout engine. The engine holds its own copy of the policy weights, version v."},
+  {on:["eng"],a:[],busy:"engine",t:"The engine generates the answers token by token. This is the slow phase: decoding is memory-bound and the batch waits for its longest answer. It also returns the log-probability of every sampled token (the behaviour log-probs)."},
+  {on:["eng","rew"],a:[1],busy:"reward",t:"Each answer goes to the reward function: a verifier (unit tests, exact match on a math answer) or a reward model forward pass. Verifiers often run on CPU workers in parallel."},
+  {on:["rew","buf"],a:[2],busy:"trainer",t:"Rewards, tokens and behaviour log-probs form the experience batch. The trainer may add reference log-probs (for the KL term), critic values (PPO) and computes advantages (GAE or group-relative)."},
+  {on:["buf","trn"],a:[3,4],busy:"trainer",t:"The trainer runs forward and backward passes with the PPO or GRPO loss on the batch, sharded with FSDP, Megatron or DeepSpeed. The weights become version v + 1."},
+  {on:["trn","eng"],a:[5],busy:"sync",t:"Weight sync: the new weights are copied into the engine (NCCL broadcast, CUDA IPC on the same GPU, or a reshard in place). Only now can the next rollout use version v + 1."}];
+ let cur=0;
+ function cen(k){const b=box[k];return [b[0]+b[2]/2,b[1]+b[3]/2];}
+ function draw(i){cur=i;const S=STEPS[i];
+  let g=`<defs><marker id="ri-ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="var(--ink2)"/></marker></defs>`;
+  for(const k in box){const [x,y,w,h]=box[k];const on=S.on.includes(k);
+   g+=`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="10" fill="color-mix(in srgb,${col[k]} ${on?22:5}%,var(--card))" stroke="${on?col[k]:"var(--rule)"}" stroke-width="${on?2.5:1.5}"/>`;
+   g+=T(x+w/2,y+h/2-4,name[k][0],{a:"middle",w:700,fs:14,c:on?"var(--ink)":"var(--muted)"})+T(x+w/2,y+h/2+15,name[k][1],{a:"middle",fs:11.5,c:"var(--ink2)"});}
+  const pts=[[[170,140],[228,75]],[[460,60],[538,60]],[[640,100],[640,198]],[[540,235],[462,240]],null,[[300,200],[300,102]]];
+  const lab=[[96,100],[470,50],[650,155],[470,228],null,[308,155]];
+  arrows.forEach((a,j)=>{if(!pts[j])return;const on=S.a.includes(j);const [p,q]=pts[j];
+   g+=`<line x1="${p[0]}" y1="${p[1]}" x2="${q[0]}" y2="${q[1]}" stroke="${on?"var(--ink)":"var(--muted)"}" stroke-width="${on?2.6:1.4}" ${j===5?'stroke-dasharray="6 4"':""} marker-end="url(#ri-ar)"/>`;
+   g+=T(lab[j][0],lab[j][1],a[2],{fs:11.5,c:on?"var(--ink)":"var(--muted)",w:on?700:400});});
+  if(S.a.includes(4))g+=`<path d="M 400 290 q 30 30 50 -2" fill="none" stroke="var(--ink)" stroke-width="2.2" marker-end="url(#ri-ar)"/>`+T(455,312,"loss.backward(), optimizer step",{fs:11.5,w:700});
+  // resource bar: which part is busy
+  const res=[["engine","Rollout GPUs","var(--q)"],["reward","Reward workers","var(--v)"],["trainer","Training GPUs","var(--k)"],["sync","Link (sync)","var(--muted)"]];
+  g+=T(20,232,"Busy now:",{fs:12,w:700,c:"var(--ink2)"});
+  res.forEach((r,j)=>{const on=S.busy===r[0];g+=`<rect x="20" y="${242+j*20}" width="14" height="12" rx="3" fill="${on?r[2]:"var(--rule)"}"/>`+T(40,252+j*20,r[1],{fs:11.5,c:on?"var(--ink)":"var(--muted)",w:on?700:400});});
+  svg.innerHTML=g;info.innerHTML=`<b>Phase ${i+1} of 6.</b> ${S.t}`;}
+ B.stepper({n:STEPS.length,prev:$("#ri-loop-prev"),next:$("#ri-loop-next"),play:$("#ri-loop-play"),label:$("#ri-loop-lab"),ms:2600,onStep:draw});
+})();
+
+/* ---------- Figure 2: the long tail of answer lengths ---------- */
+(function(){
+ const svg=$("#ri-tail-svg");if(!svg)return;const info=$("#ri-tail-info");const Ss=$("#ri-tail-s");let S=16,cap=4096;
+ const N=64,MED=400;
+ function lengths(sig){const r=rng(7),L=[];for(let i=0;i<N;i++){const u1=Math.max(r(),1e-12),u2=r();const z=Math.sqrt(-2*Math.log(u1))*Math.cos(2*Math.PI*u2);L.push(Math.min(cap,Math.max(16,Math.round(MED*Math.exp(sig*z)))));}return L;}
+ function schedStatic(L){const lanes=[];let t0=0,tot=0;for(let i=0;i<N;i+=S){const grp=L.slice(i,i+S);const m=Math.max(...grp);grp.forEach((l,j)=>lanes.push({lane:j,s:t0,l,end:t0+m}));t0+=m;}return {bars:lanes,T:t0};}
+ function schedCont(L){const free=new Array(S).fill(0),bars=[];L.forEach(l=>{let j=0;for(let q=1;q<S;q++)if(free[q]<free[j])j=q;bars.push({lane:j,s:free[j],l});free[j]+=l;});return {bars,T:Math.max(...free)};}
+ function draw(){const sig=+Ss.value;$("#ri-tail-sv").value=sig.toFixed(1);
+  const L=lengths(sig),sum=L.reduce((a,b)=>a+b,0),mx=Math.max(...L),nCap=L.filter(l=>l>=cap).length;
+  const st=schedStatic(L),ct=schedCont(L),lb=sum/S;const Tm=Math.max(st.T,ct.T);
+  const X0=120,XW=620,X=t=>X0+t/Tm*XW;let g="";
+  const panel=(sc,y0,title,color)=>{const lh=Math.min(8,130/S),gap=lh>4?1:0.5;let s=T(8,y0+12,title,{fs:12.5,w:700});
+   s+=`<rect x="${X0}" y="${y0}" width="${(X(sc.T)-X0).toFixed(1)}" height="${(S*lh).toFixed(1)}" fill="var(--rule)" opacity="0.45"/>`;
+   sc.bars.forEach(b=>{const y=y0+b.lane*lh;s+=`<rect x="${X(b.s).toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(0.6,X(b.s+b.l)-X(b.s)-0.4).toFixed(1)}" height="${(lh-gap).toFixed(1)}" fill="${b.l>=cap?"var(--bad)":color}"/>`;});
+   s+=`<line x1="${X(sc.T).toFixed(1)}" y1="${y0-3}" x2="${X(sc.T).toFixed(1)}" y2="${y0+S*lh+3}" stroke="var(--ink)" stroke-width="1.5"/>`;
+   s+=T(Math.min(X(sc.T)+4,700).toFixed(1),y0+S*lh/2+4,sc.T.toLocaleString("en-US"),{fs:11.5,w:700});
+   s+=T(8,y0+30,`${S} slots`,{fs:11,c:"var(--ink2)"})+T(8,y0+45,`use ${(100*sum/(S*sc.T)).toFixed(1)}%`,{fs:11,c:"var(--ink2)"});return s;};
+  g+=panel(st,14,"Static batches","var(--q)");
+  g+=panel(ct,170,"Continuous","var(--k)");
+  g+=`<line x1="${X(lb).toFixed(1)}" y1="166" x2="${X(lb).toFixed(1)}" y2="306" stroke="var(--ok)" stroke-width="2" stroke-dasharray="5 4"/>`+T(X(lb).toFixed(1),320,"lower bound ΣL/S",{fs:11,a:"middle",c:"var(--ok)"});
+  g+=T(X0+XW/2,338,"time in decode steps (one token per active slot per step)",{fs:11.5,a:"middle",c:"var(--ink2)"});
+  svg.innerHTML=g;
+  info.innerHTML=`64 answers, median 400 tokens, spread σ = ${sig.toFixed(1)}, cap ${cap}: mean length <b>${(sum/N).toFixed(1)}</b>, longest <b>${mx}</b>, hit the cap <b>${nCap}</b>. Static batches: <b>${st.T}</b> steps, slot use <b>${(100*sum/(S*st.T)).toFixed(1)}%</b>. Continuous batching: <b>${ct.T}</b> steps, slot use <b>${(100*sum/(S*ct.T)).toFixed(1)}%</b>. Lower bound ΣL/S = <b>${lb.toFixed(1)}</b>.`;}
+ Ss.addEventListener("input",draw);seg($("#ri-tail-slots"),v=>{S=+v;draw();});seg($("#ri-tail-cap"),v=>{cap=+v;draw();});draw();
+})();
+
+/* ---------- Figure 3: placement, sync and async ---------- */
+(function(){
+ const svg=$("#ri-place-svg");if(!svg)return;const info=$("#ri-place-info");
+ const Fs=$("#ri-place-f"),Gs=$("#ri-place-g"),Ss=$("#ri-place-s"),Ws=$("#ri-place-w");const W=400,G=8;
+ function draw(){const f=+Fs.value/100,g=+Gs.value,s=+Ss.value,w=+Ws.value/100;
+  $("#ri-place-fv").value=Math.round(f*100)+"%";$("#ri-place-gv").value=g+" + "+(G-g);$("#ri-place-sv").value=s+" s";$("#ri-place-wv").value=Math.round(w*100)+"%";
+  const cg=f*W/(G*(1-w)),ctr=(1-f)*W/G,Tc=cg+ctr+s;
+  const sg=f*W/(g*(1-w)),str=(1-f)*W/(G-g),Ts=sg+str+s;
+  const ag=f*W/g,atr=(1-f)*W/(G-g),Ta=Math.max(ag,atr)+s;
+  const U=t=>W/(G*t);const H=3*Math.max(Tc,Ts,Ta)/3;const span=Math.max(3*Tc,3*Ts,3*Ta+ag);
+  const X0=150,XW=590,X=t=>X0+t/span*XW;let o="";
+  const bar=(x0,x1,y,h,c,lab)=>{const wpx=X(x1)-X(x0);let r=`<rect x="${X(x0).toFixed(1)}" y="${y}" width="${Math.max(0.5,wpx).toFixed(1)}" height="${h}" rx="3" fill="${c}"/>`;if(lab&&wpx>22)r+=T((X(x0)+wpx/2).toFixed(1),y+h/2+4,lab,{fs:10.5,a:"middle",c:"var(--card)",w:700});return r;};
+  const rowT=(y,t,sub)=>T(8,y,t,{fs:12.5,w:700})+T(8,y+15,sub,{fs:11,c:"var(--ink2)"});
+  // colocated: all 8 GPUs alternate
+  let y=20;o+=rowT(y+12,"Colocated",`T = ${Tc.toFixed(1)} s`);
+  for(let k=0;k<3;k++){const t0=k*Tc;o+=bar(t0,t0+cg,y,26,"var(--q)","gen "+(k+1))+bar(t0+cg,t0+cg+ctr,y,26,"var(--k)","train")+bar(t0+cg+ctr,t0+Tc,y,26,"var(--muted)");}
+  o+=T(X0-6,y+17,"8 GPUs",{fs:10.5,a:"end",c:"var(--ink2)"});
+  // separate, synchronous
+  y=90;o+=rowT(y+22,"Separate, sync",`T = ${Ts.toFixed(1)} s`);
+  for(let k=0;k<3;k++){const t0=k*Ts;o+=bar(t0,t0+sg,y,22,"var(--q)","gen "+(k+1))+bar(t0+sg,t0+sg+str,y+26,22,"var(--k)","train")+bar(t0+sg+str,t0+Ts,y,48,"var(--muted)");}
+  o+=T(X0-6,y+15,`${g} gen`,{fs:10.5,a:"end",c:"var(--ink2)"})+T(X0-6,y+41,`${G-g} train`,{fs:10.5,a:"end",c:"var(--ink2)"});
+  // separate, async one step off
+  y=180;o+=rowT(y+22,"Separate, async",`T = ${Ta.toFixed(1)} s, lag 1`);
+  for(let k=0;k<4;k++){const t0=k*Ta;o+=bar(t0,t0+ag,y,22,"var(--q)","gen "+(k+1));if(k>0){const t1=k*Ta;o+=bar(t1,t1+atr,y+26,22,"var(--k)","train "+k);}o+=bar(t0+Ta-s,t0+Ta,y,48,"var(--muted)");}
+  o+=T(X0-6,y+15,`${g} gen`,{fs:10.5,a:"end",c:"var(--ink2)"})+T(X0-6,y+41,`${G-g} train`,{fs:10.5,a:"end",c:"var(--ink2)"});
+  o+=`<line x1="${X0}" y1="262" x2="${X0+XW}" y2="262" stroke="var(--muted)"/>`;
+  const tick=span>300?100:span>150?50:25;for(let t=0;t<=span;t+=tick)o+=`<line x1="${X(t).toFixed(1)}" y1="262" x2="${X(t).toFixed(1)}" y2="267" stroke="var(--muted)"/>`+T(X(t).toFixed(1),280,t,{fs:10.5,a:"middle",c:"var(--ink2)"});
+  o+=T(X0+XW/2,298,"wall-clock seconds (grey: weight sync or switch)",{fs:11.5,a:"middle",c:"var(--ink2)"});
+  svg.innerHTML=o;
+  const best=[["colocated",Tc],["separate sync",Ts],["separate async",Ta]].sort((a,b)=>a[1]-b[1])[0][0];
+  info.innerHTML=`Work per step: 400 GPU-seconds, ${Math.round(f*100)}% generation. Step time and GPU use: colocated <b>${Tc.toFixed(2)} s</b> (<b>${(100*U(Tc)).toFixed(1)}%</b>), separate sync <b>${Ts.toFixed(2)} s</b> (<b>${(100*U(Ts)).toFixed(1)}%</b>), separate async <b>${Ta.toFixed(2)} s</b> (<b>${(100*U(Ta)).toFixed(1)}%</b>). Fastest here: <b>${best}</b>. Balanced split for async: about ${(f*G).toFixed(1)} generation GPUs.`;}
+ [Fs,Gs,Ss,Ws].forEach(x=>x.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: staleness and the delayed gradient ---------- */
+(function(){
+ const svg=$("#ri-stale-svg");if(!svg)return;const info=$("#ri-stale-info");const Ks=$("#ri-stale-k"),Ls=$("#ri-stale-lr");let mode="naive";
+ const STEPS=60,N=64,SIG=1,TGT=2,C=2;
+ function run(k,lr,md){const r=rng(5),mus=[0],out=[];
+  for(let t=0;t<STEPS;t++){const mu=mus[mus.length-1],mb=mus[Math.max(0,mus.length-1-k)];const a=[];
+   for(let i=0;i<N;i++){const u1=Math.max(r(),1e-12),u2=r();a.push(mb+SIG*Math.sqrt(-2*Math.log(u1))*Math.cos(2*Math.PI*u2));}
+   const rew=a.map(x=>-(x-TGT)*(x-TGT));const m=rew.reduce((p,q)=>p+q,0)/N;let g=0,sw=0,sw2=0,mxw=0;
+   for(let i=0;i<N;i++){const x=a[i];let w=Math.exp((-(x-mu)*(x-mu)+(x-mb)*(x-mb))/(2*SIG*SIG));if(md==="naive")w=1;else if(md==="tis")w=Math.min(w,C);
+    sw+=w;sw2+=w*w;mxw=Math.max(mxw,w);g+=w*(rew[i]-m)*(x-mu)/(SIG*SIG)/N;}
+   const nm=mu+lr*g;mus.push(nm);out.push({mu:nm,ess:sw*sw/sw2,mxw});}
+  return out;}
+ function draw(){const k=+Ks.value,lr=+Ls.value;$("#ri-stale-kv").value=k;$("#ri-stale-lrv").value=lr.toFixed(2);
+  const o=run(k,lr,mode),o0=run(0,lr,"naive");const bound=Math.sin(Math.PI/(2*(2*k+1)));
+  const X0=60,XW=660,Y0=20,YH=200,lo=-2,hi=6;const X=t=>X0+t/STEPS*XW,Y=v=>Y0+(hi-Math.max(lo,Math.min(hi,v)))/(hi-lo)*YH;
+  let g=`<rect x="${X0}" y="${Y0}" width="${XW}" height="${YH}" fill="none" stroke="var(--rule)"/>`;
+  for(let v=lo;v<=hi;v+=2)g+=`<line x1="${X0}" y1="${Y(v)}" x2="${X0+XW}" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/>`+T(X0-6,Y(v)+4,v,{fs:11,a:"end",c:"var(--ink2)"});
+  g+=`<line x1="${X0}" y1="${Y(TGT)}" x2="${X0+XW}" y2="${Y(TGT)}" stroke="var(--ok)" stroke-width="1.6"/>`+T(X0+XW-4,Y(TGT)-6,"best μ = 2",{fs:11,a:"end",c:"var(--ok)"});
+  const pl=(arr,c,d,wd)=>`<polyline points="${[`${X(0)},${Y(0)}`].concat(arr.map((h,i)=>X(i+1).toFixed(1)+","+Y(h.mu).toFixed(1))).join(" ")}" fill="none" stroke="${c}" stroke-width="${wd}" ${d?'stroke-dasharray="6 4"':""} stroke-linejoin="round"/>`;
+  g+=pl(o0,"var(--muted)",true,2)+pl(o,"var(--q)",false,2.6);
+  [0,10,20,30,40,50,60].forEach(t=>g+=T(X(t),Y0+YH+16,t,{fs:11,a:"middle",c:"var(--ink2)"}));
+  g+=T(X0+XW/2,Y0+YH+32,"training step",{fs:11.5,a:"middle",c:"var(--ink2)"})+T(14,Y0+YH/2,"μ",{fs:14,w:700});
+  // ESS strip
+  const EY=272,EH=50;g+=T(X0,EY-6,"effective sample size of the batch (of 64)",{fs:11.5,c:"var(--ink2)"});
+  g+=`<rect x="${X0}" y="${EY}" width="${XW}" height="${EH}" fill="none" stroke="var(--rule)"/>`;
+  o.forEach((h,i)=>{const hh=h.ess/N*EH;g+=`<rect x="${(X(i)+1).toFixed(1)}" y="${(EY+EH-hh).toFixed(1)}" width="${(XW/STEPS-2).toFixed(1)}" height="${hh.toFixed(1)}" fill="var(--k)"/>`;});
+  svg.innerHTML=g;
+  const dev=Math.max(...o.slice(20).map(h=>Math.abs(h.mu-TGT))),ess=Math.min(...o.map(h=>h.ess)),mx=Math.max(...o.map(h=>h.mxw));
+  const nm={naive:"no correction",is:"full importance sampling",tis:"truncated IS (C = 2)"}[mode];
+  info.innerHTML=`Staleness k = ${k}, step size η = ${lr.toFixed(2)}, ${nm}: μ after 60 steps <b>${o[STEPS-1].mu.toFixed(2)}</b>, largest |μ − 2| after step 20 <b>${dev.toFixed(2)}</b>, smallest effective sample size <b>${ess.toFixed(1)}</b>, largest weight <b>${mx.toFixed(2)}</b>. Without correction this delay is stable only for η below <b>${bound.toFixed(4)}</b> (formula 75.7).`;}
+ seg($("#ri-stale-mode"),v=>{mode=v;draw();});[Ks,Ls].forEach(x=>x.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

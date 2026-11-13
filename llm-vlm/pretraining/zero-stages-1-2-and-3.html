@@ -1,0 +1,471 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>ZeRO stages 1, 2 and 3 · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 45</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="zero-stages-1-2-and-3">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="zero-stages-1-2-and-3" data-session="zero-stages-1-2-and-3" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">45</span><span>Track 3: Pretraining and scale · session 15 of 22</span></div><h1 class="chap-title">ZeRO stages 1, 2 and 3</h1><p class="chap-sub">Data parallelism keeps a full copy of the weights, the gradients and the optimizer states on every GPU, so most of the memory holds the same numbers N times. ZeRO removes this waste in three stages: stage 1 splits the optimizer states across GPUs, stage 2 also splits the gradients, and stage 3 also splits the weights. This session computes the memory per GPU and the communication cost of each stage, and shows how offloading to CPU memory or NVMe disks goes further.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 4, 38, 43 and 44 (AdamW and its 16 bytes per parameter, memory math for training, collective communication, DDP)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why plain data parallelism wastes memory: every GPU stores the same 16 bytes per parameter</li><li>What stage 1, stage 2 and stage 3 shard, and the memory formula for each (4Ψ + 12Ψ/N, 2Ψ + 14Ψ/N, 16Ψ/N)</li><li>Why stages 1 and 2 cost no more communication than DDP, and why stage 3 costs 1.5 times as much</li><li>When communication can hide behind compute, and how many tokens per GPU you need for that</li><li>What ZeRO does not shard (activations, temporary buffers) and what ZeRO-R adds</li><li>ZeRO-Offload and ZeRO-Infinity: which states go to CPU memory or NVMe, and why the PCIe traffic is 4Ψ bytes</li><li>How to read a DeepSpeed ZeRO config, and how ZeRO maps to PyTorch FSDP</li></ul></div></header><style>
+.zr-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.zr-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c);border:1.5px solid var(--b,transparent)}
+.zr-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.zr-grid input[type=range]{width:100%}
+.zr-grid output{min-width:5.5em;text-align:right;font-family:var(--mono);font-size:14px}
+.zr-tog{cursor:pointer}
+.zr-tog:focus-visible rect{stroke:var(--ink);stroke-width:3}
+[data-session="zero-stages-1-2-and-3"] p code,[data-session="zero-stages-1-2-and-3"] li code{overflow-wrap:anywhere}
+#zr-own-svg text,#zr-mem-svg text,#zr-comm-svg text,#zr-off-svg text{font-family:var(--sans)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../pretraining/data-parallelism-ddp.html">session 44</a> every GPU keeps a full copy of the model. That is simple and fast, but it means that on 64 GPUs the same optimizer states are stored 64 times. ZeRO (the Zero Redundancy Optimizer) removes this copy-everything waste, one kind of state at a time.</p>
+<p>Recall the bill from <a href="../foundations/optimization-backprop-adamw.html">session 4</a>: mixed-precision training with Adam needs about 16 bytes per parameter before any activation. For Llama 2 7B (6.74 billion parameters) that is 108 GB, more than one 80 GB GPU. With DDP, adding GPUs does not help at all: every GPU still needs 108 GB. ZeRO makes the memory per GPU go <b>down</b> as you add GPUs. With all three stages on 8 GPUs, the same model needs 13.5 GB of model states per GPU.</p>
+<p>The ZeRO paper (Rajbhandari et al., 2019) defined three stages, and the names stuck [Certain]:</p>
+<ul>
+<li><b>Stage 1</b> shards (splits into disjoint pieces) the <b>optimizer states</b>.</li>
+<li><b>Stage 2</b> also shards the <b>gradients</b>.</li>
+<li><b>Stage 3</b> also shards the <b>parameters</b> (the weights).</li></ul>
+<p>Stages 1 and 2 cost no extra communication compared with DDP. Stage 3 costs 1.5 times as much. Later work moved states to CPU memory and NVMe disks (ZeRO-Offload, ZeRO-Infinity). These ideas are inside DeepSpeed, and PyTorch FSDP (<a href="../pretraining/fsdp-version-1.html">session 46</a>) is an implementation of stage 3. Almost every large training run today uses some form of this sharding.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Expect: “What does each ZeRO stage shard?”, “How much memory per GPU for a 7B model on 8 GPUs with ZeRO-2?”, “Why is ZeRO-3 1.5 times the communication of DDP?”, “Why do stages 1 and 2 cost nothing extra?”, “What does ZeRO-Offload keep on the GPU?”. Every answer is a short formula, and all of them are below.</aside>
+
+<h2>Where the memory goes in data parallelism</h2>
+<p>Let \(\Psi\) be the number of parameters. In mixed-precision training with Adam, each GPU in DDP stores these <b>model states</b> (the ZeRO paper’s name for everything that has one number per parameter) [Certain]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>State</th><th>Precision</th><th>Bytes</th><th>Used when</th></tr></thead><tbody>
+<tr><td>Parameters (weights) for forward and backward</td><td>FP16 or BF16</td><td>\(2\Psi\)</td><td>forward and backward pass</td></tr>
+<tr><td>Gradients</td><td>FP16 or BF16</td><td>\(2\Psi\)</td><td>end of backward, optimizer step</td></tr>
+<tr><td>FP32 master copy of the weights</td><td>FP32</td><td>\(4\Psi\)</td><td>optimizer step only</td></tr>
+<tr><td>Adam momentum \(\mathbf{m}\)</td><td>FP32</td><td>\(4\Psi\)</td><td>optimizer step only</td></tr>
+<tr><td>Adam variance \(\mathbf{v}\)</td><td>FP32</td><td>\(4\Psi\)</td><td>optimizer step only</td></tr></tbody></table></div>
+<p>The paper groups the last three as the <b>optimizer states</b> and writes their size as \(K\Psi\), with \(K = 12\) for mixed-precision Adam. So the memory per GPU in DDP is</p>
+<div class="eq">\[ M_{\text{DDP}} = (2 + 2 + K)\,\Psi = 16\,\Psi \ \text{bytes} \tag{45.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\Psi\)</dt><dd>the number of parameters of the model</dd>
+<dt>\(2 + 2\)</dt><dd>bytes per parameter for the 16-bit weights and the 16-bit gradients</dd>
+<dt>\(K\)</dt><dd>bytes per parameter for the optimizer states; 12 for Adam with an FP32 master copy, \(\mathbf{m}\) and \(\mathbf{v}\)</dd>
+<dt>\(M_{\text{DDP}}\)</dt><dd>model-state memory on <b>each</b> GPU, whatever the number of GPUs</dd></dl>
+<p>The paper’s own example: GPT-2 with 1.5 billion parameters needs only 3 GB for its 16-bit weights, but 24 GB of model states, so it did not train on a 32 GB GPU once activations were added [Certain]. Three quarters of the bill (\(12\Psi\) of \(16\Psi\)) are optimizer states, which are used only for a short moment at the end of each step.</p>
+<p>Now look at what DDP does with \(N\) GPUs. After the all-reduce, every GPU holds the <b>same</b> averaged gradient, and runs the <b>same</b> optimizer step on the <b>same</b> states. \(N - 1\) of the \(N\) copies are pure redundancy. That is the waste ZeRO removes.</p>
+<p>The rest of the memory, called <b>residual states</b> in the paper, is activations, temporary buffers and fragmentation. ZeRO stages 1 to 3 do not touch activations; we come back to them in the section on ZeRO-R.</p>
+
+<h2>The ZeRO idea: keep one copy, split across GPUs</h2>
+<p>ZeRO keeps data parallelism: every GPU still gets its own slice of the batch and runs the full forward and backward pass. What changes is <b>storage</b>. Cut each kind of state into \(N\) equal shards. GPU \(r\) owns shard \(r\): it stores it, and it is the only GPU that updates it. When a GPU needs a piece it does not own, it gets it from the owner with a collective (reduce-scatter or all-gather from <a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">session 43</a>), uses it, and throws it away.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Four students prepare for the same exam. In DDP, each one buys the full set of four textbooks. In ZeRO, each buys one book. Before working on a chapter, a student borrows the right book, reads it, and gives it back. They pay for one set in total, and the cost is some walking between desks.</aside>
+<p>The three stages differ only in <b>which</b> states are cut. Each step uses the fact that a state is not needed all the time: the optimizer states are needed only in the optimizer step, a gradient only until its shard owner has reduced it, and the weights of a layer only while that layer runs. Step through Figure 1 to see who holds what during one training step.</p>
+<figure class="fig wide" id="zr-own"><div class="fig-body">
+<div class="controls"><span class="seg" id="zr-own-s"><button type="button" data-v="0" aria-pressed="true">DDP</button><button type="button" data-v="1" aria-pressed="false">ZeRO-1</button><button type="button" data-v="2" aria-pressed="false">ZeRO-2</button><button type="button" data-v="3" aria-pressed="false">ZeRO-3</button></span></div>
+<div class="controls" style="margin-top:6px"><button type="button" class="btn" id="zr-own-prev">Back</button><button type="button" class="btn primary" id="zr-own-play">Play</button><button type="button" class="btn" id="zr-own-next">Next</button><span id="zr-own-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="zr-own-svg" viewBox="0 0 780 300" role="img" aria-label="Four GPUs, each with rows for weights, gradients and optimizer states, showing which shards each GPU stores"></svg></div>
+<div class="zr-leg"><span style="--c:var(--q)">16-bit weights</span><span style="--c:var(--k)">16-bit gradients</span><span style="--c:var(--v)">FP32 optimizer states</span><span style="--c:var(--paper2);--b:var(--rule)">not stored</span><span style="--c:var(--hl);--b:var(--muted)">held only for a moment</span></div>
+<div class="readout" id="zr-own-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Who stores what on 4 GPUs during one training step. Each GPU has three rows (weights, gradients, optimizer states), and each row is cut into 4 shards. Choose a method with the buttons, then step through the training step. The readout counts the memory per GPU and the elements each GPU has sent so far.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with DDP: all 12 cells of every GPU are full at the end of the step, and one all-reduce sends \(1.5\Psi\) elements per GPU (that is \(2\Psi \cdot 3/4\) with a ring on 4 GPUs). Switch to ZeRO-1: only the purple row shrinks to one cell, yet the communication is the same \(1.5\Psi\), because an all-reduce is a reduce-scatter plus an all-gather, and ZeRO only moves the optimizer step between the two. ZeRO-2 also drops the gradient row to one cell. ZeRO-3 drops the weight row too, but must gather weights twice (forward and backward), so its total is \(2.25\Psi\): 1.5 times DDP.</p></details></figure>
+
+<h2>Stage 1: shard the optimizer states</h2>
+<p>In stage 1 (the paper calls it \(P_{os}\)), GPU \(r\) keeps the FP32 master weights, \(\mathbf{m}\) and \(\mathbf{v}\) only for its own shard: \(\Psi / N\) parameters. The 16-bit weights and the 16-bit gradients stay full on every GPU. The training step becomes:</p>
+<div class="algo"><div class="algo-h">Algorithm 1: one training step with ZeRO stage 1 (GPU \(r\) of \(N\))</div><ol>
+<li><b>input:</b> full 16-bit weights \(\theta\), optimizer states for shard \(r\) only, a local micro-batch</li>
+<li>forward and backward on the local micro-batch \(\;\to\;\) full local gradient \(\mathbf{g}\) (\(2\Psi\) bytes)</li>
+<li>\(\mathbf{g}_r \leftarrow\) <b>reduce-scatter</b>\((\mathbf{g})\) \(/\, N\) <span class="c">// GPU r gets the averaged gradient of its shard only</span></li>
+<li>update shard \(r\): AdamW on the FP32 master \(\theta^{32}_r\) with \(\mathbf{m}_r, \mathbf{v}_r\) and \(\mathbf{g}_r\)</li>
+<li>\(\theta_r \leftarrow \text{to16}(\theta^{32}_r)\)</li>
+<li>\(\theta \leftarrow\) <b>all-gather</b>\((\theta_1, \dots, \theta_N)\) <span class="c">// every GPU gets the full updated weights</span></li></ol></div>
+<p>The memory per GPU is</p>
+<div class="eq">\[ M_{1} = 2\Psi + 2\Psi + \frac{K\Psi}{N} = 4\Psi + \frac{12\,\Psi}{N} \tag{45.2} \]</div>
+<p>As \(N\) grows, the second term goes to zero and the memory goes to \(4\Psi\): at most a <b>4 times</b> saving compared with \(16\Psi\). The paper’s example: a 7.5B model on 64 GPUs needs 31.4 GB instead of 120 GB [Certain]. Stage 1 is the cheapest stage to turn on: it changes nothing in the forward and backward pass.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Gradient clipping needs the norm of the <b>whole</b> gradient. With sharded gradients, each GPU computes the squared norm of its shard and one small all-reduce adds them up. Frameworks do this for you; hand-written clipping on the local shard is wrong.</aside>
+
+<h2>Stage 2: also shard the gradients</h2>
+<p>In stage 1, every GPU still builds the full gradient and then keeps only \(1/N\) of the averaged result. Stage 2 (\(P_{os+g}\)) stops storing what it will not use. During the backward pass, gradients are put into <b>buckets</b> (fixed-size groups of gradients, as in DDP). As soon as a bucket is full, it is reduced to the GPUs that own its parts, and the other GPUs free that memory. So each GPU holds only a small window of full gradients at any moment, plus its own reduced shard.</p>
+<div class="eq">\[ M_{2} = 2\Psi + \frac{(2 + K)\,\Psi}{N} = 2\Psi + \frac{14\,\Psi}{N} \tag{45.3} \]</div>
+<p>The limit is \(2\Psi\), only the 16-bit weights: up to an <b>8 times</b> saving. The 7.5B model on 64 GPUs: 16.6 GB [Certain]. The extra memory for buckets is fixed (DeepSpeed’s default <code>reduce_bucket_size</code> is \(5 \times 10^8\) elements [Certain]), and the reduction overlaps with the rest of the backward pass, as in DDP.</p>
+<p>Stage 2 is still cheap: the forward pass does not change, and the gradient traffic is the same as before, only split into pieces. That is why ZeRO-2 is the most common choice for models that fit with it [Likely].</p>
+
+<h2>Stage 3: also shard the parameters</h2>
+<p>After stage 2, the full 16-bit weights (\(2\Psi\)) are the floor. Stage 3 (\(P_{os+g+p}\)) shards them too. Now GPU \(r\) stores only its \(1/N\) of everything. But the forward pass of layer \(\ell\) needs all of layer \(\ell\)’s weights. So weights are fetched <b>just in time</b>, one layer (or one group of layers) at a time:</p>
+<div class="algo"><div class="algo-h">Algorithm 2: one training step with ZeRO stage 3 (GPU \(r\) of \(N\))</div><ol>
+<li><b>input:</b> shard \(r\) of the 16-bit weights, of the gradients and of the optimizer states</li>
+<li><b>for</b> layer \(\ell = 1, \dots, L\): <span class="c">// forward</span></li>
+<li class="i1">\(W_\ell \leftarrow\) <b>all-gather</b> of the shards of layer \(\ell\) <span class="c">// prefetch layer ℓ+1 while ℓ computes</span></li>
+<li class="i1">run layer \(\ell\) forward on the local micro-batch, keep its activations</li>
+<li class="i1"><b>free</b> \(W_\ell\) except the own shard</li>
+<li><b>for</b> layer \(\ell = L, \dots, 1\): <span class="c">// backward</span></li>
+<li class="i1">\(W_\ell \leftarrow\) <b>all-gather</b> again</li>
+<li class="i1">compute the input gradient and the local weight gradient \(\mathbf{g}_\ell\)</li>
+<li class="i1">\(\mathbf{g}_{\ell, r} \leftarrow\) <b>reduce-scatter</b>\((\mathbf{g}_\ell) / N\); free \(W_\ell\) and \(\mathbf{g}_\ell\)</li>
+<li>AdamW on shard \(r\) only (FP32 master, \(\mathbf{m}_r\), \(\mathbf{v}_r\)); write the new 16-bit shard <span class="c">// no all-gather here: the next forward gathers</span></li></ol></div>
+<div class="eq">\[ M_{3} = \frac{(2 + 2 + K)\,\Psi}{N} = \frac{16\,\Psi}{N} \tag{45.4} \]</div>
+<p>Now the saving grows without limit: double \(N\), halve the memory. The 7.5B model on 64 GPUs needs 1.88 GB of model states; a 1-trillion-parameter model on 1,024 GPUs needs 15.6 GB [Certain]. The cost: the weights of one layer must be gathered twice per step, and each GPU needs room for at least one full layer (two, with prefetching) while it runs. For Llama 2 7B, one block has 202 million parameters (\(4 \cdot 4096^2 + 3 \cdot 4096 \cdot 11008\)), so one gathered block is 0.40 GB in BF16.</p>
+<p>Stage 3 also changes how your code sees the model. Outside the forward pass, a parameter on GPU \(r\) holds only its shard (in DeepSpeed, an empty placeholder). Reading or changing full weights outside the step (for example, to initialize, inspect or save them) needs an explicit gather, such as DeepSpeed’s <code>GatheredParameters</code> context [Certain].</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Stage 3 is a library with closed stacks. You do not keep any book at home. For each chapter, the librarian brings the book, you read, you give it back. You need almost no shelf space, but you wait for the librarian twice per chapter (once going forward, once reviewing backward) unless you ask for the next book in advance (prefetching).</aside>
+
+<h2>Memory per GPU for each stage</h2>
+<p>Formulas (45.1) to (45.4) side by side, for \(K = 12\):</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Method</th><th>What is sharded</th><th>Bytes per GPU</th><th>Limit as \(N \to \infty\)</th><th>7.5B model, \(N = 64\)</th></tr></thead><tbody>
+<tr><td>DDP</td><td>nothing</td><td>\(16\Psi\)</td><td>\(16\Psi\)</td><td>120 GB</td></tr>
+<tr><td>ZeRO-1</td><td>optimizer states</td><td>\(4\Psi + 12\Psi/N\)</td><td>\(4\Psi\) (4×)</td><td>31.4 GB</td></tr>
+<tr><td>ZeRO-2</td><td>+ gradients</td><td>\(2\Psi + 14\Psi/N\)</td><td>\(2\Psi\) (8×)</td><td>16.6 GB</td></tr>
+<tr><td>ZeRO-3</td><td>+ parameters</td><td>\(16\Psi/N\)</td><td>\(\to 0\) (\(N\)×)</td><td>1.88 GB</td></tr></tbody></table></div>
+<p>The last column is from Table 1 of the ZeRO paper, and the formulas give the same numbers [Certain]. Turn the formulas around to get the largest model whose states fit into \(M\) bytes per GPU:</p>
+<div class="eq">\[ \Psi_{\max}^{(1)} = \frac{M}{4 + 12/N}, \qquad \Psi_{\max}^{(2)} = \frac{M}{2 + 14/N}, \qquad \Psi_{\max}^{(3)} = \frac{N\,M}{16} \tag{45.5} \]</div>
+<p>With \(M = 80\) GB and \(N = 8\): DDP fits 5.0B parameters, ZeRO-1 14.5B, ZeRO-2 21.3B, and ZeRO-3 40B. In real runs you must leave room for activations, buckets and fragmentation, so the true limits are lower. Try your own model in Figure 2.</p>
+<figure class="fig" id="zr-mem"><div class="fig-body">
+<div class="controls"><span style="font:500 14px var(--sans);color:var(--muted)">Model:</span><span class="seg" id="zr-mem-pre"><button type="button" data-v="1.5" aria-pressed="false">GPT-2 1.5B</button><button type="button" data-v="6.738" aria-pressed="true">Llama 2 7B</button><button type="button" data-v="7.5" aria-pressed="false">7.5B (paper)</button><button type="button" data-v="70" aria-pressed="false">70B</button></span></div>
+<div class="zr-grid" style="margin-top:8px">
+<label for="zr-mem-p">Parameters Ψ (billions)</label><input type="range" id="zr-mem-p" min="0.5" max="200" step="0.001" value="6.738"><output id="zr-mem-pv"></output>
+<label for="zr-mem-n">GPUs N</label><input type="range" id="zr-mem-n" min="0" max="10" step="1" value="3"><output id="zr-mem-nv"></output>
+<label for="zr-mem-m">GPU memory (GB)</label><input type="range" id="zr-mem-m" min="16" max="192" step="8" value="80"><output id="zr-mem-mv"></output></div>
+<svg id="zr-mem-svg" viewBox="0 0 640 250" role="img" aria-label="Stacked bars of memory per GPU for DDP and ZeRO stages 1, 2 and 3"></svg>
+<div class="zr-leg"><span style="--c:var(--q)">16-bit weights</span><span style="--c:var(--k)">16-bit gradients</span><span style="--c:var(--v)">FP32 optimizer states</span></div>
+<div class="readout" id="zr-mem-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Model-state memory per GPU, formulas (45.1) to (45.4), for mixed-precision AdamW (\(K = 12\)). The dashed line is the GPU memory. Activations are not included.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Pick “7.5B (paper)” and move \(N\) to 64: the bars read 120, 31.4, 16.6 and 1.88 GB, the numbers in the ZeRO paper. Now drag \(N\) up to 1,024. The ZeRO-1 bar stops near 30 GB (the blue and orange parts never shrink) and the ZeRO-2 bar stops near 15 GB (the blue part never shrinks). Only the ZeRO-3 bar keeps falling. Then pick 70B with \(N = 8\): nothing but ZeRO-3 fits, and with 140 GB of weights alone, ZeRO-2 cannot fit on any number of 80 GB GPUs.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: Llama 2 7B on one 8-GPU server</div>
+<p>\(\Psi = 6.738 \times 10^9\), \(N = 8\), \(K = 12\).</p>
+<p>DDP: \(16 \times 6.738 = 107.8\) GB. Does not fit in 80 GB.</p>
+<p>ZeRO-1: \(4 \times 6.738 + 12 \times 6.738 / 8 = 26.95 + 10.11 = 37.1\) GB.</p>
+<p>ZeRO-2: \(2 \times 6.738 + 14 \times 6.738 / 8 = 13.48 + 11.79 = 25.3\) GB.</p>
+<p>ZeRO-3: \(16 \times 6.738 / 8 = 13.5\) GB, plus room for one or two gathered blocks (0.40 GB each).</p>
+<p>So ZeRO-1 already makes full fine-tuning of a 7B model possible on 8 GPUs of 80 GB, with about 40 GB left for activations; ZeRO-2 leaves about 55 GB.</p></div>
+
+<h2>Communication cost vs memory saved</h2>
+<p>Memory is only half the story. Every byte we do not store must be sent at the right moment. From <a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">session 43</a>: with a ring on \(N\) GPUs, a reduce-scatter or an all-gather of a vector of \(\Psi\) elements makes each GPU send \(\frac{N-1}{N}\Psi\) elements, and an all-reduce (which is a reduce-scatter followed by an all-gather) sends twice that.</p>
+<p><b>DDP:</b> one all-reduce of the gradients. <b>ZeRO-1 and ZeRO-2:</b> a reduce-scatter of the gradients, then an all-gather of the updated weights. That is exactly the two halves of the all-reduce, with the optimizer step moved into the middle. So the volume is the same [Certain]:</p>
+<div class="eq">\[ V_{\text{DDP}} = V_{1} = V_{2} = 2\,\frac{N-1}{N}\,\Psi \approx 2\Psi \ \text{elements per GPU per step} \tag{45.6} \]</div>
+<p><b>ZeRO-3:</b> an all-gather of the weights for the forward pass, another for the backward pass (the weights were freed in between), and a reduce-scatter of the gradients. No all-gather after the optimizer step, because the next forward pass does it. So</p>
+<div class="eq">\[ V_{3} = 3\,\frac{N-1}{N}\,\Psi \approx 3\Psi = 1.5 \times V_{\text{DDP}} \tag{45.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(V\)</dt><dd>elements sent by each GPU in one training step; multiply by the bytes per element (2 for BF16) to get bytes</dd>
+<dt>\(\frac{N-1}{N}\)</dt><dd>the ring factor: each GPU sends all shards but its own; close to 1 for large \(N\)</dd></dl>
+<p>Notice that the volume per GPU does not grow with \(N\). It depends only on the model size. This is the key reason ZeRO scales: memory per GPU falls with \(N\), but communication per GPU stays about the same.</p>
+<h3>Can the communication hide behind compute?</h3>
+<p>The collectives run on their own CUDA stream and overlap with compute (prefetching in the forward pass, bucketed reduce-scatter in the backward pass). So what matters is whether communication time is <b>shorter</b> than compute time. With \(T_g\) tokens per GPU per step, a training cost of \(6\Psi\) FLOPs per token (<a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a>), an achieved speed of \(F\) FLOP/s, \(b\) bytes per element and a bandwidth of \(\beta\) bytes/s per GPU:</p>
+<div class="eq">\[ t_{\text{compute}} = \frac{6\,\Psi\,T_g}{F}, \qquad t_{\text{comm}} = \frac{b \cdot c\,\frac{N-1}{N}\,\Psi}{\beta}, \quad c = 2 \ (\text{DDP, ZeRO-1, 2}),\ c = 3 \ (\text{ZeRO-3}) \tag{45.8} \]</div>
+<p>Both grow with \(\Psi\), so \(\Psi\) cancels when you ask “is \(t_{\text{comm}} \le t_{\text{compute}}\)?”. Communication can hide when</p>
+<div class="eq">\[ T_g \;\ge\; \frac{c\, b\, F}{6\, \beta} \cdot \frac{N-1}{N} \tag{45.9} \]</div>
+<p>That is a rule about <b>tokens per GPU</b>, not about model size. With BF16 (\(b = 2\)), \(F = 400\) TFLOP/s and 8 GPUs: inside one server (\(\beta = 450\) GB/s over NVLink) ZeRO-3 needs only about 780 tokens per GPU. Across servers (\(\beta = 50\) GB/s over InfiniBand) it needs about 7,000 tokens per GPU, and DDP or ZeRO-2 about 4,700.</p>
+<div class="worked"><div class="wt">Worked example: ZeRO-3 for Llama 2 7B across servers</div>
+<p>Each GPU sends \(3 \times \tfrac{7}{8} \times 6.738 \times 10^9 \times 2\) bytes \(= 35.4\) GB per step (DDP or ZeRO-2: 23.6 GB). At 50 GB/s that is 0.71 s (DDP: 0.47 s).</p>
+<p>With 8 sequences of 4,096 tokens per GPU (\(T_g = 32{,}768\)): \(t_{\text{compute}} = 6 \times 6.738 \times 10^9 \times 32{,}768 / (400 \times 10^{12}) = 3.31\) s. Communication hides easily.</p>
+<p>With one sequence (\(T_g = 4{,}096\)): \(t_{\text{compute}} = 0.41\) s, less than 0.71 s. Now ZeRO-3 is communication bound and the GPUs wait 0.29 s per step (even DDP waits 0.06 s). This is the setting where ZeRO++ and hybrid sharding help (below).</p></div>
+<figure class="fig" id="zr-comm"><div class="fig-body">
+<div class="controls"><span style="font:500 14px var(--sans);color:var(--muted)">Link:</span><span class="seg" id="zr-comm-bw"><button type="button" data-v="450" aria-pressed="false">NVLink 450 GB/s</button><button type="button" data-v="50" aria-pressed="true">InfiniBand 50 GB/s</button><button type="button" data-v="12.5" aria-pressed="false">100 Gb Ethernet 12.5 GB/s</button></span></div>
+<div class="zr-grid" style="margin-top:8px">
+<label for="zr-comm-p">Parameters Ψ (billions)</label><input type="range" id="zr-comm-p" min="0.5" max="200" step="0.001" value="6.738"><output id="zr-comm-pv"></output>
+<label for="zr-comm-n">GPUs N</label><input type="range" id="zr-comm-n" min="1" max="10" step="1" value="3"><output id="zr-comm-nv"></output>
+<label for="zr-comm-t">Tokens per GPU per step</label><input type="range" id="zr-comm-t" min="9" max="17" step="1" value="15"><output id="zr-comm-tv"></output>
+<label for="zr-comm-f">Achieved TFLOP/s</label><input type="range" id="zr-comm-f" min="50" max="1000" step="10" value="400"><output id="zr-comm-fv"></output></div>
+<div class="scroll-x"><svg id="zr-comm-svg" viewBox="0 0 640 240" role="img" aria-label="Time bars for compute and communication per training step for DDP and the three ZeRO stages"></svg></div>
+<div class="zr-leg"><span style="--c:var(--q)">compute (forward + backward)</span><span style="--c:var(--k)">communication</span><span style="--c:var(--bad)">exposed communication (GPU waits)</span></div>
+<div class="readout" id="zr-comm-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Compute time and communication time per step from formula (45.8), with BF16 communication and perfect overlap. When the orange bar is longer than the blue bar, the difference (red) is time the GPU waits.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The default is the worked example: Llama 2 7B, 8 GPUs, 32,768 tokens per GPU, 50 GB/s. Everything hides. Now move the tokens down to 4,096: all bars turn red, but ZeRO-3 waits about 5 times longer (0.29 s against 0.06 s), because it sends 1.5 times as much. Move the parameter slider: both bars grow together and the red part keeps the same sign, as formula (45.9) says. Change \(N\): almost nothing happens, because \((N-1)/N\) is close to 1. Switch to NVLink and the problem almost disappears. In real runs, overlap is not perfect (the first all-gather and the last reduce-scatter cannot hide), so treat the red part as a lower bound.</p></details></figure>
+<h3>Ways to pay less for stage 3</h3>
+<ul>
+<li><b>Bigger micro-batches</b> raise \(T_g\) and move you to the safe side of (45.9). Activation checkpointing (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>) frees the memory for them.</li>
+<li><b>Hybrid sharding:</b> shard inside a server (fast NVLink), replicate across servers (only gradients cross the slow network). PyTorch calls this <code>HYBRID_SHARD</code> (<a href="../pretraining/fsdp-version-1.html">session 46</a>); ZeRO++ calls its version hpZ, set by <code>zero_hpz_partition_size</code> [Certain].</li>
+<li><b>ZeRO++</b> (Wang et al., 2023) also quantizes the weight all-gather and the gradient reduction. The paper reports a 4 times smaller communication volume and up to 2.16 times higher throughput on 384 GPUs [Certain].</li>
+<li><b>Do not over-shard.</b> If ZeRO-2 fits, it sends less than ZeRO-3 and keeps the code simpler.</li></ul>
+
+<h2>Beyond model states: ZeRO-R</h2>
+<p>Stages 1 to 3 (together called ZeRO-DP in the paper) handle model states. The paper adds <b>ZeRO-R</b> for the residual states [Certain]:</p>
+<ul>
+<li><b>Activations.</b> Data parallelism already splits activations by batch, so ZeRO-DP cannot shrink them further. The paper’s GPT-2 1.5B example needs about 60 GB of activations at sequence length 1K and batch 32, and about 8 GB with activation checkpointing [Certain]. With tensor (model) parallelism, every GPU in the group stores the same checkpointed activations; ZeRO-R’s <b>partitioned activation checkpointing</b> (\(P_a\)) splits them across the group and can also move them to CPU (\(P_{a+cpu}\)).</li>
+<li><b>Constant-size buffers.</b> Fusing all gradients into one FP32 buffer for an all-reduce would need 6 GB for a 1.5B model [Certain]. ZeRO uses buffers of a fixed size instead (the buckets above), so the buffer does not grow with the model.</li>
+<li><b>Memory defragmentation.</b> Short-lived tensors (recomputed activations, gathered weights) interleave with long-lived ones and leave holes. The paper saw out-of-memory errors with over 30% of memory still free in extreme cases [Certain]. ZeRO-R moves long-lived tensors into pre-allocated contiguous memory.</li></ul>
+
+<h2>Offloading to CPU or NVMe</h2>
+<p>A GPU server has much more CPU memory (often 1 to 2 TB) than GPU memory, and NVMe disks hold even more [Likely]. The catch is bandwidth: the link between CPU and GPU (PCIe) is about 32 GB/s per direction for Gen4 x16, more than 10 times slower than GPU memory. <b>Offloading</b> moves some states off the GPU and must keep PCIe traffic small.</p>
+<h3>ZeRO-Offload: which state goes where</h3>
+<p>ZeRO-Offload (Ren et al., 2021) treats one training step as a data-flow graph with four parts: the forward-backward computation (must stay on the GPU, it is the heavy compute), the 16-bit weights \(p_{16}\), the 16-bit gradients \(g_{16}\), and an “update” node that holds the FP32 master weights, \(\mathbf{m}\) and \(\mathbf{v}\) and runs Adam. Every edge cut between GPU and CPU costs PCIe traffic [Certain]:</p>
+<ul>
+<li>forward-backward reads \(p_{16}\) twice (forward and backward): \(4\Psi\) bytes if they are on different devices;</li>
+<li>forward-backward writes \(g_{16}\): \(2\Psi\) bytes; the update reads \(g_{16}\): \(2\Psi\) bytes;</li>
+<li>the update writes new \(p_{16}\): \(2\Psi\) bytes.</li></ul>
+<p>Any split must cut at least two edges, so at least \(4\Psi\) bytes per step. Keeping \(p_{16}\) on the GPU and moving \(g_{16}\) and the update to the CPU reaches this minimum <b>and</b> saves the most GPU memory. That is ZeRO-Offload’s choice [Certain]:</p>
+<div class="eq">\[ M_{\text{GPU}} = 2\Psi, \qquad M_{\text{CPU}} = (2 + K)\,\Psi = 14\,\Psi, \qquad V_{\text{PCIe}} = 4\Psi \ \text{bytes per step} \tag{45.10} \]</div>
+<p>The optimizer step now runs on the CPU. To make that fast, ZeRO-Offload has a vectorized CPU Adam, reported as up to 6 times faster than the PyTorch CPU optimizer, and an optional <b>one-step delayed parameter update</b> (DPU): the CPU updates with the gradients of step \(i - 1\) while the GPU computes step \(i\). DPU changes the math slightly, so it is turned on only after the first few dozen steps [Certain]. With several GPUs, ZeRO-Offload runs on top of ZeRO-2: each GPU offloads only its own shard, so the CPU memory and the PCIe traffic per GPU are divided by \(N\) [Likely]. Find the best placement yourself in Figure 4.</p>
+<figure class="fig wide" id="zr-off"><div class="fig-body">
+<div class="controls"><span style="font:500 14px var(--sans);color:var(--muted)">Presets:</span><button type="button" class="btn" id="zr-off-gpu">All on GPU</button><button type="button" class="btn" id="zr-off-zo">ZeRO-Offload</button><button type="button" class="btn" id="zr-off-all">Everything on CPU</button></div>
+<div class="zr-grid" style="margin-top:8px">
+<label for="zr-off-p">Parameters Ψ (billions)</label><input type="range" id="zr-off-p" min="1" max="100" step="0.5" value="13"><output id="zr-off-pv"></output>
+<label for="zr-off-b">PCIe bandwidth (GB/s)</label><input type="range" id="zr-off-b" min="8" max="64" step="1" value="32"><output id="zr-off-bv"></output></div>
+<div class="scroll-x"><svg id="zr-off-svg" viewBox="0 0 760 300" role="img" aria-label="Data-flow graph of one training step split between GPU and CPU; click a node to move it"></svg></div>
+<div class="readout" id="zr-off-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The ZeRO-Offload data-flow graph on one GPU. Click (or Tab to and press Enter on) the weights, gradients or update node to move it between GPU and CPU. Edges that cross the PCIe link are drawn thick and orange; their weights add up to the PCIe traffic per step.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Start with “All on GPU”: 16Ψ bytes on the GPU, no traffic. Move only the update node to the CPU: the GPU drops to 4Ψ (4 times less) for \(4\Psi\) of traffic. Move the gradients too: 2Ψ on the GPU (8 times less), still \(4\Psi\) of traffic. That is the ZeRO-Offload preset. Now move the weights to the CPU as well: the GPU memory for model states goes to zero, but the traffic jumps to \(6\Psi\), because the forward and backward pass read the weights twice. With the default 13B model, ZeRO-Offload needs 26 GB on the GPU, 182 GB on the CPU, and 52 GB over PCIe per step (1.63 s at 32 GB/s).</p></details></figure>
+<p>Is 1.63 s per step acceptable? It depends on the batch. With \(T_g\) tokens per step, the GPU computes for \(6\Psi T_g / F\) seconds, and the PCIe time is \(4\Psi/\beta_{\text{PCIe}}\). The ratio again does not depend on \(\Psi\). At \(F = 100\) TFLOP/s and 32 GB/s, the transfer hides behind compute once \(T_g \ge 4 \times 100 \times 10^{12} / (6 \times 32 \times 10^9) \approx 2{,}100\) tokens per step. The ZeRO-Offload paper reports training models with over 13 billion parameters on a single GPU, 10 times larger than PyTorch alone, and about 40 TFLOP/s on one V100 for a 10B model [Certain].</p>
+<h3>Stage 3 offload and ZeRO-Infinity</h3>
+<p>With stage 3, the 16-bit weights can be offloaded too (<code>offload_param</code>). Each layer’s weights then travel from CPU to GPU just in time, the same schedule as the all-gather of Algorithm 2. This is the “everything on CPU” corner of Figure 4: traffic grows to about \(6\Psi\) bytes per step, but the GPU keeps only a working set of a few layers.</p>
+<p>ZeRO-Infinity (Rajbhandari et al., 2021) adds NVMe disks as a third tier for both parameters and optimizer states, and splits large layers into tiles so that even one layer does not have to fit on a GPU. It also spreads the PCIe and NVMe traffic over all GPUs and disks of a server in parallel, instead of one link at a time. The paper reports fine-tuning a trillion-parameter model on a single DGX-2 node (16 V100 GPUs) and over 25 PFLOP/s on 512 GPUs [Certain].</p>
+<p>In DeepSpeed, the rules are [Certain]: <code>offload_optimizer</code> works with stages 1, 2 and 3, to <code>"cpu"</code> or <code>"nvme"</code>, but NVMe only with stage 3; <code>offload_param</code> works only with stage 3. The optimizer step always runs on the CPU when the optimizer is offloaded, even with NVMe.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Offloading saves GPU memory, not time. Use it when the model does not fit any other way (one GPU, a small server, a huge model), not as a default. On a full cluster, more GPUs with ZeRO-3 are usually faster than offloading [Likely].</aside>
+
+<h2>ZeRO in code</h2>
+<p>The code below is a complete simulation of DDP and ZeRO stages 1, 2 and 3 in one process. “Ranks” are list entries, the collectives are written by hand and count the elements each rank sends. It checks that all four methods give the same weights as <code>torch.optim.AdamW</code> on the full batch, and prints the communication volume. It runs on a CPU in about a second.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+N = 4                                   <span class="cm"># number of simulated GPUs (ranks)</span>
+sent = [0] * N                          <span class="cm"># elements sent by each rank</span>
+
+<span class="kw2">def</span> reduce_scatter(full_list):          <span class="cm"># every rank has a full vector; rank r gets the sum of chunk r</span>
+    chunks = [v.chunk(N) <span class="kw2">for</span> v <span class="kw2">in</span> full_list]
+    <span class="kw2">for</span> r <span class="kw2">in</span> range(N): sent[r] += (N - 1) * chunks[r][0].numel()   <span class="cm"># ring: (N-1)/N of the vector</span>
+    <span class="kw2">return</span> [sum(chunks[s][r] <span class="kw2">for</span> s <span class="kw2">in</span> range(N)) <span class="kw2">for</span> r <span class="kw2">in</span> range(N)]
+
+<span class="kw2">def</span> all_gather(shards):                 <span class="cm"># every rank has one shard; all ranks get the full vector</span>
+    <span class="kw2">for</span> r <span class="kw2">in</span> range(N): sent[r] += (N - 1) * shards[r].numel()
+    full = torch.cat(shards)
+    <span class="kw2">return</span> [full.clone() <span class="kw2">for</span> _ <span class="kw2">in</span> range(N)]
+
+<span class="kw2">def</span> all_reduce(full_list):              <span class="cm"># = reduce-scatter followed by all-gather</span>
+    <span class="kw2">return</span> all_gather(reduce_scatter(full_list))
+
+<span class="cm"># a tiny model as one flat parameter vector: Linear(8,16) -> tanh -> Linear(16,4)</span>
+shapes = [(16, 8), (16,), (4, 16), (4,)]
+sizes = [torch.Size(s).numel() <span class="kw2">for</span> s <span class="kw2">in</span> shapes]
+P = sum(sizes)                          <span class="cm"># 212 numbers; pad to a multiple of N</span>
+pad = (-P) % N
+<span class="kw2">def</span> forward(flat, x):
+    w1, b1, w2, b2 = [t.view(s) <span class="kw2">for</span> t, s <span class="kw2">in</span> zip(flat[:P].split(sizes), shapes)]
+    <span class="kw2">return</span> torch.tanh(x @ w1.T + b1) @ w2.T + b2
+
+<span class="kw2">def</span> grad_on_rank(flat, x, y):           <span class="cm"># local backward on this rank's micro-batch</span>
+    flat = flat.detach().requires_grad_(True)
+    loss = torch.nn.functional.mse_loss(forward(flat, x), y)
+    loss.backward()
+    <span class="kw2">return</span> flat.grad
+
+theta0 = torch.cat([torch.randn(P) * 0.3, torch.zeros(pad)])
+X, Y = torch.randn(N, 8, 8), torch.randn(N, 8, 4)     <span class="cm"># 8 examples per rank</span>
+lr, b1, b2, eps, wd = 1e-2, 0.9, 0.95, 1e-8, 0.1
+
+<span class="kw2">def</span> adamw(p, g, m, v, t):               <span class="cm"># one AdamW step on any slice (formula 4.10)</span>
+    p.mul_(1 - lr * wd)
+    m.mul_(b1).add_(g, alpha=1 - b1); v.mul_(b2).addcmul_(g, g, value=1 - b2)
+    p.addcdiv_(m / (1 - b1 ** t), (v / (1 - b2 ** t)).sqrt().add_(eps), value=-lr)
+
+<span class="kw2">def</span> train(stage, steps=3):
+    sent[:] = [0] * N
+    S = (P + pad) // N                  <span class="cm"># shard length</span>
+    <span class="kw2">if</span> stage == 0:                      <span class="cm"># DDP: everything replicated</span>
+        p = [theta0.clone() <span class="kw2">for</span> _ <span class="kw2">in</span> range(N)]; m = [torch.zeros(P + pad) <span class="kw2">for</span> _ <span class="kw2">in</span> range(N)]; v = [torch.zeros(P + pad) <span class="kw2">for</span> _ <span class="kw2">in</span> range(N)]
+    <span class="kw2">else</span>:                               <span class="cm"># ZeRO: rank r owns the optimizer state of shard r</span>
+        p_shard = [theta0[r*S:(r+1)*S].clone() <span class="kw2">for</span> r <span class="kw2">in</span> range(N)]
+        m = [torch.zeros(S) <span class="kw2">for</span> _ <span class="kw2">in</span> range(N)]; v = [torch.zeros(S) <span class="kw2">for</span> _ <span class="kw2">in</span> range(N)]
+        p = all_gather(p_shard) <span class="kw2">if</span> stage <span class="kw2">in</span> (1, 2) <span class="kw2">else</span> None; sent[:] = [0] * N   <span class="cm"># setup, not counted</span>
+    <span class="kw2">for</span> t <span class="kw2">in</span> range(1, steps + 1):
+        <span class="kw2">if</span> stage == 3:                  <span class="cm"># gather for forward, free, gather again for backward</span>
+            p = all_gather(p_shard); p = all_gather(p_shard)
+        g = [grad_on_rank(p[r], X[r], Y[r]) / N <span class="kw2">for</span> r <span class="kw2">in</span> range(N)]
+        <span class="kw2">if</span> stage == 0:
+            g = all_reduce(g)
+            <span class="kw2">for</span> r <span class="kw2">in</span> range(N): adamw(p[r], g[r], m[r], v[r], t)
+        <span class="kw2">else</span>:
+            g_shard = reduce_scatter(g)  <span class="cm"># stage 2/3 do this bucket by bucket during backward</span>
+            <span class="kw2">for</span> r <span class="kw2">in</span> range(N): adamw(p_shard[r], g_shard[r], m[r], v[r], t)
+            <span class="kw2">if</span> stage <span class="kw2">in</span> (1, 2): p = all_gather(p_shard)   <span class="cm"># stage 3 gathers at the next forward</span>
+    final = p[0] <span class="kw2">if</span> stage <span class="kw2">in</span> (0, 1, 2) <span class="kw2">else</span> torch.cat(p_shard)
+    <span class="kw2">return</span> final[:P], sent[0] / steps
+
+<span class="cm"># reference: one process, full batch, torch.optim.AdamW</span>
+ref = theta0[:P].clone().requires_grad_(True)
+opt = torch.optim.AdamW([ref], lr=lr, betas=(b1, b2), eps=eps, weight_decay=wd)
+<span class="kw2">for</span> t <span class="kw2">in</span> range(3):
+    opt.zero_grad()
+    loss = sum(torch.nn.functional.mse_loss(forward(torch.cat([ref, torch.zeros(pad)]), X[r]), Y[r]) <span class="kw2">for</span> r <span class="kw2">in</span> range(N)) / N
+    loss.backward(); opt.step()
+
+<span class="kw2">for</span> stage <span class="kw2">in</span> range(4):
+    final, per_step = train(stage)
+    print(f<span class="st">"stage {stage}: max diff vs AdamW = {(final - ref.detach()).abs().max().item():.1e}, "</span>
+          f<span class="st">"elements sent per rank per step = {per_step:.0f} = {per_step / (P + pad):.2f} x params"</span>)
+<span class="cm"># stage 0: max diff vs AdamW = 3.0e-08, elements sent per rank per step = 318 = 1.50 x params</span>
+<span class="cm"># stage 1: max diff vs AdamW = 3.0e-08, elements sent per rank per step = 318 = 1.50 x params</span>
+<span class="cm"># stage 2: max diff vs AdamW = 3.0e-08, elements sent per rank per step = 318 = 1.50 x params</span>
+<span class="cm"># stage 3: max diff vs AdamW = 3.0e-08, elements sent per rank per step = 477 = 2.25 x params</span></pre>
+<p>Two lessons from the output. First, the four methods produce the <b>same</b> weights (the tiny difference is float rounding): ZeRO changes where numbers live, not the math of training. Second, the counts match formulas (45.6) and (45.7) with \(N = 4\): \(2 \times \tfrac34 = 1.5\) and \(3 \times \tfrac34 = 2.25\).</p>
+<p>In practice you do not write this yourself. With DeepSpeed, the stage and the offload options are a few lines of the config file (keys and defaults from the DeepSpeed docs [Certain]):</p>
+<pre class="code">{
+  <span class="st">"train_micro_batch_size_per_gpu"</span>: 4,
+  <span class="st">"bf16"</span>: { <span class="st">"enabled"</span>: true },
+  <span class="st">"zero_optimization"</span>: {
+    <span class="st">"stage"</span>: 3,                              <span class="cm">// 0 = off (DDP), 1, 2 or 3; default 0</span>
+    <span class="st">"overlap_comm"</span>: true,                     <span class="cm">// overlap reduce-scatter with backward; default false</span>
+    <span class="st">"contiguous_gradients"</span>: true,             <span class="cm">// copy gradients into one buffer to avoid fragmentation</span>
+    <span class="st">"reduce_bucket_size"</span>: 5e8,                <span class="cm">// elements per gradient bucket (default 5e8)</span>
+    <span class="st">"stage3_prefetch_bucket_size"</span>: 5e8,       <span class="cm">// how many weights to all-gather ahead</span>
+    <span class="st">"stage3_param_persistence_threshold"</span>: 1e5,<span class="cm">// tensors smaller than this stay unsharded</span>
+    <span class="st">"stage3_max_live_parameters"</span>: 1e9,        <span class="cm">// cap on gathered weights held at once</span>
+    <span class="st">"stage3_gather_16bit_weights_on_model_save"</span>: true,
+    <span class="st">"offload_optimizer"</span>: { <span class="st">"device"</span>: <span class="st">"cpu"</span>, <span class="st">"pin_memory"</span>: true },  <span class="cm">// ZeRO-Offload</span>
+    <span class="st">"offload_param"</span>:     { <span class="st">"device"</span>: <span class="st">"none"</span> }                       <span class="cm">// "cpu" or "nvme": stage 3 only</span>
+  }
+}</pre>
+<p>(JSON has no comments; remove the <code>//</code> parts before use.) In PyTorch, the same three levels are FSDP strategies: <code>FULL_SHARD</code> is ZeRO-3, <code>SHARD_GRAD_OP</code> is roughly ZeRO-2, and <code>NO_SHARD</code> is DDP. The next session, <a href="../pretraining/fsdp-version-1.html">session 46</a>, shows how PyTorch implements stage 3 with FlatParameters.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical choice</th><th>Why</th></tr></thead><tbody>
+<tr><td>Pretraining runs of tens to hundreds of billions of parameters</td><td>ZeRO-1 inside Megatron-style 3D parallelism (tensor + pipeline + data), for example BLOOM 176B [Likely]</td><td>Tensor and pipeline parallelism already split the weights; ZeRO-1 removes the optimizer-state copies at no extra communication</td></tr>
+<tr><td>Training or fine-tuning 7B to 70B models on one or a few servers</td><td>ZeRO-3 or FSDP <code>FULL_SHARD</code>, often hybrid across servers</td><td>Simplest way to fit the model without changing model code</td></tr>
+<tr><td>Fine-tuning a model that already fits with ZeRO-2</td><td>ZeRO-2</td><td>Same communication as DDP, 8 times less model-state memory at large \(N\)</td></tr>
+<tr><td>Fine-tuning on one GPU or a workstation</td><td>ZeRO-Offload (optimizer to CPU), or ZeRO-Infinity to NVMe</td><td>The GPU holds only \(2\Psi\) bytes of weights; slower, but it runs</td></tr>
+<tr><td>VLM training (for example LLaVA-style instruction tuning)</td><td>DeepSpeed ZeRO-2 or ZeRO-3 configs shipped with the training scripts [Likely]</td><td>The language model dominates the memory; the vision encoder is often frozen and adds no optimizer states</td></tr>
+<tr><td>Video-language models (video QA, video retrieval, action recognition, key-moment detection)</td><td>ZeRO-3 plus activation checkpointing</td><td>Many frames mean long sequences, so activations, not model states, become the limit; ZeRO frees model-state memory for them</td></tr>
+<tr><td>Hugging Face Trainer and Accelerate</td><td>A DeepSpeed JSON or an FSDP config passed on the command line</td><td>The same sharding without writing distributed code</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Expecting ZeRO to fix an out-of-memory caused by activations.</b> ZeRO-DP shards model states only. If activations dominate (long sequences, video), use activation checkpointing or a smaller micro-batch; with tensor parallelism, ZeRO-R’s partitioned activations.</li>
+<li><b>Expecting ZeRO-1 or ZeRO-2 to keep scaling.</b> They stop at \(4\Psi\) and \(2\Psi\). A 70B model has 140 GB of BF16 weights: no number of 80 GB GPUs makes ZeRO-2 fit.</li>
+<li><b>Using ZeRO-3 across a slow network with a tiny batch.</b> Formula (45.9): below a few thousand tokens per GPU at 50 GB/s, the GPUs wait. Use hybrid sharding, larger micro-batches, or ZeRO-2.</li>
+<li><b>Touching parameters outside the forward pass in stage 3.</b> They are shards or empty placeholders. Gather them first (DeepSpeed <code>GatheredParameters</code>, FSDP <code>summon_full_params</code>).</li>
+<li><b>Saving a ZeRO-3 checkpoint and loading it as a normal model.</b> The checkpoint is sharded. Either gather 16-bit weights on save (<code>stage3_gather_16bit_weights_on_model_save</code>) or convert with DeepSpeed’s <code>zero_to_fp32.py</code> script.</li>
+<li><b>Computing the gradient norm on the local shard.</b> Clipping needs the global norm; sum the squared shard norms over all ranks.</li>
+<li><b>Turning on CPU offload without enough host memory.</b> ZeRO-Offload needs about \(14\Psi\) bytes of CPU memory in total (182 GB for 13B), and pinned memory for fast copies. Check the server, not just the GPU.</li>
+<li><b>Forgetting that gradient accumulation multiplies ZeRO-3 traffic.</b> Every micro-batch needs its own forward and backward all-gathers, so with 8 accumulation steps the weight traffic is 8 times larger per optimizer step, while DDP can skip the all-reduce on all but the last micro-batch.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What does each ZeRO stage shard, and what stays replicated?<span class="lvl">basic</span></summary><div class="ans">Stage 1 shards the optimizer states (FP32 master weights, Adam \(\mathbf{m}\) and \(\mathbf{v}\)); the 16-bit weights and gradients stay full on every GPU. Stage 2 also shards the gradients; the 16-bit weights stay full. Stage 3 shards the weights too, so nothing is fully replicated between steps. In all stages, each GPU still processes its own slice of the batch (data parallelism), and activations are not sharded.</div></details>
+<details class="qa"><summary>Give the memory per GPU of each stage. Compute it for a 7B model on 8 GPUs.<span class="lvl">core</span></summary><div class="ans">With \(K = 12\): DDP \(16\Psi\), ZeRO-1 \(4\Psi + 12\Psi/N\), ZeRO-2 \(2\Psi + 14\Psi/N\), ZeRO-3 \(16\Psi/N\). For \(\Psi = 7 \times 10^9\), \(N = 8\): 112 GB, 38.5 GB, 26.25 GB and 14 GB. (For Llama 2 7B with 6.738B parameters: 107.8, 37.1, 25.3 and 13.5 GB.) Add activations, buckets and, for ZeRO-3, one or two gathered layers.</div></details>
+<details class="qa"><summary>Why can stage 1 save at most 4 times, and stage 2 at most 8 times?<span class="lvl">core</span></summary><div class="ans">Stage 1 still stores the full 16-bit weights and gradients, \(4\Psi\) bytes, on every GPU; only the \(12\Psi\) of optimizer states is divided by \(N\). As \(N \to \infty\) the memory goes to \(4\Psi\), and \(16/4 = 4\). Stage 2 still stores the full 16-bit weights, \(2\Psi\), so the limit is \(16/2 = 8\). Only stage 3 divides everything by \(N\).</div></details>
+<details class="qa"><summary>Why do ZeRO-1 and ZeRO-2 cost no extra communication compared with DDP?<span class="lvl">core</span></summary><div class="ans">A ring all-reduce is a reduce-scatter followed by an all-gather, \(2\Psi\) elements per GPU in total. ZeRO-1 and ZeRO-2 split it in the middle: reduce-scatter the gradients (each GPU gets the averaged shard it owns), run the optimizer on that shard, then all-gather the updated weights instead of the gradients. Same two collectives, same volume; only what is gathered changes. Stage 2 just does the reduce-scatter bucket by bucket during backward and frees the rest.</div></details>
+<details class="qa"><summary>Why is ZeRO-3 1.5 times the communication of DDP?<span class="lvl">core</span></summary><div class="ans">The weights are sharded, so each layer must be all-gathered before its forward pass (\(\Psi\) in total) and, because it was freed to save memory, all-gathered again before its backward pass (\(\Psi\)). The gradients are reduce-scattered (\(\Psi\)). No all-gather is needed after the optimizer step because the next forward pass does it. Total \(3\Psi\) against \(2\Psi\) for DDP. (Keeping the weights from forward to backward, as FSDP’s SHARD_GRAD_OP does, gets back to \(2\Psi\) at the cost of memory.)</div></details>
+<details class="qa"><summary>Does ZeRO change the result of training?<span class="lvl">basic</span></summary><div class="ans">No. Each GPU computes the same gradient on its micro-batch, the averaged gradient is the same, and AdamW is element-wise, so updating each shard separately gives the same weights as updating the whole vector. Only the order of floating-point additions in the reduction can differ, giving tiny rounding differences. The exception is ZeRO-Offload’s optional delayed parameter update, which uses gradients one step old.</div></details>
+<details class="qa"><summary>When is ZeRO-3 communication bound, and what do you do about it?<span class="lvl">advanced</span></summary><div class="ans">Compute per step is \(6\Psi T_g/F\) and communication is about \(3 \cdot 2\Psi/\beta\) bytes in BF16, so \(\Psi\) cancels and the condition is about tokens per GPU: \(T_g \ge F b c/(6\beta)\). At 400 TFLOP/s and 50 GB/s that is about 7,000 tokens per GPU (8 GPUs: \(\times 7/8\)). Below it, GPUs wait. Fixes: larger micro-batches (with activation checkpointing), hybrid sharding so weight gathers stay on NVLink (FSDP HYBRID_SHARD, ZeRO++ hpZ), quantized communication (ZeRO++ reports 4 times less volume), prefetching tuned to overlap, or ZeRO-2 if it fits.</div></details>
+<details class="qa"><summary>ZeRO-3 vs tensor parallelism: both split the weights. What is the difference?<span class="lvl">advanced</span></summary><div class="ans">Tensor parallelism splits the <b>computation</b> of each layer: each GPU multiplies with its slice of the matrix, and activations are exchanged (all-reduce) inside every layer, in the critical path, so it needs very fast links and stays inside a server. ZeRO-3 splits only the <b>storage</b>: before computing, each GPU gathers the full layer and computes it alone on its own data. Its traffic is weights and gradients, independent of batch size, and it can be prefetched and overlapped. ZeRO-3 needs no model code changes; tensor parallelism also cuts activation memory and helps when a single layer is too big or the batch per GPU is too small. Large runs combine them.</div></details>
+<details class="qa"><summary>What does ZeRO-Offload put on the CPU, and why that split?<span class="lvl">advanced</span></summary><div class="ans">It keeps the 16-bit weights and the forward and backward pass on the GPU, and moves the 16-bit gradients, the FP32 master weights, \(\mathbf{m}\), \(\mathbf{v}\) and the Adam step to the CPU. In the step’s data-flow graph, any GPU/CPU split cuts at least two edges of at least \(2\Psi\) bytes, so \(4\Psi\) bytes per step is the minimum. This split reaches it (gradients down, new weights up) and leaves only \(2\Psi\) on the GPU, an 8 times saving. Moving the weights too would cost \(6\Psi\), because forward and backward read them twice. A fast vectorized CPU Adam and optional one-step delayed updates hide the CPU time.</div></details>
+<details class="qa"><summary>What memory does ZeRO not remove, and what does ZeRO-R do about it?<span class="lvl">core</span></summary><div class="ans">Residual states: activations, temporary buffers and fragmentation. Data parallelism already splits activations by batch, so ZeRO-DP cannot shrink them. ZeRO-R adds partitioned activation checkpointing (split the checkpoints of a tensor-parallel group across its GPUs, optionally to CPU), constant-size fused buffers instead of one buffer as large as the model (6 GB in FP32 for 1.5B), and memory defragmentation by placing long-lived tensors in pre-allocated contiguous memory.</div></details>
+<details class="qa"><summary>How do ZeRO stages map to PyTorch FSDP?<span class="lvl">basic</span></summary><div class="ans">FSDP <code>FULL_SHARD</code> is ZeRO-3 (gather per unit for forward, free, gather again for backward, reduce-scatter gradients). <code>SHARD_GRAD_OP</code> is close to ZeRO-2: weights are sharded between steps but kept gathered from forward to backward, so it sends \(2\Psi\). <code>NO_SHARD</code> is DDP. <code>HYBRID_SHARD</code> is ZeRO-3 inside a node and replication across nodes, similar to ZeRO++ hpZ. FSDP’s <code>CPUOffload</code> moves parameters and gradients to CPU and runs the optimizer there.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A 13B model is trained with AdamW in mixed precision on 16 GPUs. Compute the model-state memory per GPU for DDP and the three ZeRO stages.</li>
+<li>You have 64 GPUs with 80 GB each and want to leave 30 GB per GPU for activations. What is the largest model you can train with ZeRO-2? With ZeRO-3?</li>
+<li>Your optimizer is SGD with momentum and an FP32 master copy (\(K = 8\)). Rewrite formulas (45.2) to (45.4). What is the largest saving of stage 1 now?</li>
+<li>A 30B model is trained with ZeRO-3 on 32 GPUs in BF16. How many gigabytes does each GPU send per step? How long does that take at 50 GB/s?</li>
+<li>For ZeRO-2 at 450 GB/s, \(F = 400\) TFLOP/s, \(N = 8\): what is the smallest \(T_g\) that lets communication hide, by formula (45.9)?</li>
+<li>With ZeRO-Offload on one GPU, a 6B model and PCIe at 24 GB/s: GPU memory, CPU memory, traffic and transfer time per step?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(\Psi = 13 \times 10^9\), \(N = 16\): DDP \(16 \times 13 = 208\) GB; ZeRO-1 \(52 + 156/16 = 61.75\) GB; ZeRO-2 \(26 + 182/16 = 37.4\) GB; ZeRO-3 \(208/16 = 13\) GB. 2. \(M = 50\) GB. ZeRO-2: \(\Psi = 50/(2 + 14/64) = 22.5\)B. ZeRO-3: \(\Psi = 64 \times 50/16 = 200\)B. 3. ZeRO-1: \(4\Psi + 8\Psi/N\); ZeRO-2: \(2\Psi + 10\Psi/N\); ZeRO-3: \(12\Psi/N\). Baseline is \(12\Psi\), so stage 1 saves at most \(12/4 = 3\) times. 4. \(3 \times \tfrac{31}{32} \times 30 \times 10^9 \times 2 = 174.4\) GB; \(174.4/50 = 3.49\) s, which needs at least about \(3.49 \times 400 \times 10^{12} / (6 \times 30 \times 10^9) \approx 7{,}750\) tokens per GPU at 400 TFLOP/s to hide. 5. \(c = 2\), \(b = 2\): \(2 \times 2 \times 400 \times 10^{12} / (6 \times 450 \times 10^9) \times 7/8 = 518.5\), so about 520 tokens per GPU. 6. GPU \(2 \times 6 = 12\) GB; CPU \(14 \times 6 = 84\) GB; traffic \(4 \times 6 = 24\) GB; time \(24/24 = 1.0\) s per step.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>DDP stores \(16\Psi\) bytes on every GPU (45.1); \(12\Psi\) of it are optimizer states, used only during the optimizer step. With \(N\) GPUs, \(N - 1\) copies are redundant.</li>
+<li>Stage 1 shards the optimizer states (\(4\Psi + 12\Psi/N\), at most 4×), stage 2 also the gradients (\(2\Psi + 14\Psi/N\), at most 8×), stage 3 also the weights (\(16\Psi/N\), no limit) (45.2 to 45.4).</li>
+<li>Stages 1 and 2 send the same \(2\Psi\) per GPU as DDP: a reduce-scatter plus an all-gather with the optimizer step in between (45.6). Stage 3 sends \(3\Psi\), 1.5× DDP (45.7).</li>
+<li>Communication per GPU does not grow with \(N\), and the condition for hiding it is about tokens per GPU, not model size (45.8, 45.9).</li>
+<li>ZeRO does not shard activations; ZeRO-R adds partitioned activation checkpoints, fixed buffers and defragmentation.</li>
+<li>ZeRO-Offload keeps \(2\Psi\) of weights on the GPU, puts \(14\Psi\) on the CPU, and moves the minimum \(4\Psi\) bytes over PCIe per step (45.10). ZeRO-Infinity adds NVMe. Offload trades time for memory.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ M_{\text{DDP}} = 16\Psi, \quad M_1 = 4\Psi + \frac{12\Psi}{N}, \quad M_2 = 2\Psi + \frac{14\Psi}{N}, \quad M_3 = \frac{16\Psi}{N} \]</div>
+<div class="eq">\[ V_{\text{DDP}} = V_1 = V_2 = 2\tfrac{N-1}{N}\Psi, \quad V_3 = 3\tfrac{N-1}{N}\Psi, \quad T_g \ge \frac{c\,b\,F}{6\beta}\cdot\frac{N-1}{N} \]</div>
+<div class="eq">\[ \text{ZeRO-Offload:}\quad M_{\text{GPU}} = 2\Psi, \quad M_{\text{CPU}} = 14\Psi, \quad V_{\text{PCIe}} = 4\Psi \]</div>
+<h2 class="plain" id="zero-stages-1-2-and-3-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Rajbhandari et al. (2019). <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Rajbhandari et al. (2019). <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Li et al. (2020). <a href="https://arxiv.org/abs/2006.15704" target="_blank" rel="noopener">PyTorch Distributed: Experiences on Accelerating Data Parallel Training</a></li><li>Ren et al. (2021). <a href="https://arxiv.org/abs/2101.06840" target="_blank" rel="noopener">ZeRO-Offload: Democratizing Billion-Scale Model Training</a></li><li>Rajbhandari et al. (2021). <a href="https://arxiv.org/abs/2104.07857" target="_blank" rel="noopener">ZeRO-Infinity: Breaking the GPU Memory Wall for Extreme Scale Deep Learning</a></li><li>Wang et al. (2023). <a href="https://arxiv.org/abs/2306.10209" target="_blank" rel="noopener">ZeRO++: Extremely Efficient Collective Communication for Giant Model Training</a></li><li>DeepSpeed (docs). <a href="https://www.deepspeed.ai/docs/config-json/" target="_blank" rel="noopener">DeepSpeed configuration JSON: ZeRO optimizations and offloading</a></li><li>Zhao et al. (2023). <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener">PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel</a></li><li>Micikevicius et al. (2017). <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Mixed Precision Training</a></li><li>Shoeybi et al. (2019). <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../pretraining/data-parallelism-ddp.html"><small>Previous · session 44</small>Data parallelism (DDP)</a><a class="next" href="../pretraining/fsdp-version-1.html"><small>Next · session 46</small>FSDP (version 1)</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="zero-stages-1-2-and-3"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const g3=v=>v>=100?v.toFixed(0):v>=10?v.toFixed(1):v.toFixed(2);   /* 3 significant digits, like the ZeRO paper */
+const segInit=(seg,cb)=>seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});
+const COL={p:"var(--q)",g:"var(--k)",o:"var(--v)"};
+
+/* ---------- Figure 1: who stores what ---------- */
+(function(){
+ const svg=$("#zr-own-svg");if(!svg)return;const info=$("#zr-own-info");const N=4,ring=(N-1)/N;let stage=0,cur=0;
+ const NAMES=["DDP","ZeRO-1","ZeRO-2","ZeRO-3"];
+ const REST=[16,4+12/N,2+14/N,16/N];       /* model-state bytes per parameter per GPU, formulas (45.1)-(45.4) */
+ const STEPS=["Before the step","Forward pass","Backward pass","Optimizer step","End of the step"];
+ /* row modes: all = full copy, own = own shard only, temp = own shard + others held for a moment, none */
+ function state(s,k){
+  const p=s===3?(k===1||k===2?"temp":"own"):"all";
+  const g=[["none","none","all","all","all"],["none","none","all","all","all"],["none","none","temp","own","own"],["none","none","temp","own","own"]][s][k];
+  const o=s===0?"all":"own";
+  /* communication in units of Psi elements, per GPU */
+  const add=[[0,0,2*ring,0,0],[0,0,ring,0,ring],[0,0,ring,0,ring],[0,ring,2*ring,0,0]][s][k];
+  const txt={
+   0:["Every GPU holds the full weights, the full optimizer states, and (after backward) the full gradients.","Each GPU computes the forward pass on its own micro-batch with its full weights. No communication.","Backward: every GPU computes the full gradient of its micro-batch. One <b>all-reduce</b> (bucketed, overlapped) averages it: 2·(N−1)/N·Ψ = 1.5Ψ elements per GPU.","Every GPU runs the <b>same</b> AdamW step on the <b>same</b> full states. N−1 of the N copies are redundant work and memory.","Done: all GPUs hold identical weights. Total sent per GPU this step: 1.5Ψ."],
+   1:["Weights are full on every GPU; each GPU owns the optimizer states (FP32 master, m, v) of one shard only.","Forward pass exactly as in DDP. No communication.","Backward builds the full local gradient (the gradient row is still full). A <b>reduce-scatter</b> gives each GPU the averaged gradient of its own shard: (N−1)/N·Ψ = 0.75Ψ.","GPU r updates only shard r with its own states and its reduced gradient shard.","An <b>all-gather</b> of the updated 16-bit shards gives every GPU the full new weights: 0.75Ψ. Total 1.5Ψ, the same as DDP."],
+   2:["Weights are full; optimizer states are sharded; gradients will be sharded too.","Forward pass exactly as in DDP. No communication.","As each gradient bucket fills, it is <b>reduce-scattered</b> to the owners and freed (pale cells are held only for a moment). 0.75Ψ in total.","GPU r updates shard r. Only one gradient shard per GPU is stored.","<b>All-gather</b> of the updated weights: 0.75Ψ. Total 1.5Ψ, the same as DDP, with less memory."],
+   3:["Everything is sharded: each GPU stores 1/N of the weights, gradients and optimizer states.","Layer by layer: <b>all-gather</b> the layer’s weights, compute, free them (pale cells). 0.75Ψ over the whole forward pass.","Layer by layer in reverse: <b>all-gather</b> the weights again (0.75Ψ), compute gradients, <b>reduce-scatter</b> them to the owners (0.75Ψ), free.","GPU r updates shard r. No all-gather afterwards.","The next forward pass gathers the weights, so nothing is sent now. Total 2.25Ψ, 1.5 times DDP."]}[s][k];
+  return {p,g,o,add,txt};}
+ function cell(x,y,w,h,mode,own,c){
+  if(mode==="all"||(mode==="own"&&own)||(mode==="temp"&&own))return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="4" fill="${c}" stroke="${c}"/>`;
+  if(mode==="temp")return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="4" fill="var(--hl)" stroke="var(--muted)" stroke-dasharray="4 3"/>`;
+  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="4" fill="var(--paper2)" stroke="var(--rule)"/>`;}
+ function draw(k){cur=k;const st=state(stage,k);let sent=0;for(let j=0;j<=k;j++)sent+=state(stage,j).add;
+  let g="";const rows=[["p","16-bit weights","2Ψ"],["g","16-bit gradients","2Ψ"],["o","FP32 master, m, v","12Ψ"]];
+  rows.forEach(([key,lab,by],i)=>{const y=62+i*68;g+=`<text x="12" y="${y+18}" font-size="13.5" font-weight="650" fill="var(--ink)">${lab}</text><text x="12" y="${y+36}" font-size="12.5" fill="var(--muted)">${by} bytes in total</text>`;});
+  for(let r=0;r<N;r++){const x0=160+r*152;
+   g+=`<rect x="${x0-6}" y="30" width="144" height="232" rx="10" fill="none" stroke="var(--rule)"/><text x="${x0+66}" y="50" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)">GPU ${r}</text>`;
+   rows.forEach(([key],i)=>{const y=62+i*68;for(let j=0;j<N;j++){g+=cell(x0+j*34,y,30,44,st[key],j===r,COL[key]);}
+    if(key==="o"&&k===3)g+=`<rect x="${x0+(stage===0?0:r*34)-2}" y="${y-2}" width="${stage===0?4*34-4+4:34}" height="48" rx="5" fill="none" stroke="var(--ink)" stroke-width="2.2"/>`;});}
+  g+=`<text x="12" y="285" font-size="12.5" fill="var(--muted)">Shard j of each row is owned by GPU j. Pale dashed cells exist only for a moment.</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`<b>${NAMES[stage]}, ${STEPS[k]}.</b> ${st.txt}<br>Sent per GPU so far: <b>${sent.toFixed(2)}Ψ</b> elements (DDP for the whole step: 1.50Ψ). Model-state memory per GPU (N = 4): <b>${REST[stage].toFixed(2)}Ψ</b> bytes, versus 16Ψ for DDP.`;
+  svg.dataset.sent=sent.toFixed(2);}
+ const stp=B.stepper({n:STEPS.length,prev:$("#zr-own-prev"),next:$("#zr-own-next"),play:$("#zr-own-play"),label:$("#zr-own-lab"),ms:2800,onStep:draw});
+ segInit($("#zr-own-s"),v=>{stage=+v;stp.stop();draw(stp.i);});
+})();
+
+/* ---------- Figure 2: memory per GPU ---------- */
+(function(){
+ const svg=$("#zr-mem-svg");if(!svg)return;const P=$("#zr-mem-p"),Nn=$("#zr-mem-n"),Mm=$("#zr-mem-m"),info=$("#zr-mem-info"),pre=$("#zr-mem-pre");
+ function draw(){const psi=+P.value,N=2**(+Nn.value),M=+Mm.value;
+  $("#zr-mem-pv").value=psi.toFixed(psi<10?3:1)+"B";$("#zr-mem-nv").value=N;$("#zr-mem-mv").value=M+" GB";
+  pre.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",Math.abs(+b.dataset.v-psi)<1e-9?"true":"false"));
+  const parts=[[2,2,12],[2,2,12/N],[2,2/N,12/N],[2/N,2/N,12/N]].map(a=>a.map(v=>v*psi));   /* GB, since psi is in billions */
+  const tot=parts.map(a=>a[0]+a[1]+a[2]);const top=Math.max(tot[0],M)*1.05;const X0=110,W=500,sx=v=>X0+v/top*W;
+  const names=["DDP","ZeRO-1","ZeRO-2","ZeRO-3"];let g="";
+  parts.forEach((a,i)=>{const y=18+i*52;let x=X0;g+=`<text x="${X0-10}" y="${y+22}" text-anchor="end" font-size="14" font-weight="650" fill="var(--ink)">${names[i]}</text>`;
+   [["p",a[0]],["g",a[1]],["o",a[2]]].forEach(([k,v])=>{const w=v/top*W;g+=`<rect x="${x.toFixed(1)}" y="${y}" width="${Math.max(0,w).toFixed(1)}" height="32" fill="${COL[k]}"/>`;x+=w;});
+   const fits=tot[i]<=M;const tx=x+6>560?x-8:x+6;g+=`<text x="${tx.toFixed(1)}" y="${y+21}" font-size="13" font-weight="700" fill="${x+6>560?"var(--on-accent)":fits?"var(--ok)":"var(--bad)"}" ${x+6>560?'text-anchor="end"':""}>${g3(tot[i])} GB</text>`;});
+  g+=`<line x1="${sx(M)}" y1="10" x2="${sx(M)}" y2="226" stroke="var(--ink)" stroke-dasharray="5 4" stroke-width="1.6"/><text x="${sx(M)}" y="243" text-anchor="middle" font-size="12.5" fill="var(--muted)">${M} GB GPU</text>`;
+  g+=`<line x1="${X0}" y1="10" x2="${X0}" y2="226" stroke="var(--muted)"/>`;svg.innerHTML=g;
+  const mx=[M/16,M/(4+12/N),M/(2+14/N),N*M/16];
+  info.innerHTML=`Model states per GPU for Ψ = ${psi.toFixed(psi<10?3:1)}B on N = ${N}: DDP <b>${g3(tot[0])} GB</b>, ZeRO-1 <b>${g3(tot[1])} GB</b>, ZeRO-2 <b>${g3(tot[2])} GB</b>, ZeRO-3 <b>${g3(tot[3])} GB</b>. Largest model whose states fit in ${M} GB (formula 45.5): ${mx.map((v,i)=>names[i]+" "+g3(v)+"B").join(", ")}.`;}
+ [P,Nn,Mm].forEach(e=>e.addEventListener("input",draw));
+ pre.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;P.value=b.dataset.v;draw();});draw();
+})();
+
+/* ---------- Figure 3: communication vs compute ---------- */
+(function(){
+ const svg=$("#zr-comm-svg");if(!svg)return;const P=$("#zr-comm-p"),Nn=$("#zr-comm-n"),T=$("#zr-comm-t"),F=$("#zr-comm-f"),info=$("#zr-comm-info");let bw=50;
+ function draw(){const psi=+P.value*1e9,N=2**(+Nn.value),tg=2**(+T.value),fl=+F.value*1e12,ring=(N-1)/N;
+  $("#zr-comm-pv").value=(+P.value).toFixed(+P.value<10?3:1)+"B";$("#zr-comm-nv").value=N;$("#zr-comm-tv").value=tg.toLocaleString("en-US");$("#zr-comm-fv").value=F.value;
+  const tc=6*psi*tg/fl;const cs=[2,2,2,3];const tm=cs.map(c=>2*c*ring*psi/(bw*1e9));
+  const top=Math.max(tc,...tm)*1.08;const X0=100,W=440,sx=v=>v/top*W;const names=["DDP","ZeRO-1","ZeRO-2","ZeRO-3"];let g="";
+  names.forEach((n,i)=>{const y=14+i*54;g+=`<text x="${X0-10}" y="${y+24}" text-anchor="end" font-size="14" font-weight="650" fill="var(--ink)">${n}</text>`;
+   g+=`<rect x="${X0}" y="${y}" width="${sx(tc).toFixed(1)}" height="18" fill="var(--q)"/>`;
+   const hid=Math.min(tm[i],tc),ex=Math.max(0,tm[i]-tc);
+   g+=`<rect x="${X0}" y="${y+22}" width="${sx(hid).toFixed(1)}" height="18" fill="var(--k)"/>`;
+   if(ex>0)g+=`<rect x="${(X0+sx(hid)).toFixed(1)}" y="${y+22}" width="${sx(ex).toFixed(1)}" height="18" fill="var(--bad)"/>`;
+   g+=`<text x="${(X0+sx(tm[i])+6).toFixed(1)}" y="${y+36}" font-size="12.5" fill="var(--ink2)">comm ${tm[i].toFixed(2)} s</text>`;});
+  g+=`<line x1="${X0}" y1="8" x2="${X0}" y2="222" stroke="var(--muted)"/><text x="${X0}" y="236" font-size="12" fill="var(--muted)">0 s</text><text x="${X0+sx(tc)}" y="236" text-anchor="middle" font-size="12" fill="var(--q)">compute ${tc.toFixed(2)} s</text>`;svg.innerHTML=g;
+  const need=cs.map(c=>c*2*fl/(6*bw*1e9)*ring);
+  info.innerHTML=`Compute per step: <b>${tc.toFixed(2)} s</b>. Communication per GPU (BF16) at ${bw} GB/s: DDP, ZeRO-1, ZeRO-2 <b>${tm[0].toFixed(2)} s</b> (${(4*ring*psi/1e9).toFixed(1)} GB); ZeRO-3 <b>${tm[3].toFixed(2)} s</b> (${(6*ring*psi/1e9).toFixed(1)} GB). ${tm[3]>tc?`<b>Communication bound</b>: the GPU waits ${tm[0]>tc?`${(tm[0]-tc).toFixed(2)} s per step with DDP, ZeRO-1 or ZeRO-2 and `:""}${(tm[3]-tc).toFixed(2)} s with ZeRO-3.`:"All of it can hide behind compute."} Tokens per GPU needed to hide (formula 45.9): ${Math.round(need[0]).toLocaleString("en-US")} for DDP/ZeRO-1/2, ${Math.round(need[3]).toLocaleString("en-US")} for ZeRO-3.`;}
+ [P,Nn,T,F].forEach(e=>e.addEventListener("input",draw));segInit($("#zr-comm-bw"),v=>{bw=+v;draw();});draw();
+})();
+
+/* ---------- Figure 4: ZeRO-Offload placement ---------- */
+(function(){
+ const svg=$("#zr-off-svg");if(!svg)return;const P=$("#zr-off-p"),Bw=$("#zr-off-b"),info=$("#zr-off-info");
+ const loc={p:"gpu",g:"gpu",u:"gpu"};                       /* p16, g16, update super-node (FP32 master, m, v) */
+ const SIZE={f:0,p:2,g:2,u:12};
+ const POS={f:{gpu:[110,150]},p:{gpu:[280,60],cpu:[480,60]},g:{gpu:[280,240],cpu:[480,240]},u:{gpu:[300,150],cpu:[640,150]}};
+ const EDGES=[["f","p",4,"read twice"],["f","g",2,"write"],["g","u",2,"read"],["u","p",2,"write new"]];
+ const LAB={f:["Forward +","backward"],p:["16-bit","weights 2Ψ"],g:["16-bit","gradients 2Ψ"],u:["Update: FP32","master, m, v 12Ψ"]};
+ const where=n=>n==="f"?"gpu":loc[n];const pos=n=>POS[n][where(n)];
+ function draw(){const psi=+P.value,bw=+Bw.value;$("#zr-off-pv").value=psi.toFixed(1)+"B";$("#zr-off-bv").value=bw+" GB/s";
+  let g=`<rect x="10" y="10" width="365" height="280" rx="14" fill="var(--q-soft)" stroke="var(--q)"/><text x="24" y="34" font-size="15" font-weight="700" fill="var(--q)">GPU</text>`+
+   `<rect x="395" y="10" width="355" height="280" rx="14" fill="var(--v-soft)" stroke="var(--v)"/><text x="736" y="34" text-anchor="end" font-size="15" font-weight="700" fill="var(--v)">CPU</text>`+
+   `<text x="385" y="150" text-anchor="middle" font-size="12" fill="var(--muted)" transform="rotate(-90 385 150)">PCIe</text>`;
+  let traffic=0;
+  EDGES.forEach(([a,b,w,l])=>{const [x1,y1]=pos(a),[x2,y2]=pos(b);const cut=where(a)!==where(b);if(cut)traffic+=w;
+   g+=`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${cut?"var(--k)":"var(--muted)"}" stroke-width="${cut?5:1.8}"/>`;
+   const mx=(x1+x2)/2,my=(y1+y2)/2;g+=`<rect x="${mx-38}" y="${my-11}" width="76" height="20" rx="6" fill="var(--card)" stroke="${cut?"var(--k)":"var(--rule)"}"/><text x="${mx}" y="${my+4}" text-anchor="middle" font-size="12" font-weight="${cut?700:500}" fill="${cut?"var(--k)":"var(--ink2)"}">${w}Ψ ${l}</text>`;});
+  ["f","p","g","u"].forEach(n=>{const [x,y]=pos(n);const w=n==="u"?128:112;const tog=n!=="f";
+   g+=`<g ${tog?`class="zr-tog" data-n="${n}" tabindex="0" role="button" aria-label="Move ${LAB[n].join(" ")} to ${where(n)==="gpu"?"CPU":"GPU"}"`:""}><rect x="${x-w/2}" y="${y-24}" width="${w}" height="48" rx="10" fill="var(--card)" stroke="${n==="f"?"var(--ink2)":COL[n==="u"?"o":n]}" stroke-width="2.2"/>`+
+   `<text x="${x}" y="${y-4}" text-anchor="middle" font-size="12.5" font-weight="650" fill="var(--ink)">${LAB[n][0]}</text><text x="${x}" y="${y+12}" text-anchor="middle" font-size="12" fill="var(--ink2)">${LAB[n][1]}</text></g>`;});
+  svg.innerHTML=g;
+  let gm=0,cm=0;["p","g","u"].forEach(n=>{if(loc[n]==="gpu")gm+=SIZE[n];else cm+=SIZE[n];});
+  const t=traffic*psi/bw;
+  info.innerHTML=`Model states on the GPU: <b>${gm}Ψ = ${g3(gm*psi)} GB</b> (${gm?(16/gm).toFixed(gm===16?0:2).replace(/\.00$/,"")+"× less than 16Ψ":"none"}). On the CPU: <b>${cm}Ψ = ${g3(cm*psi)} GB</b>. PCIe traffic per step: <b>${traffic}Ψ = ${g3(traffic*psi)} GB</b>, which takes <b>${t.toFixed(2)} s</b> at ${bw} GB/s.${traffic>4?" More than the 4Ψ minimum.":traffic===4&&gm===2?" This is the ZeRO-Offload placement: minimum traffic, maximum saving.":""}`;
+  svg.dataset.gpu=g3(gm*psi);}
+ svg.addEventListener("click",e=>{const n=e.target.closest(".zr-tog");if(!n)return;const k=n.dataset.n;loc[k]=loc[k]==="gpu"?"cpu":"gpu";draw();const el=svg.querySelector(`.zr-tog[data-n="${k}"]`);if(el)el.focus();});
+ svg.addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const n=e.target.closest(".zr-tog");if(!n)return;e.preventDefault();const k=n.dataset.n;loc[k]=loc[k]==="gpu"?"cpu":"gpu";draw();const el=svg.querySelector(`.zr-tog[data-n="${k}"]`);if(el)el.focus();});
+ const set=(p,g,u)=>{loc.p=p;loc.g=g;loc.u=u;draw();};
+ $("#zr-off-gpu").addEventListener("click",()=>set("gpu","gpu","gpu"));$("#zr-off-zo").addEventListener("click",()=>set("gpu","cpu","cpu"));$("#zr-off-all").addEventListener("click",()=>set("cpu","cpu","cpu"));
+ [P,Bw].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

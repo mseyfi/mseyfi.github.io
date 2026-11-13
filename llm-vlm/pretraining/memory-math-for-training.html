@@ -1,0 +1,459 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Memory math for training · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 38</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="memory-math-for-training">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="memory-math-for-training" data-session="memory-math-for-training" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">38</span><span>Track 3: Pretraining and scale · session 8 of 22</span></div><h1 class="chap-title">Memory math for training</h1><p class="chap-sub">Before a training run starts, you can predict how much GPU memory it needs and where every gigabyte goes. This session builds the full bill of one training step: 16 bytes per parameter for mixed-precision Adam, activations that grow with batch, sequence length and depth, the large logits tensor, and the overheads that formulas miss, such as temporary buffers and fragmentation. With it you can explain why full fine-tuning of a 7B model does not fit on one 24 GB GPU, and what does.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 1.5 to 2 hours, exercises 1 to 1.5 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 4, 25 and 37 (backprop and AdamW, counting parameters and FLOPs, numbers on GPUs and mixed precision)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The four parts of training memory: model states, activations, temporary buffers, overhead and fragmentation</li><li>Why mixed-precision AdamW costs 16 bytes per parameter, and how other optimizers and precisions change it (8, 10, 12, 20 bytes)</li><li>How to count the activations of one Llama-style block, about sb(12h + 4g + 8I) bytes, and how they grow with batch, sequence length and depth</li><li>The two hidden giants: the s² attention scores without FlashAttention, and the logits with a large vocabulary</li><li>Why full fine-tuning of a 7B model does not fit on one 24 GB GPU, and why LoRA or QLoRA with checkpointing does</li><li>Where the memory peak is in one step, and why a run can survive step 1 and crash in step 2</li><li>The PyTorch caching allocator (allocated vs reserved), fragmentation, and how to measure and fix an OOM</li></ul></div></header><style>
+.mm-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.mm-grid input[type=range]{width:100%}
+.mm-leg{display:flex;flex-wrap:wrap;gap:6px 16px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.mm-leg span::before{content:"";display:inline-block;width:14px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px;background:var(--c)}
+.mm-chk{display:flex;flex-wrap:wrap;gap:6px 18px;margin-top:8px;font:500 14.5px var(--sans)}
+pre.code,code{font-variant-ligatures:none}
+[data-session="memory-math-for-training"] code{overflow-wrap:anywhere}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Most training runs do not fail because the math is wrong. They fail with one line: <code>CUDA out of memory</code>. Before you start a run, you should be able to predict, with a pen and a few numbers, how many gigabytes it needs and where they go.</p>
+<p>In <a href="../pretraining/numbers-on-gpus-fp32-tf32-fp16-bf16.html">session 37</a> we saw that one number can take 1, 2 or 4 bytes, and that mixed precision keeps some copies in BF16 and some in FP32. In <a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a> we counted parameters and FLOPs and gave a first, short memory estimate. This session is the full memory bill of one training step. We answer four questions: how many bytes each parameter costs (16 for mixed-precision Adam), how activation memory grows with batch, sequence length and depth, why full fine-tuning of a 7B model cannot fit on one 24 GB GPU, and where the “missing” gigabytes go when your estimate says the run fits but it still crashes.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Very common questions: “How much memory do you need to fine-tune a 7B model?”, “Why does activation memory grow with sequence length?”, “My job uses only 60% of the GPU in my estimate but still OOMs. Why?”. A good answer always splits the bill into model states, activations and the rest, with numbers.</aside>
+<p>This bill decides real engineering choices. It is the reason ZeRO and FSDP shard optimizer states across GPUs (<a href="../pretraining/zero-stages-1-2-and-3.html">session 45</a>), the reason gradient checkpointing exists (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>), and the reason most people fine-tune 7B models with LoRA or QLoRA on a single card (<a href="../posttraining/lora-and-other-peft-methods.html">session 57</a>, <a href="../posttraining/qlora-and-training-with-quantized-weights.html">session 58</a>). The ZeRO paper starts with exactly this analysis and calls it “Where did all the memory go?”. [Certain]</p>
+
+<h2>The four parts of the bill</h2>
+<p>During training, GPU memory holds four kinds of things:</p>
+<ol>
+<li><b>Model states</b>: the weights, their gradients, and the optimizer states (for Adam: two running averages per weight). Their size depends only on the number of parameters \(N\), not on the data.</li>
+<li><b>Activations</b>: the intermediate results of the forward pass that the backward pass needs. Their size depends on the batch size, the sequence length and the depth, not on \(N\) directly.</li>
+<li><b>Temporary buffers</b>: tensors that live for a short time, for example a large FP32 copy of the logits, a buffer that groups gradients for communication, or scratch space of a kernel.</li>
+<li><b>Overhead and waste</b>: the CUDA context and kernels, memory that the allocator has reserved but not used, and <b>fragmentation</b> (free memory cut into pieces that are too small to use).</li></ol>
+<p>The ZeRO paper uses the same split: model states on one side, and “residual states” (activations, temporary buffers, fragmented memory) on the other. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>GPU memory is a suitcase. The weights are your clothes. The gradients are a second full set of clothes. Adam brings two more bags of the same size. Activations are the souvenirs you collect during the trip: few on a short trip, many on a long one. And a suitcase packed badly has empty corners you cannot use (fragmentation).</aside>
+
+<h2>Model states: 16 bytes per parameter</h2>
+<p>Recall the standard mixed-precision recipe (<a href="../pretraining/numbers-on-gpus-fp32-tf32-fp16-bf16.html">session 37</a>, <a href="../foundations/optimization-backprop-adamw.html">session 4</a>). The forward and backward passes run in BF16, so we keep a BF16 copy of the weights (2 bytes each) and get BF16 gradients (2 bytes each). The optimizer works in FP32: it keeps an FP32 <b>master copy</b> of the weights, so small updates are not lost to rounding, and Adam’s two moments \(\mathbf{m}\) and \(\mathbf{v}\), also in FP32. Add it up:</p>
+<div class="eq">\[ M_{\text{states}} = \big(\underbrace{2}_{\text{BF16 weights}} + \underbrace{2}_{\text{BF16 grads}} + \underbrace{4}_{\text{FP32 master}} + \underbrace{4}_{\text{Adam } m} + \underbrace{4}_{\text{Adam } v}\big)\, N = 16N \ \text{bytes} \tag{38.1} \]</div>
+<p>The ZeRO paper writes this as \(2\Psi + 2\Psi + K\Psi\) with \(K = 12\) for mixed-precision Adam, where \(\Psi\) is the number of parameters. [Certain] Its example: a 1.5B-parameter GPT-2 needs only 3 GB for its 16-bit weights, but at least 24 GB for its model states. [Certain]</p>
+<p>The general form is useful, because every optimizer and every precision choice just changes the three numbers:</p>
+<div class="eq">\[ M_{\text{states}} = (b_w + b_g + b_o)\, N \tag{38.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\)</dt><dd>number of trainable parameters (for LoRA, frozen weights count only in \(b_w\))</dd>
+<dt>\(b_w\)</dt><dd>bytes per parameter for the weights used in the forward pass (2 for BF16, 4 for FP32, about 0.5 for 4-bit)</dd>
+<dt>\(b_g\)</dt><dd>bytes per parameter for the gradients (2 for BF16, 4 for FP32, 6 if you keep both)</dd>
+<dt>\(b_o\)</dt><dd>bytes per parameter for everything the optimizer keeps: master weights and moments</dd></dl>
+<figure class="fig" id="mm-bytes"><div class="fig-body">
+<div class="scroll-x"><svg id="mm-bytes-svg" viewBox="0 0 760 330" role="img" aria-label="Bytes per parameter for seven training setups, drawn as stacked blocks"></svg></div>
+<div class="mm-leg"><span style="--c:var(--q)">weights</span><span style="--c:var(--k)">gradients</span><span style="--c:var(--v)">FP32 master weights</span><span style="--c:var(--t2)">optimizer moments m, v</span></div>
+</div><figcaption><b>Figure 1.</b> Bytes per parameter for seven common setups. Each small block is one byte. The total on the right times \(N\) gives the model-state memory (38.2). The first row is the classic 16 bytes of formula (38.1).</figcaption></figure>
+<p>Two rows of Figure 1 surprise many people. First, plain PyTorch <code>torch.autocast</code> keeps the weights and gradients in FP32 and makes BF16 copies of the weights on the fly during the forward pass: 4 + 4 + 4 + 4 is also 16 bytes, with a different layout. [Likely] Second, many large-scale frameworks keep an extra FP32 gradient buffer to add up gradients precisely, which gives 20 bytes per parameter; the Ultra-Scale Playbook lists 112 GB for a 7B model without this buffer and 140 GB with it. [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Setup</th><th>\(b_w + b_g + b_o\)</th><th>Llama 2 7B (6.74B)</th><th>Llama 3 8B (8.03B)</th></tr></thead><tbody>
+<tr><td>Mixed-precision AdamW (38.1)</td><td>2 + 2 + 12 = 16</td><td>107.8 GB</td><td>128.5 GB</td></tr>
+<tr><td>Same, plus FP32 gradient accumulation</td><td>2 + 6 + 12 = 20</td><td>134.8 GB</td><td>160.6 GB</td></tr>
+<tr><td>8-bit AdamW (moments in 8 bits)</td><td>2 + 2 + 6 = 10</td><td>67.4 GB</td><td>80.3 GB</td></tr>
+<tr><td>SGD with momentum, mixed precision</td><td>2 + 2 + 8 = 12</td><td>80.9 GB</td><td>96.4 GB</td></tr>
+<tr><td>Pure BF16 AdamW (no master copy)</td><td>2 + 2 + 4 = 8</td><td>53.9 GB</td><td>64.2 GB</td></tr>
+<tr><td>Plain SGD in BF16 (no state)</td><td>2 + 2 + 0 = 4</td><td>27.0 GB</td><td>32.1 GB</td></tr>
+<tr><td>Inference only (BF16 weights)</td><td>2</td><td>13.5 GB</td><td>16.1 GB</td></tr></tbody></table></div>
+<p>Here GB means \(10^9\) bytes. A “24 GB” or “80 GB” GPU actually has 24 or 80 GiB (\(2^{30}\) bytes each), so 24 GiB = 25.8 GB, but part of it goes to overhead (see below). In this session we compare GB against the GPU’s label, which is a safe, slightly pessimistic rule.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Pure BF16 training without a master copy saves 4 bytes per parameter, but small updates can round to zero: BF16 stores only 7 mantissa bits, so next to 1.0 the closest numbers are \(2^{-7} \approx 0.0078\) away, and a weight of 1.0 cannot change by \(10^{-4}\). It needs tricks such as stochastic rounding or Kahan summation to work well. [Likely]</aside>
+
+<h2>Activation memory</h2>
+<p>Backpropagation needs, for every operation, some of its inputs or outputs from the forward pass (<a href="../foundations/optimization-backprop-adamw.html">session 4</a>). For \(Y = XW\) the weight gradient is \(X^\top G\), so \(X\) must be kept. For \(\text{SiLU}(z)\) the local derivative needs \(z\). These saved tensors are the <b>activations</b>. Each one has the shape of the data flowing through the network: (batch \(b\)) × (sequence length \(s\)) × (some width). That is why activation memory is proportional to \(b \cdot s\), and to the number of layers \(L\).</p>
+<h3>Counting one Llama-style block</h3>
+<p>Take a modern decoder block: RMSNorm, attention with grouped-query attention (GQA) and FlashAttention, a residual add, RMSNorm, a SwiGLU feed-forward network, a residual add (<a href="../transformers/the-full-transformer-and-its-three-families.html">session 23</a>). Everything is stored in BF16 (2 bytes). Let \(h\) be the hidden size, \(g = h_{kv} d_h\) the width of K and V, and \(I\) the FFN’s inner size. Walk through the block and write down what each step must save:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Operation</th><th>What it saves for backward</th><th>Bytes</th></tr></thead><tbody>
+<tr><td>RMSNorm 1</td><td>its input</td><td>\(2sbh\)</td></tr>
+<tr><td>Q, K, V projections</td><td>their shared input (the norm output)</td><td>\(2sbh\)</td></tr>
+<tr><td>FlashAttention</td><td>Q, K, V and its output (plus one small FP32 number per row)</td><td>\(2sbh + 4sbg + 2sbh\)</td></tr>
+<tr><td>Output projection</td><td>its input = the attention output (already counted)</td><td>0</td></tr>
+<tr><td>RMSNorm 2</td><td>its input</td><td>\(2sbh\)</td></tr>
+<tr><td>Gate and up projections</td><td>their shared input</td><td>\(2sbh\)</td></tr>
+<tr><td>SiLU and the product</td><td>the gate output, the up output, SiLU(gate)</td><td>\(6sbI\)</td></tr>
+<tr><td>Down projection</td><td>its input, SiLU(gate) × up</td><td>\(2sbI\)</td></tr></tbody></table></div>
+<p>The residual adds need nothing. The sum is the activation memory of one block:</p>
+<div class="eq">\[ M_{\text{layer}} = s\, b\, \big(12h + 4g + 8I\big) \ \text{bytes} \tag{38.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(s, b\)</dt><dd>sequence length and micro-batch size (sequences per forward pass on one GPU)</dd>
+<dt>\(12h\)</dt><dd>the inputs of the two norms, of the two groups of projections, plus Q and the attention output: six tensors of width \(h\), 2 bytes each</dd>
+<dt>\(4g\)</dt><dd>K and V, which are narrower than \(h\) with GQA (\(g = h_{kv} d_h\))</dd>
+<dt>\(8I\)</dt><dd>four tensors of the FFN’s inner width \(I\), 2 bytes each</dd></dl>
+<p>For Llama 3 8B (\(h = 4096\), \(g = 8 \times 128 = 1024\), \(I = 14336\)), the bracket is \(49{,}152 + 4{,}096 + 114{,}688 = 167{,}936 = 41h\). So one block stores about <b>41 bytes per number of the residual stream</b>, and two thirds of it is the FFN. We checked this by hand-counting with PyTorch: a hook on the tensors that autograd saves gives 41.2 bytes per \(sbh\) for this block with a fused RMSNorm (the extra 0.2 are the small FP32 numbers). [Certain for this implementation] A plain, unfused RMSNorm keeps one more copy per norm and gives 45; the code below shows it.</p>
+<p>Korthikanti et al. did the same count for a GPT-style block (GELU FFN with \(4h\) inner size, dropout, 16-bit storage) and found \(sbh(34 + 5as/h)\) bytes per layer, where \(a\) is the number of heads. [Certain] The constant differs (34 vs 41) because SwiGLU is wider and has three projections, while dropout masks are gone. The method is the same: walk through the block and add up what is saved.</p>
+<h3>The attention scores: the term that grows like \(s^2\)</h3>
+<p>Without FlashAttention, “eager” attention builds the full score matrix: \(a\) heads, each \(s \times s\). The common Hugging Face pattern computes the softmax in FP32 and casts the result to BF16; both copies are saved:</p>
+<div class="eq">\[ M_{\text{scores}} = (4 + 2)\, a\, s^2\, b = 6\, a\, s^2 b \ \text{bytes per layer} \tag{38.4} \]</div>
+<p>We measured exactly \(6\) bytes per score with saved-tensor hooks for this pattern. [Certain for this implementation] For Llama 3 8B at \(s = 4096\): \(6 \times 32 \times 4096^2 = 3.22\) GB per layer, almost five times the 0.69 GB of formula (38.3). FlashAttention never stores the score matrix; it recomputes it block by block in the backward pass, so the \(s^2\) term disappears (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a> explains the same idea as “selective recomputation”).</p>
+<h3>The logits: a big tensor at the very end</h3>
+<p>After the last block, the output layer produces one score per vocabulary entry for every token: \(s \cdot b \cdot V\) numbers. With a large vocabulary this is huge. A common pattern is <code>logits = lm_head(x).float()</code> followed by cross-entropy. The FP32 logits (4 bytes) stay alive because the model returns them, and the log-softmax output (4 bytes) is saved for the backward pass:</p>
+<div class="eq">\[ M_{\text{logits}} \approx 8\, s\, b\, V \ \text{bytes} \tag{38.5} \]</div>
+<p>For Llama 3 8B (\(V = 128{,}256\)) and one sequence of 4,096 tokens, \(sbV = 525\) million, so 4.2 GB: as much as six transformer blocks. In the backward pass the FP32 gradient of the logits adds another \(4sbV\) for a moment. [Likely] For small models with big vocabularies this part can dominate: Cut Cross-Entropy (Wijmans et al., 2024) reports that the loss computation of Gemma 2 (2B) can take 24 GB, and that computing it piece by piece, without ever writing the full logits to GPU memory, brings it to 1 MB. [Certain]</p>
+<h3>The total, and how it grows</h3>
+<div class="eq">\[ M_{\text{act}} \approx L\, M_{\text{layer}} + [\text{no Flash}]\; L \cdot 6 a s^2 b + 8\, s b V \tag{38.6} \]</div>
+<ul>
+<li><b>Batch \(b\)</b>: linear. Twice the batch, twice the activations. Model states do not change.</li>
+<li><b>Sequence length \(s\)</b>: linear with FlashAttention, quadratic without it.</li>
+<li><b>Depth \(L\)</b>: linear. Each block keeps its own saved tensors until the backward pass reaches it.</li>
+<li><b>Width \(h\)</b>: linear (through \(h\), \(g\) and \(I\)), while the parameters grow like \(h^2\). So for big models the states dominate at short context, and activations dominate at long context.</li></ul>
+<div class="worked"><div class="wt">Worked example: Llama 3 8B, one sequence of 4,096 tokens</div>
+<p>One block: \(4096 \times 1 \times 167{,}936 = 0.688\) GB. Thirty-two blocks: <b>22.0 GB</b>. Logits (38.5): <b>4.2 GB</b>. Total activations about 26.3 GB, on top of 128.5 GB of model states.</p>
+<p>Without FlashAttention, add \(32 \times 3.22 = 103.1\) GB of scores: 129 GB of activations for <b>one</b> sequence. With block checkpointing (keep only each block’s input, \(2sbh\) = 34 MB per block, and recompute one block at a time), the blocks cost \(32 \times 0.034 + 0.69 = 1.76\) GB instead of 22.0 GB.</p></div>
+<p>Figure 2 puts all of this together. Choose a model, a training method and a GPU, and see which part of the bill breaks the budget.</p>
+<figure class="fig wide" id="mm-calc"><div class="fig-body">
+<div class="controls"><span class="seg" id="mm-calc-model"><button type="button" data-v="1B" aria-pressed="false">Llama 3.2 1B</button><button type="button" data-v="3B" aria-pressed="false">Llama 3.2 3B</button><button type="button" data-v="7B" aria-pressed="true">Llama 2 7B</button><button type="button" data-v="8B" aria-pressed="false">Llama 3 8B</button><button type="button" data-v="70B" aria-pressed="false">Llama 3 70B</button></span></div>
+<div class="controls"><span class="seg" id="mm-calc-meth"><button type="button" data-v="adamw" aria-pressed="true">AdamW 16 B</button><button type="button" data-v="acc32" aria-pressed="false">+FP32 grads 20 B</button><button type="button" data-v="adam8" aria-pressed="false">8-bit AdamW</button><button type="button" data-v="bf16" aria-pressed="false">Pure BF16</button><button type="button" data-v="lora" aria-pressed="false">LoRA r=16</button><button type="button" data-v="qlora" aria-pressed="false">QLoRA r=16</button></span></div>
+<div class="controls"><span class="seg" id="mm-calc-gpu"><button type="button" data-v="24" aria-pressed="true">24 GB</button><button type="button" data-v="40" aria-pressed="false">40 GB</button><button type="button" data-v="80" aria-pressed="false">80 GB</button></span></div>
+<div class="mm-grid">
+<label for="mm-calc-s">Sequence length \(s\)</label><input type="range" id="mm-calc-s" min="0" max="6" step="1" value="2"><output id="mm-calc-sv"></output>
+<label for="mm-calc-b">Micro-batch \(b\)</label><input type="range" id="mm-calc-b" min="0" max="5" step="1" value="0"><output id="mm-calc-bv"></output></div>
+<div class="mm-chk"><label><input type="checkbox" id="mm-calc-fl" checked> FlashAttention</label><label><input type="checkbox" id="mm-calc-ck"> Checkpoint every block</label><label><input type="checkbox" id="mm-calc-fu"> Chunked (fused) loss</label></div>
+<div class="scroll-x"><svg id="mm-calc-svg" viewBox="0 0 680 190" role="img" aria-label="Stacked bar of training memory compared with the GPU size"></svg></div>
+<div class="mm-leg"><span style="--c:var(--q)">weights</span><span style="--c:var(--k)">gradients</span><span style="--c:var(--v)">FP32 master</span><span style="--c:var(--t2)">optimizer moments</span><span style="--c:var(--t7)">LoRA adapters (all 16 B)</span><span style="--c:var(--t5)">block activations</span><span style="--c:var(--bad)">logits</span></div>
+<div class="readout" id="mm-calc-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The memory bill of one training step on one GPU, with no sharding. Model states use formula (38.2), block activations (38.3) or the checkpointed version (38.8), scores (38.4) when FlashAttention is off, and logits (38.5) unless the loss is chunked. The dashed line is the GPU size. Configurations are the real ones from each model’s config.json.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Start with the default: Llama 2 7B, AdamW, 24 GB. The model states alone (108 GB) are four and a half times the card. Switch through the methods: only LoRA and QLoRA bring the states below 24 GB. Now pick LoRA: states are about 14.1 GB, and with \(s = 2048\) the block activations (10.1 GB) and logits (0.5 GB) push the total just over 24 GB. Tick “Checkpoint every block”: it fits. Then raise the sequence length to 32,768 and untick FlashAttention to see the quadratic term take over. Finally pick Llama 3 70B with AdamW on 80 GB: 1.13 TB of states, so you need at least 15 such GPUs just to store them (with sharding, <a href="../pretraining/zero-stages-1-2-and-3.html">session 45</a>).</p></details></figure>
+
+<h2>Why full fine-tuning of a 7B model does not fit on one 24 GB GPU</h2>
+<p>Many people own or rent a 24 GB GPU (RTX 3090, RTX 4090, L4, A10). [Certain] A 7B model in BF16 is 13.5 GB, so it fits for inference. Can we fine-tune it? Go down the table above:</p>
+<div class="worked"><div class="wt">Worked example: Llama 2 7B (6.74B parameters) on 24 GB</div>
+<p><b>AdamW, mixed precision:</b> \(16 \times 6.74 \times 10^9 = 107.8\) GB. Over four times the card, before one activation.</p>
+<p><b>8-bit AdamW:</b> 67.4 GB. <b>Pure BF16 AdamW:</b> 53.9 GB. Still far too much.</p>
+<p><b>Even plain SGD with no optimizer state at all:</b> weights 13.5 GB + gradients 13.5 GB = 27.0 GB. It does not fit even with zero activations. Full fine-tuning needs a gradient for every weight, and the gradients alone are as big as the model.</p>
+<p><b>LoRA, rank 16 on all seven linear layers of every block:</b> the adapters have \(39{,}976{,}960\) parameters (0.59% of the model, formula 38.7). Frozen BF16 weights 13.48 GB + adapters with full AdamW states \(16 \times 0.040 = 0.64\) GB = 14.1 GB. Activations at \(s = 2048\), \(b = 1\): 10.1 GB for the blocks plus 0.5 GB of logits, so 24.7 GB in total: just over. With block checkpointing, the blocks drop to 0.9 GB and the total is 15.5 GB: it fits, with room for \(b = 4\) (19.8 GB).</p>
+<p><b>QLoRA:</b> the frozen linear weights in 4-bit NF4 with double quantization take about 4.127 bits each, \(6.48 \times 10^9 \times 4.127 / 8 = 3.3\) GB, plus 0.5 GB for the BF16 embedding and output layers. [Likely for the exact layout]</p></div>
+<p>The number of LoRA parameters comes from adding two thin matrices \(A \in \R^{d_{\text{in}} \times r}\) and \(B \in \R^{r \times d_{\text{out}}}\) to each adapted weight:</p>
+<div class="eq">\[ P_{\text{LoRA}} = L \cdot r \sum_{\text{adapted } W} \big(d_{\text{in}} + d_{\text{out}}\big) \tag{38.7} \]</div>
+<p>For Llama 2 7B with \(r = 16\): \(32 \times 16 \times \big(4 \times 8192 + 3 \times 15104\big) = 39{,}976{,}960\). The point is not the exact count. It is that LoRA removes \(b_g\) and \(b_o\) from almost all parameters, and leaves only \(b_w = 2\) (or about 0.5 with QLoRA). The activations stay, because the backward pass still has to flow through every frozen layer to reach the adapters. [Likely]</p>
+<p>There is research that pushes full-parameter training into 24 GB: GaLore projects gradients to low rank and, with 8-bit states and per-layer updates, shows pre-training a 7B model on a 24 GB RTX 4090. [Certain] But the standard answer in an interview is: <i>states are 16 bytes per parameter, so 7B needs about 112 GB before activations; use LoRA or QLoRA on one card, or shard the states across several GPUs.</i></p>
+<p>Checkpointing changes formula (38.3) into “one input per block, plus one block being recomputed”:</p>
+<div class="eq">\[ M_{\text{act}}^{\text{ckpt}} \approx L \cdot 2\, s b h + M_{\text{layer}} + 8\, s b V \tag{38.8} \]</div>
+<p>The cost is about one extra forward pass, around 33% more compute (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>).</p>
+
+<h2>One step over time: where is the peak?</h2>
+<p>Formulas (38.1) to (38.8) give sizes. But a GPU runs out of memory at one moment: the <b>peak</b>. Memory changes a lot during one step:</p>
+<ol>
+<li><b>Forward</b>: each block adds its activations. Memory climbs steadily, then jumps at the logits.</li>
+<li><b>Start of backward</b>: the gradient of the logits appears. Usually this is the highest point.</li>
+<li><b>Backward through the blocks</b>: each block frees its activations and creates its weight gradients. If the activations of a block are larger than its gradients, memory falls; otherwise it rises.</li>
+<li><b>Optimizer step</b>: reads all gradients, updates the states. Then <code>zero_grad(set_to_none=True)</code> frees the gradients.</li></ol>
+<p>So, with \(A\) the block activations, \(G = b_g N\) the gradients and \(S = (b_w + b_o) N\) the persistent part, the peak is roughly</p>
+<div class="eq">\[ M_{\text{peak}} \approx S + \max\big(A + M_{\text{logits}} + 4 s b V,\ \ G\big) \tag{38.9} \]</div>
+<p>The first term inside the max is the start of the backward pass; the second is the end of it, when all gradients exist and the activations are gone. Long sequences make the first term win; short sequences with a big model make the second win.</p>
+<p>There is a trap with Adam: PyTorch creates \(\mathbf{m}\) and \(\mathbf{v}\) lazily, inside the <b>first</b> call to <code>optimizer.step()</code>. So the first step runs with 8 fewer bytes per parameter. The Ultra-Scale Playbook notes that this is why training sometimes succeeds in the first step and then runs out of memory in the following ones. [Certain] Figure 3 shows a step of full fine-tuning of Llama 3.2 1B with \(s = 2048\) and \(b = 4\).</p>
+<figure class="fig wide" id="mm-tl"><div class="fig-body">
+<div class="mm-chk" style="margin-top:0"><label><input type="checkbox" id="mm-tl-first"> First step (Adam states not created yet)</label><label><input type="checkbox" id="mm-tl-ck"> Checkpoint every block</label><label><input type="checkbox" id="mm-tl-keep"> Keep gradients between steps (set_to_none=False)</label><label><input type="checkbox" id="mm-tl-fu"> Chunked (fused) loss</label></div>
+<div class="mm-grid" style="margin-top:8px"><label for="mm-tl-t">Moment in the step</label><input type="range" id="mm-tl-t" min="0" max="37" step="1" value="18"><output id="mm-tl-tv"></output></div>
+<div class="scroll-x"><svg id="mm-tl-svg" viewBox="0 0 680 270" role="img" aria-label="Stacked bars of memory at each moment of one training step"></svg></div>
+<div class="mm-leg"><span style="--c:var(--q)">BF16 weights + FP32 master</span><span style="--c:var(--t2)">Adam m, v</span><span style="--c:var(--k)">gradients</span><span style="--c:var(--t5)">block activations</span><span style="--c:var(--bad)">logits and their gradient</span></div>
+<div class="readout" id="mm-tl-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Memory during one training step of Llama 3.2 1B (1.24B parameters, 16 blocks, vocabulary 128,256), AdamW in mixed precision, \(s = 2048\), \(b = 4\), FlashAttention. Each bar is one moment: forward through 16 blocks, the logits, the backward pass, the optimizer step. The dashed line marks the peak. Sizes come from formulas (38.1), (38.3), (38.5) and (38.8); real traces add the overheads of the next section.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>By default the peak is 42.1 GB, at the start of the backward pass. Notice how big the red part is: for this small model with a large vocabulary, the logits (8.4 GB stored, plus 4.2 GB for their gradient, 12.6 GB together) are larger than all 16 blocks (12.1 GB). Tick “Chunked loss” and the peak falls to 29.9 GB. Tick “First step”: the bars start 9.9 GB lower and the Adam states appear only at the end, so a first step that fits does not prove that step 2 fits. Tick “Keep gradients”: 2.5 GB more for the whole step. With checkpointing and chunked loss together, the peak moves to the end of the backward pass (20.4 GB), where all gradients exist.</p></details></figure>
+
+<h2>Where memory really goes</h2>
+<p>You add up formulas (38.2) and (38.6), the total says 70 GB, the GPU has 80 GB, and the job still crashes. The difference is in the two parts of the bill we have not counted yet: temporary buffers and waste.</p>
+<h3>Overhead you cannot avoid</h3>
+<ul>
+<li><b>CUDA context and kernels.</b> Just initializing CUDA and loading the kernel libraries takes memory. The Ultra-Scale Playbook says CUDA kernels typically need 1–2 GB, and suggests checking with <code>nvidia-smi</code> after creating one small tensor. [Certain]</li>
+<li><b>Library workspaces.</b> cuBLAS and attention kernels use scratch space. Communication libraries (NCCL) allocate buffers when you train on several GPUs. [Likely]</li></ul>
+<h3>Temporary tensors</h3>
+<p>A temporary tensor is created, used and freed within one operation or one phase. It never shows up in a formula for “what is stored”, but it does count at the peak. Common examples:</p>
+<ul>
+<li><b>Upcasts.</b> <code>.float()</code> on the logits creates a full FP32 copy (formula 38.5 already counts it). An eager RMSNorm that computes in FP32 creates FP32 copies of the hidden states; we measured about 51 bytes per \(sbh\) for a block with such norms, versus 41 with fused norms. [Certain for that implementation]</li>
+<li><b>Flat buffers.</b> Some systems copy all gradients into one contiguous buffer for communication or clipping. The ZeRO paper’s example: for a 1.5B-parameter model, a flattened FP32 buffer needs 6 GB. [Certain] PyTorch DDP groups gradients into smaller “buckets” for the same reason (<a href="../pretraining/data-parallelism-ddp.html">session 44</a>).</li>
+<li><b>Optimizer temporaries.</b> The default “foreach” implementations of Adam and AdamW work on lists of tensors at once and create intermediate lists; the fused versions avoid most of them. [Likely]</li>
+<li><b>Recomputation.</b> With checkpointing, one block’s activations are rebuilt during backward; this is the \(M_{\text{layer}}\) term in (38.8).</li></ul>
+<h3>The caching allocator: allocated vs reserved</h3>
+<p>Asking the GPU driver for memory (<code>cudaMalloc</code>) is slow, so PyTorch uses a <b>caching allocator</b>: when a tensor is freed, PyTorch keeps its memory block and reuses it for later tensors. The PyTorch documentation says this unused cached memory still appears as used in <code>nvidia-smi</code>. [Certain] So there are two numbers:</p>
+<ul>
+<li><code>torch.cuda.memory_allocated()</code>: bytes occupied by live tensors. This is what our formulas predict.</li>
+<li><code>torch.cuda.memory_reserved()</code>: bytes the allocator holds, used or not. This is what the GPU sees, and it is always at least as large.</li></ul>
+<p>The allocator also rounds sizes up (in multiples of 512 bytes, and large blocks are managed separately from small ones). [Certain] Use <code>max_memory_allocated()</code> after a step to read the real peak.</p>
+<h3>Fragmentation</h3>
+<p><b>Fragmentation</b> means that free memory exists, but it is cut into pieces that are each too small for the tensor you need. A tensor needs one contiguous block of addresses. If short-lived tensors (temporaries, recomputed activations) are placed between long-lived ones (stored activations, gradients), freeing the short-lived ones leaves holes. The ZeRO paper reports running out of memory with over 30% of memory still free in some extreme cases, and explains it by exactly this mix of short and long lifetimes. [Certain] Step through Figure 4.</p>
+<figure class="fig" id="mm-frag"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="mm-frag-prev">Back</button><button type="button" class="btn primary" id="mm-frag-play">Play</button><button type="button" class="btn" id="mm-frag-next">Next</button><span id="mm-frag-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="mm-frag-svg" viewBox="0 0 640 200" role="img" aria-label="A 16 GB memory strip with blocks being allocated and freed"></svg></div>
+<div class="mm-leg"><span style="--c:var(--q)">weights (long-lived)</span><span style="--c:var(--t5)">stored activations (live until backward)</span><span style="--c:var(--k)">temporaries (short-lived)</span><span style="--c:var(--bad)">failed request</span><span style="--c:var(--v)">the request, placed</span></div>
+<div class="readout" id="mm-frag-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A toy GPU with 16 GB of memory, in 1 GB cells. Temporaries placed between activations leave holes when they are freed. A 3 GB request then fails although 4 GB are free. The last step shows the same tensors placed by lifetime.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Watch two numbers in the readout: total free memory and the largest contiguous free block. An allocation succeeds only if the largest block is big enough. In step 6 the total is 4 GB but the largest block is 2 GB, so the 3 GB request fails. In step 7 the same tensors are placed so that the short-lived ones sit together at the end; freeing them leaves one 4 GB block, and the request succeeds. This is the idea of ZeRO’s memory defragmentation: pre-allocate contiguous space for long-lived tensors so they are not mixed with short-lived ones.</p></details></figure>
+<p>Two practical fixes in PyTorch. The option <code>PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True</code> lets the allocator grow a memory segment instead of creating new fixed-size ones; the documentation says this leaves fewer “slivers” of unusable memory, especially when tensor sizes change from batch to batch. [Certain] The option <code>max_split_size_mb</code> stops the allocator from splitting large blocks, which the documentation says can reduce fragmentation. [Certain] Also: keep tensor shapes stable (pad or pack to fixed lengths), because changing sizes every step creates new block sizes again and again.</p>
+<aside class="note watch side"><span class="nt">Watch out</span><code>torch.cuda.empty_cache()</code> does not free memory used by tensors. It only returns unused cached blocks to the driver (useful if another process needs them). Calling it inside the training loop usually just makes the next allocations slower. [Certain for the first part; Likely for the second]</aside>
+
+<h2>Estimating and debugging memory: the procedure</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: estimate the peak memory of a training run before you start</div><ol>
+<li><b>input:</b> parameters \(N\) (trainable and frozen), config \(L, h, g, I, V, a\), micro-batch \(b\), length \(s\), method, attention kernel</li>
+<li>\(S + G \leftarrow (b_w + b_g + b_o) N\) <span class="c">// formula (38.2); for LoRA: \(2N\) + 16 \(P_{\text{LoRA}}\), formula (38.7)</span></li>
+<li>\(A \leftarrow L \cdot s b (12h + 4g + 8I)\) <span class="c">// formula (38.3); with checkpointing use (38.8)</span></li>
+<li><b>if</b> eager attention: \(A \leftarrow A + L \cdot 6 a s^2 b\) <span class="c">// formula (38.4)</span></li>
+<li>\(M_{\text{logits}} \leftarrow 8 s b V\) unless the loss is chunked <span class="c">// formula (38.5)</span></li>
+<li>\(M_{\text{peak}} \leftarrow S + \max(A + M_{\text{logits}} + 4sbV,\ G)\) <span class="c">// formula (38.9)</span></li>
+<li><b>if</b> data parallel with ZeRO or FSDP: divide the sharded parts of \(S + G\) by the number of GPUs</li>
+<li>add 1–2 GB for CUDA and libraries, and keep about 10% free for fragmentation and temporaries <span class="c">// rule of thumb [Likely]</span></li>
+<li><b>return</b> \(M_{\text{peak}}\); compare with the GPU size</li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: what to do when a run goes out of memory</div><ol>
+<li>Measure first: run one or two steps with <code>reset_peak_memory_stats()</code>, then read <code>max_memory_allocated()</code> and <code>max_memory_reserved()</code></li>
+<li><b>if</b> it fails only from step 2 on: the Adam states (8 B per parameter) are the cause; plan for them</li>
+<li><b>if</b> reserved is much larger than allocated: fragmentation; set <code>expandable_segments:True</code>, keep shapes fixed</li>
+<li><b>if</b> the model states are too large: 8-bit optimizer, LoRA or QLoRA, or shard with ZeRO / FSDP <span class="c">// <a href="../pretraining/zero-stages-1-2-and-3.html">session 45</a></span></li>
+<li><b>if</b> the activations are too large: FlashAttention, then a smaller micro-batch with gradient accumulation, then checkpointing <span class="c">// <a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a></span></li>
+<li><b>if</b> the peak is at the logits: chunked or fused cross-entropy; do not keep FP32 logits you do not need</li>
+<li>still too large: CPU offloading, or more GPUs with tensor / sequence parallelism</li></ol></div>
+<p>The code below does the paper estimate, then measures what autograd really saves for one Llama-style block on the CPU. It needs only PyTorch and runs in a second. The attention core is written as a small function that saves only what FlashAttention saves (Q, K, V, output, one log-sum-exp per row), so the count does not depend on which attention kernel your machine has.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="cm"># 1) The bill on paper: formulas (38.1), (38.3), (38.5) and (38.8)</span>
+<span class="kw2">def</span> train_memory_gb(N, L, h, g, I, V, s, b, bytes_per_param=16, ckpt=False):
+    states = bytes_per_param * N
+    layer  = s * b * (12 * h + 4 * g + 8 * I)          <span class="cm"># one block, FlashAttention, BF16</span>
+    acts   = L * 2 * s * b * h + layer <span class="kw2">if</span> ckpt <span class="kw2">else</span> L * layer
+    logits = 8 * s * b * V                             <span class="cm"># FP32 logits + saved log-softmax</span>
+    <span class="kw2">return</span> states / 1e9, acts / 1e9, logits / 1e9
+
+print(train_memory_gb(8.03e9, 32, 4096, 1024, 14336, 128256, 4096, 1))
+<span class="cm"># (128.48, 22.01..., 4.20...): Llama 3 8B, one sequence of 4,096 tokens</span>
+
+<span class="cm"># 2) Measure what autograd really saves for one Llama-style block</span>
+h, nh, nkv, I, s, b = 256, 8, 2, 896, 64, 2
+dh = h // nh
+
+<span class="kw2">class</span> FlashLikeAttention(torch.autograd.Function):
+    <span class="st">"""Saves only q, k, v, the output and one log-sum-exp per row, like FlashAttention."""</span>
+    @staticmethod
+    <span class="kw2">def</span> forward(ctx, q, k, v):
+        rep = q.shape[1] // k.shape[1]                 <span class="cm"># GQA: share each K/V head</span>
+        kk, vv = k.repeat_interleave(rep, 1), v.repeat_interleave(rep, 1)
+        sc = (q.float() @ kk.float().transpose(-1, -2)) / dh ** 0.5
+        sc = sc.masked_fill(torch.ones(s, s, dtype=torch.bool).triu(1), float(<span class="st">"-inf"</span>))
+        lse = torch.logsumexp(sc, -1)
+        o = (torch.exp(sc - lse[..., None]) @ vv.float()).to(q.dtype)
+        o = o.transpose(1, 2).contiguous()             <span class="cm"># (b, s, heads, dh)</span>
+        ctx.save_for_backward(q, k, v, o, lse)
+        <span class="kw2">return</span> o.view(b, s, h)
+
+<span class="kw2">class</span> RMSNorm(nn.Module):                            <span class="cm"># plain, unfused</span>
+    <span class="kw2">def</span> __init__(self, d):
+        super().__init__(); self.w = nn.Parameter(torch.ones(d))
+    <span class="kw2">def</span> forward(self, x):
+        <span class="kw2">return</span> self.w * x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + 1e-5)
+
+<span class="kw2">class</span> Block(nn.Module):
+    <span class="kw2">def</span> __init__(self):
+        super().__init__()
+        lin = <span class="kw2">lambda</span> i, o: nn.Linear(i, o, bias=False)
+        self.n1, self.n2 = RMSNorm(h), RMSNorm(h)
+        self.q, self.k, self.v, self.o = lin(h, h), lin(h, nkv * dh), lin(h, nkv * dh), lin(h, h)
+        self.g, self.u, self.d = lin(h, I), lin(h, I), lin(I, h)
+    <span class="kw2">def</span> forward(self, x):
+        y = self.n1(x)
+        q = self.q(y).view(b, s, nh, dh).transpose(1, 2)
+        k = self.k(y).view(b, s, nkv, dh).transpose(1, 2)
+        v = self.v(y).view(b, s, nkv, dh).transpose(1, 2)
+        x = x + self.o(FlashLikeAttention.apply(q, k, v))
+        y = self.n2(x)
+        <span class="kw2">return</span> x + self.d(F.silu(self.g(y)) * self.u(y))
+
+block = Block().to(torch.bfloat16)
+params = {p.untyped_storage().data_ptr() <span class="kw2">for</span> p <span class="kw2">in</span> block.parameters()}
+saved = {}
+<span class="kw2">def</span> pack(t):                                   <span class="cm"># called for every tensor autograd keeps</span>
+    st = t.untyped_storage()
+    <span class="kw2">if</span> st.data_ptr() <span class="kw2">not in</span> params:            <span class="cm"># skip weights: they are not activations</span>
+        saved[st.data_ptr()] = st.nbytes()     <span class="cm"># count each storage once</span>
+    <span class="kw2">return</span> t
+
+x = torch.randn(b, s, h, dtype=torch.bfloat16, requires_grad=True)
+<span class="kw2">with</span> torch.autograd.graph.saved_tensors_hooks(pack, <span class="kw2">lambda</span> t: t):
+    out = block(x)
+print(f<span class="st">"saved: {sum(saved.values()) / (s * b * h):.1f} bytes per (s*b*h)"</span>)        <span class="cm"># 45.1</span>
+print(f<span class="st">"formula (38.3): {(12 * h + 4 * nkv * dh + 8 * I) / h:.1f}"</span>)                <span class="cm"># 41.0</span>
+<span class="cm"># The gap of about 4 is the unfused RMSNorm: it keeps x * rsqrt(...) as an extra copy,</span>
+<span class="cm"># once per norm. A fused RMSNorm kernel saves only x and one FP32 number per row.</span>
+
+<span class="cm"># 3) On a GPU, measure the real peak of one step</span>
+<span class="kw2">if</span> torch.cuda.is_available():
+    torch.cuda.reset_peak_memory_stats()
+    <span class="cm"># ... one forward, backward and optimizer.step() here ...</span>
+    print(torch.cuda.max_memory_allocated() / 1e9, <span class="st">"GB allocated at peak"</span>)
+    print(torch.cuda.max_memory_reserved() / 1e9, <span class="st">"GB reserved by the caching allocator"</span>)</pre>
+<p>Two more tools are worth knowing. <code>torch.cuda.memory_summary()</code> prints a table of allocated, reserved and freed memory. <code>torch.cuda.memory._record_memory_history()</code> with <code>torch.cuda.memory._dump_snapshot()</code> records every allocation with its stack trace; the PyTorch memory visualizer then draws a timeline like Figure 3 for your real run. [Likely] You will use them in <a href="../pretraining/lab-measure-memory-accumulation-and-checkpointing.html">session 41</a>.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Which part of the bill dominates</th><th>Typical answer</th></tr></thead><tbody>
+<tr><td>Pretraining a large model on a cluster</td><td>Model states (16–20 B per parameter): 1.13 TB for 70B</td><td>Shard states with ZeRO-3 / FSDP; tensor and pipeline parallelism (<a href="../pretraining/fsdp-version-1.html">session 46</a>, <a href="../pretraining/tensor-parallelism-and-sequence-parallelism.html">session 48</a>)</td></tr>
+<tr><td>Long-context training (32K+ tokens)</td><td>Activations, linear in \(s\) with FlashAttention</td><td>Checkpointing, sequence or context parallelism (<a href="../pretraining/pipeline-context-and-expert-parallelism-3d-and.html">session 49</a>)</td></tr>
+<tr><td>Fine-tuning a 7B–8B model on one 24 GB GPU</td><td>Model states (108–129 GB for full fine-tuning)</td><td>LoRA or QLoRA, checkpointing, micro-batch 1–4 with accumulation (<a href="../posttraining/lab-lora-vs-qlora-vs-full-fine.html">session 62</a>)</td></tr>
+<tr><td>Small models with big vocabularies (1B–3B, 128K vocab)</td><td>Logits: 8.4 GB for Llama 3.2 1B at \(b = 4\), \(s = 2048\)</td><td>Chunked or fused cross-entropy</td></tr>
+<tr><td>Training a Video-LLM (e.g. 64 frames × 196 tokens = 12,544 visual tokens)</td><td>Activations: about 67 GB for an 8B language model per sequence, without checkpointing</td><td>Token compression or pooling, checkpointing, context parallelism (<a href="../video/index.html#row-training-video-language-models" title="Training video-language models (planned)">session 212</a>, <a href="../video/index.html#row-long-video" title="Long video (planned)">session 206</a>)</td></tr>
+<tr><td>Fine-tuning video encoders for action recognition or video retrieval</td><td>Activations of many frames × patches; batch size for contrastive loss</td><td>Frame sampling, checkpointing, gradient caching for large contrastive batches [Likely] (<a href="../video/index.html#row-text-to-video-retrieval" title="Text-to-video retrieval (planned)">session 208</a>)</td></tr>
+<tr><td>Capacity planning for a training budget</td><td>All parts</td><td>Algorithm 1 before you rent GPUs; measure one step before a long run</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Counting only the weights.</b> “7B in BF16 is 14 GB, my GPU has 24 GB, so I can fine-tune it.” The gradients alone add another 14 GB, and Adam adds 8 bytes more per parameter.</li>
+<li><b>Forgetting the first-step trap.</b> Adam creates its states in the first <code>step()</code>. A run that survives step 1 can crash at step 2. Always run at least two steps before you trust a configuration.</li>
+<li><b>Ignoring the logits.</b> With a 128K vocabulary, the FP32 logits and their gradient can be larger than several transformer blocks. Do not call <code>.float()</code> on the full logits if a fused loss is available.</li>
+<li><b>Reading <code>nvidia-smi</code> as “memory used by tensors”.</b> It shows what the caching allocator reserved. Use <code>memory_allocated</code> and <code>max_memory_allocated</code> to compare with your estimate.</li>
+<li><b>Using eager attention for long sequences.</b> The \(6as^2b\) term (38.4) is five times the rest of a block at 4,096 tokens and grows four times with each doubling of \(s\). Check which attention kernel you actually run.</li>
+<li><b>Mixing GB and GiB.</b> A 24 GB card has 25.8 × \(10^9\) bytes; tools print different units. Pick one and keep a margin.</li>
+<li><b>Variable shapes every step.</b> Different sequence lengths create different block sizes and grow fragmentation. Pack or bucket sequences; use <code>expandable_segments</code>.</li>
+<li><b>Thinking gradient accumulation reduces model-state memory.</b> It reduces only activations (smaller micro-batch). The 16 bytes per parameter stay.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Where does the “16 bytes per parameter” for Adam come from?<span class="lvl">basic</span></summary><div class="ans">Mixed precision keeps BF16 weights (2 bytes) for the forward and backward pass and BF16 gradients (2 bytes). The optimizer keeps an FP32 master copy of the weights (4 bytes) and Adam’s two moments \(m\) and \(v\) in FP32 (4 + 4). Total 16 bytes per parameter, which ZeRO writes as \(2\Psi + 2\Psi + 12\Psi\). With an extra FP32 gradient buffer it becomes 20.</div></details>
+<details class="qa"><summary>How much memory do you need to fully fine-tune a 7B model with AdamW? Does it fit on a 24 GB GPU?<span class="lvl">basic</span></summary><div class="ans">About \(16 \times 7 \times 10^9 = 112\) GB for model states (107.8 GB for Llama 2 7B’s 6.74B parameters), plus activations. It does not fit on 24 GB. Even plain SGD in BF16 needs weights plus gradients = 27 GB. Options: LoRA (about 14 GB of states), QLoRA (about 4 GB), or sharding across several GPUs with ZeRO / FSDP.</div></details>
+<details class="qa"><summary>How does activation memory scale with batch size, sequence length, layers and hidden size?<span class="lvl">core</span></summary><div class="ans">Linear in batch size \(b\), in the number of layers \(L\) and in the hidden size (through \(h\), \(g\), \(I\)): one block stores about \(sb(12h + 4g + 8I)\) bytes in BF16, about 41 \(sbh\) for Llama 3 8B. In sequence length it is linear with FlashAttention, and quadratic without it because each layer stores \(a\) score matrices of size \(s \times s\) (about \(6as^2b\) bytes in the common FP32-softmax pattern). Parameters grow like \(h^2\), so wide models are dominated by states at short context.</div></details>
+<details class="qa"><summary>Derive the activation memory of one transformer block.<span class="lvl">core</span></summary><div class="ans">Walk through the block and list what backward needs. For a Llama-style block in BF16: each RMSNorm stores its input (\(2sbh\)); the QKV projections store their shared input (\(2sbh\)); FlashAttention stores Q (\(2sbh\)), K and V (\(4sbg\)) and its output (\(2sbh\)), which is also the output projection’s input; the second norm and the gate/up projections store \(2sbh + 2sbh\); SwiGLU stores gate, up, SiLU(gate) and their product (\(8sbI\)). Sum: \(sb(12h + 4g + 8I)\). For a GPT-style block with dropout, Korthikanti et al. get \(sbh(34 + 5as/h)\).</div></details>
+<details class="qa"><summary>Training succeeds in step 1 and runs out of memory in step 2. Why?<span class="lvl">core</span></summary><div class="ans">PyTorch’s Adam creates \(m\) and \(v\) lazily during the first <code>optimizer.step()</code>. Step 1’s forward and backward ran without them; step 2 runs with 8 more bytes per parameter permanently allocated. Fragmentation from the first step can make it worse. Fix: plan for the full 16 bytes, or test two steps when tuning batch size.</div></details>
+<details class="qa"><summary>Where is the memory peak in a training step?<span class="lvl">core</span></summary><div class="ans">Usually at the start of the backward pass: all activations are stored, the logits and their FP32 gradient exist, and gradients start to appear. During backward, each block frees its activations and creates its weight gradients. If the gradients are larger than the activations (big model, short sequences, checkpointing), the peak moves to the end of backward or the optimizer step. Roughly \(S + \max(A + M_{\text{logits}} + 4sbV,\ G)\).</div></details>
+<details class="qa"><summary>Your estimate says 70 GB, the GPU has 80 GB, and you still get OOM. What do you check?<span class="lvl">advanced</span></summary><div class="ans">Measure <code>max_memory_allocated</code> vs <code>max_memory_reserved</code>. The gap is caching and fragmentation; try <code>expandable_segments:True</code> and fixed shapes. Then look for things the formula missed: 1–2 GB of CUDA context and kernels, FP32 upcasts (logits, norms), flat gradient buffers or DDP buckets, optimizer temporaries (foreach), recomputation buffers, eager attention instead of FlashAttention, Adam states from step 2. A memory snapshot shows which allocation is at the peak.</div></details>
+<details class="qa"><summary>What is memory fragmentation, and why does it happen in training?<span class="lvl">advanced</span></summary><div class="ans">Free memory is split into many non-contiguous blocks, so a large tensor cannot be placed even though the total free memory is enough. In training it comes from mixing lifetimes: short-lived temporaries and recomputed activations are allocated between long-lived stored activations and gradients; when they are freed, they leave holes. ZeRO reports OOM with over 30% free memory in extreme cases and fixes it by pre-allocating contiguous memory for long-lived tensors. PyTorch offers expandable segments and <code>max_split_size_mb</code>.</div></details>
+<details class="qa"><summary>Which memory does gradient accumulation reduce, and which does checkpointing reduce?<span class="lvl">core</span></summary><div class="ans">Both reduce only activation memory. Accumulation lets you use a smaller micro-batch \(b\) for the same effective batch, so activations shrink linearly with \(b\), at no extra compute. Checkpointing keeps only one input per block (\(2sbh\)) and recomputes the rest, about one extra forward pass (around 33% more compute). Neither changes the 16 bytes per parameter of model states; for those you need sharding, 8-bit states or LoRA.</div></details>
+<details class="qa"><summary>Why can the output layer be a memory problem, and how do fused losses help?<span class="lvl">advanced</span></summary><div class="ans">The logits have \(s \cdot b \cdot V\) entries. With \(V = 128{,}256\) and \(s = 4096\) that is 525 million per sequence; in FP32 plus the saved log-softmax it is about 4.2 GB, and the gradient adds more. For small models this can rival all transformer blocks. Chunked or fused cross-entropy computes the loss and its gradient in pieces, never materializing the full logits; Cut Cross-Entropy reports going from 24 GB to 1 MB for the loss of Gemma 2 (2B).</div></details>
+<details class="qa"><summary>Why do LoRA and QLoRA still need activation memory?<span class="lvl">core</span></summary><div class="ans">LoRA removes gradients and optimizer states for the frozen weights, so model states drop from 16 to about 2 bytes per parameter (0.5 with 4-bit QLoRA). But the adapters sit inside every block, so the gradient must flow backward through all frozen layers, and that still needs the saved inputs of norms, attention and the FFN. Activation memory is about the same as for full fine-tuning; checkpointing is often still needed.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>How much memory do the model states of Llama 3.2 3B (3.21B parameters) take with mixed-precision AdamW? Does it fit on an 80 GB GPU, before activations?</li>
+<li>Llama 3 70B has 70.55B parameters. How much do the model states take with AdamW, and how much per GPU if ZeRO-3 shards them evenly across 8 GPUs?</li>
+<li>For Llama 3 8B, how does activation memory change when the sequence length goes from 2,048 to 4,096 tokens (a) with FlashAttention, (b) for the score term (38.4) without it?</li>
+<li>Compute the bracket of formula (38.3) for Llama 3.2 3B (\(h = 3072\), \(g = 1024\), \(I = 8192\)) in units of \(h\).</li>
+<li>Llama 3.2 1B with \(s = 2048\), \(b = 4\): compute the logit memory (38.5). Compare it with the block activations (12.1 GB).</li>
+<li>In Figure 4, which single change in the placement of the tensors would make the 3 GB request succeed?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(16 \times 3.21 \times 10^9 = 51.4\) GB: it fits on 80 GB, leaving about 28 GB (minus overhead) for activations. 2. \(16 \times 70.55 \times 10^9 = 1{,}129\) GB; divided by 8: 141 GB per GPU, still too much for 80 GB GPUs, so you need more GPUs (at least 15 for the states alone at 80 GB) or other tricks. 3. (a) It doubles (linear in \(s\)): 11.0 GB to 22.0 GB for the 32 blocks. (b) It grows four times (quadratic): 25.8 GB to 103.1 GB. 4. \(12 \times 3072 + 4 \times 1024 + 8 \times 8192 = 106{,}496 = 34.7h\). 5. \(8 \times 2048 \times 4 \times 128{,}256 = 8.4\) GB, about 70% of the 12.1 GB of all 16 blocks. 6. Put the three temporaries next to each other (for example at the end, after all activations), so that freeing them leaves one 4 GB block.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Training memory = model states + activations + temporary buffers + overhead and fragmentation.</li>
+<li>Model states are \((b_w + b_g + b_o)N\) (38.2): 16 bytes per parameter for mixed-precision AdamW (38.1), 20 with FP32 gradient accumulation. A 7B model needs about 112 GB before any activation.</li>
+<li>Activations grow linearly with batch, sequence length and depth: about \(sb(12h + 4g + 8I)\) bytes per Llama-style block (38.3), plus an \(s^2\) term without FlashAttention (38.4) and a big logits term with large vocabularies (38.5).</li>
+<li>Full fine-tuning of a 7B model cannot fit on 24 GB: even weights plus gradients are 27 GB. LoRA or QLoRA plus checkpointing does fit.</li>
+<li>The OOM happens at the peak (38.9), usually at the start of backward; Adam states appear only after step 1.</li>
+<li>Measure with <code>max_memory_allocated</code> and <code>max_memory_reserved</code>; the gap is caching and fragmentation.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ M_{\text{states}} = (b_w + b_g + b_o)N = 16N, \qquad M_{\text{layer}} = s b\,(12h + 4g + 8I), \qquad M_{\text{logits}} \approx 8 s b V \]</div>
+<div class="eq">\[ M_{\text{peak}} \approx S + \max\big(A + M_{\text{logits}} + 4sbV,\ G\big), \qquad M^{\text{ckpt}}_{\text{act}} \approx 2Lsbh + M_{\text{layer}} \]</div>
+<h2 class="plain" id="memory-math-for-training-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Rajbhandari et al. (2019). <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></li><li>Korthikanti et al. (2022). <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">Reducing Activation Recomputation in Large Transformer Models</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Rajbhandari et al. (2019). <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></li><li>Korthikanti et al. (2022). <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">Reducing Activation Recomputation in Large Transformer Models</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>Hu et al. (2021). <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">LoRA: Low-Rank Adaptation of Large Language Models</a></li><li>Dettmers et al. (2023). <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">QLoRA: Efficient Finetuning of Quantized LLMs</a></li><li>Dettmers et al. (2021). <a href="https://arxiv.org/abs/2110.02861" target="_blank" rel="noopener">8-bit Optimizers via Block-wise Quantization</a></li><li>Chen et al. (2016). <a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener">Training Deep Nets with Sublinear Memory Cost</a></li><li>Zhao et al. (2024). <a href="https://arxiv.org/abs/2403.03507" target="_blank" rel="noopener">GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection</a></li><li>Wijmans, Huval, Hertzberg, Koltun, Krähenbühl (2024). <a href="https://arxiv.org/abs/2411.09009" target="_blank" rel="noopener">Cut Your Losses in Large-Vocabulary Language Models</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/docs/stable/notes/cuda.html" target="_blank" rel="noopener">CUDA semantics: memory management and the caching allocator</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../pretraining/numbers-on-gpus-fp32-tf32-fp16-bf16.html"><small>Previous · session 37</small>Numbers on GPUs: FP32, TF32, FP16, BF16, FP8 and mixed precision</a><a class="next" href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html"><small>Next · session 39</small>Gradient accumulation and gradient checkpointing</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="memory-math-for-training"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const gb=v=>{const x=v/1e9;return x>=100?x.toFixed(0):x>=10?x.toFixed(1):x>=1?x.toFixed(2):x.toFixed(2);};
+const comma=n=>Math.round(n).toLocaleString("en-US");
+const segVal=(seg,v)=>seg.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.v===v?"true":"false"));
+
+/* Real configurations from each model's config.json (Hugging Face). g = num_key_value_heads × head_dim. */
+const CFG={
+ "1B":{n:"Llama 3.2 1B",L:16,h:2048,a:32,kv:8,dh:64,I:8192,V:128256,tied:true},
+ "3B":{n:"Llama 3.2 3B",L:28,h:3072,a:24,kv:8,dh:128,I:8192,V:128256,tied:true},
+ "7B":{n:"Llama 2 7B",L:32,h:4096,a:32,kv:32,dh:128,I:11008,V:32000,tied:false},
+ "8B":{n:"Llama 3 8B",L:32,h:4096,a:32,kv:8,dh:128,I:14336,V:128256,tied:false},
+ "70B":{n:"Llama 3 70B",L:80,h:8192,a:64,kv:8,dh:128,I:28672,V:128256,tied:false}};
+function shape(c){const h=c.h,g=c.kv*c.dh,q=c.a*c.dh;const lay=2*h*q+2*h*g+3*h*c.I+2*h;const emb=c.V*h*(c.tied?1:2);
+ const lin=c.L*(2*h*q+2*h*g+3*h*c.I);const N=c.L*lay+emb+h;
+ const lora16=c.L*16*((h+q)+2*(h+g)+(q+h)+2*(h+c.I)+(c.I+h));
+ return{N,lay,emb,lin,g,q,lora16};}
+function actBytes(c,s,b,flash,ckpt,fused){const S=shape(c);const per=s*b*(12*c.h+4*S.g+8*c.I),sc=6*c.a*s*s*b;
+ const blocks=ckpt?(c.L*2*s*b*c.h+per+(flash?0:sc)):c.L*(per+(flash?0:sc));
+ return{blocks:blocks+4*s*b*c.h,logits:fused?0:8*s*b*c.V,per,sc};}
+
+/* ---------- Figure 1: bytes per parameter ---------- */
+(function(){
+ const svg=$("#mm-bytes-svg");if(!svg)return;
+ const Q="var(--q)",K="var(--k)",Vv="var(--v)",T2="var(--t2)";
+ const rows=[["Mixed-precision AdamW",[[Q,2,"BF16 w"],[K,2,"BF16 g"],[Vv,4,"FP32 master"],[T2,4,"m"],[T2,4,"v"]]],
+  ["torch.autocast, FP32 params",[[Q,4,"FP32 w"],[K,4,"FP32 g"],[T2,4,"m"],[T2,4,"v"]]],
+  ["+ FP32 grad accumulation",[[Q,2,"BF16 w"],[K,2,"BF16 g"],[K,4,"FP32 g"],[Vv,4,"master"],[T2,4,"m"],[T2,4,"v"]]],
+  ["8-bit AdamW",[[Q,2,"w"],[K,2,"g"],[Vv,4,"master"],[T2,1,""],[T2,1,""]]],
+  ["Pure BF16 AdamW",[[Q,2,"w"],[K,2,"g"],[T2,2,"m"],[T2,2,"v"]]],
+  ["LoRA: frozen base weight",[[Q,2,"BF16 w"]]],
+  ["QLoRA: frozen 4-bit weight",[[Q,0.516,""]]]];
+ const x0=222,u=23,y0=30,rh=40;let g=`<text x="${x0}" y="16" class="svgs" font-size="12">1 block = 1 byte per parameter</text>`;
+ rows.forEach(([lab,parts],i)=>{const y=y0+i*rh;let x=x0,tot=0;
+  g+=`<text x="214" y="${y+19}" text-anchor="end" class="svgt" font-size="13.5">${B.esc(lab)}</text>`;
+  parts.forEach(([col,n,t])=>{const sx=x;for(let k=0;k<Math.ceil(n);k++){const w=Math.min(1,n-k)*u;g+=`<rect x="${(x+k*u+1).toFixed(1)}" y="${y+4}" width="${Math.max(2,w-2).toFixed(1)}" height="22" rx="3" fill="${col}" opacity=".85"/>`;}
+   if(t&&n>=2)g+=`<text x="${(sx+n*u/2).toFixed(1)}" y="${y+19.5}" text-anchor="middle" font-size="11" font-weight="700" fill="var(--card)" font-family="var(--sans)">${t}</text>`;x+=n*u;tot+=n;});
+  g+=`<text x="${(x+8).toFixed(1)}" y="${y+20}" class="svgt" font-size="14" font-weight="700">${tot<1?"≈ 0.5":tot} B</text>`;});
+ svg.innerHTML=g;
+})();
+
+/* ---------- Figure 2: memory calculator ---------- */
+(function(){
+ const svg=$("#mm-calc-svg");if(!svg)return;const info=$("#mm-calc-info");
+ const SO=[512,1024,2048,4096,8192,16384,32768],BO=[1,2,4,8,16,32];
+ const st={model:"7B",meth:"adamw",gpu:24};
+ const ss=$("#mm-calc-s"),sb=$("#mm-calc-b"),fl=$("#mm-calc-fl"),ck=$("#mm-calc-ck"),fu=$("#mm-calc-fu");
+ const METH={adamw:{n:"mixed-precision AdamW",w:2,g:2,ma:4,mv:8},acc32:{n:"AdamW with FP32 gradient accumulation",w:2,g:6,ma:4,mv:8},
+  adam8:{n:"8-bit AdamW",w:2,g:2,ma:4,mv:2},bf16:{n:"pure BF16 AdamW",w:2,g:2,ma:0,mv:4},lora:{n:"LoRA, r = 16 on all linear layers",lora:true},qlora:{n:"QLoRA (NF4 base), r = 16",lora:true,q:true}};
+ function calc(){const c=CFG[st.model],S=shape(c),m=METH[st.meth],s=SO[+ss.value],b=BO[+sb.value];
+  let parts;
+  if(m.lora){const wB=m.q?S.lin*4.127/8+2*(S.N-S.lin):2*S.N;parts=[["weights",wB,"var(--q)"],["gradients",0,"var(--k)"],["FP32 master",0,"var(--v)"],["optimizer moments",0,"var(--t2)"],["LoRA adapters",16*S.lora16,"var(--t7)"]];}
+  else parts=[["weights",m.w*S.N,"var(--q)"],["gradients",m.g*S.N,"var(--k)"],["FP32 master",m.ma*S.N,"var(--v)"],["optimizer moments",m.mv*S.N,"var(--t2)"],["LoRA adapters",0,"var(--t7)"]];
+  const A=actBytes(c,s,b,fl.checked,ck.checked,fu.checked);parts.push(["block activations",A.blocks,"var(--t5)"],["logits",A.logits,"var(--bad)"]);
+  const states=parts.slice(0,5).reduce((t,p)=>t+p[1],0);const tot=states+A.blocks+A.logits;return{c,S,m,s,b,parts,states,A,tot};}
+ function draw(){const r=calc(),G=st.gpu*1e9;$("#mm-calc-sv").value=comma(r.s);$("#mm-calc-bv").value=r.b;
+  const top=Math.max(r.tot,G)*1.08,x0=20,W=640,X=v=>x0+W*v/top;let x=x0,g="";
+  r.parts.forEach(([n,v,col])=>{if(v<=0)return;const w=W*v/top;g+=`<rect x="${x.toFixed(1)}" y="40" width="${Math.max(.8,w).toFixed(1)}" height="54" fill="${col}" opacity=".85"><title>${n}: ${gb(v)} GB</title></rect>`;x+=w;});
+  g+=`<line x1="${X(G).toFixed(1)}" y1="26" x2="${X(G).toFixed(1)}" y2="110" stroke="var(--ink)" stroke-width="2" stroke-dasharray="6 4"/><text x="${X(G).toFixed(1)}" y="20" text-anchor="middle" class="svgt" font-size="12.5" font-weight="700">GPU ${st.gpu} GB</text>`;
+  const step=[1,2,5,10,20,50,100,200,500,1000].find(t=>top/1e9/t<=7)||2000;for(let t=0;t<=top;t+=step*1e9)g+=`<line x1="${X(t).toFixed(1)}" y1="96" x2="${X(t).toFixed(1)}" y2="102" stroke="var(--muted)"/><text x="${X(t).toFixed(1)}" y="117" text-anchor="middle" class="svgs" font-size="12">${t/1e9}</text>`;
+  g+=`<text x="${x0+W/2}" y="136" text-anchor="middle" class="svgs" font-size="12.5">GB (10⁹ bytes)</text>`;
+  const fits=r.tot<=G;g+=`<text x="${x0}" y="166" class="svgt" font-size="14" font-weight="700" fill="${fits?"var(--ok)":"var(--bad)"}">${fits?"Fits":"Does not fit"}: ${gb(r.tot)} GB of ${st.gpu} GB${fits?"":` (${(r.tot/G).toFixed(1)}× the GPU)`}</text>`;
+  svg.innerHTML=g;
+  const sc=fl.checked?"":` Without FlashAttention, the score matrices add ${gb(r.A.sc)} GB per layer (formula 38.4)${ck.checked?", but with checkpointing only one layer holds them at a time":""}.`;
+  const lo=r.m.lora?` Adapters: ${comma(r.S.lora16)} parameters (${(100*r.S.lora16/r.S.N).toFixed(2)}% of the model).`:"";
+  info.innerHTML=`${B.esc(r.c.n)} (${(r.S.N/1e9).toFixed(2)}B parameters), ${B.esc(r.m.n)}, s = ${comma(r.s)}, b = ${r.b}. Model states <b>${gb(r.states)} GB</b> + block activations <b>${gb(r.A.blocks)} GB</b> + logits <b>${gb(r.A.logits)} GB</b> = <b>${gb(r.tot)} GB</b>: ${fits?"fits on":"does not fit on"} ${st.gpu} GB.${lo}${sc}`;}
+ [["#mm-calc-model","model"],["#mm-calc-meth","meth"],["#mm-calc-gpu","gpu"]].forEach(([id,key])=>{const seg=$(id);seg.addEventListener("click",e=>{const bt=e.target.closest("button");if(!bt)return;st[key]=key==="gpu"?+bt.dataset.v:bt.dataset.v;segVal(seg,bt.dataset.v);draw();});});
+ [ss,sb].forEach(e=>e.addEventListener("input",draw));[fl,ck,fu].forEach(e=>e.addEventListener("change",draw));draw();
+})();
+
+/* ---------- Figure 3: memory over one training step ---------- */
+(function(){
+ const svg=$("#mm-tl-svg");if(!svg)return;const info=$("#mm-tl-info"),T=$("#mm-tl-t");
+ const c=CFG["1B"],S=shape(c),N=S.N,s=2048,b=4,h=c.h;const Aper=s*b*(12*h+4*S.g+8*c.I),x1=2*s*b*h,nrm=4*s*b*h;
+ const F=$("#mm-tl-first"),CK=$("#mm-tl-ck"),KP=$("#mm-tl-keep"),FU=$("#mm-tl-fu");
+ function sim(){const first=F.checked,ck=CK.checked,keep=KP.checked,fused=FU.checked;const lg=fused?0:8*s*b*c.V,lgg=fused?0:4*s*b*c.V;
+  const z={w:6*N,mv:first?0:8*N,g:keep?2*N:0,a:0,l:0};const ev=[];const push=t=>ev.push(Object.assign({t},z));
+  push("start of the step (only model states)");
+  for(let l=1;l<=c.L;l++){z.a+=ck?x1:Aper;push(`forward, after block ${l}`);}
+  z.a+=nrm;z.l+=lg;push(fused?"output layer and loss (chunked)":"logits in FP32 and log-softmax saved");
+  z.l+=lgg;push(fused?"start of backward (loss gradient in chunks)":"start of backward: FP32 gradient of the logits");
+  z.l=0;z.a-=nrm;if(!keep)z.g+=2*c.V*h;push("backward through the output layer");
+  for(let l=c.L;l>=1;l--){if(ck){z.a+=Aper;push(`backward: recompute block ${l}`);z.a-=Aper+x1;}else z.a-=Aper;if(!keep)z.g+=2*S.lay;push(`backward through block ${l}`);}
+  if(first){z.mv=8*N;push("first optimizer step creates Adam m and v");}
+  push("optimizer step (all gradients needed)");if(!keep)z.g=0;push(keep?"after the step (gradients kept)":"after zero_grad(set_to_none=True)");
+  ev.forEach(e=>e.tot=e.w+e.mv+e.g+e.a+e.l);return ev;}
+ const COL=[["w","var(--q)"],["mv","var(--t2)"],["g","var(--k)"],["a","var(--t5)"],["l","var(--bad)"]];
+ function draw(){const ev=sim();T.max=ev.length-1;if(+T.value>ev.length-1)T.value=ev.length-1;const k=+T.value;$("#mm-tl-tv").value=`${k+1} / ${ev.length}`;
+  let pk=0;ev.forEach((e,i)=>{if(e.tot>ev[pk].tot)pk=i;});
+  const YM=50e9,x0=44,W=620,y0=225,H=200,bw=W/ev.length,Y=v=>y0-H*v/YM;let g="";
+  for(let t=0;t<=50;t+=10)g+=`<line x1="${x0}" y1="${Y(t*1e9)}" x2="${x0+W}" y2="${Y(t*1e9)}" stroke="var(--rule)"/><text x="${x0-6}" y="${Y(t*1e9)+4}" text-anchor="end" class="svgs" font-size="11.5">${t}</text>`;
+  ev.forEach((e,i)=>{let y=y0;COL.forEach(([key,col])=>{const v=e[key];if(v<=0)return;const hh=H*v/YM;y-=hh;g+=`<rect x="${(x0+i*bw+0.6).toFixed(1)}" y="${y.toFixed(1)}" width="${Math.max(1,bw-1.2).toFixed(1)}" height="${hh.toFixed(1)}" fill="${col}" opacity="${i===k?1:.62}"/>`;});});
+  g+=`<line x1="${x0}" y1="${Y(ev[pk].tot).toFixed(1)}" x2="${x0+W}" y2="${Y(ev[pk].tot).toFixed(1)}" stroke="var(--ink)" stroke-dasharray="5 4"/><text x="${x0+W}" y="${(Y(ev[pk].tot)-5).toFixed(1)}" text-anchor="end" class="svgt" font-size="12" font-weight="700">peak ${gb(ev[pk].tot)} GB</text>`;
+  g+=`<rect x="${(x0+k*bw).toFixed(1)}" y="${Y(YM)}" width="${bw.toFixed(1)}" height="${H}" fill="none" stroke="var(--ink)" stroke-width="1.5"/>`;
+  const fEnd=c.L+1,bS=fEnd+2;g+=`<text x="${x0+fEnd*bw/2}" y="${y0+17}" text-anchor="middle" class="svgs" font-size="12">forward</text><text x="${x0+(bS+ev.length)*bw/2}" y="${y0+17}" text-anchor="middle" class="svgs" font-size="12">backward and step</text><text x="12" y="${Y(25e9)}" class="svgs" font-size="11.5" transform="rotate(-90 12 ${Y(25e9)})" text-anchor="middle">GB</text>`;
+  svg.innerHTML=g;const e=ev[k];
+  info.innerHTML=`<b>${k+1}. ${B.esc(e.t)}</b>: ${gb(e.tot)} GB (weights + master ${gb(e.w)}, Adam ${gb(e.mv)}, gradients ${gb(e.g)}, activations ${gb(e.a)}, logits ${gb(e.l)}). Peak of this step: <b>${gb(ev[pk].tot)} GB</b> at moment ${pk+1}, “${B.esc(ev[pk].t)}”.`;}
+ T.addEventListener("input",draw);[F,CK,KP,FU].forEach(e=>e.addEventListener("change",draw));draw();
+})();
+
+/* ---------- Figure 4: fragmentation ---------- */
+(function(){
+ const svg=$("#mm-frag-svg");if(!svg)return;const info=$("#mm-frag-info");
+ const W=["W","w"],a=n=>[n,"a"],t=n=>[n,"t"];
+ const lay=(spec)=>{const m=Array(16).fill(null);spec.forEach(([id,ty,from,len])=>{for(let i=from;i<from+len;i++)m[i]={id,ty};});return m;};
+ const base=[[...W,0,6]],A1=[["a1","a",6,2]],T1=[["t1","t",8,1]],A2=[["a2","a",9,2]],T2=[["t2","t",11,1]],A3=[["a3","a",12,2]],T3=[["t3","t",14,2]];
+ const S=[{m:lay([]),t:"An empty GPU with 16 GB, in cells of 1 GB."},
+  {m:lay(base),t:"The weights and optimizer states are allocated once and live for the whole run (6 GB)."},
+  {m:lay([...base,...A1,...T1]),t:"Forward, block 1: its stored activations a1 (2 GB) and a temporary t1 (1 GB) are placed in the next free cells."},
+  {m:lay([...base,...A1,...T1,...A2,...T2]),t:"Block 2: activations a2 and temporary t2, again side by side."},
+  {m:lay([...base,...A1,...T1,...A2,...T2,...A3,...T3]),t:"Block 3: activations a3 and a larger temporary t3. The GPU is now full."},
+  {m:lay([...base,...A1,...A2,...A3]),t:"The temporaries are freed. 4 GB are free again, but in three holes: 1, 1 and 2 GB."},
+  {m:lay([...base,...A1,...A2,...A3]),req:3,ok:false,t:"The backward pass asks for one 3 GB buffer. No hole is big enough: <b>out of memory</b>, with 25% of the GPU free."},
+  {m:lay([...base,["a1","a",6,2],["a2","a",8,2],["a3","a",10,2],["g","g",12,3]]),req:3,ok:true,t:"Same tensors, placed by lifetime: long-lived activations together, temporaries at the end. Freeing them left one 4 GB block, so the 3 GB buffer fits."}];
+ const COL={w:"var(--q)",a:"var(--t5)",t:"var(--k)",g:"var(--v)"};
+ function stats(m){let free=0,best=0,run=0;m.forEach(c=>{if(!c){free++;run++;best=Math.max(best,run);}else run=0;});return{free,best};}
+ function draw(k){const st=S[k],x0=20,cw=37.5,y=70;let g="";
+  st.m.forEach((c,i)=>{const x=x0+i*cw;g+=`<rect x="${(x+1).toFixed(1)}" y="${y}" width="${(cw-2).toFixed(1)}" height="52" rx="4" fill="${c?COL[c.ty]:"none"}" opacity="${c?.85:1}" stroke="${c?"none":"var(--rule)"}" stroke-width="1.5" stroke-dasharray="${c?"":"4 3"}"/>`;
+   if(c&&(i===0||!st.m[i-1]||st.m[i-1].id!==c.id))g+=`<text x="${(x+6).toFixed(1)}" y="${y+31}" font-size="13" font-weight="700" fill="var(--card)" font-family="var(--sans)">${c.id}</text>`;
+   g+=`<text x="${(x+cw/2).toFixed(1)}" y="${y+70}" text-anchor="middle" class="svgs" font-size="10.5">${i}</text>`;});
+  const sm=st.ok?stats(st.m.map(c=>c&&c.ty==="g"?null:c)):stats(st.m);
+  if(st.req&&!st.ok)g+=`<rect x="${x0+1}" y="18" width="${(3*cw-2).toFixed(1)}" height="34" rx="4" fill="var(--bad-soft)" stroke="var(--bad)" stroke-width="2" stroke-dasharray="5 3"/><text x="${x0+3*cw/2}" y="40" text-anchor="middle" font-size="13" font-weight="700" fill="var(--bad)" font-family="var(--sans)">request: 3 GB</text><text x="${x0+3*cw+12}" y="40" class="svgt" font-size="13">needs 3 contiguous cells</text>`;
+  g+=`<text x="${x0}" y="${y+100}" class="svgt" font-size="13.5">${st.req?"Before the request, free: ":"Free: "}${sm.free} GB in total, largest contiguous block: ${sm.best} GB</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`${st.t} <span style="color:var(--muted)">(Free total: ${sm.free} GB; largest contiguous free block: ${sm.best} GB${st.req?`; request ${st.req} GB ${st.ok?"succeeds":"fails"}`:""}.)</span>`;}
+ B.stepper({n:S.length,prev:$("#mm-frag-prev"),next:$("#mm-frag-next"),play:$("#mm-frag-play"),label:$("#mm-frag-lab"),ms:2600,onStep:draw});
+})();
+})();
+</script></body></html>

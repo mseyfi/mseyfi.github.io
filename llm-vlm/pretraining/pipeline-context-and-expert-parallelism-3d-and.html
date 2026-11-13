@@ -1,0 +1,671 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Pipeline, context and expert parallelism; 3D and 4D parallel · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 49</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="pipeline-context-and-expert-parallelism-3d-and">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="pipeline-context-and-expert-parallelism-3d-and" data-session="pipeline-context-and-expert-parallelism-3d-and" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">49</span><span>Track 3: Pretraining and scale · session 19 of 22</span></div><h1 class="chap-title">Pipeline, context and expert parallelism; 3D and 4D parallel</h1><p class="chap-sub">Data parallelism and tensor parallelism are not enough for the largest runs: the model is too deep, the sequences are too long, and mixture-of-experts layers have too many experts. This session adds the three remaining ways to cut a training step: pipeline parallelism splits the layers, context parallelism splits the sequence, and expert parallelism splits the experts. Then it shows how real runs such as Llama 3 405B and DeepSeek-V3 combine them into 3D and 4D parallelism.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 43 to 48 (collective communication, DDP, ZeRO, FSDP, tensor parallelism); session 29 (mixture of experts) helps for the expert part</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How pipeline parallelism cuts the layers into stages, why it needs micro-batches, and how to compute the pipeline bubble (p − 1)/m</li><li>Why 1F1B has the same bubble as GPipe but stores only p micro-batches of activations, and how the interleaved schedule divides the bubble by v</li><li>How ring attention splits a long sequence over GPUs with an online softmax, when its communication hides behind compute, and why a zig-zag split balances causal attention</li><li>How DeepSpeed-Ulysses uses two all-to-alls to switch from a sequence split to a head split, and when it sends fewer bytes than ring attention</li><li>How expert parallelism places experts on different GPUs, the dispatch and combine all-to-alls, capacity factors and dropped tokens</li><li>How to combine DP × TP × PP × CP (and EP): the rank order, which dimension goes on which link, and the real layouts of Llama 3 405B and DeepSeek-V3</li></ul></div></header><style>
+.pp4-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.pp4-grid input[type=range]{width:100%}
+.pp4-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.pp4-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c);border:1px solid var(--muted)}
+.pp4-lab{font:500 14px var(--sans);color:var(--muted)}
+.pp4-gpu{cursor:pointer}
+.pp4-gpu:focus{outline:none}
+.pp4-gpu:focus rect{stroke:var(--tc);stroke-width:2.6}
+[data-session="pipeline-context-and-expert-parallelism-3d-and"] pre.code{font-variant-ligatures:none}
+[data-session="pipeline-context-and-expert-parallelism-3d-and"] :not(pre)>code{overflow-wrap:anywhere}
+[data-session="pipeline-context-and-expert-parallelism-3d-and"] svg text:not([font-family]){font-family:var(--sans)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Llama 3 405B was trained on up to 16,384 H100 GPUs. Its model states do not fit on one GPU, one sequence of 128K tokens does not fit on one GPU, and even one 8-GPU node is far too small. Meta cut every training step in <b>four</b> ways at the same time: tensor parallelism 8, context parallelism 16, pipeline parallelism 16 and data parallelism 8. [Certain] This session explains the three cuts you have not seen yet, and how they fit together.</p>
+<p>So far in this track you have met two cuts. <a href="../pretraining/data-parallelism-ddp.html">Session 44</a>, <a href="../pretraining/zero-stages-1-2-and-3.html">session 45</a> and <a href="../pretraining/fsdp-version-1.html">session 46</a> split the <b>batch</b>: every GPU runs the whole model on different examples. <a href="../pretraining/tensor-parallelism-and-sequence-parallelism.html">Session 48</a> splits the <b>weight matrices</b> inside each layer, which needs two all-reduces per layer and therefore fast NVLink inside one node. Three things are still missing:</p>
+<ul><li>The model may be too <b>deep</b>: with tensor parallelism capped at one node of 8 GPUs, a 405B model still has 50 billion parameters per GPU. <b>Pipeline parallelism</b> (PP) gives each GPU group only some of the layers.</li>
+<li>The <b>sequence</b> may be too long: the activations of one 128K-token sequence do not fit on one GPU group. <b>Context parallelism</b> (CP) gives each GPU only part of the sequence.</li>
+<li>A mixture-of-experts model may have too many <b>experts</b>: DeepSeek-V3 has 256 routed experts in each MoE layer. [Certain] <b>Expert parallelism</b> (EP) puts different experts on different GPUs.</li></ul>
+<p>Each cut has its own communication pattern and its own cost: idle time in the pipeline, key-value passing in the ring, all-to-all traffic for experts. The engineering question of a big run is how to multiply them so that each kind of traffic runs on a link that is fast enough for it.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “What is the pipeline bubble and how do you shrink it?”, “GPipe vs 1F1B: what is the difference if the bubble is the same?”, “Ring attention vs Ulysses?”, “Why is MoE training dominated by all-to-all?”, “You have 1,024 GPUs and a 70B model: how do you lay out TP, PP and DP?”. All are answered with numbers below.</aside>
+
+<h2>Four ways to cut a training step</h2>
+<p>A training step multiplies a batch of sequences by a stack of layers. You can cut this work along any of its axes. Each cut leaves some tensor complete on every GPU and splits another one, and that decides which collective you need (<a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">session 43</a>):</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Cut</th><th>What each GPU holds</th><th>Main communication</th><th>How often</th><th>Needs</th></tr></thead><tbody>
+<tr><td>Data (DP, FSDP)</td><td>all layers, part of the batch</td><td>all-reduce (or reduce-scatter + all-gather) of gradients and weights</td><td>once per step (FSDP: per layer, but easy to overlap)</td><td>can cross nodes</td></tr>
+<tr><td>Tensor (TP)</td><td>part of every weight matrix</td><td>all-reduce of activations</td><td>2 per layer in forward, 2 in backward</td><td>NVLink, one node</td></tr>
+<tr><td>Pipeline (PP)</td><td>some layers</td><td>point-to-point send of activations to the next stage</td><td>per micro-batch, per stage boundary</td><td>little bandwidth; crosses nodes well</td></tr>
+<tr><td>Context (CP)</td><td>part of every sequence</td><td>keys and values passed in a ring, or all-to-all</td><td>per attention layer</td><td>fast links, or long enough chunks</td></tr>
+<tr><td>Expert (EP)</td><td>some experts of every MoE layer</td><td>all-to-all of token vectors</td><td>2 per MoE layer in forward, 2 in backward</td><td>high all-to-all bandwidth</td></tr></tbody></table></div>
+<aside class="note analogy side"><span class="nt">Analogy</span>Think of a car factory. Data parallelism builds many identical factories. Tensor parallelism puts four workers on the same bolt, so they must talk all the time and must stand next to each other. Pipeline parallelism is an assembly line: each hall does a few steps and pushes the car to the next hall. Context parallelism splits one very long car (a train) into wagons that different teams build, but the teams must compare notes because every wagon must match the others. Expert parallelism is a set of specialist workshops: each car is sent to the two workshops that know its job, and then sent back.</aside>
+<p>The world size is the product of all degrees, and the rest of the session takes them one at a time:</p>
+<div class="eq">\[ N_{\text{GPU}} = \text{TP} \times \text{CP} \times \text{PP} \times \text{DP} \tag{49.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>TP, CP, PP, DP</dt><dd>the <b>degree</b> of each kind of parallelism: how many GPUs share one piece of that axis. For example PP = 16 means the layers are cut into 16 stages.</dd>
+<dt>\(N_{\text{GPU}}\)</dt><dd>the total number of GPUs. Expert parallelism is usually not an extra factor: the EP group reuses GPUs of the DP (and CP) groups, as explained later.</dd></dl>
+
+<h2>Pipeline parallelism: cut the layers into stages</h2>
+<p>Take a model with \(L\) layers and \(p\) GPUs. Give GPU 0 the first \(L/p\) layers, GPU 1 the next \(L/p\), and so on. Each group of layers is a <b>stage</b>. In the forward pass, stage \(s\) computes its layers and sends the output activations (a tensor of shape batch × sequence × hidden) to stage \(s+1\). In the backward pass, the gradient with respect to those activations flows back from stage \(s+1\) to stage \(s\). That is all the communication there is: one <b>point-to-point</b> send per stage boundary, no collective. Each GPU stores only \(1/p\) of the weights, gradients and optimizer states.</p>
+<p>The problem is obvious once you draw it. If the whole batch goes through as one piece, stage 1 waits while stage 0 computes, stage 2 waits for stage 1, and in the backward pass the order reverses. At any moment only one of the \(p\) GPUs works. A pipeline of 4 stages runs at 25% use.</p>
+<h3>Micro-batches and the bubble (GPipe)</h3>
+<p>GPipe (Huang et al., 2019) fixes this the way a factory does: split the batch into \(m\) <b>micro-batches</b> and push them through one after another. While stage 1 works on micro-batch 1, stage 0 already works on micro-batch 2. GPipe runs all \(m\) forwards, then all \(m\) backwards, and then one optimizer step with the gradients summed over the micro-batches, so the result is exactly the same as one big batch. [Certain] (This is gradient accumulation, from <a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>, spread over GPUs.)</p>
+<p>Some idle time remains at the start (the pipeline fills) and at the end (it drains). This idle time is the <b>pipeline bubble</b>. Let one micro-batch need \(t_f\) for the forward and \(t_b\) for the backward of one stage. The last micro-batch can only start on stage \(p-1\) after it passed \(p-1\) earlier stages, so one step takes</p>
+<div class="eq">\[ T_{\text{step}} = (m + p - 1)\,(t_f + t_b), \qquad T_{\text{ideal}} = m\,(t_f + t_b) \tag{49.2} \]</div>
+<div class="eq">\[ \frac{T_{\text{bubble}}}{T_{\text{ideal}}} = \frac{p - 1}{m}, \qquad \frac{T_{\text{bubble}}}{T_{\text{step}}} = \frac{p - 1}{m + p - 1} \tag{49.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(p\)</dt><dd>number of pipeline stages (the PP degree)</dd>
+<dt>\(m\)</dt><dd>number of micro-batches per training step and per pipeline</dd>
+<dt>\(t_f, t_b\)</dt><dd>time of one forward and one backward of one micro-batch on one stage (often \(t_b \approx 2 t_f\))</dd>
+<dt>\(T_{\text{bubble}}\)</dt><dd>\(T_{\text{step}} - T_{\text{ideal}}\): the time each GPU is idle in one step</dd></dl>
+<p>Megatron-LM (Narayanan et al., 2021) reports the first form, bubble over ideal time. [Certain] It is the extra cost you pay. The only ways to shrink it: more micro-batches \(m\), or fewer stages \(p\). GPipe observed close to linear speedup once \(m \ge 4p\). [Likely] With \(p = 4\) and \(m = 16\), the bubble is \(3/16 = 19\%\) of the ideal time, or \(3/19 = 16\%\) of the step.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: GPipe, one training step, seen from stage \(s\) of \(p\)</div><ol>
+<li><b>input:</b> this stage’s layers; \(m\) micro-batches (stage 0 has the tokens, the last stage has the labels)</li>
+<li><b>for</b> \(i = 1, \dots, m\): <span class="c">// forward phase</span></li>
+<li>&nbsp;&nbsp;\(x_i \leftarrow\) receive from stage \(s-1\) (stage 0: embed micro-batch \(i\))</li>
+<li>&nbsp;&nbsp;\(y_i \leftarrow \text{layers}_s(x_i)\); keep the activations of micro-batch \(i\); send \(y_i\) to stage \(s+1\) (last stage: compute loss \(\ell_i\))</li>
+<li><b>for</b> \(i = 1, \dots, m\): <span class="c">// backward phase</span></li>
+<li>&nbsp;&nbsp;\(g_i \leftarrow\) receive \(\partial \ell / \partial y_i\) from stage \(s+1\) (last stage: start from \(\ell_i / m\))</li>
+<li>&nbsp;&nbsp;backward through \(\text{layers}_s\); add the weight gradients; free the activations of \(i\); send \(\partial \ell / \partial x_i\) to stage \(s-1\)</li>
+<li><b>flush:</b> wait until all stages are done, then every stage runs its optimizer step <span class="c">// same result as one big batch</span></li></ol></div>
+
+<h3>Activation memory: why 1F1B</h3>
+<p>GPipe has a memory problem. Every stage finishes all \(m\) forwards before the first backward, so it must keep the activations of all \(m\) micro-batches at once. And we just said \(m\) should be large. GPipe answered with activation recomputation (re-running each stage’s forward during the backward). [Certain]</p>
+<p>The <b>1F1B</b> schedule (“one forward, one backward”), from PipeDream (Harlap, Narayanan et al., 2018) and used in its synchronous form (PipeDream-Flush) by Megatron-LM, changes only the <b>order</b>. [Certain] Stage \(s\) does \(p - s - 1\) “warm-up” forwards, then alternates one forward and one backward, and finishes with the remaining backwards. A backward runs as soon as its gradient arrives, and frees that micro-batch’s activations. So stage \(s\) never holds more than \(p - s\) micro-batches:</p>
+<div class="eq">\[ M_{\text{act}}^{\text{GPipe}} = m \cdot A_{\text{stage}}, \qquad M_{\text{act}}^{\text{1F1B}}(s) = \min(p - s,\ m) \cdot A_{\text{stage}} \le p \cdot A_{\text{stage}} \tag{49.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(A_{\text{stage}}\)</dt><dd>activation memory that one micro-batch leaves on one stage after its forward pass</dd>
+<dt>\(s\)</dt><dd>stage index, 0 for the first stage. Stage 0 is the worst: it holds \(p\) micro-batches.</dd></dl>
+<p>The bubble is <b>the same</b>: 1F1B still fills and drains the pipe once per step, so (49.3) still holds. What changes is that memory no longer grows with \(m\), so you can raise \(m\) to shrink the bubble without running out of memory. That is why 1F1B, not GPipe, is the default in Megatron-LM and in most large runs. [Likely]</p>
+<div class="algo"><div class="algo-h">Algorithm 2: 1F1B (PipeDream-Flush), the order of work on stage \(s\) of \(p\)</div><ol>
+<li>\(w \leftarrow \min(p - s - 1,\ m)\) <span class="c">// warm-up forwards: the last stage has none</span></li>
+<li><b>for</b> \(i = 1, \dots, w\): forward of micro-batch \(i\)</li>
+<li><b>for</b> \(i = w + 1, \dots, m\): forward of micro-batch \(i\); then backward of micro-batch \(i - w\) <span class="c">// steady state</span></li>
+<li><b>for</b> \(i = m - w + 1, \dots, m\): backward of micro-batch \(i\) <span class="c">// cool-down</span></li>
+<li>each operation waits for its input from the neighbor stage (forward: from \(s-1\); backward: from \(s+1\))</li>
+<li>optimizer step after the flush <span class="c">// at most \(p - s\) micro-batches of activations alive</span></li></ol></div>
+
+<h3>Interleaved 1F1B: smaller bubble, more messages</h3>
+<p>Megatron-LM’s second trick attacks the bubble itself. Instead of one block of \(L/p\) consecutive layers, each GPU gets \(v\) smaller <b>model chunks</b> spread over the depth. With \(p = 4\) GPUs, \(v = 2\) and 16 layers, GPU 0 holds layers 1–2 and 9–10, GPU 1 holds 3–4 and 11–12, and so on. A micro-batch now visits every GPU \(v\) times, and each visit is \(v\) times shorter. The fill and drain take \(v\) times less time: [Certain]</p>
+<div class="eq">\[ \frac{T_{\text{bubble}}}{T_{\text{ideal}}} = \frac{p - 1}{v \cdot m} \tag{49.5} \]</div>
+<p>The price: \(v\) times more point-to-point messages, and somewhat more activation memory on the first stages. Megatron-LM reports more than 10% higher throughput from this schedule. [Certain] It needs \(m\) to be a multiple of \(p\) in its original form. [Certain] Llama 3 uses an interleaved schedule too, with a bubble of \((\text{PP}-1)/(V \cdot M)\) in its own notation. [Certain] Figure 1 simulates all three schedules.</p>
+<figure class="fig wide" id="pp4-sch"><div class="fig-body">
+<div class="controls"><span class="seg" id="pp4-sch-k"><button type="button" data-v="gpipe" aria-pressed="true">GPipe</button><button type="button" data-v="1f1b" aria-pressed="false">1F1B</button><button type="button" data-v="inter" aria-pressed="false">Interleaved 1F1B (v = 2)</button></span>
+<span class="pp4-lab">Stages p:</span><span class="seg" id="pp4-sch-p"><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="4" aria-pressed="true">4</button><button type="button" data-v="8" aria-pressed="false">8</button></span></div>
+<div class="pp4-grid"><label for="pp4-sch-m">Micro-batches m</label><input type="range" id="pp4-sch-m" min="1" max="24" step="1" value="8"><output id="pp4-sch-mv"></output></div>
+<div class="scroll-x"><svg id="pp4-sch-svg" viewBox="0 0 780 200" role="img" aria-label="Timeline of forward and backward passes of each micro-batch on each pipeline stage"></svg></div>
+<div class="pp4-leg"><span style="--c:var(--q)">forward (chunk 1)</span><span style="--c:var(--k)">backward (chunk 1)</span><span style="--c:var(--q-soft)">forward (chunk 2)</span><span style="--c:var(--k-soft)">backward (chunk 2)</span><span style="--c:var(--paper2)">idle (bubble)</span></div>
+<div class="readout" id="pp4-sch-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Pipeline schedules, simulated. Each row is one GPU (stage); numbers are micro-batches. A forward of a whole stage takes 1 time unit and a backward 2; with interleaving each chunk takes half of that. Communication time is ignored. The readout compares the simulated bubble with formulas (49.3) and (49.5) and counts the micro-batches whose activations stage 0 must keep.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with GPipe, \(p = 4\), \(m = 8\): the step takes 33 units instead of 24, a bubble of 0.375 = 3/8, and stage 0 keeps all 8 micro-batches. Switch to 1F1B: the step still takes 33, but stage 0 now keeps only 4 (and the last stage 1). Switch to interleaved: 28.5 units, bubble 0.1875 = 3/16, half of 1F1B, with 5.5 micro-batches’ worth of activations on stage 0. Now move \(m\) to 24 with 1F1B: the bubble falls to 0.125 while memory stays at 4. Set \(m = 1\): one GPU works at a time, and the step takes \(4 \times 3 = 12\) for 3 units of useful work.</p></details></figure>
+
+<h3>Zero-bubble and DualPipe schedules</h3>
+<p>A newer idea splits the backward pass in two: <b>B</b>, the gradient with respect to the layer’s input (needed at once by the previous stage), and <b>W</b>, the gradient with respect to the weights (needed only by the optimizer). W can be moved later, into the holes of the bubble. Qi et al. (2024) use this to build schedules with (nearly) zero bubble, and report up to 23% more throughput than 1F1B at a similar memory limit, and up to 31% with a looser one. [Certain] DeepSeek-V3’s <b>DualPipe</b> feeds micro-batches from both ends of the pipeline and overlaps the forward of one micro-batch with the backward of another, so that their communication hides behind each other’s computation. Its paper compares the bubbles like this, with \(F\), \(B\), \(W\) the times of forward, input-backward and weight-backward chunks: [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Schedule</th><th>Bubble</th><th>Weights per GPU</th><th>Activations</th></tr></thead><tbody>
+<tr><td>1F1B</td><td>\((PP-1)(F+B)\)</td><td>1×</td><td>\(PP\)</td></tr>
+<tr><td>ZB1P (zero bubble)</td><td>\((PP-1)(F+B-2W)\)</td><td>1×</td><td>\(PP\)</td></tr>
+<tr><td>DualPipe</td><td>\((PP/2-1)(F\&amp;B+B-3W)\)</td><td>2×</td><td>\(PP+1\)</td></tr></tbody></table></div>
+<p>DualPipe keeps two copies of the weights (one per direction), which is affordable for DeepSeek-V3 because expert parallelism already spreads most of the weights. [Certain]</p>
+
+<h3>What a stage boundary costs</h3>
+<p>Per micro-batch, each boundary sends the activations forward and their gradients backward:</p>
+<div class="eq">\[ V_{\text{PP}} = 2 \cdot b\,s\,h \cdot \text{bytes} \quad \text{per micro-batch and boundary (forward + backward)} \tag{49.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(b, s, h\)</dt><dd>micro-batch size (sequences), sequence length, hidden size</dd>
+<dt>bytes</dt><dd>2 for BF16</dd></dl>
+<p>This is small compared with tensor parallelism, which all-reduces a tensor of the same size 4 times per <b>layer</b>. A stage has many layers and only one boundary. That is why pipeline parallelism is the cut that goes <b>across nodes</b>, over the slower network, while TP stays inside a node. Megatron-LM even sends only \(1/\text{TP}\) of the tensor per GPU across the boundary and all-gathers it on the other side over NVLink (its “scatter/gather” optimization). [Certain]</p>
+<div class="worked"><div class="wt">Worked example: the pipeline of Llama 3 405B</div>
+<p>Llama 3 405B has 126 layers and \(h = 16{,}384\), and was trained with PP = 16, sequences of 8,192 tokens and 16 sequences per data-parallel replica (Table 4 of the paper). [Certain] 126 is not a multiple of 16: Meta removed one layer from the first and from the last stage, because those stages also hold the embedding and the output layer with the loss. [Certain] That gives \(7 + 14 \times 8 + 7 = 126\).</p>
+<p>If one micro-batch is one sequence, \(m = 16\). Plain 1F1B would give a bubble of \(15/16 = 94\%\) of the ideal time: almost half the step idle. An interleaved schedule with \(v = 4\) gives \(15/64 = 23\%\), with \(v = 8\) it gives \(15/128 = 12\%\). (The paper does not say which \(v\) it used; these are only examples.) One boundary crossing of one micro-batch is \(1 \times 8{,}192 \times 16{,}384 \times 2\) bytes \(= 268\) MB, and with TP = 8 each GPU sends only 33.5 MB of it.</p></div>
+<aside class="note watch side"><span class="nt">Watch out</span>Stages must be balanced. The slowest stage sets the pace of the whole pipeline, so the stage with the embedding (and, worse, the one with the big output layer and the loss over a 128K vocabulary) needs fewer transformer layers. Unbalanced stages add a second bubble that formula (49.3) does not show.</aside>
+
+<h2>Context parallelism: cut the sequence</h2>
+<p>Most activation memory grows linearly with the sequence length \(N\) (the attention scores do not need to be stored with FlashAttention). For long-context training, one sequence alone can fill a GPU. Megatron’s sequence parallelism from <a href="../pretraining/tensor-parallelism-and-sequence-parallelism.html">session 48</a> only splits the sequence in the LayerNorm and dropout regions; inside attention, every TP rank still sees all \(N\) tokens. <b>Context parallelism</b> splits the sequence everywhere: CP rank \(i\) holds \(N/\text{CP}\) tokens of every sequence, in every layer.</p>
+<p>Almost all layers do not care: the MLP, the norms and the projections work token by token. The only exception is attention, where every query needs the keys and values of all earlier tokens. So CP is really about one question: how does a GPU compute attention for its queries when the keys and values live on other GPUs? There are two main answers, and Llama 3 uses a third, simpler one.</p>
+<h3>Ring attention</h3>
+<p>Ring attention (Liu et al., 2023) arranges the \(P\) CP ranks in a ring. [Certain] Each rank keeps its own query block for the whole layer. The key and value blocks travel: at step \(t\), rank \(i\) holds the K,V block of rank \((i - t) \bmod P\). It computes attention of its queries against that block, and at the same time sends the block to rank \(i + 1\) and receives the next one from rank \(i - 1\). After \(P\) steps (\(P - 1\) sends) every query has seen every key.</p>
+<p>The partial results are merged exactly with the <b>online softmax</b> trick from FlashAttention. For each query row, keep a running maximum \(m\), a running sum \(\ell\) of exponentials, and a running output \(\mathbf{o}\). When a new block with scores \(\mathbf{s}\) and values \(V_j\) arrives:</p>
+<div class="eq">\[ m' = \max\big(m,\ \max_k s_k\big), \qquad \ell' = e^{m - m'}\,\ell + \sum_k e^{s_k - m'}, \qquad \mathbf{o}' = e^{m - m'}\,\mathbf{o} + \sum_k e^{s_k - m'}\,\mathbf{v}_k \tag{49.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(s_k\)</dt><dd>score \(\mathbf{q} \cdot \mathbf{k}_k / \sqrt{d}\) of this query against key \(k\) of the new block (masked keys give \(-\infty\))</dd>
+<dt>\(m, \ell, \mathbf{o}\)</dt><dd>running maximum, running sum of exponentials and running weighted sum of values for this query</dd>
+<dt>\(e^{m - m'}\)</dt><dd>rescales the old partial results when the maximum grows, so all exponentials use the same reference</dd></dl>
+<p>At the end the output is \(\mathbf{o} / \ell\), exactly the softmax attention of a single GPU; no approximation. The memory per rank depends only on the block size, not on \(N\). That is how ring attention reaches contexts “device count times longer”. [Certain]</p>
+<p><b>When is the communication free?</b> Per step, a rank computes \(4 d c^2\) FLOPs (scores and weighted values, for a block of \(c\) queries against \(c\) keys, with \(d\) the total width of the queries) and sends a K and a V block of \(c\) tokens each. Ring attention’s paper requires the compute time to cover the transfer time. [Certain] With grouped-query attention (GQA, <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>) the K,V width \(d_{kv}\) is smaller than \(d\), so the condition becomes</p>
+<div class="eq">\[ \frac{4 d c^2}{F} \ \ge\ \frac{2 \cdot 2\, c\, d_{kv}}{B} \quad\Longleftrightarrow\quad c \ \ge\ \frac{F}{B} \cdot \frac{d_{kv}}{d} \tag{49.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(c\)</dt><dd>tokens per CP rank, \(N / P\)</dd>
+<dt>\(F\)</dt><dd>FLOP/s of one GPU; \(B\): bytes per second of the link between ring neighbors</dd>
+<dt>\(d, d_{kv}\)</dt><dd>width of all query heads together, width of all key (or value) heads together. With full multi-head attention \(d_{kv} = d\) and the condition is the paper’s \(c \ge F/B\).</dd>
+<dt>2 · 2</dt><dd>two tensors (K and V), 2 bytes each in BF16</dd></dl>
+<p>For an H100 (989 TFLOPS dense BF16 [Likely]) on 50 GB/s InfiniBand, multi-head attention needs \(c \ge 19{,}788\) tokens per rank; with Llama 3 8B’s GQA (\(d_{kv}/d = 1024/4096\)) about 4,945. Over NVLink at 450 GB/s per direction, about 550 tokens are enough. These use peak FLOP/s, so they are optimistic; real kernels run slower, which makes overlap easier.</p>
+<h3>Causal attention needs a zig-zag split</h3>
+<p>With a causal mask, the token at position 10,000 attends to 10,000 keys, the first token to one. If rank 0 holds the first quarter and rank 3 the last, rank 3 does almost all the work. In ring attention every step waits for the slowest rank, so the whole layer runs at the pace of rank 3.</p>
+<p>The fix: cut the sequence into \(2P\) chunks and give rank \(i\) chunk \(i\) and chunk \(2P - 1 - i\), one early and one late. Llama 3 does exactly this. [Certain] Count work in chunk-by-chunk blocks (a block on the diagonal counts one half, because of the mask). Chunk \(j\) costs \(j + \tfrac12\) blocks, so</p>
+<div class="eq">\[ W_i = \big(i + \tfrac12\big) + \big(2P - 1 - i + \tfrac12\big) = 2P \quad \text{for every rank } i \tag{49.9} \]</div>
+<p>Every rank does the same work, and Figure 2 shows that even every ring <b>step</b> is balanced: each rank computes 2 blocks per step. With a contiguous split, the step time is 2 blocks for step 0 and 4 for every later step, which gives \(2 + 4(P-1) = 14\) for \(P = 4\) against the ideal 8: 57% efficiency.</p>
+<figure class="fig wide" id="pp4-ring"><div class="fig-body">
+<div class="controls"><span class="seg" id="pp4-ring-mode"><button type="button" data-v="zig" aria-pressed="true">Zig-zag split</button><button type="button" data-v="con" aria-pressed="false">Contiguous split</button></span>
+<span class="pp4-lab">CP ranks P:</span><span class="seg" id="pp4-ring-p"><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="4" aria-pressed="true">4</button><button type="button" data-v="8" aria-pressed="false">8</button></span></div>
+<div class="controls"><button type="button" class="btn" id="pp4-ring-prev">Back</button><button type="button" class="btn primary" id="pp4-ring-play">Play</button><button type="button" class="btn" id="pp4-ring-next">Next</button><span id="pp4-ring-lab" class="pp4-lab"></span></div>
+<div class="scroll-x"><svg id="pp4-ring-svg" viewBox="0 0 720 250" role="img" aria-label="Causal attention matrix split into chunks, colored by the rank that computes each block at each ring step"></svg></div>
+<div class="readout" id="pp4-ring-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Ring attention with a causal mask. Left: the attention matrix cut into \(2P\) chunks of queries (rows) and keys (columns); chunk numbers are colored by the rank that owns them. A block is computed by the rank that owns its query chunk, at the ring step when the key chunk arrives: bright = this step, faded = earlier steps, empty = not yet. Blocks above the diagonal are masked and never computed. Right: the work of each rank at this step.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Start with the zig-zag split and \(P = 4\). Rank 0 owns chunks 0 and 7. Press Next: at every step every rank computes exactly 2 blocks, and the layer finishes in 8 block-times, the ideal. Switch to the contiguous split and step again: at step 0 each rank does its own diagonal (2 blocks), but at later steps the ranks with late chunks compute 4 blocks while rank 0 does nothing, because everything it receives is in its future. The layer needs 14 block-times. With \(P = 8\) the contiguous split gets worse (30 against 16, 53%).</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 3: causal ring attention, one layer, seen from CP rank \(i\) of \(P\)</div><ol>
+<li><b>input:</b> local queries, keys, values for this rank’s chunks \(\{i,\ 2P-1-i\}\) <span class="c">// zig-zag split</span></li>
+<li>\(m \leftarrow -\infty,\ \ell \leftarrow 0,\ \mathbf{o} \leftarrow 0\) for every local query; \((K, V) \leftarrow\) local keys and values</li>
+<li><b>for</b> \(t = 0, \dots, P-1\):</li>
+<li>&nbsp;&nbsp;<b>if</b> \(t \lt P-1\): start sending \((K, V)\) to rank \(i+1\) and receiving the next block from rank \(i-1\) <span class="c">// asynchronous</span></li>
+<li>&nbsp;&nbsp;scores of local queries against \(K\), masked by token positions; update \(m, \ell, \mathbf{o}\) with (49.7)</li>
+<li>&nbsp;&nbsp;wait for the receive; \((K, V) \leftarrow\) the received block (it came from rank \((i - t - 1) \bmod P\))</li>
+<li><b>return</b> \(\mathbf{o} / \ell\) <span class="c">// backward: pass K, V and their gradients around the ring again</span></li></ol></div>
+
+<h3>DeepSpeed-Ulysses: switch from a sequence split to a head split</h3>
+<p>DeepSpeed-Ulysses (Jacobs et al., 2023) uses a different idea. [Certain] Attention heads are independent of each other. So before attention, do an <b>all-to-all</b> that turns “each rank has \(N/P\) tokens of all heads” into “each rank has all \(N\) tokens of \(H/P\) heads”. Now every rank runs ordinary attention (FlashAttention, any mask) on its heads, with no communication inside. After attention, a second all-to-all switches back to the sequence split. In total four all-to-alls per layer in the forward pass: Q, K, V before, the output after. Let us count the bytes each GPU sends, with the all-to-all from <a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">session 43</a> (each rank keeps \(1/P\) of its data and sends the rest):</p>
+<div class="eq">\[ V_{\text{Ulysses}} = \frac{N}{P}\cdot\frac{P-1}{P}\,(2d + 2d_{kv}) \cdot 2 \ \text{bytes}, \qquad V_{\text{ring}} = (P-1)\,\frac{N}{P}\, 2 d_{kv} \cdot 2 \ \text{bytes} \tag{49.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2d + 2d_{kv}\)</dt><dd>Ulysses moves Q and the output (width \(d\) each) and K and V (width \(d_{kv}\) each)</dd>
+<dt>\(2 d_{kv}\)</dt><dd>ring attention moves only K and V, but \(P - 1\) times</dd>
+<dt>\(\cdot\, 2\) bytes</dt><dd>BF16; both are per GPU, per attention layer, forward only</dd></dl>
+<p>Ulysses’ volume per GPU shrinks like \(N/P\): if you double both the sequence and the GPUs, it stays the same. That is the paper’s main claim. [Certain] Ring’s volume per GPU stays near \(2 N d_{kv}\) whatever \(P\) is. The ratio is \(V_{\text{ring}}/V_{\text{Ulysses}} = P\, d_{kv}/(d + d_{kv})\). With full multi-head attention, Ulysses sends \(P/2\) times less. With strong GQA, ring can send less: for Llama 3 8B (\(d_{kv}/d = 1/4\)) the ratio is \(P/5\), so ring wins below \(P = 5\). But ring’s traffic can hide behind compute (49.8), while Ulysses’ all-to-alls sit on the critical path.</p>
+<p>Ulysses has one hard limit: the CP degree cannot be larger than the number of heads, and with GQA the K,V heads must be copied once \(P\) passes the number of K,V heads (8 for all Llama 3 models). [Certain] All-to-all also wants high bandwidth between all pairs, which means one node. <b>USP</b> (Fang and Zhao, 2024) therefore combines both: Ulysses inside the node, ring attention across nodes, with CP = Ulysses degree × ring degree. [Certain]</p>
+<figure class="fig" id="pp4-uly"><div class="fig-body">
+<div class="controls"><span class="seg" id="pp4-uly-m"><button type="button" data-v="l8" aria-pressed="true">Llama 3 8B (GQA)</button><button type="button" data-v="l70" aria-pressed="false">Llama 3 70B (GQA)</button><button type="button" data-v="mha" aria-pressed="false">MHA, d = 4096</button></span></div>
+<div class="controls"><span class="pp4-lab">Link between ring neighbors:</span><span class="seg" id="pp4-uly-b"><button type="button" data-v="450" aria-pressed="false">NVLink, 450 GB/s</button><button type="button" data-v="50" aria-pressed="true">InfiniBand, 50 GB/s</button></span></div>
+<div class="pp4-grid"><label for="pp4-uly-n">Sequence length N</label><input type="range" id="pp4-uly-n" min="0" max="5" step="1" value="2"><output id="pp4-uly-nv"></output>
+<label for="pp4-uly-p">CP degree P</label><input type="range" id="pp4-uly-p" min="0" max="5" step="1" value="2"><output id="pp4-uly-pv"></output></div>
+<svg id="pp4-uly-svg" viewBox="0 0 680 140" role="img" aria-label="Bar chart of bytes sent per GPU by Ulysses and by ring attention"></svg>
+<div class="readout" id="pp4-uly-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Bytes sent per GPU for one attention layer’s forward pass, by formula (49.10), and two checks: does Ulysses have enough heads, and is ring attention’s chunk large enough to hide its transfers, by (49.8)? Model widths: Llama 3 8B \(d = 4096, d_{kv} = 1024\); 70B \(d = 8192, d_{kv} = 1024\); MHA \(d = d_{kv} = 4096\).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Defaults: Llama 3 8B, 128K tokens, \(P = 8\). Ulysses sends 294 MB and ring 470 MB per GPU (ratio 1.6 = 8 × 1024 / 5120). Raise \(P\) to 16: Ulysses falls to 157 MB, ring stays near 503 MB, but Ulysses now needs copies of the 8 K,V heads. Switch to MHA at \(P = 8\): ring sends 4 times more. Now set \(N\) = 32K and \(P = 64\) on InfiniBand: only 512 tokens per rank, far below the 4,945 needed, so ring attention cannot hide its traffic.</p></details></figure>
+<h3>The Llama 3 choice: all-gather K and V</h3>
+<p>Llama 3 does not use a ring. Each CP rank all-gathers the keys and values of the whole sequence, then computes attention for its local queries (with the zig-zag split for balance). [Certain] The authors chose this because it is simpler and works with different masks, such as document masks [Likely], and because with GQA the K and V tensors are much smaller than Q, so the all-gather is cheap. [Certain] Its volume per GPU, \(\frac{P-1}{P} N \cdot 2 d_{kv}\), is the same as the ring’s; the cost is memory for the full K and V of one layer at a time.</p>
+
+<h2>Expert parallelism: cut the experts</h2>
+<p>A mixture-of-experts layer (<a href="../transformers/mixture-of-experts-moe.html">session 29</a>) replaces one MLP with \(E\) expert MLPs and a router that sends each token to its top \(k\) experts. Most parameters of an MoE model sit in the experts, but each token uses only \(k\) of them. <b>Expert parallelism</b> places the \(E\) experts on \(\text{EP}\) GPUs, \(E/\text{EP}\) experts per GPU, introduced at scale by GShard (Lepikhin et al., 2020), which trained a 600B-parameter MoE translation model on 2,048 TPU v3 chips. [Certain]</p>
+<p>The attention part of the layer still runs data-parallel: each GPU has its own tokens. So each MoE layer becomes:</p>
+<div class="algo"><div class="algo-h">Algorithm 4: one MoE layer with expert parallelism, forward pass on EP rank \(r\)</div><ol>
+<li><b>input:</b> this rank’s tokens \(X_r\) (\(T\) tokens), router weights (replicated), the \(E/\text{EP}\) experts that live here</li>
+<li>scores \(\leftarrow \softmax(X_r W_{\text{router}})\); keep the top-\(k\) experts and weights of every token</li>
+<li>sort the token copies by destination rank (the owner of each chosen expert); drop copies beyond an expert’s capacity</li>
+<li><b>dispatch all-to-all:</b> send each copy to its expert’s rank; receive the copies that chose my experts</li>
+<li>run each local expert on the copies it received <span class="c">// a grouped matrix multiply</span></li>
+<li><b>combine all-to-all:</b> send each result back to the rank its token came from</li>
+<li>\(y_t \leftarrow \sum_{\text{kept slots}} w_{t,e}\,\text{expert}_e(x_t)\), plus the residual <span class="c">// backward: the same two all-to-alls in reverse</span></li></ol></div>
+<p>With uniform routing, a fraction \((\text{EP}-1)/\text{EP}\) of the copies leave the GPU. Per MoE layer and per GPU, in the forward pass:</p>
+<div class="eq">\[ V_{\text{dispatch}} = V_{\text{combine}} \approx T\,k\,h \cdot \frac{\text{EP}-1}{\text{EP}} \cdot 2 \ \text{bytes}, \qquad C = \Big\lceil \text{CF} \cdot \frac{T_{\text{all}}\,k}{E} \Big\rceil \tag{49.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(T\), \(T_{\text{all}}\)</dt><dd>tokens on one GPU, tokens on all GPUs of the EP group together</dd>
+<dt>\(k\)</dt><dd>experts per token (top-\(k\)); \(h\): hidden size</dd>
+<dt>\(C\)</dt><dd>the <b>capacity</b> of one expert: the most token copies it accepts in this step. Fixed-size buffers make the all-to-all and the expert matmul static and fast.</dd>
+<dt>CF</dt><dd>the <b>capacity factor</b>, for example 1.25 (Switch Transformer). Copies beyond \(C\) are <b>dropped</b>: they skip the expert and pass only through the residual connection. [Certain]</dd></dl>
+<p>For a Mixtral-like layer (\(h = 4096\), top-2, 8 experts on EP = 8) with 8,192 tokens per GPU, the dispatch sends \(8192 \times 2 \times 4096 \times 7/8 \times 2\) bytes \(= 117\) MB per GPU, and the four all-to-alls of forward and backward 470 MB, for <b>every</b> MoE layer. Unlike TP’s all-reduces this traffic is irregular (it depends on the router) and touches every pair of GPUs. Figure 4 routes real (seeded) tokens.</p>
+<figure class="fig" id="pp4-moe"><div class="fig-body">
+<div class="pp4-grid"><label for="pp4-moe-s">Router skew (preference for low-numbered experts)</label><input type="range" id="pp4-moe-s" min="0" max="3" step="0.1" value="0"><output id="pp4-moe-sv"></output>
+<label for="pp4-moe-c">Capacity factor CF</label><input type="range" id="pp4-moe-c" min="0" max="4" step="1" value="1"><output id="pp4-moe-cv"></output></div>
+<div class="scroll-x"><svg id="pp4-moe-svg" viewBox="0 0 680 240" role="img" aria-label="All-to-all send matrix between four GPUs and the number of tokens routed to each of eight experts"></svg></div>
+<div class="readout" id="pp4-moe-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Expert parallelism on 4 GPUs with 8 experts (E0, E1 on GPU 0; E2, E3 on GPU 1; and so on), top-2 routing, 16 tokens per GPU. Router logits are seeded random numbers plus a skew toward low-numbered experts. Left: how many token copies each GPU sends to each GPU in the dispatch all-to-all (the dashed diagonal stays local). Right: the load of each expert, the capacity line, and dropped copies in red.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>With no skew and CF = 1.25 (capacity 20), loads are uneven just by chance; read the dropped count in the readout. Most copies cross to another GPU: with 4 ranks, about 3/4 are expected to. Now raise the skew to 2: experts E0 and E1 get 52 and 34 copies against an average of 16, capacity drops 46 copies (36%), and GPU 0 receives 40 of the 82 kept copies while GPU 3 receives 2. (Copies are kept first come, first served, in rank order, so GPU 0’s own tokens win.) Set CF to “none”: nothing is dropped, but GPU 0 now does much more expert work than GPU 3, and every other GPU waits for it. This is why MoE training needs a load-balancing loss or bias (<a href="../transformers/mixture-of-experts-moe.html">session 29</a>).</p></details></figure>
+<h3>Where expert parallelism lives in the mesh</h3>
+<p>The EP group usually reuses GPUs of the data-parallel group: the attention weights are replicated over DP as usual, while the expert weights are split over EP and replicated over the remaining DP / EP copies. [Likely] So EP does not multiply the GPU count; it changes how the expert weights are stored. DeepSeek-V3 is the clearest real example: 2,048 H800 GPUs, 16-way pipeline parallelism, 64-way expert parallelism spread over 8 nodes, ZeRO-1 data parallelism, and <b>no tensor parallelism</b>. [Certain] With 256 routed experts per layer on 64 GPUs, each GPU holds 4 routed experts of each layer. Because the network between nodes (50 GB/s InfiniBand) is about 3.2 times slower than NVLink (160 GB/s) in their cluster, each token may be sent to at most 4 nodes, and 20 of the GPU’s streaming multiprocessors are reserved for communication kernels. [Certain]</p>
+
+<h2>Putting it together: 3D and 4D parallelism</h2>
+<p><b>3D parallelism</b> means DP × TP × PP, the recipe of Megatron-LM: it trained a 1-trillion-parameter model at 502 PFLOP/s on 3,072 A100 GPUs, 52% of peak (about 163 TFLOPS per GPU). [Certain] <b>4D</b> adds CP for long sequences, as in Llama 3. The main rule for the layout is simple: <b>the more a dimension communicates, the closer its GPUs must be.</b></p>
+<ol><li><b>TP innermost</b>, inside one node: 4 all-reduces of activations per layer. Llama 3’s order is [TP, CP, PP, DP], from innermost to outermost. [Certain]</li>
+<li><b>CP next</b>: K,V traffic every attention layer, but it can overlap with compute.</li>
+<li><b>PP</b>: only point-to-point activations at stage boundaries, across nodes.</li>
+<li><b>DP outermost</b>: one gradient reduction per step (or FSDP gathers that can be prefetched), which tolerates the most latency. [Certain]</li></ol>
+<p>“Innermost” means neighboring rank numbers. With the order [TP, CP, PP, DP], TP changes fastest:</p>
+<div class="eq">\[ r = t + \text{TP}\big(c + \text{CP}\,(q + \text{PP}\cdot d)\big), \qquad t = r \bmod \text{TP},\ \ c = \lfloor r/\text{TP} \rfloor \bmod \text{CP},\ \dots \tag{49.12} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(r\)</dt><dd>global rank, 0 to \(N_{\text{GPU}} - 1\); with 8 GPUs per node, ranks 0–7 are node 0</dd>
+<dt>\(t, c, q, d\)</dt><dd>the rank’s coordinates: TP index, CP index, pipeline stage, DP index</dd>
+<dt>a group</dt><dd>all ranks that share three coordinates and differ in the fourth; for example the TP group of rank \(r\) is all ranks with the same \(c, q, d\)</dd></dl>
+<p>With TP = 8 and 8 GPUs per node, each TP group is exactly one node. Figure 5 lets you click any GPU and see its four groups.</p>
+<figure class="fig" id="pp4-mesh"><div class="fig-body">
+<div class="controls"><span class="pp4-lab">TP</span><span class="seg" id="pp4-mesh-tp"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="true">2</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="false">8</button></span>
+<span class="pp4-lab">CP</span><span class="seg" id="pp4-mesh-cp"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="true">2</button><button type="button" data-v="4" aria-pressed="false">4</button></span>
+<span class="pp4-lab">PP</span><span class="seg" id="pp4-mesh-pp"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="true">2</button><button type="button" data-v="4" aria-pressed="false">4</button></span>
+<span class="pp4-lab">DP</span><span class="seg" id="pp4-mesh-dp"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="true">2</button><button type="button" data-v="4" aria-pressed="false">4</button></span></div>
+<div class="controls"><span class="pp4-lab">Highlight the group of:</span><span class="seg" id="pp4-mesh-g"><button type="button" data-v="tp" aria-pressed="true">TP</button><button type="button" data-v="cp" aria-pressed="false">CP</button><button type="button" data-v="pp" aria-pressed="false">PP</button><button type="button" data-v="dp" aria-pressed="false">DP</button></span></div>
+<div class="scroll-x"><svg id="pp4-mesh-svg" viewBox="0 0 720 220" role="img" aria-label="GPUs grouped into nodes, colored by pipeline stage, with the selected group highlighted"></svg></div>
+<div class="readout" id="pp4-mesh-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> The rank layout of formula (49.12), with 8 GPUs per node. Each square is one GPU, colored by its pipeline stage (s) and labeled with its DP index (d). Click (or Tab to and press Enter on) a GPU; the GPUs of its chosen group light up. The readout lists all four groups and says whether each stays inside one node.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Defaults: TP 2 × CP 2 × PP 2 × DP 2 = 16 GPUs in 2 nodes. GPU 0’s TP group is {0, 1}, its CP group {0, 2}, its pipeline group {0, 4} and its DP group {0, 8}: only the DP group leaves the node. Set TP = 8: now each node is one TP group, and every other group crosses nodes, which is what you want, since TP traffic is the heaviest. Then try the bad order in your head: if DP were innermost, the TP all-reduces would cross the network 4 times per layer.</p></details></figure>
+<h3>Real layouts</h3>
+<div class="tblw"><table class="tb"><thead><tr><th>Run</th><th>GPUs</th><th>TP</th><th>CP</th><th>PP</th><th>DP</th><th>Sequence</th><th>Result</th></tr></thead><tbody>
+<tr><td>Llama 3 405B, short context</td><td>8,192</td><td>8</td><td>1</td><td>16</td><td>64</td><td>8,192</td><td>430 TFLOPS/GPU, 43% BF16 MFU</td></tr>
+<tr><td>Llama 3 405B, short context</td><td>16,384</td><td>8</td><td>1</td><td>16</td><td>128</td><td>8,192</td><td>400 TFLOPS/GPU, 41% MFU</td></tr>
+<tr><td>Llama 3 405B, long context</td><td>16,384</td><td>8</td><td>16</td><td>16</td><td>8</td><td>131,072</td><td>380 TFLOPS/GPU, 38% MFU</td></tr>
+<tr><td>DeepSeek-V3 (MoE, 671B total)</td><td>2,048</td><td>1</td><td>–</td><td>16</td><td>ZeRO-1, with EP 64</td><td>4K (pretraining)</td><td>no TP at all; DualPipe; FP8</td></tr></tbody></table></div>
+<p>The Llama 3 rows are Table 4 of the paper; every configuration keeps 16M tokens per batch: \(64 \times 32 \times 8{,}192\), \(128 \times 16 \times 8{,}192\) and \(8 \times 16 \times 131{,}072\) all equal 16,777,216. [Certain] Notice the long-context row: CP grew from 1 to 16 and DP shrank from 128 to 8, so the same GPUs process the same number of tokens, just as fewer, longer sequences. The DeepSeek-V3 row combines facts from its report: 671B total parameters, 4K pretraining sequence length. [Likely]</p>
+<p>MFU (model FLOPs utilization: the share of the GPU’s peak FLOP/s that goes into the model’s own math, see <a href="../pretraining/distributed-checkpoints-fault-tolerance-and-mfu.html">session 51</a>) falls from 43% to 38% as the setup grows. That is the cost of more communication and more bubbles. Figure 6 lets you try layouts for the 405B model.</p>
+<figure class="fig" id="pp4-plan"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="pp4-plan-a">Llama 3: 8K context</button><button type="button" class="btn" id="pp4-plan-b">Llama 3: 128K context</button></div>
+<div class="controls"><span class="pp4-lab">TP</span><span class="seg" id="pp4-plan-tp"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="true">8</button><button type="button" data-v="16" aria-pressed="false">16</button></span>
+<span class="pp4-lab">CP</span><span class="seg" id="pp4-plan-cp"><button type="button" data-v="1" aria-pressed="true">1</button><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="false">8</button><button type="button" data-v="16" aria-pressed="false">16</button></span></div>
+<div class="controls"><span class="pp4-lab">PP</span><span class="seg" id="pp4-plan-pp"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="false">8</button><button type="button" data-v="16" aria-pressed="true">16</button><button type="button" data-v="32" aria-pressed="false">32</button></span>
+<span class="pp4-lab">DP</span><span class="seg" id="pp4-plan-dp"><button type="button" data-v="8" aria-pressed="false">8</button><button type="button" data-v="16" aria-pressed="false">16</button><button type="button" data-v="32" aria-pressed="false">32</button><button type="button" data-v="64" aria-pressed="false">64</button><button type="button" data-v="128" aria-pressed="true">128</button></span></div>
+<div class="controls"><span class="pp4-lab">Sequence</span><span class="seg" id="pp4-plan-s"><button type="button" data-v="4096" aria-pressed="false">4K</button><button type="button" data-v="8192" aria-pressed="true">8K</button><button type="button" data-v="32768" aria-pressed="false">32K</button><button type="button" data-v="131072" aria-pressed="false">128K</button></span>
+<span class="pp4-lab">Interleave V</span><span class="seg" id="pp4-plan-v"><button type="button" data-v="1" aria-pressed="true">1</button><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="false">8</button></span></div>
+<svg id="pp4-plan-svg" viewBox="0 0 680 110" role="img" aria-label="Bars for model-state memory per GPU and pipeline bubble"></svg>
+<div class="readout" id="pp4-plan-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 6.</b> A simple 4D planner for Llama 3 405B (405.85B parameters, 126 layers) with a fixed batch of 16M tokens and one sequence per micro-batch. Model states per GPU: 4 bytes per parameter of the GPU’s TP × PP slice (BF16 weights and gradients) plus 12 bytes (FP32 master weights and Adam moments) sharded over DP × CP, like ZeRO-1. Activations, buffers and the embedding imbalance are not included; this is a teaching model, not Meta’s exact memory layout.</figcaption>
+<details class="howto"><summary>How to read Figure 6</summary><p>Press “8K context”: 16,384 GPUs, 3.17B parameters per GPU, about 13.0 GB of model states, \(m = 16\) micro-batches and a bubble of 94% with \(V = 1\). Raise \(V\) to 4: 23%. Now set PP = 4: memory jumps to about 52 GB of model states, but the bubble drops. Press “128K context”: the same 16,384 GPUs, but now with DP = 8 and CP = 16; the memory of model states is the same, because CP ranks still divide the optimizer states. Set CP back to 1 with 128K: the warning tells you that the activations of a 128K sequence would have to fit on one TP group.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: model states of Llama 3 405B per GPU</div>
+<p>Parameters from the config (hidden 16,384, MLP 53,248, 126 layers, 128 query heads and 8 K,V heads of 128 dimensions, vocabulary 128,256, untied embeddings): each layer has \(2 \cdot 16384^2 + 2 \cdot 16384 \cdot 1024 + 3 \cdot 16384 \cdot 53248 + 2 \cdot 16384 = 3{,}187{,}703{,}808\) parameters, the embedding and the output layer \(128{,}256 \times 16{,}384 = 2{,}101{,}346{,}304\) each. Total: \(126 \times 3{,}187{,}703{,}808 + 2 \times 2{,}101{,}346{,}304 + 16{,}384 = 405{,}853{,}388{,}800\).</p>
+<p>With TP = 8 and PP = 16, each GPU owns \(405.85\text{B}/128 = 3.17\)B parameters. Without sharding over DP, mixed-precision AdamW costs 16 bytes each: 50.7 GB. Sharding the 12 bytes of FP32 states over DP = 128 leaves \(4 \times 3.17 = 12.7\) GB plus \(12 \times 3.17\text{B}/128 = 0.30\) GB, about 13.0 GB, so most of the 80 GB is left for activations. The 16,384 GPUs are \(8 \times 1 \times 16 \times 128\).</p></div>
+<h3>How to choose the degrees</h3>
+<p>The Megatron-LM paper gives practical rules, and they are still the starting point: [Certain]</p>
+<ol><li>Use TP up to the number of GPUs in a node (usually 8), and not beyond.</li>
+<li>Then use PP across nodes until the model states and activations fit.</li>
+<li>Use the remaining GPUs for DP (with ZeRO or FSDP to shard the optimizer states).</li>
+<li>Choose the micro-batch size and \(m\) together: larger micro-batches use the GPU better, more micro-batches shrink the bubble.</li></ol>
+<p>Add CP when one sequence’s activations do not fit, and EP for MoE layers. Then measure: the best layout depends on the network, the model shape and the batch size, and real teams search over a few candidates. [Likely]</p>
+
+<h2>Code: the ideas in runnable PyTorch</h2>
+<p>We cannot run 4D parallelism on a laptop, but every piece of math above can be checked on one CPU. First, ring attention with the zig-zag split and the online softmax of (49.7), against plain causal attention, and the two Ulysses all-to-alls as tensor reshuffles. We ran it with PyTorch 2.8: the ring result matches to about \(10^{-7}\), and both all-to-all checks print True.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+N, d, P = 16, 8, 4                                <span class="cm"># sequence length, head dim, CP ranks</span>
+q, k, v = torch.randn(3, N, d).unbind(0)
+
+<span class="kw2">def</span> full_causal(q, k, v):                         <span class="cm"># reference: one GPU sees everything</span>
+    s = q @ k.T / d**0.5
+    s = s.masked_fill(torch.ones(N, N).triu(1).bool(), float(<span class="st">"-inf"</span>))
+    <span class="kw2">return</span> torch.softmax(s, -1) @ v
+
+<span class="cm"># zig-zag split: 2P chunks, rank i keeps chunks i and 2P-1-i (balances the causal work)</span>
+chunks = torch.arange(N).chunk(2 * P)
+own = [torch.cat([chunks[i], chunks[2 * P - 1 - i]]) <span class="kw2">for</span> i <span class="kw2">in</span> range(P)]   <span class="cm"># token positions</span>
+
+<span class="kw2">def</span> ring_attention(q, k, v):
+    out = [<span class="kw2">None</span>] * P
+    <span class="kw2">for</span> i <span class="kw2">in</span> range(P):                            <span class="cm"># each rank i (simulated one after another)</span>
+        qi, pos_q = q[own[i]], own[i]
+        m = torch.full((len(pos_q), 1), float(<span class="st">"-inf"</span>))     <span class="cm"># running max     (online softmax)</span>
+        l = torch.zeros(len(pos_q), 1)                      <span class="cm"># running sum of exp</span>
+        acc = torch.zeros(len(pos_q), d)                    <span class="cm"># running weighted sum of values</span>
+        <span class="kw2">for</span> t <span class="kw2">in</span> range(P):                        <span class="cm"># ring step t: rank i holds the K,V block of rank j</span>
+            j = (i - t) % P
+            kj, vj, pos_k = k[own[j]], v[own[j]], own[j]
+            s = qi @ kj.T / d**0.5
+            s = s.masked_fill(pos_k[<span class="kw2">None</span>, :] &gt; pos_q[:, <span class="kw2">None</span>], float(<span class="st">"-inf"</span>))   <span class="cm"># causal mask</span>
+            m_new = torch.maximum(m, s.max(-1, keepdim=<span class="kw2">True</span>).values)
+            scale = torch.exp(m - m_new).nan_to_num(0.0)    <span class="cm"># rescale old partial results</span>
+            p_ = torch.exp(s - m_new).nan_to_num(0.0)
+            l = l * scale + p_.sum(-1, keepdim=<span class="kw2">True</span>)
+            acc = acc * scale + p_ @ vj
+            m = m_new
+            <span class="cm"># (on real GPUs: send K,V to rank i+1 and receive from rank i-1 while computing)</span>
+        out[i] = acc / l
+    y = torch.empty(N, d)
+    <span class="kw2">for</span> i <span class="kw2">in</span> range(P): y[own[i]] = out[i]
+    <span class="kw2">return</span> y
+
+print(<span class="st">"ring vs full, max diff:"</span>, (ring_attention(q, k, v) - full_causal(q, k, v)).abs().max().item())
+
+<span class="cm"># DeepSpeed-Ulysses: all-to-all turns "sequence-sharded, all heads" into "all tokens, some heads"</span>
+H, T, hd = 8, 16, 4                               <span class="cm"># heads, tokens, head dim; P = 4 ranks</span>
+x = torch.randn(T, H, hd)
+seq_shards = list(x.chunk(P, dim=0))              <span class="cm"># before: rank r has T/P tokens, all H heads</span>
+<span class="kw2">def</span> all_to_all(shards, split_dim, cat_dim):       <span class="cm"># rank r sends piece j of its tensor to rank j</span>
+    pieces = [s.chunk(P, dim=split_dim) <span class="kw2">for</span> s <span class="kw2">in</span> shards]
+    <span class="kw2">return</span> [torch.cat([pieces[src][dst] <span class="kw2">for</span> src <span class="kw2">in</span> range(P)], dim=cat_dim) <span class="kw2">for</span> dst <span class="kw2">in</span> range(P)]
+head_shards = all_to_all(seq_shards, split_dim=1, cat_dim=0)   <span class="cm"># after: all T tokens, H/P heads</span>
+print(<span class="st">"after all-to-all:"</span>, tuple(head_shards[0].shape),
+      <span class="st">"equal to slicing heads:"</span>, torch.equal(head_shards[1], x[:, 2:4]))
+back = all_to_all(head_shards, split_dim=0, cat_dim=1)         <span class="cm"># second all-to-all undoes it</span>
+print(<span class="st">"round trip exact:"</span>, all(torch.equal(a, b) <span class="kw2">for</span> a, b <span class="kw2">in</span> zip(back, seq_shards)))</pre>
+<p>Second, expert parallelism: route tokens on 4 simulated ranks, dispatch them to the rank that owns each expert, run the experts there, combine, and compare with a dense MoE that has all experts in one place. It prints the 4 × 4 send matrix (96 copies, 71 of them cross ranks, with this seed) and a maximum difference of about \(6 \times 10^{-8}\).</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+EP, E, k, d, T = 4, 8, 2, 16, 12                 <span class="cm"># EP ranks, experts, top-k, width, tokens per rank</span>
+experts = [torch.nn.Linear(d, d) <span class="kw2">for</span> _ <span class="kw2">in</span> range(E)]   <span class="cm"># expert e lives on rank e // (E // EP)</span>
+router = torch.nn.Linear(d, E, bias=<span class="kw2">False</span>)
+x = [torch.randn(T, d) <span class="kw2">for</span> _ <span class="kw2">in</span> range(EP)]       <span class="cm"># each rank has its own tokens (data parallel)</span>
+
+<span class="kw2">def</span> moe_dense(x):                                 <span class="cm"># reference: every expert on one device</span>
+    w, idx = torch.softmax(router(x), -1).topk(k, -1)
+    y = torch.zeros_like(x)
+    <span class="kw2">for</span> slot <span class="kw2">in</span> range(k):
+        <span class="kw2">for</span> e <span class="kw2">in</span> range(E):
+            sel = idx[:, slot] == e
+            y[sel] += w[sel, slot, <span class="kw2">None</span>] * experts[e](x[sel])
+    <span class="kw2">return</span> y
+
+<span class="kw2">with</span> torch.no_grad():
+    <span class="cm"># 1) route locally on every rank</span>
+    routes = []
+    <span class="kw2">for</span> r <span class="kw2">in</span> range(EP):
+        w, idx = torch.softmax(router(x[r]), -1).topk(k, -1)
+        routes.append((w, idx))
+    <span class="cm"># 2) dispatch all-to-all: rank r sends each (token, slot) to the rank that owns the expert</span>
+    per = E // EP
+    inbox = [[] <span class="kw2">for</span> _ <span class="kw2">in</span> range(EP)]               <span class="cm"># what each destination rank receives</span>
+    send = torch.zeros(EP, EP, dtype=torch.long)  <span class="cm"># send[src, dst] = number of token copies</span>
+    <span class="kw2">for</span> r <span class="kw2">in</span> range(EP):
+        w, idx = routes[r]
+        <span class="kw2">for</span> t <span class="kw2">in</span> range(T):
+            <span class="kw2">for</span> slot <span class="kw2">in</span> range(k):
+                dst = int(idx[t, slot]) // per
+                inbox[dst].append((r, t, slot, int(idx[t, slot]), x[r][t]))
+                send[r, dst] += 1
+    <span class="cm"># 3) each rank runs its own experts on what it received</span>
+    results = [[(r, t, slot, experts[e](xt)) <span class="kw2">for</span> (r, t, slot, e, xt) <span class="kw2">in</span> inbox[dst]] <span class="kw2">for</span> dst <span class="kw2">in</span> range(EP)]
+    <span class="cm"># 4) combine all-to-all: send outputs back, weight them, add the k slots</span>
+    y = [torch.zeros(T, d) <span class="kw2">for</span> _ <span class="kw2">in</span> range(EP)]
+    <span class="kw2">for</span> dst <span class="kw2">in</span> range(EP):
+        <span class="kw2">for</span> (r, t, slot, out) <span class="kw2">in</span> results[dst]:
+            y[r][t] += routes[r][0][t, slot] * out
+    print(<span class="st">"send matrix (rows: from rank, cols: to rank):\n"</span>, send)
+    print(<span class="st">"copies that leave their rank:"</span>, int(send.sum() - send.diag().sum()), <span class="st">"of"</span>, int(send.sum()))
+    print(<span class="st">"max diff vs dense MoE:"</span>, max((y[r] - moe_dense(x[r])).abs().max().item() <span class="kw2">for</span> r <span class="kw2">in</span> range(EP)))</pre>
+<p>Third, the pipeline schedules of Figure 1 in pure Python, and the rank mapping (49.12). It prints a bubble equal to \((p-1)/m\) for both schedules, stored micro-batches [4, 4, 4, 4] / [8, 8, 8, 8] / [16, 16, 16, 16] for GPipe against [4, 3, 2, 1] for 1F1B, and coordinates (2, 0, 10, 9) for rank 1,234 of the Llama 3 layout.</p>
+<pre class="code"><span class="cm"># Simulate pipeline schedules with F = 1 and B = 2 time units per stage (no communication time).</span>
+<span class="kw2">def</span> schedule(kind, p, m):
+    order = []
+    <span class="kw2">for</span> s <span class="kw2">in</span> range(p):                            <span class="cm"># the list of work, in order, for stage s</span>
+        <span class="kw2">if</span> kind == <span class="st">"gpipe"</span>:                       <span class="cm"># all forwards, then all backwards</span>
+            order.append([(<span class="st">"F"</span>, i) <span class="kw2">for</span> i <span class="kw2">in</span> range(m)] + [(<span class="st">"B"</span>, i) <span class="kw2">for</span> i <span class="kw2">in</span> range(m)])
+        <span class="kw2">else</span>:                                     <span class="cm"># 1F1B: warm up, then alternate, then drain</span>
+            w = min(p - s - 1, m)
+            o = [(<span class="st">"F"</span>, i) <span class="kw2">for</span> i <span class="kw2">in</span> range(w)]
+            <span class="kw2">for</span> i <span class="kw2">in</span> range(w, m): o += [(<span class="st">"F"</span>, i), (<span class="st">"B"</span>, i - w)]
+            o += [(<span class="st">"B"</span>, i) <span class="kw2">for</span> i <span class="kw2">in</span> range(m - w, m)]
+            order.append(o)
+    <span class="kw2">return</span> order
+
+<span class="kw2">def</span> simulate(kind, p, m, tF=1.0, tB=2.0):
+    order, end, clock, ptr = schedule(kind, p, m), {}, [0.0] * p, [0] * p
+    live, peak = [0] * p, [0] * p                 <span class="cm"># micro-batches with stored activations</span>
+    <span class="kw2">while</span> any(ptr[s] &lt; len(order[s]) <span class="kw2">for</span> s <span class="kw2">in</span> range(p)):
+        <span class="kw2">for</span> s <span class="kw2">in</span> range(p):
+            <span class="kw2">if</span> ptr[s] == len(order[s]): <span class="kw2">continue</span>
+            op, i = order[s][ptr[s]]
+            dep = ((<span class="st">"F"</span>, s - 1, i) <span class="kw2">if</span> s &gt; 0 <span class="kw2">else</span> <span class="kw2">None</span>) <span class="kw2">if</span> op == <span class="st">"F"</span> <span class="kw2">else</span> \
+                  ((<span class="st">"B"</span>, s + 1, i) <span class="kw2">if</span> s &lt; p - 1 <span class="kw2">else</span> (<span class="st">"F"</span>, s, i))
+            <span class="kw2">if</span> dep is <span class="kw2">not</span> <span class="kw2">None</span> <span class="kw2">and</span> dep <span class="kw2">not</span> <span class="kw2">in</span> end: <span class="kw2">continue</span>    <span class="cm"># wait for the neighbor stage</span>
+            start = max(clock[s], end.get(dep, 0.0))
+            clock[s] = end[(op, s, i)] = start + (tF <span class="kw2">if</span> op == <span class="st">"F"</span> <span class="kw2">else</span> tB)
+            live[s] += 1 <span class="kw2">if</span> op == <span class="st">"F"</span> <span class="kw2">else</span> -1
+            peak[s] = max(peak[s], live[s]); ptr[s] += 1
+    T, ideal = max(clock), m * (tF + tB)
+    <span class="kw2">return</span> T, (T - ideal) / ideal, peak
+
+<span class="kw2">for</span> kind <span class="kw2">in</span> [<span class="st">"gpipe"</span>, <span class="st">"1f1b"</span>]:
+    <span class="kw2">for</span> p, m <span class="kw2">in</span> [(4, 4), (4, 8), (4, 16)]:
+        T, bub, peak = simulate(kind, p, m)
+        print(f<span class="st">"{kind:5s} p={p} m={m:2d}  time={T:5.1f}  bubble/ideal={bub:.3f}"</span>
+              f<span class="st">"  formula (p-1)/m={(p-1)/m:.3f}  stored micro-batches per stage={peak}"</span>)
+
+<span class="kw2">def</span> coords(rank, TP, CP, PP, DP):                 <span class="cm"># order [TP, CP, PP, DP]: TP changes fastest</span>
+    tp = rank % TP; cp = rank // TP % CP; pp = rank // (TP * CP) % PP; dp = rank // (TP * CP * PP)
+    <span class="kw2">return</span> tp, cp, pp, dp
+print(<span class="st">"rank 1234 of Llama 3 (TP8 CP1 PP16 DP128) -&gt; (tp, cp, pp, dp) ="</span>, coords(1234, 8, 1, 16, 128))</pre>
+<p>On a real cluster, PyTorch has the building blocks: <code>init_device_mesh</code> for the 4D mesh and <code>torch.distributed.pipelining</code> with <code>ScheduleGPipe</code>, <code>Schedule1F1B</code> and <code>ScheduleInterleaved1F1B</code>. [Certain] A sketch (not run here; it needs GPUs, and the model-splitting function is yours):</p>
+<pre class="code"><span class="cm"># Sketch for a GPU cluster (not run here): a 4D mesh and a 1F1B pipeline in PyTorch.</span>
+<span class="cm"># Launch: torchrun --nnodes=8 --nproc_per_node=8 train.py   (64 GPUs)</span>
+<span class="kw2">import</span> torch, torch.distributed <span class="kw2">as</span> dist
+<span class="kw2">from</span> torch.distributed.device_mesh <span class="kw2">import</span> init_device_mesh
+<span class="kw2">from</span> torch.distributed.pipelining <span class="kw2">import</span> PipelineStage, Schedule1F1B
+
+dist.init_process_group(<span class="st">"nccl"</span>)
+<span class="cm"># outer -&gt; inner: the LAST dimension changes fastest, so "tp" gets neighboring ranks (one node)</span>
+mesh = init_device_mesh(<span class="st">"cuda"</span>, (2, 4, 1, 8), mesh_dim_names=(<span class="st">"dp"</span>, <span class="st">"pp"</span>, <span class="st">"cp"</span>, <span class="st">"tp"</span>))
+tp_mesh, pp_group = mesh[<span class="st">"tp"</span>], mesh[<span class="st">"pp"</span>].get_group()   <span class="cm"># TP plan uses tp_mesh; FSDP uses mesh["dp"]</span>
+
+stage_id, n_stages = mesh[<span class="st">"pp"</span>].get_local_rank(), 4
+blocks = build_blocks_for_stage(stage_id, n_stages)     <span class="cm"># your code: this stage's layers only</span>
+stage = PipelineStage(blocks, stage_id, n_stages, device=torch.device(<span class="st">"cuda"</span>), group=pp_group)
+schedule = Schedule1F1B(stage, n_microbatches=16, loss_fn=loss_fn)
+
+<span class="kw2">if</span> stage_id == 0:
+    schedule.step(tokens)                               <span class="cm"># first stage feeds the micro-batches</span>
+<span class="kw2">elif</span> stage_id == n_stages - 1:
+    losses = []
+    schedule.step(target=labels, losses=losses)         <span class="cm"># last stage computes the loss</span>
+<span class="kw2">else</span>:
+    schedule.step()                                     <span class="cm"># middle stages only pass activations</span>
+optimizer.step(); optimizer.zero_grad()</pre>
+<p>Libraries such as Megatron-LM (Megatron-Core), DeepSpeed and TorchTitan wire all of this together, including CP and EP. [Likely]</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical layout</th><th>Why</th></tr></thead><tbody>
+<tr><td>Dense pretraining, 100B+ parameters</td><td>TP 8 in the node, PP 8–16 across nodes, interleaved 1F1B, DP / FSDP outside</td><td>Model states and activations must be split beyond one node; PP traffic is light enough for the network</td></tr>
+<tr><td>Long-context extension (64K–1M tokens)</td><td>Add CP 4–16 (ring, all-gather K,V, or Ulysses inside the node); shrink DP to keep tokens per batch</td><td>Activations of one sequence are too large; Llama 3 went from CP 1 to CP 16 for 128K [Certain]</td></tr>
+<tr><td>MoE pretraining (DeepSeek-V3, Mixtral-style models)</td><td>EP across the DP group, PP, often little or no TP</td><td>Expert weights dominate; all-to-all traffic needs to be overlapped and node-limited</td></tr>
+<tr><td>Vision-language models</td><td>Vision encoder in the first pipeline stage, or replicated; LLM layers split by TP and PP [Likely]</td><td>The encoder is small but its stage must be balanced against LLM stages</td></tr>
+<tr><td>Video-language models and video encoders (video retrieval, action recognition, key-moment detection over long videos, Video-RAG)</td><td>CP over the frame tokens, for example Ulysses or ring attention [Likely]</td><td>An hour of video can be hundreds of thousands of visual tokens, a natural fit for sequence splitting</td></tr>
+<tr><td>Video diffusion transformers</td><td>Ulysses or USP over the spatio-temporal tokens [Likely]</td><td>Full (non-causal) attention over long token sequences; USP was designed with such models in mind [Likely]</td></tr>
+<tr><td>Fine-tuning a 70B model on 2–4 nodes</td><td>Often FSDP alone, or FSDP + TP; PP rarely [Likely]</td><td>The pipeline bubble hurts with small batches; FSDP is simpler</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Too few micro-batches.</b> With \(m \lt p\) the pipeline never fills; even \(m = p\) wastes almost half the step. Check \((p-1)/(v\,m)\) before launching.</li>
+<li><b>Thinking 1F1B removes the bubble.</b> It has the same bubble as GPipe. It saves activation memory, which lets you raise \(m\). Only interleaving, zero-bubble or DualPipe schedules shrink the bubble for a given \(m\).</li>
+<li><b>Unbalanced stages.</b> Putting the same number of layers on the stage that also holds the embedding or the large output layer and loss. The slowest stage sets the pace for all.</li>
+<li><b>Contiguous context split with a causal mask.</b> The last rank does most of the work, and ring attention runs at its speed (57% efficiency at CP = 4 in Figure 2). Use the zig-zag split.</li>
+<li><b>Ulysses degree above the head count.</b> CP cannot exceed the number of attention heads, and K,V heads must be copied past their count (8 for Llama 3). Use ring or USP beyond that.</li>
+<li><b>TP across nodes.</b> Four activation all-reduces per layer over InfiniBand make TP the bottleneck. Keep TP inside the node and put PP or DP across nodes.</li>
+<li><b>Ignoring MoE load balance.</b> Without a balancing loss or bias, a few experts get most tokens: tokens are dropped (with a capacity limit) or one GPU slows everybody down (without one).</li>
+<li><b>Wrong loss scaling over micro-batches.</b> The loss of each micro-batch must be divided by \(m\) (and averaged over DP) so the summed gradients equal one large batch.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is the pipeline bubble, and how big is it?<span class="lvl">basic</span></summary><div class="ans">The idle time when the pipeline fills at the start of a step and drains at the end. With \(p\) stages and \(m\) micro-batches, a step takes \((m + p - 1)(t_f + t_b)\) instead of \(m(t_f + t_b)\), so the bubble is \((p-1)/m\) of the ideal time, or \((p-1)/(m+p-1)\) of the step. It shrinks with more micro-batches, fewer stages, or an interleaved schedule, which divides it by the number of chunks \(v\).</div></details>
+<details class="qa"><summary>GPipe and 1F1B have the same bubble. Why does everyone use 1F1B?<span class="lvl">core</span></summary><div class="ans">Memory. GPipe runs all \(m\) forwards before any backward, so every stage stores the activations of \(m\) micro-batches. 1F1B starts a backward as soon as possible and alternates one forward with one backward, so stage \(s\) holds at most \(p - s\) micro-batches, independent of \(m\). Since the bubble falls with \(m\), 1F1B lets you raise \(m\) (shrink the bubble) without paying more activation memory. Both are synchronous: the gradients are exactly those of one large batch.</div></details>
+<details class="qa"><summary>How does the interleaved schedule reduce the bubble, and what does it cost?<span class="lvl">core</span></summary><div class="ans">Each GPU holds \(v\) non-adjacent chunks of layers instead of one block (GPU 0: layers 1–2 and 9–10, for example). A micro-batch visits each GPU \(v\) times, each time for \(1/v\) of the work, so filling and draining the pipe takes \(v\) times less time: the bubble becomes \((p-1)/(v\,m)\). The cost is \(v\) times more point-to-point messages and somewhat more activation memory on early stages; in Megatron’s version \(m\) must be a multiple of \(p\). Megatron-LM reports over 10% higher throughput.</div></details>
+<details class="qa"><summary>Why does pipeline parallelism go across nodes while tensor parallelism stays inside a node?<span class="lvl">core</span></summary><div class="ans">Traffic per unit of work. TP all-reduces an activation tensor of size \(b\,s\,h\) twice per layer in forward and twice in backward, on the critical path, so it needs NVLink. PP sends one activation tensor per micro-batch per stage boundary, and a stage has many layers; the sends are point-to-point and can overlap. So PP needs far less bandwidth and fits the slower network. Megatron even sends only \(1/\text{TP}\) of the tensor across nodes and all-gathers it inside the receiving node.</div></details>
+<details class="qa"><summary>Explain ring attention. Is it exact?<span class="lvl">core</span></summary><div class="ans">The sequence is split over \(P\) ranks; each keeps its query block. K and V blocks rotate around a ring: at each of \(P\) steps a rank computes attention of its queries against the block it holds, while sending that block to the next rank and receiving the next one. Partial results are merged with the online softmax (running max, running sum, rescaled running output), so the final result equals full attention exactly. Memory per rank depends on the block size only. The transfers hide behind compute if the block is large enough: \(c \ge (F/B)(d_{kv}/d)\), about 20K tokens per rank for MHA on an H100 over 50 GB/s InfiniBand, far less on NVLink.</div></details>
+<details class="qa"><summary>Why is a contiguous sequence split bad for causal attention, and what is the fix?<span class="lvl">advanced</span></summary><div class="ans">With a causal mask, late tokens attend to many more keys than early ones. The rank with the last chunk does most of the work, and since each ring step waits for the slowest rank, the layer runs at that rank’s speed: \(2 + 4(P-1)\) block-times instead of \(2P\) (57% efficiency at \(P = 4\)). The fix is to cut the sequence into \(2P\) chunks and give rank \(i\) chunks \(i\) and \(2P-1-i\). Then every rank does \(2P\) blocks in total and, in ring attention, the same 2 blocks per step. Llama 3 uses this split.</div></details>
+<details class="qa"><summary>Ring attention vs DeepSpeed-Ulysses: when would you pick each?<span class="lvl">advanced</span></summary><div class="ans">Ulysses does an all-to-all from a sequence split to a head split before attention (Q, K, V) and back after it, so attention itself runs locally with any kernel and mask. Its traffic per GPU, \((N/P)\frac{P-1}{P}(2d + 2d_{kv})\), shrinks with \(P\), but it sits on the critical path, needs all-to-all bandwidth (one node), and the degree is limited by the number of heads (K,V heads must be copied beyond their count). Ring sends \((P-1)(N/P)\,2d_{kv}\) per GPU, which does not shrink with \(P\) but overlaps with compute and has no head limit. The ratio is \(P\,d_{kv}/(d + d_{kv})\): Ulysses sends less for MHA, while ring can send less with strong GQA at small \(P\). In practice: Ulysses inside a node, ring across nodes (USP).</div></details>
+<details class="qa"><summary>What communication does expert parallelism need, and why is it hard?<span class="lvl">core</span></summary><div class="ans">Two all-to-alls per MoE layer in forward (dispatch tokens to the ranks of their chosen experts, combine the results back) and two in backward. Per GPU each moves about \(T\,k\,h\,(\text{EP}-1)/\text{EP}\) elements. It is hard because the sizes depend on the router (irregular, unbalanced), every pair of GPUs talks, and with large EP it crosses nodes. Remedies: load-balancing losses or biases, capacity factors (drop overflow), node-limited routing (DeepSeek-V3 sends each token to at most 4 nodes), and overlapping all-to-all with computation of another micro-batch (DualPipe).</div></details>
+<details class="qa"><summary>What is the capacity factor in MoE training?<span class="lvl">basic</span></summary><div class="ans">Each expert accepts at most \(C = \lceil \text{CF} \cdot T_{\text{all}}\,k/E \rceil\) token copies per step, where \(T_{\text{all}}\,k/E\) is the average load. Fixed capacity gives static buffer shapes, which makes the all-to-all and the expert matmul fast and memory predictable. Copies beyond \(C\) are dropped: they skip the expert and only go through the residual. A larger CF drops fewer tokens but wastes compute and memory on padding; Switch Transformer used values like 1.0 to 1.25 in training [Likely]. Some modern MoE systems avoid dropping altogether with variable-size grouped matmuls.</div></details>
+<details class="qa"><summary>You must train a dense 70B model on 1,024 H100s (8 per node) with 8K sequences. Propose a layout.<span class="lvl">advanced</span></summary><div class="ans">Start from the Megatron rules. TP = 8 inside each node. 70B with TP 8 is about 8.75B parameters per GPU, 140 GB at 16 bytes, so we need more splitting: either PP = 4 (2.2B per GPU, 35 GB of model states, or much less with the optimizer sharded over DP) or FSDP/ZeRO over DP instead of PP. With TP 8 × PP 4, DP = 32. CP = 1 for 8K tokens. Use interleaved 1F1B with enough micro-batches: if the batch is 4M tokens = 512 sequences, each DP replica gets 16 sequences, so \(m = 16\) and the bubble is \(3/(16v)\): 19% with \(v = 1\), 5% with \(v = 4\). Then measure MFU and compare against TP 8 × FSDP 128 without PP.</div></details>
+<details class="qa"><summary>Why does Llama 3 put the dimensions in the order [TP, CP, PP, DP]?<span class="lvl">core</span></summary><div class="ans">The innermost dimension gets neighboring ranks, which share a node and its NVLink. TP needs the most bandwidth and lowest latency (activation all-reduces in every layer), so it is innermost. CP comes next (K,V traffic every attention layer, partly overlapped). PP only sends activations at stage boundaries. DP (FSDP in Llama 3) is outermost because it tolerates the most latency: weights can be prefetched and gradients reduced in the background.</div></details>
+<details class="qa"><summary>What are zero-bubble schedules and DualPipe?<span class="lvl">advanced</span></summary><div class="ans">They split the backward into B (gradient for the input, needed immediately by the previous stage) and W (gradient for the weights, needed only by the optimizer). W can be delayed into the idle slots, which fills the bubble: Qi et al. report up to 23% more throughput than 1F1B at similar memory. DualPipe (DeepSeek-V3) also feeds micro-batches from both ends of the pipeline and overlaps one micro-batch’s forward with another’s backward so that MoE all-to-alls and pipeline sends hide behind computation. Its bubble is \((PP/2-1)(F\&B + B - 3W)\) at the cost of two copies of the weights.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A pipeline has \(p = 8\) stages and \(m = 32\) micro-batches. Compute the bubble as a fraction of the ideal time and of the step, for 1F1B and for an interleaved schedule with \(v = 4\).</li>
+<li>Same pipeline. How many micro-batches of activations does stage 0 store with GPipe and with 1F1B?</li>
+<li>Ring attention for Llama 3 8B (\(d = 4096\), \(d_{kv} = 1024\)) on GPUs with 989 TFLOPS and 50 GB/s between ring neighbors. What is the smallest chunk per rank that hides the transfers, by (49.8)? With CP = 16, what sequence length is that?</li>
+<li>With the zig-zag split and \(P = 4\), which chunks does rank 1 own? Show that its total causal work is \(2P = 8\) blocks.</li>
+<li>A DeepSeek-V3-like layer: \(h = 7168\), top-8 routing, EP = 64, 4,096 tokens per GPU. Using (49.11), how many bytes does one dispatch all-to-all send per GPU in BF16 (ignoring node-limited routing)?</li>
+<li>With the order [TP, CP, PP, DP] and TP 4 × CP 2 × PP 2 × DP 2, give the coordinates of rank 13 and its DP group.</li>
+<li>Check that each Llama 3 configuration in the table uses its stated number of GPUs and 16,777,216 tokens per batch.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. 1F1B: \(7/32 = 0.219\) of the ideal time, \(7/39 = 17.9\%\) of the step. Interleaved: \(7/(4 \times 32) = 0.055\) of the ideal time. 2. GPipe: all 32. 1F1B: \(\min(p - 0, m) = 8\), four times less. 3. \(c \ge (989 \times 10^{12} / 50 \times 10^9) \times 1024/4096 = 4{,}945\) tokens per rank; with CP = 16 that is about 79K tokens (\(16 \times 4945 = 79{,}120\)). 4. Chunks 1 and 6 (\(2P - 1 - 1 = 6\)). Chunk 1 costs \(1 + \tfrac12\), chunk 6 costs \(6 + \tfrac12\); together 8. 5. \(4096 \times 8 \times 7168 \times 63/64 \times 2 = 462\) MB per GPU, for each dispatch (and again for the combine). 6. \(t = 13 \bmod 4 = 1\), \(c = \lfloor 13/4 \rfloor \bmod 2 = 1\), \(q = \lfloor 13/8 \rfloor \bmod 2 = 1\), \(d = \lfloor 13/16 \rfloor = 0\). Its DP group is all ranks with \(t = 1, c = 1, q = 1\): {13, 29}. 7. \(8 \cdot 1 \cdot 16 \cdot 64 = 8{,}192\); \(8 \cdot 1 \cdot 16 \cdot 128 = 16{,}384\); \(8 \cdot 16 \cdot 16 \cdot 8 = 16{,}384\). Tokens: \(64 \cdot 32 \cdot 8192 = 128 \cdot 16 \cdot 8192 = 8 \cdot 16 \cdot 131072 = 16{,}777{,}216\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A big run multiplies degrees: \(N_{\text{GPU}} = \text{TP} \times \text{CP} \times \text{PP} \times \text{DP}\) (49.1); expert parallelism reuses the DP group.</li>
+<li>Pipeline parallelism splits layers into stages and pays a bubble of \((p-1)/m\) (49.3). 1F1B keeps that bubble but caps activations at \(p\) micro-batches (49.4); interleaving divides the bubble by \(v\) (49.5); zero-bubble and DualPipe fill it with weight-gradient work.</li>
+<li>PP sends only activations at stage boundaries (49.6), so it crosses nodes; TP stays inside the node.</li>
+<li>Context parallelism splits the sequence. Ring attention passes K,V around a ring and merges with the online softmax (49.7), hiding transfers when \(c \ge (F/B)(d_{kv}/d)\) (49.8). Causal masks need the zig-zag split (49.9).</li>
+<li>Ulysses swaps a sequence split for a head split with all-to-alls (49.10): its traffic shrinks with \(P\), but its degree is limited by the heads. USP combines Ulysses inside nodes and ring across nodes.</li>
+<li>Expert parallelism needs two all-to-alls per MoE layer per pass, with capacity limits and load balancing (49.11).</li>
+<li>Order the dimensions by traffic: [TP, CP, PP, DP] from inside to outside (49.12). Llama 3 405B: TP 8, CP 1 or 16, PP 16, DP 128 or 8; DeepSeek-V3: PP 16, EP 64, ZeRO-1, no TP.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \frac{T_{\text{bubble}}}{T_{\text{ideal}}} = \frac{p-1}{v\,m}, \qquad c \ge \frac{F}{B}\cdot\frac{d_{kv}}{d}, \qquad \frac{V_{\text{ring}}}{V_{\text{Ulysses}}} = \frac{P\,d_{kv}}{d + d_{kv}} \]</div>
+<div class="eq">\[ V_{\text{a2a}} \approx T k h \,\frac{\text{EP}-1}{\text{EP}}, \qquad C = \Big\lceil \text{CF}\,\frac{T_{\text{all}}\,k}{E} \Big\rceil, \qquad N_{\text{GPU}} = \text{TP}\cdot\text{CP}\cdot\text{PP}\cdot\text{DP} \]</div>
+<h2 class="plain" id="pipeline-context-and-expert-parallelism-3d-and-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Huang et al. (2018). <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener">GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism</a></li><li>Narayanan et al. (2021). <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.01889" target="_blank" rel="noopener">Ring Attention with Blockwise Transformers for Near-Infinite Context</a></li><li>Jacobs et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models&amp;quot;" target="_blank" rel="noopener">DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Huang et al. (2018). <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener">GPipe: Efficient Training of Giant Neural Networks using Pipeline Parallelism</a></li><li>Narayanan et al. (2021). <a href="https://arxiv.org/abs/2104.04473" target="_blank" rel="noopener">Efficient Large-Scale Language Model Training on GPU Clusters Using Megatron-LM</a></li><li>Harlap, Narayanan et al. (2018). <a href="https://arxiv.org/abs/1806.03377" target="_blank" rel="noopener">PipeDream: Fast and Efficient Pipeline Parallel DNN Training</a></li><li>Narayanan et al. (2021). <a href="https://arxiv.org/abs/2006.09503" target="_blank" rel="noopener">Memory-Efficient Pipeline-Parallel DNN Training (PipeDream-2BW and PipeDream-Flush)</a></li><li>Qi, Wan, Huang and Lin (2024). <a href="https://arxiv.org/abs/2401.10241" target="_blank" rel="noopener">Zero Bubble Pipeline Parallelism</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.01889" target="_blank" rel="noopener">Ring Attention with Blockwise Transformers for Near-Infinite Context</a></li><li>Jacobs et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models&amp;quot;" target="_blank" rel="noopener">DeepSpeed Ulysses: System Optimizations for Enabling Training of Extreme Long Sequence Transformer Models</a></li><li>Fang and Zhao (2024). <a href="https://arxiv.org/abs/2405.07719" target="_blank" rel="noopener">USP: A Unified Sequence Parallelism Approach for Long Context Generative AI</a></li><li>Lepikhin et al. (2020). <a href="https://arxiv.org/abs/2006.16668" target="_blank" rel="noopener">GShard: Scaling Giant Models with Conditional Computation and Automatic Sharding</a></li><li>Fedus et al. (2021). <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">Switch Transformers</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>DeepSeek-AI (2024). <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-V3 Technical Report</a></li><li>Shoeybi et al. (2019). <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../pretraining/tensor-parallelism-and-sequence-parallelism.html"><small>Previous · session 48</small>Tensor parallelism and sequence parallelism</a><a class="next" href="../pretraining/making-training-fast-compile-cuda-graphs-fused.html"><small>Next · session 50</small>Making training fast: compile, CUDA graphs, fused kernels, profiling</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="pipeline-context-and-expert-parallelism-3d-and"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function seg(el,cb){if(!el)return;el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b||!el.contains(b))return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segVal=el=>{const b=el.querySelector('button[aria-pressed="true"]');return b?b.dataset.v:null;};
+const RC=["var(--t1)","var(--t2)","var(--t3)","var(--t4)","var(--t5)","var(--t6)","var(--t7)","var(--t8)"];
+const fmtB=x=>x>=1e9?(x/1e9).toFixed(2)+" GB":(x/1e6).toFixed(x>=1e8?0:1)+" MB";
+const fx=(v,n)=>(+v).toFixed(n);
+
+/* ---------- Figure 1: pipeline schedules ---------- */
+const PP={};
+PP.orders=function(kind,p,m,v){const O=[];
+ for(let d=0;d<p;d++){let o=[];
+  if(kind==="gpipe"){for(let i=0;i<m;i++)o.push(["F",i,0]);for(let i=0;i<m;i++)o.push(["B",i,0]);}
+  else if(kind==="1f1b"){const w=Math.min(p-d-1,m);for(let i=0;i<w;i++)o.push(["F",i,0]);let bi=0;for(let i=w;i<m;i++){o.push(["F",i,0]);o.push(["B",bi++,0]);}for(;bi<m;bi++)o.push(["B",bi,0]);}
+  else{const tot=m*v,fk=k=>["F",Math.floor(k/(p*v))*p+k%p,Math.floor(k/p)%v],bk=k=>["B",Math.floor(k/(p*v))*p+k%p,v-1-Math.floor(k/p)%v];
+   const w=Math.min((p-d-1)*2+(v-1)*p,tot);for(let k=0;k<w;k++)o.push(fk(k));let fi=w,bi=0;while(fi<tot){o.push(fk(fi++));o.push(bk(bi++));}while(bi<tot)o.push(bk(bi++));}
+  O.push(o);}
+ return O;};
+PP.sim=function(kind,p,m,v){if(kind!=="inter")v=1;const O=PP.orders(kind,p,m,v),S=p*v,f=1/v,b=2/v;
+ const end=new Map(),t=new Array(p).fill(0),ptr=new Array(p).fill(0),ops=[];let left=O.reduce((a,o)=>a+o.length,0);
+ while(left>0){let prog=false;
+  for(let d=0;d<p;d++){if(ptr[d]>=O[d].length)continue;const [ty,i,c]=O[d][ptr[d]],s=c*p+d;
+   const dep=ty==="F"?(s>0?"F"+i+"_"+(s-1):null):(s<S-1?"B"+i+"_"+(s+1):"F"+i+"_"+s);
+   if(dep&&!end.has(dep))continue;const st=Math.max(t[d],dep?end.get(dep):0),en=st+(ty==="F"?f:b);
+   end.set(ty+i+"_"+s,en);t[d]=en;ptr[d]++;left--;prog=true;ops.push({d,ty,i,c,st,en});}
+  if(!prog)return null;}
+ const T=Math.max(...t),ideal=3*m;const peaks=[];
+ for(let d=0;d<p;d++){const ev=[];ops.forEach(o=>{if(o.d!==d)return;if(o.ty==="F")ev.push([o.st,1]);else ev.push([o.en,-1]);});ev.sort((a,b)=>a[0]-b[0]||a[1]-b[1]);let cur=0,pk=0;ev.forEach(e=>{cur+=e[1];pk=Math.max(pk,cur);});peaks.push(pk/v);}
+ return {T,ideal,ops,peaks,v};};
+R.pp4Sim=PP.sim;
+(function(){
+ const svg=$("#pp4-sch-svg");if(!svg)return;const info=$("#pp4-sch-info"),Ms=$("#pp4-sch-m");
+ function draw(){const kind=segVal($("#pp4-sch-k")),p=+segVal($("#pp4-sch-p"));let m=+Ms.value;$("#pp4-sch-mv").value=m;let note="";
+  if(kind==="inter"&&m%p!==0){const m2=Math.ceil(m/p)*p;note=` Megatron’s interleaved schedule needs m to be a multiple of p, so m is rounded up to <b>${m2}</b>.`;m=m2;}
+  const v=kind==="inter"?2:1,r=PP.sim(kind,p,m,v);if(!r){info.innerHTML="Schedule did not finish.";return;}
+  const X0=62,W=700,rowH=Math.min(30,180/p),sc=W/r.T;let s="";
+  for(let d=0;d<p;d++){const y=10+d*(rowH+4);s+=`<text x="${X0-8}" y="${y+rowH/2+4}" text-anchor="end" font-size="12" fill="var(--ink2)">stage ${d}</text><rect x="${X0}" y="${y}" width="${W}" height="${rowH}" fill="var(--paper2)" stroke="var(--rule)" stroke-width=".6"/>`;}
+  r.ops.forEach(o=>{const y=10+o.d*(rowH+4),x=X0+o.st*sc,w=(o.en-o.st)*sc;const fill=o.ty==="F"?(o.c?"var(--q-soft)":"var(--q)"):(o.c?"var(--k-soft)":"var(--k)");const tc=o.c?"var(--ink)":"var(--paper)";
+   s+=`<rect x="${x.toFixed(2)}" y="${y}" width="${Math.max(.8,w-.8).toFixed(2)}" height="${rowH}" fill="${fill}" stroke="${o.c?(o.ty==="F"?"var(--q)":"var(--k)"):"none"}" stroke-width=".8"/>`;
+   if(w>13&&rowH>14)s+=`<text x="${(x+w/2).toFixed(1)}" y="${y+rowH/2+4}" text-anchor="middle" font-size="${w>20?11:9.5}" fill="${tc}">${o.i+1}</text>`;});
+  const yb=10+p*(rowH+4)+4;s+=`<line x1="${X0}" y1="${yb}" x2="${X0+W}" y2="${yb}" stroke="var(--muted)"/>`;
+  const step=r.T>60?10:r.T>24?5:2;for(let t=0;t<=r.T+1e-9;t+=step)s+=`<line x1="${X0+t*sc}" y1="${yb}" x2="${X0+t*sc}" y2="${yb+5}" stroke="var(--muted)"/><text x="${X0+t*sc}" y="${yb+18}" text-anchor="middle" font-size="11" class="svgs">${t}</text>`;
+  s+=`<text x="${X0+W}" y="${yb+34}" text-anchor="end" font-size="11.5" class="svgs">time (one forward of a full stage = 1, backward = 2)</text>`;
+  svg.setAttribute("viewBox",`0 0 780 ${yb+42}`);svg.innerHTML=s;
+  const bub=(r.T-r.ideal)/r.ideal,form=(p-1)/(v*m),share=(r.T-r.ideal)/r.T;
+  const name=kind==="gpipe"?"GPipe":kind==="1f1b"?"1F1B":"Interleaved 1F1B (v = 2 chunks per GPU)";
+  info.innerHTML=`<b>${name}</b>, p = ${p} stages, m = ${m} micro-batches.${note} Step time <b>${fx(r.T,2)}</b>, ideal ${r.ideal} (m × 3). Bubble / ideal = <b>${fx(bub,3)}</b> (formula (p − 1)/(v·m) = ${fx(form,3)}); idle share of the step <b>${fx(100*share,1)}%</b>. Micro-batches whose activations stage 0 must keep at the peak: <b>${fx(r.peaks[0],1)}</b>${p>1?` (last stage: ${fx(r.peaks[p-1],1)})`:""}.`;
+  R.pp4Sch={T:r.T,bubble:+bub.toFixed(4),peak0:r.peaks[0]};}
+ seg($("#pp4-sch-k"),draw);seg($("#pp4-sch-p"),draw);Ms.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 2: ring attention with causal load balancing ---------- */
+(function(){
+ const svg=$("#pp4-ring-svg");if(!svg)return;const info=$("#pp4-ring-info");let st=null,P=4,mode="zig",cur=0;
+ function owners(){const own=[];for(let i=0;i<P;i++)own.push(mode==="zig"?[i,2*P-1-i]:[2*i,2*i+1]);return own;}
+ function work(own,i,j){let w=0;own[i].forEach(a=>own[j].forEach(b=>{if(b<a)w+=1;else if(b===a)w+=0.5;}));return w;}
+ function stats(){const own=owners(),steps=[];for(let t=0;t<P;t++){const ws=[];for(let i=0;i<P;i++)ws.push(work(own,i,((i-t)%P+P)%P));steps.push(ws);}return {own,steps};}
+ function draw(k){cur=k;const {own,steps}=stats(),n=2*P,cell=Math.min(30,236/n),G0x=40,G0y=34;let s="";
+  const ownerOf=new Array(n);own.forEach((ch,i)=>ch.forEach(c=>ownerOf[c]=i));
+  s+=`<text x="${G0x}" y="14" font-size="12" class="svgs">attention scores: rows = queries, columns = keys</text>`;
+  for(let a=0;a<n;a++){s+=`<text x="${G0x-6}" y="${G0y+a*cell+cell/2+4}" text-anchor="end" font-size="10" fill="${RC[ownerOf[a]]}" font-weight="700">${a}</text><text x="${G0x+a*cell+cell/2}" y="${G0y-5}" text-anchor="middle" font-size="10" fill="${RC[ownerOf[a]]}" font-weight="700">${a}</text>`;
+   for(let b=0;b<n;b++){const x=G0x+b*cell,y=G0y+a*cell;if(b>a){s+=`<rect x="${x}" y="${y}" width="${cell-1}" height="${cell-1}" fill="none" stroke="var(--rule2)" stroke-width=".6"/>`;continue;}
+    const i=ownerOf[a],j=ownerOf[b],t=((i-j)%P+P)%P;const done=t<k,now=t===k;
+    const op=now?0.95:done?0.35:0.0;s+=`<rect x="${x}" y="${y}" width="${cell-1}" height="${cell-1}" fill="${RC[i]}" fill-opacity="${op}" stroke="${now?"var(--ink)":RC[i]}" stroke-width="${now?1.4:.7}"/>`;
+    if(b===a)s+=`<line x1="${x}" y1="${y}" x2="${x+cell-1}" y2="${y+cell-1}" stroke="var(--muted)" stroke-width=".8"/>`;}}
+  /* right: per-rank work this step */
+  const X1=340,bw=360,ws=steps[k],mx=Math.max(...steps.flat(),1);
+  s+=`<text x="${X1}" y="14" font-size="12" class="svgs">ring step ${k}: work of each rank (blocks)</text>`;
+  for(let i=0;i<P;i++){const y=30+i*Math.min(28,200/P),h=Math.min(22,200/P-4),j=((i-k)%P+P)%P;
+   s+=`<text x="${X1+52}" y="${y+h/2+4}" text-anchor="end" font-size="11.5" fill="${RC[i]}" font-weight="700">rank ${i}</text><rect x="${X1+58}" y="${y}" width="${(ws[i]/mx*(bw-150)).toFixed(1)}" height="${h}" fill="${RC[i]}" opacity=".85"/><text x="${X1+64+ws[i]/mx*(bw-150)}" y="${y+h/2+4}" font-size="11" fill="var(--ink2)">${ws[i]} block${ws[i]===1?"":"s"}, K,V from rank ${j}</text>`;}
+  svg.setAttribute("viewBox",`0 0 720 ${Math.max(G0y+n*cell+10,250)}`);svg.innerHTML=s;
+  let tot=0;for(let t=0;t<=k;t++)tot+=Math.max(...steps[t]);let all=0;steps.forEach(w=>all+=Math.max(...w));
+  const sum=steps.flat().reduce((a,b)=>a+b,0),ideal=sum/P;
+  info.innerHTML=`<b>${mode==="zig"?"Zig-zag":"Contiguous"}</b> split over ${P} ranks; each rank keeps chunks ${own.map((c,i)=>`${i}: {${c.join(", ")}}`).join("; ")}. Ring step ${k} of ${P-1}: the step takes as long as the busiest rank, <b>${Math.max(...ws)}</b> blocks (least busy ${Math.min(...ws)}). Time so far ${tot}; whole layer <b>${all}</b> blocks against an ideal of <b>${ideal}</b> (total work ${sum} / ${P} ranks): efficiency <b>${fx(100*ideal/all,0)}%</b>.`;
+  R.pp4Ring={total:all,ideal,eff:+(ideal/all).toFixed(3)};}
+ function reset(){if(st)st.stop();st=B.stepper({n:P,prev:$("#pp4-ring-prev"),next:$("#pp4-ring-next"),play:$("#pp4-ring-play"),label:$("#pp4-ring-lab"),ms:1800,onStep:draw});}
+ /* replace buttons on reset to drop old listeners */
+ function fresh(){["#pp4-ring-prev","#pp4-ring-next","#pp4-ring-play"].forEach(id=>{const o=$(id),n=o.cloneNode(true);o.parentNode.replaceChild(n,o);});reset();}
+ seg($("#pp4-ring-mode"),v=>{mode=v;fresh();});seg($("#pp4-ring-p"),v=>{P=+v;fresh();});reset();
+})();
+
+/* ---------- Figure 3: Ulysses vs ring communication ---------- */
+(function(){
+ const svg=$("#pp4-uly-svg");if(!svg)return;const info=$("#pp4-uly-info"),Ns=$("#pp4-uly-n"),Ps=$("#pp4-uly-p");
+ const MOD={l8:["Llama 3 8B",4096,1024,32,8],l70:["Llama 3 70B",8192,1024,64,8],mha:["MHA, d = 4096 (Llama 2 7B)",4096,4096,32,32]};
+ const NL=[32768,65536,131072,262144,524288,1048576],PL=[2,4,8,16,32,64];
+ function draw(){const [nm,dq,dkv,nh,nkv]=MOD[segVal($("#pp4-uly-m"))],N=NL[+Ns.value],P=PL[+Ps.value],Bw=+segVal($("#pp4-uly-b"))*1e9,F=989e12;
+  $("#pp4-uly-nv").value=(N/1024)+"K";$("#pp4-uly-pv").value=P;
+  const U=(N/P)*(P-1)/P*(2*dq+2*dkv)*2,Rg=(P-1)*(N/P)*2*dkv*2,c=N/P,cmin=F*dkv/(Bw*dq);
+  const mx=Math.max(U,Rg)*1.15,X0=150,W=470;let s="";
+  [["Ulysses (4 all-to-alls)",U,"var(--q)"],["Ring (P − 1 K,V passes)",Rg,"var(--k)"]].forEach(([lab,val,col],i)=>{const y=20+i*52;
+   s+=`<text x="${X0-8}" y="${y+20}" text-anchor="end" font-size="12.5" fill="var(--ink2)">${lab.split(" (")[0]}</text><text x="${X0-8}" y="${y+35}" text-anchor="end" font-size="10.5" class="svgs">(${lab.split(" (")[1]}</text>`;
+   s+=`<rect x="${X0}" y="${y}" width="${(val/mx*W).toFixed(1)}" height="30" fill="${col}" opacity=".85"/><text x="${X0+val/mx*W+6}" y="${y+20}" font-size="12" fill="var(--ink)" font-family="var(--mono)">${fmtB(val)}</text>`;});
+  s+=`<text x="${X0}" y="134" font-size="11.5" class="svgs">bytes sent per GPU, one attention layer, forward pass, BF16</text>`;
+  svg.innerHTML=s;
+  const ulyOk=P<=nkv?"fits the "+nkv+" K,V heads":P<=nh?`<b>needs K,V heads copied</b> (only ${nkv} K,V heads for ${P} ranks)`:`<b style="color:var(--bad)">impossible</b>: only ${nh} query heads`;
+  info.innerHTML=`<b>${nm}</b>, N = ${N.toLocaleString("en-US")} tokens on P = ${P} ranks (${c.toLocaleString("en-US")} tokens each). Ulysses sends <b>${fmtB(U)}</b>, ring sends <b>${fmtB(Rg)}</b> (ratio ring / Ulysses = <b>${fx(Rg/U,2)}</b> = P·d<sub>kv</sub>/(d + d<sub>kv</sub>)). Ulysses: ${ulyOk}. Ring overlap needs about c ≥ F·d<sub>kv</sub>/(B·d) = <b>${Math.round(cmin).toLocaleString("en-US")}</b> tokens per rank at 989 TFLOPS and ${Bw/1e9} GB/s: ${c>=cmin?"<b>hidden</b> behind compute":"<b style='color:var(--bad)'>exposed</b>, blocks too small"}.`;
+  R.pp4Uly={U,Rg,ratio:+(Rg/U).toFixed(3),cmin:Math.round(cmin)};}
+ seg($("#pp4-uly-m"),draw);seg($("#pp4-uly-b"),draw);Ns.addEventListener("input",draw);Ps.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 4: expert parallelism, routing and all-to-all ---------- */
+(function(){
+ const svg=$("#pp4-moe-svg");if(!svg)return;const info=$("#pp4-moe-info"),Sk=$("#pp4-moe-s"),Cf=$("#pp4-moe-c");
+ const EP=4,E=8,K=2,T=16,CFL=[1,1.25,1.5,2,Infinity];
+ function rng(seed){let a=seed>>>0;return()=>{a=(a+0x6D2B79F5)>>>0;let t=a;t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296;};}
+ const r=rng(49),noise=[];for(let i=0;i<EP*T*E;i++){const u=Math.max(r(),1e-9),v=r();noise.push(Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v));}
+ const pref=[1.0,0.6,0.3,0.1,-0.1,-0.3,-0.6,-1.0];
+ function route(skew,cf){const cap=cf===Infinity?Infinity:Math.ceil(cf*EP*T*K/E);const load=new Array(E).fill(0),kept=new Array(E).fill(0),send=[...Array(EP)].map(()=>new Array(EP).fill(0));let drop=0;
+  for(let g=0;g<EP;g++)for(let t=0;t<T;t++){const lg=[];for(let e=0;e<E;e++)lg.push(noise[(g*T+t)*E+e]+skew*pref[e]);
+   const top=[...Array(E).keys()].sort((a,b)=>lg[b]-lg[a]).slice(0,K);
+   top.forEach(e=>{load[e]++;if(kept[e]<cap){kept[e]++;send[g][Math.floor(e/(E/EP))]++;}else drop++;});}
+  return {cap,load,kept,send,drop};}
+ function draw(){const skew=+Sk.value,cf=CFL[+Cf.value];$("#pp4-moe-sv").value=skew.toFixed(1);$("#pp4-moe-cv").value=cf===Infinity?"none":cf.toFixed(2);
+  const o=route(skew,cf);let s="";const cs=44,X0=60,Y0=46;
+  s+=`<text x="${X0}" y="14" font-size="12" class="svgs">dispatch all-to-all: token copies</text><text x="${X0}" y="30" font-size="11" class="svgs">from rank (row) to rank (column)</text>`;
+  const mxs=Math.max(...o.send.flat(),1);
+  for(let a=0;a<EP;a++){s+=`<text x="${X0-8}" y="${Y0+a*cs+cs/2+4}" text-anchor="end" font-size="11" fill="${RC[a]}" font-weight="700">GPU ${a}</text><text x="${X0+a*cs+cs/2}" y="${Y0+EP*cs+15}" text-anchor="middle" font-size="11" fill="${RC[a]}" font-weight="700">GPU ${a}</text>`;
+   for(let b=0;b<EP;b++){const v=o.send[a][b];s+=`<rect x="${X0+b*cs}" y="${Y0+a*cs}" width="${cs-2}" height="${cs-2}" rx="4" fill="var(--v)" fill-opacity="${(0.1+0.8*v/mxs).toFixed(2)}" stroke="${a===b?"var(--ink)":"var(--rule)"}" stroke-width="${a===b?1.6:.8}" ${a===b?'stroke-dasharray="3 2"':""}/><text x="${X0+b*cs+cs/2-1}" y="${Y0+a*cs+cs/2+4}" text-anchor="middle" font-size="12.5" fill="var(--ink)" font-weight="700">${v}</text>`;}}
+  /* right: expert loads */
+  const X1=300,bw=34,H=150,Yb=200,mxl=Math.max(...o.load,o.cap===Infinity?0:o.cap)*1.1;
+  s+=`<text x="${X1}" y="14" font-size="12" class="svgs">tokens routed to each expert (2 experts per GPU)</text>`;
+  for(let e=0;e<E;e++){const x=X1+e*(bw+12),h=o.load[e]/mxl*H,hk=o.kept[e]/mxl*H,g=Math.floor(e/2);
+   s+=`<rect x="${x}" y="${(Yb-h).toFixed(1)}" width="${bw}" height="${h.toFixed(1)}" fill="var(--bad-soft)" stroke="var(--bad)" stroke-width=".8"/><rect x="${x}" y="${(Yb-hk).toFixed(1)}" width="${bw}" height="${hk.toFixed(1)}" fill="${RC[g]}" opacity=".85"/>`;
+   s+=`<text x="${x+bw/2}" y="${(Yb-h-5).toFixed(1)}" text-anchor="middle" font-size="11" fill="var(--ink2)">${o.load[e]}</text><text x="${x+bw/2}" y="${Yb+15}" text-anchor="middle" font-size="11" fill="${RC[g]}" font-weight="700">E${e}</text>`;}
+  if(o.cap!==Infinity){const y=Yb-o.cap/mxl*H;s+=`<line x1="${X1-4}" y1="${y.toFixed(1)}" x2="${X1+E*(bw+12)}" y2="${y.toFixed(1)}" stroke="var(--bad)" stroke-dasharray="5 4" stroke-width="1.6"/><text x="${X1-6}" y="${(y+4).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--bad)">cap ${o.cap}</text>`;}
+  s+=`<text x="${X1}" y="${Yb+32}" font-size="11" class="svgs">red part = dropped copies (skip the expert, pass through the residual)</text>`;
+  svg.innerHTML=s;
+  const tot=EP*T*K,kept=tot-o.drop,local=o.send.reduce((a,row,i)=>a+row[i],0),mean=tot/E,mx=Math.max(...o.load);
+  info.innerHTML=`${EP*T} tokens (16 per GPU), top-${K} of ${E} experts: <b>${tot}</b> token copies. Busiest expert gets <b>${mx}</b>, the average is ${mean}: imbalance ${fx(mx/mean,2)}×. ${o.cap===Infinity?"No capacity limit: nothing is dropped, but the busiest GPU sets the step time.":`Capacity per expert = ⌈${cf} × ${tot} / ${E}⌉ = <b>${o.cap}</b>; dropped copies: <b>${o.drop}</b> (${fx(100*o.drop/tot,1)}%).`} Of the ${kept} kept copies, <b>${kept-local}</b> (${fx(100*(kept-local)/Math.max(kept,1),0)}%) cross to another GPU; the combine all-to-all sends the same number back.`;
+  R.pp4Moe={total:tot,drop:o.drop,cross:kept-local,max:mx,sendSum:o.send.flat().reduce((a,b)=>a+b,0)};}
+ Sk.addEventListener("input",draw);Cf.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 5: 4D rank layout ---------- */
+(function(){
+ const svg=$("#pp4-mesh-svg");if(!svg)return;const info=$("#pp4-mesh-info");let sel=0;const GPN=8;
+ const dims=()=>({TP:+segVal($("#pp4-mesh-tp")),CP:+segVal($("#pp4-mesh-cp")),PP:+segVal($("#pp4-mesh-pp")),DP:+segVal($("#pp4-mesh-dp"))});
+ const coord=(r,D)=>({tp:r%D.TP,cp:Math.floor(r/D.TP)%D.CP,pp:Math.floor(r/(D.TP*D.CP))%D.PP,dp:Math.floor(r/(D.TP*D.CP*D.PP))});
+ function group(r,D,key){const c=coord(r,D),n=D.TP*D.CP*D.PP*D.DP,out=[];for(let q=0;q<n;q++){const z=coord(q,D);let ok=true;["tp","cp","pp","dp"].forEach(k=>{if(k!==key&&z[k]!==c[k])ok=false;});if(ok)out.push(q);}return out;}
+ function draw(){const D=dims(),n=D.TP*D.CP*D.PP*D.DP,show=segVal($("#pp4-mesh-g"));
+  if(n>64){svg.innerHTML=`<text x="20" y="40" font-size="14" fill="var(--bad)">${n} GPUs: too many to draw here (at most 64). Lower one dimension.</text>`;svg.setAttribute("viewBox","0 0 720 60");info.innerHTML=`TP × CP × PP × DP = ${D.TP} × ${D.CP} × ${D.PP} × ${D.DP} = <b>${n}</b> GPUs.`;R.pp4Mesh={n};return;}
+  if(sel>=n)sel=0;const nodes=Math.ceil(n/GPN),perRow=Math.min(nodes,4),cw=40,nodeW=GPN/2*cw+16,nodeH=2*cw+30;
+  const grp=group(sel,D,show);let s="";
+  for(let k=0;k<nodes;k++){const nx=10+(k%perRow)*(nodeW+12),ny=8+Math.floor(k/perRow)*(nodeH+10);
+   s+=`<rect x="${nx}" y="${ny}" width="${nodeW}" height="${nodeH}" rx="8" fill="none" stroke="var(--rule)"/><text x="${nx+8}" y="${ny+14}" font-size="11" class="svgs">node ${k} (NVLink inside)</text>`;
+   for(let g=0;g<GPN;g++){const r=k*GPN+g;if(r>=n)break;const c=coord(r,D),x=nx+8+(g%4)*cw,y=ny+20+Math.floor(g/4)*cw,inG=grp.includes(r);
+    s+=`<g class="pp4-gpu" data-r="${r}" tabindex="0" role="button" aria-label="GPU ${r}"><rect x="${x}" y="${y}" width="${cw-4}" height="${cw-4}" rx="5" fill="${RC[c.pp%8]}" fill-opacity="${inG?0.9:0.22}" stroke="${r===sel?"var(--ink)":inG?"var(--ink2)":"var(--rule)"}" stroke-width="${r===sel?2.6:inG?1.4:.8}"/><text x="${x+(cw-4)/2}" y="${y+15}" text-anchor="middle" font-size="11.5" font-weight="700" fill="var(--ink)">${r}</text><text x="${x+(cw-4)/2}" y="${y+29}" text-anchor="middle" font-size="8.5" fill="var(--ink2)">s${c.pp}·d${c.dp}</text></g>`;}}
+  const rows=Math.ceil(nodes/perRow);svg.setAttribute("viewBox",`0 0 ${Math.max(10+perRow*(nodeW+12),300)} ${8+rows*(nodeH+10)}`);svg.innerHTML=s;
+  const c=coord(sel,D),nodeOf=q=>Math.floor(q/GPN);
+  const line=(lab,key)=>{const g=group(sel,D,key),inside=g.every(q=>nodeOf(q)===nodeOf(sel));return `<b>${lab}</b> group {${g.join(", ")}}${g.length>1?(inside?" inside one node":" <b>spans nodes</b>"):" (size 1)"}`;};
+  info.innerHTML=`GPU <b>${sel}</b> has coordinates tp = ${c.tp}, cp = ${c.cp}, pp = ${c.pp} (stage), dp = ${c.dp} (color = pipeline stage, label s = stage, d = data-parallel index). ${line("TP","tp")}; ${line("CP","cp")}; ${line("PP","pp")}; ${line("DP","dp")}. Total <b>${n}</b> GPUs in ${nodes} node${nodes>1?"s":""}.`;
+  R.pp4Mesh={n,sel,tp:group(sel,D,"tp"),dp:group(sel,D,"dp"),pp:group(sel,D,"pp")};}
+ svg.addEventListener("click",e=>{const t=e.target.closest(".pp4-gpu");if(!t)return;sel=+t.dataset.r;draw();});
+ svg.addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const t=e.target.closest(".pp4-gpu");if(!t)return;e.preventDefault();sel=+t.dataset.r;draw();const q=svg.querySelector(`.pp4-gpu[data-r="${sel}"]`);if(q)q.focus();});
+ ["#pp4-mesh-tp","#pp4-mesh-cp","#pp4-mesh-pp","#pp4-mesh-dp","#pp4-mesh-g"].forEach(id=>seg($(id),draw));draw();
+})();
+
+/* ---------- Figure 6: 4D planner for Llama 3 405B ---------- */
+(function(){
+ const svg=$("#pp4-plan-svg");if(!svg)return;const info=$("#pp4-plan-info");
+ const PSI=405853388800,L=126;
+ const set=(id,v)=>{$(id).querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.v===String(v)?"true":"false"));};
+ function draw(){const TP=+segVal($("#pp4-plan-tp")),CP=+segVal($("#pp4-plan-cp")),PPd=+segVal($("#pp4-plan-pp")),DP=+segVal($("#pp4-plan-dp")),S=+segVal($("#pp4-plan-s")),V=+segVal($("#pp4-plan-v"));
+  const n=TP*CP*PPd*DP,per=PSI/(TP*PPd),wg=4*per,opt=12*per/(DP*CP),tot=wg+opt;
+  const seqPerDP=Math.max(1,Math.round(16777216/S/DP));const m=seqPerDP;const bubble=PPd>1?(PPd-1)/(V*m):0;
+  const X0=170,W=440,mxv=Math.max(80e9,tot)*1.1;let s="";
+  const bars=[["BF16 weights + grads",wg,"var(--q)"],["FP32 Adam states (sharded)",opt,"var(--k)"]];
+  s+=`<text x="${X0-8}" y="30" text-anchor="end" font-size="12.5" fill="var(--ink2)">model states / GPU</text>`;let x=X0;
+  bars.forEach(([lab,v,col])=>{const w=v/mxv*W;s+=`<rect x="${x}" y="12" width="${w.toFixed(1)}" height="30" fill="${col}" opacity=".85"/>`;x+=w;});
+  s+=`<line x1="${X0+80e9/mxv*W}" y1="6" x2="${X0+80e9/mxv*W}" y2="50" stroke="var(--bad)" stroke-dasharray="5 4" stroke-width="1.6"/><text x="${X0+80e9/mxv*W}" y="62" text-anchor="middle" font-size="11" fill="var(--bad)">80 GB</text>`;
+  s+=`<text x="${Math.min(x+6,640)}" y="32" font-size="12" font-family="var(--mono)" fill="var(--ink)">${fx(tot/1e9,1)} GB</text>`;
+  s+=`<text x="${X0-8}" y="98" text-anchor="end" font-size="12.5" fill="var(--ink2)">pipeline bubble</text><rect x="${X0}" y="80" width="${W}" height="26" fill="var(--paper2)" stroke="var(--rule)"/><rect x="${X0}" y="80" width="${(Math.min(bubble,1)*W).toFixed(1)}" height="26" fill="var(--warn)" opacity=".8"/>${bubble>0.7?`<text x="${X0+Math.min(bubble,1)*W-6}" y="98" text-anchor="end" font-size="12" font-family="var(--mono)" fill="var(--ink)">${fx(100*bubble,1)}% of ideal</text>`:`<text x="${X0+bubble*W+6}" y="98" font-size="12" font-family="var(--mono)" fill="var(--ink)">${fx(100*bubble,1)}% of ideal</text>`}`;
+  svg.innerHTML=s;
+  const flags=[];if(TP>8)flags.push("TP larger than one 8-GPU node: TP all-reduces would cross the slow network");
+  if(L%PPd!==0&&PPd>1)flags.push(`${L} layers do not split evenly into ${PPd} stages (Llama 3 put one layer fewer on the first and last stage)`);
+  if(CP===1&&S>16384)flags.push("long sequence without context parallelism: activations of one sequence must fit on the TP group");
+  if(m<PPd&&PPd>1)flags.push("fewer micro-batches than stages: the pipeline never fills");
+  info.innerHTML=`TP ${TP} × CP ${CP} × PP ${PPd} × DP ${DP} = <b>${n.toLocaleString("en-US")}</b> GPUs. Each GPU holds 1/(TP·PP) of the 405.9B parameters = <b>${fx(per/1e9,2)}B</b>: ${fx(wg/1e9,1)} GB of BF16 weights and gradients + ${fx(opt/1e9,2)} GB of Adam states sharded over DP × CP = <b>${fx(tot/1e9,1)} GB</b> (before activations). With a 16M-token batch and sequences of ${S.toLocaleString("en-US")}, each DP replica runs m = <b>${m}</b> micro-batches of one sequence: bubble (PP − 1)/(V·m) = <b>${fx(100*bubble,1)}%</b>.${flags.length?" <b style='color:var(--bad)'>Check:</b> "+flags.join("; ")+".":""}`;
+  R.pp4Plan={n,perB:+(per/1e9).toFixed(3),totGB:+(tot/1e9).toFixed(2),m,bubble:+bubble.toFixed(4)};}
+ ["#pp4-plan-tp","#pp4-plan-cp","#pp4-plan-pp","#pp4-plan-dp","#pp4-plan-s","#pp4-plan-v"].forEach(id=>seg($(id),draw));
+ $("#pp4-plan-a").addEventListener("click",()=>{set("#pp4-plan-tp",8);set("#pp4-plan-cp",1);set("#pp4-plan-pp",16);set("#pp4-plan-dp",128);set("#pp4-plan-s",8192);draw();});
+ $("#pp4-plan-b").addEventListener("click",()=>{set("#pp4-plan-tp",8);set("#pp4-plan-cp",16);set("#pp4-plan-pp",16);set("#pp4-plan-dp",8);set("#pp4-plan-s",131072);draw();});
+ draw();
+})();
+})();
+</script></body></html>

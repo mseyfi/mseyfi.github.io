@@ -1,0 +1,464 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>The generation loop: prefill and decode · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 78</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="the-generation-loop-prefill-and-decode">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="the-generation-loop-prefill-and-decode" data-session="the-generation-loop-prefill-and-decode" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">78</span><span>Track 5: LLM inference and serving · session 1 of 65</span></div><h1 class="chap-title">The generation loop: prefill and decode</h1><p class="chap-sub">An LLM writes its answer one token at a time. This session splits that loop into two phases: prefill, which reads the whole prompt in parallel and fills the KV cache, and decode, which makes one token per step and must read all the weights each time. You will learn to predict, with two numbers (weight bytes and memory bandwidth), why decoding is slow and how batching helps.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 6, 25, 26 and 42 (next-token prediction, counting FLOPs and memory, the KV cache idea, GPU architecture)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How the autoregressive loop works, and why a KV cache turns quadratic repeated work into linear work</li><li>Prefill: all prompt tokens in one pass, GEMMs, causal mask, logits only for the last position; why it is compute-bound</li><li>Decode: one token per step, a GEMV against every weight matrix plus a read of the whole cache; why it is memory-bound</li><li>Arithmetic intensity, the ridge point and the roofline, with real H100 and A100 numbers</li><li>The survey’s example: why LLaMA-2-70B in FP16 needs 140 GB, and why one token takes tens of milliseconds on 2 A100s</li><li>How batching shares the weight read, and why the KV cache keeps long-context decode memory-bound</li><li>TTFT and TPOT, and how to estimate the latency of a request</li></ul></div></header><style>
+.gl-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.gl-grid input[type=range]{width:100%}
+.gl-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.gl-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.gl-svg text{font-family:var(--sans)}
+.gl-warn{color:var(--k);font-weight:700}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">You type a question into a chatbot. First there is a short wait. Then the answer appears word by word, at a steady speed. These two parts, the wait and the steady stream, come from two very different kinds of work inside the model. They are called <b>prefill</b> and <b>decode</b>.</p>
+<p><b>Prefill</b> is the model reading your whole prompt at once. All prompt tokens go through the network together, in parallel, and the model stores what it computed (the <b>KV cache</b>) so it never has to redo that work. Prefill ends with the first output token. <b>Decode</b> is everything after that: the model makes one token, appends it, makes the next one, and so on. Each decode step processes only one new token per sequence, but it must still read every weight of the model from GPU memory.</p>
+<p>This difference decides almost everything in LLM inference. Prefill is limited by arithmetic (it is <b>compute-bound</b>). Decode is limited by how fast the GPU can read memory (it is <b>memory-bound</b>). The survey by Zhou et al. gives a concrete example: LLaMA-2-70B stored in FP16 needs 140 GB just for its weights, and generating one token on 2 NVIDIA A100 GPUs takes about 100 milliseconds. [Certain: both numbers are quoted from the survey, Section 2.] By the end of this session you will be able to derive the 140 GB yourself, compute a lower bound of about 34 ms for that token, and explain where the rest of the time goes.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Very common questions: “What is the difference between prefill and decode?”, “Why is decoding memory-bound?”, “Why does batching help decode but not prefill?”, “Estimate the tokens per second of a 7B model on one GPU.” All of them are answered with two numbers: the weight bytes and the memory bandwidth.</aside>
+<p>Every later idea in this track builds on these two phases: the KV cache (<a href="../inference/the-kv-cache.html">session 80</a>), latency metrics (<a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>), the roofline (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>), batching (<a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>), quantization, speculative decoding, and serving systems such as vLLM. We continue from the post-training track (<a href="../posttraining/index.html#row-lab-grpo-with-a-verifiable-reward" title="GRPO with a verifiable reward (planned)">session 77</a>), where we generated many samples during RL without asking how generation itself works. Now we open that box.</p>
+
+<h2>The generation loop</h2>
+<p>A decoder-only LLM is trained to predict the next token (see <a href="../foundations/next-token-prediction.html">session 6</a>). It gives a probability to a whole sequence by multiplying next-token probabilities:</p>
+<div class="eq">\[ p(x_1, \dots, x_T) = \prod_{t=1}^{T} p_\theta\!\left(x_t \mid x_1, \dots, x_{t-1}\right) \tag{78.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(x_t\)</dt><dd>the token at position \(t\) (an integer ID from the vocabulary)</dd>
+<dt>\(p_\theta(x_t \mid x_1, \dots, x_{t-1})\)</dt><dd>the model’s probability for token \(x_t\), given all tokens before it; \(\theta\) are the weights</dd>
+<dt>\(T\)</dt><dd>the length of the sequence</dd></dl>
+<p>Generation uses formula (78.1) one factor at a time. Given a prompt of \(P\) tokens, the model computes the distribution of token \(P+1\), we choose one token from it (greedy, sampling, and so on; that choice is the topic of <a href="../inference/decoding-strategies.html">session 79</a>), append it, and repeat. The loop stops when the model outputs an end-of-sequence token or when we reach a length limit. This is called <b>autoregressive</b> generation: each output becomes part of the next input.</p>
+<p>There is a simple but slow way to run this loop: at every step, feed the whole sequence (prompt plus all tokens made so far) through the model again. That repeats a lot of work. Thanks to the causal mask, the hidden state at position \(i\) depends only on tokens \(1..i\). So when a new token is added, nothing at the old positions changes. The only thing the new position needs from the old positions is their <b>keys</b> and <b>values</b> in every attention layer. If we store those, each new step only has to process one token. The stored keys and values are the <b>KV cache</b>.</p>
+<p>With the cache, the loop splits into two phases:</p>
+<ul>
+<li><b>Prefill</b> (one step): run all \(P\) prompt tokens through the model at once, write their keys and values into the cache, and compute the distribution of the first output token.</li>
+<li><b>Decode</b> (many steps): feed only the newest token, read the cache to attend to all earlier tokens, append the new key and value, and compute the next distribution.</li></ul>
+<aside class="note analogy side"><span class="nt">Analogy</span>Prefill is reading the whole question at once. Decode is writing the answer one word at a time, and for every single word you walk to a far warehouse (GPU memory) to fetch all the tools (weights) again, use them for a moment, and put them back.</aside>
+<p>Step through the loop in Figure 1. Switch the cache off to see how much work the naive loop repeats.</p>
+<figure class="fig" id="gl-loop"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="gl-loop-prev">Back</button><button type="button" class="btn primary" id="gl-loop-play">Play</button><button type="button" class="btn" id="gl-loop-next">Next</button><span id="gl-loop-lab" style="font:500 14px var(--sans);color:var(--muted)"></span>
+<label class="sl"><input type="checkbox" id="gl-loop-nocache"> No KV cache (recompute everything)</label></div>
+<div class="scroll-x"><svg id="gl-loop-svg" class="gl-svg" viewBox="0 0 760 300" role="img" aria-label="Tokens of a prompt and an answer, with the positions processed at each step and the KV cache filling up"></svg></div>
+<div class="gl-leg"><span style="--c:var(--q)">processed in this step</span><span style="--c:var(--v)">read from the KV cache</span><span style="--c:var(--k)">new output token</span></div>
+<div class="readout" id="gl-loop-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The generation loop for a 5-token prompt and 5 output tokens. Each column is one position. The top row shows the tokens. The middle row shows which positions go through the model in the current step. The bottom row is the KV cache. The output words are only an illustration.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Step 1 shows the prompt before anything runs. Step 2 is the prefill: all five prompt columns light up together, the cache fills with five entries, and the first answer token appears. Steps 3 to 6 are decode steps: only one column is processed, and the green cache cells are read. The counter in the readout adds up the positions processed. With the cache it ends at 9 (5 + 4). With the cache switched off, every step re-processes the full sequence, and the counter ends at 35 (5 + 6 + 7 + 8 + 9). The answers are the same in both cases; only the work differs.</p></details></figure>
+<p>We can write the work of the two loops as a count of positions that pass through the network. For a prompt of \(P\) tokens and \(n\) output tokens, the last output token is never fed back, so:</p>
+<div class="eq">\[ W_{\text{naive}} = \sum_{i=0}^{n-1} (P + i) = nP + \frac{n(n-1)}{2}, \qquad W_{\text{cached}} = P + (n - 1) \tag{78.2} \]</div>
+<div class="worked"><div class="wt">Worked example: how much the cache saves</div>
+<p>Figure 1 has \(P = 5\) and \(n = 5\): \(W_{\text{naive}} = 25 + 10 = 35\) and \(W_{\text{cached}} = 9\).</p>
+<p>A more typical chat turn: \(P = 1000\), \(n = 500\). Then \(W_{\text{naive}} = 500{,}000 + 124{,}750 = 624{,}750\) and \(W_{\text{cached}} = 1{,}499\). The naive loop does about 417 times more weight work. The cost of the cache is memory: we must keep keys and values for all \(1{,}499\) positions. The rest of this session is about the two new kinds of steps the cache creates.</p></div>
+
+<h2>Prefill: read the whole prompt in parallel</h2>
+<p>In the prefill step the input is a matrix \(X \in \R^{P \times d}\): one row per prompt token, \(d\) numbers per row. Every linear layer multiplies this whole matrix by its weight matrix at once. In each attention layer \(\ell\), the step also computes the keys and values of all prompt positions and stores them:</p>
+<div class="eq">\[ K^{(\ell)} = X^{(\ell)} W_K^{(\ell)}, \qquad V^{(\ell)} = X^{(\ell)} W_V^{(\ell)}, \qquad K^{(\ell)}, V^{(\ell)} \in \R^{P \times n_{kv} d_h} \tag{78.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(X^{(\ell)}\)</dt><dd>the normalized hidden states that enter attention layer \(\ell\), one row per prompt token</dd>
+<dt>\(W_K^{(\ell)}, W_V^{(\ell)}\)</dt><dd>the key and value projection matrices of that layer</dd>
+<dt>\(n_{kv}\), \(d_h\)</dt><dd>the number of key/value heads and the size of each head (with grouped-query attention, \(n_{kv}\) is smaller than the number of query heads; see <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>)</dd></dl>
+<p>Attention inside the prompt uses the causal mask, so position \(i\) attends to positions \(1..i\), exactly as in training. At the end, the model applies the output layer to the <b>last</b> position only, because only that position predicts the first new token. (In training, logits at all positions are needed. In inference, computing logits for all \(P\) positions wastes time and memory, especially with vocabularies of 128K tokens.)</p>
+<h3>The cost of prefill</h3>
+<p>Recall from <a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a> that a forward pass costs about \(2N\) FLOPs per token for a model with \(N\) parameters (one multiply and one add per weight). Attention adds work that grows with the square of the prompt length. With the causal mask, about half of the score matrix is needed:</p>
+<div class="eq">\[ F_{\text{prefill}} \approx 2 N P \; + \; 2\, L\, d_{\text{attn}}\, P^2 \tag{78.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\)</dt><dd>number of parameters; each is used once per token, for a multiply and an add</dd>
+<dt>\(P\)</dt><dd>prompt length in tokens</dd>
+<dt>\(L\), \(d_{\text{attn}}\)</dt><dd>number of layers and the total width of the query heads (\(n_h d_h\)); \(QK^\top\) and the weighted sum of values each cost \(2 d_{\text{attn}}\) FLOPs per pair of positions, and the causal mask keeps about \(P^2/2\) pairs</dd></dl>
+<p>The important point is what prefill reads from memory. All \(P\) tokens use the <b>same</b> weights. So the weights are read from memory once and used \(P\) times. The work is large matrix–matrix multiplications (GEMMs), which GPUs are built for.</p>
+<div class="worked"><div class="wt">Worked example: prefill of a 2,000-token prompt on Llama 3 8B</div>
+<p>Llama 3 8B has \(N \approx 8.03 \times 10^9\) parameters, \(L = 32\) layers and \(d_{\text{attn}} = 4096\) (from its <code>config.json</code>). Weight FLOPs: \(2 \times 8.03 \times 10^9 \times 2000 = 3.21 \times 10^{13}\). Attention FLOPs: \(2 \times 32 \times 4096 \times 2000^2 = 1.05 \times 10^{12}\), only about 3% more.</p>
+<p>On an H100 SXM (989 TFLOP/s dense BF16, 3.35 TB/s, numbers from <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>), the arithmetic takes at least \(3.31 \times 10^{13} / 9.89 \times 10^{14} \approx 33.5\) ms. Reading the 16.06 GB of BF16 weights takes only \(16.06 / 3350 \approx 4.8\) ms. The arithmetic is 7 times longer than the memory reading: prefill is compute-bound.</p></div>
+
+<h2>Decode: one token per step</h2>
+<p>In a decode step the input is a single row \(\mathbf{x}_t \in \R^{1 \times d}\) per sequence: the embedding of the token we just chose. In each layer, attention computes one query \(\mathbf{q}_t\), one key and one value, appends the key and value to the cache, and attends over everything in the cache:</p>
+<div class="eq">\[ \mathbf{o}_t = \softmax\!\left( \frac{\mathbf{q}_t\, [K_{\text{cache}}; \mathbf{k}_t]^\top}{\sqrt{d_h}} \right) [V_{\text{cache}}; \mathbf{v}_t] \tag{78.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{q}_t, \mathbf{k}_t, \mathbf{v}_t\)</dt><dd>query, key and value of the new token (for one head)</dd>
+<dt>\(K_{\text{cache}}, V_{\text{cache}}\)</dt><dd>the stored keys and values of all \(t-1\) earlier positions</dd>
+<dt>\([A; \mathbf{b}]\)</dt><dd>append row \(\mathbf{b}\) at the bottom of matrix \(A\)</dd>
+<dt>no mask</dt><dd>the newest token may see every earlier token, so the causal mask is not needed in decode</dd></dl>
+<p>The new query is used once and thrown away; it is never cached. Only keys and values are reused by later tokens. The cache grows by one row per layer and per KV head at every step. Its size per token is</p>
+<div class="eq">\[ s_{\text{kv}} = 2 \cdot L \cdot n_{kv} \cdot d_h \cdot b \quad \text{bytes per token} \tag{78.6} \]</div>
+<p>where the 2 counts K and V, and \(b\) is the bytes per number (2 for BF16 or FP16). For Llama 3 8B (\(L = 32\), \(n_{kv} = 8\), \(d_h = 128\)): \(s_{\text{kv}} = 131{,}072\) bytes = 128 KiB per token. For Llama 2 70B (\(L = 80\), \(n_{kv} = 8\), \(d_h = 128\)): 327,680 bytes = 320 KiB per token, or 1.34 GB for one sequence of 4,096 tokens. [Certain: computed from the published configs.] <a href="../inference/the-kv-cache.html">Session 80</a> studies this memory in depth.</p>
+<p>Now look at the shapes in each linear layer. Prefill multiplies a \(P \times d\) matrix by a \(d \times d\) weight matrix. Decode at batch size 1 multiplies a \(1 \times d\) vector by the same matrix. This is a matrix–vector product (GEMV). Figure 2 compares them.</p>
+<figure class="fig" id="gl-shape"><div class="fig-body">
+<div class="scroll-x"><svg id="gl-shape-svg" class="gl-svg" viewBox="0 0 680 270" role="img" aria-label="Prefill multiplies a tall matrix by the weights; decode multiplies a single row by the same weights">
+<text x="170" y="22" text-anchor="middle" font-size="15" font-weight="700" fill="var(--ink)">Prefill: matrix × matrix (GEMM)</text>
+<rect x="20" y="50" width="70" height="150" rx="4" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1.6"/>
+<text x="55" y="130" text-anchor="middle" font-size="14" fill="var(--ink)">X</text><text x="55" y="218" text-anchor="middle" font-size="12" fill="var(--muted)">P × d</text>
+<text x="107" y="130" text-anchor="middle" font-size="18" fill="var(--ink)">×</text>
+<rect x="125" y="60" width="110" height="110" rx="4" fill="var(--card)" stroke="var(--tc)" stroke-width="1.6"/>
+<text x="180" y="120" text-anchor="middle" font-size="14" fill="var(--ink)">W</text><text x="180" y="188" text-anchor="middle" font-size="12" fill="var(--muted)">d × d, read once</text>
+<text x="252" y="130" text-anchor="middle" font-size="18" fill="var(--ink)">=</text>
+<rect x="270" y="50" width="70" height="150" rx="4" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1.6"/>
+<text x="305" y="130" text-anchor="middle" font-size="14" fill="var(--ink)">Y</text><text x="305" y="218" text-anchor="middle" font-size="12" fill="var(--muted)">P × d</text>
+<text x="170" y="245" text-anchor="middle" font-size="13" fill="var(--ink2)">FLOPs 2Pd², bytes ≈ 2d²: each weight used P times</text>
+<line x1="360" y1="30" x2="360" y2="250" stroke="var(--rule)" stroke-width="1.4"/>
+<text x="520" y="22" text-anchor="middle" font-size="15" font-weight="700" fill="var(--ink)">Decode: vector × matrix (GEMV)</text>
+<rect x="390" y="110" width="55" height="12" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1.6"/>
+<text x="417" y="145" text-anchor="middle" font-size="12" fill="var(--muted)">1 × d</text>
+<text x="472" y="122" text-anchor="middle" font-size="18" fill="var(--ink)">×</text>
+<rect x="490" y="60" width="110" height="110" rx="4" fill="var(--card)" stroke="var(--tc)" stroke-width="1.6"/>
+<text x="545" y="120" text-anchor="middle" font-size="14" fill="var(--ink)">W</text><text x="545" y="188" text-anchor="middle" font-size="12" fill="var(--muted)">d × d, read once</text>
+<text x="610" y="122" text-anchor="middle" font-size="18" fill="var(--ink)">=</text>
+<rect x="622" y="110" width="55" height="12" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1.6"/>
+<text x="649" y="145" text-anchor="middle" font-size="12" fill="var(--muted)">1 × d</text>
+<text x="520" y="245" text-anchor="middle" font-size="13" fill="var(--ink2)">FLOPs 2d², bytes ≈ 2d²: each weight used once</text>
+</svg></div>
+</div><figcaption><b>Figure 2.</b> The same weight matrix \(W\) in the two phases (BF16, 2 bytes per number). In prefill, the cost of reading \(W\) is shared by \(P\) tokens. In decode at batch size 1, all of \(W\) is read to produce one row. For \(d = 4096\), \(W\) is 33.5 MB; prefill with \(P = 2000\) does about 1,012 FLOPs per byte read, decode does about 1.</figcaption></figure>
+
+<h2>Arithmetic intensity and the roofline</h2>
+<p>To decide whether a step is limited by arithmetic or by memory, we compare two numbers. The <b>arithmetic intensity</b> of a piece of work is how many FLOPs it does per byte it moves between GPU memory (HBM) and the chip:</p>
+<div class="eq">\[ I = \frac{\text{FLOPs}}{\text{bytes moved}}, \qquad t \;\ge\; \max\!\left( \frac{\text{FLOPs}}{\pi}, \ \frac{\text{bytes}}{\beta} \right) \tag{78.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(I\)</dt><dd>arithmetic intensity, in FLOPs per byte</dd>
+<dt>\(\pi\)</dt><dd>the peak compute speed of the GPU (FLOP/s), for example 989 TFLOP/s on an H100 SXM in BF16</dd>
+<dt>\(\beta\)</dt><dd>the memory bandwidth (bytes/s), for example 3.35 TB/s on an H100 SXM</dd>
+<dt>\(t\)</dt><dd>a lower bound on the time of the step: the GPU can overlap arithmetic and memory reads, but it cannot beat either limit</dd></dl>
+<p>The two limits are equal when \(I = \pi / \beta\). This is the <b>ridge point</b>: about 295 FLOPs/byte for an H100 SXM and 153 for an A100 80 GB. [Certain: ratios of NVIDIA datasheet numbers.] Work with intensity below the ridge is memory-bound; above it, compute-bound. This picture is the <b>roofline model</b> (Williams et al.); <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a> uses it for whole models.</p>
+<p>For one linear layer \(Y = XW\) with \(X \in \R^{m \times d}\), \(W \in \R^{d \times d}\) and 2 bytes per number, we read \(W\) and \(X\) and write \(Y\):</p>
+<div class="eq">\[ I(m) = \frac{2 m d^2}{2\,(d^2 + 2 m d)} \;\approx\; m \quad \text{when } m \ll d \tag{78.8} \]</div>
+<p>Here \(m\) is the number of token rows that share one read of the weights: \(m = P\) in prefill, and \(m = B\) (the batch size) in decode. So the intensity is roughly <b>the number of tokens processed per weight read</b>. Prefill has \(m\) in the thousands. Decode at batch 1 has \(m = 1\). Figure 3 places both on the roofline.</p>
+<figure class="fig" id="gl-roof"><div class="fig-body">
+<div class="controls"><span class="seg" id="gl-roof-gpu"><button type="button" data-v="h100" aria-pressed="true">H100 SXM</button><button type="button" data-v="a100" aria-pressed="false">A100 80 GB</button></span></div>
+<div class="gl-grid"><label for="gl-roof-m">Tokens per weight read \(m\)</label><input type="range" id="gl-roof-m" min="0" max="13" step="0.25" value="0"><output id="gl-roof-mv"></output></div>
+<svg id="gl-roof-svg" class="gl-svg" viewBox="0 0 640 300" role="img" aria-label="Roofline: attainable FLOP per second against arithmetic intensity, with the current operating point"></svg>
+<div class="readout" id="gl-roof-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> The roofline of one GPU for a single \(4096 \times 4096\) BF16 linear layer. The slanted line is the memory limit \(I \cdot \beta\); the flat line is the compute limit \(\pi\). The dot shows your choice of \(m\); the gray marks show decode at batch 1 and a 2,000-token prefill. Both axes are logarithmic.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Start at \(m = 1\) (decode, one sequence): the intensity is about 1 FLOP/byte and the GPU reaches only 0.3% of its peak on an H100 (0.7% on an A100). Move the slider right. Each doubling of \(m\) roughly doubles the useful speed, as long as you are on the slanted part. The layer becomes compute-bound at about \(m = 345\) on the H100 and \(m = 165\) on the A100; after that, more tokens per read do not make each FLOP faster. A typical prefill (\(m\) in the thousands) sits on the flat part. Decode lives on the far left unless we batch many sequences.</p></details></figure>
+
+<h2>Why decode at batch 1 reads all weights to make one token</h2>
+<p>Put the pieces together for one decode step with batch size \(B\) and \(T\) tokens already in each cache. The weights are read once per step, whatever \(B\) is. Each sequence reads its own cache:</p>
+<div class="eq">\[ F_{\text{decode}} \approx 2 N B + 4\, L\, d_{\text{attn}}\, T B, \qquad \text{bytes}_{\text{decode}} \approx b N + B\, T\, s_{\text{kv}} \tag{78.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(B\)</dt><dd>batch size: how many sequences make one token each in this step</dd>
+<dt>\(T\)</dt><dd>context length: tokens already in each sequence’s KV cache</dd>
+<dt>\(b N\)</dt><dd>bytes of all weights (\(b = 2\) for BF16): read once per step and shared by the batch</dd>
+<dt>\(B T s_{\text{kv}}\)</dt><dd>bytes of all KV caches: each sequence reads its own, so this is <b>not</b> shared</dd></dl>
+<p>At \(B = 1\) and short context, the intensity is \(2N / 2N = 1\) FLOP per byte. That is 295 times below the H100 ridge. The arithmetic units are idle about 99.7% of the time, waiting for weights to arrive. So the speed of single-user decode is set by memory bandwidth alone:</p>
+<div class="eq">\[ t_{\text{token}} \;\ge\; \frac{b\, N}{\beta_{\text{total}}} \tag{78.10} \]</div>
+<p>where \(\beta_{\text{total}}\) is the summed bandwidth of all GPUs that hold a piece of the model (with tensor parallelism, each GPU reads only its own share of the weights, in parallel).</p>
+<div class="worked"><div class="wt">Worked example: the survey’s LLaMA-2-70B numbers</div>
+<p><b>Memory.</b> 70 billion parameters × 2 bytes (FP16) = 140 GB, the survey’s number. The exact count from the Llama 2 70B config (80 layers, width 8192, FFN width 28672, 64 query heads, 8 KV heads, vocabulary 32,000, untied embeddings) is 68.98 billion, so 138 GB. One A100 has 80 GB, so the model needs at least 2 GPUs. Together they have 160 GB, which leaves about 20 GB for the KV cache and activations: room for about 14 sequences of 4,096 tokens at 1.34 GB each.</p>
+<p><b>Time.</b> Two A100s read \(2 \times 2.039 = 4.078\) TB/s together. Formula (78.10): \(140 \text{ GB} / 4.078 \text{ TB/s} = 34.3\) ms per token, at most about 29 tokens per second. The arithmetic needs only \(2 \times 70 \times 10^9 = 1.4 \times 10^{11}\) FLOPs, which takes 0.22 ms at the two GPUs’ combined peak of 624 TFLOP/s. Memory reading is about 150 times longer than the arithmetic.</p>
+<p><b>The gap.</b> The survey reports about 100 ms, roughly 3 times our bound; the bound corresponds to about 34% of peak bandwidth. Real systems lose time to the communication between the two GPUs after each layer, to many small kernel launches, to attention over the cache, and to kernels that do not reach peak bandwidth. [Likely: the survey does not break the 100 ms down.] The lower bound is still the right first estimate: no software trick can make batch-1 decode faster than bytes ÷ bandwidth, except reading fewer bytes (quantization, smaller models) or making more tokens per read (batching, speculative decoding).</p></div>
+<h3>Batching: share the weight read</h3>
+<p>Formula (78.9) shows why batching is the main tool for decode throughput. The \(bN\) bytes are shared by all \(B\) sequences, so at short context the intensity is about \(B\), and the step time hardly changes as \(B\) grows. Total tokens per second grows almost linearly with \(B\). But the KV term \(B T s_{\text{kv}}\) grows with \(B\) too, and it is not shared. At long context it takes over. In the limit of very large \(B\), the intensity tends to \((2N + 4 L d_{\text{attn}} T)/(T s_{\text{kv}})\): about 124 FLOPs/byte for Llama 3 8B at \(T = 1024\), and only about 34 at \(T = 4096\). Both are below the H100 ridge, so decode with long contexts stays memory-bound at any batch size. Memory capacity also limits \(B\): all caches must fit next to the weights. Explore both effects in Figure 4.</p>
+<figure class="fig" id="gl-calc"><div class="fig-body">
+<div class="controls"><span class="seg" id="gl-calc-model"><button type="button" data-v="8b" aria-pressed="true">Llama 3 8B on 1 H100</button><button type="button" data-v="70b" aria-pressed="false">Llama 2 70B on 2 A100s</button></span></div>
+<div class="gl-grid">
+<label for="gl-calc-b">Batch size \(B\)</label><input type="range" id="gl-calc-b" min="0" max="8" step="1" value="0"><output id="gl-calc-bv"></output>
+<label for="gl-calc-t">Context \(T\) (tokens in each cache)</label><input type="range" id="gl-calc-t" min="0" max="6" step="1" value="3"><output id="gl-calc-tv"></output></div>
+<div class="scroll-x"><svg id="gl-calc-svg" class="gl-svg" viewBox="0 0 640 260" role="img" aria-label="Bytes read per decode step split into weights and KV cache, and tokens per second against batch size"></svg></div>
+<div class="gl-leg"><span style="--c:var(--tc)">weights read per step</span><span style="--c:var(--v)">KV cache read per step</span><span style="--c:var(--k)">total tokens/s</span><span style="--c:var(--q)">tokens/s for one user</span></div>
+<div class="readout" id="gl-calc-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A roofline estimate of one decode step, using formulas (78.7) and (78.9) with datasheet peaks (BF16/FP16 weights and cache). Left: the bytes read in one step. Right: tokens per second against batch size for the chosen context; the dot is your batch size. These are best-case numbers; real systems are slower.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At \(B = 1\) the left bar is almost all weights, and the step takes about 4.8 ms for the 8B model (about 207 tokens/s at \(T = 1024\)). Increase \(B\): the green part grows, the step gets a little slower, but total tokens per second (orange) climbs fast, while each user’s speed (blue) drops only slowly. Now raise \(T\) to 4,096 or 8,192: the green part dominates and the orange curve flattens early. If the readout says the caches do not fit, that batch is impossible on this hardware. Switch to the 70B model to see the survey’s setting: about 34 ms per token at batch 1.</p></details></figure>
+
+<h2>The latency of one request</h2>
+<p>A user sees the two phases as two different latencies. The <b>time to first token (TTFT)</b> is the time until the first output token appears; it is mostly the prefill (plus queueing in a real server). The <b>time per output token (TPOT)</b> is the average time of one decode step. The survey calls them first-token latency and per-output-token latency. For \(n\) output tokens:</p>
+<div class="eq">\[ T_{\text{request}} \;\approx\; \text{TTFT} + (n - 1) \cdot \text{TPOT} \tag{78.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>TTFT</dt><dd>time to first token: grows with the prompt length \(P\), roughly linearly, plus a \(P^2\) attention part</dd>
+<dt>TPOT</dt><dd>time per output token: set by the weight bytes and the cache bytes, almost independent of \(P\) for short prompts</dd>
+<dt>\(n\)</dt><dd>number of output tokens; the first one comes from the prefill</dd></dl>
+<p>Because one prefill token is about 150 to 300 times cheaper in time than one decode token, long answers are usually dominated by decode, while long prompts with short answers (summarization, retrieval, classification with an LLM, video question answering) are dominated by prefill. Figure 5 lets you check this.</p>
+<figure class="fig" id="gl-req"><div class="fig-body">
+<div class="gl-grid">
+<label for="gl-req-p">Prompt length \(P\)</label><input type="range" id="gl-req-p" min="100" max="16000" step="100" value="2000"><output id="gl-req-pv"></output>
+<label for="gl-req-n">Output tokens \(n\)</label><input type="range" id="gl-req-n" min="1" max="1000" step="1" value="500"><output id="gl-req-nv"></output></div>
+<div class="scroll-x"><svg id="gl-req-svg" class="gl-svg" viewBox="0 0 640 150" role="img" aria-label="Timeline of one request: one prefill block followed by many decode steps"></svg></div>
+<div class="gl-leg"><span style="--c:var(--q)">prefill (TTFT)</span><span style="--c:var(--k)">decode steps</span></div>
+<div class="readout" id="gl-req-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Timeline of one request on Llama 3 8B, one H100, batch size 1, best-case roofline times from formulas (78.4) and (78.9). The decode part is drawn as one tick per step when there are few steps.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>With \(P = 2000\) and \(n = 500\), TTFT is about 33.5 ms and the total is about 2.47 s: the prefill is only 1.4% of the time, even though it handles four times as many tokens as the decode. Set \(n\) to 100 and \(P\) to 8,000: TTFT grows to about 147 ms and becomes 22.5% of the request. Notice that TPOT rises slowly with \(P\): each decode step reads a longer cache.</p></details></figure>
+
+<h2>The algorithms and the code</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: generation with prefill and decode</div><ol>
+<li><b>input:</b> prompt tokens \(x_1, \dots, x_P\), maximum new tokens \(n\), a rule to choose a token from logits</li>
+<li>cache \(\leftarrow\) empty, one (K, V) store per layer</li>
+<li>logits \(\leftarrow\) model(\(x_{1..P}\), cache, positions \(1..P\)) <span class="c">// PREFILL: causal mask, writes P entries, returns logits of the last position only</span></li>
+<li>out \(\leftarrow\) [ ]</li>
+<li><b>repeat</b> \(n\) times:</li>
+<li>&nbsp;&nbsp;\(y \leftarrow\) choose(logits); append \(y\) to out <span class="c">// greedy, sampling, ...</span></li>
+<li>&nbsp;&nbsp;<b>if</b> \(y\) is end-of-sequence or out has \(n\) tokens: <b>stop</b></li>
+<li>&nbsp;&nbsp;logits \(\leftarrow\) model(\(y\), cache, position \(P\) + |out|) <span class="c">// DECODE: one token, reads all weights and the cache, appends 1 entry per layer</span></li>
+<li><b>return</b> out</li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: roofline estimate of one step</div><ol>
+<li><b>input:</b> parameters \(N\), layers \(L\), cache bytes per token \(s_{\text{kv}}\), new tokens per sequence \(m\), context \(T\), batch \(B\), GPU peak \(\pi\), bandwidth \(\beta\)</li>
+<li>FLOPs \(\leftarrow 2NmB + 4 L d_{\text{attn}}\, m\,(T + m/2)\, B\) <span class="c">// weights + causal attention; prefill: m = P, T = 0; decode: m = 1</span></li>
+<li>bytes \(\leftarrow bN + B\,(T + m)\, s_{\text{kv}}\) <span class="c">// weights read once; cache read and written</span></li>
+<li>\(I \leftarrow\) FLOPs / bytes <span class="c">// compare with the ridge point \(\pi / \beta\)</span></li>
+<li><b>return</b> \(\max(\text{FLOPs}/\pi,\ \text{bytes}/\beta)\) <span class="c">// formula (78.7): a lower bound</span></li></ol></div>
+<p>The PyTorch code below builds a tiny decoder (2 layers, width 32) with a hand-written KV cache. It generates 8 tokens with prefill and decode, generates them again with the naive loop, and checks that both give the same tokens and the same logits. It runs on a CPU in about a second.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+V, d, H, L = 50, 32, 4, 2            <span class="cm"># vocab, width, heads, layers</span>
+dh = d // H
+
+<span class="kw2">class</span> Block(torch.nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.n1, s.n2 = torch.nn.LayerNorm(d), torch.nn.LayerNorm(d)
+        s.qkv, s.o = torch.nn.Linear(d, 3 * d), torch.nn.Linear(d, d)
+        s.ff = torch.nn.Sequential(torch.nn.Linear(d, 4 * d), torch.nn.GELU(), torch.nn.Linear(4 * d, d))
+    <span class="kw2">def</span> forward(s, x, cache):                      <span class="cm"># x: (B, T_new, d); cache: dict with "k","v" or empty</span>
+        B, T, _ = x.shape
+        q, k, v = s.qkv(s.n1(x)).split(d, dim=-1)
+        q, k, v = [t.view(B, T, H, dh).transpose(1, 2) <span class="kw2">for</span> t <span class="kw2">in</span> (q, k, v)]   <span class="cm"># (B, H, T_new, dh)</span>
+        <span class="kw2">if</span> "k" <span class="kw2">in</span> cache:                           <span class="cm"># decode: append the new keys and values</span>
+            k = torch.cat([cache["k"], k], dim=2); v = torch.cat([cache["v"], v], dim=2)
+        cache["k"], cache["v"] = k, v              <span class="cm"># the cache now covers all positions so far</span>
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=(T > 1))  <span class="cm"># prefill: causal mask; decode: 1 query sees all</span>
+        x = x + s.o(a.transpose(1, 2).reshape(B, T, d))
+        <span class="kw2">return</span> x + s.ff(s.n2(x))
+
+<span class="kw2">class</span> TinyLM(torch.nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.emb, s.pos = torch.nn.Embedding(V, d), torch.nn.Embedding(64, d)
+        s.blocks = torch.nn.ModuleList([Block() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)])
+        s.head = torch.nn.Linear(d, V)
+    <span class="kw2">def</span> forward(s, ids, caches, start):            <span class="cm"># start = number of positions already in the cache</span>
+        x = s.emb(ids) + s.pos(torch.arange(start, start + ids.shape[1]))
+        <span class="kw2">for</span> blk, c <span class="kw2">in</span> zip(s.blocks, caches):
+            x = blk(x, c)
+        <span class="kw2">return</span> s.head(x[:, -1])                    <span class="cm"># only the last position's logits are needed</span>
+
+model = TinyLM().eval()
+prompt = torch.tensor([[3, 14, 15, 9, 26, 5]])     <span class="cm"># P = 6 prompt tokens</span>
+n_new = 8
+
+@torch.no_grad()
+<span class="kw2">def</span> generate_cached(ids):
+    caches = [dict() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)]
+    logits = model(ids, caches, 0)                 <span class="cm"># PREFILL: all P tokens in one pass</span>
+    out, pos, work = [], ids.shape[1], ids.shape[1]
+    <span class="kw2">while</span> True:
+        nxt = logits.argmax(-1, keepdim=True)      <span class="cm"># greedy choice</span>
+        out.append(nxt.item())
+        <span class="kw2">if</span> len(out) == n_new:
+            <span class="kw2">break</span>
+        logits = model(nxt, caches, pos)           <span class="cm"># DECODE: one token, reuse the cache</span>
+        pos += 1; work += 1
+    <span class="kw2">return</span> out, work, caches[0]["k"].shape[2]
+
+@torch.no_grad()
+<span class="kw2">def</span> generate_naive(ids):
+    out, work = [], 0
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(n_new):
+        logits = model(ids, [dict() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)], 0)   <span class="cm"># re-read the whole sequence every step</span>
+        work += ids.shape[1]
+        nxt = logits.argmax(-1, keepdim=True)
+        out.append(nxt.item()); ids = torch.cat([ids, nxt], dim=1)
+    <span class="kw2">return</span> out, work
+
+a, wa, cache_len = generate_cached(prompt)
+b, wb = generate_naive(prompt)
+print(a)
+print(a == b, "positions processed: cached", wa, "naive", wb, "cache length", cache_len)
+
+<span class="cm"># the logits match too, not only the argmax</span>
+caches = [dict() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)]
+full = torch.cat([prompt, torch.tensor([a[:3]])], dim=1)
+<span class="kw2">with</span> torch.no_grad():
+    model(prompt, caches, 0)
+    <span class="kw2">for</span> i, t <span class="kw2">in</span> enumerate(a[:3]):
+        step_logits = model(torch.tensor([[t]]), caches, 6 + i)
+    ref = model(full, [dict() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)], 0)
+print("max logit difference:", (step_logits - ref).abs().max().item())</pre>
+<p>With PyTorch 2.8 on a CPU this prints the token list <code>[29, 6, 47, 23, 6, 47, 9, 5]</code>, then <code>True positions processed: cached 13 naive 76 cache length 13</code>, and a logit difference of about \(2 \times 10^{-7}\) (float32 rounding). The counts match formula (78.2) with \(P = 6\), \(n = 8\): \(6 + 7 = 13\) and \(48 + 28 = 76\). The exact token IDs may differ across PyTorch versions because the random initialization can change; the equality and the counts do not.</p>
+<p>The roofline estimate of Algorithm 2 fits in a few lines of plain Python. It reproduces the numbers of the worked examples:</p>
+<pre class="code"><span class="cm"># Roofline estimate of prefill and decode time (a lower bound: peak FLOP/s and peak bandwidth)</span>
+<span class="kw2">def</span> step_time(N, L, n_kv, d_head, d_attn, new_tokens, context, batch, flops_peak, bandwidth, bytes_per=2):
+    kv_per_token = 2 * L * n_kv * d_head * bytes_per              <span class="cm"># K and V, every layer</span>
+    flops = 2 * N * new_tokens * batch                            <span class="cm"># weight matmuls</span>
+    flops += 4 * L * d_attn * new_tokens * (context + new_tokens / 2) * batch   <span class="cm"># QK^T and AV, causal</span>
+    bytes_ = bytes_per * N + batch * (context + new_tokens) * kv_per_token   <span class="cm"># read weights once, read/write KV</span>
+    <span class="kw2">return</span> max(flops / flops_peak, bytes_ / bandwidth), flops / bytes_
+
+llama3_8b = dict(N=8.03e9, L=32, n_kv=8, d_head=128, d_attn=4096)
+h100 = dict(flops_peak=989e12, bandwidth=3.35e12)
+t, ai = step_time(**llama3_8b, new_tokens=2000, context=0, batch=1, **h100)
+print(f"prefill 2000 tokens: {t*1e3:.1f} ms, intensity {ai:.0f} FLOP/byte")      <span class="cm"># 33.5 ms, 2032</span>
+t, ai = step_time(**llama3_8b, new_tokens=1, context=2000, batch=1, **h100)
+print(f"decode 1 token at context 2000: {t*1e3:.2f} ms, intensity {ai:.2f} FLOP/byte")   <span class="cm"># 4.87 ms, 1.05</span>
+t, ai = step_time(**llama3_8b, new_tokens=1, context=2000, batch=64, **h100)
+print(f"decode batch 64: {t*1e3:.2f} ms per step, {64/t:.0f} tokens/s in total")  <span class="cm"># 9.80 ms, 6528</span></pre>
+
+<h2>Beyond the basic loop</h2>
+<p>Real serving systems keep the two phases but schedule them cleverly. A short map of what comes later in this track:</p>
+<ul>
+<li><b>Continuous batching</b> (Orca, vLLM): new requests join the running decode batch at any step, and finished ones leave, so \(B\) stays large (<a href="../inference/index.html#row-batching-continuous-batching-chunked-prefill-split-fuse" title="Batching: continuous batching, chunked prefill, split-fuse (planned)">session 135</a>).</li>
+<li><b>Chunked prefill</b> (Sarathi): a long prompt is cut into chunks that run together with decode steps, so one long prefill does not freeze everyone else’s token stream.</li>
+<li><b>Prefill–decode disaggregation</b> (DistServe, Splitwise): run prefill and decode on different GPUs, because one phase wants compute and the other wants bandwidth and memory (<a href="../inference/index.html#row-distributed-serving-and-prefill-decode-disaggregation" title="Distributed serving and prefill–decode disaggregation (planned)">session 137</a>).</li>
+<li><b>Fewer bytes per token</b>: weight quantization (INT8, INT4) cuts the \(bN\) term; GQA, MLA and KV quantization cut \(s_{\text{kv}}\).</li>
+<li><b>More tokens per weight read</b>: speculative decoding lets a small draft model propose several tokens that the big model checks in one step, which raises \(m\) above 1 even for one user (<a href="../inference/index.html#row-speculative-decoding-1-the-math" title="Speculative decoding 1: the math (planned)">session 128</a>).</li></ul>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Which phase dominates</th><th>What people do about it</th></tr></thead><tbody>
+<tr><td>Chat assistant, long answers</td><td>Decode (TPOT)</td><td>Large batches with continuous batching, quantized weights, speculative decoding</td></tr>
+<tr><td>Summarization, RAG with long retrieved context</td><td>Prefill (TTFT), plus a large KV cache</td><td>Prefix caching of shared documents, chunked prefill, prompt compression</td></tr>
+<tr><td>Code completion in an editor</td><td>Both, with a strict TTFT budget</td><td>Small models, reuse of the cache between keystrokes</td></tr>
+<tr><td>Agents and multi-turn tools</td><td>Repeated prefill of a growing history</td><td>Keep the KV cache of the conversation prefix between turns</td></tr>
+<tr><td>Image question answering (VLM)</td><td>Prefill grows with visual tokens: LLaVA-1.5 uses 576 tokens per image [Certain]</td><td>Fewer or merged visual tokens</td></tr>
+<tr><td>Video QA, video captioning, key-moment detection, Video-RAG</td><td>Prefill: 32 frames × 576 tokens = 18,432 tokens, about 0.39 s of pure compute on an 8B model on one H100 even at peak, and 2.4 GB of cache</td><td>Frame sampling, token pooling, caching the video’s KV once and asking many questions</td></tr>
+<tr><td>Offline batch generation (synthetic data, RL rollouts, evaluation)</td><td>Decode throughput</td><td>Very large batches; latency per user does not matter</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Computing logits for all prompt positions in prefill.</b> With a 128K vocabulary and a long prompt, that is a huge extra matrix and a lot of memory. Only the last position is needed.</li>
+<li><b>Wrong positions in decode.</b> The new token sits at position \(P + i\), not 0. Forgetting to pass the offset (for RoPE or learned positions) gives garbage after the prompt, while prefill still looks fine.</li>
+<li><b>Using the causal mask with a single decode query in a hand-written kernel.</b> A causal mask built for a 1 × 1 square lets the new token see only itself. In decode, the one query must see the whole cache. (In the code above, <code>is_causal</code> is turned off when there is one new token.)</li>
+<li><b>Estimating decode speed from FLOPs.</b> “16 GFLOPs per token at 989 TFLOP/s = 60,000 tokens/s” is wrong by a factor of about 300 at batch 1. Use bytes ÷ bandwidth.</li>
+<li><b>Thinking that batching makes each user faster.</b> Batching raises total throughput; each user’s TPOT gets slightly worse.</li>
+<li><b>Forgetting the KV cache in memory planning.</b> The weights may fit, but 20 GB left on two A100s holds only about 14 sequences of 4,096 tokens for Llama 2 70B.</li>
+<li><b>Benchmarking with tiny prompts only.</b> Short prompts hide the TTFT problem that real RAG and video inputs create.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What are prefill and decode?<span class="lvl">basic</span></summary><div class="ans">Prefill is the first forward pass over the whole prompt: all prompt tokens are processed in parallel with a causal mask, their keys and values are stored in the KV cache, and the logits of the last position give the first output token. Decode is every step after that: one new token per sequence goes through the model, attends to the cached keys and values, appends its own key and value, and produces the next logits.</div></details>
+<details class="qa"><summary>Why is prefill compute-bound and decode memory-bound?<span class="lvl">core</span></summary><div class="ans">In prefill, the \(P\) prompt tokens share each weight read, so each linear layer is a GEMM with about \(P\) FLOPs per byte, far above the GPU ridge point (about 295 on H100, 153 on A100). In decode at batch 1, each weight is read to do one multiply-add for one token, about 1 FLOP per byte, so the GPU waits for memory almost all the time. The time of a decode step is about (weight bytes + cache bytes) ÷ bandwidth.</div></details>
+<details class="qa"><summary>Estimate the decode speed of an 8B model in BF16 on one H100 at batch 1.<span class="lvl">core</span></summary><div class="ans">Weights: about \(8.03 \times 10^9 \times 2 = 16.06\) GB. Bandwidth: 3.35 TB/s. Lower bound per token: \(16.06 / 3350 \approx 4.8\) ms, so at most about 209 tokens per second. Real systems reach a good fraction of this but not all of it. On an A100 (2.039 TB/s), the bound is 7.9 ms, about 127 tokens per second.</div></details>
+<details class="qa"><summary>The survey says LLaMA-2-70B needs 140 GB and about 100 ms per token on 2 A100s. Explain both numbers.<span class="lvl">core</span></summary><div class="ans">140 GB = 70 billion parameters × 2 bytes in FP16, so it needs two 80 GB GPUs. Two A100s read about 4.08 TB/s together, so the lower bound is 140 / 4.078 ≈ 34 ms per token. The reported 100 ms is about 3 times that: tensor-parallel communication between the GPUs at every layer, kernel launch overhead, attention over the cache and imperfect bandwidth use add up. The arithmetic itself (1.4 × 10¹¹ FLOPs) would take only about 0.2 ms.</div></details>
+<details class="qa"><summary>Why does batching help decode throughput but not prefill?<span class="lvl">core</span></summary><div class="ans">Decode at small batch is memory-bound: the weight read costs the same for 1 or 64 sequences, so adding sequences raises FLOPs per byte and total tokens per second almost for free, until the KV-cache reads or the compute limit take over. Prefill is already compute-bound because its own \(P\) tokens share the weight read; adding more prompts adds proportional compute time, so throughput per GPU barely changes.</div></details>
+<details class="qa"><summary>Does batching make decode compute-bound eventually?<span class="lvl">advanced</span></summary><div class="ans">Only at short contexts. The KV-cache bytes grow as \(B T s_{\text{kv}}\) and are not shared, so for large \(B\) the intensity tends to \((2N + 4 L d_{\text{attn}} T)/(T s_{\text{kv}})\). For Llama 3 8B that is about 124 FLOPs/byte at \(T = 1024\) and 34 at \(T = 4096\), both below the H100 ridge of 295. So long-context decode stays memory-bound; reducing \(s_{\text{kv}}\) (GQA, MLA, KV quantization) is what helps. Memory capacity usually limits \(B\) before that.</div></details>
+<details class="qa"><summary>What do TTFT and TPOT measure, and which phase drives each?<span class="lvl">basic</span></summary><div class="ans">TTFT (time to first token) is the wait before the first output token: queueing plus prefill, so it grows with prompt length. TPOT (time per output token) is the average decode step time, driven by weight and cache bytes divided by bandwidth, and by the batch the request shares. A request takes about TTFT + (n − 1) × TPOT.</div></details>
+<details class="qa"><summary>Without a KV cache, how does the cost of generating n tokens grow?<span class="lvl">core</span></summary><div class="ans">Each step re-processes the full sequence, so the number of token passes is \(nP + n(n-1)/2\): quadratic in \(n\) for the weight work, and the attention work grows even faster (cubic in total). With the cache it is \(P + n - 1\) token passes, linear. For \(P = 1000\), \(n = 500\) that is 624,750 versus 1,499. The price is the cache memory, which grows linearly with sequence length and batch.</div></details>
+<details class="qa"><summary>Why is the query not cached, only keys and values?<span class="lvl">basic</span></summary><div class="ans">With causal attention, old positions never attend to new tokens, so their outputs never change. A query is used only to compute its own position’s output, which happens once. Keys and values of old positions are needed by every future query, so they are kept.</div></details>
+<details class="qa"><summary>A long prompt (32K tokens) freezes other users’ streams in your server. Why, and what can you do?<span class="lvl">advanced</span></summary><div class="ans">The prefill of 32K tokens is one long compute-bound step; if the scheduler runs it as a single iteration, all running decode sequences wait until it finishes, so their TPOT spikes. Fixes: chunked prefill (Sarathi), which splits the prompt into chunks mixed with decode steps; separating prefill and decode onto different GPUs (DistServe, Splitwise); prefix caching if the long prompt is shared; and limits on tokens per scheduler step.</div></details>
+<details class="qa"><summary>How do speculative decoding and quantization each attack the decode bottleneck?<span class="lvl">advanced</span></summary><div class="ans">Decode time ≈ bytes read ÷ bandwidth per useful token. Quantization reduces the bytes: INT4 weights are a quarter of FP16, so the bound per token drops about 4 times (ignoring dequantization overhead and the cache). Speculative decoding increases useful tokens per weight read: the big model verifies several drafted tokens in one pass (a small prefill-like step with \(m \gt 1\)), so when drafts are accepted it produces more than one token per read of its weights.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Compute the KV cache size per token of Llama 2 70B in FP16 from its config (80 layers, 8 KV heads, head size 128). How much memory does one sequence of 4,096 tokens need?</li>
+<li>What is the best possible batch-1 decode speed (tokens per second) of Llama 3 8B in BF16 on one A100 80 GB (2.039 TB/s)?</li>
+<li>Use formula (78.2) for \(P = 1000\) and \(n = 500\). How many times more token passes does the naive loop do?</li>
+<li>If Llama 2 70B ran on 4 A100s with perfect tensor parallelism, what would the lower bound per token be? Name one reason the real speed-up is smaller than 2 times.</li>
+<li>Using Figure 5, set \(P = 8000\) and \(n = 100\). Which share of the request time is prefill? What happens to that share if \(n = 1000\)?</li>
+<li>For Llama 3 8B on an H100, compute the limit of decode arithmetic intensity for very large batches at \(T = 1024\). Is decode compute-bound there?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(s_{\text{kv}} = 2 \times 80 \times 8 \times 128 \times 2 = 327{,}680\) bytes (320 KiB). For 4,096 tokens: \(327{,}680 \times 4096 = 1.34\) GB. 2. \(16.06 \text{ GB} / 2.039 \text{ TB/s} = 7.88\) ms, so at most about 127 tokens/s. 3. Naive 624,750, cached 1,499: about 417 times more. 4. \(140 / (4 \times 2.039) = 17.2\) ms. The communication between GPUs grows with more GPUs and does not shrink, and each GPU’s matrices become smaller, so kernels use bandwidth less well. 5. TTFT is about 147 ms of about 0.65 s, so 22.5%. With \(n = 1000\) the decode part grows ten times and the prefill share falls to about 3%. 6. \((2N + 4 L d_{\text{attn}} T)/(T s_{\text{kv}}) = (1.606 \times 10^{10} + 5.37 \times 10^{8})/(1024 \times 131{,}072) \approx 124\) FLOPs/byte, below the ridge of 295: still memory-bound.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Generation follows formula (78.1) one token at a time. The KV cache removes the repeated work: \(P + n - 1\) token passes instead of \(nP + n(n-1)/2\) (78.2).</li>
+<li>Prefill processes all prompt tokens at once with GEMMs, fills the cache (78.3) and costs about \(2NP\) FLOPs plus quadratic attention (78.4). It is compute-bound and sets the time to first token.</li>
+<li>Decode processes one token per sequence, reads all weights and the cache (78.5, 78.6), and has an arithmetic intensity of about \(B\) (78.8, 78.9). At batch 1 it is memory-bound: time ≥ weight bytes ÷ bandwidth (78.10).</li>
+<li>The survey’s example: LLaMA-2-70B in FP16 is 140 GB; on 2 A100s the bandwidth bound is about 34 ms per token, and the reported time is about 100 ms.</li>
+<li>Batching shares the weight read and raises throughput, but the KV cache is not shared and keeps long-context decode memory-bound. A request takes about TTFT + (n − 1) × TPOT (78.11).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ t \ge \max\!\left(\frac{\text{FLOPs}}{\pi}, \frac{\text{bytes}}{\beta}\right), \quad F_{\text{prefill}} \approx 2NP + 2Ld_{\text{attn}}P^2, \quad \text{bytes}_{\text{decode}} \approx bN + BTs_{\text{kv}}, \quad s_{\text{kv}} = 2Ln_{kv}d_hb \]</div>
+<h2 class="plain" id="the-generation-loop-prefill-and-decode-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Xiao &amp; Zhu, <a href="https://github.com/NiuTrans/NLPBook" target="_blank" rel="noopener"><i>NLP: Neural Networks and Large Language Models</i></a>, chapter 11: Inference</li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Xiao &amp; Zhu, <a href="https://github.com/NiuTrans/NLPBook" target="_blank" rel="noopener"><i>NLP: Neural Networks and Large Language Models</i></a>, chapter 11: Inference</li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">Llama 2: Open Foundation and Fine-Tuned Chat Models</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li><li>Ainslie et al. (2023). <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Yu et al. (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;Orca: A Distributed Serving System for Transformer-Based Generative Models&amp;quot;" target="_blank" rel="noopener">Orca: A Distributed Serving System for Transformer-Based Generative Models</a></li><li>Agrawal et al. (2023). <a href="https://arxiv.org/abs/2308.16369" target="_blank" rel="noopener">SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills</a></li><li>Zhong et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving&amp;quot;" target="_blank" rel="noopener">DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</a></li><li>Patel et al. (2023). <a href="https://arxiv.org/abs/2311.18677" target="_blank" rel="noopener">Splitwise: Efficient Generative LLM Inference Using Phase Splitting</a></li><li>Leviathan et al. (2022). <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">Fast Inference from Transformers via Speculative Decoding</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.03744" target="_blank" rel="noopener">Improved Baselines with Visual Instruction Tuning</a></li></ol><nav class="pn" aria-label="Previous and next session"><span class="prev"><small>Previous · session 77, planned</small>GRPO with a verifiable reward</span><a class="next" href="../inference/decoding-strategies.html"><small>Next · session 79</small>Decoding strategies</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="the-generation-loop-prefill-and-decode"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const comma=n=>Math.round(n).toLocaleString("en-US");
+const fx=(v,d)=>Number(v).toFixed(d);
+function seg(el,cb){if(!el)return;el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+/* shared roofline step model, same as Algorithm 2 */
+function stepT(M,newTok,ctx,batch){const kv=2*M.L*M.nkv*M.dh*2;
+ const fl=2*M.N*newTok*batch+4*M.L*M.da*newTok*(ctx+newTok/2)*batch;
+ const by=2*M.N+batch*(ctx+newTok)*kv;
+ const tc=fl/(M.F*M.g),tm=by/(M.BW*M.g);
+ return{t:Math.max(tc,tm),tc,tm,ai:fl/by,fl,by,kv};}
+const M8={N:8.03e9,L:32,nkv:8,dh:128,da:4096,F:989e12,BW:3.35e12,g:1,cap:80e9,ctxMax:8192,name:"Llama 3 8B, 1 H100"};
+const M70={N:68.98e9,L:80,nkv:8,dh:128,da:8192,F:312e12,BW:2.039e12,g:2,cap:160e9,ctxMax:4096,name:"Llama 2 70B, 2 A100s"};
+
+/* ---------- Figure 1: the generation loop ---------- */
+(function(){
+ const svg=$("#gl-loop-svg");if(!svg)return;const info=$("#gl-loop-info"),nc=$("#gl-loop-nocache");
+ const toks=["The","capital","of","France","is","Paris",",","not","Lyon","."];const P=5,NS=6;let cur=0;
+ function work(s,naive){let w=0;for(let j=1;j<=s;j++)w+=naive?(j===1?P:P+j-1):(j===1?P:1);return w;}
+ function draw(s){cur=s;const naive=nc.checked;const x0=30,cw=70,w=60;let g="";
+  g+=`<text x="${x0}" y="18" font-size="13" fill="var(--muted)">tokens (prompt | answer)</text>`;
+  g+=`<text x="${x0}" y="112" font-size="13" fill="var(--muted)">goes through the model in this step</text>`;
+  g+=`<text x="${x0}" y="212" font-size="13" fill="var(--muted)">KV cache (one K and one V per layer)</text>`;
+  g+=`<line x1="${x0+P*cw-5}" y1="26" x2="${x0+P*cw-5}" y2="285" stroke="var(--rule)" stroke-width="1.6" stroke-dasharray="5 4"/>`;
+  const known=s===0?P:P+s;               // tokens visible after this step
+  const procLo=s===0?-1:(naive?0:(s===1?0:P+s-2)),procHi=s===0?-2:(s===1?P-1:P+s-2);
+  const cacheN=naive?0:(s===0?0:P+s-1);
+  for(let i=0;i<toks.length;i++){const x=x0+i*cw;const vis=i<known;const isNew=s>=1&&i===P+s-1;
+   g+=`<rect x="${x}" y="30" width="${w}" height="38" rx="7" fill="${isNew?"var(--k-soft)":"var(--card)"}" stroke="${isNew?"var(--k)":vis?"var(--tc)":"var(--rule)"}" stroke-width="${isNew?2.2:1.4}" ${vis?"":'stroke-dasharray="4 4"'}/>`;
+   g+=`<text x="${x+w/2}" y="54" text-anchor="middle" font-size="13" font-weight="${isNew?700:500}" fill="${vis?"var(--ink)":"var(--muted)"}">${vis?B.esc(toks[i]):"?"}</text>`;
+   const proc=i>=procLo&&i<=procHi;
+   g+=`<rect x="${x}" y="122" width="${w}" height="44" rx="7" fill="${proc?"var(--q-soft)":"none"}" stroke="${proc?"var(--q)":"var(--rule)"}" stroke-width="${proc?2:1}"/>`;
+   if(proc)g+=`<text x="${x+w/2}" y="149" text-anchor="middle" font-size="12" fill="var(--q)" font-weight="700">layers</text>`;
+   const inCache=i<cacheN;const read=!naive&&s>=2&&i<P+s-2;const written=!naive&&s>=1&&i>=procLo&&i<=procHi;
+   g+=`<rect x="${x}" y="222" width="${w}" height="44" rx="7" fill="${read?"var(--v-soft)":inCache?"var(--paper2)":"none"}" stroke="${read?"var(--v)":inCache?"var(--tc)":"var(--rule)"}" stroke-width="${read||written?2:1}"/>`;
+   if(inCache)g+=`<text x="${x+w/2}" y="249" text-anchor="middle" font-size="12" fill="${read?"var(--v)":"var(--ink2)"}" font-family="var(--mono)">${written?"new":"K,V"}</text>`;}
+  if(naive&&s>=1)g+=`<text x="${x0+5*cw}" y="252" text-anchor="middle" font-size="13" fill="var(--k)">no cache: everything is recomputed and thrown away</text>`;
+  svg.innerHTML=g;
+  const nowN=s===0?0:procHi-procLo+1,tot=work(s,naive);
+  let t;
+  if(s===0)t=`The prompt has ${P} tokens. Nothing has run yet. Press Next.`;
+  else if(s===1)t=`<b>Prefill.</b> All ${P} prompt positions go through the model together (causal mask). ${naive?"":"Their keys and values are written into the cache. "}The logits of the last position give the first answer token “${B.esc(toks[P])}”.`;
+  else t=naive?`<b>Naive step.</b> The whole sequence of ${nowN} tokens is fed again, just to get one new token “${B.esc(toks[P+s-1])}”.`:`<b>Decode.</b> Only the newest token “${B.esc(toks[P+s-2])}” goes through the model. Its query reads the ${P+s-2} cached keys and values (green), one new K,V pair is appended, and “${B.esc(toks[P+s-1])}” comes out.`;
+  info.innerHTML=t+`<br>Positions processed in this step: <b>${nowN}</b> · KV cache entries: <b>${cacheN}</b> · total positions processed so far: <b id="gl-loop-total">${tot}</b>${s===NS-1?` (${naive?"naive":"cached"} loop finished)`:""}`;}
+ const st=B.stepper({n:NS,prev:$("#gl-loop-prev"),next:$("#gl-loop-next"),play:$("#gl-loop-play"),label:$("#gl-loop-lab"),ms:2400,onStep:draw});
+ nc.addEventListener("change",()=>draw(cur));
+ R.glLoop={go:k=>st.go(k),setNaive:v=>{nc.checked=v;draw(cur);}};
+})();
+
+/* ---------- Figure 3: roofline ---------- */
+(function(){
+ const svg=$("#gl-roof-svg");if(!svg)return;const sl=$("#gl-roof-m"),out=$("#gl-roof-mv"),info=$("#gl-roof-info");
+ const G={h100:{F:989e12,BW:3.35e12,n:"H100 SXM"},a100:{F:312e12,BW:2.039e12,n:"A100 80 GB"}};let gpu="h100";const d=4096;
+ const I=m=>2*m*d*d/(2*(d*d+2*m*d));
+ const X=v=>60+(Math.log10(v)-Math.log10(0.5))/(Math.log10(4000)-Math.log10(0.5))*560;
+ const Y=v=>260-(Math.log10(v)-Math.log10(0.5))/(Math.log10(3000)-Math.log10(0.5))*235;
+ function draw(){const g=G[gpu];const m=Math.round(Math.pow(2,+sl.value));out.textContent=comma(m);
+  const ridge=g.F/g.BW,ai=I(m),perf=Math.min(g.F,ai*g.BW)/1e12,bound=ai*g.BW<g.F?"memory-bound":"compute-bound";
+  let s="";
+  [1,10,100,1000].forEach(v=>{s+=`<line x1="${X(v)}" y1="25" x2="${X(v)}" y2="260" stroke="var(--rule)"/><text x="${X(v)}" y="276" text-anchor="middle" font-size="12" fill="var(--muted)">${comma(v)}</text>`;});
+  [1,10,100,1000].forEach(v=>{s+=`<line x1="60" y1="${Y(v)}" x2="620" y2="${Y(v)}" stroke="var(--rule)"/><text x="54" y="${Y(v)+4}" text-anchor="end" font-size="12" fill="var(--muted)">${comma(v)}</text>`;});
+  s+=`<text x="340" y="295" text-anchor="middle" font-size="12" fill="var(--ink2)">arithmetic intensity (FLOPs per byte)</text>`;
+  s+=`<text x="14" y="140" font-size="12" fill="var(--ink2)" transform="rotate(-90 14 140)" text-anchor="middle">TFLOP/s</text>`;
+  const pk=g.F/1e12,x1=X(0.5),y1=Y(0.5*g.BW/1e12),xr=X(ridge),yr=Y(pk);
+  s+=`<path d="M${x1} ${y1} L${xr} ${yr} L620 ${yr}" fill="none" stroke="var(--tc)" stroke-width="2.6"/>`;
+  s+=`<line x1="${xr}" y1="${yr}" x2="${xr}" y2="260" stroke="var(--muted)" stroke-dasharray="4 4"/><text x="${xr-5}" y="254" text-anchor="end" font-size="12" fill="var(--muted)">ridge ${fx(ridge,0)}</text>`;
+  s+=`<text x="${X(1)}" y="${yr-8}" font-size="12" fill="var(--ink2)">peak ${comma(pk)} TFLOP/s (${g.n})</text>`;
+  const mk=(v,lab,dy)=>{const a=I(v),p=Math.min(g.F,a*g.BW)/1e12;return `<circle cx="${X(a)}" cy="${Y(p)}" r="5" fill="var(--muted)"/><text x="${X(a)}" y="${Y(p)+dy}" text-anchor="middle" font-size="12" fill="var(--muted)">${lab}</text>`;};
+  s+=mk(1,"decode, B = 1",18)+mk(2000,"prefill, P = 2,000",-12);
+  s+=`<circle cx="${X(ai)}" cy="${Y(perf)}" r="8" fill="${bound==="memory-bound"?"var(--k)":"var(--q)"}" stroke="var(--card)" stroke-width="2"/>`;
+  svg.innerHTML=s;
+  info.innerHTML=`m = <b>${comma(m)}</b> tokens per weight read · intensity <b>${fx(ai,ai<10?2:0)}</b> FLOP/byte · attainable <b>${fx(perf,perf<10?2:0)}</b> TFLOP/s = <b>${fx(100*perf/pk,perf/pk<0.1?2:0)}%</b> of peak · <b>${bound}</b> (ridge ${fx(ridge,0)} FLOP/byte on the ${g.n})`;}
+ sl.addEventListener("input",draw);seg($("#gl-roof-gpu"),v=>{gpu=v;draw();});draw();
+})();
+
+/* ---------- Figure 4: decode step calculator ---------- */
+(function(){
+ const svg=$("#gl-calc-svg");if(!svg)return;const bs=$("#gl-calc-b"),ts=$("#gl-calc-t"),bv=$("#gl-calc-bv"),tv=$("#gl-calc-tv"),info=$("#gl-calc-info");
+ const BS=[1,2,4,8,16,32,64,128,256],TS=[128,256,512,1024,2048,4096,8192];let M=M8;
+ const X=i=>250+i*(370/8),Y=v=>225-(Math.log10(v))/5*200;
+ function draw(){const Bn=BS[+bs.value],T=TS[+ts.value];bv.textContent=Bn;tv.textContent=comma(T);
+  const r=stepT(M,1,T,Bn);const wB=2*M.N,kB=Bn*(T+1)*r.kv,mem=wB+kB,fits=mem<=M.cap;
+  let s="";const H=190,sc=H/Math.max(M.cap,mem);
+  s+=`<text x="95" y="18" text-anchor="middle" font-size="13" fill="var(--ink2)">bytes read per step</text>`;
+  s+=`<rect x="60" y="${225-wB*sc}" width="70" height="${wB*sc}" fill="var(--tc)" opacity="0.85"/>`;
+  s+=`<rect x="60" y="${225-(wB+kB)*sc}" width="70" height="${kB*sc}" fill="var(--v)" opacity="0.85"/>`;
+  s+=`<line x1="50" y1="${225-M.cap*sc}" x2="140" y2="${225-M.cap*sc}" stroke="var(--k)" stroke-dasharray="5 3" stroke-width="1.6"/><text x="145" y="${229-M.cap*sc}" font-size="11" fill="var(--k)">GPU memory ${fx(M.cap/1e9,0)} GB</text>`;
+  s+=`<text x="95" y="244" text-anchor="middle" font-size="12" fill="var(--ink2)">${fx(wB/1e9,1)} + ${fx(kB/1e9,1)} GB</text>`;
+  [1,10,100,1000,10000].forEach(v=>{s+=`<line x1="250" y1="${Y(v)}" x2="620" y2="${Y(v)}" stroke="var(--rule)"/><text x="244" y="${Y(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${comma(v)}</text>`;});
+  BS.forEach((b,i)=>{s+=`<text x="${X(i)}" y="242" text-anchor="middle" font-size="11" fill="var(--muted)">${b}</text>`;});
+  s+=`<text x="435" y="257" text-anchor="middle" font-size="12" fill="var(--ink2)">batch size B (log scale); y: tokens per second</text>`;
+  let pt="",pu="";BS.forEach((b,i)=>{const q=stepT(M,1,T,b);pt+=(i?"L":"M")+X(i)+" "+Y(b/q.t);pu+=(i?"L":"M")+X(i)+" "+Y(1/q.t);
+   const ok=2*M.N+b*(T+1)*q.kv<=M.cap;if(!ok)s+=`<rect x="${X(i)-12}" y="25" width="24" height="200" fill="var(--k-soft)" opacity="0.6"/>`;});
+  s+=`<path d="${pt}" fill="none" stroke="var(--k)" stroke-width="2.4"/><path d="${pu}" fill="none" stroke="var(--q)" stroke-width="2.4"/>`;
+  const i=+bs.value;s+=`<circle cx="${X(i)}" cy="${Y(Bn/r.t)}" r="6" fill="var(--k)" stroke="var(--card)" stroke-width="2"/><circle cx="${X(i)}" cy="${Y(1/r.t)}" r="6" fill="var(--q)" stroke="var(--card)" stroke-width="2"/>`;
+  svg.innerHTML=s;
+  const bound=r.tc>r.tm?"compute-bound":"memory-bound";
+  info.innerHTML=`${M.name}, B = <b>${Bn}</b>, T = <b>${comma(T)}</b>: step <b id="gl-calc-step">${fx(r.t*1e3,2)}</b> ms (memory ${fx(r.tm*1e3,2)} ms, compute ${fx(r.tc*1e3,3)} ms) → <b>${bound}</b>, intensity ${fx(r.ai,1)} FLOP/byte · one user: <b>${fx(1/r.t,1)}</b> tokens/s · all users: <b>${comma(Bn/r.t)}</b> tokens/s · memory needed ${fx(mem/1e9,1)} of ${fx(M.cap/1e9,0)} GB`+
+   (fits?"":` · <span class="gl-warn">does not fit: this batch is impossible</span>`)+(T>M.ctxMax?` · <span class="gl-warn">longer than the model’s ${comma(M.ctxMax)}-token context</span>`:"");}
+ bs.addEventListener("input",draw);ts.addEventListener("input",draw);seg($("#gl-calc-model"),v=>{M=v==="70b"?M70:M8;draw();});draw();
+})();
+
+/* ---------- Figure 5: one request timeline ---------- */
+(function(){
+ const svg=$("#gl-req-svg");if(!svg)return;const ps=$("#gl-req-p"),ns=$("#gl-req-n"),pv=$("#gl-req-pv"),nv=$("#gl-req-nv"),info=$("#gl-req-info");
+ function draw(){const P=+ps.value,n=+ns.value;pv.textContent=comma(P);nv.textContent=comma(n);
+  const ttft=stepT(M8,P,0,1).t;let dec=0;const steps=[];for(let i=1;i<n;i++){const t=stepT(M8,1,P+i-1,1).t;steps.push(t);dec+=t;}
+  const tot=ttft+dec,tpot=n>1?dec/(n-1):0,W=600,x0=20,sc=W/tot;let s="";
+  s+=`<rect x="${x0}" y="40" width="${Math.max(1.5,ttft*sc)}" height="44" fill="var(--q)" opacity="0.85"/>`;
+  if(n>1){if(n-1<=120){let x=x0+ttft*sc;steps.forEach(t=>{s+=`<rect x="${x+0.4}" y="40" width="${Math.max(0.6,t*sc-0.8)}" height="44" fill="var(--k)" opacity="0.85"/>`;x+=t*sc;});}
+   else s+=`<rect x="${x0+ttft*sc}" y="40" width="${dec*sc}" height="44" fill="var(--k)" opacity="0.85"/>`;}
+  s+=`<text x="${x0}" y="28" font-size="12" fill="var(--ink2)">0</text><text x="${x0+W}" y="28" text-anchor="end" font-size="12" fill="var(--ink2)">${fx(tot,2)} s</text>`;
+  s+=`<text x="${x0}" y="108" font-size="12" fill="var(--q)">TTFT ${fx(ttft*1e3,1)} ms</text><text x="${x0+W}" y="108" text-anchor="end" font-size="12" fill="var(--k)">${comma(Math.max(0,n-1))} decode steps × ${fx(tpot*1e3,2)} ms</text>`;
+  s+=`<text x="${x0+W/2}" y="136" text-anchor="middle" font-size="12" fill="var(--muted)">prompt ${comma(P)} tokens · answer ${comma(n)} tokens</text>`;
+  svg.innerHTML=s;
+  info.innerHTML=`TTFT <b>${fx(ttft*1e3,1)}</b> ms · TPOT <b>${n>1?fx(tpot*1e3,2):"–"}</b> ms · total <b>${fx(tot,2)}</b> s · prefill share <b id="gl-req-share">${fx(100*ttft/tot,1)}</b>% of the time, for ${fx(100*P/(P+n),0)}% of the tokens`;}
+ ps.addEventListener("input",draw);ns.addEventListener("input",draw);draw();
+})();
+})();
+</script></body></html>

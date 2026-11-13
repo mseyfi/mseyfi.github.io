@@ -1,0 +1,537 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>GPU kernels 1: CUDA basics for ML engineers · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 85</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="gpu-kernels-1-cuda-basics-for-ml">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="gpu-kernels-1-cuda-basics-for-ml" data-session="gpu-kernels-1-cuda-basics-for-ml" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">85</span><span>Track 5: LLM inference and serving · session 8 of 65</span></div><h1 class="chap-title">GPU kernels 1: CUDA basics for ML engineers</h1><p class="chap-sub">Every PyTorch operation runs on the GPU as a kernel: one small program that thousands of threads run at the same time. This session teaches the CUDA model behind it: threads, warps, blocks and grids, occupancy, the three kinds of memory, coalesced reads and shared-memory bank conflicts. Then it shows why fusing kernels saves time, and how to place any kernel you measure on the roofline.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 42 and 84 (GPU architecture for ML; batching basics). You can read C-like code.</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How a kernel launch works: the grid of blocks, the block of threads, and the index formula every kernel starts with</li><li>What a warp and a lane are, why threads of a warp should follow the same branch, and what occupancy means</li><li>How to compute occupancy from threads, registers and shared memory per block, with the real H100, A100 and RTX 4090 limits</li><li>Registers, shared memory and global memory; why a warp should read neighboring addresses (coalescing) and how to count wasted bytes</li><li>Shared-memory banks: why reading a column of a 32 × 32 tile is 32 times slower, and how one padding column fixes it</li><li>Why kernel fusion helps: count the HBM bytes of an unfused and a fused bias + GELU + residual chain</li><li>How to place a kernel you measured on the roofline, and what to do when it sits far below the roof</li></ul></div></header><style>
+.ck-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.ck-grid input[type=range]{width:100%}
+.ck-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.ck-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+.ck-svg text{font-family:var(--sans)}
+.ck-cell{cursor:pointer}
+.ck-chk{display:flex;flex-wrap:wrap;gap:6px 16px;font:500 15px var(--sans);margin:6px 0}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">When you call <code>torch.matmul</code>, <code>F.gelu</code> or <code>F.softmax</code> on a GPU tensor, PyTorch does not compute anything itself. It launches a <b>kernel</b>: a small program that runs on the GPU, copied into thousands of threads that each handle a small piece of the data. Every speed question in LLM serving ends inside such kernels.</p>
+<p>In <a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a> you saw that decoding is limited by how fast the GPU reads the weights from memory, and that batching helps because one read serves many tokens. In <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a> you met the hardware: streaming multiprocessors (SMs), warps, shared memory and HBM, and the roofline. This session is the software side of the same story. How does a kernel decide which thread does which element? Why does the same kernel run at 90% of the memory bandwidth with one memory layout and at 12% with another? Why are FlashAttention, fused RMSNorm and fused MoE kernels the heart of vLLM and TensorRT-LLM? And when your profiler says a kernel took 150 µs, is that good or bad?</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “What is a warp?”, “What limits occupancy?”, “What is coalesced memory access?”, “What is a bank conflict and how do you avoid it?”, “Why does kernel fusion help if it does the same math?”, “Your kernel takes X µs. How close is it to the hardware limit?”. Each one is answered with numbers below.</aside>
+<p>You do not need to become a full-time CUDA programmer. But you should be able to read a simple kernel, count its memory traffic, and tell if it is close to the hardware limit. In <a href="../inference/gpu-kernels-2-write-kernels-in-the.html">session 86</a> you will write real kernels in the Triton language, which hides some details shown here but not the ideas.</p>
+
+<h2>The CUDA model: host, device, kernel</h2>
+<p>CUDA is NVIDIA’s programming model for its GPUs. It uses two words for the two processors: the <b>host</b> is the CPU with its memory, the <b>device</b> is the GPU with its memory. A <b>kernel</b> is a function marked <code>__global__</code>. The host launches it; the device runs it.</p>
+<p>When you launch a kernel, you say how many threads to start, in two levels:</p>
+<ul>
+<li>A <b>thread block</b> (or just <b>block</b>) is a group of up to 1,024 threads. [Certain] All threads of one block run on the <b>same SM</b>, can share a fast on-chip memory (shared memory), and can wait for each other with a barrier (<code>__syncthreads()</code>).</li>
+<li>The <b>grid</b> is the set of all blocks of one launch. Blocks are independent: they may run in any order, on any SM, and they cannot wait for each other inside the kernel.</li></ul>
+<aside class="note analogy side"><span class="nt">Analogy</span>A grid is an exam hall. Each block is one table of students (they can pass notes to each other, but not to other tables). Each student gets a seat number at the table (<code>threadIdx</code>) and the table number (<code>blockIdx</code>), and from those two numbers knows which exam page to grade. If there are more seats than pages, some students sit and wait: that is the bounds check.</aside>
+<p>Inside the kernel, each thread reads four built-in variables to learn who it is: <code>threadIdx.x</code> (its number inside the block), <code>blockIdx.x</code> (the number of its block), <code>blockDim.x</code> (threads per block) and <code>gridDim.x</code> (blocks in the grid). From these it computes which element it owns:</p>
+<div class="eq">\[ i = \text{blockIdx.x} \cdot \text{blockDim.x} + \text{threadIdx.x} \tag{85.1} \]</div>
+<p>To cover \(n\) elements with blocks of \(b\) threads, you launch</p>
+<div class="eq">\[ G = \left\lceil \frac{n}{b} \right\rceil \text{ blocks}, \qquad \text{idle threads} = G\, b - n \tag{85.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(i\)</dt><dd>the global index: which element of the array this thread works on</dd>
+<dt>\(n\)</dt><dd>the number of elements to process</dd>
+<dt>\(b\)</dt><dd>block size = <code>blockDim.x</code>, threads per block (usually 128, 256 or 512)</dd>
+<dt>\(G\)</dt><dd>grid size = <code>gridDim.x</code>, the number of blocks; \(\lceil\cdot\rceil\) rounds up</dd></dl>
+<p>Because \(G\,b\) is usually a bit larger than \(n\), the last block has threads with nothing to do. That is why almost every kernel starts with a <b>bounds check</b>: <code>if (i &lt; n)</code>. Here is the complete “hello world” of CUDA, a vector add:</p>
+<pre class="code"><span class="kw2">__global__ void</span> add(<span class="kw2">const float</span>* x, <span class="kw2">const float</span>* y, <span class="kw2">float</span>* z, <span class="kw2">int</span> n) {
+  <span class="kw2">int</span> i = blockIdx.x * blockDim.x + threadIdx.x;   <span class="cm">// formula (85.1)</span>
+  <span class="kw2">if</span> (i &lt; n) z[i] = x[i] + y[i];                   <span class="cm">// bounds check for the last block</span>
+}
+<span class="cm">// host side: n = 1000, b = 256 gives G = 4 blocks, formula (85.2)</span>
+<span class="kw2">int</span> b = 256, G = (n + b - 1) / b;
+add&lt;&lt;&lt;G, b&gt;&gt;&gt;(x, y, z, n);                         <span class="cm">// launch: returns at once, runs asynchronously</span></pre>
+<p>Blocks and grids can also be 2-D or 3-D (<code>threadIdx.y</code>, <code>blockIdx.y</code>, …). That is only a convenience for matrices and images: the hardware sees a flat list of threads. A 2-D tile index \((r, c)\) of a row-major matrix with \(C\) columns lives at address \(r \cdot C + c\), so threads with neighboring <code>threadIdx.x</code> should take neighboring \(c\). You will see why in the section on coalescing.</p>
+<figure class="fig wide" id="ck-idx"><div class="fig-body">
+<div class="ck-grid">
+<label for="ck-idx-n">Elements \(n\)</label><input type="range" id="ck-idx-n" min="1" max="1000" step="1" value="1000"><output id="ck-idx-nv"></output></div>
+<div class="controls" style="margin-top:8px"><span style="font:500 15px var(--sans)">Block size \(b\):</span><span class="seg" id="ck-idx-b"><button type="button" data-v="32" aria-pressed="false">32</button><button type="button" data-v="64" aria-pressed="false">64</button><button type="button" data-v="128" aria-pressed="false">128</button><button type="button" data-v="256" aria-pressed="true">256</button><button type="button" data-v="96" aria-pressed="false">96</button><button type="button" data-v="100" aria-pressed="false">100</button></span></div>
+<div class="scroll-x"><svg id="ck-idx-svg" class="ck-svg" viewBox="0 0 680 420" role="img" aria-label="Threads of a 1-D grid drawn as cells, one warp per row, grouped by block"></svg></div>
+<div class="ck-leg"><span style="--c:var(--q)">active thread (has an element)</span><span style="--c:var(--rule)">idle thread (fails the bounds check)</span><span style="--c:var(--k)">the thread you clicked</span><span style="--c:var(--paper2)">empty lane (block size not a multiple of 32)</span></div>
+<div class="readout" id="ck-idx-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> A 1-D launch, thread by thread. Each row is one warp of 32 threads; a colored band groups the warps of one block. Click any cell to see its <code>blockIdx</code>, <code>threadIdx</code>, global index (formula 85.1), warp and lane.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>With \(n = 1000\) and \(b = 256\) you get 4 blocks and 1,024 threads; the last 24 threads are idle. Click a cell in the third block: the global index is \(2 \cdot 256 + \text{threadIdx.x}\). Now compare block sizes 96 and 100. 96 is a multiple of 32 (3 full warps). 100 is not: with 100, every block ends with a warp that has only 4 real threads: the hardware still schedules a full warp of 32, so 28 lanes are wasted in every block, not only at the end. That is why block sizes are multiples of 32.</p></details></figure>
+
+<h2>Warps, lanes and divergence</h2>
+<p>The SM does not run threads one at a time. It runs them in groups of 32 consecutive threads of a block, called <b>warps</b>. [Certain] Thread \(t\) of a block (with \(t\) = <code>threadIdx.x</code>) belongs to</p>
+<div class="eq">\[ \text{warp} = \left\lfloor \frac{t}{32} \right\rfloor, \qquad \text{lane} = t \bmod 32 \tag{85.3} \]</div>
+<p>The <b>lane</b> is the thread’s position inside its warp, from 0 to 31. The 32 lanes of a warp execute the same instruction at the same time, each on its own data (NVIDIA calls this SIMT, single instruction, multiple threads). Two rules follow, and the rest of this session is built on them:</p>
+<ol>
+<li><b>Divergence.</b> If lanes of one warp take different sides of an <code>if</code>, the warp runs both sides one after the other, with the lanes of the other side switched off. A branch that depends on <code>threadIdx.x % 2</code> halves the speed of that code; a branch that is the same for all 32 lanes (for example, it depends on the warp number or the block number) costs nothing extra. Volta and newer GPUs schedule diverged lanes more flexibly, but the inactive lanes still do no useful work. [Likely]</li>
+<li><b>Memory accesses are per warp.</b> When a warp executes a load, the 32 addresses are handled together. Whether those 32 addresses are close to each other decides how many bytes really move (the coalescing section).</li></ol>
+<p>Warps are also the unit that hides memory latency. A load from HBM takes hundreds of clock cycles. [Likely] While one warp waits, the warp scheduler issues instructions from another warp that is ready. So an SM needs many warps “in flight” at once. How many it can hold depends on the kernel, and that is occupancy.</p>
+
+<h2>Occupancy: how many warps fit on an SM</h2>
+<p>Each SM has fixed resources, and every resident block takes a share of them. On an H100 (compute capability 9.0) an SM can hold at most 64 warps (2,048 threads), at most 32 blocks, 65,536 registers of 32 bits, and 228 KB of shared memory, of which one block can use at most 227 KB; CUDA also reserves 1 KB of shared memory per block. [Certain] A block of \(T\) threads that uses \(r\) registers per thread and \(s\) KB of shared memory can be placed on the SM this many times:</p>
+<div class="eq">\[ n_{\text{blocks}} = \min\left( \left\lfloor \frac{2048}{T} \right\rfloor,\ 32,\ \left\lfloor \frac{65536}{r\, T} \right\rfloor,\ \left\lfloor \frac{228}{s + 1} \right\rfloor \right) \tag{85.4} \]</div>
+<p>Then <b>occupancy</b> is the fraction of the SM’s warp slots that are filled:</p>
+<div class="eq">\[ \text{occupancy} = \frac{n_{\text{blocks}} \cdot T / 32}{64} \tag{85.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(T\)</dt><dd>threads per block (the block size \(b\) from before)</dd>
+<dt>\(r\)</dt><dd>registers per thread, decided by the compiler (you can see it with <code>nvcc -Xptxas -v</code>); the hardware hands registers out in chunks, so we round \(r\) up to a multiple of 8 [Likely]</dd>
+<dt>\(s\)</dt><dd>shared memory per block in KB (the <code>__shared__</code> arrays plus any dynamic shared memory)</dd>
+<dt>2048, 32, 65536, 228</dt><dd>the H100 limits per SM: threads, blocks, registers, KB of shared memory. The A100 has 164 KB of shared memory per SM; the RTX 4090 has 48 warps (1,536 threads), 24 blocks and 100 KB per SM [Certain]</dd></dl>
+<div class="worked"><div class="wt">Worked example: why is my kernel at 50% occupancy?</div>
+<p>A kernel uses \(T = 256\) threads, \(r = 64\) registers per thread and \(s = 48\) KB of shared memory per block. On an H100, the four limits of formula (85.4) are: threads \(\lfloor 2048/256 \rfloor = 8\) blocks; blocks 32; registers \(\lfloor 65536 / (64 \cdot 256) \rfloor = 4\); shared memory \(\lfloor 228 / 49 \rfloor = 4\). The minimum is 4 blocks, so 32 warps of 64: occupancy 50%.</p>
+<p>To reach 100% you must fix <b>both</b> limits. Cut the registers to 32 and the shared memory to 24 KB: now the limits are 8, 32, 8 and \(\lfloor 228/25 \rfloor = 9\), so 8 blocks and 100%. Cutting only the shared memory leaves you at 50%, because registers still allow only 4 blocks.</p>
+<p>The same kernel (\(r = 64\), \(s = 48\)) on an A100 gets \(\lfloor 164/49 \rfloor = 3\) blocks, 37.5%; on an RTX 4090, \(\lfloor 100/49 \rfloor = 2\) blocks of 48 warp slots, 33.3%.</p></div>
+<figure class="fig" id="ck-occ"><div class="fig-body">
+<div class="controls"><span class="seg" id="ck-occ-gpu"><button type="button" data-v="h100" aria-pressed="true">H100</button><button type="button" data-v="a100" aria-pressed="false">A100</button><button type="button" data-v="4090" aria-pressed="false">RTX 4090</button></span></div>
+<div class="ck-grid">
+<label for="ck-occ-t">Threads per block \(T\)</label><input type="range" id="ck-occ-t" min="32" max="1024" step="32" value="256"><output id="ck-occ-tv"></output>
+<label for="ck-occ-r">Registers per thread \(r\)</label><input type="range" id="ck-occ-r" min="16" max="255" step="1" value="64"><output id="ck-occ-rv"></output>
+<label for="ck-occ-s">Shared memory per block \(s\) (KB)</label><input type="range" id="ck-occ-s" min="0" max="227" step="1" value="48"><output id="ck-occ-sv"></output></div>
+<svg id="ck-occ-svg" class="ck-svg" viewBox="0 0 640 250" role="img" aria-label="Bar chart of the blocks per SM allowed by each of the four limits"></svg>
+<div class="readout" id="ck-occ-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> An occupancy calculator (formula 85.4) with the published limits of three GPUs. Each bar is the number of blocks one limit would allow; the shortest bar (orange) decides. The strip below shows the 64 (or 48) warp slots of one SM.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Start at the worked example (256 threads, 64 registers, 48 KB): two bars tie at 4 blocks. Lower the registers to 32: the shared-memory bar now decides alone. Then lower the shared memory to 24 KB: 100%. Try 1,024 threads with 40 registers: one block needs 40,960 registers, so only one block fits and half the SM is empty. Push the registers to 255: one block of 256 threads, 12.5%. Switch GPUs: the same kernel can be fine on one GPU and starved on another.</p></details></figure>
+<h3>Is high occupancy the goal?</h3>
+<p>No. Occupancy is a means to hide latency, not a score. A kernel can hide latency in another way: each thread issues several independent loads before it needs the first result, or keeps more data in registers and reuses it. Fast matrix-multiplication kernels (cuBLAS, CUTLASS, FlashAttention) often run at low occupancy, with many registers per thread and large shared-memory tiles, because reuse matters more for them than the number of warps. [Likely] The useful rule: if a memory-bound kernel has low occupancy <b>and</b> reaches a low share of the bandwidth, more warps will probably help. If it already moves bytes near the bandwidth limit, more occupancy cannot help.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>If a thread needs more than 255 registers, or you cap registers too low with <code>__launch_bounds__</code> or <code>-maxrregcount</code>, the compiler moves values to <b>local memory</b>. Despite the name, local memory lives in HBM (cached in L1 and L2). These “register spills” can make a kernel several times slower. <code>nvcc -Xptxas -v</code> prints spill bytes; you want 0.</aside>
+
+<h2>Three kinds of memory a kernel sees</h2>
+<p>From inside a kernel, there are three memory spaces that matter. They match the hardware levels from <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Space</th><th>How you write it</th><th>Who sees it</th><th>Lives in</th><th>Lifetime</th></tr></thead><tbody>
+<tr><td>Registers</td><td>ordinary local variables: <code>float v = x[i];</code></td><td>one thread</td><td>the SM’s register file (256 KB per SM on H100)</td><td>the thread</td></tr>
+<tr><td>Shared memory</td><td><code>__shared__ float tile[32][33];</code></td><td>all threads of one block</td><td>on-chip SRAM of the SM (up to 228 KB per SM on H100)</td><td>the block</td></tr>
+<tr><td>Global memory</td><td>pointers passed to the kernel: <code>x[i]</code></td><td>all threads, all kernels, and the host (by copies)</td><td>HBM (80 GB at 3.35 TB/s on H100 SXM), cached in L2</td><td>until freed</td></tr></tbody></table></div>
+<p>The rule of thumb: read from global memory as few times as possible, and in a good pattern; keep values you reuse in registers; use shared memory when threads of a block need each other’s data (a reduction, a tile of a matrix, a transpose). Shared memory needs a <code>__syncthreads()</code> between the writes of some threads and the reads of others, or a thread may read a value that is not written yet.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Registers are your own notebook. Shared memory is the whiteboard of your team’s room: everyone in the room can read it, but you must wait until a teammate has finished writing before you read. Global memory is the company archive in the basement: huge and shared by everyone, but every trip is slow, so you bring a full box each time.</aside>
+
+<h2>Coalesced access: how a warp reads global memory</h2>
+<p>Global memory is not read byte by byte. On current GPUs, the loads of one warp are served in <b>32-byte sectors</b>: the hardware collects the 32 addresses of the warp and fetches every 32-byte sector that contains at least one requested byte. [Certain] If the 32 lanes read 32 neighboring 4-byte floats, that is 128 bytes in exactly 4 sectors: nothing is wasted. We call this a <b>coalesced</b> access. If lane \(k\) reads element \(k \cdot S\) (a stride of \(S\) elements), the addresses spread out and more sectors move for the same useful bytes:</p>
+<div class="eq">\[ \text{efficiency} = \frac{\text{bytes the warp asked for}}{32 \cdot (\text{number of sectors touched})} = \frac{32\, w}{32\, N_{\text{sec}}} \tag{85.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(w\)</dt><dd>bytes per element: 4 for FP32, 2 for BF16 or FP16</dd>
+<dt>\(N_{\text{sec}}\)</dt><dd>the number of different 32-byte sectors that the 32 addresses fall into</dd>
+<dt>efficiency</dt><dd>the share of the moved bytes that the kernel really uses; the rest is wasted bandwidth</dd></dl>
+<p>For FP32 and a stride of 2, the warp touches 8 sectors (256 bytes) to use 128 bytes: 50%, as the CUDA Best Practices Guide states. [Certain] At a stride of 8 or more, every lane hits its own sector: 32 sectors, 1,024 bytes moved, 12.5% efficiency. For BF16 it is even worse: a large stride gives \(2/32 = 6.25\%\). A start address that is not a multiple of 32 bytes costs one extra sector (5 instead of 4 for FP32, 80%).</p>
+<figure class="fig wide" id="ck-coal"><div class="fig-body">
+<div class="controls"><span class="seg" id="ck-coal-w"><button type="button" data-v="4" aria-pressed="true">FP32 (4 bytes)</button><button type="button" data-v="2" aria-pressed="false">BF16 (2 bytes)</button></span></div>
+<div class="ck-grid">
+<label for="ck-coal-s">Stride \(S\) (elements)</label><input type="range" id="ck-coal-s" min="1" max="16" step="1" value="1"><output id="ck-coal-sv"></output>
+<label for="ck-coal-o">Start offset (elements)</label><input type="range" id="ck-coal-o" min="0" max="15" step="1" value="0"><output id="ck-coal-ov"></output></div>
+<div class="scroll-x"><svg id="ck-coal-svg" class="ck-svg" viewBox="0 0 680 230" role="img" aria-label="32 lanes of a warp with lines to the 32-byte memory sectors they touch"></svg></div>
+<div class="ck-leg"><span style="--c:var(--q)">bytes the warp uses</span><span style="--c:var(--k-soft)">sector that is moved</span><span style="--c:var(--paper2)">sector not touched</span></div>
+<div class="readout" id="ck-coal-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> One warp load. Lane \(k\) reads element \(\text{offset} + k S\). Each small box at the bottom is a 32-byte sector of global memory; orange sectors are moved in full, and the blue part of each is what the kernel actually uses (formula 85.6).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At stride 1 with FP32, the lanes fill 4 sectors exactly. Move the stride to 2: twice as many sectors for the same data. At stride 8 each lane gets its own sector, and from then on it cannot get worse: 32 sectors, 12.5%. Set the stride back to 1 and move the start offset to 1: the warp now straddles one more sector. Switch to BF16: at stride 1 the warp reads only 64 bytes (2 sectors), so with BF16 each thread should load two or more elements (for example as one 4-byte or 16-byte vector load) to keep the warp’s requests large.</p></details></figure>
+<h3>Where strided access comes from in ML</h3>
+<p>The usual cause is a <b>transposed or permuted tensor</b>. A PyTorch tensor of shape \((M, N)\) is stored row by row. If a kernel puts neighboring threads on neighboring <b>rows</b> (for example to sum each column), lane \(k\) reads address \(k N\): stride \(N\), the worst case. <code>x.t()</code>, <code>x.permute(...)</code> and slicing every second element create such views without moving data. Many PyTorch kernels then call <code>.contiguous()</code> internally (an extra copy), or run a slow strided path. The fix in your own kernel: map <code>threadIdx.x</code> to the <b>last</b> (fastest-changing) dimension, or stage the data through shared memory (next section).</p>
+
+<h2>Shared memory and bank conflicts</h2>
+<p>Shared memory is fast, but it has its own access rule. It is split into 32 <b>banks</b>; consecutive 4-byte words go to consecutive banks, so</p>
+<div class="eq">\[ \text{bank}(a) = \left\lfloor \frac{a}{4} \right\rfloor \bmod 32 \tag{85.7} \]</div>
+<p>for a byte address \(a\) inside shared memory. [Certain] Each bank can serve one 4-byte word per cycle. If the 32 lanes of a warp access 32 words in 32 different banks, the access takes one pass. If several lanes need <b>different</b> words in the <b>same</b> bank, the accesses are serialized: a <b>\(k\)-way bank conflict</b> takes \(k\) passes. If several lanes read the <b>same</b> word, the value is broadcast to all of them and there is no conflict. [Certain]</p>
+<p>The classic case is a \(32 \times 32\) tile of floats, <code>__shared__ float tile[32][32]</code>. Element \((r, c)\) is word \(32r + c\), so its bank is \(c\). When a warp reads a <b>row</b> (lane \(k\) reads \((0, k)\)), the banks are \(0, 1, \dots, 31\): perfect. When it reads a <b>column</b> (lane \(k\) reads \((k, 0)\)), every word is in bank 0: a 32-way conflict, 32 times slower. Matrix transposes, and many attention and matmul kernels, read tiles by columns.</p>
+<p>The fix is one extra column: <code>tile[32][33]</code>. Now \((r, c)\) is word \(33r + c\), and its bank is \((33r + c) \bmod 32 = (r + c) \bmod 32\). A column read hits banks \(0, 1, \dots, 31\) again. We waste 32 floats (128 bytes) of shared memory and remove the conflict. Mark Harris’s transpose article shows this change bringing a shared-memory transpose to about 95% of the speed of a plain copy. [Certain]</p>
+<figure class="fig wide" id="ck-bank"><div class="fig-body">
+<div class="controls"><span class="seg" id="ck-bank-w"><button type="button" data-v="32" aria-pressed="true">tile[32][32]</button><button type="button" data-v="33" aria-pressed="false">tile[32][33] (padded)</button></span></div>
+<div class="controls"><span class="seg" id="ck-bank-p"><button type="button" data-v="row" aria-pressed="false">read a row</button><button type="button" data-v="col" aria-pressed="true">read a column</button><button type="button" data-v="s2" aria-pressed="false">row, every 2nd word</button><button type="button" data-v="bc" aria-pressed="false">all lanes, one word</button></span></div>
+<div class="scroll-x"><svg id="ck-bank-svg" class="ck-svg" viewBox="0 0 680 290" role="img" aria-label="The 32 shared memory banks with the words each lane of a warp requests"></svg></div>
+<div class="readout" id="ck-bank-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> One warp accesses a tile of floats in shared memory. Each column is one of the 32 banks; each colored box is a different word that a lane needs from that bank. The tallest stack is the number of passes the access needs (formula 85.7).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>With the unpadded tile, “read a column” stacks all 32 words in bank 0: 32 passes. Click the padded tile: the stack spreads into 32 banks of height 1. “Every 2nd word” gives a 2-way conflict for any tile width, because even word numbers only hit even banks. “All lanes, one word” is a broadcast: 32 lanes, one word, one pass.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>Bank conflicts are about <b>shared</b> memory. Coalescing is about <b>global</b> memory. A transpose kernel needs both: read the input coalesced by rows into a shared tile, then read the tile by columns (needs padding) and write the output coalesced by rows.</aside>
+
+<h2>A real kernel: softmax over the rows of a matrix</h2>
+<p>Attention scores, logits and router outputs all need a softmax over each row. A good beginner kernel gives one block to each row. The threads of the block walk along the row with a stride of <code>blockDim.x</code>, so that at each step the 32 lanes of a warp read 32 neighboring numbers (coalesced). The block then needs two <b>reductions</b>: the maximum of the row (for numerical safety) and the sum of the exponentials.</p>
+<p>A reduction inside a warp does not need shared memory. The instruction <code>__shfl_down_sync(mask, v, o)</code> lets lane \(k\) read the register <code>v</code> of lane \(k + o\). Five rounds with \(o = 16, 8, 4, 2, 1\) combine 32 values into lane 0, since \(2^5 = 32\). The warps then meet through a small shared array, one slot per warp.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: block-wide reduction (sum or max) of one row</div><ol>
+<li><b>input:</b> a row \(x\) of \(N\) numbers in global memory; one block of \(T\) threads (\(T\) a multiple of 32)</li>
+<li>each thread: \(v \leftarrow\) identity (0 for sum, \(-\infty\) for max)</li>
+<li><b>for</b> \(j = \text{threadIdx.x};\ j \lt N;\ j \mathrel{+}= T\) <b>do</b> \(v \leftarrow v \oplus x_j\) <span class="c">// strided walk: each warp reads 32 neighbors</span></li>
+<li><b>for</b> \(o = 16, 8, 4, 2, 1\) <b>do</b> \(v \leftarrow v \oplus \text{shfl\_down}(v, o)\) <span class="c">// inside the warp, registers only</span></li>
+<li><b>if</b> lane = 0 <b>then</b> \(\text{red}[\text{warp}] \leftarrow v\) <span class="c">// one value per warp into shared memory</span></li>
+<li><code>__syncthreads()</code> <span class="c">// wait until every warp has written</span></li>
+<li><b>if</b> warp = 0 <b>then</b> \(v \leftarrow \text{red}[\text{lane}]\) if lane \(\lt T/32\), else identity; repeat step 4; lane 0 writes \(\text{red}[0]\)</li>
+<li><code>__syncthreads()</code>; every thread reads the result \(\text{red}[0]\)</li></ol></div>
+<pre class="code"><span class="kw2">__device__ float</span> warp_max(<span class="kw2">float</span> v) { <span class="kw2">for</span> (<span class="kw2">int</span> o = 16; o &gt; 0; o &gt;&gt;= 1) v = fmaxf(v, __shfl_down_sync(0xffffffff, v, o)); <span class="kw2">return</span> v; }
+<span class="kw2">__device__ float</span> warp_sum(<span class="kw2">float</span> v) { <span class="kw2">for</span> (<span class="kw2">int</span> o = 16; o &gt; 0; o &gt;&gt;= 1) v += __shfl_down_sync(0xffffffff, v, o); <span class="kw2">return</span> v; }
+
+<span class="cm">// one block per row; launch with softmax_rows&lt;&lt;&lt;M, 256&gt;&gt;&gt;(x, y, N)</span>
+<span class="kw2">__global__ void</span> softmax_rows(<span class="kw2">const float</span>* x, <span class="kw2">float</span>* y, <span class="kw2">int</span> N) {
+  <span class="kw2">const float</span>* xr = x + (<span class="kw2">long</span>)blockIdx.x * N;  <span class="kw2">float</span>* yr = y + (<span class="kw2">long</span>)blockIdx.x * N;
+  <span class="kw2">__shared__ float</span> red[32];                      <span class="cm">// one slot per warp (at most 1024/32)</span>
+  <span class="kw2">int</span> lane = threadIdx.x % 32, wid = threadIdx.x / 32, nw = blockDim.x / 32;   <span class="cm">// formula (85.3)</span>
+
+  <span class="kw2">float</span> m = -INFINITY;                              <span class="cm">// 1) row maximum, Algorithm 1 with max</span>
+  <span class="kw2">for</span> (<span class="kw2">int</span> j = threadIdx.x; j &lt; N; j += blockDim.x) m = fmaxf(m, xr[j]);
+  m = warp_max(m);  <span class="kw2">if</span> (lane == 0) red[wid] = m;  __syncthreads();
+  <span class="kw2">if</span> (wid == 0) { m = warp_max(lane &lt; nw ? red[lane] : -INFINITY); <span class="kw2">if</span> (lane == 0) red[0] = m; }
+  __syncthreads();  m = red[0];  __syncthreads();   <span class="cm">// last barrier: red[] is reused below</span>
+
+  <span class="kw2">float</span> s = 0.f;                                    <span class="cm">// 2) sum of exp(x - max), Algorithm 1 with sum</span>
+  <span class="kw2">for</span> (<span class="kw2">int</span> j = threadIdx.x; j &lt; N; j += blockDim.x) s += __expf(xr[j] - m);
+  s = warp_sum(s);  <span class="kw2">if</span> (lane == 0) red[wid] = s;  __syncthreads();
+  <span class="kw2">if</span> (wid == 0) { s = warp_sum(lane &lt; nw ? red[lane] : 0.f); <span class="kw2">if</span> (lane == 0) red[0] = s; }
+  __syncthreads();
+  <span class="kw2">float</span> inv = 1.f / red[0];
+
+  <span class="kw2">for</span> (<span class="kw2">int</span> j = threadIdx.x; j &lt; N; j += blockDim.x) yr[j] = __expf(xr[j] - m) * inv;   <span class="cm">// 3) write</span>
+}</pre>
+<p>This kernel reads each row three times. For rows of a few thousand floats, the second and third reads usually hit the L1 or L2 cache, so HBM sees close to one read and one write. [Likely] For very long rows you would keep the row in registers or shared memory, or use the <b>online softmax</b> trick, which computes the maximum and the sum in a single pass. That trick is the core of FlashAttention (<a href="../inference/index.html#row-attention-operator-1-flashattention-1-2-and" title="Attention operator 1: FlashAttention 1, 2 and 3 (planned)">session 124</a>).</p>
+
+<h2>Why fusion helps: fewer trips to HBM</h2>
+<p>Most operations in a transformer besides the matrix multiplications are <b>elementwise</b> (bias add, GELU or SiLU, residual add, scaling, dropout, type casts) or small reductions (RMSNorm, softmax). They do a few FLOPs per element. From <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>, their arithmetic intensity is around 1 FLOP per byte or less, far below the H100 ridge point of 295. They are memory-bound: their time is the bytes they move divided by the bandwidth.</p>
+<p>In eager PyTorch, each operation is its own kernel. Each kernel reads its inputs from HBM and writes its output to HBM, and the next kernel reads that output back. <b>Kernel fusion</b> does the whole chain in one kernel: each thread loads its element once, applies all operations in registers, and writes only the final result. The math is identical; only the memory traffic changes. For a chain of operations on \(n\) elements of \(w\) bytes:</p>
+<div class="eq">\[ Q_{\text{unfused}} = n\, w \sum_{k=1}^{K} (a_k + 1), \qquad Q_{\text{fused}} = n\, w\, (a_{\text{ext}} + 1) \tag{85.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(K\)</dt><dd>the number of operations in the chain</dd>
+<dt>\(a_k\)</dt><dd>how many full-size tensors operation \(k\) reads (1 for GELU, 2 for a residual add); the \(+1\) is its output. Small inputs such as a bias vector are ignored</dd>
+<dt>\(a_{\text{ext}}\)</dt><dd>the number of full-size tensors the whole chain reads from outside (the first input, plus a residual if there is one)</dd>
+<dt>\(Q\)</dt><dd>bytes moved between HBM and the chip; for a memory-bound kernel the time is about \(Q / B\), with \(B\) the bandwidth</dd></dl>
+<div class="worked"><div class="wt">Worked example: bias + GELU + residual in an MLP</div>
+<p>Take the MLP output chain \(y = \text{GELU}(x + \text{bias}) + r\) on \(M = 4096\) tokens and width 16,384, in BF16: \(n = 4096 \times 16384 = 67{,}108{,}864\) elements, \(w = 2\) bytes.</p>
+<p>Unfused, three kernels: the bias add reads \(x\) and writes \(t_1\) (2 tensors), GELU reads \(t_1\) and writes \(t_2\) (2), the residual add reads \(t_2\) and \(r\) and writes \(y\) (3). Total \(7 n w = 939.5\) MB, which takes at least \(939.5\ \text{MB} / 3.35\ \text{TB/s} = 280\) µs on an H100.</p>
+<p>Fused, one kernel: read \(x\) and \(r\), write \(y\): \(3 n w = 402.7\) MB, at least 120 µs. The same math, \(7/3 = 2.33\) times less traffic, and two fewer kernel launches. The intermediate tensors \(t_1\) and \(t_2\) (134 MB each) are also never allocated.</p></div>
+<figure class="fig" id="ck-fuse"><div class="fig-body">
+<div class="ck-chk" id="ck-fuse-ops">
+<label class="sl"><input type="checkbox" data-a="1" value="bias" checked> add bias</label>
+<label class="sl"><input type="checkbox" data-a="1" value="gelu" checked> GELU</label>
+<label class="sl"><input type="checkbox" data-a="1" value="scale"> multiply by a scale</label>
+<label class="sl"><input type="checkbox" data-a="1" value="cast"> dropout (mask from a seed)</label>
+<label class="sl"><input type="checkbox" data-a="2" value="res" checked> add residual</label></div>
+<div class="ck-grid">
+<label for="ck-fuse-m">Tokens \(M\) (width 16,384, BF16)</label><input type="range" id="ck-fuse-m" min="1" max="8192" step="1" value="4096"><output id="ck-fuse-mv"></output></div>
+<svg id="ck-fuse-svg" class="ck-svg" viewBox="0 0 640 230" role="img" aria-label="HBM bytes of each kernel in the unfused chain compared with one fused kernel"></svg>
+<div class="readout" id="ck-fuse-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> HBM traffic of an elementwise chain, unfused (one kernel per operation) and fused (one kernel), from formula (85.8). Times are the memory-bound lower bound on an H100 SXM (3.35 TB/s). The dropout here makes its random mask from a seed inside the kernel, so it reads and writes one tensor.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Each colored segment of the top bar is one kernel of the unfused chain: its reads and its write. The bottom bar is the fused kernel. Add operations: the unfused bar grows by \(2nw\) per unary operation, the fused bar does not grow at all. With all five operations selected, fusion cuts traffic by \(11/3 = 3.7\times\). Move \(M\) down to 1: the bytes become tiny (98 KB fused), and the time is then dominated by the few microseconds of each kernel launch, a second reason to fuse (<a href="../pretraining/making-training-fast-compile-cuda-graphs-fused.html">session 50</a>).</p></details></figure>
+<p>Fusion has limits. A matrix multiplication followed by an elementwise operation can be fused as an <b>epilogue</b> (the GEMM applies the bias and activation to its output tile before writing it), and cuBLASLt and CUTLASS offer this. [Certain] Two large reductions over different dimensions are hard to fuse. And fusion can raise register use and lower occupancy. In practice you get most fusions from <code>torch.compile</code>, which generates fused Triton kernels for elementwise and reduction chains, and from hand-written kernels for the important patterns: FlashAttention, fused RMSNorm with residual, fused rotary embedding, fused MoE routing, and fused dequantize-plus-GEMV for quantized decoding. [Likely]</p>
+<div class="algo"><div class="algo-h">Algorithm 2: a fused elementwise kernel with a grid-stride loop</div><ol>
+<li><b>input:</b> pointers to \(x, r, y\) (each \(n\) elements) and a bias of \(d\) elements; grid of \(G\) blocks of \(T\) threads</li>
+<li>\(i \leftarrow \text{blockIdx.x} \cdot T + \text{threadIdx.x}\) <span class="c">// formula (85.1)</span></li>
+<li><b>while</b> \(i \lt n\) <b>do</b></li>
+<li class="i1">\(v \leftarrow x_i + \text{bias}_{i \bmod d}\) <span class="c">// one coalesced read of x; bias stays in cache</span></li>
+<li class="i1">\(g \leftarrow \text{GELU}(v)\) <span class="c">// registers only, nothing written to HBM</span></li>
+<li class="i1">\(y_i \leftarrow g + r_i\) <span class="c">// one read of r, one write of y</span></li>
+<li class="i1">\(i \leftarrow i + G \cdot T\) <span class="c">// grid-stride: a fixed grid covers any n</span></li></ol></div>
+<p>The <b>grid-stride loop</b> lets you launch a fixed number of blocks (for example a few per SM) whatever the size of the tensor. Each thread handles elements \(i, i + GT, i + 2GT, \dots\), and at every step the warp still reads 32 neighbors.</p>
+
+<h2>Placing a kernel on the roofline</h2>
+<p>You wrote or profiled a kernel and measured its time \(t\). Is it good? The roofline answers this with three numbers you can compute on paper: the FLOPs \(F\) it must do, the bytes \(Q\) it must move to and from HBM (count them as in formula 85.8, assuming each byte crosses once), and the hardware peaks \(P\) and \(B\). Then:</p>
+<div class="eq">\[ I = \frac{F}{Q}, \qquad t_{\min} = \max\!\left(\frac{F}{P},\ \frac{Q}{B}\right), \qquad \text{achieved} = \frac{F}{t}, \quad \frac{Q}{t} \tag{85.9} \]</div>
+<div class="eq">\[ \text{fraction of roof} = \frac{F / t}{\min(P,\ I \cdot B)} = \frac{t_{\min}}{t} \tag{85.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(I\)</dt><dd>arithmetic intensity in FLOP per byte: the x-position of the kernel on the roofline plot</dd>
+<dt>\(t_{\min}\)</dt><dd>the fastest the kernel could possibly run on this GPU (formula 42.5 of <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>)</dd>
+<dt>\(F/t\), \(Q/t\)</dt><dd>achieved FLOP/s (the y-position on the plot) and achieved bandwidth</dd>
+<dt>\(P\), \(B\)</dt><dd>peak FLOP/s for the units the kernel uses (989 TFLOP/s dense BF16 on tensor cores, 67 TFLOP/s for ordinary FP32 math on H100 SXM) and peak bandwidth (3.35 TB/s) [Certain]</dd></dl>
+<div class="worked"><div class="wt">Worked example: is 150 µs good for the fused kernel?</div>
+<p>The fused bias + GELU + residual kernel from above moves \(Q = 402.7\) MB. Count about 10 FLOPs per element (1 for the bias, about 8 for the tanh form of GELU, 1 for the residual; the exact count does not change the answer): \(F = 6.71 \times 10^8\). So \(I = F/Q = 1.67\) FLOP/byte: far left of the ridge, memory-bound. \(t_{\min} = Q/B = 120\) µs.</p>
+<p>Suppose you measure \(t = 150\) µs (an example value). Achieved bandwidth \(= 402.7\ \text{MB} / 150\ \mu\text{s} = 2.68\) TB/s, which is 80% of 3.35 TB/s. Achieved compute is only 4.47 TFLOP/s, but that does not matter: the kernel is limited by bytes, and it is at 80% of its roof. Memory-bound kernels usually top out somewhat below the peak bandwidth, so this is a good kernel. [Likely] There is little left to gain by tuning it; the only big win is to move fewer bytes (fuse more, or use smaller number formats).</p></div>
+<div class="algo"><div class="algo-h">Algorithm 3: place a kernel on the roofline and decide what to do</div><ol>
+<li>count \(F\) and \(Q\) from the shapes, assuming each input byte is read once and each output byte written once</li>
+<li>time the kernel with CUDA events after warm-up, or read its duration from Nsight Systems or the PyTorch profiler</li>
+<li>compute \(I\), \(t_{\min}\), \(F/t\), \(Q/t\) and the fraction of roof (formulas 85.9, 85.10)</li>
+<li><b>if</b> \(I \lt P/B\) (memory-bound) <b>then</b></li>
+<li class="i1"><b>if</b> fraction is high (say above 70%): done; only fewer bytes help (fusion, BF16 or FP8, avoid copies)</li>
+<li class="i1"><b>else</b>: look for uncoalesced access (formula 85.6), too few blocks or warps (85.4), register spills, or extra traffic from re-reads</li>
+<li><b>else</b> (compute-bound): check that the math runs on tensor cores (right dtype, shapes that are multiples of 8 or 16), then tiling, bank conflicts (85.7) and occupancy</li></ol></div>
+<figure class="fig wide" id="ck-roof"><div class="fig-body">
+<div class="controls"><span class="seg" id="ck-roof-k"><button type="button" data-v="0" aria-pressed="false">vector add FP32</button><button type="button" data-v="1" aria-pressed="false">unfused chain</button><button type="button" data-v="2" aria-pressed="true">fused chain</button><button type="button" data-v="3" aria-pressed="false">row softmax</button><button type="button" data-v="4" aria-pressed="false">decode GEMV</button><button type="button" data-v="5" aria-pressed="false">GEMM 4096³</button></span></div>
+<div class="ck-grid">
+<label for="ck-roof-t">Measured time \(t\) ÷ \(t_{\min}\)</label><input type="range" id="ck-roof-t" min="1" max="20" step="0.05" value="1.25"><output id="ck-roof-tv"></output></div>
+<div class="scroll-x"><svg id="ck-roof-svg" class="ck-svg" viewBox="0 0 680 330" role="img" aria-label="Log-log roofline of an H100 with the selected kernel placed at its intensity and measured speed"></svg></div>
+<div class="ck-leg"><span style="--c:var(--tc)">roof: min(P, I·B)</span><span style="--c:var(--k)">your kernel at the measured time</span><span style="--c:var(--rule)">other kernels at 80% of their roof</span></div>
+<div class="readout" id="ck-roof-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 6.</b> Placing a kernel on the H100 SXM roofline (formulas 85.9 and 85.10). The upper flat roof is dense BF16 on tensor cores (989 TFLOP/s), the lower dashed one is ordinary FP32 math (67 TFLOP/s); the slope is 3.35 TB/s. Pick a kernel and set the measured time as a multiple of its lower bound \(t_{\min}\).</figcaption>
+<details class="howto"><summary>How to read Figure 6</summary><p>Every elementwise kernel, the softmax and the batch-1 decode GEMV sit near \(I \approx 1\), far left of both ridges: they can only be judged by bandwidth. The GEMM sits far right at \(I = 1365\): it is judged by tensor-core FLOP/s. Slide the measured time up: the orange point drops straight down, because \(I\) depends only on the work, not on how well you did it. Compare “unfused chain” and “fused chain”: fusion does not move a kernel up the slope by making it run better; it moves it to the right by removing bytes, and the roof above it is higher there.</p></details></figure>
+<aside class="note interview side"><span class="nt">Interview tip</span>A strong answer to “your kernel takes X µs, is that good?” has three steps: count bytes and FLOPs, find which roof applies, and give the fraction. “It moves 400 MB, so on 3.35 TB/s the floor is 120 µs; at 150 µs it is at 80% of the memory roof, so the next win is fewer bytes, not tuning.”</aside>
+
+<h2>Calling your own kernel from PyTorch</h2>
+<p>The code below collects the session in one script. Part 1 implements formulas (85.2), (85.4), (85.6) and (85.7) as plain Python and prints the numbers from the figures. Part 2 counts the bytes of the fused chain (85.8). Part 3 compiles the fused kernel of Algorithm 2 with <code>load_inline</code> from <code>torch.utils.cpp_extension</code>, checks it against PyTorch, and times both with CUDA events. Parts 1 and 2 run anywhere; part 3 needs an NVIDIA GPU with the CUDA toolkit (<code>nvcc</code>), and its printed times depend on your GPU.</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+torch.manual_seed(0)
+
+<span class="cm"># 1) The rules of this session as small functions</span>
+<span class="kw2">def</span> grid_size(n, block):                          <span class="cm"># formula (85.2)</span>
+    <span class="kw2">return</span> (n + block - 1) // block
+
+<span class="kw2">def</span> occupancy(T, regs, smem_kb, max_threads=2048, max_blocks=32,
+              regs_sm=65536, smem_sm_kb=228, reserved_kb=1):   <span class="cm"># H100 limits, formula (85.4)</span>
+    r = math.ceil(regs / 8) * 8                   <span class="cm"># registers are handed out in chunks</span>
+    lim = {"threads": max_threads // T, "blocks": max_blocks,
+           "registers": regs_sm // (r * T),
+           "shared": smem_sm_kb // (smem_kb + reserved_kb) <span class="kw2">if</span> smem_kb > 0 <span class="kw2">else</span> max_blocks}
+    b = min(lim.values())
+    <span class="kw2">return</span> b, b * T / max_threads, min(lim, key=lim.get)
+
+<span class="kw2">def</span> sectors(stride, elem=4, offset=0):            <span class="cm"># 32-byte sectors touched by one warp</span>
+    s = {(offset + lane * stride * elem + k) // 32 <span class="kw2">for</span> lane <span class="kw2">in</span> range(32) <span class="kw2">for</span> k <span class="kw2">in</span> range(elem)}
+    <span class="kw2">return</span> len(s), 32 * elem / (32 * len(s))      <span class="cm"># formula (85.6): useful / moved</span>
+
+<span class="kw2">def</span> bank_conflict(word_idx):                      <span class="cm"># formula (85.7), words of 4 bytes</span>
+    banks = {}
+    <span class="kw2">for</span> w <span class="kw2">in</span> set(word_idx):                       <span class="cm"># the same word twice is a broadcast</span>
+        banks.setdefault(w % 32, set()).add(w)
+    <span class="kw2">return</span> max(len(v) <span class="kw2">for</span> v <span class="kw2">in</span> banks.values())
+
+print(grid_size(1000, 256), occupancy(256, 64, 48))           <span class="cm"># 4 (4, 0.5, 'registers')</span>
+print(sectors(1), sectors(2), sectors(8))                     <span class="cm"># (4, 1.0) (8, 0.5) (32, 0.125)</span>
+print(bank_conflict([r * 32 <span class="kw2">for</span> r <span class="kw2">in</span> range(32)]),             <span class="cm"># column of a 32x32 tile: 32</span>
+      bank_conflict([r * 33 <span class="kw2">for</span> r <span class="kw2">in</span> range(32)]))             <span class="cm"># padded to 33 columns: 1</span>
+
+<span class="cm"># 2) HBM bytes of y = gelu(x + b) + r: unfused (3 kernels) vs fused (1 kernel), formula (85.8)</span>
+n, s = 4096 * 16384, 2                            <span class="cm"># BF16</span>
+unfused = (2 + 2 + 3) * n * s                     <span class="cm"># add: x->t1, gelu: t1->t2, add: t2,r->y</span>
+fused = 3 * n * s                                 <span class="cm"># read x and r once, write y once</span>
+print(unfused / 1e6, fused / 1e6, unfused / 3.35e12 * 1e6, fused / 3.35e12 * 1e6)
+<span class="cm"># 939.5 MB, 402.7 MB, 280 us, 120 us on an H100</span>
+
+<span class="cm"># 3) The fused kernel (Algorithm 2) in CUDA C++, compiled from Python</span>
+cuda_src = r"""
+__global__ void bias_gelu_res(const float* __restrict__ x, const float* __restrict__ b,
+                              const float* __restrict__ r, float* __restrict__ y,
+                              long n, int d) {
+  for (long i = blockIdx.x * (long)blockDim.x + threadIdx.x; i &lt; n;
+       i += (long)blockDim.x * gridDim.x) {               // grid-stride loop
+    float v = x[i] + b[i % d];                            // neighbors read neighbors: coalesced
+    float g = 0.5f * v * (1.f + tanhf(0.7978845608f * (v + 0.044715f * v * v * v)));
+    y[i] = g + r[i];                                      // one write, no temporaries in HBM
+  }
+}
+torch::Tensor fused(torch::Tensor x, torch::Tensor b, torch::Tensor r) {
+  TORCH_CHECK(x.is_cuda() &amp;&amp; x.is_contiguous() &amp;&amp; r.is_contiguous());
+  auto y = torch::empty_like(x);
+  long n = x.numel(); int d = b.numel(); int threads = 256;
+  long blocks = std::min&lt;long&gt;((n + threads - 1) / threads, 132L * 8);
+  bias_gelu_res&lt;&lt;&lt;blocks, threads&gt;&gt;&gt;(x.data_ptr&lt;float&gt;(), b.data_ptr&lt;float&gt;(),
+      r.data_ptr&lt;float&gt;(), y.data_ptr&lt;float&gt;(), n, d);
+  return y;
+}
+"""
+<span class="kw2">def</span> reference(x, b, r):
+    <span class="kw2">return</span> torch.nn.functional.gelu(x + b, approximate="tanh") + r   <span class="cm"># 3 kernels in eager mode</span>
+
+<span class="kw2">if</span> torch.cuda.is_available():
+    <span class="kw2">from</span> torch.utils.cpp_extension <span class="kw2">import</span> load_inline
+    ext = load_inline("fused_ext", cuda_sources=cuda_src, functions=["fused"],
+        cpp_sources="torch::Tensor fused(torch::Tensor x, torch::Tensor b, torch::Tensor r);")
+    M, d = 4096, 16384
+    x, r = torch.randn(M, d, device="cuda"), torch.randn(M, d, device="cuda")
+    b = torch.randn(d, device="cuda")
+    print((ext.fused(x, b, r) - reference(x, b, r)).abs().max().item())   <span class="cm"># tiny, about 1e-6</span>
+    <span class="kw2">for</span> name, fn <span class="kw2">in</span> [("eager", reference), ("fused", ext.fused)]:
+        <span class="kw2">for</span> _ <span class="kw2">in</span> range(3): fn(x, b, r)                    <span class="cm"># warm-up</span>
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record(); [fn(x, b, r) <span class="kw2">for</span> _ <span class="kw2">in</span> range(20)]; e1.record()
+        torch.cuda.synchronize()                          <span class="cm"># launches are async: wait before reading</span>
+        t = e0.elapsed_time(e1) / 20 * 1e-3               <span class="cm"># seconds per call</span>
+        q = 3 * x.numel() * 4                             <span class="cm"># bytes the fused kernel must move (FP32)</span>
+        print(name, f"{t*1e6:.0f} us, {q/t/1e12:.2f} TB/s of useful traffic")
+<span class="kw2">else</span>:
+    x, b, r = torch.randn(8, 16), torch.randn(16), torch.randn(8, 16)
+    v = x + b
+    mine = 0.5 * v * (1 + torch.tanh(0.7978845608 * (v + 0.044715 * v ** 3))) + r
+    print((mine - reference(x, b, r)).abs().max().item())   <span class="cm"># the kernel's math matches PyTorch</span></pre>
+<p>Two details in this code matter in real work. The index uses <code>long</code>: a tensor with more than \(2^{31} - 1\) elements (for example \(32768 \times 65536\)) overflows a 32-bit <code>int</code> and silently writes to wrong addresses. And the timing records CUDA events and synchronizes; timing a kernel launch with Python’s <code>time.time()</code> alone measures only the launch, because launches are asynchronous.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Where</th><th>Which idea from this session</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td>FlashAttention in every serving engine</td><td>tiles in shared memory, online softmax, fusion of QKᵀ, softmax and PV</td><td>the \(T \times T\) score matrix never goes to HBM (<a href="../inference/index.html#row-attention-operator-1-flashattention-1-2-and" title="Attention operator 1: FlashAttention 1, 2 and 3 (planned)">session 124</a>)</td></tr>
+<tr><td>vLLM, TensorRT-LLM, SGLang custom kernels</td><td>fused RMSNorm + residual, fused rotary embedding, fused MoE, PagedAttention</td><td>decode is memory-bound; every saved byte is saved time [Likely]</td></tr>
+<tr><td>Quantized decoding (INT4 or FP8 weights)</td><td>fused dequantize + GEMV; coalesced, vectorized loads of packed weights</td><td>fewer bytes per weight moves the GEMV right on the roofline (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>)</td></tr>
+<tr><td>torch.compile and Triton</td><td>automatic fusion of elementwise and reduction chains</td><td>you get formula (85.8) savings without writing CUDA (<a href="../inference/gpu-kernels-2-write-kernels-in-the.html">session 86</a>)</td></tr>
+<tr><td>Video preprocessing for VLMs and video classification</td><td>one fused kernel for decode output → resize → normalize → patchify, coalesced over pixels</td><td>at many frames per clip, separate kernels per step re-read every frame from HBM [Likely]</td></tr>
+<tr><td>Video retrieval, Video-RAG and fingerprinting</td><td>fused similarity + top-k kernels over large embedding or hash tables</td><td>scoring millions of clip vectors is memory-bound; never write the full score matrix [Likely]</td></tr>
+<tr><td>Profiling any training or serving job</td><td>placing kernels on the roofline (Algorithm 3), occupancy from Nsight Compute</td><td>tells you whether to optimize a kernel or remove it</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>No bounds check.</b> The last block reads and writes past the end of the array. Sometimes it crashes, often it silently corrupts another tensor. Always guard with <code>if (i &lt; n)</code> or a grid-stride loop.</li>
+<li><b>Block size not a multiple of 32.</b> A block of 100 threads still occupies 4 full warps; 28 lanes per block do nothing (Figure 1).</li>
+<li><b>A missing <code>__syncthreads()</code></b> between writing shared memory and reading what other threads wrote, or before reusing a shared buffer. The result is wrong only sometimes, which makes it hard to find. A barrier inside a branch that not all threads of the block reach can hang the kernel.</li>
+<li><b>Threads mapped to the wrong dimension.</b> Neighboring <code>threadIdx.x</code> on neighboring rows gives stride-\(N\) reads at 12.5% efficiency for FP32 (Figure 3). Map <code>threadIdx.x</code> to the contiguous dimension, and pass contiguous tensors.</li>
+<li><b>Ignoring bank conflicts in column reads</b> of a shared tile. Pad the tile to 33 columns (Figure 4).</li>
+<li><b>Chasing 100% occupancy.</b> More warps help only if latency is the problem. Measure the fraction of the roof first (Algorithm 3).</li>
+<li><b>32-bit index overflow</b> on tensors with more than about 2.1 billion elements. Use 64-bit indices for large tensors.</li>
+<li><b>Timing without synchronization</b>, or timing the first call (which includes compilation and memory allocation). Warm up, then use CUDA events or a profiler.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What are threads, warps, blocks and grids, and what does each level guarantee?<span class="lvl">basic</span></summary><div class="ans">A thread runs the kernel on its own data with its own registers. A warp is 32 consecutive threads of a block that the hardware executes together, one instruction at a time (SIMT). A block is up to 1,024 threads that run on one SM, can share shared memory and can synchronize with <code>__syncthreads()</code>. The grid is all blocks of a launch; blocks are independent, run in any order and cannot synchronize with each other inside the kernel. Each thread finds its element with <code>blockIdx.x * blockDim.x + threadIdx.x</code>.</div></details>
+<details class="qa"><summary>What is warp divergence, and when does a branch cost nothing?<span class="lvl">basic</span></summary><div class="ans">If lanes of one warp take different paths of a branch, the warp executes both paths in turn with the lanes of the other path disabled, so the cost is the sum of both paths. A branch is free when all 32 lanes of every warp take the same path, for example when the condition depends on the block index, the warp index, or a value that is the same for the whole warp. The bounds check is cheap because only the single partly filled warp at the end diverges.</div></details>
+<details class="qa"><summary>What limits occupancy? Compute it for 256 threads, 64 registers, 48 KB shared memory on an H100.<span class="lvl">core</span></summary><div class="ans">Four limits per SM: threads (2,048), blocks (32), registers (65,536) and shared memory (228 KB, plus 1 KB reserved per block). Threads allow 8 blocks, registers \(65536/(64 \cdot 256) = 4\), shared memory \(\lfloor 228/49 \rfloor = 4\). So 4 blocks, 32 of 64 warps: 50%. You must lower both registers and shared memory to raise it.</div></details>
+<details class="qa"><summary>Is higher occupancy always faster?<span class="lvl">core</span></summary><div class="ans">No. Occupancy is one way to hide memory latency: more warps to switch to while others wait. Kernels can also hide latency with instruction-level parallelism (several independent loads in flight per thread) and data reuse in registers. GEMM and attention kernels often run at low occupancy with large tiles and many registers and still reach most of the peak. Raise occupancy when a memory-bound kernel is far below the bandwidth roof and the profiler shows warps stalled on memory with few eligible warps.</div></details>
+<details class="qa"><summary>What is coalesced global memory access? Give the efficiency of a stride-2 and a stride-32 FP32 read.<span class="lvl">core</span></summary><div class="ans">The 32 addresses of a warp load are served in 32-byte sectors. When the lanes read consecutive elements, the warp’s 128 bytes (FP32) need exactly 4 sectors: coalesced, 100% efficiency. Stride 2 touches 8 sectors for the same 128 useful bytes: 50%. Stride 32 (or any stride of 8 or more) gives each lane its own sector: 32 sectors, 1,024 bytes moved, 12.5%. Strided access usually comes from mapping threads to the wrong dimension of a row-major tensor.</div></details>
+<details class="qa"><summary>What is a shared-memory bank conflict, and how does padding fix the transpose case?<span class="lvl">core</span></summary><div class="ans">Shared memory has 32 banks; word \(k\) (4 bytes) is in bank \(k \bmod 32\). If lanes of a warp access different words in the same bank, the accesses are serialized. In a <code>float tile[32][32]</code>, element \((r, c)\) is in bank \(c\), so reading a column puts all 32 lanes in one bank: 32 passes. With <code>tile[32][33]</code> the bank is \((r + c) \bmod 32\), so a column spreads over all 32 banks. Lanes that read the same word get a broadcast, which is not a conflict.</div></details>
+<details class="qa"><summary>Why does kernel fusion help if it does exactly the same math?<span class="lvl">basic</span></summary><div class="ans">Elementwise and normalization operations are memory-bound: their time is bytes divided by bandwidth. Unfused, every operation writes its output to HBM and the next one reads it back. Fused, each element is loaded once, all operations run in registers, and only the final result is written. For bias + GELU + residual this is \(7nw\) versus \(3nw\) bytes, 2.33× less traffic, plus fewer kernel launches and no temporary tensors.</div></details>
+<details class="qa"><summary>Your fused kernel takes 150 µs and moves 400 MB on an H100. Is it good? What next?<span class="lvl">core</span></summary><div class="ans">Its intensity is around 1–2 FLOP per byte, far below the ridge (295), so it is memory-bound. The floor is \(0.4\ \text{GB} / 3.35\ \text{TB/s} \approx 120\) µs; 150 µs is about 80% of the memory roof (2.68 TB/s). That is close to what memory-bound kernels reach in practice. Further tuning of the same kernel will gain little; to go faster, move fewer bytes: fuse it with its neighbors, use BF16 or FP8 instead of FP32, or avoid a copy before it.</div></details>
+<details class="qa"><summary>How does a block-wide reduction work in a softmax kernel?<span class="lvl">advanced</span></summary><div class="ans">Each thread first reduces a strided slice of the row into a register (coalesced reads). Then each warp reduces its 32 values with five <code>__shfl_down_sync</code> steps (offsets 16, 8, 4, 2, 1), with no shared memory. Lane 0 of each warp writes its result to a small shared array; after <code>__syncthreads()</code>, the first warp reduces those values the same way and broadcasts the final result through shared memory. Softmax does this twice (max, then sum of exponentials), with a barrier before the shared buffer is reused. Online softmax merges both into one pass.</div></details>
+<details class="qa"><summary>Why do GEMM kernels need tiling but elementwise kernels do not?<span class="lvl">advanced</span></summary><div class="ans">An elementwise kernel uses each input once, so there is nothing to reuse; its best case is to read and write each byte once with coalesced access. A GEMM uses each input number many times (each element of A meets a whole row of B). Without tiling, each thread reloads its row and column from global memory and the intensity falls to about 0.5 FLOP per byte in BF16. Tiles in shared memory and registers let a block reuse each loaded number many times, which raises the intensity past the ridge so the tensor cores become the limit. Column reads from those tiles are also where bank conflicts appear.</div></details>
+<details class="qa"><summary>A colleague times a kernel with time.time() around the call and reports 8 µs for a 1 GB copy. What is wrong?<span class="lvl">basic</span></summary><div class="ans">Kernel launches are asynchronous: the call returns as soon as the kernel is queued, so 8 µs is the launch cost, not the run time. A 1 GB read plus write cannot take less than \(2\ \text{GB} / 3.35\ \text{TB/s} \approx 0.6\) ms on an H100. Use CUDA events with <code>torch.cuda.synchronize()</code>, warm up first, average several runs, or read the kernel duration from a profiler.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>You process \(n = 10^6\) elements with blocks of 256 threads. How many blocks do you launch, and how many threads are idle? Which block and lane handle element 777,777?</li>
+<li>On an H100, a kernel uses 128 threads per block, 96 registers per thread and no shared memory. What is its occupancy, and which limit decides?</li>
+<li>A BF16 kernel reads with a stride of 4 elements. What is its coalescing efficiency? What if each thread instead reads 8 neighboring BF16 values (16 bytes) with one vector load, and lanes are 16 bytes apart?</li>
+<li>A shared tile is <code>float tile[32][64]</code>. A warp reads column 5 (lane \(k\) reads \((k, 5)\)). What is the conflict degree? Which padding fixes it?</li>
+<li>Use formula (85.8) for the chain: scale, add bias, SiLU, multiply by another tensor \(g\) (as in a SwiGLU gate), on \(n\) elements of 2 bytes. Count unfused and fused bytes.</li>
+<li>A decode GEMV with a \(4096 \times 4096\) BF16 weight takes 14 µs on an H100. Place it on the roofline: \(I\), \(t_{\min}\), the fraction of the roof.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(G = \lceil 10^6/256 \rceil = 3907\) blocks, \(3907 \times 256 - 10^6 = 192\) idle threads. Element 777,777: block \(\lfloor 777777/256 \rfloor = 3038\), <code>threadIdx.x</code> \(= 777777 - 3038 \cdot 256 = 49\), so warp 1, lane 17. 2. Registers: \(65536 / (96 \cdot 128) = 5.33\), so 5 blocks; threads allow 16, blocks 32. 5 blocks × 4 warps = 20 of 64 warps: 31.25%, limited by registers. 3. Lanes are \(4 \times 2 = 8\) bytes apart: 32 lanes span 256 bytes = 8 sectors for 64 useful bytes: 25%. With 16-byte vector loads per lane, the warp reads 512 contiguous bytes in 16 sectors: 100%. 4. Element \((k, 5)\) is word \(64k + 5\), bank 5 for every \(k\): 32-way. Pad to <code>tile[32][65]</code>: bank \((65k + 5) \bmod 32 = (k + 5) \bmod 32\), all different. 5. Unfused: scale 2, bias 2, SiLU 2, multiply 3, total \(9nw = 18n\) bytes. Fused: read \(x\) and \(g\), write \(y\): \(3nw = 6n\) bytes, 3× less. 6. \(F = 2 \cdot 4096^2 = 3.36 \times 10^7\), \(Q \approx 2 \cdot 4096^2 = 3.36 \times 10^7\) bytes (the vectors are tiny), \(I \approx 1\). \(t_{\min} = 33.6\ \text{MB}/3.35\ \text{TB/s} = 10.0\) µs. Fraction \(= 10.0/14 = 72\%\) of the memory roof (2.40 TB/s).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A kernel runs as a grid of independent blocks of up to 1,024 threads; each thread finds its element with formula (85.1), and the launch needs \(\lceil n/b \rceil\) blocks plus a bounds check (85.2).</li>
+<li>Threads run in warps of 32 lanes (85.3). Keep branches uniform per warp and block sizes a multiple of 32.</li>
+<li>Occupancy (85.4, 85.5) is set by the tightest of four limits: threads, blocks, registers and shared memory. It hides latency but is not a goal in itself.</li>
+<li>Global memory moves 32-byte sectors per warp: neighboring lanes must read neighboring addresses (85.6). Shared memory has 32 banks: pad tiles to avoid column conflicts (85.7).</li>
+<li>Elementwise chains are memory-bound; fusion cuts HBM bytes (85.8), for bias + GELU + residual from \(7nw\) to \(3nw\).</li>
+<li>To judge any kernel: count \(F\) and \(Q\), compute \(t_{\min}\), and report the fraction of the roof (85.9, 85.10). Memory-bound and near the roof means: move fewer bytes.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ i = \text{blockIdx}\cdot\text{blockDim} + \text{threadIdx}, \quad n_{\text{blocks}} = \min\!\left(\tfrac{2048}{T}, 32, \tfrac{65536}{rT}, \tfrac{228}{s+1}\right), \quad \text{bank} = \tfrac{a}{4} \bmod 32 \]</div>
+<div class="eq">\[ Q_{\text{fused}} = n w (a_{\text{ext}} + 1), \quad I = \frac{F}{Q}, \quad t_{\min} = \max\!\left(\frac{F}{P}, \frac{Q}{B}\right), \quad \text{fraction} = \frac{t_{\min}}{t} \]</div>
+<h2 class="plain" id="gpu-kernels-1-cuda-basics-for-ml-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">CUDA C++ Programming Guide</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/cuda-c-best-practices-guide/" target="_blank" rel="noopener">CUDA C++ Best Practices Guide</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/hopper-tuning-guide/" target="_blank" rel="noopener">NVIDIA Hopper Tuning Guide (H100 occupancy and shared-memory limits)</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/ampere-tuning-guide/" target="_blank" rel="noopener">NVIDIA Ampere GPU Architecture Tuning Guide (A100 limits)</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/ada-tuning-guide/" target="_blank" rel="noopener">NVIDIA Ada GPU Architecture Tuning Guide (RTX 4090 limits)</a></li><li>Hwu, Kirk &amp; El Hajj (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;Programming Massively Parallel Processors: A Hands-on Approach (4th edition)&amp;quot;" target="_blank" rel="noopener">Programming Massively Parallel Processors: A Hands-on Approach (4th edition)</a></li><li>Harris (2013). <a href="https://developer.nvidia.com/blog/efficient-matrix-transpose-cuda-cc/" target="_blank" rel="noopener">An Efficient Matrix Transpose in CUDA C/C++ (NVIDIA technical blog)</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/batching-basics-and-the-latency-throughput-trade.html"><small>Previous · session 84</small>Batching basics and the latency–throughput trade-off</a><a class="next" href="../inference/gpu-kernels-2-write-kernels-in-the.html"><small>Next · session 86</small>GPU kernels 2: write kernels in the Triton language</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="gpu-kernels-1-cuda-basics-for-ml"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmtB=v=>v>=1e9?(v/1e9).toFixed(2)+" GB":v>=1e6?(v/1e6).toFixed(1)+" MB":v>=1e3?(v/1e3).toFixed(1)+" KB":v.toFixed(0)+" B";
+const fmtT=s=>s>=1e-3?(s*1e3).toFixed(2)+" ms":(s*1e6).toFixed(1)+" µs";
+const sci=v=>{const e=Math.floor(Math.log10(v));const m=v/Math.pow(10,e);return m.toFixed(2)+"×10<sup>"+e+"</sup>";};
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b||!el.contains(b))return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+function segVal(el){const b=el.querySelector('button[aria-pressed="true"]');return b?b.dataset.v:null;}
+
+/* ---------- Figure 1: thread index explorer ---------- */
+(function(){
+ const svg=$("#ck-idx-svg");if(!svg)return;const N=$("#ck-idx-n"),info=$("#ck-idx-info"),bs=$("#ck-idx-b");
+ let b=+segVal(bs),selB=2,selT=188;
+ const CW=17,CH=9,X0=96,Y0=26;
+ function draw(){const n=+N.value;$("#ck-idx-nv").value=n;
+  const G=Math.ceil(n/b),wpb=Math.ceil(b/32);
+  if(selB>=G)selB=G-1;if(selT>=b)selT=b-1;
+  let g="",y=Y0;
+  for(let l=0;l<32;l+=8)g+=`<text x="${X0+l*CW+CW/2}" y="16" text-anchor="middle" font-size="11" fill="var(--muted)">lane ${l}</text>`;
+  for(let blk=0;blk<G;blk++){const h=wpb*(CH+1);
+   g+=`<rect x="4" y="${y-2}" width="${X0+32*CW-0}" height="${h+3}" rx="4" fill="${blk%2?"var(--paper2)":"none"}" stroke="var(--rule)" stroke-width="0.8"/>`;
+   g+=`<text x="10" y="${y+Math.min(h,22)/2+4}" font-size="11.5" fill="var(--ink2)">block ${blk}</text>`;
+   for(let w=0;w<wpb;w++){for(let l=0;l<32;l++){const t=w*32+l;const x=X0+l*CW,yy=y+w*(CH+1);
+     if(t>=b){g+=`<rect x="${x+1}" y="${yy}" width="${CW-2}" height="${CH}" rx="1.5" fill="none" stroke="var(--muted)" stroke-dasharray="2 2" stroke-width="0.8"/>`;continue;}
+     const i=blk*b+t,act=i<n,sel=blk===selB&&t===selT;
+     g+=`<rect class="ck-cell" data-b="${blk}" data-t="${t}" x="${x+1}" y="${yy}" width="${CW-2}" height="${CH}" rx="1.5" fill="${sel?"var(--k)":act?"var(--q)":"var(--rule)"}" opacity="${sel||!act?1:0.75}"><title>block ${blk}, thread ${t}, i = ${i}</title></rect>`;}}
+   y+=h+5;}
+  svg.setAttribute("viewBox",`0 0 680 ${Math.max(120,y+6)}`);svg.innerHTML=g;
+  const total=G*b,idle=total-n,lanes=G*wpb*32,emptyLanes=lanes-total;
+  const i=selB*b+selT,act=i<n;
+  info.innerHTML=`G = ⌈${n}/${b}⌉ = <b>${G}</b> blocks, ${total} threads, <b>${idle}</b> idle (bounds check fails). Each block has ${wpb} warp${wpb>1?"s":""}; ${G*wpb} warps scheduled, ${lanes} lanes${emptyLanes?`, of which <b>${emptyLanes}</b> are empty lanes because ${b} is not a multiple of 32`:""}.<br>Clicked: blockIdx.x = <b>${selB}</b>, threadIdx.x = <b>${selT}</b> → i = ${selB} × ${b} + ${selT} = <b>${i}</b> (${act?"active":"idle"}), warp <b>${Math.floor(selT/32)}</b>, lane <b>${selT%32}</b>.`;}
+ svg.addEventListener("click",e=>{const c=e.target.closest(".ck-cell");if(!c)return;selB=+c.dataset.b;selT=+c.dataset.t;draw();});
+ seg(bs,v=>{const i=selB*b+selT;b=+v;selB=Math.floor(i/b);selT=i%b;draw();});
+ N.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 2: occupancy calculator ---------- */
+(function(){
+ const svg=$("#ck-occ-svg");if(!svg)return;const T=$("#ck-occ-t"),Rg=$("#ck-occ-r"),S=$("#ck-occ-s"),info=$("#ck-occ-info"),gs=$("#ck-occ-gpu");
+ const GPU={h100:{name:"H100",th:2048,bl:32,rg:65536,sm:228,smb:227,w:64},a100:{name:"A100",th:2048,bl:32,rg:65536,sm:164,smb:163,w:64},"4090":{name:"RTX 4090",th:1536,bl:24,rg:65536,sm:100,smb:99,w:48}};
+ let gk="h100";
+ function draw(){const G=GPU[gk],t=+T.value,r=+Rg.value,s=+S.value;$("#ck-occ-tv").value=t;$("#ck-occ-rv").value=r;$("#ck-occ-sv").value=s;
+  const rr=Math.ceil(r/8)*8;
+  const lim=[["threads",Math.floor(G.th/t),`⌊${G.th}/${t}⌋`],["blocks",G.bl,"hardware cap"],["registers",Math.floor(G.rg/(rr*t)),`⌊65536/(${rr} × ${t})⌋`],["shared memory",s>0?Math.floor(G.sm/(s+1)):Infinity,s>0?`⌊${G.sm}/(${s}+1)⌋`:"not used"]];
+  const bad=s>G.smb?`a block may use at most ${G.smb} KB of shared memory on the ${G.name}`:rr*t>G.rg?`one block would need ${rr*t} registers, more than the ${G.rg} of an SM`:null;
+  const nb=bad?0:Math.min(...lim.map(x=>x[1]));const warps=nb*t/32,occ=warps/G.w;
+  const top=Math.max(8,...lim.map(x=>Number.isFinite(x[1])?x[1]:0));
+  let g="";const X0=150,W=330;
+  lim.forEach(([nm,v,f],k)=>{const y=14+k*38;const vv=Number.isFinite(v)?v:top;const wd=Math.max(2,W*Math.min(vv,top)/top);const tie=!bad&&v===nb;
+   g+=`<text x="${X0-8}" y="${y+17}" text-anchor="end" font-size="13" fill="var(--ink2)">${nm}</text><rect x="${X0}" y="${y}" width="${wd}" height="24" rx="4" fill="${tie?"var(--k)":"var(--q-soft)"}" stroke="${tie?"var(--k)":"var(--q)"}"/>`+
+   `<text x="${X0+wd+6}" y="${y+17}" font-size="12.5" fill="var(--ink)">${Number.isFinite(v)?v:"no limit"} <tspan fill="var(--muted)">${f}</tspan></text>`;});
+  const sy=180,sw=Math.min(9.4,600/G.w);g+=`<text x="10" y="${sy-6}" font-size="12.5" fill="var(--ink2)">warp slots of one SM (${G.w})</text>`;
+  for(let k=0;k<G.w;k++){const used=k<warps;const blk=Math.floor(k/(t/32));g+=`<rect x="${10+k*sw}" y="${sy}" width="${sw-1.5}" height="26" rx="2" fill="${used?(blk%2?"var(--v)":"var(--q)"):"var(--paper2)"}" stroke="var(--rule)" stroke-width="0.6"/>`;}
+  g+=`<text x="10" y="${sy+46}" font-size="12" fill="var(--muted)">colors alternate per resident block</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=bad?`<b style="color:var(--bad)">Launch fails:</b> ${bad}.`:`${G.name}: registers rounded to ${rr} per thread. Resident blocks per SM = min(${lim.map(x=>Number.isFinite(x[1])?x[1]:"–").join(", ")}) = <b>${nb}</b>, so ${warps} of ${G.w} warps: occupancy <b>${(100*occ).toFixed(1)}%</b>. Limited by <b>${lim.filter(x=>x[1]===nb).map(x=>x[0]).join(" and ")}</b>.`;}
+ seg(gs,v=>{gk=v;const G=GPU[gk];S.max=G.smb;draw();});
+ [T,Rg,S].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: coalescing ---------- */
+(function(){
+ const svg=$("#ck-coal-svg");if(!svg)return;const St=$("#ck-coal-s"),Of=$("#ck-coal-o"),info=$("#ck-coal-info"),ws=$("#ck-coal-w");
+ let w=+segVal(ws);
+ function draw(){const S=+St.value,o=+Of.value;$("#ck-coal-sv").value=S;$("#ck-coal-ov").value=o;
+  const addr=Array.from({length:32},(_,k)=>(o+k*S)*w);const secs=new Set();addr.forEach(a=>{for(let q=a;q<a+w;q++)secs.add(Math.floor(q/32));});
+  const last=Math.floor((addr[31]+w-1)/32),nS=last+1;const sw=Math.min(40,640/nS),X0=20;
+  let g="";
+  for(let k=0;k<32;k++){const x=X0+k*20;g+=`<rect x="${x}" y="14" width="17" height="22" rx="3" fill="var(--q-soft)" stroke="var(--q)"/>`;if(k%4===0)g+=`<text x="${x+8.5}" y="50" text-anchor="middle" font-size="10.5" fill="var(--muted)">${k}</text>`;}
+  g+=`<text x="${X0}" y="10" font-size="11.5" fill="var(--ink2)">lanes 0 to 31 of one warp</text>`;
+  for(let s=0;s<nS;s++){const x=X0+s*sw,t=secs.has(s);g+=`<rect x="${x}" y="150" width="${Math.max(1,sw-1)}" height="30" fill="${t?"var(--k-soft)":"var(--paper2)"}" stroke="${t?"var(--k)":"var(--rule)"}" stroke-width="0.7"/>`;}
+  addr.forEach((a,k)=>{const s=Math.floor(a/32),fx=(a%32)/32;const x=X0+s*sw+fx*sw;g+=`<rect x="${x}" y="152" width="${Math.max(1,sw*w/32)}" height="26" fill="var(--q)"/>`;
+   g+=`<line x1="${X0+k*20+8.5}" y1="37" x2="${x+sw*w/64}" y2="150" stroke="var(--q)" stroke-width="0.8" opacity="0.55"/>`;});
+  g+=`<text x="${X0}" y="200" font-size="11.5" fill="var(--ink2)">global memory: ${nS} sectors of 32 bytes shown (bytes 0 to ${nS*32-1})</text>`;
+  svg.innerHTML=g;const used=32*w,moved=32*secs.size;
+  info.innerHTML=`Lane k reads byte address ${w} × (${o} + ${S}k). The warp asks for <b>${used} bytes</b> and touches <b>${secs.size}</b> sectors = ${moved} bytes moved. Efficiency (85.6) = ${used}/${moved} = <b>${(100*used/moved).toFixed(1)}%</b>${S===1&&o===0?" — fully coalesced":""}.`;}
+ seg(ws,v=>{w=+v;draw();});[St,Of].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: bank conflicts ---------- */
+(function(){
+ const svg=$("#ck-bank-svg");if(!svg)return;const info=$("#ck-bank-info"),wsg=$("#ck-bank-w"),psg=$("#ck-bank-p");
+ let W=+segVal(wsg),P=segVal(psg);
+ const names={row:"row 0 (lane k reads (0, k))",col:"column 0 (lane k reads (k, 0))",s2:"every 2nd word (lane k reads word 2k)",bc:"one word for all lanes (word 0)"};
+ function word(k){return P==="row"?k:P==="col"?k*W:P==="s2"?2*k:0;}
+ function draw(){const words=Array.from({length:32},(_,k)=>word(k));const banks=Array.from({length:32},()=>new Map());
+  words.forEach((wd,k)=>{const m=banks[wd%32];if(!m.has(wd))m.set(wd,[]);m.get(wd).push(k);});
+  const deg=Math.max(...banks.map(m=>m.size));const bh=deg>8?5.5:18;const X0=20,CW=20,base=232;
+  let g="";
+  for(let b=0;b<32;b++){const x=X0+b*CW;g+=`<rect x="${x}" y="${base}" width="${CW-2}" height="14" fill="var(--paper2)" stroke="var(--rule)" stroke-width="0.6"/>`;if(b%4===0)g+=`<text x="${x+9}" y="${base+28}" text-anchor="middle" font-size="10.5" fill="var(--muted)">${b}</text>`;
+   let j=0;banks[b].forEach((lanes,wd)=>{const y=base-4-(j+1)*(bh+1);g+=`<rect x="${x+1}" y="${y}" width="${CW-4}" height="${bh}" rx="1.5" fill="${banks[b].size>1?"var(--k)":"var(--q)"}"><title>word ${wd}: lanes ${lanes.join(", ")}</title></rect>`;
+    if(bh>12)g+=`<text x="${x+9}" y="${y+bh-5}" text-anchor="middle" font-size="9.5" fill="var(--on-accent)">${lanes.length>1?"×"+lanes.length:lanes[0]}</text>`;j++;});
+   if(banks[b].size>1)g+=`<text x="${x+9}" y="${base-10-banks[b].size*(bh+1)}" text-anchor="middle" font-size="11" font-weight="700" fill="var(--k)">${banks[b].size}</text>`;}
+  g+=`<text x="${X0}" y="${base+48}" font-size="12" fill="var(--ink2)">stack height = different words requested from that bank</text><text x="${X0+640}" y="${base+28}" text-anchor="end" font-size="11" fill="var(--muted)">bank</text>`;
+  svg.innerHTML=g;
+  const ex=[1,2].map(k=>`lane ${k} → word ${words[k]} → bank ${words[k]%32}`).join("; ");
+  info.innerHTML=`tile[32][${W}], warp reads ${names[P]}. ${ex}. Conflict degree = <b>${deg}</b>: the access takes <b>${deg}</b> pass${deg>1?"es":""}${deg===1&&P==="bc"?" (broadcast: 32 lanes share one word)":deg===1?" (conflict-free)":""}.`;}
+ seg(wsg,v=>{W=+v;draw();});seg(psg,v=>{P=v;draw();});draw();
+})();
+
+/* ---------- Figure 5: fusion traffic ---------- */
+(function(){
+ const svg=$("#ck-fuse-svg");if(!svg)return;const box=$("#ck-fuse-ops"),M=$("#ck-fuse-m"),info=$("#ck-fuse-info");
+ const COL=["var(--q)","var(--k)","var(--v)","var(--t3)","var(--t5)"];const BW=3.35e12;
+ const label={bias:"add bias",gelu:"GELU",scale:"scale",cast:"dropout",res:"add residual"};
+ function draw(){const m=+M.value;$("#ck-fuse-mv").value=m;const n=m*16384,w=2;
+  const ops=[...box.querySelectorAll("input")].filter(x=>x.checked).map(x=>({k:x.value,a:+x.dataset.a}));
+  if(!ops.length){svg.innerHTML=`<text x="320" y="110" text-anchor="middle" font-size="14" fill="var(--muted)">Select at least one operation.</text>`;info.innerHTML="No operations selected.";return;}
+  const un=ops.map(o=>(o.a+1)*n*w),U=un.reduce((a,b)=>a+b,0);const ext=1+(ops.some(o=>o.k==="res")?1:0);const F=(ext+1)*n*w;
+  const maxB=11*n*w,X0=90,W=520,sc=W/maxB;let g="",x=X0;
+  g+=`<text x="${X0-8}" y="52" text-anchor="end" font-size="13" fill="var(--ink2)">unfused</text><text x="${X0-8}" y="66" text-anchor="end" font-size="11" fill="var(--muted)">${ops.length} kernel${ops.length>1?"s":""}</text>`;
+  ops.forEach((o,k)=>{const wd=un[k]*sc;g+=`<rect x="${x}" y="34" width="${Math.max(1,wd-1.5)}" height="38" rx="3" fill="${COL[k%5]}" opacity="0.85"><title>${label[o.k]}: ${fmtB(un[k])}</title></rect>`;
+   if(wd>46)g+=`<text x="${x+wd/2}" y="57" text-anchor="middle" font-size="11.5" fill="var(--on-accent)">${label[o.k]}</text>`;x+=wd;});
+  g+=`<text x="${Math.min(x+6,610)}" y="${x>560?28:57}" font-size="12" fill="var(--ink)" text-anchor="${x>560?"end":"start"}">${fmtB(U)}</text>`;
+  g+=`<text x="${X0-8}" y="132" text-anchor="end" font-size="13" fill="var(--ink2)">fused</text><text x="${X0-8}" y="146" text-anchor="end" font-size="11" fill="var(--muted)">1 kernel</text>`;
+  g+=`<rect x="${X0}" y="114" width="${F*sc}" height="38" rx="3" fill="var(--ok)" opacity="0.85"/><text x="${X0+F*sc+6}" y="137" font-size="12" fill="var(--ink)">${fmtB(F)}</text>`;
+  for(let k=0;k<=11;k++){const xx=X0+k*n*w*sc;g+=`<line x1="${xx}" y1="166" x2="${xx}" y2="171" stroke="var(--muted)"/>`;if(k%2===1||k===0)g+=`<text x="${xx}" y="185" text-anchor="middle" font-size="10.5" fill="var(--muted)">${k}nw</text>`;}
+  g+=`<line x1="${X0}" y1="166" x2="${X0+W}" y2="166" stroke="var(--muted)"/><text x="${X0+W/2}" y="205" text-anchor="middle" font-size="12" fill="var(--ink2)">HBM bytes, in units of one full tensor (n·w = ${fmtB(n*w)})</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`n = ${m} × 16384 = ${n.toLocaleString("en-US")} elements. Unfused: ${ops.map((o,k)=>`${label[o.k]} ${o.a+1}`).join(" + ")} = <b>${un.length?U/(n*w):0}nw = ${fmtB(U)}</b>, at least <b>${fmtT(U/BW)}</b>, ${ops.length} launches. Fused: ${ext+1}nw = <b>${fmtB(F)}</b>, at least <b>${fmtT(F/BW)}</b>, 1 launch. Traffic ratio <b>${(U/F).toFixed(2)}×</b>.`;}
+ box.addEventListener("change",draw);M.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 6: place a kernel on the roofline ---------- */
+(function(){
+ const svg=$("#ck-roof-svg");if(!svg)return;const ks=$("#ck-roof-k"),Tm=$("#ck-roof-t"),info=$("#ck-roof-info");
+ const BW=3.35e12,PT=989e12,PF=67e12,n=4096*16384,sm=32768*4096,d=4096;
+ const K=[{nm:"vector add FP32, n = 2²⁸",F:2**28,Q:12*2**28,P:PF,note:"1 FLOP and 12 bytes per element"},
+  {nm:"bias + GELU + residual, unfused (3 kernels, BF16)",F:10*n,Q:14*n,P:PF,note:"10 FLOPs per element counted; 7 tensors moved"},
+  {nm:"bias + GELU + residual, fused (BF16)",F:10*n,Q:6*n,P:PF,note:"same FLOPs; 3 tensors moved"},
+  {nm:"row softmax, 32768 × 4096 BF16",F:5*sm,Q:4*sm,P:PF,note:"about 5 FLOPs per element counted; one read and one write"},
+  {nm:"decode GEMV, 4096 × 4096 BF16 weight, batch 1",F:2*d*d,Q:2*d*d+4*d,P:PT,note:"every weight read once, used once"},
+  {nm:"GEMM 4096 × 4096 × 4096 BF16",F:2*d**3,Q:6*d*d,P:PT,note:"each matrix crosses HBM once (ideal tiling)"}];
+ let k=+segVal(ks);
+ const X0=70,X1=660,Y0=290,Y1=14,lx0=-2,lx1=4,ly0=11,ly1=15.3;
+ const X=I=>X0+(Math.log10(I)-lx0)/(lx1-lx0)*(X1-X0),Y=f=>Y0-(Math.log10(f)-ly0)/(ly1-ly0)*(Y0-Y1);
+ const roof=(I,P)=>Math.min(P,I*BW);
+ function path(P){let d="";for(let e=lx0;e<=lx1+1e-9;e+=0.02){const I=Math.pow(10,e);d+=(d?"L":"M")+X(I).toFixed(1)+" "+Y(roof(I,P)).toFixed(1);}return d;}
+ function draw(){const mult=+Tm.value;$("#ck-roof-tv").value=mult.toFixed(2)+"×";const q=K[k];
+  const I=q.F/q.Q,tmin=Math.max(q.F/q.P,q.Q/BW),t=mult*tmin,ach=q.F/t,bw=q.Q/t,memb=q.Q/BW>=q.F/q.P;
+  let g=`<defs><clipPath id="ck-roof-clip"><rect x="${X0}" y="${Y1}" width="${X1-X0}" height="${Y0-Y1}"/></clipPath></defs>`;
+  for(let e=lx0;e<=lx1;e++)g+=`<line x1="${X(10**e)}" y1="${Y1}" x2="${X(10**e)}" y2="${Y0}" stroke="var(--rule)" stroke-width="0.6"/><text x="${X(10**e)}" y="${Y0+16}" text-anchor="middle" font-size="11" fill="var(--muted)">${e<0?(10**e).toFixed(-e):10**e}</text>`;
+  [11,12,13,14,15].forEach(e=>g+=`<line x1="${X0}" y1="${Y(10**e)}" x2="${X1}" y2="${Y(10**e)}" stroke="var(--rule)" stroke-width="0.6"/><text x="${X0-6}" y="${Y(10**e)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${["0.1","1","10","100","1000"][e-11]}</text>`);
+  g+=`<text x="${(X0+X1)/2}" y="${Y0+32}" text-anchor="middle" font-size="12" fill="var(--ink2)">arithmetic intensity I (FLOP per byte)</text><text x="16" y="${(Y0+Y1)/2}" transform="rotate(-90 16 ${(Y0+Y1)/2})" text-anchor="middle" font-size="12" fill="var(--ink2)">TFLOP/s</text>`;
+  g+=`<g clip-path="url(#ck-roof-clip)"><path d="${path(PF)}" fill="none" stroke="var(--tc)" stroke-width="2" stroke-dasharray="6 4" opacity="0.8"/><path d="${path(PT)}" fill="none" stroke="var(--tc)" stroke-width="3"/></g>`;
+  g+=`<text x="${X1-4}" y="${Y(PT)-6}" text-anchor="end" font-size="11.5" fill="var(--tc)">BF16 tensor cores 989</text><text x="${X1-4}" y="${Y(PF)-6}" text-anchor="end" font-size="11.5" fill="var(--tc)">FP32 math 67</text>`;
+  K.forEach((o,j)=>{if(j===k)return;const Ii=o.F/o.Q;g+=`<circle cx="${X(Ii)}" cy="${Y(0.8*roof(Ii,o.P))}" r="5" fill="var(--rule)" stroke="var(--muted)"><title>${o.nm}</title></circle>`;});
+  g+=`<line x1="${X(I)}" y1="${Y(roof(I,q.P))}" x2="${X(I)}" y2="${Y(ach)}" stroke="var(--k)" stroke-dasharray="3 3"/><circle cx="${X(I)}" cy="${Y(ach)}" r="7" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;
+  svg.innerHTML=g;
+  info.innerHTML=`<b>${q.nm}</b> (${q.note}). F = ${sci(q.F)} FLOPs, Q = ${fmtB(q.Q)}, I = F/Q = <b>${I<10?I.toFixed(3):I.toFixed(0)}</b> FLOP/byte → <b>${memb?"memory-bound":"compute-bound"}</b>. t<sub>min</sub> = ${fmtT(tmin)}; measured t = <b>${fmtT(t)}</b>. Achieved ${(ach/1e12).toFixed(2)} TFLOP/s and ${(bw/1e12).toFixed(2)} TB/s: <b>${(100/mult).toFixed(1)}%</b> of the roof (85.10). ${mult<=1.43?"Close to the limit: only less work or fewer bytes help.":mult<=3?"Some room left: check coalescing, occupancy and extra traffic.":"Far below the roof: something is wrong (strided access, too few blocks, spills, or not using tensor cores)."}`;}
+ seg(ks,v=>{k=+v;draw();});Tm.addEventListener("input",draw);draw();
+})();
+})();
+</script></body></html>

@@ -1,0 +1,488 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>One training step, end to end: forward, loss, backward, update · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 32</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="one-training-step-end-to-end-forward">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="one-training-step-end-to-end-forward" data-session="one-training-step-end-to-end-forward" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">32</span><span>Track 3: Pretraining and scale · session 2 of 22</span></div><h1 class="chap-title">One training step, end to end: forward, loss, backward, update</h1><p class="chap-sub">This session follows one batch through one full training step of an LLM: token ids become embeddings, pass through the blocks, become logits and one loss. Then the gradient flows back layer by layer, the optimizer clips, reads the learning rate and updates every weight. At each moment we ask which tensors are in GPU memory, and why the peak comes where it does.</p><div class="meta-row"><span><b>Time:</b> 3 hours (reading 2 hours, exercises 1 hour)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Session 4 (backpropagation and AdamW), session 25 (counting parameters, FLOPs and memory) and session 31 (pretraining objectives)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The shapes and sizes of every tensor in the forward pass, from (B, T) ids to (B, T, V) logits and one loss</li><li>Why the first gradient is prediction minus truth, (p − e_y)/N, and how to check it</li><li>Where every weight gradient comes from: X^T G for linear layers, the residual copy, the softmax backward in attention, the scatter-add in the embedding</li><li>The update in the right order: unscale, clip the global norm, AdamW with a warmup-cosine schedule, scheduler step, zero_grad</li><li>What lives in GPU memory at each moment of the step, and why the peak is usually at the start of the backward pass</li><li>How large logits, lazily created Adam states and checkpointing change the memory peak</li><li>A deterministic PyTorch step that checks these claims</li></ul></div></header><style>
+[data-session="one-training-step-end-to-end-forward"] code,[data-session="one-training-step-end-to-end-forward"] pre{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.ot-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.ot-grid input[type=range]{width:100%}
+.ot-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.ot-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.ot-node rect{fill:var(--card);stroke:var(--rule);stroke-width:1.6;transition:stroke .2s,fill .2s}
+.ot-node.on rect{stroke:var(--q);fill:var(--q-soft);stroke-width:2.4}
+.ot-node.bk rect{stroke:var(--k);fill:var(--k-soft);stroke-width:2.4}
+.ot-node.up rect{stroke:var(--v);fill:var(--v-soft);stroke-width:2.4}
+.ot-node text{font-family:var(--sans);text-anchor:middle}
+.ot-toks{display:flex;flex-wrap:wrap;gap:6px;margin:6px 0}
+.ot-toks button{font:600 14px var(--mono);padding:4px 9px;border-radius:7px;border:1.5px solid var(--rule);background:var(--card);color:var(--ink);cursor:pointer}
+.ot-toks button[aria-pressed="true"]{border-color:var(--k);background:var(--k-soft)}
+.ot-tbl td,.ot-tbl th{font-variant-numeric:tabular-nums}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Training a language model is one small procedure repeated hundreds of thousands of times: take a batch of tokens, compute the loss, compute the gradient of every weight, change the weights a little. This session follows <b>one</b> such step from the first token id to the last freed byte of memory.</p>
+<p>So far the course has shown the pieces one at a time: embeddings (<a href="../foundations/embeddings-turning-token-ids-into-vectors.html">session 11</a>), attention and the MLP, the residual stream (<a href="../transformers/the-residual-stream-and-normalization.html">session 22</a>), the causal loss (<a href="../pretraining/pretraining-objectives.html">session 31</a>), backpropagation and AdamW (<a href="../foundations/optimization-backprop-adamw.html">session 4</a>), and the counts of parameters, FLOPs and memory (<a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a>). Here we put them in the order in which a GPU actually runs them. Three questions guide the session:</p>
+<ul><li><b>Forward:</b> what tensor exists after each stage, and what is its shape and size?</li>
+<li><b>Backward:</b> where does the gradient of every weight come from? Which formula produces it, and which stored tensor does that formula need?</li>
+<li><b>Memory:</b> what lives in GPU memory at each moment of the step, and when is the peak?</li></ul>
+<p>The answers explain most practical training problems. "CUDA out of memory" at the start of the backward pass, a loss that does not move because gradients were never cleared, a run that diverges because the clipping happened before un-scaling: these are all bugs in the order of the step. And the interview question "walk me through one training step of an LLM" is very common; a good answer gives shapes, gradients and memory, not only the four words "forward, backward, step, zero".</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>When asked to explain a training step, say the shapes out loud: \((B, T)\) ids, \((B, T, d)\) hidden states, \((B, T, V)\) logits, one scalar loss. Then say what is stored for the backward pass and when it is freed. This shows you understand memory, which is what most follow-up questions are about.</aside>
+<p>As a running example we use <b>Llama 3 8B</b>: \(L = 32\) layers, width \(d = 4096\), vocabulary \(V = 128{,}256\), MLP width 14,336, 32 query heads and 8 key-value heads, untied input and output embeddings, \(N = 8.03 \times 10^9\) parameters. [Certain: from the model's config.json.] We follow one sequence of \(T = 8192\) tokens, its pretraining context length.</p>
+
+<h2>The map of one step</h2>
+<p>One training step has five phases. Each phase reads some tensors and writes others:</p>
+<ol><li><b>Load a batch.</b> A tensor of token ids of shape \((B, T)\), and the targets, which are the same ids shifted by one position.</li>
+<li><b>Forward pass.</b> Embedding lookup, \(L\) transformer blocks, a final norm, the output projection to logits, and the cross-entropy loss. Every operation <b>saves</b> the inputs it will need for its backward pass. These saved tensors are the <b>activations</b>.</li>
+<li><b>Backward pass.</b> Start from the loss and go back through the same operations in reverse order. Each one turns the gradient of its output into the gradient of its input and of its weights, then frees its saved activations.</li>
+<li><b>Update.</b> Clip the global gradient norm, read the learning rate from the schedule, and apply AdamW to every weight.</li>
+<li><b>Clean up.</b> Free (or zero) the gradients so the next step starts fresh, and advance the schedule.</li></ol>
+<p>Step through Figure 1. The readout gives the shape and the size in memory of the main tensor at each moment, for Llama 3 8B with one sequence of 8,192 tokens.</p>
+<figure class="fig wide" id="ot-map"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="ot-map-prev">Back</button><button type="button" class="btn primary" id="ot-map-play">Play</button><button type="button" class="btn" id="ot-map-next">Next</button><span id="ot-map-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="ot-map-svg" viewBox="0 0 780 250" role="img" aria-label="The stages of one training step: tokens, embedding, blocks, logits, loss, then backward and update"></svg></div>
+<div class="ot-leg"><span style="--c:var(--q)">forward (active)</span><span style="--c:var(--k)">backward (active)</span><span style="--c:var(--v)">update and clean-up</span></div>
+<div class="readout" id="ot-map-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> One training step of Llama 3 8B on one sequence of 8,192 tokens, stage by stage. Forward goes left to right along the top row, backward right to left, then the optimizer updates every weight.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Press Next. Blue boxes are forward stages, orange boxes backward stages, green boxes the update. Watch the numbers in the readout: the hidden states are 64 MiB, but the logits are about 1.05 billion numbers (4.2 GB in FP32), larger than all the hidden states of one layer. The saved activations of all 32 blocks add up to tens of GB. These numbers come back in Figure 4.</p></details></figure>
+<aside class="note analogy side"><span class="nt">Analogy</span>A factory assembly line that builds a product, then a quality inspector walks the line backwards. At each station the inspector reads the station's notes (the saved activations) and writes how much that station is to blame for the final defect (the gradient). Then every station adjusts its machine a little (the update) and throws its notes away.</aside>
+
+<h2>Forward: from token ids to one number</h2>
+<h3>Batch and targets</h3>
+<p>The data loader gives a tensor of shape \((B, T + 1)\) of token ids. The input is the first \(T\) columns, and the target at each position is the next id:</p>
+<div class="eq">\[ \mathbf{x} = \text{ids}[:, 0{:}T], \qquad \mathbf{y} = \text{ids}[:, 1{:}T{+}1], \qquad \mathbf{x}, \mathbf{y} \in \{0, \dots, V{-}1\}^{B \times T} \tag{32.1} \]</div>
+<p>With packing (<a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a>), every position is a real token, so a batch gives \(B \cdot T\) predictions. Llama 2 used batches of about 4 million tokens per step. [Certain] The ids are 64-bit integers: one sequence of 8,192 ids is only 64 KiB. Data is never the memory problem.</p>
+<h3>Embedding lookup</h3>
+<p>Each id selects one row of the embedding matrix \(E \in \R^{V \times d}\):</p>
+<div class="eq">\[ X_0[b, t, :] = E[\,x_{b,t}, :\,], \qquad X_0 \in \R^{B \times T \times d} \tag{32.2} \]</div>
+<p>This is a lookup, not a matrix multiply: it costs almost no FLOPs. For one sequence, \(X_0\) has \(8192 \times 4096 = 33.6\) million numbers, 64 MiB in BF16. Llama has no position embedding to add here; position enters inside attention through RoPE (<a href="../foundations/position-part-2-rope-in-depth-and.html">session 14</a>).</p>
+<h3>The blocks</h3>
+<p>Each of the \(L\) blocks reads the residual stream and adds two updates to it (pre-norm, as in Llama):</p>
+<div class="eq">\[ U_\ell = X_{\ell-1} + \operatorname{Attn}_\ell\big(\operatorname{Norm}(X_{\ell-1})\big), \qquad X_\ell = U_\ell + \operatorname{MLP}_\ell\big(\operatorname{Norm}(U_\ell)\big) \tag{32.3} \]</div>
+<p>The shape stays \((B, T, d)\) through all blocks. But inside a block many larger tensors appear: the queries, keys and values, the attention output, and the MLP's hidden layer (width 14,336, which is 3.5 times \(d\)). Each linear layer saves its input for the backward pass (it needs \(X\) to compute \(\partial L/\partial W = X^\top G\)). Each norm saves its input. The MLP saves the values before and after its activation function. Korthikanti et al. counted these saved tensors for a GPT-style block in 16-bit: about \(34\) bytes per number of the residual stream, per layer, when the attention scores are not stored (FlashAttention). [Certain for their GPT block; for a Llama block with SwiGLU the constant is similar but not identical. Likely.] For our sequence that is</p>
+<div class="eq">\[ M_{\text{act}} \approx L \cdot 34 \cdot B\,T\,d \ \text{bytes} = 32 \times 34 \times 8192 \times 4096 \approx 36.5 \ \text{GB} \tag{32.4} \]</div>
+<p>1.14 GB per layer, 36.5 GB for the model, for a single sequence. The weights in BF16 are 16.1 GB. So for long sequences, the stored activations are larger than the model itself.</p>
+<h3>Logits and loss</h3>
+<p>After the last block, a final norm and the output matrix \(W_{\text{out}} \in \R^{d \times V}\) give one score per vocabulary entry at every position:</p>
+<div class="eq">\[ H = \operatorname{Norm}(X_L), \qquad Z = H\,W_{\text{out}} \in \R^{B \times T \times V} \tag{32.5} \]</div>
+<p>\(Z\) is the largest tensor of the forward pass: \(8192 \times 128{,}256 = 1.05\) billion numbers. Losses are computed in FP32 for accuracy, so this one tensor takes 4.2 GB. Then the cross-entropy loss averages the negative log-probability of each target over the \(N_{\text{tok}}\) positions that have a target:</p>
+<div class="eq">\[ \mathcal{L} = -\frac{1}{N_{\text{tok}}} \sum_{b, t} m_{b,t}\, \log \softmax(\mathbf{z}_{b,t})_{y_{b,t}}, \qquad N_{\text{tok}} = \sum_{b,t} m_{b,t} \tag{32.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{z}_{b,t} \in \R^V\)</dt><dd>the logits at sequence \(b\), position \(t\)</dd>
+<dt>\(y_{b,t}\)</dt><dd>the target id: the next token in the text</dd>
+<dt>\(m_{b,t}\)</dt><dd>1 if this position gets a loss, 0 if not (padding, or a prompt in SFT). PyTorch marks the 0 positions with the label \(-100\), the <code>ignore_index</code>.</dd>
+<dt>\(N_{\text{tok}}\)</dt><dd>how many positions really get a loss; the average is over them only</dd></dl>
+<p>At initialization the model knows nothing, all \(V\) tokens get about the same probability, and the loss is close to \(\ln V\). For Llama 3 that is \(\ln 128{,}256 = 11.76\) nats. If your first loss is much larger, the initialization or the output scale is wrong. This is a cheap and very useful check. [Certain]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>The tensor <code>loss</code> is not just a number. It holds a reference to the whole computation graph and, through it, to all saved activations. Writing <code>total += loss</code> in a logging loop keeps every step's graph alive and leaks memory. Use <code>loss.item()</code> or <code>loss.detach()</code> for logging.</aside>
+
+<h2>The first gradient: softmax and cross-entropy</h2>
+<p>The backward pass starts at the scalar \(\mathcal{L}\), with \(\partial \mathcal{L}/\partial \mathcal{L} = 1\). The first real gradient is the one of the logits. For one position with logits \(\mathbf{z}\), probabilities \(\mathbf{p} = \softmax(\mathbf{z})\) and target \(y\), the loss is \(-\log p_y = -z_y + \log \sum_j e^{z_j}\). Its derivative with respect to \(z_i\) is \(-[i = y] + e^{z_i}/\sum_j e^{z_j}\). So:</p>
+<div class="eq">\[ \frac{\partial \mathcal{L}}{\partial \mathbf{z}_{b,t}} = \frac{m_{b,t}}{N_{\text{tok}}} \big(\mathbf{p}_{b,t} - \mathbf{e}_{y_{b,t}}\big) \tag{32.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{p}_{b,t}\)</dt><dd>the predicted distribution at that position</dd>
+<dt>\(\mathbf{e}_{y}\)</dt><dd>the one-hot vector of the target: 1 at position \(y\), 0 everywhere else</dd>
+<dt>\(m / N_{\text{tok}}\)</dt><dd>the averaging: each position contributes with weight \(1/N_{\text{tok}}\), and ignored positions contribute 0</dd></dl>
+<p>This is the cleanest formula in deep learning: <b>prediction minus truth</b>. The gradient pushes the target's logit up by \(1 - p_y\) and every other logit down by its own probability. It is never larger than 1 in size, and it is 0 only when the model puts probability 1 on the right token. Every gradient in the whole network comes from this one tensor, sent backward.</p>
+<div class="worked"><div class="wt">Worked example: the logit gradient for three tokens</div>
+<p>Logits \(\mathbf{z} = (2.0, 1.0, 0.1)\), target \(y = 0\), one position (\(N_{\text{tok}} = 1\)). Softmax: \(\mathbf{p} = (0.659, 0.242, 0.099)\). Loss: \(-\ln 0.659 = 0.417\).</p>
+<p>Gradient: \(\mathbf{p} - \mathbf{e}_0 = (0.659 - 1,\ 0.242,\ 0.099) = (-0.341, 0.242, 0.099)\). The components sum to 0, as they always must: the probabilities and the one-hot vector both sum to 1. A step against this gradient raises \(z_0\) and lowers \(z_1\) and \(z_2\).</p></div>
+<p>Figure 2 lets you do this by hand. Choose the target, then take gradient steps directly on the logits (as if the logits were the weights).</p>
+<figure class="fig" id="ot-ce"><div class="fig-body">
+<div style="font:600 14px var(--sans);color:var(--muted)">Context: "the cat sat on the ..." Choose the target token:</div>
+<div class="ot-toks" id="ot-ce-tg"></div>
+<div class="ot-grid"><label for="ot-ce-eta">Step size \(\eta\) on the logits</label><input type="range" id="ot-ce-eta" min="0.5" max="5" step="0.5" value="2"><output id="ot-ce-etav"></output></div>
+<div class="controls" style="margin-top:8px"><button type="button" class="btn primary" id="ot-ce-step">Take one step</button><button type="button" class="btn" id="ot-ce-reset">Reset</button></div>
+<div class="scroll-x"><svg id="ot-ce-svg" viewBox="0 0 640 270" role="img" aria-label="Bars of logits, probabilities and the gradient p minus one-hot for six tokens"></svg></div>
+<div class="ot-leg"><span style="--c:var(--q)">probability p</span><span style="--c:var(--k)">gradient p − e<sub>y</sub></span><span style="--c:var(--v)">target</span></div>
+<div class="readout" id="ot-ce-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The first gradient of the backward pass, for a vocabulary of six tokens. Top: the probabilities. Bottom: the gradient of the loss with respect to each logit, formula (32.7).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>The orange bar of the target is always negative (its logit must go up), the others are positive and equal to their probabilities. The bars always sum to zero. Press "Take one step" a few times: the loss falls fast at first, then slowly, because the gradient \(1 - p_y\) shrinks as \(p_y\) grows. Choose an unlikely target such as "sat": the first loss is large and the gradient is close to \(-1\), the largest it can be.</p></details></figure>
+
+<h2>Backward: where every gradient comes from</h2>
+<p>Now we walk back through the network, in exactly the reverse order of the forward pass. Every operation uses the same two rules from <a href="../foundations/optimization-backprop-adamw.html">session 4</a>: the chain rule, and for a linear layer \(Y = XW\) with incoming gradient \(G = \partial \mathcal{L}/\partial Y\):</p>
+<div class="eq">\[ \frac{\partial \mathcal{L}}{\partial W} = X^\top G, \qquad \frac{\partial \mathcal{L}}{\partial X} = G\, W^\top \tag{32.8} \]</div>
+<p>(For a batch of shape \((B, T, \cdot)\), the first formula also sums over all \(B \cdot T\) positions: every position adds its own small contribution to the weight gradient.) The first formula needs the stored input \(X\). The second needs the weight \(W\). This is why activations must be kept: the weight gradient of every linear layer is built from its forward input.</p>
+<h3>The output layer and the final norm</h3>
+<p>From \(G_Z = \partial \mathcal{L}/\partial Z\) (formula 32.7, shape \((B, T, V)\), another 4.2 GB in FP32), formula (32.8) gives \(\partial \mathcal{L}/\partial W_{\text{out}} = H^\top G_Z\), a \(4096 \times 128{,}256\) matrix, and \(\partial \mathcal{L}/\partial H = G_Z W_{\text{out}}^\top\), back to shape \((B, T, d)\). After this, the logits and their gradient can be freed. The final RMSNorm then turns \(\partial \mathcal{L}/\partial H\) into \(\partial \mathcal{L}/\partial X_L\), using its stored input, and gives the gradient of its scale vector.</p>
+<h3>The residual stream: a gradient highway</h3>
+<p>Write one sub-layer as \(X_{\text{out}} = X_{\text{in}} + F(X_{\text{in}})\). The chain rule gives</p>
+<div class="eq">\[ \frac{\partial \mathcal{L}}{\partial X_{\text{in}}} = \frac{\partial \mathcal{L}}{\partial X_{\text{out}}} + \Big(\frac{\partial F}{\partial X_{\text{in}}}\Big)^{\!\top} \frac{\partial \mathcal{L}}{\partial X_{\text{out}}} \tag{32.9} \]</div>
+<p>The first term is a plain copy. Whatever gradient arrives at the top of a block passes to the bottom unchanged, and the block only <b>adds</b> its own term. So the gradient of the loss reaches the embedding through 64 additions (two per block), not through 64 multiplications that could shrink it to zero. This is the main reason very deep transformers train at all (<a href="../transformers/the-residual-stream-and-normalization.html">session 22</a>). [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A highway with exits. The main traffic (the gradient) drives straight from the loss to the embedding. At each block, some cars take the exit, go through the town (the attention or MLP), and rejoin the highway further on. The town can add traffic, but it cannot block the highway.</aside>
+<h3>Inside a block: the MLP and attention</h3>
+<p>The MLP is three linear layers and an elementwise function. Its backward pass is formula (32.8) three times, plus the derivative of the activation (SiLU in Llama) at the stored pre-activation values. Attention is more interesting. With scores \(S = QK^\top/\sqrt{d_h}\) (causal mask applied), \(P = \softmax(S)\) row by row, output \(O = PV\), and incoming gradient \(G_O\):</p>
+<div class="eq">\[ \begin{aligned} G_V &= P^\top G_O, \qquad G_P = G_O V^\top \\ G_S &= P \odot \big(G_P - \operatorname{rowsum}(G_P \odot P)\big) \\ G_Q &= G_S K / \sqrt{d_h}, \qquad G_K = G_S^\top Q / \sqrt{d_h} \end{aligned} \tag{32.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\odot\)</dt><dd>elementwise product</dd>
+<dt>\(\operatorname{rowsum}(\cdot)\)</dt><dd>the sum of each row, kept as a column and subtracted from every element of that row: the softmax backward step</dd>
+<dt>\(G_Q, G_K, G_V\)</dt><dd>gradients that then flow into the query, key and value projections by formula (32.8), and through RoPE (a fixed rotation, whose backward is the inverse rotation)</dd></dl>
+<p>The softmax backward needs \(P\), a \(T \times T\) matrix per head. Storing it for \(T = 8192\) and 32 heads would be 4.3 GB per layer in BF16. FlashAttention does not store it. It keeps only \(Q, K, V, O\) and one number per row (the log-sum-exp), and recomputes \(P\) block by block in the backward pass (<a href="../inference/index.html#row-attention-operator-1-flashattention-1-2-and" title="Attention operator 1: FlashAttention 1, 2 and 3 (planned)">session 124</a>). [Certain] We checked formula (32.10) against PyTorch autograd in float64; the code is in the exercises.</p>
+<h3>The embedding: a scatter-add</h3>
+<p>The lookup (32.2) copied row \(x_{b,t}\) of \(E\) into position \((b, t)\). Its backward does the opposite: it adds the gradient of each position into the row it came from:</p>
+<div class="eq">\[ \frac{\partial \mathcal{L}}{\partial E[v, :]} = \sum_{(b,t)\,:\,x_{b,t} = v} \frac{\partial \mathcal{L}}{\partial X_0[b, t, :]} \tag{32.11} \]</div>
+<p>Rows of tokens that do not appear in the batch get exactly zero gradient. A token that appears 50 times gets the sum of 50 contributions. In PyTorch this is an <code>index_add</code> into a dense \(V \times d\) gradient (unless you ask for sparse gradients). If the model <b>ties</b> the input and output embeddings (GPT-2, many small models), the same matrix gets two gradients, one from (32.11) and one from the output layer, and autograd adds them. [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 1: the backward pass of a pre-norm decoder, layer by layer</div><ol>
+<li><b>input:</b> loss \(\mathcal{L}\), saved activations of every layer, weights</li>
+<li>\(G_Z \leftarrow \frac{m}{N_{\text{tok}}}(\mathbf{p} - \mathbf{e}_y)\) <span class="c">// formula (32.7), shape (B, T, V)</span></li>
+<li>\(\nabla W_{\text{out}} \leftarrow H^\top G_Z\); \(\;G \leftarrow G_Z W_{\text{out}}^\top\); free \(Z\), \(G_Z\) <span class="c">// formula (32.8)</span></li>
+<li>\(G \leftarrow\) backward of the final norm (uses its saved input); \(\nabla\gamma_{\text{final}}\)</li>
+<li><b>for</b> \(\ell = L, L-1, \dots, 1\):</li>
+<li>&nbsp;&nbsp;\(G_U \leftarrow G + \) MLP-branch backward of \(G\) <span class="c">// formula (32.9); gives ∇ of 3 MLP matrices and the norm</span></li>
+<li>&nbsp;&nbsp;\(G \leftarrow G_U + \) attention-branch backward of \(G_U\) <span class="c">// formula (32.10); gives ∇ of W_q, W_k, W_v, W_o and the norm</span></li>
+<li>&nbsp;&nbsp;free the saved activations of layer \(\ell\); (DDP: start the all-reduce of this layer's gradients)</li>
+<li>\(\nabla E \leftarrow\) scatter-add of \(G\) into the rows of the input ids <span class="c">// formula (32.11)</span></li>
+<li><b>return</b> a gradient for every weight</li></ol></div>
+<p>Count the work: each linear layer does two matrix multiplies in the backward pass (one for \(\nabla W\), one for \(\nabla X\)) and one in the forward pass. So backward costs about twice the forward, and one step costs about</p>
+<div class="eq">\[ C_{\text{step}} \approx 6\, N \cdot B\,T \ \text{FLOPs} \tag{32.12} \]</div>
+<p>For one sequence of 8,192 tokens on Llama 3 8B: \(6 \times 8.03 \times 10^9 \times 8192 = 3.95 \times 10^{14}\) FLOPs, without the attention-score term. A GPU that sustains 400 TFLOP/s needs about 1 second for it. For a 4-million-token batch the step is \(1.93 \times 10^{17}\) FLOPs, which is why such batches are spread over hundreds or thousands of GPUs (<a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a>).</p>
+
+<h2>The update: clipping, schedule, AdamW</h2>
+<p>When the backward pass ends, every weight \(\theta_i\) has a gradient \(g_i\) in its <code>.grad</code> field. Three things happen before the weights change, in this order.</p>
+<h3>1. Clip the global norm</h3>
+<p>Compute one number for the whole model, the length of the gradient vector over all 8 billion weights, and shrink the whole vector if it is too long:</p>
+<div class="eq">\[ \lVert \mathbf{g} \rVert = \sqrt{\textstyle\sum_{i=1}^{N} g_i^2}, \qquad \mathbf{g} \leftarrow \mathbf{g} \cdot \min\!\Big(1, \frac{c}{\lVert \mathbf{g} \rVert}\Big) \tag{32.13} \]</div>
+<p>The usual threshold is \(c = 1.0\), as in Llama 2. [Certain] The norm must be computed over <b>all</b> gradients, so with sharded training (FSDP) each GPU computes its part of the sum of squares and the parts are added with an all-reduce. Log the norm before clipping: it is one of the best health signals of a run (<a href="../pretraining/training-recipe-and-stability.html">session 36</a>).</p>
+<h3>2. Read the learning rate</h3>
+<p>The schedule turns the step number \(t\) into a learning rate. The common shape is linear warmup over \(W\) steps, then cosine decay to a fraction \(r\) of the peak at the last step \(T_{\max}\):</p>
+<div class="eq">\[ \eta(t) = \begin{cases} \eta_{\max}\, t / W, & t \lt W \\ \eta_{\max} \Big( r + (1 - r)\, \tfrac12 \big(1 + \cos \pi \tfrac{t - W}{T_{\max} - W}\big) \Big), & t \ge W \end{cases} \tag{32.14} \]</div>
+<p>For a Llama 2 7B-like run, \(\eta_{\max} = 3 \times 10^{-4}\), \(W = 2000\), \(r = 0.1\) and about 500,000 steps (2 trillion tokens at 4 million per step). [Certain for the recipe; the step count is our arithmetic.]</p>
+<h3>3. AdamW</h3>
+<p>For each weight, AdamW updates its two running averages \(m\) and \(v\), corrects their start-up bias, and moves the weight (formula 4.10 in <a href="../foundations/optimization-backprop-adamw.html">session 4</a>):</p>
+<div class="eq">\[ \theta \leftarrow \theta - \eta(t) \Big( \frac{\hat m}{\sqrt{\hat v} + \varepsilon} + \lambda\, \theta \Big) \tag{32.15} \]</div>
+<p>The update of each weight is roughly \(\eta\) in size, whatever the size of its gradient. Clipping still matters with Adam: a huge gradient enters \(m\) and \(v\) and distorts them for many steps. AdamW is elementwise: weight \(i\) only needs \(\theta_i, g_i, m_i, v_i\). That makes it easy to shard: each GPU can update only its own slice of the weights (ZeRO, FSDP).</p>
+<figure class="fig" id="ot-upd"><div class="fig-body">
+<div class="ot-grid">
+<label for="ot-upd-t">Step \(t\)</label><input type="range" id="ot-upd-t" min="0" max="500000" step="500" value="1000"><output id="ot-upd-tv"></output>
+<label for="ot-upd-g">Gradient norm before clipping</label><input type="range" id="ot-upd-g" min="-1" max="1.3" step="0.01" value="0.4"><output id="ot-upd-gv"></output>
+<label for="ot-upd-c">Clip threshold \(c\)</label><input type="range" id="ot-upd-c" min="0.25" max="4" step="0.25" value="1"><output id="ot-upd-cv"></output></div>
+<div class="scroll-x"><svg id="ot-upd-svg" viewBox="0 0 640 250" role="img" aria-label="Warmup and cosine learning-rate schedule with the current step marked, and the gradient norm before and after clipping"></svg></div>
+<div class="readout" id="ot-upd-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> The update phase of one step, with the Llama 2 7B recipe: peak learning rate \(3 \times 10^{-4}\), 2,000 warmup steps, cosine decay to 10% over 500,000 steps, clipping at \(c\). Left: the schedule (32.14). Right: the gradient norm before and after clipping (32.13).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Move the step: during the first 2,000 steps the learning rate grows linearly; halfway through the decay it is \(1.65 \times 10^{-4}\), the average of the peak and the minimum. Move the gradient norm above \(c\): the right bar is cut to \(c\), and the readout gives the scale factor applied to every gradient. The last line gives the largest move of one weight in this step (about \(\eta\), by formula 32.15) and the shrink from weight decay (\(\eta\lambda\) of each weight, with \(\lambda = 0.1\)).</p></details></figure>
+<h3>4. Clean up</h3>
+<p>Call <code>optimizer.zero_grad()</code>. Since PyTorch 2.0 its default is <code>set_to_none=True</code>: the gradient tensors are freed, not filled with zeros, and the next backward pass allocates them again. [Certain] If you forget this call, the next backward pass <b>adds</b> its gradients to the old ones. That is exactly what gradient accumulation does on purpose (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>), and a silent bug when it is not on purpose. Then call <code>scheduler.step()</code> to move to the next learning rate.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: one complete training step (BF16 autocast, AdamW, clipping, schedule)</div><ol>
+<li><b>input:</b> model, optimizer, scheduler, batch of ids of shape \((B, T + 1)\)</li>
+<li>\(\mathbf{x}, \mathbf{y} \leftarrow\) ids[:, :-1], ids[:, 1:] <span class="c">// formula (32.1)</span></li>
+<li><b>with</b> autocast(BF16): \(Z \leftarrow\) model(\(\mathbf{x}\)) <span class="c">// (32.2), (32.3), (32.5); activations saved</span></li>
+<li>\(\mathcal{L} \leftarrow\) cross_entropy(\(Z\) in FP32, \(\mathbf{y}\), ignore_index = −100) <span class="c">// formula (32.6)</span></li>
+<li>\(\mathcal{L}\).backward() <span class="c">// Algorithm 1; fills .grad of every weight, frees activations</span></li>
+<li>(FP16 only: unscale the gradients first, see below)</li>
+<li>\(\lVert\mathbf{g}\rVert \leftarrow\) clip_grad_norm_(params, \(c\)) <span class="c">// formula (32.13); log it</span></li>
+<li>optimizer.step() <span class="c">// AdamW (32.15) with η(t) from (32.14); creates m, v at the first step</span></li>
+<li>scheduler.step(); optimizer.zero_grad(set_to_none = True)</li>
+<li>every k steps: log \(\mathcal{L}\).item() and \(\lVert\mathbf{g}\rVert\) <span class="c">// .item() waits for the GPU, so not every step</span></li></ol></div>
+<p>Where does mixed precision fit? With BF16 autocast, the matrix multiplies run in BF16 but the weights, the gradients that the optimizer reads, and the optimizer states stay in FP32 or are kept as an FP32 master copy (<a href="../pretraining/numbers-on-gpus-fp32-tf32-fp16-bf16.html">session 37</a>). With FP16, small gradients would underflow to zero, so the loss is multiplied by a large scale before <code>backward()</code>, and the gradients must be divided by it again (<code>scaler.unscale_</code>) <b>before</b> clipping. Otherwise the threshold \(c\) is compared with a norm that is thousands of times too large. BF16 has the same exponent range as FP32 and needs no loss scaling. [Certain]</p>
+
+<h2>What lives in GPU memory, moment by moment</h2>
+<p>Now we can answer the memory question exactly. Four kinds of tensors live on the GPU during a step:</p>
+<div class="tblw"><table class="tb ot-tbl"><thead><tr><th>Tensor</th><th>Bytes</th><th>When it exists</th><th>Llama 3 8B, one sequence of 8,192</th></tr></thead><tbody>
+<tr><td>BF16 weights</td><td>\(2N\)</td><td>always</td><td>16.1 GB</td></tr>
+<tr><td>FP32 master weights + Adam \(m\), \(v\)</td><td>\(12N\)</td><td>always (\(m, v\) created at the first <code>step()</code>)</td><td>96.4 GB</td></tr>
+<tr><td>Gradients (BF16)</td><td>\(2N\)</td><td>from the moment backward reaches a layer until <code>zero_grad</code></td><td>0 to 16.1 GB</td></tr>
+<tr><td>Saved activations</td><td>\(\approx 34\, BTd\) per layer</td><td>grow during forward, shrink during backward</td><td>0 to 36.5 GB</td></tr>
+<tr><td>Logits and their gradient (FP32)</td><td>\(4BTV\) each</td><td>end of forward to the output-layer backward</td><td>4.2 GB + 4.2 GB</td></tr></tbody></table></div>
+<p>The four parts peak at different moments. Weights and optimizer states are a constant floor. Activations climb during the forward pass, layer by layer, and fall during the backward pass in reverse order. Gradients start at zero and climb during the backward pass. Because activations fall while gradients rise, the peak is usually at the <b>start of the backward pass</b>, where all activations, the logits and the logit gradient exist together:</p>
+<div class="eq">\[ M_{\text{peak}} \approx \underbrace{14N}_{\text{weights + master + Adam}} + \underbrace{34\,L\,BTd}_{\text{activations}} + \underbrace{8\,BTV}_{\text{logits + their gradient}} \ \text{bytes} \tag{32.16} \]</div>
+<p>With activation checkpointing (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>), each layer keeps only its input (\(2BTd\) bytes) and recomputes the rest during backward. Then the activation term is small and the gradients, which keep growing until the end of backward, can move the peak to the <b>end</b> of the backward pass. Figure 4 draws the whole timeline.</p>
+<figure class="fig wide" id="ot-mem"><div class="fig-body">
+<div class="controls"><span class="seg" id="ot-mem-m"><button type="button" data-v="llama" aria-pressed="true">Llama 3 8B</button><button type="button" data-v="gpt2" aria-pressed="false">GPT-2 small (124M)</button></span></div>
+<div class="ot-grid">
+<label for="ot-mem-b">Micro-batch \(B\) (sequences)</label><input type="range" id="ot-mem-b" min="0" max="4" step="1" value="0"><output id="ot-mem-bv"></output>
+<label for="ot-mem-s">Sequence length \(T\)</label><input type="range" id="ot-mem-s" min="9" max="13" step="1" value="13"><output id="ot-mem-sv"></output>
+<label for="ot-mem-x">Read the moment</label><input type="range" id="ot-mem-x" min="0" max="100" step="1" value="35"><output id="ot-mem-xv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="ot-mem-ck"> Activation checkpointing</label><label class="sl"><input type="checkbox" id="ot-mem-first"> First step (Adam states not yet created)</label><label class="sl"><input type="checkbox" id="ot-mem-none" checked> zero_grad(set_to_none=True)</label></div>
+<div class="scroll-x"><svg id="ot-mem-svg" viewBox="0 0 760 290" role="img" aria-label="Stacked area chart of GPU memory over the phases of one training step"></svg></div>
+<div class="ot-leg"><span style="--c:var(--muted)">weights + master + Adam</span><span style="--c:var(--k)">gradients</span><span style="--c:var(--q)">saved activations</span><span style="--c:var(--v)">logits and their gradient</span></div>
+<div class="readout" id="ot-mem-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> GPU memory during one training step, without any sharding, from the start of the forward pass to <code>zero_grad</code>. The model of each part follows the table above: activations \(34BTd\) bytes per layer (Korthikanti et al., no stored attention scores), FP32 logits. The dashed line is one 80 GB GPU.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The x-axis is time inside one step: forward through the layers, the loss, backward through the layers in reverse, the optimizer step, then <code>zero_grad</code>. Move "Read the moment" to see what is in memory at that moment. For Llama 3 8B the floor alone (112 GB) is above one 80 GB GPU: this is why such training is sharded with FSDP or ZeRO. Switch to GPT-2 small and raise the batch: the logits (vocabulary 50,257) become the largest single part. Turn on checkpointing and see the peak move to the end of the backward pass. Turn on "First step": the Adam states appear only at <code>optimizer.step()</code>, so the first step can fail with out-of-memory after a successful forward and backward.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: the peak for Llama 3 8B, one sequence</div>
+<p>Floor: \(14N = 14 \times 8.03 \times 10^9 = 112.4\) GB. Activations: 36.5 GB (formula 32.4). Logits and their gradient: \(8 \times 8192 \times 128{,}256 = 8.4\) GB. Peak at the start of backward: \(112.4 + 36.5 + 8.4 = 157.3\) GB. Gradients are still zero at that moment (they are freed by <code>zero_grad</code> and not yet recreated).</p>
+<p>With checkpointing: stored layer inputs are \(32 \times 2 \times 8192 \times 4096 = 2.1\) GB. The start of backward is now \(112.4 + 2.1 + 8.4 = 123.0\) GB, but at the end of the backward pass the gradients have reached 15.0 GB and the last recomputed layer adds 1.2 GB: the new peak is 128.6 GB, at the end of backward. On 8 GPUs with FSDP the \(16N\) part is split 8 ways (16.1 GB each), while each GPU still holds the activations of its own micro-batch.</p></div>
+<p>Two lessons from this table are worth remembering. First, the <b>logits</b> are a real memory problem for large vocabularies. Fused kernels such as Liger Kernel and Cut Cross-Entropy never build the full \((B, T, V)\) tensor; they compute the loss and its gradient chunk by chunk. Cut Cross-Entropy reports that the loss memory for Gemma 2 2B falls from 24 GB to 1 MB. [Certain: reported in that paper.] Second, the activations scale with \(B \cdot T\) and the states scale with \(N\). So you fix activation memory with smaller micro-batches, checkpointing or sequence parallelism, and state memory with sharding or smaller optimizers.</p>
+
+<h2>One step in PyTorch, checked</h2>
+<p>This program runs one full step of a tiny GPT on the CPU and checks three claims of this session: the logit gradient is \((\mathbf{p} - \mathbf{e}_y)/N_{\text{tok}}\) (32.7), only the rows of used ids get an embedding gradient (32.11), and the first AdamW step moves each weight by about \(\eta\). It also counts the bytes that autograd saves for the backward pass with a <code>saved_tensors_hooks</code> context. It is deterministic (seeded) and needs PyTorch 2.4 or newer for <code>nn.RMSNorm</code>.</p>
+<pre class="code"><span class="kw2">import</span> math, torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+V, d, h, L, T, B = 64, 32, 4, 2, 16, 4          <span class="cm"># vocab, width, heads, layers, length, batch</span>
+
+<span class="kw2">class</span> Block(nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.n1, s.n2 = nn.RMSNorm(d), nn.RMSNorm(d)
+        s.qkv, s.o = nn.Linear(d, 3 * d, bias=False), nn.Linear(d, d, bias=False)
+        s.up, s.down = nn.Linear(d, 4 * d, bias=False), nn.Linear(4 * d, d, bias=False)
+    <span class="kw2">def</span> forward(s, x):
+        q, k, v = s.qkv(s.n1(x)).view(B, T, 3, h, d // h).transpose(1, 3).unbind(2)
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + s.o(a.transpose(1, 2).reshape(B, T, d))       <span class="cm"># residual 1</span>
+        <span class="kw2">return</span> x + s.down(F.gelu(s.up(s.n2(x))))              <span class="cm"># residual 2</span>
+
+<span class="kw2">class</span> TinyGPT(nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.tok, s.pos = nn.Embedding(V, d), nn.Embedding(T, d)
+        s.blocks = nn.ModuleList(Block() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L))
+        s.norm, s.head = nn.RMSNorm(d), nn.Linear(d, V, bias=False)
+    <span class="kw2">def</span> forward(s, x):
+        hdn = s.tok(x) + s.pos(torch.arange(T))               <span class="cm"># (B, T, d)</span>
+        <span class="kw2">for</span> blk <span class="kw2">in</span> s.blocks:
+            hdn = blk(hdn)
+        <span class="kw2">return</span> s.head(s.norm(hdn))                            <span class="cm"># (B, T, V)</span>
+
+model = TinyGPT()
+decay   = [p <span class="kw2">for</span> p <span class="kw2">in</span> model.parameters() <span class="kw2">if</span> p.ndim >= 2]
+nodecay = [p <span class="kw2">for</span> p <span class="kw2">in</span> model.parameters() <span class="kw2">if</span> p.ndim &lt; 2]
+opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
+                         {"params": nodecay, "weight_decay": 0.0}],
+                        lr=1e-3, betas=(0.9, 0.95), eps=1e-8)
+W, S = 10, 100                                                <span class="cm"># warmup, total steps</span>
+sched = torch.optim.lr_scheduler.LambdaLR(opt, <span class="kw2">lambda</span> t: (t + 1) / W <span class="kw2">if</span> t &lt; W
+            <span class="kw2">else</span> 0.1 + 0.9 * 0.5 * (1 + math.cos(math.pi * (t - W) / (S - W))))
+
+data = torch.randint(0, V, (B, T + 1))
+x, y = data[:, :-1], data[:, 1:]                              <span class="cm"># shift by one, (32.1)</span>
+
+<span class="cm"># 1) forward, counting the bytes autograd saves for backward</span>
+saved = {}
+<span class="kw2">def</span> pack(t):
+    saved[(t.data_ptr(), t.shape)] = t.numel() * t.element_size(); <span class="kw2">return</span> t
+<span class="kw2">with</span> torch.autograd.graph.saved_tensors_hooks(pack, <span class="kw2">lambda</span> t: t):
+    logits = model(x)
+    loss = F.cross_entropy(logits.reshape(-1, V), y.reshape(-1))
+logits.retain_grad()
+n_par = sum(p.numel() <span class="kw2">for</span> p <span class="kw2">in</span> model.parameters())
+print(f"loss {loss.item():.4f}   ln V = {math.log(V):.4f}")
+print(f"params {n_par:,}  ({4 * n_par:,} bytes)   saved activations {sum(saved.values()):,} bytes")
+
+<span class="cm"># 2) backward</span>
+loss.backward()
+p = logits.softmax(-1)
+expect = (p - F.one_hot(y, V).float()) / (B * T)              <span class="cm"># formula (32.7)</span>
+print("dL/dlogits == (p - onehot)/N :", torch.allclose(logits.grad, expect, atol=1e-7))
+rows = model.tok.weight.grad.abs().sum(1) > 0
+used = torch.zeros(V, dtype=torch.bool); used[x.unique()] = True
+print("embedding rows with gradient:", rows.sum().item(), "of", V, " match used ids:", torch.equal(rows, used))
+
+<span class="cm"># 3) clip, update, schedule, zero</span>
+norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+print(f"grad norm before clip {norm.item():.4f}")
+w0 = model.head.weight.detach().clone(); lr = opt.param_groups[0]["lr"]
+opt.step(); sched.step(); opt.zero_grad(set_to_none=True)
+dw = (model.head.weight.detach() - w0).abs().max().item()
+print(f"lr used {lr:.1e}   largest |change| in head / lr = {dw / lr:.3f}")
+print("next lr", f"{opt.param_groups[0]['lr']:.1e}", "  grads freed:", model.head.weight.grad <span class="kw2">is</span> None)
+print("adam state tensors per weight:", sorted(opt.state[model.head.weight].keys()))</pre>
+<p>Output (PyTorch 2.8, CPU):</p>
+<pre class="code">loss 4.3468   ln V = 4.1589
+params 29,344  (117,376 bytes)   saved activations 463,876 bytes
+dL/dlogits == (p - onehot)/N : True
+embedding rows with gradient: 37 of 64  match used ids: True
+grad norm before clip 0.7936
+lr used 1.0e-04   largest |change| in head / lr = 1.018
+next lr 2.0e-04   grads freed: True
+adam state tensors per weight: ['exp_avg', 'exp_avg_sq', 'step']</pre>
+<p>Read the output. The first loss, 4.35, is close to \(\ln 64 = 4.16\), as expected at initialization. The saved activations (464 KB) are already four times the FP32 weights (117 KB), even for this tiny model with 16 tokens per sequence. Only 37 of the 64 embedding rows got a gradient. The gradient norm, 0.79, was below 1, so clipping did nothing this time. The first step moved the largest weight by 1.018 times the learning rate: 1 from the bias-corrected Adam ratio \(\hat m/\sqrt{\hat v} = \pm 1\), plus a little from weight decay \(\lambda\theta\). After <code>zero_grad</code> the gradient is <code>None</code>, and Adam now holds two state tensors per weight (plus a step counter).</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What changes in the step</th><th>What stays the same</th></tr></thead><tbody>
+<tr><td>LLM pretraining (Llama, Qwen, DeepSeek)</td><td>Thousands of GPUs: gradients all-reduced (DDP) or reduce-scattered (FSDP) during backward; weights all-gathered during forward</td><td>Forward, loss (32.6), backward, clip, AdamW, schedule</td></tr>
+<tr><td>Supervised fine-tuning (SFT)</td><td>Mask \(m = 0\) on prompt tokens, so (32.7) is zero there; smaller learning rate</td><td>Everything else</td></tr>
+<tr><td>LoRA and other PEFT</td><td>Base weights frozen: no gradients and no Adam states for them; only small adapter matrices are updated</td><td>Activations are still stored, because the gradient must flow back through frozen layers</td></tr>
+<tr><td>VLM training (LLaVA style)</td><td>Image tokens enter as embeddings from a vision encoder and projector; loss mask is 0 on them; the encoder is often frozen</td><td>The decoder step; activations now also grow with the number of image tokens</td></tr>
+<tr><td>Video-LLMs for video QA, captioning and key-moment detection</td><td>Hundreds or thousands of frame tokens per sample make activations dominate memory; checkpointing and fewer tokens per frame are common</td><td>Causal loss only on the text answer</td></tr>
+<tr><td>Contrastive video–text retrieval and video fingerprinting models</td><td>The loss is contrastive (a softmax over the batch) instead of next-token; larger batches give more negatives</td><td>Backward, clipping, AdamW and schedule</td></tr>
+<tr><td>Debugging a training run</td><td>Check \(\mathcal{L} \approx \ln V\) at step 0; overfit one batch; log gradient norm; read peak memory</td><td>This session's order of operations</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Forgetting <code>zero_grad</code>.</b> Gradients add up across steps, the effective learning rate grows every step, and training diverges or behaves strangely. Clear gradients once per optimizer step (with accumulation, once per accumulation cycle).</li>
+<li><b>Clipping scaled gradients.</b> With FP16 and a <code>GradScaler</code>, call <code>scaler.unscale_(optimizer)</code> before <code>clip_grad_norm_</code>. Otherwise the norm is multiplied by the scale (often 65,536) and every step is clipped to almost nothing.</li>
+<li><b>Keeping the graph alive.</b> <code>losses.append(loss)</code> or <code>total += loss</code> keeps every step's activations. Memory grows each step until out-of-memory. Use <code>loss.item()</code> (sparingly) or <code>loss.detach()</code>.</li>
+<li><b>Calling <code>.item()</code> every step.</b> It forces the CPU to wait for the GPU and removes all overlap. Log every few steps, or keep a GPU tensor and read it rarely.</li>
+<li><b>Wrong averaging of the loss.</b> Averaging over all positions including padding, or averaging per sequence and then over sequences, gives different weights to different tokens. Use <code>ignore_index=-100</code> and divide by the real token count \(N_{\text{tok}}\) (32.6). With accumulation, divide by the token count of the whole accumulated batch.</li>
+<li><b>Calling <code>scheduler.step()</code> at the wrong place.</b> It belongs after <code>optimizer.step()</code>, once per optimizer step. Calling it per epoch, or per micro-batch, gives a very different schedule from the one you designed.</li>
+<li><b>Logits in BF16 for the loss.</b> Computing softmax and log over 128,256 entries in BF16 loses precision; compute the loss in FP32 (or with a fused kernel that does so internally).</li>
+<li><b>Measuring memory after the first step only.</b> Adam states are created at the first <code>optimizer.step()</code>, and the allocator caches memory. Read <code>torch.cuda.max_memory_allocated()</code> after two or three steps.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Walk me through one training step of a decoder-only LLM.<span class="lvl">basic</span></summary><div class="ans">Load ids \((B, T{+}1)\); inputs are the first \(T\), targets are shifted by one. Forward: embedding lookup to \((B, T, d)\), \(L\) pre-norm blocks (attention and MLP, each added to the residual stream), final norm, output projection to logits \((B, T, V)\), cross-entropy averaged over the real target tokens. Each operation saves what its backward needs. Backward: start with \((\mathbf{p} - \mathbf{e}_y)/N\) at the logits, go back layer by layer, each layer producing weight gradients (\(X^\top G\)) and the input gradient (\(G W^\top\)) and freeing its activations; the embedding gets a scatter-add. Update: clip the global norm to 1.0, read \(\eta(t)\) from warmup plus cosine, apply AdamW. Clean up: zero_grad (set to None), scheduler.step. Cost about \(6N\) FLOPs per token.</div></details>
+<details class="qa"><summary>Derive the gradient of softmax cross-entropy with respect to the logits.<span class="lvl">basic</span></summary><div class="ans">\(\ell = -\log p_y = -z_y + \log\sum_j e^{z_j}\). Then \(\partial\ell/\partial z_i = -[i=y] + e^{z_i}/\sum_j e^{z_j} = p_i - [i = y]\). As a vector: \(\mathbf{p} - \mathbf{e}_y\). With averaging over \(N\) tokens, divide by \(N\). It sums to zero, is bounded in \([-1, 1]\) per component, and is why frameworks fuse softmax and cross-entropy: the fused backward is one subtraction and is numerically stable.</div></details>
+<details class="qa"><summary>Why must activations be stored, and which ones?<span class="lvl">core</span></summary><div class="ans">The weight gradient of a linear layer is \(X^\top G\): it needs the layer's forward input \(X\). Norms need their input (and the RMS), activation functions need their pre-activation values, attention needs \(Q, K, V\), the output and the log-sum-exp (with FlashAttention; otherwise the full probability matrix). For a GPT-style block this is about 34 bytes per residual-stream element per layer in 16-bit, which for long sequences exceeds the weights. Checkpointing keeps only block inputs and recomputes the rest, at about one extra forward pass.</div></details>
+<details class="qa"><summary>How does the residual connection help the backward pass?<span class="lvl">core</span></summary><div class="ans">For \(X_{\text{out}} = X_{\text{in}} + F(X_{\text{in}})\), the gradient is \(G_{\text{in}} = G_{\text{out}} + J_F^\top G_{\text{out}}\). The identity term carries the gradient from the loss to every layer unchanged, so it does not vanish through depth; each block only adds a correction. Without residuals, the gradient would be a product of 2L Jacobians, which tends to shrink or explode.</div></details>
+<details class="qa"><summary>Which rows of the embedding matrix get a gradient in one step? What changes with tied embeddings?<span class="lvl">core</span></summary><div class="ans">Only the rows of token ids that appear in the batch: the lookup's backward is a scatter-add of the position gradients into their rows (32.11); a row used \(k\) times receives the sum of \(k\) vectors. With tied input and output embeddings, the matrix also receives \(H^\top G_Z\) from the output layer, which is dense: every row gets a gradient, because every vocabulary entry has a logit at every position. Autograd sums the two contributions. Note that AdamW with weight decay still changes unused rows (decay, and momentum from earlier steps).</div></details>
+<details class="qa"><summary>What is the correct order of backward, clipping, optimizer step, scheduler and zero_grad? What if you use FP16?<span class="lvl">core</span></summary><div class="ans">backward → (FP16: scaler.unscale_) → clip_grad_norm_ → optimizer.step (FP16: scaler.step, then scaler.update) → scheduler.step → zero_grad. zero_grad may also be at the start of the next step, as long as it comes before the next backward. Clipping must see the true gradients; with FP16 they are multiplied by the loss scale until unscaled, so clipping first would cut almost everything.</div></details>
+<details class="qa"><summary>When during a step is GPU memory at its peak, and what is in memory then?<span class="lvl">advanced</span></summary><div class="ans">Without checkpointing, usually at the start of the backward pass: the weights, master copy and Adam states (14N bytes with mixed precision), all saved activations of all layers, the FP32 logits and the logit gradient (8BTV bytes). Gradients are still near zero then. For Llama 3 8B on one 8,192-token sequence that is about 112 + 36.5 + 8.4 = 157 GB. With checkpointing the activation term is small, and since gradients grow until the end of the backward pass, the peak can move there. There are also temporary buffers (all-reduce buckets, optimizer temporaries) and allocator fragmentation on top.</div></details>
+<details class="qa"><summary>Why is the output layer a memory problem for large vocabularies, and how is it solved?<span class="lvl">advanced</span></summary><div class="ans">The logits have shape \((B, T, V)\); with \(V = 128{,}256\) and one 8K sequence that is 1.05 billion numbers, 4.2 GB in FP32, and the gradient has the same size. This can exceed the activations of several layers. Fused linear cross-entropy kernels (Liger Kernel, Cut Cross-Entropy) compute the logits chunk by chunk, compute the loss and the logit gradient for each chunk immediately, and never store the full tensor. Cut Cross-Entropy reports 24 GB to 1 MB of loss memory for Gemma 2 2B. Another simple fix is computing the loss over chunks of positions in a loop.</div></details>
+<details class="qa"><summary>Your first-step loss is 25 on a model with a 50K vocabulary. What do you check?<span class="lvl">basic</span></summary><div class="ans">At initialization the loss should be near \(\ln V = \ln 50{,}257 = 10.8\). A loss of 25 means the logits are far too large: wrong initialization scale (for example of the output layer or the embedding), a missing final norm, or a missing scaling factor. Also check that the targets are shifted correctly and that the ignore_index masks padding. Then overfit one batch: the loss should drop toward zero quickly.</div></details>
+<details class="qa"><summary>In data-parallel training, where does communication happen inside the step?<span class="lvl">advanced</span></summary><div class="ans">In DDP, every GPU has the full model and its own micro-batch. During backward, as soon as a bucket of gradients is ready (the last layers first), an all-reduce averages it across GPUs, overlapped with the backward of earlier layers. After backward, every GPU has the same averaged gradient and runs the same clip and AdamW. In FSDP/ZeRO-3, forward and backward also all-gather each layer's weights just before use, and gradients are reduce-scattered, so each GPU keeps and updates only its shard of weights, gradients and Adam states. The clipping norm needs one extra all-reduce of the sum of squares.</div></details>
+<details class="qa"><summary>Why can the first training step run out of memory even though the forward and backward passes succeeded?<span class="lvl">advanced</span></summary><div class="ans">PyTorch optimizers create their state lazily, at the first <code>step()</code>. For AdamW that is two FP32 tensors per weight, 8N bytes, allocated after the backward pass, while the gradients still exist. If memory was tight, this is where it fails. Also, the allocator caches freed blocks, so measure peak memory after a few steps, and keep in mind that the optimizer may create temporary buffers during the update.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A model with \(V = 4\) gives logits \((0, 0, 0, 0)\) at one position, with target \(y = 2\). Compute the loss and the logit gradient (one position, \(N_{\text{tok}} = 1\)).</li>
+<li>The gradient norm before clipping is 4.0 and \(c = 1.0\). What factor multiplies every gradient? By how much does the update of each weight change with AdamW at a late step? (Think before answering: AdamW divides by \(\sqrt{\hat v}\).)</li>
+<li>With the schedule of Figure 3, compute \(\eta\) at step 1,000 and at step 251,000.</li>
+<li>Logits for a micro-batch of \(B = 4\) sequences of \(T = 4096\) tokens, \(V = 128{,}256\), in FP32: how many GB? How many with the gradient?</li>
+<li>The input is "the cat sat on the mat" (6 tokens, one id each). Which embedding rows get a gradient, and how many contributions does each get? What changes if the embeddings are tied?</li>
+<li>Run the attention-backward check below and explain why the result does not depend on the random values. Then add a causal mask check: what is \(G_S\) at the masked positions?</li></ol>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+T, dh = 5, 4
+Q, K, V = [torch.randn(T, dh, dtype=torch.float64, requires_grad=<span class="kw2">True</span>) <span class="kw2">for</span> _ <span class="kw2">in</span> range(3)]
+S = (Q @ K.T / dh**0.5).masked_fill(torch.triu(torch.ones(T, T, dtype=torch.bool), 1), float("-inf"))
+P = S.softmax(-1); O = P @ V
+G = torch.randn(T, dh, dtype=torch.float64); (O * G).sum().backward()   <span class="cm"># so dL/dO = G</span>
+dV = P.T @ G; dP = G @ V.T
+dS = P * (dP - (dP * P).sum(-1, keepdim=<span class="kw2">True</span>))                       <span class="cm"># formula (32.10)</span>
+print(torch.allclose(dV, V.grad), torch.allclose(dS @ K / dh**0.5, Q.grad),
+      torch.allclose(dS.T @ Q / dh**0.5, K.grad))                       <span class="cm"># True True True</span></pre>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. All probabilities are 0.25, so the loss is \(\ln 4 = 1.386\) and the gradient is \((0.25, 0.25, -0.75, 0.25)\). 2. The factor is \(1/4 = 0.25\). With AdamW at a late step, the update is \(\eta\,\hat m/(\sqrt{\hat v} + \varepsilon)\); one clipped step changes \(\hat m\) and \(\hat v\) only by their small \((1-\beta)\) shares, so the update barely changes. Clipping with Adam mainly protects the running averages from one huge gradient, rather than scaling the step directly. (At the very first step, \(\hat m/\sqrt{\hat v} = \pm 1\) whatever the scale.) 3. Step 1,000: \(3\times10^{-4} \times 1000/2000 = 1.5\times10^{-4}\). Step 251,000 is exactly halfway through the decay (\((251{,}000 - 2000)/498{,}000 = 0.5\)), so \(\eta = 3\times10^{-4}(0.1 + 0.9 \times 0.5) = 1.65\times10^{-4}\). 4. \(4 \times 4096 \times 128{,}256 \times 4 = 8.4\) GB; with the gradient, 16.8 GB. 5. Five rows: "the" gets two contributions (positions 1 and 5), "cat", "sat", "on", "mat" one each; all other rows get zero. With tied embeddings every row gets a gradient from the output layer, since every token has a logit at every position. 6. Formula (32.10) is an exact identity of calculus, so it matches autograd for any values (up to float64 rounding). At masked positions \(P = 0\), so \(G_S = P \odot (\dots) = 0\): no gradient flows to future keys.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>One step: ids \((B, T)\) → embeddings \((B, T, d)\) → \(L\) blocks → logits \((B, T, V)\) → one loss averaged over real target tokens (32.1–32.6). Initial loss ≈ \(\ln V\).</li>
+<li>Every gradient starts as prediction minus truth, \((\mathbf{p} - \mathbf{e}_y)/N_{\text{tok}}\) (32.7), and flows back by \(X^\top G\) and \(G W^\top\) (32.8). The residual stream copies it through every block (32.9); attention uses the softmax backward (32.10); the embedding gets a scatter-add (32.11).</li>
+<li>Backward costs about twice the forward; a step is about \(6N\) FLOPs per token (32.12).</li>
+<li>Update order: (unscale) → clip the global norm (32.13) → AdamW with \(\eta(t)\) from the schedule (32.14, 32.15) → scheduler.step → zero_grad.</li>
+<li>Memory: a floor of \(14N\) for weights, master copy and Adam; activations rise in forward and fall in backward; gradients rise in backward; logits cost \(8BTV\). Without checkpointing the peak is at the start of backward (32.16): about 157 GB for Llama 3 8B on one 8K sequence.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \frac{\partial \mathcal{L}}{\partial \mathbf{z}} = \frac{\mathbf{p} - \mathbf{e}_y}{N_{\text{tok}}}, \qquad \frac{\partial \mathcal{L}}{\partial W} = X^\top G, \qquad \frac{\partial \mathcal{L}}{\partial X} = G W^\top, \qquad G_{\text{in}} = G_{\text{out}} + J_F^\top G_{\text{out}} \]</div>
+<div class="eq">\[ \mathbf{g} \leftarrow \mathbf{g}\min\!\Big(1, \frac{c}{\lVert\mathbf{g}\rVert}\Big), \qquad C_{\text{step}} \approx 6NBT, \qquad M_{\text{peak}} \approx 14N + 34LBTd + 8BTV \]</div>
+<h2 class="plain" id="one-training-step-end-to-end-forward-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Karpathy (2023). <a href="https://karpathy.ai/zero-to-hero.html" target="_blank" rel="noopener">Neural Networks: Zero to Hero (video course)</a></li><li>Stanford (2025). <a href="https://stanford-cs336.github.io/" target="_blank" rel="noopener">CS336: Language Modeling from Scratch (course)</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">Llama 2: Open Foundation and Fine-Tuned Chat Models</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Korthikanti et al. (2022). <a href="https://arxiv.org/abs/2205.05198" target="_blank" rel="noopener">Reducing Activation Recomputation in Large Transformer Models</a></li><li>Dao (2023). <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a></li><li>Chen et al. (2016). <a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener">Training Deep Nets with Sublinear Memory Cost</a></li><li>Micikevicius et al. (2017). <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Mixed Precision Training</a></li><li>Loshchilov &amp; Hutter (2017). <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener">Decoupled Weight Decay Regularization</a></li><li>Li et al. (2020). <a href="https://arxiv.org/abs/2006.15704" target="_blank" rel="noopener">PyTorch Distributed: Experiences on Accelerating Data Parallel Training</a></li><li>Zhao et al. (2023). <a href="https://arxiv.org/abs/2304.11277" target="_blank" rel="noopener">PyTorch FSDP: Experiences on Scaling Fully Sharded Data Parallel</a></li><li>Rajbhandari et al. (2019). <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">ZeRO: Memory Optimizations Toward Training Trillion Parameter Models</a></li><li>Hsu, Dai, Kothapalli, Song, Tang, Zhu, Shimizu, Sahni, Ning, Chen (2024). <a href="https://arxiv.org/abs/2410.10989" target="_blank" rel="noopener">Liger Kernel: Efficient Triton Kernels for LLM Training</a></li><li>Wijmans, Huval, Hertzberg, Koltun, Krähenbühl (2024). <a href="https://arxiv.org/abs/2411.09009" target="_blank" rel="noopener">Cut Your Losses in Large-Vocabulary Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../pretraining/pretraining-objectives.html"><small>Previous · session 31</small>Pretraining objectives</a><a class="next" href="../pretraining/encoders-for-understanding-bert-roberta-albert-and.html"><small>Next · session 33</small>Encoders for understanding: BERT, RoBERTa, ALBERT and the CLS token</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="one-training-step-end-to-end-forward"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const GB=x=>(x/1e9).toFixed(2);
+const fmtS=v=>{if(v===0)return"0";const e=Math.floor(Math.log10(Math.abs(v)));const m=v/Math.pow(10,e);return m.toFixed(2)+"×10<sup>"+(e<0?"−"+(-e):e)+"</sup>";};
+const minus=s=>String(s).replace(/-/g,"−");
+
+/* ---------- shared model numbers (Llama 3 8B, from config.json) ---------- */
+const LL={V:128256,d:4096,L:32,f:14336,kv:1024};
+LL.Pl=LL.d*(2*LL.d+2*LL.kv)+3*LL.d*LL.f+2*LL.d;LL.Pe=LL.V*LL.d;LL.Ph=LL.V*LL.d+LL.d;LL.N=LL.Pe+LL.Ph+LL.L*LL.Pl;
+
+/* ---------- Figure 1: the map of one step ---------- */
+(function(){
+ const svg=$("#ot-map-svg");if(!svg)return;const info=$("#ot-map-info");
+ const T=8192,{V,d,L,N,Pl,Pe}=LL;const act=34*T*d;
+ const nodes={tok:[70,70,"token ids","(1, 8192)"],emb:[200,70,"embedding","E[x]"],blk:[360,70,"32 blocks","attn + MLP"],head:[530,70,"norm + head","logits"],loss:[690,70,"loss","one number"],
+  clip:[250,190,"clip","global norm"],opt:[420,190,"AdamW","η(t)"],zero:[590,190,"zero_grad","free grads"]};
+ const S=[
+  {n:"tok",m:"f",t:`<b>Load a batch.</b> Ids <b>x</b> of shape (1, 8192), int64: ${(T*8/1024).toFixed(0)} KiB. Targets <b>y</b> are the same ids shifted by one position (32.1).`},
+  {n:"emb",m:"f",t:`<b>Embedding lookup</b> (32.2): X<sub>0</sub> = E[x], shape (1, 8192, 4096) = ${(T*d/1e6).toFixed(1)} M numbers, ${(T*d*2/2**20).toFixed(0)} MiB in BF16. Saved for backward: the ids.`},
+  {n:"blk",m:"f",t:`<b>Block 1 of 32</b> (32.3): attention and MLP each add to the residual stream; the shape stays (1, 8192, 4096). Saved activations of this block ≈ 34·T·d bytes = <b>${GB(act)} GB</b>.`},
+  {n:"blk",m:"f",t:`<b>After all 32 blocks.</b> Saved activations: 32 × ${GB(act)} = <b>${GB(L*act)} GB</b> (32.4), more than the ${GB(2*N)} GB of BF16 weights.`},
+  {n:"head",m:"f",t:`<b>Final norm and output layer</b> (32.5): logits Z of shape (1, 8192, 128256) = ${(T*V/1e9).toFixed(2)} B numbers, <b>${GB(4*T*V)} GB</b> in FP32. The largest tensor of the forward pass.`},
+  {n:"loss",m:"f",t:`<b>Cross-entropy</b> (32.6), averaged over 8,192 targets: one number. At initialization it is about ln V = <b>${Math.log(V).toFixed(2)}</b> nats.`},
+  {n:"loss",m:"b",t:`<b>Backward starts.</b> ∂L/∂Z = (p − e<sub>y</sub>)/8192 (32.7): same shape as Z, another <b>${GB(4*T*V)} GB</b>. Memory is usually at its peak right now.`},
+  {n:"head",m:"b",t:`<b>Output layer backward</b> (32.8): ∇W<sub>out</sub> = H<sup>T</sup>G<sub>Z</sub>, a 4096 × 128256 matrix (${(LL.V*d/1e6).toFixed(1)} M gradients); G<sub>H</sub> = G<sub>Z</sub>W<sub>out</sub><sup>T</sup> is back to (1, 8192, 4096). Logits and their gradient are freed (−${GB(8*T*V)} GB).`},
+  {n:"blk",m:"b",t:`<b>Blocks 32 → 1, in reverse.</b> The residual copies the gradient through (32.9); attention uses the softmax backward (32.10). Each block makes gradients for its ${(Pl/1e6).toFixed(1)} M weights (${(2*Pl/1e6).toFixed(0)} MB in BF16) and frees its ${GB(act)} GB of activations.`},
+  {n:"emb",m:"b",t:`<b>Embedding backward</b> (32.11): scatter-add of the 8,192 position gradients into the rows of their ids. Rows of tokens not in this batch stay exactly 0. Gradient matrix: ${(Pe/1e6).toFixed(1)} M numbers.`},
+  {n:"clip",m:"u",t:`<b>Clip</b> (32.13): one norm over all ${(N/1e9).toFixed(2)} B gradients; if it is above c = 1.0, every gradient is multiplied by 1/‖g‖.`},
+  {n:"opt",m:"u",t:`<b>AdamW</b> (32.15) with η(t) from the schedule (32.14): every weight reads its gradient, m and v, and moves by about η. States: 12 bytes per weight = ${GB(12*N)} GB (FP32 master, m, v).`},
+  {n:"zero",m:"u",t:`<b>Clean up.</b> zero_grad(set_to_none=True) frees ${GB(2*N)} GB of gradients; scheduler.step() moves to the next learning rate. The next step starts from the same floor of ${GB(14*N)} GB.`}];
+ const mark=`<defs><marker id="ot-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker><marker id="ot-ahk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--k)"/></marker></defs>`;
+ function draw(k){const st=S[k];let g=mark;const W=128,H=56;
+  const top=["tok","emb","blk","head","loss"];
+  for(let i=0;i<top.length-1;i++){const a=nodes[top[i]],b=nodes[top[i+1]];g+=`<line x1="${a[0]+W/2}" y1="${a[1]-10}" x2="${b[0]-W/2-2}" y2="${b[1]-10}" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#ot-ah)"/>`;
+   g+=`<line x1="${b[0]-W/2}" y1="${b[1]+12}" x2="${a[0]+W/2+2}" y2="${a[1]+12}" stroke="var(--k)" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#ot-ahk)"/>`;}
+  g+=`<path d="M${nodes.emb[0]-30} ${nodes.emb[1]+H/2} C ${nodes.emb[0]-30} 160, 150 ${nodes.clip[1]}, ${nodes.clip[0]-W/2-2} ${nodes.clip[1]}" fill="none" stroke="var(--v)" stroke-width="1.6" marker-end="url(#ot-ah)"/>`;
+  g+=`<line x1="${nodes.clip[0]+W/2}" y1="190" x2="${nodes.opt[0]-W/2-2}" y2="190" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#ot-ah)"/><line x1="${nodes.opt[0]+W/2}" y1="190" x2="${nodes.zero[0]-W/2-2}" y2="190" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#ot-ah)"/>`;
+  g+=`<text x="390" y="22" font-size="12.5" fill="var(--muted)" text-anchor="middle" font-family="var(--sans)">forward →   ← backward (dashed)</text><text x="96" y="150" font-size="12" fill="var(--v)" font-family="var(--sans)" text-anchor="end">after backward</text>`;
+  for(const id in nodes){const [cx,cy,lab,sub]=nodes[id];const on=id===st.n;const cls=on?(st.m==="f"?" on":st.m==="b"?" bk":" up"):"";
+   g+=`<g class="ot-node${cls}"><rect x="${cx-W/2}" y="${cy-H/2}" width="${W}" height="${H}" rx="11"/><text x="${cx}" y="${cy-4}" font-size="14" font-weight="700" fill="var(--ink)">${lab}</text><text x="${cx}" y="${cy+15}" font-size="12" fill="var(--muted)">${sub}</text></g>`;}
+  svg.innerHTML=g;info.innerHTML=st.t;}
+ B.stepper({n:S.length,prev:$("#ot-map-prev"),next:$("#ot-map-next"),play:$("#ot-map-play"),label:$("#ot-map-lab"),ms:3200,onStep:draw});
+})();
+
+/* ---------- Figure 2: softmax cross-entropy gradient ---------- */
+(function(){
+ const svg=$("#ot-ce-svg");if(!svg)return;const info=$("#ot-ce-info"),tg=$("#ot-ce-tg"),eta=$("#ot-ce-eta");
+ const W=["the","cat","sat","on","mat","."],Z0=[1.0,0.5,-1.0,0.2,1.5,-0.5];let z=Z0.slice(),y=4,n=0;
+ tg.innerHTML=W.map((w,i)=>`<button type="button" data-i="${i}" aria-pressed="${i===y}">${B.esc(w)}</button>`).join("");
+ function draw(){const p=B.softmax(z);const gr=p.map((v,i)=>v-(i===y?1:0));const loss=-Math.log(p[y]);
+  $("#ot-ce-etav").value=(+eta.value).toFixed(1);
+  let g="";const x0=70,bw=80;const topY=20,topH=100,midY=200,half=60;
+  g+=`<text x="10" y="${topY+10}" font-size="12" fill="var(--muted)" font-family="var(--sans)">p</text><line x1="${x0-10}" y1="${topY+topH}" x2="630" y2="${topY+topH}" stroke="var(--rule)"/>`;
+  g+=`<text x="10" y="${midY-half+10}" font-size="12" fill="var(--muted)" font-family="var(--sans)">∂L/∂z</text><line x1="${x0-10}" y1="${midY}" x2="630" y2="${midY}" stroke="var(--rule)"/>`;
+  W.forEach((w,i)=>{const cx=x0+i*95;const h=p[i]*topH;const isT=i===y;
+   g+=`<rect x="${cx}" y="${topY+topH-h}" width="${bw}" height="${h}" rx="3" fill="var(--q)" opacity="0.85" ${isT?'stroke="var(--v)" stroke-width="3"':""}/>`;
+   g+=`<text x="${cx+bw/2}" y="${topY+topH-h-4}" font-size="12" text-anchor="middle" fill="var(--ink)" font-family="var(--mono)">${p[i].toFixed(3)}</text>`;
+   const gh=gr[i]*half;g+=`<rect x="${cx}" y="${gh>=0?midY-gh:midY}" width="${bw}" height="${Math.abs(gh)}" rx="3" fill="var(--k)" opacity="0.85"/>`;
+   g+=`<text x="${cx+bw/2}" y="${gh>=0?midY-gh-4:midY-gh+14}" font-size="12" text-anchor="middle" fill="var(--ink)" font-family="var(--mono)">${minus(gr[i].toFixed(3))}</text>`;
+   g+=`<text x="${cx+bw/2}" y="${topY+topH+16}" font-size="13" text-anchor="middle" font-weight="${isT?700:500}" fill="${isT?"var(--v)":"var(--ink2)"}" font-family="var(--mono)">${B.esc(w)}</text>`;});
+  svg.innerHTML=g;const sum=gr.reduce((a,b)=>a+b,0);
+  info.innerHTML=`Steps taken: <b>${n}</b>. Target “${B.esc(W[y])}”: p<sub>y</sub> = <b>${p[y].toFixed(3)}</b>, loss −ln p<sub>y</sub> = <b>${loss.toFixed(3)}</b>. Gradient of the target logit = p<sub>y</sub> − 1 = <b>${minus(gr[y].toFixed(3))}</b>; sum of all gradient components = ${Math.abs(sum)<5e-13?"0":sum.toExponential(1)}.`;
+  R.dataset.otCe=JSON.stringify({n,loss:+loss.toFixed(4),py:+p[y].toFixed(4)});}
+ tg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;y=+b.dataset.i;z=Z0.slice();n=0;tg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",String(+x.dataset.i===y)));draw();});
+ $("#ot-ce-step").addEventListener("click",()=>{const p=B.softmax(z);const e=+eta.value;z=z.map((v,i)=>v-e*(p[i]-(i===y?1:0)));n++;draw();});
+ $("#ot-ce-reset").addEventListener("click",()=>{z=Z0.slice();n=0;draw();});
+ eta.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: schedule + clipping + AdamW step size ---------- */
+(function(){
+ const svg=$("#ot-upd-svg");if(!svg)return;const info=$("#ot-upd-info"),ts=$("#ot-upd-t"),gs=$("#ot-upd-g"),cs=$("#ot-upd-c");
+ const PK=3e-4,WU=2000,TM=500000,MR=0.1,LAM=0.1;
+ const lr=t=>t<WU?PK*t/WU:PK*(MR+(1-MR)*0.5*(1+Math.cos(Math.PI*(t-WU)/(TM-WU))));
+ function draw(){const t=+ts.value,gn=Math.pow(10,+gs.value),c=+cs.value;const e=lr(t);const f=Math.min(1,c/gn);
+  $("#ot-upd-tv").value=t.toLocaleString("en-US");$("#ot-upd-gv").value=gn<1?gn.toFixed(2):gn.toFixed(1);$("#ot-upd-cv").value=c.toFixed(2);
+  const X0=50,X1=400,Y0=210,Y1=25;const X=s=>X0+(X1-X0)*s/TM,Y=v=>Y0-(Y0-Y1)*v/PK;
+  let g=`<line x1="${X0}" y1="${Y0}" x2="${X1}" y2="${Y0}" stroke="var(--rule)"/><line x1="${X0}" y1="${Y0}" x2="${X0}" y2="${Y1}" stroke="var(--rule)"/>`;
+  let pts=[];for(let i=0;i<=400;i++){const s=i<40?WU*i/40:WU+(TM-WU)*(i-40)/360;pts.push(X(s).toFixed(1)+","+Y(lr(s)).toFixed(1));}
+  g+=`<polyline points="${pts.join(" ")}" fill="none" stroke="var(--q)" stroke-width="2.4"/>`;
+  g+=`<circle cx="${X(t)}" cy="${Y(e)}" r="6" fill="var(--k)"/>`;
+  [["3e-4",PK],["1.5e-4",PK/2],["0",0]].forEach(([l,v])=>g+=`<text x="${X0-6}" y="${Y(v)+4}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--mono)">${l}</text>`);
+  [0,250000,500000].forEach(s=>g+=`<text x="${X(s)}" y="${Y0+16}" font-size="11" text-anchor="middle" fill="var(--muted)" font-family="var(--mono)">${s/1000}k</text>`);
+  g+=`<text x="${(X0+X1)/2}" y="${Y0+34}" font-size="12" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">step t → learning rate η(t)</text>`;
+  const bx=470,bw=50,bmax=Math.max(gn,c,1)*1.1,H=v=>(Y0-Y1)*v/bmax;
+  g+=`<line x1="${bx-15}" y1="${Y0}" x2="630" y2="${Y0}" stroke="var(--rule)"/>`;
+  g+=`<rect x="${bx}" y="${Y0-H(gn)}" width="${bw}" height="${H(gn)}" fill="var(--muted)" opacity="0.7" rx="3"/><rect x="${bx+80}" y="${Y0-H(gn*f)}" width="${bw}" height="${H(gn*f)}" fill="var(--k)" rx="3"/>`;
+  g+=`<line x1="${bx-10}" y1="${Y0-H(c)}" x2="${bx+140}" y2="${Y0-H(c)}" stroke="var(--bad)" stroke-dasharray="5 4" stroke-width="1.6"/><text x="${bx+142}" y="${Y0-H(c)+4}" font-size="11" fill="var(--bad)" font-family="var(--mono)">c</text>`;
+  g+=`<text x="${bx+bw/2}" y="${Y0+16}" font-size="12" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">before</text><text x="${bx+80+bw/2}" y="${Y0+16}" font-size="12" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">after</text><text x="${bx+65}" y="${Y0+34}" font-size="12" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">‖g‖</text>`;
+  svg.innerHTML=g;
+  const phase=t<WU?"warmup":"cosine decay ("+((t-WU)/(TM-WU)*100).toFixed(1)+"% done)";
+  info.innerHTML=`Step ${t.toLocaleString("en-US")} (${phase}): η = <b>${fmtS(e)}</b>. Gradient norm ${gn.toFixed(3)} vs c = ${c.toFixed(2)}: scale factor min(1, c/‖g‖) = <b>${f.toFixed(3)}</b>${f<1?" (clipped)":" (no clipping)"}, norm after = ${(gn*f).toFixed(3)}.<br>AdamW: the largest move of one weight is about η = ${fmtS(e)}; weight decay shrinks every decayed weight by η·λ = ${fmtS(e*LAM)} of its value.`;
+  R.dataset.otUpd=JSON.stringify({t,lr:e,f:+f.toFixed(4)});}
+ [ts,gs,cs].forEach(x=>x.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: GPU memory timeline ---------- */
+(function(){
+ const svg=$("#ot-mem-svg");if(!svg)return;const info=$("#ot-mem-info");
+ const ms=$("#ot-mem-m"),bs=$("#ot-mem-b"),ss=$("#ot-mem-s"),xs=$("#ot-mem-x"),ck=$("#ot-mem-ck"),fi=$("#ot-mem-first"),no=$("#ot-mem-none");
+ const MODELS={llama:{V:128256,d:4096,L:32,tied:false,N:LL.N,Pl:LL.Pl,Pe:LL.Pe,Ph:LL.Ph,maxT:13},
+  gpt2:(()=>{const V=50257,d=768,L=12,Pl=12*d*d+13*d,Pe=V*d+1024*d;return{V,d,L,tied:true,Pl,Pe,Ph:0,N:Pe+L*Pl+2*d,maxT:10};})()};
+ let mk="llama";
+ function sim(m,b,s,useCk,first,none){const {V,d,L}=m,N=m.N,c=34;let st=6*N+(first?0:8*N),g=none?0:2*N,a=0,lg=0;const ev=[];
+  const rec=(lab,ph)=>ev.push({lab,ph,st,g,a,lg,tot:st+g+a+lg});
+  rec("start of step","f");
+  for(let l=1;l<=L;l++){a+=(useCk?2:c)*b*s*d;rec("forward, block "+l,"f");}
+  lg+=4*b*s*V;rec("logits and loss","f");
+  lg+=4*b*s*V;rec("backward starts: logit gradient","b");
+  if(none)g+=2*(m.tied?V*d:m.Ph);lg=0;rec("output layer backward","b");
+  for(let l=L;l>=1;l--){if(useCk)a+=c*b*s*d;if(none)g+=2*m.Pl;rec("backward, block "+l,"b");a-=(useCk?c+2:c)*b*s*d;}
+  if(none)g+=2*(m.tied?1024*d:m.Pe);rec("embedding backward","b");rec("clip","u");
+  if(first)st+=8*N;rec("optimizer.step()","u");
+  if(none)g=0;rec("zero_grad","u");
+  let pk=0;ev.forEach((e,i)=>{if(e.tot>ev[pk].tot+1)pk=i;});return{ev,pk};}
+ ms.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;mk=b.dataset.v;ms.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",String(x===b)));
+  ss.max=MODELS[mk].maxT;if(+ss.value>MODELS[mk].maxT)ss.value=MODELS[mk].maxT;if(mk==="gpt2"&&+bs.value===0)bs.value=3;draw();});
+ function draw(){const m=MODELS[mk],b=Math.pow(2,+bs.value),s=Math.pow(2,+ss.value);$("#ot-mem-bv").value=b;$("#ot-mem-sv").value=s.toLocaleString("en-US");
+  const {ev,pk}=sim(m,b,s,ck.checked,fi.checked,no.checked);const n=ev.length;const xi=Math.round(+xs.value/100*(n-1));$("#ot-mem-xv").value=(xi+1)+"/"+n;
+  const top=Math.max(ev[pk].tot,mk==="llama"?80e9:0)*1.12;const X0=60,X1=745,Y0=255,Y1=15;const X=i=>X0+(X1-X0)*i/n,Y=v=>Y0-(Y0-Y1)*v/top;
+  let g="";const layers=[["st","var(--muted)",0.45],["g","var(--k)",0.8],["a","var(--q)",0.75],["lg","var(--v)",0.8]];
+  ev.forEach((e,i)=>{let base=0;layers.forEach(([k,col,op])=>{const v=e[k];if(v>0){g+=`<rect x="${X(i).toFixed(2)}" y="${Y(base+v).toFixed(2)}" width="${(X(i+1)-X(i)+0.4).toFixed(2)}" height="${(Y(base)-Y(base+v)).toFixed(2)}" fill="${col}" opacity="${op}"/>`;}base+=v;});});
+  const step=top>200e9?50e9:top>80e9?20e9:top>20e9?5e9:top>5e9?1e9:0.5e9;
+  for(let v=0;v<=top;v+=step)g+=`<line x1="${X0}" y1="${Y(v)}" x2="${X1}" y2="${Y(v)}" stroke="var(--rule)" stroke-width="0.6" opacity="0.6"/><text x="${X0-6}" y="${Y(v)+4}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--mono)">${(v/1e9).toFixed(step<1e9?1:0)}</text>`;
+  g+=`<text x="12" y="${Y1+4}" font-size="11" fill="var(--muted)" font-family="var(--sans)">GB</text>`;
+  if(80e9<top)g+=`<line x1="${X0}" y1="${Y(80e9)}" x2="${X1}" y2="${Y(80e9)}" stroke="var(--bad)" stroke-dasharray="6 4" stroke-width="1.6"/><text x="${X1-4}" y="${Y(80e9)-5}" font-size="11" text-anchor="end" fill="var(--bad)" font-family="var(--sans)">one 80 GB GPU</text>`;
+  const fEnd=ev.findIndex(e=>e.ph==="b"),bEnd=ev.findIndex(e=>e.ph==="u");
+  [[0,fEnd,"forward"],[fEnd,bEnd,"backward"],[bEnd,n,"update"]].forEach(([a,c,l])=>g+=`<text x="${(X(a)+X(c))/2}" y="${Y0+16}" font-size="12" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">${l}</text><line x1="${X(a)}" y1="${Y0}" x2="${X(a)}" y2="${Y0+6}" stroke="var(--muted)"/>`);
+  g+=`<line x1="${X0}" y1="${Y0}" x2="${X1}" y2="${Y0}" stroke="var(--muted)"/>`;
+  g+=`<circle cx="${(X(pk)+X(pk+1))/2}" cy="${Y(ev[pk].tot)-7}" r="4.5" fill="var(--bad)"/>`;
+  g+=`<rect x="${X(xi)}" y="${Y1}" width="${Math.max(2,X(xi+1)-X(xi))}" height="${Y0-Y1}" fill="none" stroke="var(--ink)" stroke-width="1.6"/>`;
+  svg.innerHTML=g;const e=ev[xi],P=ev[pk];
+  const brk=q=>`weights + master + Adam ${GB(q.st)}, gradients ${GB(q.g)}, activations ${GB(q.a)}, logits ${GB(q.lg)}`;
+  info.innerHTML=`Moment ${xi+1}/${n}, <b>${e.lab}</b>: total <b>${GB(e.tot)} GB</b> (${brk(e)}).<br>Peak: <b>${GB(P.tot)} GB</b> at “${P.lab}” (${brk(P)}). ${P.tot>80e9?"Does <b>not</b> fit on one 80 GB GPU without sharding.":"Fits on one 80 GB GPU."}${mk==="gpt2"?" GPT-2 sequences are at most 1,024 tokens.":""}`;
+  R.dataset.otMem=JSON.stringify({peak:+GB(P.tot),at:P.lab,now:+GB(e.tot),n});}
+ [bs,ss,xs].forEach(x=>x.addEventListener("input",draw));[ck,fi,no].forEach(x=>x.addEventListener("change",draw));draw();
+})();
+})();
+</script></body></html>
