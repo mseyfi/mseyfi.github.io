@@ -16,16 +16,16 @@ title: Home
 .course-cards strong{display:block;font-size:15px}.course-cards small{display:block;color:#7a586a;margin-top:4px}
 </style>
 <div class="course-hero">
- <div class="eyebrow">Interactive research curriculum · 2026</div>
- <h1>LLM &amp; VLM Research Learning Lab</h1>
- <p>88 planned sessions across 14 survey-guided research tracks: Transformers, distributed training, fine-tuning, efficient inference, VLMs, video understanding, retrieval and diffusion. Existing 46 pages remain accessible; four new interactive chapters are in development. Planned sessions are clearly labeled.</p>
- <a class="course-btn" href="{{ '/courses/llm-vlm-research-lab/index.html' | relative_url }}">Explore 14 research tracks →</a>
+ <div class="eyebrow">Interactive course · 2026</div>
+ <h1>LLM &amp; VLM Course</h1>
+ <p>239 sessions in 10 tracks: foundations → transformers → pretraining → post-training → inference → applications → vision → video → generative → capstone. Each session has interactive figures, the math, code and interview questions. New sessions are added as they are finished.</p>
+ <a class="course-btn" href="{{ '/llm-vlm/' | relative_url }}">Start the course →</a>
 </div>
 <div class="course-cards">
- <a href="{{ '/courses/llm-vlm-research-lab/index.html' | relative_url }}"><strong>📚 All sessions</strong><small>Browse the complete curriculum</small></a>
- <a href="{{ '/courses/llm-vlm-research-lab/session-03-decoder-only-transformer-anatomy.html' | relative_url }}"><strong>🧠 Transformer anatomy</strong><small>Interactive architecture exploration</small></a>
- <a href="{{ '/courses/llm-vlm-research-lab/session-26-vlm-architecture-encoder-projector-decoder.html' | relative_url }}"><strong>👁️ Vision-language models</strong><small>Encoder · projector · decoder</small></a>
- <a href="{{ '/courses/llm-vlm-research-lab/session-34-text-to-video-retrieval-and-video-embeddings.html' | relative_url }}"><strong>🎞️ Video retrieval</strong><small>Search video using embeddings</small></a>
+ <a href="{{ '/llm-vlm/' | relative_url }}"><strong>📚 All tracks</strong><small>Browse the complete curriculum</small></a>
+ <a href="{{ '/llm-vlm/foundations/' | relative_url }}"><strong>🔤 Foundations</strong><small>Tokens, embeddings and the math behind them</small></a>
+ <a href="{{ '/llm-vlm/transformers/' | relative_url }}"><strong>🧠 Transformers</strong><small>Attention, MLPs and the full architecture</small></a>
+ <a href="{{ '/llm-vlm/vision/' | relative_url }}"><strong>👁️ Vision-language models</strong><small>ViT, CLIP and modern VLMs</small></a>
 </div>
 <hr>
 <h2>Learning Muse · Previous Articles</h2>
