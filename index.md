@@ -18,7 +18,7 @@ title: Home
 <div class="course-hero">
  <div class="eyebrow">Interactive research curriculum · 2026</div>
  <h1>LLM &amp; VLM Research Learning Lab</h1>
- <p>46 interactive sessions on Transformers, distributed training, fine-tuning, vision-language models, video understanding, retrieval and diffusion. Visual diagrams, mathematics, PyTorch examples, and self-paced progress tracking.</p>
+ <p>46 lessons covering Transformers, distributed training, fine-tuning, VLMs, video understanding, retrieval, and diffusion. Session 01 is now a deep, scrollable research chapter; Sessions 02–46 display their draft content in uninterrupted reading mode while their deeper rewrite remains outstanding.</p>
  <a class="course-btn" href="{{ '/courses/llm-vlm-research-lab/index.html' | relative_url }}">Explore all 46 lessons →</a>
 </div>
 <div class="course-cards">
