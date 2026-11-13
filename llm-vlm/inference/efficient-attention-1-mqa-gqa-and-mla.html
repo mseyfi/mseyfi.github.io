@@ -1,0 +1,608 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Efficient attention 1: MQA, GQA and MLA, from the KV-cache view · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 97</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="efficient-attention-1-mqa-gqa-and-mla">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="efficient-attention-1-mqa-gqa-and-mla" data-session="efficient-attention-1-mqa-gqa-and-mla" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">97</span><span>Track 5: LLM inference and serving · session 20 of 65</span></div><h1 class="chap-title">Efficient attention 1: MQA, GQA and MLA, from the KV-cache view</h1><p class="chap-sub">When a model is served to many users, one number decides how many fit on a GPU and how many tokens per second it can sell: the KV bytes per token. This session looks at MQA, GQA and MLA through that number: what each stores, how to convert a trained MHA model by mean pooling and uptraining (or by an SVD into MLA), how MLA runs in prefill and decode, and what happens under tensor parallelism. Quality numbers from the papers sit next to the bytes.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 26, 80 and 82 (attention variants, the KV cache, why inference is slow)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Compute KV bytes per token for MHA, GQA, MQA and MLA models from their config files, and avoid the MLA config trap</li><li>Turn bytes per token into the largest batch and into decode throughput on a real GPU, and see why throughput at full memory is inversely proportional to it</li><li>Convert an MHA checkpoint into GQA: why mean pooling is the least-squares start and what the GQA paper found about uptraining</li><li>Show that GQA is a special case of MLA, and convert MHA weights to MLA with an SVD at the same cache size</li><li>Explain the two ways to run MLA (naive for prefill, absorbed for decode) with their FLOPs and arithmetic intensity</li><li>Work out where the cache lives under tensor parallelism, why GQA-8 fits 8-GPU nodes and why MLA is served with data-parallel attention</li><li>Read the quality results of the MQA, GQA and DeepSeek-V2 papers next to the cache sizes</li></ul></div></header><style>
+.ea-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px;justify-content:center}
+.ea-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.ea-lab{font:500 14px var(--sans);color:var(--muted)}
+.ea-tb{width:100%;border-collapse:collapse;font:500 14px var(--sans);margin-top:6px}
+.ea-tb td,.ea-tb th{padding:3px 6px;border-bottom:1px solid var(--rule);text-align:right}
+.ea-tb td:first-child,.ea-tb th:first-child{text-align:left}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">When a model serves many users, one number decides how many of them fit on a GPU and how fast each of them gets tokens: the <b>KV bytes per token</b>, the memory that one token of context takes in the key–value cache. This session looks at MQA, GQA and MLA through that one number. We ask what each design stores, how many users it lets you serve, how to get it from a model that was trained with ordinary attention, and what it costs in quality.</p>
+<p><a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">Session 26</a> introduced the four designs (MHA, MQA, GQA, MLA) and their math. <a href="../inference/the-kv-cache.html">Session 80</a> showed that peak memory is roughly weights plus cache, and <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a> showed that decoding is limited by memory traffic. Here we put the three together, as an engineer who must serve a model. New in this session:</p>
+<ul><li>A table of <b>real KV bytes per token</b>, read from config files, from 8 KiB (Falcon 7B) to 512 KiB (Llama 2 7B).</li>
+<li>A <b>serving model</b>: how bytes per token turn into the largest batch and into tokens per second (Figure 2).</li>
+<li><b>Uptraining</b> in detail: why mean pooling is the right start, what the GQA paper measured, and a small uptraining run you can watch (Figure 3).</li>
+<li><b>MLA as a superset of GQA</b>: GQA is a special case of MLA with the same cache, and an SVD can turn MHA weights into MLA weights (Figure 4).</li>
+<li><b>Two ways to run MLA</b> (prefill and decode), and what happens to all four designs under <b>tensor parallelism</b> (Figure 5).</li>
+<li>Bytes per token and quality <b>side by side</b>, with the numbers the papers report.</li></ul>
+<aside class="note analogy side"><span class="nt">Analogy</span>Think of a hotel. Rooms are GPU memory, guests are the requests, and each night a guest stays is one token of context. MHA gives every guest a large suite. GQA puts guests in shared family rooms. MQA puts everyone in one dormitory. MLA gives each guest a small capsule with a fold-out bed that opens into a full room when needed. The hotel’s income (throughput) depends on how many guests fit.</aside>
+<p>This is the <b>multi-query attention</b> part of the model-level optimizations in the efficient-inference survey (its section 5.1.2). [Certain] It comes up in interviews as: “How many concurrent 32k-token users fit on one H100 with Llama 3.1 8B?”, “How would you turn an MHA checkpoint into GQA?”, “Why is GQA-8 so popular with 8-GPU nodes?”, “Why does DeepSeek serve MLA with data-parallel attention instead of tensor parallelism?”. All of them come down to bytes per token.</p>
+<p>In this part of the course, <a href="../inference/efficient-ffn-1-swiglu-and-parameter-sharing.html">session 94</a> to <a href="../inference/efficient-ffn-3-moe-from-dense-models.html">session 96</a> made the feed-forward network cheaper. This session and the next two do the same for attention. Here we attack the <b>memory</b> cost of attention (the cache); <a href="../inference/efficient-attention-2-low-rank-attention-linformer.html">session 98</a> attacks its <b>compute</b> cost, the \(T^2\) attention matrix.</p>
+
+<h2>One number: KV bytes per token</h2>
+<h3>What each design stores</h3>
+<p>For every token of context and in every layer, the cache stores some numbers. MHA, GQA and MQA store \(n_{kv}\) key heads and \(n_{kv}\) value heads of size \(d_h\). MLA stores one latent vector of size \(d_c\) and one shared RoPE key of size \(d_R\). Multiply by the number of layers and by the bytes per number:</p>
+<div class="eq">\[ \beta_{\text{GQA}} = 2\, L\, n_{kv}\, d_h\, b, \qquad \beta_{\text{MLA}} = L\,(d_c + d_R)\, b \tag{97.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\beta\)</dt><dd>KV bytes per token: the memory one token of context takes in the cache, over all layers</dd>
+<dt>\(L\)</dt><dd>the number of layers (<code>num_hidden_layers</code> in the config)</dd>
+<dt>\(n_{kv}\)</dt><dd>the number of key–value heads (<code>num_key_value_heads</code>): \(n_{kv} = n_h\) is MHA, \(n_{kv} = 1\) is MQA, anything between is GQA</dd>
+<dt>\(d_h\)</dt><dd>the size of one head (<code>head_dim</code>, or hidden size divided by the number of heads)</dd>
+<dt>\(d_c, d_R\)</dt><dd>for MLA: the latent size (<code>kv_lora_rank</code>) and the size of the shared RoPE key (<code>qk_rope_head_dim</code>)</dd>
+<dt>\(b\)</dt><dd>bytes per number: 2 for bfloat16, 1 for an 8-bit cache</dd></dl>
+<p>Notice what is <b>not</b> in (97.1): the hidden size \(d\), the number of query heads \(n_h\), and the feed-forward width. A model can grow wider and add query heads without growing its cache. That is why model designers like these variants: they decouple model size from cache size.</p>
+<p>The cache for a whole batch is \(\beta \cdot T \cdot B\) for \(B\) sequences of \(T\) tokens. Everything in this session follows from \(\beta\).</p>
+<figure class="fig" id="ea-ladder"><div class="fig-body">
+<div class="controls"><span class="seg" id="ea-ladder-mode"><button type="button" data-m="real" aria-pressed="true">As built</button><button type="button" data-m="mha" aria-pressed="false">Also show the MHA version</button></span></div>
+<div class="scroll-x"><svg id="ea-ladder-svg" viewBox="0 0 640 330" role="img" aria-label="KV bytes per token of ten real models on a log scale"></svg></div>
+<div class="ea-leg"><span style="--c:var(--k)">MHA</span><span style="--c:var(--q)">GQA</span><span style="--c:var(--v)">MQA</span><span style="--c:var(--tc)">MLA</span><span style="--c:var(--rule)">same model with MHA (what-if)</span></div>
+<div class="readout" id="ea-ladder-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> KV bytes per token \(\beta\) of ten real models, formula (97.1), bfloat16 cache, log scale. All sizes come from the models’ config files on Hugging Face. Click a bar to see the calculation. The second button adds, in grey, what the same model would need with full MHA (\(n_{kv} = n_h\), and for MLA models \(2 n_h \cdot 128\) numbers per layer).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Each bar is one model; longer means more cache per token. One grid step is a factor of 4. The colours show the design. Click Llama 3.1 8B: 128 KiB per token, so 1 GiB holds 8,192 tokens. Click Llama 2 7B, a model of almost the same size with MHA: 512 KiB, four times more. The three MLA models (DeepSeek-V2, DeepSeek-V3, Kimi K2) are huge mixture-of-experts models with 128 or 64 heads, yet their cache per token is about half of Llama 3.1 8B’s. Turn on the MHA versions: for DeepSeek-V3 the grey bar is 57 times longer than the real one. Falcon 7B (MQA) is the smallest: 8 KiB.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: reading β from three config files</div>
+<p><b>Llama 3.1 8B</b>: <code>num_hidden_layers = 32</code>, <code>num_key_value_heads = 8</code>, <code>head_dim = 128</code>. \(\beta = 2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes \(= 128\) KiB.</p>
+<p><b>Qwen3-235B-A22B</b> (a mixture-of-experts model): 94 layers, 64 query heads, 4 key–value heads, \(d_h = 128\). \(\beta = 2 \times 94 \times 4 \times 128 \times 2 = 192{,}512\) bytes \(= 188\) KiB. A model with 235B parameters has a cache per token only 1.5 times larger than an 8B model.</p>
+<p><b>DeepSeek-V3</b>: 61 layers, <code>kv_lora_rank = 512</code>, <code>qk_rope_head_dim = 64</code>. Note that its config also says <code>num_key_value_heads = 128</code>; that number is <b>not</b> what is cached. \(\beta = 61 \times (512 + 64) \times 2 = 70{,}272\) bytes \(\approx 68.6\) KiB. With MHA and its 128 heads of 128 it would be \(2 \times 61 \times 128 \times 128 \times 2\) bytes \(= 3{,}904\) KiB, about 57 times more.</p></div>
+
+<h2>From bytes per token to users and tokens per second</h2>
+<h3>How many sequences fit</h3>
+<p>A GPU has memory \(M\). We can use a fraction \(u\) of it (the rest goes to activations, the CUDA context and fragmentation; serving systems such as vLLM use \(u = 0.9\) by default). The weights take \(W\) bytes. What is left holds the cache:</p>
+<div class="eq">\[ N_{\text{tok}} = \frac{u M - W}{\beta}, \qquad B_{\max} = \left\lfloor \frac{N_{\text{tok}}}{T} \right\rfloor \tag{97.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N_{\text{tok}}\)</dt><dd>the total number of tokens of context that the GPU can hold, over all sequences</dd>
+<dt>\(B_{\max}\)</dt><dd>the largest batch: how many sequences of \(T\) tokens can be decoded at the same time</dd>
+<dt>\(u M - W\)</dt><dd>the memory left for the cache after the weights</dd></dl>
+<p>For Llama 3.1 8B on an 80 GB H100: \(W = 16.06\) GB in bfloat16 and \(u M - W = 72 - 16.06 = 55.94\) GB. At \(T = 32{,}768\) tokens, (97.2) gives 13 sequences with its real GQA-8 cache, but only 3 with MHA, 104 with MQA, and 46 with a DeepSeek-style MLA cache (\(d_c = 4 d_h = 512\), \(d_R = 64\): 36 KiB per token over 32 layers).</p>
+<h3>How fast each step is</h3>
+<p>A decode step reads all weights once and the whole cache once. It also does about \(2 N_p\) FLOPs per sequence for the weights (\(N_p\) is the number of parameters) and some FLOPs for attention. The step can be no faster than the slower of the two limits:</p>
+<div class="eq">\[ t_{\text{step}}(B) \approx \max\!\left( \frac{W + B\,T\,\beta}{\text{BW}},\ \ \frac{2 N_p B + B\,T\,\phi}{F} \right), \qquad \text{throughput} = \frac{B}{t_{\text{step}}} \tag{97.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\text{BW}\)</dt><dd>memory bandwidth: 3.35 TB/s on an H100 SXM</dd>
+<dt>\(F\)</dt><dd>peak compute: about 989 TFLOP/s dense bfloat16 on an H100 SXM [Certain for both spec numbers]</dd>
+<dt>\(\phi\)</dt><dd>attention FLOPs per cached token per new token: \(4 L n_h d_h\) for MHA, GQA and MQA; more for MLA (formula 97.8)</dd>
+<dt>throughput</dt><dd>generated tokens per second, summed over the batch</dd></dl>
+<p>Now fill the GPU: \(B = B_{\max}\). Then \(W + B T \beta \approx u M\): every step reads almost the whole usable memory, whatever the design. The step time is about \(uM / \text{BW} \approx 21.5\) ms, and only the number of sequences that share this step changes. If the memory term wins:</p>
+<div class="eq">\[ \text{throughput}_{\max} \approx \frac{\text{BW}\,(u M - W)}{u M \cdot T \cdot \beta} \tag{97.4} \]</div>
+<p>Throughput at full memory is <b>inversely proportional to \(\beta\)</b>. Halve the bytes per token and you double the tokens per second the GPU can sell, as long as the step stays memory-bound. This is the serving case for MQA, GQA and MLA in one line.</p>
+<aside class="note numbers side"><span class="nt">Real numbers</span>Formula (97.4) for Llama 3.1 8B on one H100 at \(T = 4{,}096\): MHA gives about 1,212 tokens/s, GQA-8 about 4,848. At \(T = 32{,}768\): MHA 152, GQA-8 606. These are upper bounds from a simple model, not measurements. [Certain for the arithmetic]</aside>
+<figure class="fig" id="ea-serve"><div class="fig-body">
+<div class="controls"><label class="sl">Context \(T\) <input type="range" id="ea-serve-t" min="0" max="7" step="1" value="5"><output id="ea-serve-tv">32,768</output></label></div>
+<div class="scroll-x"><svg id="ea-serve-svg" viewBox="0 0 640 300" role="img" aria-label="Decode throughput against batch size for MHA, GQA-8, MQA and MLA on one H100"></svg></div>
+<div class="ea-leg"><span style="--c:var(--k)">MHA (32 KV heads)</span><span style="--c:var(--q)">GQA-8 (as built)</span><span style="--c:var(--v)">MQA</span><span style="--c:var(--tc)">MLA (DeepSeek sizes, dashed)</span></div>
+<div class="readout" id="ea-serve-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Decode throughput against batch size, formulas (97.2) and (97.3), for a Llama-3.1-8B-shaped model (32 layers, 32 query heads, \(d_h = 128\), 8.03B parameters in bfloat16) on one H100 (80 GB, \(u = 0.9\), 3.35 TB/s, 989 TFLOP/s). Only the attention design changes; we keep the weights fixed to isolate the cache. Each curve stops (dot) at the largest batch that fits. Both axes are logarithmic.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>At batch 1 all four designs give almost the same speed: the step is dominated by reading 16 GB of weights. As the batch grows, the cache grows, and the curves split. The dot at the end of each curve is \(B_{\max}\); higher dots mean more tokens per second per GPU. Move the context slider: at 4,096 tokens MHA stops at batch 26, at 131,072 tokens it cannot even hold one sequence (no curve). The readout lists, for each design, \(\beta\), \(B_{\max}\), the step time and the throughput at \(B_{\max}\). For MQA at short context the compute term starts to matter; real servers also hit other limits first (activation memory, latency targets).</p></details></figure>
+<p>Two lessons from Figure 2. First, at small batch, the design barely matters: the weights dominate. A chatbot that serves one user does not get faster with GQA unless the context is long. Second, at full memory the design decides everything. The real Llama 3.1 8B (GQA-8) gives about 4 times the throughput of an MHA version at every context length. This is why every large open model since 2023 uses GQA or MLA. [Likely, as a statement about the major open model families]</p>
+
+<h2>Sharing K and V: MQA and GQA, briefly</h2>
+<p>As a recap from <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>: in MQA all \(n_h\) query heads read one key head and one value head. In GQA the query heads are split into \(n_{kv}\) groups of \(r = n_h / n_{kv}\), and query head \(i\) reads key–value head \(g(i) = \lfloor i / r \rfloor\). The FLOPs barely change; the cache shrinks by \(r\), and the arithmetic intensity of decode attention rises from 1 to \(r\) FLOPs per byte.</p>
+<p>What did the first paper actually measure? Shazeer (2019) trained translation models on WMT14 English–German with 8 heads of size 128, and widened the feed-forward layers of the MQA model so that both had the same number of parameters. [Certain, numbers from the paper’s Tables 1 and 2]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Attention</th><th>KV numbers per token per layer</th><th>Dev ln(PPL)</th><th>Dev BLEU</th><th>Test BLEU (greedy / beam 4)</th><th>Decoder time per token</th></tr></thead><tbody>
+<tr><td>MHA, \(h = 8\), \(d_k = 128\)</td><td>2,048</td><td>1.424</td><td>26.7</td><td>27.7 / 28.4</td><td>46 µs</td></tr>
+<tr><td>MQA, \(h = 8\), \(d_k = 128\)</td><td>256</td><td>1.439</td><td>26.5</td><td>27.5 / 28.5</td><td>3.8 µs</td></tr>
+<tr><td>MHA, \(h = 1\), \(d_k = 128\)</td><td>256</td><td>1.518</td><td>25.8</td><td>–</td><td>–</td></tr>
+<tr><td>MHA, \(h = 2\), \(d_k = 64\)</td><td>256</td><td>1.480</td><td>26.2</td><td>26.8 / 27.9</td><td>–</td></tr>
+<tr><td>MHA, \(h = 8\), \(d_k = 16\)</td><td>256</td><td>1.513</td><td>25.8</td><td>–</td><td>–</td></tr></tbody></table></div>
+<p>The decoder time is in TPUv2 microseconds per token, amortized over a batch of 1,024 sequences. MQA made the decoder about 12 times faster (46 vs 3.8) and lost 0.2 BLEU on the dev set. The rows below it are the most useful part of the table and are often forgotten: they are <b>MHA models with the same cache as MQA</b> (fewer or smaller heads, so \(2 h d_k = 256\)). All of them are clearly worse than MQA. So for a fixed cache budget, keeping many query heads and sharing K and V beats simply having fewer heads.</p>
+<p>The GQA paper (Ainslie et al., 2023) then showed that the middle ground is better still: on T5-XXL, uptrained GQA-8 scored 47.1 on average against 47.2 for MHA and 46.6 for MQA, at 0.28 s per sample against 1.51 s for MHA and 0.24 s for MQA. [Certain, Table 1 of the paper] It also reported that MQA can make fine-tuning unstable, while uptrained GQA appeared stable. [Certain that the paper reports this]</p>
+
+<h2>Uptraining: from an MHA checkpoint to GQA</h2>
+<h3>The problem</h3>
+<p>Suppose you own a strong MHA model and serving it is too expensive. Training a GQA model from scratch costs as much as the original. The GQA paper’s answer is <b>uptraining</b>: change the architecture of the trained model, then train it a little more. It has two steps: build the new key and value heads from the old ones, and continue pre-training on the original data for a fraction \(\alpha\) of the original steps.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A company merges four small teams into one. You do not hire a new team from the street (random init), and you do not just keep one of the four leaders and fire the rest (first head). You write a joint handbook that averages what the four teams knew (mean pooling), then give everyone a few weeks to adjust (uptraining).</aside>
+<h3>Step 1: why the mean is the natural start</h3>
+<p>For each group \(g\) we need one key matrix \(W^K_g\) that replaces the \(r\) old matrices \(W^K_i\) of that group. A natural goal is to stay as close as possible to all of them:</p>
+<div class="eq">\[ W^K_g = \argmin_{W} \sum_{i \,:\, g(i) = g} \lVert W - W^K_i \rVert_F^2 = \frac{1}{r} \sum_{i \,:\, g(i) = g} W^K_i \tag{97.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\lVert \cdot \rVert_F\)</dt><dd>the Frobenius norm: the square root of the sum of all squared entries of a matrix</dd>
+<dt>\(\argmin_W\)</dt><dd>the matrix \(W\) that makes the sum smallest</dd>
+<dt>\(i : g(i) = g\)</dt><dd>the \(r\) query heads of group \(g\)</dd></dl>
+<p>The proof is one line: the gradient of the sum is \(2 \sum_i (W - W^K_i)\), which is zero exactly at the mean. The same holds for \(W^V_g\). So mean pooling is the <b>least-squares</b> choice in weight space. It is not the best choice for the <b>output</b> of the layer, because the softmax is not linear; that gap is what uptraining has to close. The query and output matrices \(W^Q_i\) and \(W^O\) are kept as they are.</p>
+<h3>Step 2: continue training</h3>
+<p>What the GQA paper reports about uptraining [Certain, from the paper’s text and figures]:</p>
+<ul><li>The main setting is \(\alpha = 0.05\): 5% of the original pre-training steps, with the same data, optimizer (Adafactor) and learning-rate schedule as T5. For T5-XXL this took about 600 TPUv3 chip-days.</li>
+<li>Mean pooling worked best, then keeping the first head of each group, then random initialization (tested on T5-Large converted to MQA).</li>
+<li>GQA already gives reasonable quality right after conversion, while MQA needs uptraining to be useful. Both gain from 5% uptraining, with diminishing returns at 10%.</li>
+<li>Going from 1 group (MQA) to 8 groups adds only a little inference time; more groups cost more. The authors chose 8 groups as the middle ground.</li></ul>
+<p>Figure 3 lets you watch a tiny version of this. A real uptraining run continues pre-training with the language-model loss; our stand-in trains the shared key and value weights so that the converted layer reproduces the MHA layer’s output on fresh random inputs. It is a toy, but the order of the three starting points, and the floor that more groups lower, are the same as in the paper.</p>
+<figure class="fig" id="ea-up"><div class="fig-body">
+<div class="controls"><span class="seg" id="ea-up-g"><button type="button" data-g="1" aria-pressed="false">1 group (MQA)</button><button type="button" data-g="2" aria-pressed="true">2 groups</button><button type="button" data-g="4" aria-pressed="false">4 groups</button></span><label class="sl">Head similarity \(\rho\) <input type="range" id="ea-up-rho" min="0" max="0.9" step="0.1" value="0.5"><output id="ea-up-rhov">0.5</output></label></div>
+<div class="controls"><button type="button" class="btn primary" id="ea-up-play">Train</button><button type="button" class="btn" id="ea-up-end">Run to step 200</button><span class="ea-lab" id="ea-up-lab">step 0 of 200</span></div>
+<div class="scroll-x"><svg id="ea-up-svg" viewBox="0 0 640 280" role="img" aria-label="Relative output error during uptraining for three initializations"></svg></div>
+<div class="ea-leg"><span style="--c:var(--q)">mean pooling</span><span style="--c:var(--v)">first head of each group</span><span style="--c:var(--k)">random</span></div>
+<div class="readout" id="ea-up-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Uptraining, live. A toy causal attention layer with 8 heads of size 4, width 32 and 12 tokens (fixed seeds). The MHA heads are \(W^K_i = \sqrt{\rho}\, (\text{shared}) + \sqrt{1-\rho}\, (\text{own})\), and the same for \(W^V_i\). We convert it to GQA with three different starts and train only the shared \(W^K_g, W^V_g\) with Adam (learning rate 0.005), two fresh random sequences per step, to match the MHA output. The curves show the relative output error \(\lVert \mathbf{y}_{\text{GQA}} - \mathbf{y}_{\text{MHA}} \rVert / \lVert \mathbf{y}_{\text{MHA}} \rVert\) on four held-out sequences, every 10 steps.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Press Train (or Run to step 200). At step 0, mean pooling starts lowest, the first head next, random highest: this is the order of the GQA paper. With \(\rho = 0.5\) and 2 groups the three start near 0.65, 0.89 and 1.39. After about 100 to 150 steps the first-head start has caught up with mean pooling; random is still behind at step 200 (0.684 against 0.620). All curves flatten at a floor: shared heads cannot copy 8 different heads exactly. More groups lower the floor (try 4 groups), a larger \(\rho\) (more similar heads) lowers it too. The readout gives the three errors at the current step.</p></details></figure>
+<p>Two honest limits of the toy. Real uptraining also trains the queries, the output projection and every other layer, so the network can move work around and the floor is much lower. And real heads are neither random nor all alike; how similar they are inside a group decides how much is lost, which is why the paper found GQA-8 much easier to recover than MQA.</p>
+
+<h2>MLA from the cache view</h2>
+<h3>What MLA caches, in one line</h3>
+<p>From <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>: MLA projects each hidden vector to a latent \(\mathbf{c}_t = W^{DKV} \mathbf{h}_t \in \R^{d_c}\) and caches it with one small shared RoPE key \(\mathbf{k}^R_t \in \R^{d_R}\). Each head \(i\) gets its own content key \(W^{UK}_i \mathbf{c}_t\) and value \(W^{UV}_i \mathbf{c}_t\). The DeepSeek-V2 paper sets \(d_c = 4 d_h\) and \(d_R = d_h / 2\), so the cache equals GQA with 2.25 groups. [Certain]</p>
+<h3>GQA is a special case of MLA</h3>
+<p>Here is a fact that explains why MLA can only be better than GQA at the same cache size (ignoring RoPE for now). Take any GQA layer. Stack all its cached keys and values into one vector, and call it the latent:</p>
+<div class="eq">\[ \mathbf{c}_t = \begin{bmatrix} W^K_0 \\ \vdots \\ W^K_{n_{kv}-1} \\ W^V_0 \\ \vdots \\ W^V_{n_{kv}-1} \end{bmatrix} \mathbf{h}_t \in \R^{2 n_{kv} d_h}, \qquad W^{UK}_i = E_{g(i)}, \quad W^{UV}_i = E_{n_{kv} + g(i)} \tag{97.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{c}_t\)</dt><dd>the GQA cache of token \(t\) written as one vector: exactly the same numbers GQA stores</dd>
+<dt>\(E_m\)</dt><dd>a selection matrix of shape \(d_h \times 2 n_{kv} d_h\): an identity block at block position \(m\), zeros elsewhere. It just picks block \(m\) of the latent.</dd>
+<dt>\(g(i)\)</dt><dd>the group of query head \(i\)</dd></dl>
+<p>With these up-projections, MLA gives every head exactly the key and value that GQA gives it. So GQA is MLA with \(d_c = 2 n_{kv} d_h\) and fixed 0/1 up-projections. MLA learns the up-projections instead, so with the same cache it can give each head a <b>different</b> key and value, mixed from the whole latent. The reverse is not true: an MLA layer generally cannot be written as GQA. The TransMLA paper (Meng et al., 2025) proves this, with a way to handle RoPE, and uses it to convert GQA models such as Llama and Qwen into MLA. [Certain that the paper proves and does this] The PyTorch code below checks (97.6) numerically.</p>
+<h3>Converting MHA to MLA with an SVD</h3>
+<p>(97.6) also suggests a conversion from MHA. Stack all key and value matrices of an MHA layer into one tall matrix \(W^{KV} \in \R^{2 n_h d_h \times d}\). The keys and values of a token are \(W^{KV} \mathbf{h}_t\). If we must squeeze them through a latent of size \(d_c\), the best rank-\(d_c\) approximation of \(W^{KV}\) (in Frobenius norm) comes from the singular value decomposition (SVD), by the Eckart–Young theorem:</p>
+<div class="eq">\[ W^{KV} = U \Sigma V^{\top} \approx \underbrace{\big(W^{KV} V_{d_c}\big)}_{\text{up-projections}}\ \underbrace{V_{d_c}^{\top}}_{W^{DKV}}, \qquad \frac{\lVert W^{KV} - W^{KV} V_{d_c} V_{d_c}^{\top} \rVert_F^2}{\lVert W^{KV} \rVert_F^2} = \frac{\sum_{j \gt d_c} \sigma_j^2}{\sum_j \sigma_j^2} \tag{97.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(U \Sigma V^{\top}\)</dt><dd>the SVD: \(\Sigma\) holds the singular values \(\sigma_1 \ge \sigma_2 \ge \dots\), \(V\) the right singular vectors</dd>
+<dt>\(V_{d_c}\)</dt><dd>the first \(d_c\) columns of \(V\) (shape \(d \times d_c\))</dd>
+<dt>\(W^{DKV} = V_{d_c}^{\top}\)</dt><dd>the down-projection: the latent is \(\mathbf{c}_t = V_{d_c}^{\top} \mathbf{h}_t\)</dd>
+<dt>\(W^{KV} V_{d_c}\)</dt><dd>the up-projections of all heads, stacked; rows of head \(i\) give \(W^{UK}_i\) or \(W^{UV}_i\)</dd>
+<dt>right-hand fraction</dt><dd>the relative weight error: the share of the “energy” \(\sum \sigma_j^2\) that the discarded directions carried</dd></dl>
+<p>Mean-pooled GQA with \(n_{kv}\) groups is also a matrix of rank at most \(2 n_{kv} d_h\) (its rows repeat). So at the same cache size, the SVD is never worse than mean pooling in weight space. This is guaranteed by Eckart–Young. For the layer’s <b>output</b> there is no such guarantee, but in practice it usually follows; Figure 4 measures it. This joint SVD of keys and values, plus keeping RoPE only on a few dimensions (“partial RoPE”), is the method of MHA2MLA (Ji et al., 2025), which reports a 92.19% smaller cache for Llama 2 7B with a 0.5% drop on LongBench, after fine-tuning on a small fraction of the data. [Certain that the paper reports this]</p>
+<figure class="fig" id="ea-svd"><div class="fig-body">
+<div class="controls"><label class="sl">Head similarity \(\rho\) <input type="range" id="ea-svd-rho" min="0" max="1" step="0.05" value="0.5"><output id="ea-svd-rhov">0.50</output></label></div>
+<div class="scroll-x"><svg id="ea-svd-svg" viewBox="0 0 640 260" role="img" aria-label="Output error of mean-pooled GQA and SVD-converted MLA at the same cache size"></svg></div>
+<div class="ea-leg"><span style="--c:var(--q)">GQA by mean pooling (97.5)</span><span style="--c:var(--tc)">MLA by SVD, same cache (97.7)</span></div>
+<div class="readout" id="ea-svd-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Two conversions of the same MHA layer at the same cache budget, computed live, with no training. Toy layer: 8 heads of size 8, width \(d = 96\), 16 tokens, six held-out sequences (fixed seed); heads built with similarity \(\rho\) as in Figure 3. For each budget of \(2 n_{kv} d_h\) cached numbers per token (16, 32 or 64), the left bar mean-pools into \(n_{kv}\) groups, the right bar keeps all 8 heads and uses an MLA latent of \(d_c = 2 n_{kv} d_h\) from the SVD (97.7). RoPE is ignored.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Lower is better. In every pair the MLA bar is lower: with the same number of cached numbers, the SVD keeps more of the eight heads than averaging them. At \(\rho = 0.5\) and 64 cached numbers, mean pooling leaves an output error of about 0.56, the SVD about 0.22. Move \(\rho\) to 1: all heads are equal, so both errors drop to zero. The readout also shows the weight errors; the SVD weight error is never larger than the pooling one (Eckart–Young). In this toy the latent is still smaller than \(d = 96\); if \(d_c \ge d\), the latent could simply be \(\mathbf{h}_t\) itself and nothing would be lost.</p></details></figure>
+<h3>Two ways to run MLA: prefill and decode</h3>
+<p>MLA can be computed in two mathematically equal ways, and serving systems use both.</p>
+<ul><li><b>Naive (expanded) form</b>: up-project the latents into per-head keys (\(d_h + d_R = 192\) numbers in DeepSeek-V2/V3) and values (128), then run ordinary attention with 128 heads. Per (query, key) pair and head this costs \(2 \cdot 192 + 2 \cdot 128 = 640\) FLOPs.</li>
+<li><b>Absorbed form</b>: fold \(W^{UK}_i\) into the query and \(W^{UV}_i\) after the weighted sum (see <a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>, formulas 26.8 and 26.9). Each head now works directly on the 576 cached numbers, like MQA with one very wide key–value head: \(2 \cdot 576 + 2 \cdot 512 = 2{,}176\) FLOPs per pair and head.</li></ul>
+<p>So the absorbed form does 3.4 times more FLOPs per pair, but never builds per-head keys. Which one wins depends on the phase:</p>
+<div class="eq">\[ \underbrace{n_h\,\big(2(d_c + d_R) + 2 d_c\big)}_{\text{absorbed: per cached token}} \quad \text{vs} \quad \underbrace{2\, n_h\, d_c\,(d_h + d_v)}_{\text{naive: rebuild K and V of one cached token}}, \qquad I_{\text{MLA}} = \frac{n_h\,\big(2(d_c + d_R) + 2 d_c\big)}{(d_c + d_R)\, b} \tag{97.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(d_v\)</dt><dd>the value size per head (<code>v_head_dim</code>, 128)</dd>
+<dt>\(I_{\text{MLA}}\)</dt><dd>the arithmetic intensity of absorbed decode attention: FLOPs per byte of cache read</dd>
+<dt>\(b\)</dt><dd>bytes per cached number (2 in bfloat16)</dd></dl>
+<div class="worked"><div class="wt">Worked example: MLA decode and prefill, one layer of DeepSeek-V3</div>
+<p>\(n_h = 128\), \(d_c = 512\), \(d_R = 64\), \(d_h = d_v = 128\).</p>
+<p><b>Decode.</b> Absorbed: \(128 \times (2 \times 576 + 2 \times 512) = 278{,}528\) FLOPs per cached token. Naive: the cache holds only latents, so each step must rebuild K and V of every cached token: \(2 \times 128 \times 512 \times 256 = 33{,}554{,}432\) FLOPs per cached token, about 120 times more. (The other naive option, caching the rebuilt keys and values, brings back an MHA-sized cache.) So decode uses the absorbed form. Its intensity is \(278{,}528 / 1{,}152 \approx 241.8\) FLOPs per byte, close to the H100 ridge point of about 295. MLA decode is almost compute-bound, unlike GQA-8 at 8 FLOPs per byte.</p>
+<p><b>Prefill</b> of \(T = 4{,}096\) tokens. Both forms first pay about 33.6 MFLOPs per token for projections (rebuilding K and V, or absorbing into queries). The pair term is \(T(T+1)/2 \times 128 \times 640\) for naive and \(\times 2{,}176\) for absorbed. In total: \(8.25 \times 10^{11}\) FLOPs naive against \(2.47 \times 10^{12}\) absorbed per layer, 3 times more. Prefill is compute-bound, so it uses the naive form. [Likely that this is how the main serving engines implement MLA; DeepSeek’s own inference code offers both modes]</p></div>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Is MLA cheaper than GQA?” In memory, yes. In FLOPs per decode step, no: each head does dot products over 576 numbers per cached token instead of 128. MLA moves decode attention from the memory-bound corner to near the compute roof. That is a good trade on GPUs, where compute is cheap and bandwidth is scarce, but it needs a kernel built for it (DeepSeek released one, FlashMLA). [Certain that FlashMLA exists; performance not verified here]</aside>
+
+<h2>Tensor parallelism: whose cache is it?</h2>
+<p>Large models are split across GPUs with <b>tensor parallelism</b> (TP, see <a href="../pretraining/tensor-parallelism-and-sequence-parallelism.html">session 48</a>): each of \(P\) GPUs holds \(n_h / P\) query heads of every layer, and the cache of those heads. This interacts with key–value sharing in a way that often surprises people.</p>
+<div class="eq">\[ \beta_{\text{GPU}} = \begin{cases} 2\, L\, \dfrac{n_{kv}}{P}\, d_h\, b & \text{if } P \le n_{kv} \\[2mm] 2\, L\, d_h\, b & \text{if } P \gt n_{kv} \text{ (each GPU needs at least one KV head)} \\[2mm] L\,(d_c + d_R)\, b & \text{MLA under TP: every head needs the whole latent} \end{cases} \tag{97.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\beta_{\text{GPU}}\)</dt><dd>cache bytes per token stored on <b>each</b> GPU</dd>
+<dt>\(P\)</dt><dd>the tensor-parallel degree (number of GPUs that share one layer)</dd>
+<dt>\(P \beta_{\text{GPU}} / \beta\)</dt><dd>the replication factor: how many copies of each cached number exist in total</dd></dl>
+<p>Three consequences:</p>
+<ul><li><b>MQA loses its edge under TP.</b> With \(P = 8\), MQA stores one key–value head per GPU, and so does GQA-8. The per-GPU cache is the same; MQA just keeps 8 identical copies. The GQA paper points out this waste. [Certain]</li>
+<li><b>GQA-8 fits 8-GPU nodes.</b> With \(n_{kv} = 8 = P\), each GPU holds exactly one key–value head and nothing is copied. With \(P = 16\) every head is stored twice.</li>
+<li><b>MLA does not shard under TP.</b> Every head reads the full latent, so every GPU stores all of it. For a 70B-shaped model with MLA sizes, that is 90 KiB per token on each GPU, more than GQA-8’s 40 KiB per GPU at \(P = 8\). This is why SGLang serves DeepSeek models with <b>data-parallel attention</b>: each GPU runs attention for its own set of requests and keeps only their latents, while the MoE layers are still shared across GPUs. SGLang’s documentation says that without it, the KV cache is duplicated on all TP ranks. [Certain that the docs say this]</li></ul>
+<figure class="fig" id="ea-tp"><div class="fig-body">
+<div class="controls"><span class="seg" id="ea-tp-p"><button type="button" data-p="1" aria-pressed="false">1 GPU</button><button type="button" data-p="2" aria-pressed="false">2</button><button type="button" data-p="4" aria-pressed="false">4</button><button type="button" data-p="8" aria-pressed="true">8</button><button type="button" data-p="16" aria-pressed="false">16</button></span></div>
+<div class="controls"><span class="seg" id="ea-tp-d"><button type="button" data-d="mha" aria-pressed="false">MHA</button><button type="button" data-d="gqa" aria-pressed="true">GQA-8</button><button type="button" data-d="mqa" aria-pressed="false">MQA</button><button type="button" data-d="mla" aria-pressed="false">MLA, TP</button><button type="button" data-d="mladp" aria-pressed="false">MLA, DP attention</button></span></div>
+<div class="scroll-x"><svg id="ea-tp-svg" viewBox="0 0 640 250" role="img" aria-label="Key-value heads or latents stored on each GPU under tensor parallelism"></svg></div>
+<div class="readout" id="ea-tp-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Where the cache lives when one layer is split over \(P\) GPUs, formula (97.9). Model shape of Llama 3.1 70B: 80 layers, 64 query heads, \(d_h = 128\), bfloat16. MHA has 64 key–value heads, GQA-8 has 8, MQA has 1; MLA uses DeepSeek sizes (\(d_c = 512\), \(d_R = 64\)). Each box is one GPU; a chip is one cached key–value head (or the latent). A chip with a dashed border is a copy of a head that another GPU also stores.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Pick a number of GPUs and a design. The readout gives the cache per token on each GPU, the total over all GPUs, the replication factor and the arithmetic intensity of decode attention on one GPU (FLOPs per byte read). Start with GQA-8 on 8 GPUs: one head per GPU, 40 KiB, no copies. Switch to MQA: still 40 KiB per GPU, now 8 copies. Switch to MLA, TP: 90 KiB on every GPU, 8 copies, and the intensity falls from 120.9 to 15.1, because each GPU has only 8 heads reading the full latent. MLA with DP attention: each GPU keeps the latents of its own requests only, so the total is 90 KiB per token and the intensity stays at 120.9.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: capacity on 8 GPUs</div>
+<p>Same 70B shape, 8 GPUs, and say each GPU has \(C\) bytes free for cache. GQA-8 with TP: every token takes 40 KiB on every GPU, so the node holds \(C / 40\,\text{KiB}\) tokens in total. MLA with DP attention: a token takes 90 KiB on one GPU only, so the node holds \(8 C / 90\,\text{KiB}\) tokens. The ratio is \((8/90) / (1/40) = 320 / 90 \approx 3.56\): exactly the ratio of total bytes per token (320 KiB vs 90 KiB). With MLA under plain TP the node would hold only \(C / 90\,\text{KiB}\) tokens, less than GQA-8. The design and the parallel layout must be chosen together.</p></div>
+
+<h2>Bytes per token and quality, side by side</h2>
+<p>All the quality numbers below come from the papers; they used different models, data and tasks, so compare rows only <b>within</b> one block. [Certain that these are the reported numbers]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Study</th><th>Design</th><th>KV cache</th><th>Quality</th><th>Speed</th></tr></thead><tbody>
+<tr><td rowspan="2">Shazeer 2019, WMT14 En–De, trained from scratch</td><td>MHA (8 × 128)</td><td>2,048 per layer</td><td>BLEU 26.7 (dev)</td><td>46 µs/token</td></tr>
+<tr><td>MQA</td><td>256 per layer (8× smaller)</td><td>BLEU 26.5</td><td>3.8 µs/token</td></tr>
+<tr><td rowspan="3">Ainslie et al. 2023, T5-XXL, uptrained 5%</td><td>MHA</td><td>1×</td><td>47.2 average</td><td>1.51 s/sample</td></tr>
+<tr><td>GQA-8</td><td>\(n_{kv} = 8\)</td><td>47.1</td><td>0.28 s</td></tr>
+<tr><td>MQA</td><td>\(n_{kv} = 1\)</td><td>46.6</td><td>0.24 s</td></tr>
+<tr><td rowspan="3">DeepSeek-V2 paper, dense 7B, 1.33T tokens from scratch</td><td>MHA</td><td>1×</td><td>MMLU 45.2, BBH 37.0</td><td>–</td></tr>
+<tr><td>GQA (8 groups)</td><td>smaller</td><td>MMLU 41.2, BBH 35.6</td><td>–</td></tr>
+<tr><td>MQA</td><td>smallest</td><td>MMLU 37.9, BBH 33.2</td><td>–</td></tr>
+<tr><td rowspan="2">DeepSeek-V2 paper, small MoE (15.7B total), 1.33T tokens</td><td>MHA</td><td>110.6K numbers per token</td><td>MMLU 48.7, BBH 37.9</td><td>–</td></tr>
+<tr><td>MLA</td><td>15.6K (7.1× smaller)</td><td>MMLU 50.0, BBH 39.0</td><td>–</td></tr>
+<tr><td rowspan="2">DeepSeek-V2 paper, large MoE (about 250B total), 420B tokens</td><td>MHA</td><td>860.2K numbers per token</td><td>MMLU 57.5, BBH 46.6</td><td>–</td></tr>
+<tr><td>MLA</td><td>34.6K (24.9× smaller)</td><td>MMLU 59.0, BBH 50.7</td><td>–</td></tr></tbody></table></div>
+<p>The picture is consistent in direction: sharing keys and values costs some quality (a lot for MQA when training from scratch at 7B: 7.3 MMLU points), uptrained GQA-8 costs very little, and MLA matched or beat MHA in DeepSeek’s own ablations while caching 7 to 25 times less. Two cautions. The DeepSeek ablation uses benchmarks where the differences can depend on the training recipe, and nobody outside DeepSeek has published a same-budget MLA vs GQA comparison of that size that we know of. [Likely] And the parameter counts are not equal: in the 7B ablation the MQA model has 7.1B parameters against 6.9B for the others, because the saved key–value weights were spent elsewhere. [Certain, from the table]</p>
+
+<h2>Pseudo-code</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: uptrain an MHA checkpoint into GQA</div><ol>
+<li><b>input:</b> MHA model with \(W^K_i, W^V_i\) per head and layer; target \(n_{kv}\) (a divisor of \(n_h\)); fraction \(\alpha\) (0.05 in the paper)</li>
+<li>\(r \leftarrow n_h / n_{kv}\)</li>
+<li><b>for</b> each layer, <b>for</b> \(g = 0\) <b>to</b> \(n_{kv} - 1\) <b>do</b></li>
+<li class="i1">\(W^K_g \leftarrow \frac{1}{r}\sum_{i = gr}^{gr + r - 1} W^K_i\); \(\ W^V_g \leftarrow \frac{1}{r}\sum_{i = gr}^{gr + r - 1} W^V_i\) <span class="c">// least squares, formula (97.5)</span></li>
+<li>keep all \(W^Q_i\), \(W^O\) and the rest of the model; set <code>num_key_value_heads</code> \(= n_{kv}\)</li>
+<li>continue pre-training on the original data for \(\alpha \times\) the original steps, same optimizer and schedule</li>
+<li>evaluate against the MHA model; if the gap is too large, raise \(n_{kv}\) or \(\alpha\) <span class="c">// GQA recovers faster than MQA</span></li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: choose the attention path and the layout when serving</div><ol>
+<li><b>input:</b> config, GPU memory \(M\), weights \(W\), number of GPUs \(P\), expected context \(T\)</li>
+<li>\(\beta \leftarrow\) formula (97.1) from the config <span class="c">// read kv_lora_rank first; num_key_value_heads can mislead for MLA</span></li>
+<li><b>if</b> MLA <b>then</b> use data-parallel attention, so each GPU stores latents of its own requests only <span class="c">// formula (97.9)</span></li>
+<li><b>else</b> pick TP degree \(P \le n_{kv}\) where possible, so no key–value head is copied</li>
+<li>\(B_{\max} \leftarrow \lfloor (uM - W_{\text{GPU}}) / (T \beta_{\text{GPU}}) \rfloor\) <span class="c">// formula (97.2) per GPU</span></li>
+<li><b>for</b> each step: <b>if</b> prefill <b>then</b> MLA in naive (expanded) form <b>else</b> MLA in absorbed form <span class="c">// formula (97.8)</span></li></ol></div>
+<p>The same ideas in PyTorch. The script is deterministic (fixed seed) and runs on a CPU in a few seconds. Each part checks one claim of this session; the printed values are in the comments.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+
+<span class="cm"># 1) KV bytes per token from config values, formula (97.1)</span>
+<span class="kw2">def</span> kv_bytes(cfg, b=2):
+    L = cfg[<span class="st">"num_hidden_layers"</span>]
+    <span class="kw2">if</span> <span class="st">"kv_lora_rank"</span> <span class="kw2">in</span> cfg:                       <span class="cm"># MLA: latent + shared RoPE key</span>
+        <span class="kw2">return</span> L * (cfg[<span class="st">"kv_lora_rank"</span>] + cfg[<span class="st">"qk_rope_head_dim"</span>]) * b
+    dh = cfg.get(<span class="st">"head_dim"</span>, cfg[<span class="st">"hidden_size"</span>] // cfg[<span class="st">"num_attention_heads"</span>])
+    <span class="kw2">return</span> 2 * L * cfg[<span class="st">"num_key_value_heads"</span>] * dh * b
+llama31_8b = dict(num_hidden_layers=32, hidden_size=4096, num_attention_heads=32,
+                  num_key_value_heads=8, head_dim=128)
+deepseek_v3 = dict(num_hidden_layers=61, kv_lora_rank=512, qk_rope_head_dim=64)
+print(kv_bytes(llama31_8b), kv_bytes(deepseek_v3))     <span class="cm"># 131072 70272 bytes per token</span>
+free = 0.9 * 80e9 - 16.06e9                         <span class="cm"># H100 80 GB, 90% usable, 8B weights in BF16</span>
+<span class="kw2">for</span> n_kv <span class="kw2">in</span> (32, 8, 1):                              <span class="cm"># MHA, GQA-8 (the real model), MQA</span>
+    beta = kv_bytes(dict(llama31_8b, num_key_value_heads=n_kv))
+    print(n_kv, <span class="st">"KV heads:"</span>, beta // 1024, <span class="st">"KiB/token,"</span>, int(free // (32768 * beta)), <span class="st">"sequences of 32k fit"</span>)
+<span class="cm"># 512 KiB: 3 sequences, 128 KiB: 13, 16 KiB: 104   (formula 97.2)</span>
+
+<span class="cm"># 2) a toy MHA layer and its GQA conversion, formula (97.5)</span>
+d, n_h, dh, T = 64, 8, 8, 16
+<span class="kw2">def</span> heads(rho):                                     <span class="cm"># heads = shared part + own part</span>
+    shared = torch.randn(dh, d) / d ** 0.5
+    own = torch.randn(n_h, dh, d) / d ** 0.5
+    <span class="kw2">return</span> rho ** 0.5 * shared + (1 - rho) ** 0.5 * own
+Wq, Wk, Wv = torch.randn(n_h, dh, d) / d ** 0.5, heads(0.5), heads(0.5)
+Wo = torch.randn(n_h, d, dh) / (n_h * dh) ** 0.5
+mask = torch.ones(T, T, dtype=torch.bool).tril()
+
+<span class="kw2">def</span> attn(x, Wk_, Wv_, group):                       <span class="cm"># group[i] = KV head read by query head i</span>
+    q = torch.einsum(<span class="st">"hed,btd->bhte"</span>, Wq, x)
+    k = torch.einsum(<span class="st">"hed,btd->bhte"</span>, Wk_, x)[:, group]
+    v = torch.einsum(<span class="st">"hed,btd->bhte"</span>, Wv_, x)[:, group]
+    a = (q @ k.transpose(-1, -2) / dh ** 0.5).masked_fill(~mask, float(<span class="st">"-inf"</span>)).softmax(-1)
+    <span class="kw2">return</span> torch.einsum(<span class="st">"hde,bhte->btd"</span>, Wo, a @ v)
+
+<span class="kw2">def</span> rel_err(y, y_ref):
+    <span class="kw2">return</span> ((y - y_ref).norm() / y_ref.norm()).item()
+
+x_test = torch.randn(64, T, d)
+y_mha = attn(x_test, Wk, Wv, list(range(n_h)))
+n_kv = 2; r = n_h // n_kv; group = [i // r <span class="kw2">for</span> i <span class="kw2">in</span> range(n_h)]
+inits = {<span class="st">"mean"</span>: (Wk.view(n_kv, r, dh, d).mean(1), Wv.view(n_kv, r, dh, d).mean(1)),
+         <span class="st">"first"</span>: (Wk[::r].clone(), Wv[::r].clone()),
+         <span class="st">"random"</span>: (torch.randn(n_kv, dh, d) / d ** 0.5, torch.randn(n_kv, dh, d) / d ** 0.5)}
+
+<span class="cm"># 3) "uptraining": train only the shared K, V weights to match the MHA layer on fresh data</span>
+<span class="kw2">for</span> name, (k0, v0) <span class="kw2">in</span> inits.items():
+    k_g, v_g = k0.clone().requires_grad_(), v0.clone().requires_grad_()
+    opt = torch.optim.Adam([k_g, v_g], lr=3e-3)
+    before = rel_err(attn(x_test, k_g, v_g, group), y_mha)
+    <span class="kw2">for</span> step <span class="kw2">in</span> range(300):
+        x = torch.randn(4, T, d)                      <span class="cm"># a new batch each step: no overfitting</span>
+        loss = ((attn(x, k_g, v_g, group) - attn(x, Wk, Wv, list(range(n_h)))) ** 2).sum()
+        opt.zero_grad(); loss.backward(); opt.step()
+    <span class="kw2">with</span> torch.no_grad():
+        print(f<span class="st">"{name:6s} error before {before:.3f}  after 300 steps {rel_err(attn(x_test, k_g, v_g, group), y_mha):.3f}"</span>)
+<span class="cm"># mean 0.656 -> 0.616, first 0.918 -> 0.616, random 1.341 -> 0.632</span>
+
+<span class="cm"># 4) GQA is a special case of MLA with the same cache, formula (97.6)</span>
+c_dim = 2 * n_kv * dh                                <span class="cm"># latent = all GQA keys and values</span>
+W_down = torch.cat([Wk.view(n_kv, r, dh, d).mean(1).reshape(-1, d),
+                    Wv.view(n_kv, r, dh, d).mean(1).reshape(-1, d)])   <span class="cm"># (c_dim, d)</span>
+E = torch.eye(c_dim)
+W_uk = torch.stack([E[group[i] * dh:(group[i] + 1) * dh] <span class="kw2">for</span> i <span class="kw2">in</span> range(n_h)])            <span class="cm"># selections</span>
+W_uv = torch.stack([E[(n_kv + group[i]) * dh:(n_kv + group[i] + 1) * dh] <span class="kw2">for</span> i <span class="kw2">in</span> range(n_h)])
+gqa = attn(x_test, *inits[<span class="st">"mean"</span>], group)
+mla = attn(x_test, W_uk @ W_down, W_uv @ W_down, list(range(n_h)))    <span class="cm"># per-head K, V from c</span>
+print(<span class="st">"GQA == MLA with selection up-projections:"</span>, torch.allclose(gqa, mla, atol=1e-5))   <span class="cm"># True</span>
+
+<span class="cm"># 5) MHA -> MLA at the same cache size: joint SVD of the stacked K and V weights, formula (97.7)</span>
+W_kv = torch.cat([Wk.reshape(-1, d), Wv.reshape(-1, d)])                <span class="cm"># (2*n_h*dh, d)</span>
+U, S, Vh = torch.linalg.svd(W_kv, full_matrices=False)
+Vr = Vh[:c_dim]                                        <span class="cm"># top right singular vectors = W_down</span>
+P = Vr.T @ Vr                                          <span class="cm"># project h onto the latent space</span>
+y_svd = attn(x_test, Wk @ P, Wv @ P, list(range(n_h)))
+print(f<span class="st">"same cache ({c_dim} numbers/token): GQA mean-pool error {rel_err(gqa, y_mha):.3f}, "</span>
+      f<span class="st">"MLA via SVD error {rel_err(y_svd, y_mha):.3f}"</span>)
+<span class="cm"># same cache (32 numbers/token): GQA mean-pool error 0.656, MLA via SVD error 0.393</span>
+
+<span class="cm"># 6) MLA decode: absorbed vs rebuilding K and V, per cached token, one layer, DeepSeek-V3 sizes</span>
+n_h3, d_c, d_r, d_nope, d_v = 128, 512, 64, 128, 128
+absorbed = n_h3 * (2 * (d_c + d_r) + 2 * d_c)          <span class="cm"># scores on c and k_R, weighted sum of c</span>
+rebuild = n_h3 * 2 * d_c * (d_nope + d_v)              <span class="cm"># up-project one cached latent to K and V</span>
+print(<span class="st">"absorbed:"</span>, absorbed, <span class="st">"FLOPs; rebuild K,V:"</span>, rebuild, <span class="st">"FLOPs; intensity"</span>,
+      round(absorbed / ((d_c + d_r) * 2), 1), <span class="st">"FLOPs/byte"</span>)
+<span class="cm"># absorbed: 278528 FLOPs; rebuild K,V: 33554432 FLOPs; intensity 241.8 FLOPs/byte   (formula 97.8)</span></pre>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>Why bytes per token matter</th><th>Link</th></tr></thead><tbody>
+<tr><td>High-throughput chat serving</td><td>At full memory, throughput is inversely proportional to \(\beta\) (97.4). GQA-8 gives about 4 times the tokens per second of MHA on the same GPU.</td><td><a href="../inference/index.html#row-batching-continuous-batching-chunked-prefill-split-fuse" title="Batching: continuous batching, chunked prefill, split-fuse (planned)">session 135</a></td></tr>
+<tr><td>Serving DeepSeek and Kimi models</td><td>MLA caches about 68.6 KiB per token for 61 layers; data-parallel attention keeps it from being copied on every GPU (97.9).</td><td><a href="../inference/index.html#row-distributed-serving-and-prefill-decode-disaggregation" title="Distributed serving and prefill–decode disaggregation (planned)">session 137</a></td></tr>
+<tr><td>Cheaper serving of an existing model</td><td>Convert MHA to GQA by mean pooling plus a short uptraining (Algorithm 1), or MHA/GQA to MLA (MHA2MLA, TransMLA).</td><td><a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a></td></tr>
+<tr><td>Long-video understanding and Video-RAG</td><td>A 30-minute video at 1 frame per second and 256 visual tokens per frame is 460,800 tokens: 56.25 GiB of cache at 128 KiB per token (Llama-3.1-8B-like GQA), 225 GiB with MHA, 30.2 GiB at an MLA cost of 68.6 KiB per token.</td><td><a href="../video/index.html#row-long-video" title="Long video (planned)">session 206</a></td></tr>
+<tr><td>Video question answering and key-moment detection</td><td>Many questions reuse one prefilled video prefix; a smaller \(\beta\) keeps more videos’ caches resident for prefix caching.</td><td><a href="../inference/index.html#row-memory-management-pagedattention-prefix-caching-radixattention" title="Memory management: PagedAttention, prefix caching, RadixAttention (planned)">session 134</a></td></tr>
+<tr><td>Agents and long tool traces</td><td>Context grows with every tool call; \(N_{\text{tok}}\) in (97.2) sets how many agent sessions one GPU can keep alive.</td><td><a href="../inference/index.html#row-scenarios-and-capacity-planning-agents-long-context" title="Scenarios and capacity planning: agents, long context, edge, cost (planned)">session 141</a></td></tr>
+<tr><td>Edge and on-device models</td><td>The weights are small, so the cache is a large share of memory even at short context; GQA with few KV heads is common in small models. [Likely]</td><td><a href="../inference/index.html#row-hardware-accelerators-and-edge-deployment" title="Hardware accelerators and edge deployment (planned)">session 140</a></td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Reading <code>num_key_value_heads</code> for an MLA model.</b> DeepSeek-V3’s config says 128, which would give 3.8 MiB per token. The real cache is set by <code>kv_lora_rank</code> and <code>qk_rope_head_dim</code>: 68.6 KiB.</li>
+<li><b>Expecting GQA to speed up batch-1 short-context decoding.</b> With 16 GB of weights and a short context, the cache is a small part of the bytes read (Figure 2 at batch 1). The gain shows up at large batch or long context.</li>
+<li><b>Assuming MQA always beats GQA-8 in memory.</b> Under tensor parallelism with \(P = 8\), both store one key–value head per GPU (97.9). MQA just stores 8 copies and loses quality.</li>
+<li><b>Running MLA under plain tensor parallelism and counting the cache once.</b> Every GPU holds the full latent; the cache per GPU does not shrink with \(P\). Use data-parallel attention or count it \(P\) times.</li>
+<li><b>Using one MLA form for both phases.</b> The absorbed form in prefill does about 3 times more FLOPs; the naive form in decode either rebuilds K and V for every cached token (about 120 times more FLOPs) or needs an MHA-sized cache.</li>
+<li><b>Mean-pooling heads that are not neighbours in the checkpoint’s layout.</b> Groups must follow the layout the inference code will use (query head \(i\) reads KV head \(\lfloor i / r \rfloor\)); pooling heads \(0, 4, 8, \dots\) and then serving with <code>repeat_interleave</code> gives silently wrong outputs.</li>
+<li><b>Skipping uptraining.</b> Mean pooling is least squares in weight space, not in output space; MQA in particular is not useful before uptraining, according to the GQA paper.</li>
+<li><b>Comparing quality numbers across papers.</b> The MQA, GQA and DeepSeek studies used different models, data and metrics. Compare designs only inside one study.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is “KV bytes per token” and how do you compute it from a config file?<span class="lvl">basic</span></summary><div class="ans">It is the cache memory one token of context takes over all layers. For MHA, GQA and MQA: \(2 L n_{kv} d_h b\) with <code>num_hidden_layers</code>, <code>num_key_value_heads</code>, <code>head_dim</code> (or hidden size / heads) and \(b = 2\) for bfloat16. For MLA: \(L (d_c + d_R) b\) with <code>kv_lora_rank</code> and <code>qk_rope_head_dim</code> (97.1). Llama 3.1 8B: \(2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) bytes = 128 KiB. DeepSeek-V3: \(61 \cdot 576 \cdot 2 = 70{,}272\) bytes.</div></details>
+<details class="qa"><summary>How many 32k-token sequences fit on one 80 GB H100 with Llama 3.1 8B?<span class="lvl">basic</span></summary><div class="ans">Weights in bfloat16: about 16.06 GB. With 90% of memory usable, \(72 - 16.06 = 55.94\) GB are left. One sequence needs \(32{,}768 \times 131{,}072\) bytes = 4 GiB ≈ 4.29 GB. So \(\lfloor 55.94 / 4.29 \rfloor = 13\) sequences (97.2). An MHA version (512 KiB per token) would fit 3.</div></details>
+<details class="qa"><summary>GQA barely changes FLOPs. When does it make serving faster, and when not?<span class="lvl">core</span></summary><div class="ans">Decode is memory-bound: each step reads the weights and the whole cache (97.3). At batch 1 and short context the weights dominate the bytes, so GQA hardly helps. At large batch or long context the cache dominates. When the GPU is full, every step reads about \(uM\) bytes whatever the design, and the number of sequences in the batch is \((uM - W)/(T\beta)\), so throughput is inversely proportional to \(\beta\) (97.4). GQA-8 with 32 query heads gives 4 times the throughput of MHA at full memory.</div></details>
+<details class="qa"><summary>How do you convert an MHA checkpoint to GQA? Why the mean?<span class="lvl">core</span></summary><div class="ans">Group neighbouring query heads into \(n_{kv}\) groups. Set each group’s key and value projection to the mean of the old projections in the group; keep \(W^Q\), \(W^O\) and everything else. The mean is the least-squares solution \(\argmin_W \sum_i \lVert W - W^K_i \rVert_F^2\) (97.5). Then uptrain: continue pre-training on the original data for about 5% of the original steps. The GQA paper found mean pooling better than the first head or random init, and found that GQA is reasonable right after conversion while MQA needs uptraining.</div></details>
+<details class="qa"><summary>In the MQA paper, why compare MQA with MHA models that have 1 head of 128 or 8 heads of 16?<span class="lvl">core</span></summary><div class="ans">Those MHA models have exactly the same cache as MQA: \(2 h d_k = 256\) numbers per layer. They show what you get by simply shrinking attention to the same budget. All were worse than MQA (dev BLEU 25.8 to 26.2 against 26.5; ln-perplexity 1.480 to 1.518 against 1.439). So with a fixed cache, keeping many query heads and sharing one key–value head is the better use of the bytes.</div></details>
+<details class="qa"><summary>Show that GQA is a special case of MLA. What does that imply?<span class="lvl">advanced</span></summary><div class="ans">Define the MLA latent as all of GQA’s cached keys and values stacked: \(\mathbf{c}_t = [W^K_0; \dots; W^V_{n_{kv}-1}] \mathbf{h}_t\), size \(2 n_{kv} d_h\). Choose up-projections that select blocks: \(W^{UK}_i = E_{g(i)}\), \(W^{UV}_i = E_{n_{kv} + g(i)}\) (97.6). Then every head gets exactly its GQA key and value, with the same cache. So MLA with learned up-projections can represent anything GQA can at that cache size, and more (different keys per head). The catch is RoPE, which must be handled separately (decoupled RoPE in DeepSeek, special conversions in TransMLA).</div></details>
+<details class="qa"><summary>How would you convert an MHA model into MLA without training from scratch?<span class="lvl">advanced</span></summary><div class="ans">Stack the key and value matrices into \(W^{KV}\) and take its SVD. Keep the top \(d_c\) right singular vectors as the down-projection and \(W^{KV} V_{d_c}\) as the up-projections (97.7). By Eckart–Young this is the best rank-\(d_c\) approximation in Frobenius norm, so at the same cache it is never worse in weight space than mean-pooled GQA. RoPE does not commute with the absorption, so keep RoPE only on a few dimensions as a separate shared key (partial RoPE), then fine-tune briefly. This is the MHA2MLA recipe; it reports 92.19% less cache on Llama 2 7B with a 0.5% LongBench drop.</div></details>
+<details class="qa"><summary>Why do serving engines run MLA differently in prefill and decode?<span class="lvl">advanced</span></summary><div class="ans">The naive form up-projects latents to per-head keys (192) and values (128): 640 FLOPs per pair and head. The absorbed form works on the 576 cached numbers directly: 2,176 FLOPs per pair and head, 3.4 times more, but it never builds keys. In prefill, compute is the limit and each latent is used by many queries, so the naive form wins (about 3 times fewer FLOPs at 4k tokens). In decode, the naive form would rebuild K and V for every cached token at every step (33.6 MFLOPs per token per layer in DeepSeek-V3, 120 times the absorbed cost), so the absorbed form wins and runs at about 242 FLOPs per byte (97.8).</div></details>
+<details class="qa"><summary>Why is GQA with 8 key–value heads such a common choice?<span class="lvl">core</span></summary><div class="ans">Quality: uptrained GQA-8 was within 0.1 points of MHA on T5-XXL while almost as fast as MQA (0.28 vs 0.24 s per sample). Hardware: nodes usually have 8 GPUs, and with \(n_{kv} = 8\) and \(P = 8\) each GPU holds exactly one key–value head with no copies (97.9). MQA under the same TP stores the same 40 KiB per GPU (for a 70B shape) but as 8 copies, so it has no memory advantage there and loses quality.</div></details>
+<details class="qa"><summary>You deploy an MLA model with tensor parallelism on 8 GPUs and the batch is smaller than expected. Why?<span class="lvl">advanced</span></summary><div class="ans">Under TP each GPU holds \(n_h / 8\) heads, but every head reads the full latent, so every GPU stores the whole cache: the cache per GPU does not shrink with \(P\), and the total is copied 8 times. For a 70B shape that is 90 KiB per token per GPU against 40 KiB for GQA-8. The intensity of decode attention per GPU also falls (from 121 to 15 FLOPs per byte for 64 heads). The fix is data-parallel attention: each GPU runs attention for its own requests and keeps only their latents; SGLang does this for DeepSeek models.</div></details>
+<details class="qa"><summary>Is MLA always better than GQA? Give the trade-offs.<span class="lvl">advanced</span></summary><div class="ans">Pros: per-head keys and values from a small cache; DeepSeek’s ablations show MLA matching or beating MHA with a 7 to 25 times smaller cache. Cons: more FLOPs per decode step (near compute-bound), a separate RoPE path, two execution forms, special kernels, and a cache that does not shard under TP. The quality evidence comes mostly from DeepSeek’s own experiments. For a small dense model served with TP on one node, GQA-8 is simpler and its per-GPU cache can be smaller.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Qwen2.5-72B has 80 layers, 64 query heads, 8 key–value heads and \(d_h = 128\). Compute \(\beta\) in bfloat16 and the cache of one 32,768-token sequence.</li>
+<li>For the same model, compute \(\beta_{\text{GPU}}\) and the replication factor with \(P = 4\) and \(P = 16\).</li>
+<li>Use (97.4) to compute the full-memory throughput of the Llama-3.1-8B shape at \(T = 4{,}096\) with GQA-8 and with MHA (\(u M = 72\) GB, \(W = 16.06\) GB, 3.35 TB/s). Why is the ratio exactly 4?</li>
+<li>Prove (97.5): show that the mean of \(r\) matrices minimizes the sum of squared Frobenius distances to them.</li>
+<li>Kimi K2 uses MLA with 64 heads and the same \(d_c = 512\), \(d_R = 64\). What is the arithmetic intensity of absorbed decode attention (97.8)? What is it per GPU under TP with \(P = 8\)?</li>
+<li>The GQA paper’s uptraining with \(\alpha = 0.05\) took about 600 TPUv3 chip-days for T5-XXL. If cost is linear in steps, what did the original pre-training cost, and what would \(\alpha = 0.1\) cost?</li>
+<li>Why can an MLA latent with \(d_c \ge d\) always represent the MHA layer exactly? Why do real models still use \(d_c \ll d\)?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(2 \times 80 \times 8 \times 128 \times 2 = 327{,}680\) bytes = 320 KiB per token; \(32{,}768 \times 320\) KiB = 10 GiB per sequence. 2. \(P = 4\): 2 KV heads per GPU, \(2 \times 80 \times 2 \times 128 \times 2\) bytes = 80 KiB per GPU, total 320 KiB, no copies (factor 1). \(P = 16\): one head per GPU = 40 KiB, total 640 KiB, factor 2. 3. \(3.35 \times 10^{12} \times 55.94 \times 10^{9} / (72 \times 10^{9} \times 4{,}096 \times \beta)\): GQA-8 (\(\beta = 131{,}072\)) about 4,848 tokens/s; MHA (\(\beta = 524{,}288\)) about 1,212. The ratio is exactly \(524{,}288 / 131{,}072 = 4\) because (97.4) is inversely proportional to \(\beta\) and nothing else changes. 4. \(f(W) = \sum_i \lVert W - W_i \rVert_F^2\) is a sum of convex quadratics; its gradient is \(2 \sum_i (W - W_i) = 2 (r W - \sum_i W_i)\), which is zero only at \(W = \frac{1}{r} \sum_i W_i\). 5. \(64 \times 2{,}176 / 1{,}152 \approx 120.9\) FLOPs per byte; under TP with \(P = 8\) each GPU has 8 heads reading the full latent: \(8 \times 2{,}176 / 1{,}152 \approx 15.1\). 6. \(600 / 0.05 = 12{,}000\) chip-days for pre-training; \(\alpha = 0.1\) would take about 1,200 chip-days. 7. If \(d_c \ge d\), the down-projection can be the identity on \(\mathbf{h}_t\) (or any invertible map), and \(W^{UK}_i = W^K_i\), \(W^{UV}_i = W^V_i\) reproduce MHA exactly; but then the cache is \(d\) numbers per layer, no better than caching the hidden state. Compression only helps when \(d_c \ll 2 n_h d_h\); DeepSeek-V3 uses \(d_c = 512\) with \(d = 7{,}168\) and \(2 n_h d_h = 32{,}768\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>KV bytes per token \(\beta\) is the serving currency: \(2 L n_{kv} d_h b\) for MHA, GQA and MQA, \(L (d_c + d_R) b\) for MLA (97.1). It does not depend on width or on the number of query heads.</li>
+<li>\(\beta\) sets the largest batch \((uM - W)/(T\beta)\) (97.2), and at full memory throughput is inversely proportional to \(\beta\) (97.4). At batch 1 and short context the design barely matters.</li>
+<li>For a fixed cache, sharing K and V across many query heads beats having fewer heads (MQA paper); GQA-8 keeps almost all MHA quality (GQA paper).</li>
+<li>Uptraining converts MHA to GQA: mean-pool each group (the least-squares choice, 97.5), then continue pre-training for about 5% of the original steps.</li>
+<li>GQA is MLA with 0/1 up-projections (97.6); an SVD converts MHA to MLA at equal cache and is never worse than mean pooling in weight space (97.7).</li>
+<li>MLA runs in naive form for prefill and absorbed form for decode (97.8); absorbed decode reaches about 242 FLOPs per byte in DeepSeek-V3.</li>
+<li>Under tensor parallelism MQA and MLA replicate their cache (97.9): GQA-8 fits 8-GPU nodes, and MLA is served with data-parallel attention.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \beta_{\text{GQA}} = 2 L n_{kv} d_h b, \quad \beta_{\text{MLA}} = L (d_c + d_R) b, \quad B_{\max} = \left\lfloor \frac{uM - W}{T \beta} \right\rfloor, \quad \text{thr}_{\max} \approx \frac{\text{BW}\,(uM - W)}{uM\, T\, \beta} \]</div>
+<div class="eq">\[ W^K_g = \frac{1}{r} \sum_{i : g(i) = g} W^K_i, \qquad W^{KV} \approx (W^{KV} V_{d_c}) V_{d_c}^{\top}, \qquad I_{\text{MLA}} = \frac{n_h (2(d_c + d_R) + 2 d_c)}{(d_c + d_R) b} \]</div>
+<h2 class="plain" id="efficient-attention-1-mqa-gqa-and-mla-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Shazeer (2019). <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener">Fast Transformer Decoding: One Write-Head is All You Need</a></li><li>Ainslie et al. (2023). <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</a></li><li>DeepSeek-AI (2024). <a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Shazeer (2019). <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener">Fast Transformer Decoding: One Write-Head is All You Need</a></li><li>Ainslie et al. (2023). <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</a></li><li>DeepSeek-AI (2024). <a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">DeepSeek-V2: A Strong, Economical, and Efficient Mixture-of-Experts Language Model</a></li><li>DeepSeek-AI (2024). <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-V3 Technical Report</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Meng, Tang, Tang, Yao, Sun, Zhang (2025). <a href="https://arxiv.org/abs/2502.07864" target="_blank" rel="noopener">TransMLA: Multi-Head Latent Attention Is All You Need</a></li><li>Ji et al. (2025). <a href="https://arxiv.org/abs/2502.14837" target="_blank" rel="noopener">Towards Economical Inference: Enabling DeepSeek&#x27;s Multi-Head Latent Attention in Any Transformer-based LLMs</a></li><li>Zheng et al. (2023). <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">SGLang: Efficient Execution of Structured Language Model Programs</a></li><li>SGLang team (2025). <a href="https://docs.sglang.ai/references/deepseek.html" target="_blank" rel="noopener">SGLang documentation: DeepSeek model optimizations (data-parallel attention)</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Moonshot AI (2025). <a href="https://huggingface.co/moonshotai/Kimi-K2-Instruct/blob/main/config.json" target="_blank" rel="noopener">Kimi-K2-Instruct config.json (Hugging Face)</a></li><li>Qwen team (2025). <a href="https://huggingface.co/Qwen/Qwen3-235B-A22B/blob/main/config.json" target="_blank" rel="noopener">Qwen3-235B-A22B config.json (Hugging Face)</a></li><li>Shoeybi et al. (2019). <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/efficient-ffn-3-moe-from-dense-models.html"><small>Previous · session 96</small>Efficient FFN 3: MoE from dense models, and MoE inference</a><a class="next" href="../inference/efficient-attention-2-low-rank-attention-linformer.html"><small>Next · session 98</small>Efficient attention 2: low-rank attention (Linformer, Luna, Set Transformer)</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="efficient-attention-1-mqa-gqa-and-mla"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const comma=n=>Math.round(n).toLocaleString("en-US");
+const f1=x=>(Math.round(x*10)/10).toLocaleString("en-US",{minimumFractionDigits:1,maximumFractionDigits:1});
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let spare=null;return()=>{if(spare!==null){const v=spare;spare=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));spare=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+function arr(g,n,sc){const a=new Float64Array(n);for(let i=0;i<n;i++)a[i]=g()*sc;return a;}
+const T_=(x,y,s,o)=>`<text x="${x}" y="${y}" ${o||""}>${s}</text>`;
+function segInit(seg,attr,cb){seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+const KIB=1024,GIB=1024**3;
+
+/* ---------- Figure 1: KV bytes per token of real models ---------- */
+(function(){
+ const svg=$("#ea-ladder-svg");if(!svg)return;const info=$("#ea-ladder-info"),seg=$("#ea-ladder-mode");
+ // name, kind, L, n_h, n_kv, d_h, d_c, d_R
+ const M=[
+  ["Falcon 7B","MQA",32,71,1,64],
+  ["DeepSeek-V2","MLA",60,128,0,128,512,64],
+  ["DeepSeek-V3","MLA",61,128,0,128,512,64],
+  ["Kimi K2","MLA",61,64,0,128,512,64],
+  ["Llama 3.1 8B","GQA",32,32,8,128],
+  ["Qwen3-235B-A22B","GQA",94,64,4,128],
+  ["Llama 3.1 70B","GQA",80,64,8,128],
+  ["Qwen2.5 72B","GQA",80,64,8,128],
+  ["DeepSeek 67B","GQA",95,64,8,128],
+  ["Llama 2 7B","MHA",32,32,32,128]];
+ const COL={MHA:"var(--k)",GQA:"var(--q)",MQA:"var(--v)",MLA:"var(--tc)"};
+ const beta=m=>m[1]==="MLA"?m[2]*(m[6]+m[7])*2:2*m[2]*m[4]*m[5]*2;
+ const mha=m=>2*m[2]*m[3]*m[5]*2;
+ let sel=2,mode="real";
+ const x0=160,x1=620,lo=Math.log(4),hi=Math.log(4096);
+ const X=kib=>x0+(Math.log(Math.max(kib,4))-lo)/(hi-lo)*(x1-x0);
+ function draw(){
+  let g="";
+  for(let k=4;k<=4096;k*=4){const x=X(k);g+=`<line x1="${x}" y1="18" x2="${x}" y2="300" stroke="var(--rule)" stroke-width="1"/>`+T_(x,318,k>=1024?(k/1024)+" MiB":k+" KiB",'text-anchor="middle" font-size="12" class="svgs"');}
+  M.forEach((m,i)=>{const y=24+i*28,b=beta(m)/KIB,on=i===sel;
+   g+=`<g class="ea-row" data-i="${i}" style="cursor:pointer"><rect x="0" y="${y-4}" width="640" height="26" fill="${on?"var(--paper2)":"transparent"}"/>`;
+   g+=T_(x0-8,y+13,m[0],`text-anchor="end" font-size="13" class="svgt" ${on?'font-weight="700"':""}`);
+   if(mode==="mha"){const w=X(mha(m)/KIB)-x0;g+=`<rect x="${x0}" y="${y+2}" width="${w}" height="14" rx="3" fill="var(--rule)"/>`;}
+   g+=`<rect x="${x0}" y="${y}" width="${Math.max(2,X(b)-x0)}" height="18" rx="4" fill="${COL[m[1]]}" stroke="${on?"var(--ink)":"none"}" stroke-width="2"/>`;
+   const lab=(b%1===0?comma(b):b.toFixed(b<100?3:1).replace(/0+$/,""))+" KiB";
+   const xe=mode==="mha"?Math.max(X(b),X(mha(m)/KIB)):X(b);
+   g+=T_(Math.min(xe+6,628),y+13,lab,`font-size="12" class="svgs" ${xe+6>560?'text-anchor="end"':""}`)+`</g>`;});
+  svg.innerHTML=g;
+  const m=M[sel],b=beta(m),h=mha(m);
+  const f=m[1]==="MLA"?`L (d<sub>c</sub> + d<sub>R</sub>) b = ${m[2]} × (${m[6]} + ${m[7]}) × 2`:`2 L n<sub>kv</sub> d<sub>h</sub> b = 2 × ${m[2]} × ${m[4]} × ${m[5]} × 2`;
+  info.dataset.bytes=String(b);info.dataset.tokPerGiB=String(Math.floor(GIB/b));
+  info.innerHTML=`<b>${m[0]}</b> (${m[1]}${m[1]==="MLA"?"":`, ${m[3]} query heads, ${m[4]} KV head${m[4]>1?"s":""}`}): β = ${f} = <b>${comma(b)} bytes</b> = ${(b/KIB).toLocaleString("en-US",{maximumFractionDigits:3})} KiB per token.<br>1 GiB of cache holds ${comma(Math.floor(GIB/b))} tokens; one 32,768-token context takes ${(32768*b/GIB).toFixed(2)} GiB.<br>The same model with full MHA (${m[3]} KV heads of ${m[1]==="MLA"?128:m[5]}): ${comma(h/KIB)} KiB per token, ${(h/b).toFixed(1)}× more.`;}
+ svg.addEventListener("click",e=>{const r=e.target.closest(".ea-row");if(!r)return;sel=+r.dataset.i;draw();});
+ segInit(seg,"m",v=>{mode=v;draw();});
+ draw();
+})();
+
+/* ---------- Figure 2: throughput vs batch ---------- */
+(function(){
+ const svg=$("#ea-serve-svg");if(!svg)return;const sl=$("#ea-serve-t"),out=$("#ea-serve-tv"),info=$("#ea-serve-info");
+ const L=32,NH=32,DH=128,NP=8.03e9,W=2*NP,BW=3.35e12,F=989e12,UM=0.9*80e9;
+ const D=[["MHA","var(--k)","g",32],["GQA-8","var(--q)","g",8],["MQA","var(--v)","g",1],["MLA","var(--tc)","m",0]];
+ const beta=d=>d[2]==="g"?2*L*d[3]*DH*2:(4*DH+DH/2)*L*2;
+ const phi=d=>d[2]==="g"?L*NH*4*DH:L*NH*(2*(4*DH+DH/2)+2*4*DH);
+ const extra=d=>d[2]==="g"?0:L*NH*(2*DH*4*DH*2);
+ function step(d,b,T){const mem=(W+b*T*beta(d))/BW,comp=(2*NP*b+b*T*phi(d)+b*extra(d))/F;return [Math.max(mem,comp),mem>=comp?"memory":"compute"];}
+ const px0=58,px1=620,py0=262,py1=16;
+ const XB=b=>px0+Math.log2(b)/12*(px1-px0);
+ const YT=v=>py0-(Math.log10(Math.max(v,10))-1)/4*(py0-py1);
+ function draw(){
+  const T=1024*Math.pow(2,+sl.value);out.textContent=comma(T);
+  let g="";
+  for(let e=0;e<=12;e+=2){const x=XB(2**e);g+=`<line x1="${x}" y1="${py1}" x2="${x}" y2="${py0}" stroke="var(--rule)"/>`+T_(x,py0+16,comma(2**e),'text-anchor="middle" font-size="12" class="svgs"');}
+  for(let e=1;e<=5;e++){const y=YT(10**e);g+=`<line x1="${px0}" y1="${y}" x2="${px1}" y2="${y}" stroke="var(--rule)"/>`+T_(px0-6,y+4,e>=3?comma(10**e/1000)+"k":comma(10**e),'text-anchor="end" font-size="12" class="svgs"');}
+  g+=T_((px0+px1)/2,py0+33,"batch size B (sequences decoded together)",'text-anchor="middle" font-size="12" class="svgs"');
+  g+=T_(14,(py0+py1)/2,"tokens / s",`text-anchor="middle" font-size="12" class="svgs" transform="rotate(-90 14 ${(py0+py1)/2})"`);
+  const rows=[];const ds=[];
+  D.forEach(d=>{const be=beta(d);const Bm=Math.floor((UM-W)/(T*be));
+   if(Bm>=1){const pts=[];const set=new Set();for(let k=0;k<=60;k++){const b=Math.round(Math.pow(Bm,k/60));if(b>=1&&!set.has(b)){set.add(b);pts.push(b);}}if(!set.has(Bm))pts.push(Bm);
+    g+=`<polyline fill="none" stroke="${d[1]}" stroke-width="2.6" ${d[2]==="m"?'stroke-dasharray="7 4"':""} points="${pts.map(b=>XB(b).toFixed(1)+","+YT(b/step(d,b,T)[0]).toFixed(1)).join(" ")}"/>`;
+    const [tm,lim]=step(d,Bm,T);const thr=Bm/tm;
+    g+=`<circle cx="${XB(Bm)}" cy="${YT(thr)}" r="5.5" fill="${d[1]}" stroke="var(--paper)" stroke-width="1.5"/>`;
+    rows.push(`<tr><td>${d[0]}</td><td>${comma(be/KIB)}</td><td>${comma(Bm)}</td><td>${(tm*1e3).toFixed(1)} (${lim})</td><td><b>${comma(thr)}</b></td><td>${comma(1/step(d,1,T)[0])}</td></tr>`);ds.push(`${d[0]}:${Bm}:${Math.round(thr)}`);}
+   else{rows.push(`<tr><td>${d[0]}</td><td>${comma(be/KIB)}</td><td>0</td><td colspan="3">one sequence needs ${(T*be/1e9).toFixed(1)} GB; does not fit</td></tr>`);ds.push(`${d[0]}:0:0`);}});
+  svg.innerHTML=g;info.dataset.v=ds.join("|");
+  info.innerHTML=`Context ${comma(T)} tokens, ${((UM-W)/1e9).toFixed(2)} GB free for the cache.<div class="scroll-x"><table class="ea-tb"><thead><tr><th>Design</th><th>β (KiB)</th><th>B<sub>max</sub></th><th>step at B<sub>max</sub> (ms)</th><th>tokens/s at B<sub>max</sub></th><th>tokens/s at B = 1</th></tr></thead><tbody>${rows.join("")}</tbody></table></div>`;}
+ sl.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: uptraining live ---------- */
+(function(){
+ const svg=$("#ea-up-svg");if(!svg)return;
+ const segG=$("#ea-up-g"),sl=$("#ea-up-rho"),out=$("#ea-up-rhov"),play=$("#ea-up-play"),endB=$("#ea-up-end"),lab=$("#ea-up-lab"),info=$("#ea-up-info");
+ const D=32,NH=8,DH=4,T=12,NT=4,BS=2,STEPS=200,EVERY=10,LR=0.005,SQ=Math.sqrt(DH);
+ const g0=gauss(rng(97)),s=1/Math.sqrt(D);
+ const WQ=arr(g0,NH*DH*D,s),BK=arr(g0,DH*D,s),BV=arr(g0,DH*D,s),OK=arr(g0,NH*DH*D,s),OV=arr(g0,NH*DH*D,s),WO=arr(g0,NH*D*DH,1/Math.sqrt(NH*DH)),XTE=arr(g0,NT*T*D,1);
+ // helpers on flat arrays
+ function proj(X,xo,Wm,wo,out){for(let t=0;t<T;t++)for(let e=0;e<DH;e++){let a=0;const xb=xo+t*D,wb=wo+e*D;for(let c=0;c<D;c++)a+=X[xb+c]*Wm[wb+c];out[t*DH+e]=a;}}
+ function qOf(X,xo){const Q=[];for(let i=0;i<NH;i++){const q=new Float64Array(T*DH);proj(X,xo,WQ,i*DH*D,q);Q.push(q);}return Q;}
+ // forward: Kw,Vw flat (nkv*DH*D); grp: kv head per query head. returns Y and per-head A, plus K,V
+ function fwd(X,xo,Q,Kw,Vw,nkv,grp,keep){
+  const Ks=[],Vs=[];for(let k=0;k<nkv;k++){const a=new Float64Array(T*DH),b=new Float64Array(T*DH);proj(X,xo,Kw,k*DH*D,a);proj(X,xo,Vw,k*DH*D,b);Ks.push(a);Vs.push(b);}
+  const Y=new Float64Array(T*D);const As=keep?[]:null;
+  for(let i=0;i<NH;i++){const q=Q[i],K=Ks[grp[i]],V=Vs[grp[i]];const A=new Float64Array(T*T);const O=new Float64Array(T*DH);
+   for(let t=0;t<T;t++){let mx=-Infinity;for(let j=0;j<=t;j++){let a=0;for(let e=0;e<DH;e++)a+=q[t*DH+e]*K[j*DH+e];a/=SQ;A[t*T+j]=a;if(a>mx)mx=a;}
+    let z=0;for(let j=0;j<=t;j++){const v=Math.exp(A[t*T+j]-mx);A[t*T+j]=v;z+=v;}for(let j=0;j<=t;j++)A[t*T+j]/=z;
+    for(let e=0;e<DH;e++){let a=0;for(let j=0;j<=t;j++)a+=A[t*T+j]*V[j*DH+e];O[t*DH+e]=a;}}
+   const wb=i*D*DH;for(let t=0;t<T;t++)for(let a=0;a<D;a++){let v=0;for(let e=0;e<DH;e++)v+=O[t*DH+e]*WO[wb+a*DH+e];Y[t*D+a]+=v;}
+   if(keep)As.push(A);}
+  return {Y,Ks,Vs,As};}
+ let nkv=2,rho=0.5,st=null,timer=null;
+ function build(){
+  const a=Math.sqrt(rho),b=Math.sqrt(1-rho);const WK=new Float64Array(NH*DH*D),WV=new Float64Array(NH*DH*D);
+  for(let i=0;i<NH;i++)for(let k=0;k<DH*D;k++){WK[i*DH*D+k]=a*BK[k]+b*OK[i*DH*D+k];WV[i*DH*D+k]=a*BV[k]+b*OV[i*DH*D+k];}
+  const r=NH/nkv,grp=[],full=[];for(let i=0;i<NH;i++){grp.push(Math.floor(i/r));full.push(i);}
+  const gr=gauss(rng(5));const RK=arr(gr,nkv*DH*D,s),RV=arr(gr,nkv*DH*D,s);
+  const mean=(Wm)=>{const o=new Float64Array(nkv*DH*D);for(let g=0;g<nkv;g++)for(let k=0;k<DH*D;k++){let v=0;for(let j=0;j<r;j++)v+=Wm[(g*r+j)*DH*D+k];o[g*DH*D+k]=v/r;}return o;};
+  const first=(Wm)=>{const o=new Float64Array(nkv*DH*D);for(let g=0;g<nkv;g++)for(let k=0;k<DH*D;k++)o[g*DH*D+k]=Wm[(g*r)*DH*D+k];return o;};
+  const QTE=[],YTE=[];let dte=0;for(let n=0;n<NT;n++){const Q=qOf(XTE,n*T*D);QTE.push(Q);const y=fwd(XTE,n*T*D,Q,WK,WV,NH,full,false).Y;YTE.push(y);for(const v of y)dte+=v*v;}
+  const mk=(K,V)=>({K,V,mK:new Float64Array(K.length),vK:new Float64Array(K.length),mV:new Float64Array(K.length),vV:new Float64Array(K.length),h:[]});
+  st={WK,WV,grp,full,QTE,YTE,dte,gb:gauss(rng(99)),step:0,S:[mk(mean(WK),mean(WV)),mk(first(WK),first(WV)),mk(RK,RV)]};
+  st.S.forEach(o=>o.h.push(ev(o)));}
+ function ev(o){let num=0;for(let n=0;n<NT;n++){const y=fwd(XTE,n*T*D,st.QTE[n],o.K,o.V,nkv,st.grp,false).Y,yt=st.YTE[n];for(let k=0;k<y.length;k++){const d=y[k]-yt[k];num+=d*d;}}return Math.sqrt(num/st.dte);}
+ function trainStep(){
+  st.step++;const s_=st.step;const Xb=arr(st.gb,BS*T*D,1);const Qs=[],Yt=[];let den=0;
+  for(let n=0;n<BS;n++){const Q=qOf(Xb,n*T*D);Qs.push(Q);const y=fwd(Xb,n*T*D,Q,st.WK,st.WV,NH,st.full,false).Y;Yt.push(y);for(const v of y)den+=v*v;}
+  const b1=1-Math.pow(0.9,s_),b2=1-Math.pow(0.999,s_);
+  for(const o of st.S){const gK=new Float64Array(o.K.length),gV=new Float64Array(o.V.length);
+   for(let n=0;n<BS;n++){const xo=n*T*D;const Q=Qs[n];const f=fwd(Xb,xo,Q,o.K,o.V,nkv,st.grp,true);const dY=new Float64Array(T*D);for(let k=0;k<T*D;k++)dY[k]=2*(f.Y[k]-Yt[n][k])/den;
+    for(let i=0;i<NH;i++){const g=st.grp[i],A=f.As[i],K=f.Ks[g],V=f.Vs[g],q=Q[i];const wb=i*D*DH;
+     const dO=new Float64Array(T*DH);for(let t=0;t<T;t++)for(let e=0;e<DH;e++){let v=0;for(let a=0;a<D;a++)v+=dY[t*D+a]*WO[wb+a*DH+e];dO[t*DH+e]=v;}
+     const dV=new Float64Array(T*DH);for(let j=0;j<T;j++)for(let e=0;e<DH;e++){let v=0;for(let t=j;t<T;t++)v+=A[t*T+j]*dO[t*DH+e];dV[j*DH+e]=v;}
+     const dS=new Float64Array(T*T);for(let t=0;t<T;t++){let rs=0;for(let j=0;j<=t;j++){let v=0;for(let e=0;e<DH;e++)v+=dO[t*DH+e]*V[j*DH+e];dS[t*T+j]=v;rs+=v*A[t*T+j];}for(let j=0;j<=t;j++)dS[t*T+j]=A[t*T+j]*(dS[t*T+j]-rs);}
+     const dK=new Float64Array(T*DH);for(let j=0;j<T;j++)for(let e=0;e<DH;e++){let v=0;for(let t=j;t<T;t++)v+=dS[t*T+j]*q[t*DH+e];dK[j*DH+e]=v/SQ;}
+     const gb=g*DH*D;for(let e=0;e<DH;e++)for(let c=0;c<D;c++){let a=0,b=0;for(let j=0;j<T;j++){const x=Xb[xo+j*D+c];a+=dK[j*DH+e]*x;b+=dV[j*DH+e]*x;}gK[gb+e*D+c]+=a;gV[gb+e*D+c]+=b;}}}
+   const upd=(p,gr,m,v)=>{for(let k=0;k<p.length;k++){m[k]=0.9*m[k]+0.1*gr[k];v[k]=0.999*v[k]+0.001*gr[k]*gr[k];p[k]-=LR*(m[k]/b1)/(Math.sqrt(v[k]/b2)+1e-8);}};
+   upd(o.K,gK,o.mK,o.vK);upd(o.V,gV,o.mV,o.vV);}
+  if(st.step%EVERY===0)st.S.forEach(o=>o.h.push(ev(o)));}
+ const px0=50,px1=620,py0=240,py1=14,YM=1.7;
+ const XS=k=>px0+k/STEPS*(px1-px0),YE=v=>py0-Math.min(v,YM)/YM*(py0-py1);
+ const COL=["var(--q)","var(--v)","var(--k)"],NAME=["mean pooling","first head","random"];
+ function draw(){
+  let g="";for(let k=0;k<=STEPS;k+=50){const x=XS(k);g+=`<line x1="${x}" y1="${py1}" x2="${x}" y2="${py0}" stroke="var(--rule)"/>`+T_(x,py0+16,k,'text-anchor="middle" font-size="12" class="svgs"');}
+  for(let v=0;v<=1.6;v+=0.4){const y=YE(v);g+=`<line x1="${px0}" y1="${y}" x2="${px1}" y2="${y}" stroke="var(--rule)"/>`+T_(px0-6,y+4,v.toFixed(1),'text-anchor="end" font-size="12" class="svgs"');}
+  g+=T_((px0+px1)/2,py0+33,"uptraining step",'text-anchor="middle" font-size="12" class="svgs"');
+  g+=T_(13,(py0+py1)/2,"relative output error",`text-anchor="middle" font-size="12" class="svgs" transform="rotate(-90 13 ${(py0+py1)/2})"`);
+  st.S.forEach((o,k)=>{const pts=o.h.map((v,j)=>XS(j*EVERY).toFixed(1)+","+YE(v).toFixed(1)).join(" ");g+=`<polyline fill="none" stroke="${COL[k]}" stroke-width="2.6" points="${pts}"/>`;const L_=o.h.length-1;g+=`<circle cx="${XS(L_*EVERY)}" cy="${YE(o.h[L_])}" r="4.5" fill="${COL[k]}"/>`;});
+  svg.innerHTML=g;
+  const last=st.S.map(o=>o.h[o.h.length-1]),firstE=st.S.map(o=>o.h[0]),k=(st.S[0].h.length-1)*EVERY;
+  lab.textContent=`step ${k} of ${STEPS}`;info.dataset.v=last.map(v=>v.toFixed(3)).join(",");info.dataset.step=String(k);
+  info.innerHTML=`${nkv} group${nkv>1?"s":""} (${nkv===1?"MQA":"GQA-"+nkv}), ρ = ${rho.toFixed(1)}, cache ${2*nkv*DH} instead of ${2*NH*DH} numbers per token. Relative output error at step ${k}: `+st.S.map((o,j)=>`<b>${NAME[j]}</b> ${last[j].toFixed(3)}${k>0?` (start ${firstE[j].toFixed(3)})`:""}`).join(", ")+".";}
+ function stop(){if(timer){cancelAnimationFrame(timer);timer=null;}play.textContent=st&&st.step>=STEPS?"Train again":"Train";}
+ function reset(){stop();build();draw();play.textContent="Train";}
+ function frame(){const t0=performance.now();while(st.step<STEPS&&performance.now()-t0<30)trainStep();draw();if(st.step<STEPS)timer=requestAnimationFrame(frame);else{timer=null;stop();}}
+ play.addEventListener("click",()=>{if(timer){stop();return;}if(st.step>=STEPS){build();}play.textContent="Pause";timer=requestAnimationFrame(frame);});
+ endB.addEventListener("click",()=>{if(timer){cancelAnimationFrame(timer);timer=null;}while(st.step<STEPS)trainStep();draw();stop();});
+ segInit(segG,"g",v=>{nkv=+v;reset();});
+ sl.addEventListener("input",()=>{rho=+sl.value;out.textContent=rho.toFixed(1);reset();});
+ reset();
+})();
+
+/* ---------- Figure 4: mean-pool GQA vs SVD MLA at the same cache ---------- */
+(function(){
+ const svg=$("#ea-svd-svg");if(!svg)return;const sl=$("#ea-svd-rho"),out=$("#ea-svd-rhov"),info=$("#ea-svd-info");
+ const D=96,NH=8,DH=8,T=16,NT=6,SQ=Math.sqrt(DH);
+ const g0=gauss(rng(197)),s=1/Math.sqrt(D);
+ const WQ=arr(g0,NH*DH*D,s),BK=arr(g0,DH*D,s),BV=arr(g0,DH*D,s),OK=arr(g0,NH*DH*D,s),OV=arr(g0,NH*DH*D,s),WO=arr(g0,NH*D*DH,1/Math.sqrt(NH*DH)),XTE=arr(g0,NT*T*D,1);
+ function proj(X,xo,Wm,wo,o){for(let t=0;t<T;t++)for(let e=0;e<DH;e++){let a=0;const xb=xo+t*D,wb=wo+e*D;for(let c=0;c<D;c++)a+=X[xb+c]*Wm[wb+c];o[t*DH+e]=a;}}
+ const QTE=[];for(let n=0;n<NT;n++){const Q=[];for(let i=0;i<NH;i++){const q=new Float64Array(T*DH);proj(XTE,n*T*D,WQ,i*DH*D,q);Q.push(q);}QTE.push(Q);}
+ function fwd(n,Kw,Vw,nkv,grp){const xo=n*T*D,Q=QTE[n];const Ks=[],Vs=[];for(let k=0;k<nkv;k++){const a=new Float64Array(T*DH),b=new Float64Array(T*DH);proj(XTE,xo,Kw,k*DH*D,a);proj(XTE,xo,Vw,k*DH*D,b);Ks.push(a);Vs.push(b);}
+  const Y=new Float64Array(T*D);const A=new Float64Array(T),O=new Float64Array(T*DH);
+  for(let i=0;i<NH;i++){const q=Q[i],K=Ks[grp[i]],V=Vs[grp[i]];
+   for(let t=0;t<T;t++){let mx=-Infinity;for(let j=0;j<=t;j++){let a=0;for(let e=0;e<DH;e++)a+=q[t*DH+e]*K[j*DH+e];a/=SQ;A[j]=a;if(a>mx)mx=a;}let z=0;for(let j=0;j<=t;j++){A[j]=Math.exp(A[j]-mx);z+=A[j];}
+    for(let e=0;e<DH;e++){let a=0;for(let j=0;j<=t;j++)a+=A[j]*V[j*DH+e];O[t*DH+e]=a/z;}}
+   const wb=i*D*DH;for(let t=0;t<T;t++)for(let a=0;a<D;a++){let v=0;for(let e=0;e<DH;e++)v+=O[t*DH+e]*WO[wb+a*DH+e];Y[t*D+a]+=v;}}
+  return Y;}
+ function jacobi(Ain,n){const A=Float64Array.from(Ain),V=new Float64Array(n*n);for(let i=0;i<n;i++)V[i*n+i]=1;
+  let tot=0;for(let i=0;i<n*n;i++)tot+=A[i]*A[i];
+  for(let sw=0;sw<30;sw++){let off=0;for(let p=0;p<n;p++)for(let q=p+1;q<n;q++)off+=A[p*n+q]*A[p*n+q];if(off<1e-26*tot)break;
+   for(let p=0;p<n-1;p++)for(let q=p+1;q<n;q++){const apq=A[p*n+q];if(Math.abs(apq)<1e-300)continue;const app=A[p*n+p],aqq=A[q*n+q];const th=(aqq-app)/(2*apq);const t=(th>=0?1:-1)/(Math.abs(th)+Math.sqrt(th*th+1));const c=1/Math.sqrt(t*t+1),sn=t*c;
+    for(let k=0;k<n;k++){const akp=A[k*n+p],akq=A[k*n+q];A[k*n+p]=c*akp-sn*akq;A[k*n+q]=sn*akp+c*akq;}
+    for(let k=0;k<n;k++){const apk=A[p*n+k],aqk=A[q*n+k];A[p*n+k]=c*apk-sn*aqk;A[q*n+k]=sn*apk+c*aqk;}
+    for(let k=0;k<n;k++){const vkp=V[k*n+p],vkq=V[k*n+q];V[k*n+p]=c*vkp-sn*vkq;V[k*n+q]=sn*vkp+c*vkq;}}}
+  const ev=[];for(let i=0;i<n;i++)ev.push([A[i*n+i],i]);ev.sort((a,b)=>b[0]-a[0]);return {ev:ev.map(e=>e[0]),idx:ev.map(e=>e[1]),V};}
+ const cache={};
+ function compute(rho){const key=rho.toFixed(2);if(cache[key])return cache[key];
+  const a=Math.sqrt(rho),b=Math.sqrt(1-rho);const WK=new Float64Array(NH*DH*D),WV=new Float64Array(NH*DH*D);
+  for(let i=0;i<NH;i++)for(let k=0;k<DH*D;k++){WK[i*DH*D+k]=a*BK[k]+b*OK[i*DH*D+k];WV[i*DH*D+k]=a*BV[k]+b*OV[i*DH*D+k];}
+  const full=[...Array(NH).keys()];const YT=[];let den=0;for(let n=0;n<NT;n++){const y=fwd(n,WK,WV,NH,full);YT.push(y);for(const v of y)den+=v*v;}
+  const err=(K,V,nkv,grp)=>{let num=0;for(let n=0;n<NT;n++){const y=fwd(n,K,V,nkv,grp);for(let k=0;k<y.length;k++){const d=y[k]-YT[n][k];num+=d*d;}}return Math.sqrt(num/den);};
+  // C = Wst^T Wst, Wst rows = all key rows then all value rows
+  const R2=2*NH*DH;const C=new Float64Array(D*D);let wn=0;
+  for(let r=0;r<R2;r++){const src=r<NH*DH?WK:WV,o=(r%(NH*DH))*D;for(let i=0;i<D;i++){const vi=src[o+i];wn+=vi*vi;for(let j=0;j<D;j++)C[i*D+j]+=vi*src[o+j];}}
+  const J=jacobi(C,D);const evs=J.ev.map(v=>Math.max(0,v)),sev=evs.reduce((x,y)=>x+y,0);
+  const res=[];
+  for(const nkv of [1,2,4]){const r=NH/nkv,grp=full.map(i=>Math.floor(i/r));
+   const Kg=new Float64Array(nkv*DH*D),Vg=new Float64Array(nkv*DH*D);
+   for(let g=0;g<nkv;g++)for(let k=0;k<DH*D;k++){let u=0,v=0;for(let j=0;j<r;j++){u+=WK[(g*r+j)*DH*D+k];v+=WV[(g*r+j)*DH*D+k];}Kg[g*DH*D+k]=u/r;Vg[g*DH*D+k]=v/r;}
+   let wg=0;for(let i=0;i<NH;i++){const g=grp[i];for(let k=0;k<DH*D;k++){const d1=WK[i*DH*D+k]-Kg[g*DH*D+k],d2=WV[i*DH*D+k]-Vg[g*DH*D+k];wg+=d1*d1+d2*d2;}}
+   const dc=2*nkv*DH;const P=new Float64Array(D*D);for(let m=0;m<dc;m++){const col=J.idx[m];for(let i=0;i<D;i++){const vi=J.V[i*D+col];if(vi===0)continue;for(let j=0;j<D;j++)P[i*D+j]+=vi*J.V[j*D+col];}}
+   const mulP=Wm=>{const o=new Float64Array(Wm.length);for(let rr=0;rr<NH*DH;rr++)for(let j=0;j<D;j++){let v=0;for(let i=0;i<D;i++)v+=Wm[rr*D+i]*P[i*D+j];o[rr*D+j]=v;}return o;};
+   let tail=0;for(let m=dc;m<D;m++)tail+=evs[m];
+   res.push({nkv,dc,gqa:err(Kg,Vg,nkv,grp),mla:err(mulP(WK),mulP(WV),NH,full),wg:Math.sqrt(wg/wn),wm:sev>0?Math.sqrt(tail/sev):0});}
+  cache[key]=res;return res;}
+ const px0=50,px1=620,py0=212,py1=14,YM=1.0;const YE=v=>py0-Math.min(v,YM)/YM*(py0-py1);
+ function draw(){const rho=+sl.value;out.textContent=rho.toFixed(2);const res=compute(rho);
+  let g="";for(let v=0;v<=1.0001;v+=0.2){const y=YE(v);g+=`<line x1="${px0}" y1="${y}" x2="${px1}" y2="${y}" stroke="var(--rule)"/>`+T_(px0-6,y+4,v.toFixed(1),'text-anchor="end" font-size="12" class="svgs"');}
+  g+=T_(13,(py0+py1)/2,"relative output error",`text-anchor="middle" font-size="12" class="svgs" transform="rotate(-90 13 ${(py0+py1)/2})"`);
+  const W=(px1-px0)/3;
+  res.forEach((r,k)=>{const cx=px0+W*k+W/2;const bw=64;
+   [[r.gqa,"var(--q)",-bw-4],[r.mla,"var(--tc)",4]].forEach(([v,c,dx])=>{const y=YE(v);g+=`<rect x="${cx+dx}" y="${y}" width="${bw}" height="${py0-y}" rx="4" fill="${c}"/>`+T_(cx+dx+bw/2,y-5,v.toFixed(3),'text-anchor="middle" font-size="12" class="svgt"');});
+   g+=T_(cx,py0+17,`${r.dc} cached numbers`,'text-anchor="middle" font-size="13" class="svgt"')+T_(cx,py0+33,`GQA ${r.nkv} group${r.nkv>1?"s":""} vs MLA d<tspan dy="3" font-size="9">c</tspan><tspan dy="-3"> = ${r.dc}</tspan>`,'text-anchor="middle" font-size="12" class="svgs"');});
+  svg.innerHTML=g;info.dataset.v=res.map(r=>r.gqa.toFixed(3)+"/"+r.mla.toFixed(3)).join(",");
+  info.innerHTML=`ρ = ${rho.toFixed(2)}. MHA would cache ${2*NH*DH} numbers per token. `+res.map(r=>`<b>${r.dc} numbers</b>: GQA output error ${r.gqa.toFixed(3)} (weights ${r.wg.toFixed(3)}), MLA ${r.mla.toFixed(3)} (weights ${r.wm.toFixed(3)})`).join("; ")+".";}
+ sl.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 5: tensor parallelism ---------- */
+(function(){
+ const svg=$("#ea-tp-svg");if(!svg)return;const segP=$("#ea-tp-p"),segD=$("#ea-tp-d"),info=$("#ea-tp-info");
+ const L=80,NH=64,DH=128,DC=512,DR=64;const MLAF=2*(DC+DR)+2*DC,MLAB=(DC+DR)*2;
+ let P=8,des="gqa";
+ const NKV={mha:64,gqa:8,mqa:1};
+ function calc(){
+  if(des==="mla"||des==="mladp"){const per=L*(DC+DR)*2;const dp=des==="mladp";return {per,tot:dp?per:per*P,uniq:per,rep:dp?1:P,int:(dp?NH:NH/P)*MLAF/MLAB,heads:1};}
+  const nkv=NKV[des];const kvg=Math.max(nkv/P,1);const per=2*L*kvg*DH*2;const uniq=2*L*nkv*DH*2;return {per,tot:per*P,uniq,rep:per*P/uniq,int:(NH/P)/kvg,heads:kvg};}
+ function draw(){
+  const c=calc();let g="";const rows=P>8?2:1,cols=Math.min(P,8);const gw=(632-8*(cols-1))/cols,gh=rows===2?96:190;
+  const name={mha:"MHA",gqa:"GQA-8",mqa:"MQA",mla:"MLA, TP",mladp:"MLA, DP attention"}[des];
+  for(let p=0;p<P;p++){const rr=Math.floor(p/8),cc=p%8;const x=4+cc*(gw+8),y=6+rr*(gh+10);
+   g+=`<rect x="${x}" y="${y}" width="${gw}" height="${gh}" rx="8" fill="var(--paper2)" stroke="var(--rule)"/>`;
+   g+=T_(x+gw/2,y+15,`GPU ${p}`,'text-anchor="middle" font-size="12" class="svgs"');
+   const qh=des==="mladp"?NH:NH/P;g+=T_(x+gw/2,y+30,`${qh} query head${qh>1?"s":""}`,'text-anchor="middle" font-size="11" class="svgs"');
+   if(des==="mla"||des==="mladp"){const copy=des==="mla"&&p>0;const h=Math.min(40,gh-60);
+    g+=`<rect x="${x+6}" y="${y+40}" width="${gw-12}" height="${h}" rx="5" fill="var(--tc)" ${copy?'fill-opacity="0.45" stroke="var(--ink)" stroke-dasharray="4 3"':""}/>`;
+    if(gw>50)g+=T_(x+gw/2,y+40+h/2+4,"c + kᴿ",'text-anchor="middle" font-size="12" font-weight="700" style="fill:#fff;font-family:var(--sans)"');
+    if(des==="mladp"&&gh>100)g+=T_(x+gw/2,y+gh-10,"own requests",'text-anchor="middle" font-size="11" class="svgs"');}
+   else{const nkv=NKV[des];const k=c.heads;const per=Math.ceil(Math.sqrt(k*gw/(gh-44)));const cw=Math.min(28,(gw-8)/per);const ch=Math.min(28,cw);
+    for(let h=0;h<k;h++){const hid=nkv>=P?p*k+h:Math.floor(p*nkv/P);const copy=nkv<P&&(p%(P/nkv))!==0;const hx=x+4+(h%per)*cw,hy=y+38+Math.floor(h/per)*ch;
+     g+=`<rect x="${hx+1}" y="${hy+1}" width="${cw/2-1.5}" height="${ch-2}" rx="2" fill="var(--k)" ${copy?'fill-opacity="0.45" stroke="var(--ink)" stroke-dasharray="3 2"':""}/><rect x="${hx+cw/2+0.5}" y="${hy+1}" width="${cw/2-1.5}" height="${ch-2}" rx="2" fill="var(--v)" ${copy?'fill-opacity="0.45" stroke="var(--ink)" stroke-dasharray="3 2"':""}/>`;
+     if(cw>=24&&k<=2)g+=T_(hx+cw/2,hy+ch+12,"head "+hid,'text-anchor="middle" font-size="10" class="svgs"');}}}
+  svg.setAttribute("viewBox",`0 0 640 ${rows===2?218:202}`);svg.innerHTML=g;
+  info.dataset.v=[c.per/KIB,c.tot/KIB,c.rep,c.int.toFixed(1)].join(",");
+  info.innerHTML=`<b>${name}</b> on ${P} GPU${P>1?"s":""}: cache per token on each GPU <b>${comma(c.per/KIB)} KiB</b>; total over all GPUs ${comma(c.tot/KIB)} KiB (unique ${comma(c.uniq/KIB)} KiB, replication ${f1(c.rep)}×). Decode attention intensity on one GPU: <b>${f1(c.int)}</b> FLOPs per byte.${des==="mladp"?" Each GPU holds the latents of different requests, so nothing is copied.":""}`;}
+ segInit(segP,"p",v=>{P=+v;draw();});segInit(segD,"d",v=>{des=v;draw();});draw();
+})();
+})();
+</script></body></html>
