@@ -25,6 +25,11 @@ The reader must be able to scroll from beginning to end without switching Overvi
 ## Core reference
 *Vision Language Models: Building VLMs with Hugging Face* (Merve Noyan, Miquel Farré, Andrés Marafioti, Orr Zohar; O'Reilly, June 2026). Book chapters: 1 foundations; 2 applications; 3 VLM training; 4 data; 5 post-training; 6 architectures; 7 deployment; 8 Document AI; 9 Video-Language Models; 10 any-to-any models; 11 agents/research. Book assumes prior ML/Python; fill foundational gaps rather than using unexplained terms. For tokenizer specifics use [Hugging Face components](https://huggingface.co/docs/tokenizers/main/en/components), [SentencePiece docs](https://google.github.io/sentencepiece/) and [tiktoken](https://github.com/openai/tiktoken).
 
+## High-priority paper: efficient LLM inference
+- **Highest priority:** [A Survey on Efficient Inference for Large Language Models](https://arxiv.org/pdf/2404.14294) (Zhou et al., v3, July 2024). Use its three-level taxonomy (data / model / system) and the prefill/decode bottleneck analysis as the organizing reference for the inference block.
+- [Cross-lesson reading map and required labs](EFFICIENT_INFERENCE_READING_MAP.md). Focus Sessions 19–23 first, especially KV cache, IO-aware attention, quantization, speculative decoding, scheduling and serving; also strengthen Sessions 05, 12 and 13.
+- Treat the survey as a foundational 2024 paper, not a verified 2026 SOTA benchmark. Verify newer methods and up-to-date official implementations before making ranking claims.
+
 ## Long-form expansion coverage for all 46 sessions
 - **01–08:** tokenization and embeddings; autoregressive LM; transformer blocks; scaled attention; MHA/MQA/GQA; RoPE/ALiBi; RMSNorm/SwiGLU/MoE; sampling.
 - **09–18:** training data, scaling, optimization, checkpointing, FSDP/ZeRO, TP/PP/CP, SFT, LoRA/QLoRA, reward modeling, DPO/PPO, distillation.
