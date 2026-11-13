@@ -1,0 +1,589 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>The serving stack and the life of a request · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 133</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="the-serving-stack-and-the-life-of">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="the-serving-stack-and-the-life-of" data-session="the-serving-stack-and-the-life-of" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">133</span><span>Track 5: LLM inference and serving · session 56 of 65</span></div><h1 class="chap-title">The serving stack and the life of a request</h1><p class="chap-sub">A model file is not a service. Between a user and the GPU sit an engine (vLLM, TensorRT-LLM, SGLang), an API server, a router and an autoscaler. This session follows one request through all of them: tokenize, queue, schedule, prefill, decode, detokenize, stream. You learn where each millisecond of latency comes from, how streaming, cancellation and timeouts work, and how one GPU can serve many models and hundreds of LoRA adapters.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 2 hours, exercises 1 to 1.5 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 78 (prefill and decode), 80 (the KV cache), 81 (inference metrics), 84 (batching basics) and 57 (LoRA)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The four layers of a serving stack (engine, API server, router, autoscaler), what each one owns, and which real systems fill each layer</li><li>The seven stages in the life of a request, and a cost model that splits TTFT and end-to-end latency into network, queue, prefill and decode parts</li><li>Why one decode step costs almost the same for 1 and for 32 sequences, and how the batch size trades per-user speed against GPU throughput</li><li>How streaming works (server-sent events, incremental detokenization that never cuts a UTF-8 character), and how cancellation and timeouts free GPU memory</li><li>How a router spreads load and why prefix-aware routing can cut prefill work by a large factor, and how to size replicas with Little’s law</li><li>How to serve many models and many LoRA adapters on one base model: adapter size, batched LoRA kernels (Punica, S-LoRA), and vLLM’s flags</li></ul></div></header><style>
+.ss-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.ss-grid input[type=range]{width:100%}
+.ss-grid output{font:600 14px var(--mono);min-width:5.5em;text-align:right}
+.ss-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.ss-leg span::before{content:"";display:inline-block;width:14px;height:10px;border-radius:2px;margin-right:6px;vertical-align:0;background:var(--c)}
+.ss-layer{cursor:pointer}.ss-layer rect{fill:var(--card);stroke:var(--rule);stroke-width:1.6;transition:fill .2s,stroke .2s}
+.ss-layer:hover rect{stroke:var(--q)}.ss-layer.on rect{fill:var(--q-soft);stroke:var(--q);stroke-width:2.4}
+.ss-layer:focus{outline:none}.ss-layer:focus-visible rect{stroke:var(--k);stroke-width:2.6}
+.ss-tbl{width:100%;border-collapse:collapse;font:500 13.5px var(--mono);font-variant-ligatures:none}
+.ss-tbl th{font:650 13px var(--sans);text-align:left;padding:5px 8px;border-bottom:1.5px solid var(--rule);color:var(--ink2);white-space:nowrap}
+.ss-tbl td{padding:4px 8px;border-bottom:1px solid var(--rule2);white-space:nowrap}
+.ss-tbl tr.on td{background:var(--q-soft)}
+pre.code,.ss-mono{font-variant-ligatures:none}
+.article p code,.article li code,.article td code{overflow-wrap:anywhere}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Until now we made the model faster: better kernels, fewer bytes, fewer steps. But a user never talks to a model. A user sends an HTTP request to a <b>service</b>, and that service has many parts besides the GPU. Each part can add latency, waste GPU time, or drop the request.</p>
+<p>Think about what happens when you type a question into a chat product. Your text travels over the network. A <b>router</b> picks one of many machines. A web <b>server</b> checks your request, applies the chat template and turns text into token ids. The request waits in a <b>queue</b> until the <b>engine</b> has room for it in GPU memory. The engine runs the prompt through the model (<b>prefill</b>), then makes one token at a time (<b>decode</b>). Each new token is turned back into text and <b>streamed</b> to you, piece by piece. Meanwhile an <b>autoscaler</b> watches the queues and adds or removes machines. If you close the tab, all of this must stop, or the GPU keeps working for nobody.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>System-design interviews for LLM roles often start with: “Design a service that serves Llama 3 8B to 10,000 users.” Expect follow-ups such as “Where does time to first token go?”, “What do you autoscale on?”, “What happens when the client disconnects?”, “How do you serve 500 fine-tuned variants?”. This session gives you a numbered answer to each.</aside>
+<p>The serving survey by Miao et al. calls this the system side of LLM serving: memory management, batching, scheduling and distributed execution around the model. [Certain] The rest of this track goes deep into each piece: memory in <a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>, batching in <a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">session 135</a>, scheduling in <a href="../inference/scheduling-fcfs-preemption-fairness-and-slos.html">session 136</a>, multi-GPU serving in <a href="../inference/distributed-serving-and-prefill-decode-disaggregation.html">session 137</a>, and real code in <a href="../inference/vllm-internals.html">session 138</a>. This session is the map that connects them. In <a href="../inference/index.html#row-lab-profile-fuse-and-speculate" title="profile, fuse and speculate (planned)">session 132</a> you made one decode step fast. Now you see everything that happens around that step.</p>
+
+<h2>The four layers of a serving stack</h2>
+<p>A production LLM service has four layers. Each one has a different job and a different time scale.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A restaurant. The kitchen is the engine: it cooks, and its stove space (GPU memory) is limited. The waiter is the API server: takes the order, translates it for the kitchen, brings each dish as soon as it is ready. The host at the door is the router: sends each group to a table in a section that is not too busy, and sends regulars to the waiter who knows them (cache). The manager is the autoscaler: calls in more cooks when the line at the door grows, and sends them home when it is quiet.</aside>
+<ol>
+<li><b>Engine.</b> The program that owns the GPUs and runs the model. It keeps the KV cache, decides which requests run in each step (the <b>scheduler</b>), and calls the kernels. Examples: vLLM, TensorRT-LLM, SGLang. It works on a time scale of milliseconds: one decode step.</li>
+<li><b>API server.</b> The front door of one engine. It speaks HTTP (or gRPC), checks inputs, applies the chat template, tokenizes, streams the output back, and reports metrics. The most common interface is the <b>OpenAI-compatible API</b> (<code>/v1/chat/completions</code>, <code>/v1/completions</code>): <code>vllm serve &lt;model&gt;</code> starts one. [Certain] NVIDIA’s Triton Inference Server is a general server that can host many models with different <b>backends</b>, including TensorRT-LLM and vLLM. [Certain]</li>
+<li><b>Router</b> (also called gateway or load balancer). It sits in front of many engine <b>replicas</b> (copies of the same model on different GPUs) and picks one for each request. A simple router uses round robin; an LLM-aware router looks at queue lengths and at which replica already has the prompt’s prefix in its KV cache. It also handles authentication, rate limits and retries.</li>
+<li><b>Autoscaler.</b> It watches metrics (queue length, KV-cache use, latency) and changes the number of replicas. It works on a time scale of tens of seconds to minutes, because starting a replica means loading many gigabytes of weights.</li></ol>
+
+<figure class="fig wide" id="ss-stack"><div class="fig-body">
+<div class="scroll-x"><svg id="ss-stack-svg" viewBox="0 0 760 300" role="img" aria-label="The serving stack: clients, router, API servers, engines and GPUs, with the autoscaler on the side"></svg></div>
+<div class="readout" id="ss-stack-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The serving stack. Requests flow from the clients at the top down to the GPUs, and tokens flow back up. Click a layer (or focus it and press Enter) to see what it owns, which real systems fill it, and which metric tells you it is the problem.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>There is one router for many replicas, and one API server per engine (vLLM runs it as a separate process that talks to the engine core). [Certain] The autoscaler is on the side because it is not in the path of a request: it only changes how many replicas exist. Notice which layer owns which resource: only the engine knows about GPU memory and the KV cache, so only the engine can decide whether a request fits.</p></details></figure>
+<p>Inside vLLM (version 1) these layers map to separate processes: one API server process handles HTTP, tokenization and streaming; one <b>engine core</b> process runs the scheduler and manages the KV cache; and one <b>worker</b> process per GPU runs the model. They talk over ZeroMQ. [Certain] Splitting them means that slow Python work in the server (tokenizing a long prompt, building JSON) does not stop the GPU loop.</p>
+
+<h2>The life of a request, step by step</h2>
+<p>Here are the seven stages every request goes through. We give names to the times, because every latency metric is a sum of them.</p>
+<ol>
+<li><b>Tokenize.</b> The server checks the JSON, applies the chat template (<a href="../foundations/special-tokens-chat-templates-and-tokenizer-pitfalls.html">session 9</a>) and converts text to token ids. For a VLM it also decodes and resizes the images. Time \(t_{\text{tok}}\).</li>
+<li><b>Queue.</b> The request waits in the engine’s <b>waiting queue</b>. Time \(t_{\text{queue}}\). This is the part that explodes when the service is overloaded.</li>
+<li><b>Schedule.</b> At the start of every engine step, the scheduler picks which waiting requests to admit. A request is admitted only if there is enough free KV-cache memory for it. The policy (first come first served, priorities, preemption) is the topic of <a href="../inference/scheduling-fcfs-preemption-fairness-and-slos.html">session 136</a>.</li>
+<li><b>Prefill.</b> The engine runs all prompt tokens through the model in one pass, fills the KV cache, and produces the first output token. Time \(t_{\text{prefill}}\). This is compute-bound (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>).</li>
+<li><b>Decode.</b> The engine makes one token per step for every running request. Each step reads all the weights and each request’s KV cache. The time of one step is the <b>time per output token</b>, TPOT.</li>
+<li><b>Detokenize.</b> Each new token id is converted back to text, carefully, because one character can be split over several tokens.</li>
+<li><b>Stream.</b> Each new piece of text is sent to the client right away, as a server-sent event. When a stop condition is met (end-of-sequence token, <code>max_tokens</code>, a stop string), the engine frees the request’s KV cache and the server sends a final message.</li></ol>
+<p>From these stages we get the two latency numbers that users feel (<a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>). The <b>time to first token</b> (TTFT) is everything until the first piece of text arrives:</p>
+<div class="eq">\[ \text{TTFT} = t_{\text{net}}^{\uparrow} + t_{\text{tok}} + t_{\text{queue}} + t_{\text{prefill}} + t_{\text{net}}^{\downarrow} \tag{133.1} \]</div>
+<p>and the <b>end-to-end latency</b> for \(N_{\text{out}}\) output tokens adds one decode step per remaining token:</p>
+<div class="eq">\[ \text{E2E} = \text{TTFT} + (N_{\text{out}} - 1)\cdot \text{TPOT} \tag{133.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t_{\text{net}}^{\uparrow}, t_{\text{net}}^{\downarrow}\)</dt><dd>network time from client to server and back (one way each)</dd>
+<dt>\(t_{\text{tok}}\)</dt><dd>time to validate, apply the template and tokenize (plus image preprocessing for a VLM)</dd>
+<dt>\(t_{\text{queue}}\)</dt><dd>time waiting in the engine queue until the scheduler admits the request</dd>
+<dt>\(t_{\text{prefill}}\)</dt><dd>time of the forward pass over the whole prompt</dd>
+<dt>\(N_{\text{out}}\)</dt><dd>number of output tokens</dd>
+<dt>TPOT</dt><dd>time per output token: the duration of one decode step of the batch the request is in</dd></dl>
+<p>The first output token comes out of the prefill pass itself, so only \(N_{\text{out}} - 1\) decode steps follow. Detokenization and sending each chunk overlap with the next decode step, so in a good server they do not add to TPOT.</p>
+<h3>A cost model for prefill and decode</h3>
+<p>To put numbers in (133.1) and (133.2), we use the roofline view from <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>. Prefill does about \(2P\) FLOPs per prompt token, where \(P\) is the number of parameters, and it is compute-bound:</p>
+<div class="eq">\[ t_{\text{prefill}} \approx \frac{2 P\, n_{\text{in}}}{F \cdot u} \tag{133.3} \]</div>
+<p>A decode step for a batch of \(B\) sequences must read all weights once plus every sequence’s KV cache, and it does \(2PB\) FLOPs. It takes the larger of the memory time and the compute time, plus a fixed cost \(t_0\) for scheduling and kernel launches:</p>
+<div class="eq">\[ \text{TPOT}(B) = t_{\text{step}}(B) \approx t_0 + \max\!\left( \frac{M_W + B\,\bar{L}\, s_{kv}}{\eta\, \text{BW}},\ \frac{2 P B}{F \cdot u} \right) \tag{133.4} \]</div>
+<p>where the KV cache needs \(s_{kv}\) bytes per token (<a href="../inference/the-kv-cache.html">session 80</a>):</p>
+<div class="eq">\[ s_{kv} = 2 \cdot n_{\text{layers}} \cdot n_{kv} \cdot d_{\text{head}} \cdot b \tag{133.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P, M_W\)</dt><dd>number of parameters, and their size in bytes (\(2P\) in BF16)</dd>
+<dt>\(n_{\text{in}}\)</dt><dd>number of prompt tokens</dd>
+<dt>\(F, u\)</dt><dd>peak FLOP/s of the GPU, and the fraction of it we really get (model FLOPs utilization)</dd>
+<dt>\(\text{BW}, \eta\)</dt><dd>peak memory bandwidth, and the fraction of it we really get</dd>
+<dt>\(B, \bar{L}\)</dt><dd>batch size (sequences decoded together), and their average context length</dd>
+<dt>\(t_0\)</dt><dd>fixed cost per step (CPU scheduling, launches, sampling)</dd>
+<dt>\(n_{kv}, d_{\text{head}}, b\)</dt><dd>number of KV heads, size of one head, bytes per number; the 2 is for K and V</dd></dl>
+<p>Our running example is Llama 3 8B in BF16 on one H100 SXM. From its config: 32 layers, hidden size 4096, FFN size 14,336, 8 KV heads of size 128, vocabulary 128,256. [Certain] That gives \(P = 8.03 \times 10^9\) parameters, \(M_W = 16.06\) GB, and \(s_{kv} = 2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) bytes (128 KiB) per token. The H100 SXM has \(F = 989\) TFLOP/s dense BF16 and \(\text{BW} = 3.35\) TB/s. [Certain] We assume \(u = 0.5\), \(\eta = 0.8\) and \(t_0 = 1\) ms. These three are assumptions, not measurements; real values depend on the engine and the kernels.</p>
+<div class="worked"><div class="wt">Worked example: where the time of one request goes</div>
+<p>A request with \(n_{\text{in}} = 1000\) prompt tokens asks for \(N_{\text{out}} = 200\) tokens. It joins a batch of \(B = 32\) running requests. Assume 10 ms network each way, 1 ms to tokenize, and 50 ms in the queue.</p>
+<p>Prefill (133.3): \(2 \cdot 8.03\times10^9 \cdot 1000 / (989\times10^{12} \cdot 0.5) = 32.5\) ms. So TTFT (133.1) \(= 10 + 1 + 50 + 32.5 + 10 = 103.5\) ms. Half of it is queueing; the GPU work is less than a third.</p>
+<p>Decode (133.4) with \(\bar{L} = 1100\) (the average context: 1,000 prompt tokens plus half of the 200 output tokens): memory time \((16.06 + 32 \cdot 1100 \cdot 131{,}072 \times 10^{-9})\) GB \(/ (0.8 \cdot 3.35\) TB/s\() = 7.71\) ms; compute time \(2 \cdot 8.03\times10^9 \cdot 32 / (4.945\times10^{14}) = 1.04\) ms. The step is memory-bound: TPOT \(= 1 + 7.71 = 8.71\) ms, which is 115 tokens per second for this user.</p>
+<p>End to end (133.2): \(103.5 + 199 \cdot 8.71 = 1{,}838\) ms. The 199 decode steps are 94% of the total. The GPU makes \(32 / 8.71\text{ ms} = 3{,}672\) tokens per second for the whole batch.</p></div>
+<p>Step through the same request in Figure 2 to see which component holds it at each moment.</p>
+<figure class="fig wide" id="ss-life"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="ss-life-prev">Back</button><button type="button" class="btn primary" id="ss-life-play">Play</button><button type="button" class="btn" id="ss-life-next">Next</button><span id="ss-life-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="ss-life-svg" viewBox="0 0 760 330" role="img" aria-label="Swim-lane diagram of one request moving through client, router, API server, scheduler and GPU, with a timeline"></svg></div>
+<div class="readout" id="ss-life-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The life of one request (1,000 prompt tokens, 200 output tokens, batch of 32, Llama 3 8B on one H100, cost model 133.3 and 133.4). Each lane is a component; the bar at the bottom is the clock, on a log-like scale so that short stages stay visible.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>The highlighted lane holds the request in this step. The readout gives the stage, what happens in it, and the clock time when it ends. Two things to notice. First, the API server is busy twice: before the engine (tokenize) and after every step (detokenize, send). Second, after prefill the request does not “own” the GPU: it is one row of a batch of 32, and every step serves all of them.</p></details></figure>
+
+<h2>The batch size: per-user speed against GPU throughput</h2>
+<p>Look again at (133.4). At small batch sizes the step is memory-bound, and most of the bytes are the weights, which are read <b>once per step no matter how many sequences are in the batch</b>. So adding sequences is almost free: at \(B = 1\) the step takes 7.05 ms, at \(B = 32\) it takes 8.71 ms. The GPU makes 142 tokens per second at \(B = 1\) and 3,672 at \(B = 32\), 26 times more for 24% more latency per token. This is why every engine batches (<a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>).</p>
+<p>The GPU throughput in tokens per second is</p>
+<div class="eq">\[ \Theta(B) = \frac{B}{t_{\text{step}}(B)} \tag{133.6} \]</div>
+<p>But the free lunch ends. Each sequence adds its KV cache to the bytes read, so the step slowly gets longer: at \(B = 256\) it is 20.8 ms, and each user sees only 48 tokens per second. And the KV cache must fit in memory: with 90% of 80 GB usable, minus 16.06 GB of weights, about 55.9 GB is left, which holds 355 sequences of 1,200 tokens. Long prompts change everything: with 8,000-token prompts only 52 sequences fit. Explore it in Figure 3.</p>
+<figure class="fig" id="ss-lat"><div class="fig-body">
+<div class="ss-grid">
+<label for="ss-lat-in">Prompt tokens \(n_{\text{in}}\)</label><input type="range" id="ss-lat-in" min="100" max="8000" step="100" value="1000"><output id="ss-lat-inv"></output>
+<label for="ss-lat-out">Output tokens \(N_{\text{out}}\)</label><input type="range" id="ss-lat-out" min="10" max="1000" step="10" value="200"><output id="ss-lat-outv"></output>
+<label for="ss-lat-b">Batch size \(B\)</label><input type="range" id="ss-lat-b" min="0" max="8" step="1" value="5"><output id="ss-lat-bv"></output>
+<label for="ss-lat-q">Queue wait</label><input type="range" id="ss-lat-q" min="0" max="2000" step="10" value="50"><output id="ss-lat-qv"></output></div>
+<svg id="ss-lat-svg" viewBox="0 0 640 250" role="img" aria-label="Stacked bar of end-to-end latency and a curve of GPU throughput against batch size"></svg>
+<div class="ss-leg"><span style="--c:var(--muted)">network + tokenize</span><span style="--c:var(--bad)">queue</span><span style="--c:var(--k)">prefill</span><span style="--c:var(--q)">decode</span><span style="--c:var(--v)">GPU tokens/s (right plot)</span></div>
+<div class="readout" id="ss-lat-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Latency budget of one request and GPU throughput, from the cost model (133.1) to (133.6) for Llama 3 8B BF16 on one H100 SXM (\(u = 0.5\), \(\eta = 0.8\), \(t_0 = 1\) ms, 10 ms network each way, 1 ms tokenize). Left: where the end-to-end time goes. Right: throughput against batch size, with the current batch marked.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Start at the defaults: decode dominates the bar. Move the batch slider from 1 to 256: the throughput curve rises steeply, then flattens, while the decode part of the bar grows. Now push the prompt to 8,000 tokens: prefill grows (TTFT goes over 300 ms) and the readout warns when the batch no longer fits in KV memory. Finally move the queue slider: queueing adds directly to TTFT, which is why overload shows up first as slow first tokens.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>In a real engine, prefills of new requests run on the same GPU as the decode steps of old ones. A long prefill can stall every running user for tens of milliseconds. Chunked prefill splits it into pieces that share each step with decode work (<a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">session 135</a>), and disaggregated serving moves prefill to other GPUs (<a href="../inference/distributed-serving-and-prefill-decode-disaggregation.html">session 137</a>).</aside>
+
+<h2>Streaming</h2>
+<p>A user reads about as fast as a few words per second, so waiting 1.8 s for the full answer feels slow, while seeing the first words after 0.1 s feels fast. That is why chat services <b>stream</b>: they send each new piece of text as soon as it exists.</p>
+<p>The OpenAI-compatible API streams with <b>server-sent events</b> (SSE): one HTTP response stays open with content type <code>text/event-stream</code>, and the server writes lines of the form <code>data: {...}</code>, each followed by a blank line. Each chunk is a JSON object with <code>"object": "chat.completion.chunk"</code> and the new text in <code>choices[0].delta.content</code>. The last content chunk carries a <code>finish_reason</code> such as <code>"stop"</code> or <code>"length"</code>, and the stream ends with <code>data: [DONE]</code>. If the client sets <code>stream_options: {"include_usage": true}</code>, one extra chunk with token counts and an empty <code>choices</code> list comes at the end. [Certain]</p>
+<h3>Incremental detokenization</h3>
+<p>Streaming has a trap. Byte-level BPE tokenizers (<a href="../foundations/what-is-a-token-subword-tokenization-bpe.html">session 8</a>) can split one character over several tokens. The emoji 👍 is four UTF-8 bytes (<code>F0 9F 91 8D</code>); if the model emits it as two tokens, the first token alone is not valid text. Decoding each token separately gives the replacement character � (U+FFFD). Also, some tokenizers add or remove spaces depending on the neighbors, so decoding one token alone can give the wrong spacing.</p>
+<p>The fix is <b>incremental detokenization</b>: decode a short window of recent tokens together, compare with the text already sent, and send only the new part. If the new text ends with �, the last character is not finished yet, so send nothing and wait for the next token. vLLM does exactly this: its <code>detokenize_incrementally</code> keeps two offsets into the token list (a <code>prefix_offset</code> where the window starts and a <code>read_offset</code> where unsent text starts) and returns an empty string while the text ends with U+FFFD. [Certain] It also holds back the last few characters when the request has <b>stop strings</b>, so that a stop string that arrives in pieces is never shown to the user. [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 1: incremental detokenization with stop strings</div><ol>
+<li><b>state per request:</b> token list \(T\), offsets \(p\) (window start) and \(r\) (first unsent token), sent text \(S\)</li>
+<li><b>on</b> each new token \(t\): append \(t\) to \(T\)</li>
+<li>&nbsp;&nbsp;\(a \leftarrow \text{decode}(T[p:r])\) <span class="c">// text already sent, decoded with its left context</span></li>
+<li>&nbsp;&nbsp;\(b \leftarrow \text{decode}(T[p:])\) <span class="c">// the same window plus the new tokens</span></li>
+<li>&nbsp;&nbsp;<b>if</b> \(b\) ends with U+FFFD <b>or</b> \(|b| \le |a|\): <b>return</b> nothing <span class="c">// unfinished character: wait</span></li>
+<li>&nbsp;&nbsp;\(\delta \leftarrow b[|a|:]\); \(\;p \leftarrow r\); \(\;r \leftarrow |T|\); append \(\delta\) to \(S\)</li>
+<li>&nbsp;&nbsp;<b>if</b> a stop string occurs in the new part of \(S\): cut \(S\) at it, finish with reason “stop”</li>
+<li>&nbsp;&nbsp;<b>send</b> \(S\) minus its last \(\ell_{\max} - 1\) characters (not yet sent) <span class="c">// \(\ell_{\max}\) = longest stop string</span></li></ol></div>
+<figure class="fig" id="ss-detok"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="ss-detok-prev">Back</button><button type="button" class="btn primary" id="ss-detok-play">Play</button><button type="button" class="btn" id="ss-detok-next">Next</button><span id="ss-detok-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="tblw"><table class="ss-tbl" id="ss-detok-tbl"></table></div>
+<div class="readout" id="ss-detok-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Streaming the text “ Café 👍 ok” from six byte-level tokens (an illustrative split; real tokenizers split differently). Each row is one decode step. The third column decodes each token alone, which is what a naive server would send. The fourth column is what incremental detokenization sends, and the last one is the text the client has so far (␣ marks a space).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The byte <code>C3</code> starts a two-byte character (é), so alone it is not text: the naive column shows �, while the incremental column sends nothing and waits. One step later <code>A9</code> completes the character and é is sent. The emoji needs four bytes spread over two tokens, so the same thing happens again. The user sees the same final text in both columns only if nothing is shown until the end; with streaming, only the right column is correct.</p></details></figure>
+<p>Two more streaming details matter in practice. <b>Backpressure:</b> if a client reads slowly, chunks pile up in the server’s buffers; a server should not let one slow reader block the engine loop, so the engine writes into a per-request queue and the HTTP layer drains it. <b>Batching of chunks:</b> sending one HTTP write per token costs CPU time for every token of every user; some servers can combine several tokens into one chunk to save it. [Likely]</p>
+
+<h2>Cancellation and timeouts</h2>
+<p>Requests end in four ways: the model emits the end-of-sequence token, the request reaches <code>max_tokens</code>, a stop string appears, or the request is <b>cancelled</b>. Cancellation is the one people forget, and it is common: users press “stop”, close the tab, or the client library gives up.</p>
+<p>When a client disconnects, the engine does not know it. If nobody tells it, the request keeps decoding up to <code>max_tokens</code>, holding a batch slot and its KV cache for nobody. With \(N_{\text{out}} = 200\) and TPOT of 8.71 ms, that is 1.7 s of a batch slot wasted per abandoned request, and its KV cache (here 157 MB for 1,200 tokens) blocks a waiting request from being admitted. So the server must detect the disconnect and <b>abort</b> the request in the engine. In vLLM, the HTTP handler waits on two tasks at once, the real work and a listener for the <code>http.disconnect</code> message; when the client leaves, the work task is cancelled, and the engine’s <code>generate()</code> catches the cancellation and calls <code>abort</code>, which frees the request’s KV blocks at the next step. [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 2: one streamed request on the server, with cancellation and a timeout</div><ol>
+<li><b>input:</b> request \(q\), deadline \(D\)</li>
+<li>tokenize \(q\); <b>if</b> the waiting queue is too long: reply HTTP 429 (“try later”) <span class="c">// admission control</span></li>
+<li>engine.add(\(q\)); start a task that waits for the client to disconnect</li>
+<li><b>try:</b></li>
+<li>&nbsp;&nbsp;<b>loop:</b> wait for the next output of \(q\), but not past \(D\)</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(\delta\) ← incremental detokenize (Algorithm 1); <b>if</b> \(\delta\) is not empty: send <code>data: chunk</code></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;<b>if</b> \(q\) is finished: send the final chunk (finish reason, usage) and <code>data: [DONE]</code>; <b>break</b></li>
+<li><b>on</b> disconnect or deadline: stop waiting <span class="c">// both arrive as a cancellation</span></li>
+<li><b>finally:</b> engine.abort(\(q\)) <span class="c">// always runs; aborting a finished request does nothing</span></li>
+<li>at its next step the engine drops \(q\) from the batch and returns its KV blocks to the free pool</li></ol></div>
+<p><b>Timeouts</b> protect the system from requests that would take too long. Use separate limits for separate stages: a <b>queue timeout</b> (if a request waited 30 s, the user is gone anyway; reject it before spending GPU time on prefill), a limit on time to first token, and an overall deadline. Clients should also send a sensible <code>max_tokens</code>, which is the cheapest timeout of all. And a request that times out must be aborted in the engine, exactly like a disconnect, or the timeout only hides the waste.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Retries can multiply load. If a client times out after 10 s and retries, but the server never aborted the first attempt, the GPU now runs both. Under overload this makes queues longer, which causes more timeouts and more retries. Abort on timeout, and use backoff with a retry budget.</aside>
+
+<h2>Routing across replicas</h2>
+<p>One engine replica has a limit. To serve more traffic you run many replicas and put a router in front. The router must answer one question per request: which replica?</p>
+<ul>
+<li><b>Round robin:</b> replica 1, 2, 3, 4, 1, 2, … Simple, but blind: LLM requests differ in cost by 1,000 times (a 50-token chat turn against a 50,000-token document).</li>
+<li><b>Least loaded:</b> send to the replica with the fewest queued tokens or running requests. A cheap variant, “power of two choices”, picks two replicas at random and takes the less loaded one.</li>
+<li><b>Prefix-aware</b> (cache-aware): many requests share a long prefix, such as a system prompt, a few-shot block, or an uploaded document. If a replica already has that prefix in its KV cache, it can skip that part of the prefill (<a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>). So send the request to a replica that has the prefix, unless that replica is much busier than the others. The SGLang router has such a cache-aware policy, with a fallback to load balancing. [Certain]</li></ul>
+<p>Figure 5 simulates 600 requests from 16 “tenants” (for example, apps that each have their own 1,000-token system prompt) on 4 replicas. Each replica can keep a few prefixes in its cache.</p>
+<figure class="fig" id="ss-route"><div class="fig-body">
+<div class="controls"><div class="seg" id="ss-route-pol" role="group" aria-label="Routing policy"><button type="button" data-v="rr" aria-pressed="false">Round robin</button><button type="button" data-v="least" aria-pressed="false">Least loaded</button><button type="button" data-v="prefix" aria-pressed="true">Prefix-aware</button></div></div>
+<div class="ss-grid" style="margin-top:8px">
+<label for="ss-route-t">Tenants (distinct prefixes)</label><input type="range" id="ss-route-t" min="2" max="64" step="1" value="16"><output id="ss-route-tv"></output>
+<label for="ss-route-c">Prefixes cached per replica</label><input type="range" id="ss-route-c" min="1" max="16" step="1" value="4"><output id="ss-route-cv"></output>
+<label for="ss-route-z">Popularity skew (Zipf \(s\))</label><input type="range" id="ss-route-z" min="0" max="2" step="0.1" value="1"><output id="ss-route-zv"></output>
+<label for="ss-route-k">Balance slack (requests)</label><input type="range" id="ss-route-k" min="0" max="3" step="0.25" value="1"><output id="ss-route-kv"></output></div>
+<svg id="ss-route-svg" viewBox="0 0 640 230" role="img" aria-label="Work done by each of four replicas, split into prefill and decode, and the prefixes each replica holds"></svg>
+<div class="ss-leg"><span style="--c:var(--k)">prefill work</span><span style="--c:var(--q)">decode work</span><span style="--c:var(--v)">cached prefixes (tenant number)</span></div>
+<div class="readout" id="ss-route-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> A toy router simulation (seeded, so every run is the same). Each request has a 1,000-token tenant prefix, 200 new prompt tokens and 200 output tokens; one output token is counted as 4 units of work and one prefill token as 1. A request arrives every 50 ms, and the 4 replicas together can do 1,500 units in 50 ms. A cache hit skips the 1,000 prefix tokens. Each replica keeps its most recently used prefixes.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>The bars show the total work each replica did; the orange part is prefill. Round robin and least loaded spread tenants over all replicas, so each replica must cache all of them and misses often. Prefix-aware routing gives each tenant a “home” replica, so the hit rate jumps and the orange parts shrink. The readout’s “offered load” is work per second divided by capacity: above 100%, queues grow without limit. Notice that at the default settings only the prefix-aware router keeps the load under 100%. Cache hits are capacity. Then move the balance slack (prefix-aware only). At 0 the router leaves a request’s home replica as soon as it is busier than the others: load is even, but the hit rate drops. Larger slack keeps requests at home: more hits, but the home replicas of popular tenants build queues. The best wait is in between.</p></details></figure>
+<p>The rule the simulation uses for the prefix-aware case is: among replicas that hold the prefix, take the least loaded one, but only if its queue is at most twice the shortest queue plus a slack (in units of one request’s work); otherwise take the least loaded replica. Real routers use the same idea with their own thresholds, and their flags change between versions, so check the documentation of the version you run. [Likely]</p>
+
+<h2>Autoscaling and capacity</h2>
+<p>How many replicas do you need? Two simple laws answer most of it.</p>
+<p><b>Little’s law</b> connects the average number of requests in the system \(L\), the arrival rate \(\lambda\), and the average time each request spends inside \(W\). It holds for any stable system, whatever the details of the scheduler:</p>
+<div class="eq">\[ L = \lambda \, W \tag{133.7} \]</div>
+<p><b>GPU time per request.</b> Each request needs its own prefill, and a \(1/B\) share of each of its \(N_{\text{out}}\) decode steps. If the replicas run at an operating batch size \(B\), one request costs \(s\) GPU-seconds, and with a target utilization \(\rho\) you need \(R\) replicas:</p>
+<div class="eq">\[ s = t_{\text{prefill}} + \frac{N_{\text{out}}\, t_{\text{step}}(B)}{B}, \qquad R = \left\lceil \frac{\lambda\, s}{\rho} \right\rceil \tag{133.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\lambda\)</dt><dd>arrival rate, requests per second</dd>
+<dt>\(W\), \(L\)</dt><dd>average time a request spends in the system, and the average number of requests inside it</dd>
+<dt>\(s\)</dt><dd>GPU-seconds one request uses</dd>
+<dt>\(\rho\)</dt><dd>target utilization, below 1 so that bursts do not overflow the queue (0.6 to 0.8 is common [Likely])</dd>
+<dt>\(R\)</dt><dd>number of replicas</dd></dl>
+<div class="worked"><div class="wt">Worked example: sizing a service</div>
+<p>Traffic: \(\lambda = 20\) requests per second, each with 1,000 prompt and 200 output tokens. We allow each replica a batch of at most \(B = 64\), so \(t_{\text{step}} = 10.44\) ms by (133.4).</p>
+<p>GPU time per request (133.8): \(s = 32.5 + 200 \cdot 10.44 / 64 = 32.5 + 32.6 = 65.1\) ms. Half is prefill: long prompts are expensive even though decode takes most of the wall-clock time. Load \(\lambda s = 20 \cdot 0.0651 = 1.30\) GPUs. With \(\rho = 0.7\): \(R = \lceil 1.30 / 0.7 \rceil = \lceil 1.86 \rceil = 2\) replicas.</p>
+<p>Check with Little’s law (133.7): \(W \approx 32.5 + 200 \cdot 10.44 = 2{,}120\) ms, so \(L = 20 \cdot 2.12 = 42\) requests are inside at any moment, about 21 per replica: below the batch limit of 64, so the plan is consistent. One prefill-only bound is also worth knowing: at \(u = 0.5\), one H100 prefills only about 30,800 tokens per second of this model, so 20,000 prompt tokens per second already use 65% of a GPU.</p></div>
+<p><b>What to scale on.</b> GPU utilization as reported by <code>nvidia-smi</code> is a poor signal: it only says a kernel was running, not how much work was done (<a href="../inference/runtime-profiling-where-the-time-goes.html">session 123</a>). Better signals come from the engine itself. vLLM exports Prometheus metrics such as <code>vllm:num_requests_waiting</code>, <code>vllm:num_requests_running</code>, <code>vllm:kv_cache_usage_perc</code>, and histograms of <code>vllm:time_to_first_token_seconds</code> and <code>vllm:inter_token_latency_seconds</code>. [Certain] A common policy: scale up when the waiting queue stays above a threshold or the p95 TTFT breaks its target, scale down slowly when the queue is empty.</p>
+<p><b>Cold start.</b> A new replica must get a GPU, start the container, load 16 GB of weights (at 1 GB/s from network storage that alone is 16 s), and warm up (for example capture CUDA graphs, <a href="../inference/index.html#row-graph-level-optimization-fusion-cuda-graphs-torch" title="Graph-level optimization: fusion, CUDA graphs, torch.compile (planned)">session 127</a>). So autoscaling reacts in tens of seconds to minutes, not milliseconds. Keep some headroom (the \(\rho\) in 133.8), cache weights on local disk, and scale on queue growth early rather than on latency after it is already bad.</p>
+
+<h2>Serving many models and many LoRA adapters</h2>
+<p>Real services rarely have one model. A platform may host ten base models, and hundreds of customers who each fine-tuned their own variant. Copying full models does not scale: one 8B model in BF16 is 16.06 GB, so one 80 GB GPU holds at most four copies, with no room left for KV cache. Moving a full model in from CPU memory over PCIe Gen5 x16 (about 64 GB/s per direction, theoretical [Likely]) takes at least 0.25 s, far too slow to do per request.</p>
+<p>For many models of different families there are three options: give each its own replicas (simple, wasteful when traffic is uneven), put several small models on one GPU (Triton Inference Server can host many models and load or unload them through its model-control API [Certain]), or route by model name in the router to separate pools. For many <b>fine-tuned variants of one base model</b>, there is a much better option: LoRA.</p>
+<h3>One base model, many adapters</h3>
+<p>A LoRA adapter (<a href="../posttraining/lora-and-other-peft-methods.html">session 57</a>) changes a weight \(W\) by a low-rank product \(BA\) with rank \(r\). The base weights stay the same for every customer, so a server keeps <b>one</b> copy of the base model and many small adapters. Request \(i\) uses adapter \(a(i)\):</p>
+<div class="eq">\[ \mathbf{y}_i = W \mathbf{x}_i + \frac{\alpha}{r}\, B_{a(i)} \left( A_{a(i)}\, \mathbf{x}_i \right) \tag{133.9} \]</div>
+<p>Each adapted layer with input size \(d_{\text{in}}\) and output size \(d_{\text{out}}\) adds \(r(d_{\text{in}} + d_{\text{out}})\) parameters, so for \(n_{\text{layers}}\) blocks with a set \(\mathcal{M}\) of adapted matrices:</p>
+<div class="eq">\[ p_{\text{LoRA}} = n_{\text{layers}} \sum_{m \in \mathcal{M}} r \left( d_{\text{in}}^{(m)} + d_{\text{out}}^{(m)} \right) \tag{133.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W\)</dt><dd>the shared base weight of one layer (one copy for all requests)</dd>
+<dt>\(A_{a}, B_{a}\)</dt><dd>the down-projection (\(r \times d_{\text{in}}\)) and up-projection (\(d_{\text{out}} \times r\)) of adapter \(a\)</dd>
+<dt>\(a(i)\)</dt><dd>the adapter chosen by request \(i\) (in vLLM, by the <code>model</code> field of the request)</dd>
+<dt>\(\alpha / r\)</dt><dd>the LoRA scale factor</dd>
+<dt>\(\mathcal{M}\)</dt><dd>the adapted matrices, for example q, k, v, o only, or all seven linear layers of a block</dd></dl>
+<div class="worked"><div class="wt">Worked example: how big is one adapter?</div>
+<p>Llama 3 8B, rank 16, all seven linear layers per block. Per block: q and o \(16 \cdot (4096 + 4096) = 131{,}072\) each; k and v \(16 \cdot (4096 + 1024) = 81{,}920\) each; gate, up and down \(16 \cdot (4096 + 14{,}336) = 294{,}912\) each. Sum: 1,310,720. Times 32 blocks: \(p_{\text{LoRA}} = 41{,}943{,}040\) parameters, 83.9 MB in BF16, which is 0.52% of the base model.</p>
+<p>So 100 such adapters take 8.4 GB, and 1,000 take 84 GB: they fit in CPU memory, not all on the GPU. Loading one over PCIe at 64 GB/s takes about 1.3 ms. One hundred full fine-tuned copies would take 1,606 GB.</p></div>
+<p>The hard part is not memory but <b>batching</b>. The batch now mixes requests for different adapters. The base product \(W\mathbf{x}\) is shared, so it stays one big GEMM for the whole batch. The adapter part is different for each row. Running one small GEMM per adapter is slow, and merging \(BA\) into \(W\) works only if the whole batch uses one adapter. Punica introduced a CUDA kernel that computes the adapter products for a batch where each row has its own adapter (Segmented Gather Matrix-Vector multiplication, SGMV), keeping one copy of the base model; the paper reports 12 times the throughput of previous systems on multi-LoRA workloads and 2 ms of extra latency per token. [Certain] S-LoRA keeps all adapters in CPU memory, moves the needed ones to the GPU, and stores adapter weights and KV cache in one paged memory pool (“unified paging”) to avoid fragmentation; it reports serving thousands of adapters on one GPU and up to 4 times the throughput of Hugging Face PEFT and vLLM’s early LoRA support. [Certain]</p>
+<p>In vLLM you start the server with <code>--enable-lora</code>, register adapters with <code>--lora-modules name=path</code>, and the client picks one by putting its name in the <code>model</code> field. <code>--max-loras</code> sets how many adapters can be in one batch at the same time, <code>--max-lora-rank</code> must be at least the largest rank you serve (a much larger value wastes memory), and <code>--max-cpu-loras</code> sets how many are kept in CPU memory [Likely]. Adapters can also be loaded at runtime through <code>/v1/load_lora_adapter</code> when the environment variable <code>VLLM_ALLOW_RUNTIME_LORA_UPDATING</code> is set, which the docs warn against outside trusted environments. [Certain]</p>
+<figure class="fig" id="ss-lora"><div class="fig-body">
+<div class="ss-grid">
+<label for="ss-lora-r">LoRA rank \(r\)</label><input type="range" id="ss-lora-r" min="0" max="5" step="1" value="2"><output id="ss-lora-rv"></output>
+<label for="ss-lora-n">Adapters served</label><input type="range" id="ss-lora-n" min="1" max="2000" step="1" value="100"><output id="ss-lora-nv"></output>
+<label for="ss-lora-s">GPU adapter slots (max_loras)</label><input type="range" id="ss-lora-s" min="1" max="64" step="1" value="8"><output id="ss-lora-sv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="ss-lora-all" checked> Adapt all 7 linear layers (off: only q, k, v, o)</label></div>
+<svg id="ss-lora-svg" viewBox="0 0 640 200" role="img" aria-label="Memory of an 80 GB GPU split into base weights, adapter slots and KV cache, compared with full fine-tuned copies"></svg>
+<div class="ss-leg"><span style="--c:var(--muted)">base weights</span><span style="--c:var(--k)">adapter slots on GPU</span><span style="--c:var(--q)">KV cache</span><span style="--c:var(--bad)">full copies (would need)</span></div>
+<div class="readout" id="ss-lora-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 6.</b> Multi-LoRA memory for Llama 3 8B in BF16 on one 80 GB GPU (90% usable). The top bar is one GPU serving the base model plus LoRA slots; the bottom bar is what one full fine-tuned copy per variant would need, on a log scale of GPUs.</figcaption>
+<details class="howto"><summary>How to read Figure 6</summary><p>At the defaults (rank 16, all layers, 8 slots) the adapter slots take 0.67 GB, which costs about 5,100 tokens of KV cache: almost nothing next to 55.9 GB. Raise the rank to 128 and the slots to 64: now adapters take 43 GB and the KV cache shrinks badly, so fewer requests fit in a batch. The number of adapters served only changes CPU memory, not GPU memory: that is the point of keeping a small set of slots on the GPU and the rest on the host.</p></details></figure>
+
+<h2>Code: a tiny engine with streaming, cancellation and batched LoRA</h2>
+<p>The first program is a working miniature of the whole path: a request object, an engine that batches requests and runs one step at a time, incremental detokenization, a server function that yields SSE lines, a client that disconnects, and one that times out. The “model” is scripted so that the output is deterministic, but it runs one batched forward pass per step like a real one.</p>
+<pre class="code"><span class="kw2">import</span> asyncio, json, torch
+torch.manual_seed(0)
+EOS, VOCAB = 256, 257                 <span class="cm"># byte-level vocabulary: 256 bytes + an end token</span>
+
+<span class="kw2">class</span> ScriptedLM(torch.nn.Module):
+    <span class="cm">"""Stands in for the real model: one batched forward pass per step, returns logits.</span>
+    <span class="cm">Each request 'wants' to say a fixed reply, so the output is deterministic."""</span>
+    <span class="kw2">def</span> forward(self, reqs):
+        nxt = []
+        <span class="kw2">for</span> r <span class="kw2">in</span> reqs:
+            want = r.reply_ids + [EOS]
+            nxt.append(want[min(len(r.out_ids), len(want) - 1)])
+        <span class="kw2">return</span> torch.nn.functional.one_hot(torch.tensor(nxt), VOCAB).float()   <span class="cm"># [B, VOCAB]</span>
+
+<span class="kw2">class</span> Request:
+    <span class="kw2">def</span> __init__(self, rid, prompt, reply, max_tokens):
+        self.rid, self.prompt_ids = rid, list(prompt.encode("utf-8"))      <span class="cm"># "tokenize"</span>
+        self.reply_ids, self.max_tokens = list(reply.encode("utf-8")), max_tokens
+        self.out_ids, self.sent, self.aborted = [], 0, <span class="kw2">False</span>
+        self.queue = asyncio.Queue()                                        <span class="cm"># engine -&gt; server</span>
+
+<span class="kw2">def</span> detok_delta(r):
+    <span class="cm">"""Incremental detokenization: only emit text that is complete UTF-8."""</span>
+    text = bytes(r.out_ids).decode("utf-8", errors="replace")
+    <span class="kw2">if</span> text.endswith("\ufffd"):        <span class="cm"># unfinished multi-byte character: hold it back</span>
+        <span class="kw2">return</span> ""
+    delta, r.sent = text[r.sent:], len(text)
+    <span class="kw2">return</span> delta
+
+<span class="kw2">class</span> Engine:
+    <span class="kw2">def</span> __init__(self, model, max_batch=2):
+        self.model, self.max_batch, self.waiting, self.running = model, max_batch, [], []
+    <span class="kw2">def</span> add(self, r):   self.waiting.append(r)
+    <span class="kw2">def</span> abort(self, r): r.aborted = <span class="kw2">True</span>
+    <span class="kw2">def</span> step(self):
+        self.running = [r <span class="kw2">for</span> r <span class="kw2">in</span> self.running <span class="kw2">if</span> <span class="kw2">not</span> r.aborted]       <span class="cm"># free KV of aborted requests</span>
+        self.waiting = [r <span class="kw2">for</span> r <span class="kw2">in</span> self.waiting <span class="kw2">if</span> <span class="kw2">not</span> r.aborted]
+        <span class="kw2">while</span> self.waiting <span class="kw2">and</span> len(self.running) &lt; self.max_batch:      <span class="cm"># FCFS admission</span>
+            self.running.append(self.waiting.pop(0))                    <span class="cm"># (prefill would run here)</span>
+        <span class="kw2">if</span> <span class="kw2">not</span> self.running:
+            <span class="kw2">return</span>
+        nxt = self.model(self.running).argmax(-1).tolist()             <span class="cm"># one step for the whole batch</span>
+        still = []
+        <span class="kw2">for</span> r, t <span class="kw2">in</span> zip(self.running, nxt):
+            <span class="kw2">if</span> t != EOS:
+                r.out_ids.append(t)
+            done = t == EOS <span class="kw2">or</span> len(r.out_ids) &gt;= r.max_tokens
+            r.queue.put_nowait((detok_delta(r), "stop" <span class="kw2">if</span> t == EOS <span class="kw2">else</span> ("length" <span class="kw2">if</span> done <span class="kw2">else</span> <span class="kw2">None</span>)))
+            <span class="kw2">if</span> <span class="kw2">not</span> done:
+                still.append(r)
+        self.running = still
+
+<span class="kw2">async</span> <span class="kw2">def</span> engine_loop(engine):
+    <span class="kw2">while</span> <span class="kw2">True</span>:
+        engine.step()
+        <span class="kw2">await</span> asyncio.sleep(0.01)                                       <span class="cm"># one "decode step" = 10 ms</span>
+
+<span class="kw2">async</span> <span class="kw2">def</span> stream(engine, r, timeout):
+    <span class="cm">"""Server side of one request: yields SSE lines; always aborts on exit."""</span>
+    engine.add(r)
+    deadline = asyncio.get_running_loop().time() + timeout
+    <span class="kw2">try</span>:
+        <span class="kw2">while</span> <span class="kw2">True</span>:
+            left = deadline - asyncio.get_running_loop().time()
+            delta, finish = <span class="kw2">await</span> asyncio.wait_for(r.queue.get(), max(left, 0))
+            <span class="kw2">if</span> <span class="kw2">not</span> delta <span class="kw2">and</span> <span class="kw2">not</span> finish:
+                <span class="kw2">continue</span>                       <span class="cm"># nothing printable yet: send nothing</span>
+            chunk = {"id": r.rid, "object": "chat.completion.chunk",
+                     "choices": [{"index": 0, "delta": {"content": delta}, "finish_reason": finish}]}
+            <span class="kw2">yield</span> "data: " + json.dumps(chunk, ensure_ascii=<span class="kw2">False</span>)
+            <span class="kw2">if</span> finish:
+                <span class="kw2">yield</span> "data: [DONE]"
+                <span class="kw2">return</span>
+    <span class="kw2">finally</span>:
+        engine.abort(r)          <span class="cm"># runs on normal end, client disconnect, and timeout</span>
+
+<span class="kw2">async</span> <span class="kw2">def</span> client(engine, r, timeout=5.0, read_max=<span class="kw2">None</span>):
+    got, n = [], 0
+    agen = stream(engine, r, timeout)
+    <span class="kw2">try</span>:
+        <span class="kw2">async</span> <span class="kw2">for</span> line <span class="kw2">in</span> agen:
+            got.append(line); n += 1
+            <span class="kw2">if</span> read_max <span class="kw2">and</span> n &gt;= read_max:
+                <span class="kw2">break</span>                                                    <span class="cm"># client disconnects</span>
+    <span class="kw2">except</span> asyncio.TimeoutError:
+        got.append("timeout")
+    <span class="kw2">finally</span>:
+        <span class="kw2">await</span> agen.aclose()
+    <span class="kw2">return</span> got
+
+<span class="kw2">async</span> <span class="kw2">def</span> main():
+    eng = Engine(ScriptedLM(), max_batch=2)
+    loop_task = asyncio.create_task(engine_loop(eng))
+    a = Request("a", "Hi", "Café 👍", max_tokens=50)
+    b = Request("b", "Hello", "a long answer nobody reads", max_tokens=50)
+    c = Request("c", "Hey", "this one is too slow", max_tokens=50)
+    ra, rb, rc = <span class="kw2">await</span> asyncio.gather(client(eng, a), client(eng, b, read_max=3),
+                                      client(eng, c, timeout=0.08))
+    loop_task.cancel()
+    print(ra[0])
+    print([json.loads(l[6:])["choices"][0]["delta"]["content"] <span class="kw2">for</span> l <span class="kw2">in</span> ra[:-1]], ra[-1])
+    print("b: client left after", len(rb), "chunks; engine stopped early:", len(b.out_ids) &lt; len(b.reply_ids))
+    print("c:", rc[-1], "| aborted:", c.aborted, "| stopped early:", len(c.out_ids) &lt; len(c.reply_ids))
+asyncio.run(main())</pre>
+<p>The output: request a streams <code>['C', 'a', 'f', 'é', ' ', '👍', '']</code> and then <code>data: [DONE]</code>, with no broken characters, because the half-finished é and 👍 are held back for one step. Request b reads 3 chunks and leaves, and the engine stops it early. Request c waits in the queue (the batch holds only 2), hits its deadline, and is aborted. The second program checks that batched multi-LoRA (133.9), with a gathered adapter per row and one shared base GEMM, gives the same result as merging each adapter separately, and computes the adapter size (133.10).</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+d_in, d_out, r, n_adapters = 64, 48, 8, 3
+alpha = 16.0
+W = torch.randn(d_out, d_in) / d_in ** 0.5            <span class="cm"># shared base weight (one copy)</span>
+A = torch.randn(n_adapters, r, d_in) * 0.1            <span class="cm"># LoRA down-projections, one per adapter</span>
+Bu = torch.randn(n_adapters, d_out, r) * 0.1          <span class="cm"># LoRA up-projections</span>
+x = torch.randn(5, d_in)                              <span class="cm"># 5 requests in one batch</span>
+idx = torch.tensor([0, 2, 2, -1, 1])                  <span class="cm"># adapter of each request; -1 = base model only</span>
+
+<span class="kw2">def</span> lora_batched(x, idx):
+    y = x @ W.T                                       <span class="cm"># ONE base GEMM for the whole batch</span>
+    m = idx &gt;= 0
+    h = torch.einsum("brd,bd-&gt;br", A[idx[m]], x[m])   <span class="cm"># gather each row's A: shrink to rank r</span>
+    y[m] += (alpha / r) * torch.einsum("bor,br-&gt;bo", Bu[idx[m]], h)   <span class="cm"># expand back</span>
+    <span class="kw2">return</span> y
+
+<span class="kw2">def</span> lora_one_by_one(x, idx):                          <span class="cm"># reference: merge weights per request</span>
+    rows = []
+    <span class="kw2">for</span> xi, i <span class="kw2">in</span> zip(x, idx.tolist()):
+        Wi = W <span class="kw2">if</span> i &lt; 0 <span class="kw2">else</span> W + (alpha / r) * Bu[i] @ A[i]
+        rows.append(Wi @ xi)
+    <span class="kw2">return</span> torch.stack(rows)
+
+print((lora_batched(x, idx) - lora_one_by_one(x, idx)).abs().max().item())   <span class="cm"># tiny: same math</span>
+
+<span class="cm"># size of one adapter for Llama 3 8B, rank 16 on all 7 linear layers of the 32 blocks</span>
+shapes = {"q": (4096, 4096), "k": (4096, 1024), "v": (4096, 1024), "o": (4096, 4096),
+          "gate": (4096, 14336), "up": (4096, 14336), "down": (14336, 4096)}
+p = 32 * sum(16 * (a + b) <span class="kw2">for</span> a, b <span class="kw2">in</span> shapes.values())
+print(p, "parameters,", 2 * p / 1e6, "MB in BF16")   <span class="cm"># 41943040 parameters, 83.88608 MB</span></pre>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What the stack must do</th><th>Main lever</th></tr></thead><tbody>
+<tr><td>Chat assistant</td><td>Low TTFT, steady streaming, many users; frequent “stop” presses</td><td>Streaming with incremental detokenization; abort on disconnect; scale on queue length and p95 TTFT</td></tr>
+<tr><td>Coding assistant in an IDE</td><td>Very short deadlines; most completions are cancelled because the user keeps typing</td><td>Aggressive cancellation and small <code>max_tokens</code>; prefix-aware routing on the shared file context</td></tr>
+<tr><td>Multi-tenant fine-tuning platform</td><td>Hundreds of customer variants of a few base models</td><td>Multi-LoRA serving (Punica, S-LoRA, vLLM <code>--enable-lora</code>), adapter cache on CPU</td></tr>
+<tr><td>Agents and tool use</td><td>Many calls that share a long system prompt and history</td><td>Prefix-aware routing so the shared prefix is prefilled once per replica (<a href="../inference/scenarios-and-capacity-planning-agents-long-context.html">session 141</a>)</td></tr>
+<tr><td>Video-RAG and video question answering</td><td>Very long multimodal prompts (frames as thousands of visual tokens) and often the same video asked many times</td><td>Route all questions about one video to the replica that has its prefix cached; long prefill makes TTFT the key metric</td></tr>
+<tr><td>Batch jobs (video captioning, action-recognition labels, key-moment summaries)</td><td>Millions of requests, no user waiting</td><td>Large batch sizes for throughput (133.6), offline mode instead of the HTTP server, no streaming</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Not aborting on disconnect or timeout.</b> The GPU keeps generating for nobody and the KV cache stays full. Test it: start a long request, kill the client, and watch <code>vllm:num_requests_running</code>.</li>
+<li><b>Decoding each token separately for streaming.</b> Users see � in the middle of emoji and non-English text, or wrong spaces. Use the engine’s incremental detokenizer.</li>
+<li><b>Autoscaling on GPU utilization.</b> A GPU decoding one sequence shows high utilization while doing a tiny fraction of the work it could. Scale on waiting requests, KV-cache use and latency percentiles.</li>
+<li><b>Round-robin routing for workloads with shared prefixes.</b> Every replica must prefill every system prompt; prefix-aware routing can cut prefill work by several times (Figure 5).</li>
+<li><b>One timeout for everything.</b> Without a queue timeout, an overloaded server spends GPU time on prefill for requests whose users already left.</li>
+<li><b>Setting <code>--max-lora-rank</code> or <code>--max-loras</code> far above need.</b> Slots are reserved GPU memory; that memory is taken from the KV cache and lowers the batch size (Figure 6).</li>
+<li><b>Measuring latency only as an average.</b> Users feel the tail. Track p50, p95 and p99 of TTFT and TPOT, separately (<a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>).</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Name the layers of an LLM serving stack and what each one owns.<span class="lvl">basic</span></summary><div class="ans">The engine (vLLM, TensorRT-LLM, SGLang) owns the GPUs: model weights, KV cache, the scheduler and the kernels. The API server (OpenAI-compatible server, Triton Inference Server) owns the protocol: validation, chat template, tokenization, detokenization, streaming, metrics. The router owns the choice of replica, plus authentication, rate limits and retries. The autoscaler owns the number of replicas. Only the engine knows GPU memory, so only it decides if a request fits.</div></details>
+<details class="qa"><summary>Walk through the life of a request in a chat service.<span class="lvl">basic</span></summary><div class="ans">The client sends a POST to <code>/v1/chat/completions</code> with <code>stream: true</code>. The router picks a replica. The API server validates, applies the chat template and tokenizes. The request waits in the engine’s queue until the scheduler admits it, which needs free KV-cache blocks. Prefill runs the prompt and produces the first token. Then decode adds one token per step, batched with other requests. Each token is detokenized incrementally and sent as an SSE chunk. On a stop condition the engine frees the KV cache, and the server sends a final chunk with the finish reason (and usage, if asked) and <code>data: [DONE]</code>.</div></details>
+<details class="qa"><summary>Break down time to first token. Which part grows under overload?<span class="lvl">core</span></summary><div class="ans">TTFT = network up + tokenize + queue + prefill + network down (133.1). Prefill grows with prompt length (about \(2Pn_{\text{in}}/(Fu)\), 32.5 ms for 1,000 tokens of an 8B model on an H100 at 50% MFU). The queue time is the part that grows without limit under overload, because when arrivals exceed capacity the waiting queue grows every second. That is why TTFT percentiles and queue length are the first signals of overload.</div></details>
+<details class="qa"><summary>Why does going from batch 1 to batch 32 barely change TPOT?<span class="lvl">core</span></summary><div class="ans">A decode step is memory-bound: it must read all 16 GB of weights once per step, whatever the batch size. Extra sequences add only their KV cache bytes and some FLOPs that are far below the compute limit. In the cost model the step goes from 7.05 ms at batch 1 to 8.71 ms at batch 32, while throughput rises from 142 to 3,672 tokens per second. The gain stops when KV reads dominate the bytes, when compute becomes the limit, or when KV memory is full.</div></details>
+<details class="qa"><summary>What happens when a streaming client disconnects, and what should happen?<span class="lvl">core</span></summary><div class="ans">The engine does not see the TCP connection, so by default the request keeps running until EOS or <code>max_tokens</code>, holding a batch slot and its KV cache. The server must detect the disconnect (vLLM races the handler against a listener for the <code>http.disconnect</code> message and cancels the handler), and the cancellation must reach the engine as an abort, which removes the request from the batch and frees its KV blocks at the next step. The same must happen on timeouts.</div></details>
+<details class="qa"><summary>Why can you not just decode each new token to text and send it?<span class="lvl">core</span></summary><div class="ans">With byte-level BPE, one character can span several tokens (an emoji is 4 UTF-8 bytes), so a single token can be an incomplete byte sequence that decodes to U+FFFD. Some tokenizers also change spaces depending on neighbors. Incremental detokenization decodes a small window of tokens, compares it with the text already sent, sends only the new suffix, and waits while the text ends with U+FFFD. With stop strings it also holds back the last few characters so a partial stop string is never shown.</div></details>
+<details class="qa"><summary>What metric would you autoscale an LLM service on, and why not GPU utilization?<span class="lvl">core</span></summary><div class="ans">On engine-level signals: number of waiting requests, KV-cache usage, and latency percentiles such as p95 TTFT against the SLO. GPU utilization from nvidia-smi only says a kernel was running during the sample interval; a GPU decoding batch 1 looks busy while delivering a small fraction of its possible throughput. Also account for cold start (loading 16 GB of weights, warm-up), which means scaling must start early and keep headroom.</div></details>
+<details class="qa"><summary>Size a deployment: 20 requests/s, 1,000 prompt and 200 output tokens, Llama 3 8B on H100s.<span class="lvl">advanced</span></summary><div class="ans">With the cost model and a max batch of 64: decode step 10.44 ms, prefill 32.5 ms. GPU time per request \(s = 32.5 + 200 \cdot 10.44/64 = 65.1\) ms (133.8), load \(\lambda s = 1.30\) GPUs, so 2 replicas at a 70% target. Little’s law: \(W \approx 2.12\) s, \(L = 42\) requests inside, about 21 per replica, under the batch limit. Then check memory: 21 sequences of 1,200 tokens need 3.3 GB of KV cache, far below 55.9 GB. Mention that real numbers must be measured and that p99 targets need more headroom.</div></details>
+<details class="qa"><summary>How does prefix-aware routing work, and what is its risk?<span class="lvl">advanced</span></summary><div class="ans">The router keeps track (exactly or approximately) of which prefixes each replica has in its KV cache, for example with a radix tree of token sequences. For a new request it prefers the replica with the longest cached match, so the shared system prompt or document is not prefilled again. The risk is hot spots: a popular prefix sends most traffic to one replica. So the router falls back to the least loaded replica when the preferred one is much busier, trading some hit rate for balance.</div></details>
+<details class="qa"><summary>How do you serve 500 fine-tuned variants of the same 8B model?<span class="lvl">advanced</span></summary><div class="ans">Fine-tune them as LoRA adapters and serve one base model with multi-LoRA. Each rank-16 adapter on all linear layers is 84 MB (0.52% of the base), so 500 take 42 GB of CPU memory, versus 8 TB for full copies. The engine keeps a few adapter slots on the GPU, loads adapters on demand (about 1 ms each over PCIe), and batches requests of different adapters together: one shared base GEMM plus a gathered per-row LoRA product (Punica’s SGMV, S-LoRA’s kernels). Limit max rank and slots, because they take memory from the KV cache.</div></details>
+<details class="qa"><summary>Why does vLLM split the API server, the engine core and the GPU workers into separate processes?<span class="lvl">advanced</span></summary><div class="ans">Python work in the server (HTTP parsing, JSON, tokenization, detokenization) is CPU-bound and would otherwise share the interpreter with the scheduling loop, adding gaps between GPU steps. In separate processes, talking over ZeroMQ, the engine core can schedule the next step while the server is still formatting the last chunk, and one worker per GPU runs the model. The number of processes grows with tensor, pipeline and data parallelism.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>With the cost model, compute TTFT for a 4,000-token prompt with 0 ms queue time (10 ms network each way, 1 ms tokenize).</li>
+<li>A request is abandoned after 20 output tokens but runs until <code>max_tokens</code> = 1,000 at a TPOT of 10 ms. How many seconds of batch slot are wasted? If 5% of 20 requests per second are abandoned like this, how many batch slots are blocked on average?</li>
+<li>Compute the size of a rank-8 adapter on q, k, v and o only for Llama 3 8B, in parameters and MB (BF16).</li>
+<li>In Figure 5, why does increasing “prefixes cached per replica” to 16 help round robin much more than it helps prefix-aware routing?</li>
+<li>A service has \(\lambda = 5\) requests per second and an average end-to-end time of 6 s. How many requests are in the system on average? If each replica can run 32 at once, what is the minimum number of replicas?</li>
+<li>The emoji “😀” is <code>F0 9F 98 80</code>. If it arrives as three tokens (<code>F0</code>, <code>9F 98</code>, <code>80</code>), what does incremental detokenization send after each one?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Prefill \(= 2 \cdot 8.03\times10^9 \cdot 4000 / 4.945\times10^{14} = 129.9\) ms; TTFT \(= 10 + 1 + 0 + 129.9 + 10 = 150.9\) ms. 2. \(980 \times 10\) ms \(= 9.8\) s wasted per request. Abandoned rate \(= 1\) per second, each holding a slot for 9.8 s, so by Little’s law about 9.8 slots are blocked on average. 3. Per block: \(8\cdot(8192) \cdot 2 + 8 \cdot (5120) \cdot 2 = 131{,}072 + 81{,}920 = 212{,}992\); times 32 \(= 6{,}815{,}744\) parameters, 13.6 MB. 4. With 16 slots, every replica can cache all 16 tenants, so round robin stops missing after the warm-up; prefix-aware routing already gave each tenant a home replica, so it needed few slots. 5. \(L = 5 \cdot 6 = 30\) requests; one replica of 32 is the minimum, but with no headroom for bursts, so 2 would be safer. 6. After <code>F0</code>: nothing (the text ends with U+FFFD). After <code>9F 98</code>: still nothing (three of four bytes). After <code>80</code>: “😀”.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A serving stack has four layers: engine (GPU, KV cache, scheduler), API server (protocol, tokenizer, streaming), router (which replica) and autoscaler (how many replicas).</li>
+<li>A request goes through tokenize, queue, schedule, prefill, decode, detokenize and stream. TTFT (133.1) is network + tokenize + queue + prefill; E2E (133.2) adds one TPOT per further token.</li>
+<li>Decode is memory-bound, so batching is almost free until KV reads, compute or KV memory become the limit (133.4, 133.6): 142 tokens/s at batch 1 against 3,672 at batch 32 in our model.</li>
+<li>Streaming needs incremental detokenization; cancellation and timeouts must reach the engine as aborts, or the GPU works for nobody.</li>
+<li>Prefix-aware routing turns cache hits into capacity; size replicas with GPU time per request and Little’s law (133.7, 133.8), and autoscale on queues, not on GPU utilization.</li>
+<li>Many variants of one base model are served as LoRA adapters (133.9, 133.10): 84 MB each for rank 16 on Llama 3 8B, batched together with shared base GEMMs.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \text{TTFT} = t_{\text{net}} + t_{\text{tok}} + t_{\text{queue}} + t_{\text{prefill}}, \quad \text{E2E} = \text{TTFT} + (N_{\text{out}} - 1)\,\text{TPOT} \]</div>
+<div class="eq">\[ t_{\text{step}}(B) \approx t_0 + \max\!\left(\frac{M_W + B \bar{L} s_{kv}}{\eta\,\text{BW}}, \frac{2PB}{Fu}\right), \quad L = \lambda W, \quad R = \left\lceil \frac{\lambda s}{\rho} \right\rceil \]</div>
+<div class="eq">\[ \mathbf{y}_i = W\mathbf{x}_i + \tfrac{\alpha}{r} B_{a(i)} A_{a(i)} \mathbf{x}_i, \quad p_{\text{LoRA}} = n_{\text{layers}} \sum_m r\,(d_{\text{in}} + d_{\text{out}}) \]</div>
+<h2 class="plain" id="the-serving-stack-and-the-life-of-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Miao et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Towards Efficient Generative Large Language Model Serving: A Survey from Algorithms to Systems&amp;quot;" target="_blank" rel="noopener">Towards Efficient Generative Large Language Model Serving: A Survey from Algorithms to Systems</a></li><li>vLLM project (docs). <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM documentation</a></li><li>Miao et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Towards Efficient Generative Large Language Model Serving: A Survey from Algorithms to Systems&amp;quot;" target="_blank" rel="noopener">Towards Efficient Generative Large Language Model Serving: A Survey from Algorithms to Systems</a></li><li>vLLM project (docs). <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM documentation</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Zheng et al. (2023). <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">SGLang: Efficient Execution of Structured Language Model Programs</a></li><li>NVIDIA (code). <a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">TensorRT-LLM</a></li><li>NVIDIA (code). <a href="https://github.com/triton-inference-server/server" target="_blank" rel="noopener">Triton Inference Server</a></li><li>Yu et al. (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;Orca: A Distributed Serving System for Transformer-Based Generative Models&amp;quot;" target="_blank" rel="noopener">Orca: A Distributed Serving System for Transformer-Based Generative Models</a></li><li>Hu et al. (2021). <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">LoRA: Low-Rank Adaptation of Large Language Models</a></li><li>Sheng et al. (2023). <a href="https://arxiv.org/abs/2311.03285" target="_blank" rel="noopener">S-LoRA: Serving Thousands of Concurrent LoRA Adapters</a></li><li>Chen et al. (2023). <a href="https://arxiv.org/abs/2310.18547" target="_blank" rel="noopener">Punica: Multi-Tenant LoRA Serving</a></li><li>vLLM project (docs). <a href="https://docs.vllm.ai/en/latest/features/lora.html" target="_blank" rel="noopener">vLLM documentation: LoRA adapters (--enable-lora, --max-loras, --max-lora-rank, dynamic loading)</a></li><li>vLLM project (code). <a href="https://github.com/vllm-project/vllm/blob/main/vllm/v1/engine/async_llm.py" target="_blank" rel="noopener">vLLM: with_cancellation and listen_for_disconnect (entrypoints/serve/utils/api_utils.py); abort on CancelledError (v1/engine/async_llm.py)</a></li><li>vLLM project (code). <a href="https://github.com/vllm-project/vllm/blob/main/vllm/v1/engine/detokenizer.py" target="_blank" rel="noopener">vLLM: incremental detokenization (v1/engine/detokenizer.py, tokenizers/detokenizer_utils.py)</a></li><li>SGLang project (code). <a href="https://github.com/sgl-project/sglang/tree/main/sgl-router" target="_blank" rel="noopener">SGLang router (sgl-router): cache-aware and power-of-two routing</a></li><li>NVIDIA (2023). <a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener">NVIDIA H100 Tensor Core GPU (specifications)</a></li></ol><nav class="pn" aria-label="Previous and next session"><span class="prev"><small>Previous · session 132, planned</small>profile, fuse and speculate</span><a class="next" href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html"><small>Next · session 134</small>Memory management: PagedAttention, prefix caching, RadixAttention</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="the-serving-stack-and-the-life-of"]');if(!R)return;
+const $=s=>R.querySelector(s);const esc=B.esc;
+const f0=v=>Math.round(v).toLocaleString("en-US"),f1=v=>v.toFixed(1),f2=v=>v.toFixed(2);
+/* shared cost model: Llama 3 8B BF16 on one H100 SXM (equations 133.3 to 133.6) */
+const P=8030261248,KV=131072,BW=3.35e12,FL=989e12,U=0.5,ETA=0.8,T0=1e-3,MW=2*P,USABLE=0.9*80e9;
+const tPre=n=>2*P*n/(FL*U);
+const tStep=(b,L)=>T0+Math.max((MW+b*L*KV)/(BW*ETA),2*P*b/(FL*U));
+
+/* ---------- Figure 1: the stack (clickable layers) ---------- */
+(function(){
+ const svg=$("#ss-stack-svg");if(!svg)return;const info=$("#ss-stack-info");
+ const L={
+  client:{t:"Clients",d:"Browsers, apps, agents and batch jobs. They send HTTP requests (often <code>POST /v1/chat/completions</code> with <code>stream: true</code>) and read the stream.",ex:"OpenAI SDK, curl, LangChain, your own app",m:"What users feel: TTFT and tokens per second as seen at the client, error rate, disconnects"},
+  router:{t:"Router / gateway",d:"Picks a replica for each request: round robin, least loaded, or prefix-aware. Also authentication, rate limits per user, retries, and routing by model name.",ex:"SGLang router, Envoy or NGINX based gateways, Kubernetes services, NVIDIA Dynamo, llm-d [Likely]",m:"Load imbalance between replicas, prefix-cache hit rate, 429 (rate limited) responses"},
+  server:{t:"API server",d:"The front door of one engine: validates the JSON, applies the chat template, tokenizes (and preprocesses images for a VLM), detokenizes incrementally and streams server-sent events. Exposes metrics.",ex:"vLLM OpenAI-compatible server (<code>vllm serve</code>), SGLang server, TensorRT-LLM <code>trtllm-serve</code>, Triton Inference Server",m:"Tokenize time, CPU load of the server process, open connections"},
+  engine:{t:"Engine core",d:"Owns the GPUs: waiting and running queues, the scheduler that admits requests each step, the KV-cache block manager, sampling, and aborts. The only layer that knows whether a request fits in memory.",ex:"vLLM engine core, TensorRT-LLM executor, SGLang scheduler",m:"<code>num_requests_waiting</code>, <code>num_requests_running</code>, KV-cache usage, preemptions, TPOT"},
+  gpu:{t:"GPU workers",d:"One process per GPU runs the model: prefill and decode forward passes, attention kernels over the paged KV cache, CUDA graphs. With tensor parallelism, several workers run one replica together.",ex:"vLLM worker and model runner, TensorRT-LLM runtime, FlashAttention and FlashInfer kernels",m:"Step time, achieved bandwidth and FLOP/s (from a profiler, not nvidia-smi)"},
+  scale:{t:"Autoscaler",d:"Not in the request path. Watches engine metrics and changes the number of replicas. Slow: a new replica must load about 16 GB of weights and warm up before it can serve.",ex:"Kubernetes HPA or KEDA on Prometheus metrics, KServe, Ray Serve autoscaling [Likely]",m:"Queue length over time, p95 TTFT against the SLO, cost per million tokens"}};
+ let sel="engine";
+ function box(id,x,y,w,h,label,sub){return `<g class="ss-layer${sel===id?" on":""}" data-l="${id}" tabindex="0" role="button" aria-label="${esc(L[id].t)}"><rect x="${x}" y="${y}" width="${w}" height="${h}" rx="10"/><text x="${x+w/2}" y="${y+h/2+(sub?-3:5)}" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)" font-family="var(--sans)">${label}</text>${sub?`<text x="${x+w/2}" y="${y+h/2+14}" text-anchor="middle" font-size="11.5" fill="var(--muted)" font-family="var(--sans)">${sub}</text>`:""}</g>`;}
+ function arrow(x1,y1,x2,y2){return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#ss-ah)"/>`;}
+ function draw(){
+  let g=`<defs><marker id="ss-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+  [90,250,410].forEach((x,i)=>{g+=box("client",x,8,120,34,["app","chat UI","agent"][i]);g+=arrow(x+60,42,305,64);});
+  g+=box("router",160,64,290,40,"Router / gateway","");
+  [[40,"Replica 1"],[330,"Replica 2"]].forEach(([x,lab])=>{
+   g+=`<rect x="${x}" y="122" width="250" height="170" rx="12" fill="none" stroke="var(--rule)" stroke-dasharray="5 4"/><text x="${x+10}" y="138" font-size="11.5" fill="var(--muted)" font-family="var(--sans)">${lab}</text>`;
+   g+=arrow(305,104,x+125,146);
+   g+=box("server",x+20,146,210,40,"API server","HTTP, tokenizer, SSE");
+   g+=arrow(x+125,186,x+125,198);
+   g+=box("engine",x+20,198,210,40,"Engine core","scheduler, KV cache");
+   g+=arrow(x+125,238,x+125,248);
+   g+=box("gpu",x+20,248,100,36,"GPU 0","");g+=box("gpu",x+130,248,100,36,"GPU 1","");});
+  g+=box("scale",600,40,150,56,"Autoscaler","adds / removes replicas");
+  g+=`<path d="M675 96 V112 H600" fill="none" stroke="var(--muted)" stroke-width="1.4" stroke-dasharray="4 4" marker-end="url(#ss-ah)"/>`;
+  svg.innerHTML=g;const l=L[sel];
+  info.innerHTML=`<b>${l.t}.</b> ${l.d}<br><b>Examples:</b> ${l.ex}<br><b>Look at:</b> ${l.m}`;
+  svg.dataset.sel=sel;}
+ svg.addEventListener("click",e=>{const n=e.target.closest(".ss-layer");if(!n)return;sel=n.dataset.l;draw();const f=svg.querySelector(`.ss-layer[data-l="${sel}"]`);if(f)f.focus({preventScroll:true});});
+ svg.addEventListener("keydown",e=>{if(e.key!=="Enter"&&e.key!==" ")return;const n=e.target.closest(".ss-layer");if(!n)return;e.preventDefault();sel=n.dataset.l;draw();const f=svg.querySelector(`.ss-layer[data-l="${sel}"]`);if(f)f.focus({preventScroll:true});});
+ draw();
+})();
+
+/* ---------- Figure 2: life of a request (stepper) ---------- */
+(function(){
+ const svg=$("#ss-life-svg");if(!svg)return;const info=$("#ss-life-info");
+ const nin=1000,N=200,Bt=32,net=10,tok=1,q=50,pre=tPre(nin)*1e3,tp=tStep(Bt,nin+N/2)*1e3;
+ const blk=n=>Math.ceil(n/16);
+ const lanes=["Client","Router","API server","Scheduler / queue","GPU worker"];
+ const t1=net,t2=t1+tok,t3=t2+q,t4=t3,t5=t4+pre,t6=t5+net,t8=t5+(N-1)*tp,t9=t8+net;
+ const S=[
+  {l:[0],w:"POST /v1/chat/completions, stream: true",a:0,b:0,t:`The client sends <code>POST /v1/chat/completions</code> with the messages, <code>stream: true</code> and <code>max_tokens</code>. Clock: <b>0 ms</b>.`},
+  {l:[1],w:"pick a replica, forward (network up)",a:0,b:t1,t:`The router picks a replica (least loaded, or the one that holds this prompt’s prefix) and forwards the request. Network up: ${net} ms. Clock: <b>${f1(t1)} ms</b>.`},
+  {l:[2],w:"validate, chat template, tokenize",a:t1,b:t2,t:`<b>Tokenize.</b> The API server validates the JSON, applies the chat template and turns the text into ${f0(nin)} token ids. Assumed ${tok} ms. Clock: <b>${f1(t2)} ms</b>.`},
+  {l:[3],w:"waiting queue",a:t2,b:t3,t:`<b>Queue.</b> The request waits in the engine’s waiting queue while the GPU serves others. Assumed ${q} ms. Clock: <b>${f1(t3)} ms</b>.`},
+  {l:[3],w:"admit: reserve KV blocks",a:t3,b:t4,t:`<b>Schedule.</b> At the start of a step the scheduler admits the request: it reserves KV-cache blocks for the prompt (${blk(nin)} blocks of 16 tokens, if the block size is 16). If memory were full, the request would stay in the queue.`},
+  {l:[4],w:"prefill 1,000 tokens → first token",a:t4,b:t5,t:`<b>Prefill.</b> One forward pass over all ${f0(nin)} prompt tokens fills the KV cache and samples the first token: 2P·n / (F·u) = <b>${f1(pre)} ms</b>. Clock: <b>${f1(t5)} ms</b>.`},
+  {l:[2,0],w:"detokenize, send SSE chunk",a:t5,b:t6,t:`<b>Detokenize and stream.</b> The server turns the first token into text and writes one SSE chunk <code>data: {...}</code>. After ${net} ms of network the client shows it. <b>TTFT = ${f1(t6)} ms</b> (equation 133.1).`},
+  {l:[4],w:"decode: 199 steps of the batch of 32",a:t5,b:t8,t:`<b>Decode.</b> ${N-1} more steps, each one forward pass for the whole batch of ${Bt}. TPOT = <b>${f2(tp)} ms</b> (equation 133.4), so this takes ${f0((N-1)*tp)} ms. Our request is one row of every step.`},
+  {l:[2,0],w:"one chunk per step, overlapped with decode",a:t5,b:t8,t:`<b>Stream, overlapped.</b> After every step the server detokenizes the new token (holding back half-finished characters) and sends a chunk while the GPU already runs the next step. The user reads about ${f0(1000/tp)} tokens per second.`},
+  {l:[3,2],w:"EOS: free KV blocks, final chunk, [DONE]",a:t8,b:t8,t:`<b>Finish.</b> The model emits the end-of-sequence token at output ${N}. The engine frees the request’s ${blk(nin+N)} KV blocks for waiting requests; the server sends the final chunk with <code>finish_reason: "stop"</code> and usage, then <code>data: [DONE]</code>.`},
+  {l:[0],w:"last chunk received",a:t8,b:t9,t:`The client receives the last chunk. <b>E2E = ${f0(t9)} ms</b> = TTFT + ${N-1} × TPOT (equation 133.2). Decode was ${f1(100*(N-1)*tp/t9)}% of it.`}];
+ const X0=150,X1=740,sc=v=>X0+(X1-X0)*Math.sqrt(v/t9);
+ function draw(k){const st=S[k];let g="";
+  lanes.forEach((nm,i)=>{const y=18+i*46,on=st.l.includes(i);g+=`<rect x="8" y="${y}" width="744" height="38" rx="8" fill="${on?"var(--q-soft)":"none"}" stroke="${on?"var(--q)":"var(--rule)"}" stroke-width="${on?2:1}"/><text x="18" y="${y+24}" font-size="13.5" font-weight="${on?700:500}" fill="var(--ink)" font-family="var(--sans)">${nm}</text>`+(on?`<text x="200" y="${y+24}" font-size="13" fill="var(--q)" font-weight="600" font-family="var(--sans)">${esc(st.w)}</text>`:"");});
+  const marks=[[0,"0"],[t3,"queue end"],[t6,"TTFT"],[t9,"E2E"]];
+  g+=`<line x1="${X0}" y1="270" x2="${X1}" y2="270" stroke="var(--muted)"/>`;
+  const segs=[[0,t1,"var(--muted)"],[t1,t2,"var(--muted)"],[t2,t3,"var(--bad)"],[t4,t5,"var(--k)"],[t5,t8,"var(--q)"],[t8,t9,"var(--muted)"]];
+  segs.forEach(([a,b,c])=>{const done=b<=st.b+1e-9&&k>0;g+=`<rect x="${sc(a).toFixed(1)}" y="262" width="${Math.max(1.5,sc(b)-sc(a)).toFixed(1)}" height="16" fill="${c}" opacity="${done?0.9:0.18}"/>`;});
+  marks.forEach(([v,l],i)=>{const an=i===3?"end":i===1?"end":"start";g+=`<line x1="${sc(v)}" y1="282" x2="${sc(v)}" y2="290" stroke="var(--muted)"/><text x="${sc(v)+(i===3?6:i===1?-2:0)}" y="${i===2?318:304}" text-anchor="${i===0?"middle":an}" font-size="11.5" fill="var(--muted)" font-family="var(--sans)">${l}${i?" "+f0(v)+" ms":""}</text>`;});
+  if(k>0)g+=`<line x1="${sc(st.b)}" y1="255" x2="${sc(st.b)}" y2="284" stroke="var(--tc)" stroke-width="2.5"/>`;
+  g+=`<text x="${X0-8}" y="274" text-anchor="end" font-size="12" fill="var(--muted)" font-family="var(--sans)">clock (√ scale)</text>`;
+  svg.innerHTML=g;info.innerHTML=`<b>Step ${k+1}.</b> ${st.t}`;svg.dataset.ttft=f1(t6);svg.dataset.e2e=f0(t9);}
+ B.stepper({n:S.length,prev:$("#ss-life-prev"),next:$("#ss-life-next"),play:$("#ss-life-play"),label:$("#ss-life-lab"),ms:2600,onStep:draw});
+})();
+
+/* ---------- Figure 3: latency budget and throughput ---------- */
+(function(){
+ const svg=$("#ss-lat-svg");if(!svg)return;const info=$("#ss-lat-info");
+ const In=$("#ss-lat-in"),Out=$("#ss-lat-out"),Bb=$("#ss-lat-b"),Q=$("#ss-lat-q");const BS=[1,2,4,8,16,32,64,128,256];
+ function draw(){const nin=+In.value,N=+Out.value,b=BS[+Bb.value],q=+Q.value;
+  $("#ss-lat-inv").value=f0(nin);$("#ss-lat-outv").value=f0(N);$("#ss-lat-bv").value=b;$("#ss-lat-qv").value=q+" ms";
+  const L=nin+N/2,pre=tPre(nin)*1e3,tp=tStep(b,L)*1e3,ttft=10+1+q+pre+10,dec=(N-1)*tp,e2e=ttft+dec,thr=b/tp*1e3;
+  const kvGB=b*(nin+N)*KV/1e9,budget=(USABLE-MW)/1e9,maxB=Math.floor((USABLE-MW)/((nin+N)*KV)),fits=b<=maxB;
+  let g="";const x0=20,W=300;const parts=[[21,"var(--muted)"],[q,"var(--bad)"],[pre,"var(--k)"],[dec,"var(--q)"]];let x=x0;
+  g+=`<text x="${x0}" y="22" font-size="13" font-weight="700" fill="var(--ink)" font-family="var(--sans)">End-to-end ${f0(e2e)} ms</text>`;
+  parts.forEach(([v,c])=>{const w=W*v/e2e;g+=`<rect x="${x.toFixed(1)}" y="34" width="${Math.max(0,w).toFixed(1)}" height="30" fill="${c}"/>`;x+=w;});
+  const rows=[["network + tokenize",21],["queue",q],["prefill",pre],["decode ("+(N-1)+" × "+f2(tp)+" ms)",dec]];
+  rows.forEach(([l,v],i)=>{g+=`<rect x="${x0}" y="${84+i*24}" width="12" height="12" fill="${parts[i][1]}"/><text x="${x0+18}" y="${94+i*24}" font-size="12.5" fill="var(--ink)" font-family="var(--sans)">${l}: ${f0(v)} ms (${f1(100*v/e2e)}%)</text>`;});
+  g+=`<text x="${x0}" y="${94+4*24+6}" font-size="12.5" fill="var(--ink)" font-family="var(--sans)">TTFT = ${f1(ttft)} ms</text>`;
+  /* throughput plot */
+  const px0=380,px1=625,py0=200,py1=30,tmax=Math.max(...BS.map(v=>v/tStep(v,L)));const X=i=>px0+(px1-px0)*i/8,Y=v=>py0-(py0-py1)*v/tmax;
+  g+=`<path d="M${px0} ${py1} V${py0} H${px1}" fill="none" stroke="var(--muted)"/>`;
+  g+=`<polyline points="${BS.map((v,i)=>X(i).toFixed(1)+","+Y(v/tStep(v,L)).toFixed(1)).join(" ")}" fill="none" stroke="var(--v)" stroke-width="2.5"/>`;
+  BS.forEach((v,i)=>{const ok=v<=maxB;g+=`<circle cx="${X(i)}" cy="${Y(v/tStep(v,L))}" r="${v===b?6:3}" fill="${ok?"var(--v)":"var(--bad)"}" stroke="${v===b?"var(--ink)":"none"}" stroke-width="1.5"/><text x="${X(i)}" y="${py0+15}" text-anchor="middle" font-size="11" fill="var(--muted)" font-family="var(--sans)">${v}</text>`;});
+  g+=`<text x="${(px0+px1)/2}" y="${py0+32}" text-anchor="middle" font-size="12" fill="var(--muted)" font-family="var(--sans)">batch size B (red: KV cache does not fit)</text><text x="${px0}" y="20" font-size="12" fill="var(--muted)" font-family="var(--sans)">GPU tokens/s, max ${f0(tmax)}</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`TTFT <b>${f1(ttft)} ms</b>, TPOT <b>${f2(tp)} ms</b> (${f0(1000/tp)} tokens/s per user), E2E <b>${f0(e2e)} ms</b>. GPU throughput at B = ${b}: <b>${f0(thr)} tokens/s</b>. KV cache at the end: ${f2(kvGB)} GB of ${f1(budget)} GB free; at most ${f0(maxB)} such sequences fit.`+(fits?"":` <b style="color:var(--bad)">This batch does not fit: the scheduler would keep requests waiting or preempt them.</b>`);
+  svg.dataset.ttft=f1(ttft);svg.dataset.tpot=f2(tp);svg.dataset.thr=f0(thr);}
+ [In,Out,Bb,Q].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: incremental detokenization ---------- */
+(function(){
+ const tbl=$("#ss-detok-tbl");if(!tbl)return;const info=$("#ss-detok-info");
+ const T=[[0x20,0x43,0x61,0x66],[0xC3],[0xA9],[0x20,0xF0,0x9F],[0x91,0x8D],[0x20,0x6F,0x6B]];
+ const dec=a=>new TextDecoder("utf-8").decode(new Uint8Array(a));const cat=(i,j)=>[].concat(...T.slice(i,j));
+ const rows=[];let p=0,r=0,sent="";
+ T.forEach((tk,k)=>{const n=k+1;const a=dec(cat(p,r)),b=dec(cat(p,n));let d="",why="";
+  if(b.endsWith("�")||b.length<=a.length){why="text ends with U+FFFD: wait";}else{d=b.slice(a.length);p=r;r=n;sent+=d;why=`sent; the next window starts at token ${p+1}`;}
+  rows.push({hex:tk.map(x=>x.toString(16).toUpperCase().padStart(2,"0")).join(" "),naive:dec(tk),d,sent,why});});
+ const vis=s=>s===""?"<span style=\"color:var(--muted)\">(nothing)</span>":esc(s).replace(/ /g,"␣").replace(/�/g,"<b style=\"color:var(--bad)\">�</b>");
+ function draw(k){let h=`<thead><tr><th>step</th><th>token bytes</th><th>naive: decode this token</th><th>incremental: sent now</th><th>client shows</th></tr></thead><tbody>`;
+  rows.forEach((w,i)=>{if(i>k)return;h+=`<tr class="${i===k?"on":""}"><td>${i+1}</td><td>${w.hex}</td><td>${vis(w.naive)}</td><td>${vis(w.d)}</td><td>${vis(w.sent)}</td></tr>`;});
+  tbl.innerHTML=h+"</tbody>";const w=rows[k];
+  info.innerHTML=`Step ${k+1}: token <code>${w.hex}</code>. Naive server would send “${vis(w.naive)}”. Incremental: ${w.why}. Client text so far: “${vis(w.sent)}”.`;
+  tbl.dataset.sent=rows[k].sent;}
+ B.stepper({n:rows.length,prev:$("#ss-detok-prev"),next:$("#ss-detok-next"),play:$("#ss-detok-play"),label:$("#ss-detok-lab"),ms:2200,onStep:draw});
+})();
+
+/* ---------- Figure 5: router simulation ---------- */
+(function(){
+ const svg=$("#ss-route-svg");if(!svg)return;const info=$("#ss-route-info");
+ const Tt=$("#ss-route-t"),Cc=$("#ss-route-c"),Zz=$("#ss-route-z"),Kk=$("#ss-route-k"),seg=$("#ss-route-pol");let pol="prefix";
+ function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+ const NR=4,NQ=600,PRE=1000,USR=200,DEC=800,JOB=PRE+USR+DEC,CAPW=1500,DT=50;
+ function sim(policy,T,C,zs,sl){const r=rng(7);const w=[];for(let i=0;i<T;i++)w.push(1/Math.pow(i+1,zs));const S=w.reduce((a,b)=>a+b,0);const cdf=[];let a=0;w.forEach(x=>{a+=x/S;cdf.push(a);});
+  const drain=CAPW/NR;let out=new Array(NR).fill(0);const pf=new Array(NR).fill(0),dc=new Array(NR).fill(0),cache=Array.from({length:NR},()=>[]);let hits=0,pft=0,rr=0,wait=0,work=0;
+  for(let i=0;i<NQ;i++){const u=r();let t=T-1;for(let k=0;k<T;k++){if(u<cdf[k]){t=k;break;}}
+   let k;if(policy==="rr"){k=rr%NR;rr++;}else{const mn=Math.min(...out);k=out.indexOf(mn);
+    if(policy==="prefix"){let best=-1;for(let j=0;j<NR;j++)if(cache[j].includes(t)&&(best<0||out[j]<out[best]))best=j;if(best>=0&&out[best]<=2*mn+sl*JOB)k=best;}}
+   const hit=cache[k].includes(t);wait+=out[k];
+   if(hit){hits++;cache[k].splice(cache[k].indexOf(t),1);}cache[k].push(t);if(cache[k].length>C)cache[k].shift();
+   const pw=(hit?0:PRE)+USR;pft+=pw;pf[k]+=pw;dc[k]+=DEC;out[k]+=pw+DEC;work+=pw+DEC;out=out.map(o=>Math.max(0,o-drain));}
+  return {hit:hits/NQ,pf:pft/(NQ*(PRE+USR)),wait:wait/NQ/drain*DT,load:work/(NQ*CAPW),pfr:pf,dcr:dc,cache};}
+ function draw(){const T=+Tt.value,C=+Cc.value,zs=+Zz.value,sl=+Kk.value;$("#ss-route-kv").value=sl.toFixed(2);$("#ss-route-tv").value=T;$("#ss-route-cv").value=C;$("#ss-route-zv").value=zs.toFixed(1);
+  const res={rr:sim("rr",T,C,zs,sl),least:sim("least",T,C,zs,sl),prefix:sim("prefix",T,C,zs,sl)},s=res[pol];
+  const mx=Math.max(...["rr","least","prefix"].map(p=>Math.max(...res[p].pfr.map((v,i)=>v+res[p].dcr[i]))));
+  let g="";const bw=90,gap=60,x0=50,y0=170,H=140;
+  for(let j=0;j<NR;j++){const x=x0+j*(bw+gap),hp=H*s.pfr[j]/mx,hd=H*s.dcr[j]/mx;
+   g+=`<rect x="${x}" y="${(y0-hd).toFixed(1)}" width="${bw}" height="${hd.toFixed(1)}" fill="var(--q)"/><rect x="${x}" y="${(y0-hd-hp).toFixed(1)}" width="${bw}" height="${hp.toFixed(1)}" fill="var(--k)"/>`;
+   g+=`<text x="${x+bw/2}" y="${y0+16}" text-anchor="middle" font-size="12.5" fill="var(--ink)" font-family="var(--sans)">replica ${j+1}</text>`;
+   const cs=s.cache[j].slice().sort((a,b)=>a-b);const shown=cs.slice(0,8);
+   g+=`<text x="${x+bw/2}" y="${y0+34}" text-anchor="middle" font-size="11.5" fill="var(--v)" font-family="var(--mono)">${shown.map(v=>v+1).join(" ")}${cs.length>8?" …":""}</text>`;
+   g+=`<text x="${x+bw/2}" y="${(y0-hd-hp-6).toFixed(1)}" text-anchor="middle" font-size="11.5" fill="var(--muted)" font-family="var(--sans)">${(s.pfr[j]/1e3+s.dcr[j]/1e3).toFixed(0)}k</text>`;}
+  g+=`<line x1="40" y1="${y0}" x2="630" y2="${y0}" stroke="var(--muted)"/>`;svg.innerHTML=g;
+  const nm={rr:"Round robin",least:"Least loaded",prefix:"Prefix-aware"};const pc=v=>f1(100*v)+"%";
+  info.innerHTML=`<b>${nm[pol]}</b>: prefix hit rate <b>${pc(s.hit)}</b>, prefill tokens computed <b>${pc(s.pf)}</b> of the no-cache amount, offered load <b>${pc(s.load)}</b> of capacity${s.load>1?` (<b style="color:var(--bad)">overloaded: queues grow</b>)`:""}, mean wait before service <b>${f0(s.wait)} ms</b>.<br>All three: hit rate ${pc(res.rr.hit)} / ${pc(res.least.hit)} / ${pc(res.prefix.hit)}, mean wait ${f0(res.rr.wait)} / ${f0(res.least.wait)} / ${f0(res.prefix.wait)} ms (round robin / least loaded / prefix-aware).`;
+  svg.dataset.hit=pc(s.hit);svg.dataset.wait=f0(s.wait);}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;pol=b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ [Tt,Cc,Zz,Kk].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 6: multi-LoRA memory ---------- */
+(function(){
+ const svg=$("#ss-lora-svg");if(!svg)return;const info=$("#ss-lora-info");
+ const Rr=$("#ss-lora-r"),Nn=$("#ss-lora-n"),Ss=$("#ss-lora-s"),All=$("#ss-lora-all");const RS=[4,8,16,32,64,128];
+ const SH={q:[4096,4096],k:[4096,1024],v:[4096,1024],o:[4096,4096],gate:[4096,14336],up:[4096,14336],down:[14336,4096]};
+ function draw(){const r=RS[+Rr.value],n=+Nn.value,sl=Math.min(+Ss.value,n),all=All.checked;
+  $("#ss-lora-rv").value=r;$("#ss-lora-nv").value=f0(n);$("#ss-lora-sv").value=+Ss.value;
+  const mods=all?Object.keys(SH):["q","k","v","o"];const p=32*mods.reduce((a,m)=>a+r*(SH[m][0]+SH[m][1]),0);
+  const mb=2*p/1e6,slotGB=sl*mb/1e3,hostGB=n*mb/1e3,kvGB=(USABLE-MW)/1e9-slotGB,lostTok=slotGB*1e9/KV,fullGB=n*MW/1e9,perGPU=Math.floor(USABLE/MW),gpus=Math.ceil(n/perGPU);
+  let g="";const x0=20,W=600,sc=W/80;
+  g+=`<text x="${x0}" y="18" font-size="13" font-weight="700" fill="var(--ink)" font-family="var(--sans)">One 80 GB GPU: base model + ${sl} adapter slot${sl>1?"s":""}</text>`;
+  let x=x0;[[MW/1e9,"var(--muted)","base "+f1(MW/1e9)+" GB","var(--paper)"],[slotGB,"var(--k)","","var(--paper)"],[Math.max(0,kvGB),"var(--q)","KV "+f1(Math.max(0,kvGB))+" GB","var(--paper)"],[8,"var(--rule)","reserve","var(--ink2)"]].forEach(([v,c,l,tc])=>{const w=v*sc;g+=`<rect x="${x.toFixed(1)}" y="28" width="${Math.max(0,w).toFixed(1)}" height="34" fill="${c}"/>`;if(l&&w>50)g+=`<text x="${(x+w/2).toFixed(1)}" y="50" text-anchor="middle" font-size="12" fill="${tc}" font-family="var(--sans)" font-weight="700">${l}</text>`;x+=w;});
+  g+=`<text x="${x0}" y="80" font-size="12" fill="var(--k)" font-family="var(--sans)">adapter slots: ${f2(slotGB)} GB (${f0(lostTok)} tokens of KV cache)</text>`;
+  g+=`<text x="${x0}" y="118" font-size="13" font-weight="700" fill="var(--ink)" font-family="var(--sans)">${f0(n)} full fine-tuned copies instead: ${f0(fullGB)} GB, ${f0(gpus)} GPU${gpus>1?"s":""} (at most ${perGPU} copies per GPU, with no KV cache)</text>`;
+  const lg=v=>Math.log10(Math.max(1,v));const wl=W*lg(gpus)/lg(500);g+=`<rect x="${x0}" y="128" width="${Math.max(3,Math.min(W,wl)).toFixed(1)}" height="24" fill="var(--bad)" opacity="0.85"/>`;
+  [1,10,100,500].forEach(v=>g+=`<text x="${(x0+W*lg(v)/lg(500)).toFixed(1)}" y="170" text-anchor="middle" font-size="11" fill="var(--muted)" font-family="var(--sans)">${v}</text>`);
+  g+=`<text x="${x0+W/2}" y="190" text-anchor="middle" font-size="11.5" fill="var(--muted)" font-family="var(--sans)">GPUs (log scale)</text>`;svg.innerHTML=g;
+  info.innerHTML=`One adapter (rank ${r}, ${all?"all 7 linear layers":"q, k, v, o"}): <b>${f0(p)}</b> parameters, <b>${f1(mb)} MB</b> in BF16 (${f2(100*p/P)}% of the base model, also its extra FLOPs per token). All ${f0(n)} adapters on the host: <b>${f2(hostGB)} GB</b> of CPU memory. ${sl} GPU slot${sl>1?"s":""}: <b>${f2(slotGB)} GB</b>, leaving ${f1(kvGB)} GB for KV cache. Loading one adapter over PCIe at 64 GB/s: about ${f1(mb/64)} ms.`;
+  svg.dataset.mb=f1(mb);svg.dataset.slot=f2(slotGB);}
+ [Rr,Nn,Ss].forEach(e=>e.addEventListener("input",draw));All.addEventListener("change",draw);draw();
+})();
+})();
+</script></body></html>

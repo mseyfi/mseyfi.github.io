@@ -1,0 +1,470 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Speculative decoding 2: drafts and verification (Medusa, EAGLE, Lookahead, SpecInfer) · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 129</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="speculative-decoding-2-drafts-and-verification-medusa">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="speculative-decoding-2-drafts-and-verification-medusa" data-session="speculative-decoding-2-drafts-and-verification-medusa" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">129</span><span>Track 5: LLM inference and serving · session 52 of 65</span></div><h1 class="chap-title">Speculative decoding 2: drafts and verification (Medusa, EAGLE, Lookahead, SpecInfer)</h1><p class="chap-sub">Session 128 proved that a draft-then-verify loop keeps the target model’s exact output. This session is about the drafter: a separate small model, extra heads on the target itself (Medusa), a tiny head that predicts the target’s own features (EAGLE), no model at all (prompt lookup and Lookahead decoding), or multi-token prediction heads trained with the model (DeepSeek-V3). You also learn tree verification: how one forward pass checks many candidate branches at once with a special attention mask (SpecInfer, Medusa).</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Session 128 (speculative decoding: the math), Session 80 (the KV cache), Session 82 (why inference is slow)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The four kinds of drafter (separate model, self-drafting heads, feature-level drafting, no model) and what each one costs</li><li>How Medusa heads are built and trained, and why their guesses for different positions combine into a Cartesian-product tree</li><li>Tree attention: the mask and position ids that let one target pass verify every branch, and how to count tree tokens</li><li>Why a wide tree helps a weak drafter and a long chain helps a strong one, with a small expected-length model</li><li>How EAGLE drafts at the feature level, why it feeds the sampled token shifted by one step, and what EAGLE-2 and EAGLE-3 changed</li><li>Prompt lookup decoding and Lookahead decoding: speculation with no draft model at all</li><li>Multi-token prediction heads (Gloeckle et al., DeepSeek-V3) used as built-in drafters, and their reported acceptance rates</li></ul></div></header><style>
+.sd2-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.sd2-grid input[type=range]{width:100%}
+.sd2-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.sd2-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.sd2-strip{display:flex;flex-wrap:wrap;gap:0;line-height:1.2}
+.sd2-strip .tok{font-size:13.5px;padding:2px 6px;margin:2px;font-variant-ligatures:none}
+.sd2-strip .tok.m{background:var(--k-soft);border-color:var(--k)}
+.sd2-strip .tok.p{background:var(--q-soft);border-color:var(--q)}
+.sd2-strip .tok.a{background:var(--v-soft);border-color:var(--v)}
+.sd2-strip .tok.b{background:var(--v-soft);border:2px dashed var(--v)}
+.sd2-strip .tok.x{background:var(--paper2);border:1px dashed var(--q);color:var(--muted);text-decoration:line-through}
+.sd2-row{font:600 13px var(--sans);color:var(--muted);margin:8px 0 2px}
+.sd2-tree-wrap{display:flex;flex-wrap:wrap;gap:12px;align-items:flex-start}
+.sd2-tree-wrap svg{flex:1 1 300px;min-width:0}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../inference/index.html#row-speculative-decoding-1-the-math" title="Speculative decoding 1: the math (planned)">session 128</a> we proved a strong result: if a cheap drafter guesses a few tokens and the big model checks them in one pass, the output has exactly the big model’s distribution. The math does not care <b>where the guesses come from</b>. The speed does. This session is about the drafter, and about checking many guesses at once.</p>
+<p>Decoding one token at a time is slow because each step reads all the weights from memory to produce just one token (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>). The GPU has spare compute in every step. Speculative decoding uses that spare compute to check several tokens per weight read. How many tokens you gain per step depends on two things: how often the guesses are right, and how much the guessing costs. Every method in this session is a different answer to “how do we get good guesses cheaply?”</p>
+<ul>
+<li><b>A separate draft model</b>: a small model of the same family (for example a 4B draft for the 70B Chinchilla model in Chen et al. [Likely]). Simple, but you must train, host and keep in sync a second model.</li>
+<li><b>Self-drafting heads (Medusa)</b>: a few extra output heads on the big model guess tokens 2, 3, 4 … steps ahead from the same hidden state.</li>
+<li><b>Feature-level drafting (EAGLE)</b>: one small decoder layer predicts the big model’s next <i>hidden feature</i>, not its next token.</li>
+<li><b>No draft model at all</b>: copy candidate tokens from the prompt (prompt lookup decoding), or from n-grams the model itself produced in parallel (Lookahead decoding).</li>
+<li><b>Multi-token prediction (MTP) heads</b> trained together with the model, as in DeepSeek-V3, which serve as a free drafter at inference.</li></ul>
+<p>The second idea is <b>tree verification</b>. Instead of one chain of guesses, the drafter proposes a small tree of alternatives. A special attention mask lets the big model check every branch in the same single pass (SpecInfer, Medusa). Trees are why a weak drafter can still give a large speedup.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “How is Medusa different from a draft model?”, “What does EAGLE predict, and why does it feed the next token too?”, “How does tree attention work?”, “When does speculative decoding stop paying off?”, “What is prompt lookup decoding good for?”. Each one is answered below with formulas and numbers.</aside>
+<p>These are not research toys. vLLM, SGLang, TensorRT-LLM and Hugging Face transformers ship several of these drafters [Likely], and DeepSeek-V3 reports that its MTP module, used as a drafter, gives 1.8 times the tokens per second of plain decoding [Certain].</p>
+
+<h2>What a drafter must deliver</h2>
+<p>Recall the two numbers from <a href="../inference/index.html#row-speculative-decoding-1-the-math" title="Speculative decoding 1: the math (planned)">session 128</a>. Let \(\alpha\) be the chance that the target accepts one drafted token (assume it is the same at each position), and let \(\gamma\) be the number of drafted tokens per step. One target pass then produces on average</p>
+<div class="eq">\[ \E[\text{tokens per target pass}] = \frac{1 - \alpha^{\gamma + 1}}{1 - \alpha} \tag{129.1} \]</div>
+<p>tokens: the accepted prefix of the draft plus one token that the target always adds itself (the correction token, or a “bonus” token when all guesses pass). Drafting is not free. If one draft step costs a fraction \(c\) of one target pass, a full step costs \(1 + \gamma c\) target passes, and the speedup over plain decoding is</p>
+<div class="eq">\[ \text{speedup} = \frac{1 - \alpha^{\gamma + 1}}{(1 - \alpha)(1 + \gamma c)} \tag{129.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\alpha\)</dt><dd>acceptance rate: the chance that one drafted token survives verification</dd>
+<dt>\(\gamma\)</dt><dd>how many tokens the drafter proposes before each target pass</dd>
+<dt>\(c\)</dt><dd>cost of one draft step divided by the cost of one target pass (0.05 means the drafter is 20 times cheaper)</dd></dl>
+<p>Formula (129.2) is the scorecard for every method in this session. A good drafter has a high \(\alpha\) <i>and</i> a small \(c\). A separate draft model has a medium \(\alpha\) and a medium \(c\). Medusa heads have \(c\) close to 0 (they run inside the target pass) but a lower \(\alpha\) for far positions. EAGLE spends a little more \(c\) for a much higher \(\alpha\). Prompt lookup has \(c \approx 0\) and an \(\alpha\) that is near 1 when the output copies the input and near 0 when it does not. This formula assumes that verification of \(\gamma + 1\) tokens costs the same as one decode step; that is true only while decoding is memory-bound (small batches). We return to this in “Common mistakes”.</p>
+<figure class="fig" id="sd2-cost"><div class="fig-body">
+<div class="sd2-grid">
+<label for="sd2-cost-a">acceptance rate \(\alpha\)</label><input type="range" id="sd2-cost-a" min="0.3" max="0.95" step="0.01" value="0.8"><output id="sd2-cost-av"></output>
+<label for="sd2-cost-g">draft length \(\gamma\)</label><input type="range" id="sd2-cost-g" min="1" max="12" step="1" value="4"><output id="sd2-cost-gv"></output>
+<label for="sd2-cost-c">draft cost ratio \(c\)</label><input type="range" id="sd2-cost-c" min="0" max="0.5" step="0.01" value="0.05"><output id="sd2-cost-cv"></output></div>
+<svg id="sd2-cost-svg" viewBox="0 0 640 260" role="img" aria-label="Speedup as a function of the draft length for the chosen acceptance rate and draft cost"></svg>
+<div class="sd2-leg"><span style="--c:var(--q)">speedup, formula (129.2)</span><span style="--c:var(--k)">tokens per target pass, formula (129.1)</span></div>
+<div class="readout" id="sd2-cost-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The drafter scorecard. For a given acceptance rate and draft cost, the curves show tokens per target pass and the real speedup as the draft length grows. The dot marks the chosen \(\gamma\).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Tokens per pass (orange) always rises with \(\gamma\) but saturates at \(1/(1 - \alpha)\). The speedup (red) rises, peaks, and then falls, because every extra draft step costs \(c\) but is accepted less and less often. Set \(c = 0\) (Medusa-like heads, prompt lookup): the speedup equals the tokens per pass. Set \(c = 0.2\): the best \(\gamma\) moves down and the peak drops. Lower \(\alpha\) to 0.5: even a free drafter gives less than 2×. This is why the rest of the session is about raising \(\alpha\) without raising \(c\).</p></details></figure>
+<div class="worked"><div class="wt">Worked example: one drafter, two costs</div>
+<p>Take \(\alpha = 0.8\) and \(\gamma = 4\). Formula (129.1): \((1 - 0.8^5)/(1 - 0.8) = (1 - 0.32768)/0.2 = 3.36\) tokens per target pass.</p>
+<p>With a draft model that costs \(c = 0.05\): speedup \(= 3.36 / (1 + 4 \times 0.05) = 3.36/1.2 = 2.80\). The best draft length for this \(c\) is \(\gamma = 8\), with speedup 3.09.</p>
+<p>With a heavier draft, \(c = 0.2\): the best is \(\gamma = 4\), and the speedup is only \(3.36 / 1.8 = 1.87\). Same acceptance, much less gain. With a weaker drafter, \(\alpha = 0.6\), \(\gamma = 4\), \(c = 0.05\): \(2.31\) tokens per pass and speedup 1.92.</p></div>
+
+<h2>Four ways to draft</h2>
+<p>Figure 2 puts the drafters side by side. The key question for each one is: <b>what information does the drafter see</b>, and <b>what extra thing must you train or host</b>?</p>
+
+<figure class="fig wide" id="sd2-kinds"><div class="fig-body">
+<div class="scroll-x"><svg id="sd2-kinds-svg" viewBox="0 0 860 300" role="img" aria-label="Four drafter designs: separate model, Medusa heads, EAGLE feature drafter, and prompt lookup"></svg></div>
+</div><figcaption><b>Figure 2.</b> Four drafters. Red boxes are the target model, green boxes are what you must add. A separate model sees only tokens. Medusa heads see the target’s last hidden state \(\mathbf{h}_t\). EAGLE sees the hidden features and the already chosen next token. Prompt lookup sees only the text and needs no new weights.</figcaption></figure>
+<div class="tblw"><table class="tb"><thead><tr><th>Drafter</th><th>Input to the drafter</th><th>Extra weights</th><th>Draft cost \(c\)</th><th>Typical weakness</th></tr></thead><tbody>
+<tr><td>Separate small model</td><td>the tokens</td><td>a full small LM with the same tokenizer</td><td>medium (its own forward passes)</td><td>must be kept aligned with the target; second KV cache</td></tr>
+<tr><td>Medusa heads</td><td>last hidden state \(\mathbf{h}_t\)</td><td>\(K\) small heads (one layer each)</td><td>near 0 (run with the target)</td><td>heads guess position \(t + k\) without seeing tokens \(t+1, \dots\), so far heads are weak</td></tr>
+<tr><td>EAGLE</td><td>hidden features + the next token</td><td>one decoder layer (under 1B for a 70B target)</td><td>small (one layer per draft step)</td><td>needs training per target model</td></tr>
+<tr><td>Prompt lookup / n-gram</td><td>the text so far</td><td>none</td><td>near 0</td><td>helps only when the output repeats the input</td></tr>
+<tr><td>Lookahead decoding</td><td>the target’s own parallel guesses</td><td>none</td><td>extra tokens in each target pass</td><td>uses spare compute; gains shrink at large batch</td></tr>
+<tr><td>MTP heads (DeepSeek-V3)</td><td>hidden state + next-token embedding</td><td>one transformer block per depth, trained in pretraining</td><td>small</td><td>must be part of pretraining</td></tr></tbody></table></div>
+
+<h3>A separate draft model</h3>
+<aside class="note analogy side"><span class="nt">Analogy</span>A senior editor (the target model) must approve every sentence of a report. A junior writer can draft ahead (separate draft model). Or the editor can scribble quick notes about the next few words while reading (Medusa heads). Or a trusted assistant who sees the editor’s own notes can guess the editor’s next thought (EAGLE). Or, when the report quotes a source, you simply copy the next words from the source (prompt lookup). In every case the editor still approves word by word, so the final report is the editor’s.</aside>
+<p>This is the original design of Leviathan et al. and Chen et al. The drafter is a smaller language model that uses <b>the same tokenizer</b>, because the target verifies token ids. Chen et al. used a 4B draft model [Likely] for the 70B Chinchilla model and report a 2 to 2.5× decoding speedup in a distributed setup [Certain]. The drafter runs \(\gamma\) ordinary decoding steps, keeping its own KV cache, then the target scores all \(\gamma\) tokens in one pass. After verification, both caches are cut back to the accepted length.</p>
+<p>The cost is operational more than mathematical: a second model to host, a second KV cache in GPU memory, and a drafter that may drift away from the target after you fine-tune the target. A common fix is to distill the drafter on the target’s own outputs (<a href="../inference/distillation-for-llms-1-white-box-logits.html">session 119</a>), which raises \(\alpha\).</p>
+
+<h2>Medusa: extra heads on the target model</h2>
+<p>Medusa removes the second model. The target already computes a last hidden state \(\mathbf{h}_t\) at position \(t\), and its normal LM head turns it into the next token \(t+1\). Medusa adds \(K\) more heads. Head \(k\) reads the same \(\mathbf{h}_t\) and predicts the token at position \(t + k + 1\):</p>
+<div class="eq">\[ p_t^{(k)} = \softmax\!\Big( W_2^{(k)} \big( \operatorname{SiLU}(W_1^{(k)} \mathbf{h}_t) + \mathbf{h}_t \big) \Big) \tag{129.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{h}_t \in \R^{d}\)</dt><dd>the target’s last hidden state at position \(t\), the same vector the normal LM head uses</dd>
+<dt>\(W_1^{(k)} \in \R^{d \times d}\)</dt><dd>one feed-forward layer per head, with a residual connection; it starts at zero</dd>
+<dt>\(W_2^{(k)} \in \R^{V \times d}\)</dt><dd>the head’s output matrix over the vocabulary of size \(V\); it starts as a copy of the original LM head</dd>
+<dt>\(p_t^{(k)}\)</dt><dd>head \(k\)’s guess for the token \(k + 1\) steps ahead</dd></dl>
+<p>Because \(W_1\) starts at zero and \(W_2\) copies the LM head, every head starts by predicting the same thing as the normal head, and training moves it from there [Certain]. Medusa-1 freezes the target and trains only the heads, with a loss that gives far heads less weight:</p>
+<div class="eq">\[ \mathcal{L}_{\text{Medusa-1}} = \sum_{k=1}^{K} -\lambda_k \log p_t^{(k)}\big(y_{t+k+1}\big), \qquad \lambda_k = 0.8^{k} \tag{129.4} \]</div>
+<p>The paper suggests about five heads, and reports that Medusa-1 on Vicuna-7B trains in about five hours on one A100 with 60k ShareGPT samples [Certain]. Medusa-2 trains the heads and the target together (with care so the target’s own quality does not drop). The reported speedups are over 2.2× for Medusa-1 and 2.3 to 3.6× for Medusa-2 [Certain].</p>
+<p>The weakness is visible in formula (129.3): head 3 must guess token \(t+4\) without knowing which tokens \(t+2\) and \(t+3\) will be. Its guess cannot depend on the branch. Medusa’s answer is to take the <b>top few</b> guesses of each head and verify all their combinations: a tree.</p>
+<h3>Typical acceptance (an optional, lossy rule)</h3>
+<p>With sampling, Medusa can verify with the exact rule from <a href="../inference/index.html#row-speculative-decoding-1-the-math" title="Speculative decoding 1: the math (planned)">session 128</a>. The paper also proposes a looser rule called <b>typical acceptance</b>: accept a candidate token \(x\) if the target gives it enough probability,</p>
+<div class="eq">\[ p_{\text{target}}(x \mid \text{context}) \gt \min\!\big(\varepsilon,\ \delta \, e^{-H(p_{\text{target}})}\big) \tag{129.5} \]</div>
+<p>where \(H\) is the entropy of the target’s distribution at that position, and \(\varepsilon\), \(\delta\) are thresholds. When the target is unsure (high entropy), the bar is lower. This accepts more tokens, but the output <b>no longer has exactly</b> the target’s distribution. Know the difference in an interview: greedy verification and the rejection-sampling rule are lossless; typical acceptance is not.</p>
+
+<h2>Tree verification: many branches in one pass</h2>
+<p>Suppose head 1 offers its top 2 tokens and head 2 its top 3. All combinations give \(2 \times 3 = 6\) candidate continuations. Verifying them one by one would take 6 target passes. Tree verification checks all of them in <b>one</b> pass, and shares the common prefixes so each distinct node is computed once.</p>
+<p>Put every tree node into the input sequence after the accepted prefix. Each node must “see” the prefix and its own ancestors, and nothing else: a token on one branch must not attend to a token on a sibling branch. That is a custom attention mask:</p>
+<div class="eq">\[ M_{ij} = \begin{cases} 0 & \text{if } j \text{ is in the prefix, or } j \text{ is an ancestor of } i \text{, or } j = i \\ -\infty & \text{otherwise} \end{cases} \tag{129.6} \]</div>
+<p>The mask is added to the attention scores before the softmax, so \(-\infty\) entries get zero weight. Each node also gets the <b>position id</b> of its depth (prefix length + depth − 1), not its index in the flattened sequence; siblings share a position. With these two changes, the output at each node is exactly what the target would compute if that branch were the only text. SpecInfer introduced this tree-based parallel decoding for serving, with trees built from one or more small draft models [Certain], and Medusa uses the same idea for its heads.</p>
+<p>If head \(i\) offers its top \(s_i\) tokens and the tree is the full Cartesian product, the number of nodes to verify and the number of complete candidates are</p>
+<div class="eq">\[ N_{\text{nodes}} = \sum_{d=1}^{D} \prod_{i=1}^{d} s_i, \qquad N_{\text{candidates}} = \prod_{i=1}^{D} s_i \tag{129.7} \]</div>
+<p>For \((s_1, s_2) = (2, 3)\): \(2 + 6 = 8\) nodes and 6 candidates. For \((3, 3, 3)\): \(3 + 9 + 27 = 39\) nodes. Real systems do not use full products; they prune the tree to the branches most likely to be accepted, under a node budget [Likely].</p>
+<h3>Why a tree helps: a small model</h3>
+<p>For greedy decoding, a branch survives at depth \(d\) if the target’s own choice is among the \(s_d\) guesses at that depth. Assume a toy drafter whose guesses at depth \(d\) are right with probability \(a_d\), and whose wrong guesses miss independently, so that the top \(s\) contain the right token with probability \(1 - (1 - a_d)^{s}\). Then the expected number of accepted draft tokens is</p>
+<div class="eq">\[ \E[\text{accepted}] = \sum_{d=1}^{D} \prod_{i=1}^{d} \Big( 1 - (1 - a_i)^{s_i} \Big), \qquad a_i = a \cdot r^{\,i-1} \tag{129.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(a\)</dt><dd>top-1 accuracy of the drafter at the first draft position</dd>
+<dt>\(r\)</dt><dd>how fast accuracy drops with depth (Medusa’s far heads are weaker, so \(r \lt 1\))</dd>
+<dt>\(s_i\)</dt><dd>how many guesses the tree keeps at depth \(i\)</dd></dl>
+<p>This is a teaching model, not a measured curve: real top-\(s\) hit rates come from running the drafter on data. But it shows the trade-off. Each target pass returns \(1 + \E[\text{accepted}]\) tokens. Explore it in Figure 3.</p>
+<figure class="fig wide" id="sd2-tree"><div class="fig-body">
+<div class="sd2-grid">
+<label for="sd2-tree-s1">top-\(s_1\) of head 1</label><input type="range" id="sd2-tree-s1" min="1" max="3" step="1" value="2"><output id="sd2-tree-s1v"></output>
+<label for="sd2-tree-s2">top-\(s_2\) of head 2 (0 = stop)</label><input type="range" id="sd2-tree-s2" min="0" max="3" step="1" value="2"><output id="sd2-tree-s2v"></output>
+<label for="sd2-tree-s3">top-\(s_3\) of head 3 (0 = stop)</label><input type="range" id="sd2-tree-s3" min="0" max="3" step="1" value="2"><output id="sd2-tree-s3v"></output>
+<label for="sd2-tree-a">top-1 accuracy \(a\)</label><input type="range" id="sd2-tree-a" min="0.3" max="0.95" step="0.01" value="0.6"><output id="sd2-tree-av"></output>
+<label for="sd2-tree-r">decay per depth \(r\)</label><input type="range" id="sd2-tree-r" min="0.6" max="1" step="0.01" value="0.85"><output id="sd2-tree-rv"></output></div>
+<div class="sd2-tree-wrap"><svg id="sd2-tree-svg" viewBox="0 0 330 340" role="img" aria-label="Candidate tree built from the top guesses of each head"></svg><svg id="sd2-tree-mask" viewBox="0 0 330 340" role="img" aria-label="Tree attention mask among the tree tokens"></svg></div>
+<div class="sd2-leg"><span style="--c:var(--q)">selected node and its path</span><span style="--c:var(--v)">allowed attention (mask 0)</span><span style="--c:var(--paper2)">blocked (mask −∞)</span></div>
+<div class="readout" id="sd2-tree-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> A Medusa-style candidate tree (left) and its tree attention mask among the tree tokens (right). Node labels give the head and the rank of the guess: “2b” is head 2’s second-best token. Click a node to see its row in the mask: it may attend only to its ancestors and itself (and to the whole prefix, not drawn).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The readout counts nodes and candidates with formula (129.7) and the expected accepted length with formula (129.8). It also compares the tree with a plain chain that uses the <b>same number of nodes</b> (the same verification compute). With the defaults (\(a = 0.6\), \(r = 0.85\)), the tree \((2, 2, 2)\) of 14 nodes accepts 1.91 tokens per pass on average, while a 14-token chain accepts only 1.11: with a weak drafter, width beats depth. Now raise \(a\) to 0.9 and \(r\) to 0.95: the 14-token chain accepts 3.77 and the tree 2.89. A strong drafter wants a long, thin tree. This is why EAGLE-2 changes the tree shape at run time from the drafter’s confidence.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: the default tree in Figure 3</div>
+<p>\(a_1 = 0.6\), \(a_2 = 0.6 \times 0.85 = 0.51\), \(a_3 = 0.6 \times 0.85^2 = 0.4335\). With two guesses per depth, the survival chances are \(1 - 0.4^2 = 0.84\), \(1 - 0.49^2 = 0.7599\), and \(1 - 0.5665^2 = 0.6791\).</p>
+<p>Formula (129.8): \(0.84 + 0.84 \times 0.7599 + 0.84 \times 0.7599 \times 0.6791 = 0.84 + 0.638 + 0.433 = 1.91\) accepted tokens, so 2.91 tokens per target pass. The tree has \(2 + 4 + 8 = 14\) nodes. A chain of 3 (one guess per depth) accepts only 1.04, and even a chain of 14 accepts 1.11, because \(0.6 \times 0.51 \times 0.43 \times \dots\) shrinks fast.</p></div>
+<h3>Stochastic verification of a tree</h3>
+<p>For greedy decoding, verification is easy: walk down from the root, and at each node follow the child equal to the target’s argmax; stop when no child matches, then append the target’s own token. For sampling, SpecInfer proposes <b>multi-step speculative sampling</b>: at a node, try the children one at a time with the usual accept test \(\min(1, p(x)/q(x))\); after each rejection, replace the target distribution by the normalized residual \(\max(0, p - q)\) before testing the next child; if all children fail, sample from the final residual [Likely]. The paper proves that this keeps the target’s distribution [Certain], so trees do not force you to give up exact sampling.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: one decoding step with tree verification (greedy)</div><ol>
+<li><b>input:</b> accepted tokens \(x_{1:n}\), the target’s KV cache for them, a drafter, per-depth widths \(s_1, \dots, s_D\)</li>
+<li>drafter proposes the top-\(s_d\) tokens for each depth \(d\) <span class="c">// Medusa: heads on \(\mathbf{h}_n\); EAGLE: a few draft-layer steps</span></li>
+<li>build the tree nodes (every prefix path), formula (129.7)</li>
+<li>build the mask (129.6) and position ids (\(n + \text{depth} - 1\)) for the nodes</li>
+<li>run the target <b>once</b> on all nodes, attending to the cached prefix <span class="c">// the only expensive step</span></li>
+<li>\(y \leftarrow\) target argmax after \(x_n\); path \(\leftarrow\) empty</li>
+<li><b>while</b> the node path + \(y\) exists in the tree: path \(\leftarrow\) path + \(y\); \(y \leftarrow\) target argmax at that node</li>
+<li>append path and then \(y\) to the output <span class="c">// at least one new token per step</span></li>
+<li>keep the KV entries of the accepted path, drop the rest of the tree’s entries</li></ol></div>
+
+<h2>EAGLE: draft the features, not the tokens</h2>
+<p>EAGLE starts from an observation: predicting the target’s next <b>hidden feature</b> (the vector just before the LM head) is easier than predicting its next token, because features change smoothly while tokens jump. Its drafter is small: the target’s own embedding layer and LM head (frozen, reused), plus one fully connected layer and <b>one decoder layer</b> that are trained. For LLaMA2-Chat 70B this is under 1B trainable parameters, trained in 1 to 2 days on 4 A100 (40 GB) GPUs [Certain].</p>
+<p>There is a catch. With sampling, the feature \(\mathbf{f}_i\) does not tell the drafter which token was actually sampled at position \(i+1\); many tokens are possible. The next feature depends on that choice. EAGLE removes this uncertainty by feeding the drafter the token sequence <b>advanced by one step</b>: to predict \(\mathbf{f}_{i+1}\), it sees the features up to \(i\) and the tokens up to \(i + 1\):</p>
+<div class="eq">\[ \hat{\mathbf{f}}_{i+1} = g_\phi\big(\mathbf{f}_{1:i},\ e(t_{2:i+1})\big), \qquad \mathcal{L} = \operatorname{SmoothL1}\big(\hat{\mathbf{f}}_{i+1}, \mathbf{f}_{i+1}\big) + w_{\text{cls}} \, \mathrm{CE}\big(\mathrm{LMHead}(\hat{\mathbf{f}}_{i+1}),\ t_{i+2}\big) \tag{129.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{f}_i\)</dt><dd>the target’s top hidden feature at position \(i\) (input of its LM head)</dd>
+<dt>\(e(t)\)</dt><dd>the target’s embedding of token \(t\); the drafter fuses it with \(\mathbf{f}\) through the FC layer</dd>
+<dt>\(g_\phi\)</dt><dd>the drafter: one FC layer plus one decoder layer, with trainable weights \(\phi\)</dd>
+<dt>\(w_{\text{cls}}\)</dt><dd>weight of the token loss; EAGLE uses 0.1</dd></dl>
+<p>At inference, the drafter runs a few cheap steps, each one turning a predicted feature into token guesses through the frozen LM head, and builds a tree. EAGLE reports a 2.7 to 3.5× latency speedup on LLaMA2-Chat 70B, with the target generating 3.2 to 4.5 tokens per forward pass, while keeping the output distribution [Certain]. Compared with Medusa, the key difference is that each EAGLE draft step <b>does</b> know the tokens chosen before it, so far positions stay accurate.</p>
+<ul>
+<li><b>EAGLE-2</b> keeps the drafter and makes the tree <b>dynamic</b>: the drafter’s confidence is a good estimate of the acceptance rate, so it expands the most promising branches for each context instead of using one fixed tree shape. It reports speedups of 3.05× to 4.26×, 20% to 40% faster than EAGLE-1 [Certain].</li>
+<li><b>EAGLE-3</b> drops the feature-prediction loss, predicts tokens directly, fuses features from several target layers (low, middle, high), and trains with “training-time test”: during training the drafter is fed its own earlier predictions, as it will be at inference. It reports up to 6.5× speedup, about 1.4× over EAGLE-2, and a 1.38× throughput gain at batch size 64 in SGLang [Certain].</li></ul>
+
+<h2>Multi-token prediction heads as drafters</h2>
+<p>Medusa and EAGLE add a drafter <i>after</i> the model is trained. <b>Multi-token prediction (MTP)</b> trains the model from the start to predict several future tokens. Gloeckle et al. put \(n\) output heads on a shared trunk and train with the sum of the losses:</p>
+<div class="eq">\[ \mathcal{L}_n = -\sum_{t} \sum_{i=1}^{n} \log P_\theta\big(x_{t+i} \mid x_{1:t}\big) \tag{129.10} \]</div>
+<p>They report better code models and that, with 4-token prediction, the extra heads used for self-speculative decoding make inference up to 3 times faster [Certain]. DeepSeek-V3 uses a <b>sequential</b> MTP module instead of parallel heads. The module at depth \(k\) combines the previous depth’s hidden state with the embedding of the next known token, then runs one transformer block:</p>
+<div class="eq">\[ \mathbf{h}_i'^{\,k} = M_k \big[ \operatorname{RMSNorm}(\mathbf{h}_i^{k-1});\ \operatorname{RMSNorm}(\operatorname{Emb}(t_{i+k})) \big], \qquad \mathbf{h}^{k}_{1:T-k} = \operatorname{TRM}_k\big(\mathbf{h}'^{\,k}_{1:T-k}\big) \tag{129.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{h}_i^{k-1}\)</dt><dd>hidden state of token \(i\) at depth \(k - 1\) (depth 0 is the main model)</dd>
+<dt>\([\,\cdot\,;\,\cdot\,]\)</dt><dd>concatenation of two \(d\)-dimensional vectors into one of size \(2d\)</dd>
+<dt>\(M_k \in \R^{d \times 2d}\)</dt><dd>projection back to size \(d\)</dd>
+<dt>\(\operatorname{TRM}_k\)</dt><dd>one transformer block; the embedding layer and output head are shared with the main model</dd></dl>
+<p>This is very close to EAGLE’s drafter (features plus the next token), but trained during pretraining. DeepSeek-V3 uses depth \(D = 1\), reports that the second token is accepted 85% to 90% of the time, and that this gives 1.8 times the tokens per second [Certain].</p>
+<div class="worked"><div class="wt">Worked example: does 85–90% explain 1.8×?</div>
+<p>With one drafted token (\(\gamma = 1\)), formula (129.1) gives \(1 + \alpha\) tokens per target pass: \(1.85\) for \(\alpha = 0.85\) and \(1.90\) for \(\alpha = 0.90\). The reported 1.8× is a little lower, which fits a small cost for the MTP block and the verification overhead (\(c \gt 0\) in formula 129.2). The numbers are consistent.</p></div>
+
+<h2>No draft model: prompt lookup and Lookahead decoding</h2>
+<h3>Prompt lookup decoding</h3>
+<p>Many outputs copy the input: a summary repeats names and phrases, a code edit repeats most of the file, a RAG answer quotes the retrieved passage. <b>Prompt lookup decoding</b> (Saxena, 2023) uses this. Take the last few tokens generated, search for the same n-gram earlier in the text, and propose the tokens that followed it there. The target verifies them as usual. There are no new weights and the draft costs almost nothing. The reference implementation uses n-grams of up to 3 tokens and proposes 10 tokens [Certain]; the author reports about 2.4× average speedup on summarization and context QA with Mistral-7B, and smaller gains on open-ended chat [Certain]. Hugging Face transformers exposes it as <code>prompt_lookup_num_tokens</code>, and vLLM as an “ngram” speculative method [Likely].</p>
+<div class="algo"><div class="algo-h">Algorithm 2: prompt lookup drafting</div><ol>
+<li><b>input:</b> all tokens so far \(x_{1:n}\) (prompt + output), max n-gram size \(n_{\max}\), proposal length \(K\)</li>
+<li><b>for</b> \(m = n_{\max}\) down to 1:</li>
+<li>&nbsp;&nbsp;tail \(\leftarrow x_{n-m+1:n}\)</li>
+<li>&nbsp;&nbsp;find the latest \(j \lt n - m + 1\) with \(x_{j:j+m-1} =\) tail</li>
+<li>&nbsp;&nbsp;<b>if</b> found: <b>return</b> \(x_{j+m : j+m+K-1}\) <span class="c">// the tokens that followed the match</span></li>
+<li><b>return</b> no proposal <span class="c">// fall back to one normal decoding step</span></li>
+<li>verify the proposal with one target pass; keep the matching prefix plus the target’s next token</li></ol></div>
+<figure class="fig" id="sd2-pld"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="sd2-pld-prev">Back</button><button type="button" class="btn primary" id="sd2-pld-play">Play</button><button type="button" class="btn" id="sd2-pld-next">Next</button><span id="sd2-pld-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="sd2-row">Prompt (a Video-RAG style request with a retrieved clip description)</div>
+<div class="sd2-strip" id="sd2-pld-prompt"></div>
+<div class="sd2-row">Output</div>
+<div class="sd2-strip" id="sd2-pld-out"></div>
+<div class="sd2-leg"><span style="--c:var(--k-soft)">matched n-gram</span><span style="--c:var(--q-soft)">proposed and rejected</span><span style="--c:var(--v-soft)">accepted (dashed: target’s own token)</span></div>
+<div class="readout" id="sd2-pld-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Prompt lookup decoding on a 21-token answer. Each step searches for the last n-gram (up to 3 tokens) of the text so far, proposes the next 4 tokens after the match, and keeps those that agree with the target, plus one token from the target itself.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The target’s greedy answer is fixed in advance, so every step is exact. Early steps find only weak 1-token matches and gain little. Once the answer starts quoting the clip description (“the striker”), 2- and 3-gram matches propose the right words and every proposal is accepted: 5 tokens per target pass. The whole answer takes 7 target passes instead of 21. On text that does not repeat the input, the proposals would be rejected and each step would produce just the 1 target token: no gain, but almost no loss.</p></details></figure>
+<h3>Lookahead decoding</h3>
+<p>Lookahead decoding (Fu et al.) also needs no drafter, but it does not rely on the prompt. It builds on <b>Jacobi decoding</b>: guess the next \(m\) tokens at once (even randomly), then update all of them in parallel with the target until they stop changing:</p>
+<div class="eq">\[ y_i^{(j+1)} = \argmax_{y}\ p_\theta\big(y \mid x,\ y_{1:i-1}^{(j)}\big), \qquad i = 1, \dots, m \tag{129.12} \]</div>
+<p>The fixed point of this iteration is exactly the greedy output. Plain Jacobi decoding rarely fixes more than one token per iteration, but the half-converged guesses contain useful n-grams. Lookahead decoding keeps a window of these parallel guesses (the “lookahead branch”), collects the n-grams they produce into a pool, and in the <b>same</b> target pass verifies the pool’s n-grams that start with the current last token (the “verification branch”). The output stays exactly greedy. It reports up to 1.8× on MT-bench and up to 4× with several GPUs on code completion [Certain]. The cost is many extra tokens in each pass, so it uses the spare compute of small-batch decoding and helps less when the GPU is already busy.</p>
+
+<h2>Putting it together in code</h2>
+<div class="algo"><div class="algo-h">Algorithm 3: choosing a drafter for a deployment</div><ol>
+<li>measure the batch size you serve; <b>if</b> decoding is compute-bound at that batch, expect small gains and maybe stop here</li>
+<li><b>if</b> outputs copy the input (summaries, code edits, RAG): start with prompt lookup, it is free</li>
+<li><b>if</b> the model was trained with MTP heads: use them as the drafter</li>
+<li><b>else if</b> you can train a little: EAGLE-style drafter (best \(\alpha\) per unit of cost), or Medusa heads (simplest)</li>
+<li><b>else if</b> a small model of the same family and tokenizer exists: separate draft model</li>
+<li>tune \(\gamma\) or the tree budget on real traffic: maximize formula (129.2), not the acceptance rate</li></ol></div>
+<p>The code below builds a tiny target model that accepts any attention mask and position ids, makes a slightly noisy copy of it as the drafter, imitates Medusa heads (top-\(s_k\) guesses for each future position, fixed per step), builds the Cartesian tree, the mask (129.6) and the position ids, and verifies all branches in one target pass. The final check: the output is identical to plain greedy decoding, for every tree shape.</p>
+<pre class="code"><span class="kw2">import</span> itertools, torch, torch.nn as nn
+torch.manual_seed(0)
+V, D = 40, 64
+
+<span class="kw2">class</span> TinyLM(nn.Module):
+    """A small causal LM that accepts any attention mask and any position ids."""
+    def __init__(self):
+        super().__init__()
+        self.emb, self.pos = nn.Embedding(V, D), nn.Embedding(128, D)
+        self.attn = nn.ModuleList([nn.MultiheadAttention(D, 4, batch_first=True) for _ in range(2)])
+        self.mlp = nn.ModuleList([nn.Sequential(nn.Linear(D, 4 * D), nn.GELU(), nn.Linear(4 * D, D)) for _ in range(2)])
+        self.norm, self.head = nn.LayerNorm(D), nn.Linear(D, V)
+    def forward(self, ids, pos, allow):<span class="cm">            # allow[i, j] = True: token i may look at token j</span>
+        x = self.emb(ids)[None] + self.pos(pos)[None]
+        for a, m in zip(self.attn, self.mlp):
+            h = self.norm(x)
+            x = x + a(h, h, h, attn_mask=~allow)[0]
+            x = x + m(self.norm(x))
+        return self.head(self.norm(x))[0]<span class="cm">          # (tokens, V) logits</span>
+
+<span class="kw2">def</span> causal(n):
+    return torch.ones(n, n, dtype=torch.bool).tril()
+
+target = TinyLM().eval()
+draft = TinyLM().eval()
+draft.load_state_dict(target.state_dict())
+<span class="kw2">with</span> torch.no_grad():<span class="cm">                              # the draft = the target plus noise: often right, not always</span>
+    for p in draft.parameters():
+        p.add_(0.05 * torch.randn_like(p))
+
+@torch.no_grad()
+<span class="kw2">def</span> greedy(prefix, n):<span class="cm">                             # reference: plain one-token-at-a-time greedy decoding</span>
+    ids = list(prefix)
+    for _ in range(n):
+        t = torch.tensor(ids)
+        ids.append(target(t, torch.arange(len(ids)), causal(len(ids)))[-1].argmax().item())
+    return ids[len(prefix):]
+
+@torch.no_grad()
+<span class="kw2">def</span> medusa_like_heads(ids, ks):<span class="cm">                    # head k gives top-ks[k] guesses for position +k+1</span>
+    ids, cand = list(ids), []
+    for k in ks:<span class="cm">                                   # imitate heads: roll the draft greedily, keep top-k per step</span>
+        t = torch.tensor(ids)
+        logits = draft(t, torch.arange(len(ids)), causal(len(ids)))[-1]
+        cand.append(logits.topk(k).indices.tolist())
+        ids.append(cand[-1][0])
+    return cand
+
+<span class="kw2">def</span> build_tree(cand):<span class="cm">                              # Cartesian product, formula (129.7): one node per prefix path</span>
+    nodes = []<span class="cm">                                     # each node = a tuple of tokens from the root</span>
+    for d in range(1, len(cand) + 1):
+        nodes += list(itertools.product(*cand[:d]))
+    return nodes
+
+<span class="kw2">def</span> tree_mask(n_prefix, nodes):<span class="cm">                    # formula (129.6)</span>
+    n = n_prefix + len(nodes)
+    allow = torch.zeros(n, n, dtype=torch.bool)
+    allow[:n_prefix, :n_prefix] = causal(n_prefix)
+    index = {path: n_prefix + i for i, path in enumerate(nodes)}
+    for path, i in index.items():
+        allow[i, :n_prefix] = True<span class="cm">                 # every node sees the whole prefix</span>
+        for d in range(1, len(path) + 1):
+            allow[i, index[path[:d]]] = True<span class="cm">       # ... and its ancestors and itself, nothing else</span>
+    return allow, index
+
+@torch.no_grad()
+<span class="kw2">def</span> tree_step(ids, ks):
+    nodes = build_tree(medusa_like_heads(ids, ks))
+    allow, index = tree_mask(len(ids), nodes)
+    toks = torch.tensor(list(ids) + [p[-1] for p in nodes])
+    pos = torch.tensor(list(range(len(ids))) + [len(ids) + len(p) - 1 for p in nodes])
+    pred = target(toks, pos, allow).argmax(-1)<span class="cm">     # ONE target pass checks every branch</span>
+    path, nxt = (), pred[len(ids) - 1].item()<span class="cm">      # the target's own next token after the prefix</span>
+    while path + (nxt,) in index:<span class="cm">                  # walk down while the target agrees with a child</span>
+        path = path + (nxt,)
+        nxt = pred[index[path]].item()
+    return list(path) + [nxt], len(nodes)<span class="cm">          # accepted tokens + one bonus token from the target</span>
+
+prefix, N = [1, 2, 3, 4], 40
+<span class="kw2">for</span> ks in [(1, 1, 1, 1), (2, 2, 2), (3, 2, 2)]:
+    out, steps, nodes = list(prefix), 0, 0
+    while len(out) - len(prefix) &lt; N:
+        new, n = tree_step(out, ks)
+        out += new; steps += 1; nodes = n
+    out = out[len(prefix):len(prefix) + N]
+    print(ks, "tree nodes", nodes, "target passes", steps,
+          "tokens/pass", round(N / steps, 2), "same as greedy:", out == greedy(prefix, N))
+<span class="cm"># (1, 1, 1, 1) tree nodes 4 target passes 29 tokens/pass 1.38 same as greedy: True</span>
+<span class="cm"># (2, 2, 2) tree nodes 14 target passes 20 tokens/pass 2.0 same as greedy: True</span>
+<span class="cm"># (3, 2, 2) tree nodes 21 target passes 20 tokens/pass 2.0 same as greedy: True</span></pre>
+<p>The printed lines show the lossless property directly (“same as greedy: True”), and that the 14-node tree needs 20 target passes for 40 tokens instead of 29 for a 4-token chain. The 21-node tree is no better here: extra width helps only where the drafter’s second and third guesses are actually right, which is what EAGLE-2’s dynamic trees try to predict. In a real system, the prefix would come from the KV cache instead of being recomputed, and the rejected nodes’ KV entries would be discarded.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Drafter that fits</th><th>Why</th></tr></thead><tbody>
+<tr><td>Chat serving at small batch (vLLM, SGLang, TensorRT-LLM)</td><td>EAGLE-style drafter or Medusa heads, with a tree [Likely]</td><td>Decode is memory-bound, so verification of a small tree is nearly free</td></tr>
+<tr><td>DeepSeek-V3 and other MTP-trained models</td><td>the model’s own MTP module</td><td>No extra training; 85–90% acceptance for the second token [Certain]</td></tr>
+<tr><td>Code editing, summarization, document QA</td><td>prompt lookup (n-gram) drafting</td><td>The output repeats long spans of the input</td></tr>
+<tr><td>Video-RAG answers and video QA over transcripts</td><td>prompt lookup over the retrieved transcript or clip captions</td><td>Answers quote names, times and events from the retrieved text (Figure 4)</td></tr>
+<tr><td>Dense video captioning and key-moment reports</td><td>prompt lookup over earlier captions, or a small draft model</td><td>Captions of nearby segments repeat entities and phrases [Speculation]</td></tr>
+<tr><td>VLM chat (image or video + text)</td><td>an EAGLE-style drafter trained on the VLM’s features, or a small VLM of the same family [Likely]</td><td>After the visual prefill, decoding is the same memory-bound loop as for text LLMs</td></tr>
+<tr><td>On-device and laptop inference (llama.cpp)</td><td>a small draft model of the same family [Likely]</td><td>Memory bandwidth is very limited, so each saved target pass matters</td></tr>
+<tr><td>Offloaded or distributed serving</td><td>tree drafts from small models (SpecInfer)</td><td>Each target pass is very slow, so checking many branches per pass pays well: 2.6–3.5× reported for offloading [Certain]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Measuring acceptance instead of speed.</b> A bigger drafter or a bigger tree raises acceptance but also raises \(c\) or the verification cost. Optimize formula (129.2) on wall-clock time.</li>
+<li><b>Expecting the same gain at large batch.</b> At large batch, decoding becomes compute-bound and the extra tree tokens are no longer free. Gains shrink and can become a slowdown. Many servers turn speculation off or shrink \(\gamma\) as load grows [Likely].</li>
+<li><b>Wrong position ids in the tree.</b> Sibling nodes must share the position of their depth. Using flattened indices gives different numbers from normal decoding, and the “lossless” property silently breaks.</li>
+<li><b>Calling typical acceptance lossless.</b> Medusa’s typical acceptance (129.5) changes the output distribution. Only greedy matching and the rejection-sampling rule (and SpecInfer’s multi-step version) are exact.</li>
+<li><b>Forgetting to roll back the KV cache.</b> After verification, the KV entries of rejected nodes (and of the drafter’s rejected steps) must be removed, or the next step attends to tokens that were never accepted.</li>
+<li><b>A drafter with a different tokenizer.</b> The target verifies token ids. A drafter from another family produces ids that mean other strings.</li>
+<li><b>Training the drafter on the wrong data.</b> A drafter learns to predict the target. Training it on generic text instead of the target’s own outputs (or its features) lowers \(\alpha\), especially after the target was fine-tuned.</li>
+<li><b>Prompt lookup on open-ended chat.</b> When the answer does not copy the input, nearly every proposal is rejected; you pay the extra verification tokens for nothing.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Name the main kinds of drafter for speculative decoding and one trade-off of each.<span class="lvl">basic</span></summary><div class="ans">(1) A separate small model with the same tokenizer: flexible, but you host and align a second model with its own KV cache, and its draft steps cost \(c \gt 0\). (2) Medusa heads on the target: almost free to run and simple to train, but far heads guess without knowing the intermediate tokens, so they are weak. (3) EAGLE feature-level drafter: one decoder layer that sees the target’s features and the next token; high acceptance, small cost, but needs training per target. (4) No model (prompt lookup, Lookahead): no training at all; prompt lookup only helps when the output copies the input, Lookahead spends extra compute in every pass. (5) MTP heads trained in pretraining (DeepSeek-V3): a free, well-aligned drafter, but only if you control pretraining.</div></details>
+<details class="qa"><summary>How is a Medusa head built, and how is it initialized?<span class="lvl">core</span></summary><div class="ans">Head \(k\) is one residual feed-forward layer followed by an output matrix: \(p^{(k)}_t = \softmax(W_2^{(k)}(\operatorname{SiLU}(W_1^{(k)}\mathbf{h}_t) + \mathbf{h}_t))\). It reads the target’s last hidden state and predicts the token \(k + 1\) positions ahead. \(W_1\) starts at zero and \(W_2\) as a copy of the LM head, so at the start every head equals the normal next-token head. Medusa-1 trains only the heads, with loss weights \(0.8^k\); Medusa-2 also fine-tunes the backbone.</div></details>
+<details class="qa"><summary>Explain tree attention. What must change in the attention mask and in the positions?<span class="lvl">core</span></summary><div class="ans">All tree nodes are appended after the accepted prefix in one sequence. Each node may attend to the whole prefix, to its ancestors and to itself, and to nothing else, so branches do not see each other (formula 129.6). Each node gets the position id of its depth (prefix length + depth − 1), so siblings share a position. With these two changes, the output at every node equals what normal decoding would compute for that branch, and one target pass verifies all branches. Afterwards only the accepted path’s KV entries are kept.</div></details>
+<details class="qa"><summary>How many tokens does the target process for a Medusa tree with top-3, top-2, top-2 guesses? How many candidates are there?<span class="lvl">basic</span></summary><div class="ans">Formula (129.7): nodes \(= 3 + 3 \cdot 2 + 3 \cdot 2 \cdot 2 = 3 + 6 + 12 = 21\); candidates \(= 3 \cdot 2 \cdot 2 = 12\) complete paths. The target processes 21 tree tokens (plus the prefix from the KV cache) in one pass.</div></details>
+<details class="qa"><summary>What does EAGLE predict, and why does it also take the token one step ahead as input?<span class="lvl">advanced</span></summary><div class="ans">EAGLE predicts the target’s next top-layer feature (the input to the LM head), then turns it into token guesses with the frozen LM head. Features are smoother and easier to predict than tokens. But with sampling, the feature \(\mathbf{f}_i\) does not determine which token was sampled next, and the next feature depends on that token. Feeding the token sequence advanced by one step, \(e(t_{2:i+1})\), together with \(\mathbf{f}_{1:i}\), removes that uncertainty. Training uses a Smooth L1 loss on the feature plus 0.1 times a cross-entropy on the token.</div></details>
+<details class="qa"><summary>When is a wide tree better than a long chain?<span class="lvl">advanced</span></summary><div class="ans">When the drafter’s top-1 guess is often wrong but the right token is often in its top few. Then a chain dies early, while a tree keeps several alternatives alive at each depth. With the toy model (129.8), \(a = 0.6\), \(r = 0.85\): a 14-node tree \((2,2,2)\) accepts 1.91 tokens per pass versus 1.11 for a 14-node chain. With a strong drafter (\(a = 0.9\), \(r = 0.95\)) the chain wins (3.77 vs 2.89). EAGLE-2 uses the drafter’s confidence to pick the shape per context.</div></details>
+<details class="qa"><summary>Is Medusa lossless?<span class="lvl">core</span></summary><div class="ans">With greedy verification or the standard rejection-sampling rule, yes: the heads only propose, the target decides. With Medusa’s typical acceptance rule (accept if \(p_{\text{target}}(x) \gt \min(\varepsilon, \delta e^{-H})\)), no: it accepts tokens the exact rule would sometimes reject, trading exactness for speed. Medusa-2 also changes the target itself, because the backbone is fine-tuned jointly, so the “target distribution” is that of the fine-tuned model.</div></details>
+<details class="qa"><summary>What is prompt lookup decoding, and when would you turn it on?<span class="lvl">basic</span></summary><div class="ans">It drafts by string matching: find the last n-gram of the text so far earlier in the prompt, and propose the tokens that followed it. No new weights and nearly zero draft cost. Turn it on for input-grounded tasks: summarization, RAG and Video-RAG answers that quote sources, code editing, document QA. The author reports about 2.4× on summarization and context QA with Mistral-7B; on open-ended chat the gain is small.</div></details>
+<details class="qa"><summary>How does Lookahead decoding get guesses without any draft model?<span class="lvl">advanced</span></summary><div class="ans">It runs Jacobi iterations inside the decoding loop: it keeps a window of guessed future tokens and updates them all in parallel with the target (formula 129.12). These half-converged trajectories produce n-grams, which go into a pool. In the same pass, a verification branch checks pool n-grams that start with the current last token, using a suitable attention mask. Accepted n-grams advance the output several tokens at once, and the result equals greedy decoding. It spends extra compute per pass, so it suits memory-bound decoding.</div></details>
+<details class="qa"><summary>DeepSeek-V3 reports 85–90% acceptance of the second token and 1.8× tokens per second. Are these numbers consistent?<span class="lvl">core</span></summary><div class="ans">Yes. With one drafted token, each target pass yields \(1 + \alpha\) tokens on average, which is 1.85 to 1.90. The reported 1.8× is slightly below, which matches a small cost for running the MTP block and verifying (the \(1 + \gamma c\) term). The MTP module itself is one transformer block on \([\operatorname{RMSNorm}(\mathbf{h}); \operatorname{RMSNorm}(\operatorname{Emb}(t_{i+1}))]\) with a shared embedding and output head.</div></details>
+<details class="qa"><summary>Your speculative decoding gives 2.5× at batch 1 but a slowdown at batch 64. Why, and what do you do?<span class="lvl">advanced</span></summary><div class="ans">At batch 1 decoding is memory-bound: verifying 5 or 20 tokens costs about the same as 1, so accepted tokens are almost free. At batch 64 the GPU is closer to compute-bound; every extra tree token now costs real compute for every sequence, and rejected tokens are pure waste. Fixes: shrink \(\gamma\) or the tree budget as the batch grows, turn speculation off above a threshold, use a drafter with higher acceptance so less compute is wasted, and measure end-to-end throughput, not acceptance.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A drafter has \(\alpha = 0.7\) and \(c = 0.1\). Compute the tokens per target pass and the speedup for \(\gamma = 3\). Check in Figure 1.</li>
+<li>Count the nodes and candidates of a Medusa tree with \((s_1, s_2) = (4, 2)\) and of \((3, 3, 3)\).</li>
+<li>In the toy model (129.8) with \(a = 0.6\) and one head (\(D = 1\)), what is the survival chance with \(s_1 = 2\) and with \(s_1 = 3\)?</li>
+<li>Write the tree attention mask among the tree tokens for \((s_1, s_2) = (2, 2)\), with nodes ordered 1a, 1b, 1a-2a, 1a-2b, 1b-2a, 1b-2b. Which position ids do they get after a prefix of 10 tokens?</li>
+<li>Why does a Medusa head for position \(t + 3\) usually have lower accuracy than an EAGLE draft step for the same position?</li>
+<li>In Figure 4, which step is the first one with a 3-gram match, and how many tokens does it add?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \((1 - 0.7^4)/0.3 = 0.7599/0.3 = 2.53\) tokens per pass; speedup \(= 2.53/(1 + 0.3) = 1.95\). 2. \((4, 2)\): \(4 + 8 = 12\) nodes, 8 candidates. \((3,3,3)\): \(3 + 9 + 27 = 39\) nodes, 27 candidates. 3. \(1 - 0.4^2 = 0.84\) and \(1 - 0.4^3 = 0.936\). 4. Rows (who looks) and columns (looked at), 1 = allowed: 1a: [1,0,0,0,0,0]; 1b: [0,1,0,0,0,0]; 1a-2a: [1,0,1,0,0,0]; 1a-2b: [1,0,0,1,0,0]; 1b-2a: [0,1,0,0,1,0]; 1b-2b: [0,1,0,0,0,1]. All rows also see the 10 prefix tokens. Position ids: 10, 10, 11, 11, 11, 11 (counting from 0). 5. The Medusa head reads only \(\mathbf{h}_t\) and must guess \(t+3\) without knowing the tokens at \(t+1\) and \(t+2\); its guess is the same for every branch. An EAGLE draft step for \(t + 3\) is conditioned on the tokens already drafted for \(t + 1\) and \(t + 2\), and on predicted features, so it follows the branch. 6. Step 5: the tail “the final minute” matches, the proposal “of extra time and” is fully accepted, and the target adds “the”: 5 tokens.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>All drafters are judged by formula (129.2): high acceptance \(\alpha\) at low draft cost \(c\), while verification stays cheap (memory-bound, small batches).</li>
+<li>Medusa (129.3) adds cheap heads that guess several positions from one hidden state; since far heads cannot see the branch, it verifies a Cartesian tree of their top guesses.</li>
+<li>Tree attention (129.6) plus depth position ids lets one target pass verify every branch exactly; tree size follows (129.7). Wide trees help weak drafters, long chains help strong ones (129.8).</li>
+<li>EAGLE (129.9) drafts the target’s features with one decoder layer and feeds the next token to remove sampling uncertainty; EAGLE-2 makes trees dynamic, EAGLE-3 fuses several layers.</li>
+<li>MTP heads (129.10, 129.11) trained in pretraining are a built-in drafter: DeepSeek-V3 reports 85–90% second-token acceptance and 1.8× tokens per second.</li>
+<li>Prompt lookup (copy from the input) and Lookahead decoding (Jacobi n-grams, 129.12) need no draft model at all.</li>
+<li>Greedy matching and rejection sampling (including SpecInfer’s multi-step version) are lossless; Medusa’s typical acceptance is not.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \text{speedup} = \frac{1 - \alpha^{\gamma+1}}{(1-\alpha)(1+\gamma c)}, \qquad N_{\text{nodes}} = \sum_{d=1}^{D}\prod_{i=1}^{d} s_i \]</div>
+<div class="eq">\[ p_t^{(k)} = \softmax\big(W_2^{(k)}(\operatorname{SiLU}(W_1^{(k)}\mathbf{h}_t)+\mathbf{h}_t)\big), \qquad \hat{\mathbf{f}}_{i+1} = g_\phi\big(\mathbf{f}_{1:i}, e(t_{2:i+1})\big) \]</div>
+<h2 class="plain" id="speculative-decoding-2-drafts-and-verification-medusa-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Cai et al. (2024). <a href="https://arxiv.org/abs/2401.10774" target="_blank" rel="noopener">Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads</a></li><li>Li et al. (2024). <a href="https://arxiv.org/abs/2401.15077" target="_blank" rel="noopener">EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty</a></li><li>Fu et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Break the Sequential Dependency of LLM Inference Using Lookahead Decoding&amp;quot;" target="_blank" rel="noopener">Break the Sequential Dependency of LLM Inference Using Lookahead Decoding</a></li><li>Miao et al. (2023). <a href="https://arxiv.org/abs/2305.09781" target="_blank" rel="noopener">SpecInfer: Accelerating Generative LLM Serving with Tree-based Speculative Inference and Verification</a></li><li>Gloeckle et al. (2024). <a href="https://arxiv.org/abs/2404.19737" target="_blank" rel="noopener">Better &amp; Faster Large Language Models via Multi-token Prediction</a></li><li>Cai et al. (2024). <a href="https://arxiv.org/abs/2401.10774" target="_blank" rel="noopener">Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads</a></li><li>Li et al. (2024). <a href="https://arxiv.org/abs/2401.15077" target="_blank" rel="noopener">EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty</a></li><li>Li, Wei, Zhang, Zhang (2024). <a href="https://arxiv.org/abs/2406.16858" target="_blank" rel="noopener">EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees</a></li><li>Li et al. (2025). <a href="https://arxiv.org/abs/2503.01840" target="_blank" rel="noopener">EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test</a></li><li>Fu et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Break the Sequential Dependency of LLM Inference Using Lookahead Decoding&amp;quot;" target="_blank" rel="noopener">Break the Sequential Dependency of LLM Inference Using Lookahead Decoding</a></li><li>Saxena (2023). <a href="https://github.com/apoorvumang/prompt-lookup-decoding" target="_blank" rel="noopener">Prompt Lookup Decoding (GitHub repository)</a></li><li>Miao et al. (2023). <a href="https://arxiv.org/abs/2305.09781" target="_blank" rel="noopener">SpecInfer: Accelerating Generative LLM Serving with Tree-based Speculative Inference and Verification</a></li><li>Gloeckle et al. (2024). <a href="https://arxiv.org/abs/2404.19737" target="_blank" rel="noopener">Better &amp; Faster Large Language Models via Multi-token Prediction</a></li><li>DeepSeek-AI (2024). <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-V3 Technical Report</a></li><li>Leviathan et al. (2022). <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">Fast Inference from Transformers via Speculative Decoding</a></li><li>Chen et al. (2023). <a href="https://arxiv.org/abs/2302.01318" target="_blank" rel="noopener">Accelerating Large Language Model Decoding with Speculative Sampling</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><span class="prev"><small>Previous · session 128, planned</small>Speculative decoding 1: the math</span><a class="next" href="../inference/offloading-flexgen-llama-cpp-powerinfer.html"><small>Next · session 130</small>Offloading: FlexGen, llama.cpp, PowerInfer</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="speculative-decoding-2-drafts-and-verification-medusa"]');if(!R)return;
+const $=s=>R.querySelector(s);const esc=B.esc;
+const f2=v=>v.toFixed(2);
+
+/* ---------- Figure 1: drafter scorecard, formulas (129.1) and (129.2) ---------- */
+(function(){
+ const svg=$("#sd2-cost-svg");if(!svg)return;const A=$("#sd2-cost-a"),G=$("#sd2-cost-g"),C=$("#sd2-cost-c"),info=$("#sd2-cost-info");
+ const Etok=(a,g)=>(1-Math.pow(a,g+1))/(1-a);const Sp=(a,g,c)=>Etok(a,g)/(1+g*c);
+ const x0=60,x1=610,y0=220,y1=20;
+ function draw(){const a=+A.value,g=+G.value,c=+C.value;$("#sd2-cost-av").textContent=a.toFixed(2);$("#sd2-cost-gv").textContent=g;$("#sd2-cost-cv").textContent=c.toFixed(2);
+  const gs=[];for(let k=1;k<=12;k++)gs.push(k);const ymax=Math.max(2,Math.ceil(Math.max(...gs.map(k=>Etok(a,k)))));
+  const X=k=>x0+(k-1)/11*(x1-x0),Y=v=>y0-(v/ymax)*(y0-y1);
+  let s="";for(let v=0;v<=ymax;v++){s+=`<line x1="${x0}" x2="${x1}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--rule)" stroke-width="1"/><text x="${x0-8}" y="${Y(v)+4}" font-size="12" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">${v}×</text>`;}
+  gs.forEach(k=>{s+=`<text x="${X(k)}" y="${y0+18}" font-size="12" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">${k}</text>`;});
+  s+=`<text x="${(x0+x1)/2}" y="${y0+36}" font-size="13" text-anchor="middle" fill="var(--ink2)" font-family="var(--sans)">draft length γ</text>`;
+  s+=`<line x1="${x0}" x2="${x1}" y1="${Y(1)}" y2="${Y(1)}" stroke="var(--muted)" stroke-dasharray="4 4"/>`;
+  const pe=gs.map((k,i)=>(i?"L":"M")+X(k)+" "+Y(Etok(a,k))).join(" "),ps=gs.map((k,i)=>(i?"L":"M")+X(k)+" "+Y(Sp(a,k,c))).join(" ");
+  s+=`<path d="${pe}" fill="none" stroke="var(--k)" stroke-width="2.5"/><path d="${ps}" fill="none" stroke="var(--q)" stroke-width="3"/>`;
+  let best=1;gs.forEach(k=>{if(Sp(a,k,c)>Sp(a,best,c)+1e-12)best=k;});
+  s+=`<circle cx="${X(best)}" cy="${Y(Sp(a,best,c))}" r="5" fill="none" stroke="var(--q)" stroke-width="2"/>`;
+  s+=`<circle cx="${X(g)}" cy="${Y(Sp(a,g,c))}" r="6" fill="var(--q)"/><circle cx="${X(g)}" cy="${Y(Etok(a,g))}" r="5" fill="var(--k)"/>`;
+  svg.innerHTML=s;
+  const e=Etok(a,g),sp=Sp(a,g,c);
+  info.innerHTML=`α = ${a.toFixed(2)}, γ = ${g}, c = ${c.toFixed(2)}: tokens per target pass = <b>${f2(e)}</b>, cost per step = 1 + γc = ${(1+g*c).toFixed(2)} target passes, speedup = <b>${f2(sp)}×</b>. Best draft length for this α and c: γ = <b>${best}</b> (speedup ${f2(Sp(a,best,c))}×, open circle). Upper limit for any γ: 1/(1 − α) = ${f2(1/(1-a))} tokens per pass.`;
+  R.querySelector("#sd2-cost").dataset.out=`E=${f2(e)} S=${f2(sp)} best=${best}`;}
+ [A,G,C].forEach(el=>el.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: four drafters (static) ---------- */
+(function(){
+ const svg=$("#sd2-kinds-svg");if(!svg)return;
+ const box=(x,y,w,h,t,kind,sub)=>{const st=kind==="t"?"var(--q)":kind==="n"?"var(--v)":"var(--muted)";const fl=kind==="t"?"var(--q-soft)":kind==="n"?"var(--v-soft)":"var(--card)";
+  return `<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="9" fill="${fl}" stroke="${st}" stroke-width="1.6"/><text x="${x+w/2}" y="${y+h/2+(sub?-3:5)}" font-size="13" font-weight="700" text-anchor="middle" fill="var(--ink)" font-family="var(--sans)">${t}</text>`+(sub?`<text x="${x+w/2}" y="${y+h/2+13}" font-size="11.5" text-anchor="middle" fill="var(--ink2)" font-family="var(--sans)">${sub}</text>`:"");};
+ const ar=(x1,y1,x2,y2)=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#sd2-ah)"/>`;
+ const tt=(x,y,t,sz,c)=>`<text x="${x}" y="${y}" font-size="${sz||12}" text-anchor="middle" fill="${c||"var(--ink2)"}" font-family="var(--sans)">${t}</text>`;
+ let s=`<defs><marker id="sd2-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+ const W=200,gap=15;const titles=["Separate draft model","Medusa heads","EAGLE drafter","Prompt lookup"];
+ titles.forEach((t,i)=>{const x=10+i*(W+gap);s+=`<rect x="${x}" y="4" width="${W}" height="292" rx="12" fill="none" stroke="var(--rule)"/>`+tt(x+W/2,26,t,14,"var(--ink)");});
+ // 1 separate model
+ let x=10;s+=box(x+20,50,160,40,"small LM","n","same tokenizer, own KV cache")+ar(x+100,90,x+100,120)+tt(x+100,138,"γ drafted tokens (γ passes)")+ar(x+100,146,x+100,176)+box(x+20,180,160,44,"target LM","t","1 pass checks all γ")+tt(x+100,250,"c: medium",12,"var(--k)")+tt(x+100,268,"α: medium to high",12,"var(--k)");
+ // 2 medusa
+ x=10+W+gap;s+=box(x+20,180,160,44,"target LM","t","gives h_t")+ar(x+100,180,x+100,150);
+ [0,1,2].forEach(j=>{s+=box(x+14+j*58,96,52,46,"head "+(j+1),"n","t+"+(j+2));});s+=tt(x+100,70,"top-s guesses per head → tree");s+=tt(x+100,86,"(heads do not see the branch)",11);
+ s+=tt(x+100,250,"c: near 0",12,"var(--k)")+tt(x+100,268,"α: falls with distance",12,"var(--k)");
+ // 3 eagle
+ x=10+2*(W+gap);s+=box(x+20,180,160,44,"target LM","t","features f₁…fᵢ")+ar(x+100,180,x+100,150)+box(x+20,98,160,50,"FC + 1 decoder layer","n","in: fᵢ and token tᵢ₊₁")+tt(x+100,62,"predicts fᵢ₊₁ → frozen LM head");tt(x+100,80,"");
+ s+=ar(x+100,98,x+100,70)+tt(x+100,250,"c: small",12,"var(--k)")+tt(x+100,268,"α: high (3.2–4.5 tok/pass)",12,"var(--k)");
+ // 4 prompt lookup
+ x=10+3*(W+gap);s+=box(x+20,50,160,48,"string match","o","last n-gram → earlier copy")+ar(x+100,98,x+100,128)+tt(x+100,144,"next K tokens after the match")+ar(x+100,150,x+100,176)+box(x+20,180,160,44,"target LM","t","1 pass checks K")+tt(x+100,250,"c: near 0, no weights",12,"var(--k)")+tt(x+100,268,"α: high only if output copies input",11.5,"var(--k)");
+ svg.innerHTML=s;
+})();
+
+/* ---------- Figure 3: Medusa tree, mask, expected accepted length (129.7), (129.8) ---------- */
+(function(){
+ const svg=$("#sd2-tree-svg"),msk=$("#sd2-tree-mask");if(!svg||!msk)return;const S1=$("#sd2-tree-s1"),S2=$("#sd2-tree-s2"),S3=$("#sd2-tree-s3"),A=$("#sd2-tree-a"),Rr=$("#sd2-tree-r"),info=$("#sd2-tree-info");
+ let sel=-1;const L="abc";
+ function widths(){const s=[+S1.value];if(+S2.value>0){s.push(+S2.value);if(+S3.value>0)s.push(+S3.value);}return s;}
+ function acc(ks,a,r){let e=0,p=1;ks.forEach((k,d)=>{const ad=a*Math.pow(r,d);p*=1-Math.pow(1-ad,k);e+=p;});return e;}
+ function build(ks){const nodes=[];let level=[[]];ks.forEach((k,d)=>{const nl=[];level.forEach(par=>{for(let j=0;j<k;j++)nl.push(par.concat([j]));});nl.forEach(p=>nodes.push(p));level=nl;});
+  nodes.sort((u,v)=>u.length-v.length);return nodes;}
+ function draw(){const ks=widths();$("#sd2-tree-s1v").textContent=S1.value;$("#sd2-tree-s2v").textContent=S2.value;$("#sd2-tree-s3v").textContent=+S2.value>0?S3.value:"—";
+  const a=+A.value,r=+Rr.value;$("#sd2-tree-av").textContent=a.toFixed(2);$("#sd2-tree-rv").textContent=r.toFixed(2);
+  const nodes=build(ks),N=nodes.length;if(sel>=N)sel=-1;const key=p=>p.join(",");const idx={};nodes.forEach((p,i)=>idx[key(p)]=i);
+  const D=ks.length;const leaves=nodes.filter(p=>p.length===D);
+  // layout: leaves evenly spaced; inner nodes at mean of their leaves
+  const top=20,bot=325,xs=[40,130,220,305];const y={};leaves.forEach((p,i)=>{y[key(p)]=leaves.length===1?(top+bot)/2:top+i*(bot-top)/(leaves.length-1);});
+  for(let d=D-1;d>=1;d--)nodes.filter(p=>p.length===d).forEach(p=>{const ch=nodes.filter(q=>q.length===d+1&&key(q.slice(0,d))===key(p));y[key(p)]=ch.reduce((s,q)=>s+y[key(q)],0)/ch.length;});
+  const ry=(top+bot)/2;const anc=new Set();if(sel>=0){const p=nodes[sel];for(let d=1;d<=p.length;d++)anc.add(key(p.slice(0,d)));}
+  const rad=N>20?7:11,fs=N>20?8:10;
+  let s=`<text x="${xs[0]}" y="12" font-size="11" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">last token</text>`;
+  nodes.forEach(p=>{const d=p.length,px=d===1?xs[0]:xs[d-1],py=d===1?ry:y[key(p.slice(0,d-1))];const on=anc.has(key(p));
+   s+=`<line x1="${px}" y1="${py}" x2="${xs[d]}" y2="${y[key(p)]}" stroke="${on?"var(--q)":"var(--rule)"}" stroke-width="${on?2.5:1.3}"/>`;});
+  s+=`<circle cx="${xs[0]}" cy="${ry}" r="12" fill="var(--paper2)" stroke="var(--muted)"/><text x="${xs[0]}" y="${ry+4}" font-size="10" text-anchor="middle" fill="var(--ink)" font-family="var(--sans)">x</text>`;
+  nodes.forEach((p,i)=>{const d=p.length,on=anc.has(key(p));const lab=d+L[p[d-1]];
+   s+=`<g data-i="${i}" style="cursor:pointer"><circle cx="${xs[d]}" cy="${y[key(p)]}" r="${rad}" fill="${on?"var(--q-soft)":"var(--card)"}" stroke="${on?"var(--q)":"var(--muted)"}" stroke-width="${on?2:1.2}"/><text x="${xs[d]}" y="${y[key(p)]+3.5}" font-size="${fs}" text-anchor="middle" fill="var(--ink)" font-family="var(--sans)" pointer-events="none">${lab}</text></g>`;});
+  svg.innerHTML=s;
+  // mask
+  const cs=Math.min(22,300/N),ox=26,oy=26;let m="";
+  nodes.forEach((pi,i)=>{nodes.forEach((pj,j)=>{const ok=pj.length<=pi.length&&key(pi.slice(0,pj.length))===key(pj);const hl=i===sel;
+    m+=`<rect x="${ox+j*cs}" y="${oy+i*cs}" width="${cs-0.6}" height="${cs-0.6}" fill="${ok?(hl?"var(--q)":"var(--v)"):(hl?"var(--q-soft)":"var(--paper2)")}" data-i="${i}" style="cursor:pointer"/>`;});});
+  if(N<=14)nodes.forEach((p,i)=>{const lab=p.map((v,d)=>(d+1)+L[v]).join("-");const sh=p.length+L[p[p.length-1]];
+   m+=`<text x="${ox-3}" y="${oy+i*cs+cs/2+3}" font-size="9" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">${sh}</text><text x="${ox+i*cs+cs/2}" y="${oy-4}" font-size="9" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">${sh}</text>`;});
+  m+=`<text x="${ox}" y="12" font-size="11" fill="var(--muted)" font-family="var(--sans)">row = query node, column = key node (${N}×${N})</text>`;
+  msk.innerHTML=m;
+  const cand=ks.reduce((x,y)=>x*y,1),ea=acc(ks,a,r),chain=acc(new Array(N).fill(1),a,r);
+  let txt=`Widths (${ks.join(", ")}): <b>${N}</b> tree nodes and <b>${cand}</b> candidates, formula (129.7). Expected accepted draft tokens, formula (129.8): <b>${f2(ea)}</b>, so <b>${f2(1+ea)}</b> tokens per target pass. A chain of the same ${N} nodes accepts <b>${f2(chain)}</b> (${f2(1+chain)} per pass): ${ea>chain+1e-9?"the tree wins":"the chain wins or ties"}.`;
+  if(sel>=0){const p=nodes[sel];txt+=` Selected node ${p.map((v,d)=>(d+1)+L[v]).join(" → ")}: position id = prefix length + ${p.length-1}; it may attend to ${p.length} tree node${p.length>1?"s":""} (its path) and to the prefix.`;}
+  info.innerHTML=txt;R.querySelector("#sd2-tree").dataset.out=`N=${N} C=${cand} acc=${f2(ea)} chain=${f2(chain)}`;}
+ function pick(e){const g=e.target.closest("[data-i]");if(!g)return;const i=+g.getAttribute("data-i");sel=sel===i?-1:i;draw();}
+ svg.addEventListener("click",pick);msk.addEventListener("click",pick);
+ [S1,S2,S3,A,Rr].forEach(el=>el.addEventListener("input",()=>{if(el!==A&&el!==Rr)sel=-1;draw();}));draw();
+})();
+
+/* ---------- Figure 4: prompt lookup decoding stepper ---------- */
+(function(){
+ const pe=$("#sd2-pld-prompt"),oe=$("#sd2-pld-out"),info=$("#sd2-pld-info");if(!pe)return;
+ const P="clip 14 : the striker scored in the final minute of extra time and the crowd ran onto the pitch . question : what happened in clip 14 ? answer :".split(" ");
+ const T="in clip 14 the striker scored in the final minute of extra time and the crowd ran onto the pitch .".split(" ");
+ const K=4,NMAX=3;
+ function propose(seq){for(let n=NMAX;n>=1;n--){if(seq.length<n+1)continue;const tail=seq.slice(-n).join(" ");
+   for(let s=seq.length-n-1;s>=0;s--){if(seq.slice(s,s+n).join(" ")===tail){const c=seq.slice(s+n,s+n+K);if(c.length)return{n,s,c};}}}return{n:0,s:-1,c:[]};}
+ const steps=[];let seq=P.slice(),gen=0;
+ while(gen<T.length){const pr=propose(seq);let acc=0;while(acc<pr.c.length&&gen+acc<T.length&&pr.c[acc]===T[gen+acc])acc++;
+  const nw=T.slice(gen,gen+acc+1);steps.push({pr,acc,nw,gen,seqLen:seq.length});seq=seq.concat(nw);gen+=nw.length;}
+ const tok=(w,c)=>`<span class="tok${c?" "+c:""}">${esc(w)}</span>`;
+ function show(k){
+  if(k===0){pe.innerHTML=P.map(w=>tok(w)).join("");oe.innerHTML=`<span class="tok x" style="text-decoration:none">(empty)</span>`;
+   info.innerHTML=`The target’s greedy answer has ${T.length} tokens. Plain decoding needs ${T.length} target passes. Press Next to run prompt lookup (n-grams up to ${NMAX}, proposals of ${K} tokens).`;R.querySelector("#sd2-pld").dataset.out=`passes=0`;return;}
+  const st=steps[k-1];const full=P.concat(T.slice(0,st.gen));const mset=new Set(),tset=new Set();
+  if(st.pr.n>0){for(let i=0;i<st.pr.n;i++){mset.add(st.pr.s+i);tset.add(full.length-st.pr.n+i);}}
+  const cls=i=>mset.has(i)||tset.has(i)?"m":"";
+  pe.innerHTML=P.map((w,i)=>tok(w,cls(i))).join("");
+  let o=T.slice(0,st.gen).map((w,i)=>tok(w,cls(P.length+i))).join("");
+  st.pr.c.forEach((w,i)=>{o+=i<st.acc?tok(w,"a"):tok(w,"x");});o+=tok(st.nw[st.nw.length-1],"b");
+  oe.innerHTML=o;const done=st.gen+st.nw.length;
+  info.innerHTML=`Pass ${k}: ${st.pr.n?`last ${st.pr.n}-gram “${esc(full.slice(-st.pr.n).join(" "))}” found earlier, proposal “${esc(st.pr.c.join(" "))}”`:"no match, no proposal"}. Accepted <b>${st.acc}</b> of ${st.pr.c.length}, plus 1 token from the target (“${esc(st.nw[st.nw.length-1])}”): <b>${st.nw.length}</b> new tokens. Total: ${done} of ${T.length} tokens in ${k} target passes`+(done===T.length?`, <b>${f2(T.length/k)} tokens per pass</b> instead of 1.`:".");
+  R.querySelector("#sd2-pld").dataset.out=`passes=${k} tokens=${done}`;}
+ B.stepper({n:steps.length+1,prev:$("#sd2-pld-prev"),next:$("#sd2-pld-next"),play:$("#sd2-pld-play"),label:$("#sd2-pld-lab"),ms:2600,onStep:show});
+})();
+})();
+</script></body></html>

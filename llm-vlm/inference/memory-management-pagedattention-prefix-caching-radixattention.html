@@ -1,0 +1,572 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Memory management: PagedAttention, prefix caching, RadixAttention · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 134</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="memory-management-pagedattention-prefix-caching-radixattention">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="memory-management-pagedattention-prefix-caching-radixattention" data-session="memory-management-pagedattention-prefix-caching-radixattention" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">134</span><span>Track 5: LLM inference and serving · session 57 of 65</span></div><h1 class="chap-title">Memory management: PagedAttention, prefix caching, RadixAttention</h1><p class="chap-sub">The KV cache is the memory that decides how many users a GPU can serve. This session shows why reserving one contiguous slab per request wastes most of it, how PagedAttention cuts the cache into fixed-size blocks found through a block table, how blocks are shared with reference counts and copy-on-write, and how prefix caching and RadixAttention reuse the cache of repeated system prompts, documents and chat turns.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 2 hours, exercises 1 hour)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 80 (the KV cache), 125 (decode attention) and 133 (the serving stack)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The three kinds of waste in naive KV allocation: reserved-but-unused slots, internal fragmentation and external fragmentation</li><li>How paging works: fixed-size blocks, a block table per sequence, address translation, and the block-size trade-off</li><li>How the attention kernel reads K and V through the block table, and what that costs</li><li>How reference counts and copy-on-write let parallel samples and beams share blocks, with the memory saved</li><li>How hash-based prefix caching finds reusable full blocks with a chain of block hashes, and why one changed token breaks all later blocks</li><li>How RadixAttention stores every cached sequence in a radix tree, evicts least-recently-used leaves, and why longest-prefix-first scheduling raises the hit rate</li><li>How to size the cache in tokens and requests for a real model on a real GPU</li></ul></div></header><style>
+.mm-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.mm-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c);border:1px solid var(--rule)}
+.mm-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.mm-grid input[type=range]{width:100%}
+.mm-lab{font:500 14px var(--sans);color:var(--muted)}
+[data-session="memory-management-pagedattention-prefix-caching-radixattention"] svg text{font-family:var(--sans)}
+[data-session="memory-management-pagedattention-prefix-caching-radixattention"] svg text.mm-mono{font-family:var(--mono);font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">On a serving GPU, the model weights are fixed, but the KV cache grows with every user and every token. The number of requests that can run at the same time, and so the throughput, is decided by how well that cache memory is managed.</p>
+<p>In <a href="../inference/the-kv-cache.html">session 80</a> we computed how big the cache is: for Llama 3 8B, 128 KiB per token. In <a href="../inference/the-serving-stack-and-the-life-of.html">session 133</a> we followed one request from the API to the GPU. This session is about the part of the engine that hands out cache memory to those requests. Three problems must be solved:</p>
+<ol>
+<li><b>Waste.</b> We do not know how long an answer will be. If each request gets one contiguous slab of memory for its maximum length, most of the slab is never used. The vLLM paper measured that in the systems it studied only 20.4% to 38.2% of KV cache memory held real token states. [Certain]</li>
+<li><b>Sharing.</b> When you ask for 4 samples of one prompt, or run beam search, all candidates have the same prompt. Storing its cache 4 times is wasteful.</li>
+<li><b>Reuse across requests.</b> Thousands of requests start with the same system prompt, the same few-shot examples, the same document, or the earlier turns of the same chat. Their KV cache is identical. Computing it again for each request wastes both memory and prefill compute.</li></ol>
+<p><b>PagedAttention</b> (vLLM) solves the first two with an idea from operating systems: virtual memory with pages. <b>Prefix caching</b> (vLLM) and <b>RadixAttention</b> (SGLang) solve the third by keeping finished caches and matching new prompts against them. The vLLM paper reports 2–4× higher throughput than the systems it compared, at the same latency [Certain that the paper reports this], and SGLang reports up to 6.4× higher throughput for programs with a lot of shared structure. [Certain that the paper reports this]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “What problem does PagedAttention solve?”, “What is in a block table?”, “How does copy-on-write work for parallel sampling?”, “How does vLLM know two prompts share a prefix?”, “Prefix caching vs RadixAttention?”, “How many concurrent requests fit on this GPU?”. Each one is answered below with numbers.</aside>
+
+<h2>The problem: fragmentation with naive KV allocation</h2>
+<p>A request arrives with a prompt of \(P\) tokens and a limit <code>max_tokens</code> on the answer. Early serving systems stored each request’s cache as one <b>contiguous</b> tensor, because attention kernels expected K and V for one sequence in one piece. Since the answer length is unknown, the system must reserve space for the worst case when the request starts:</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A restaurant that seats every group at a long table for 20 people, “just in case more friends come”. Most groups are 2 or 3 people. The restaurant is “full” while most chairs are empty. And when two groups leave from different ends of the room, the two free tables are not next to each other, so a group of 20 still cannot sit.</aside>
+<div class="eq">\[ R_i = P_i + G^{\max}_i, \qquad \eta_{\text{contig}} = \frac{\sum_i T_i}{\sum_i R_i} \tag{134.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(R_i\)</dt><dd>tokens reserved for request \(i\): its prompt length \(P_i\) plus its maximum answer length \(G^{\max}_i\)</dd>
+<dt>\(T_i\)</dt><dd>tokens that request \(i\) really holds right now (prompt plus tokens generated so far)</dd>
+<dt>\(\eta\)</dt><dd>memory utilization: the fraction of the allocated cache memory that holds real token states</dd></dl>
+<p>The vLLM paper names three kinds of waste [Certain]:</p>
+<ul>
+<li><b>Reserved slots.</b> Space for tokens that will be generated later. It is used one day, but for now it blocks other requests.</li>
+<li><b>Internal fragmentation.</b> Space inside a reservation that is never used, because the answer stopped before <code>max_tokens</code>. Most answers are much shorter than the limit.</li>
+<li><b>External fragmentation.</b> Free gaps <i>between</i> reservations. When requests finish at different times, free memory is cut into holes. A new request may need 320 tokens of contiguous space, and the GPU may have 448 free tokens, but in two holes of 192 and 256. The request must wait.</li></ul>
+<p>Step through Figure 1. The same requests run in both memories. The top memory reserves contiguous slabs; the bottom one uses blocks, which we explain in the next section.</p>
+<figure class="fig wide" id="mm-frag"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="mm-frag-prev">Back</button><button type="button" class="btn primary" id="mm-frag-play">Play</button><button type="button" class="btn" id="mm-frag-next">Next</button><span id="mm-frag-lab" class="mm-lab"></span></div>
+<div class="scroll-x"><svg id="mm-frag-svg" viewBox="0 0 780 300" role="img" aria-label="Two KV cache memories of 64 blocks each. Top: contiguous reservations with unused space and holes. Bottom: paged blocks."></svg></div>
+<div class="mm-leg"><span style="--c:var(--q)">token states in use</span><span style="--c:var(--q-soft)">reserved but empty</span><span style="--c:var(--card)">free</span></div>
+<div class="readout" id="mm-frag-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> One KV memory of 1,024 token slots (64 cells of 16 tokens), used two ways. Top: each request reserves prompt plus <code>max_tokens</code> in one contiguous range (first fit). Bottom: each request gets 16-token blocks only when it needs them, anywhere in memory. Requests A to D arrive first; B and D finish; then E, F and G arrive.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Each cell is 16 tokens. Dark fill is real token data, light fill is reserved space that holds nothing yet. At step 4, the contiguous memory has 28 free cells, but the largest hole is 16 cells and E needs 20, so E must wait: this is external fragmentation. The paged memory never has this problem, because any free block can be used. At the last step compare the utilization numbers: about a quarter for the contiguous scheme and above 90% for the paged one, with more than twice as many requests running.</p></details></figure>
+
+<h2>Paging: fixed-size blocks and a block table</h2>
+<p>Operating systems solved the same problem decades ago. A program sees one long, contiguous <b>virtual</b> address space, but the memory behind it is cut into fixed-size <b>pages</b> that can sit anywhere in physical RAM. A <b>page table</b> maps virtual pages to physical pages. Memory is given out one page at a time, when it is touched.</p>
+<p>PagedAttention does exactly this for the KV cache [Certain]:</p>
+<ul>
+<li>At startup, the engine measures free GPU memory and cuts it into a pool of <b>physical blocks</b>. Each block holds the keys and values of \(\beta\) tokens (vLLM’s default is \(\beta = 16\) [Certain]).</li>
+<li>Each sequence has a <b>block table</b>: a short list that maps its <b>logical blocks</b> 0, 1, 2, … to physical block numbers. The paper also keeps the number of filled slots per entry. [Certain]</li>
+<li>Blocks are filled from left to right. A new physical block is taken from the free list only when the last block of the sequence is full.</li>
+<li>When a request finishes, its blocks go back to the free list. Any free block can serve any request, so there is no external fragmentation.</li></ul>
+<p>So a sequence of \(T_i\) tokens uses</p>
+<div class="eq">\[ n_i = \left\lceil \frac{T_i}{\beta} \right\rceil \text{ blocks}, \qquad \text{waste}_i = \beta\, n_i - T_i \le \beta - 1, \qquad \eta_{\text{paged}} = \frac{\sum_i T_i}{\beta \sum_i n_i} \tag{134.2} \]</div>
+<p>All waste sits in the last, partly filled block of each sequence: less than one block per sequence, about \(\beta/2\) tokens on average. With \(\beta = 16\) and sequences of a few hundred tokens, utilization is above 95%.</p>
+<p>To read token \(t\) of a sequence (counting from 0), the kernel does the same <b>address translation</b> as a CPU:</p>
+<div class="eq">\[ j = \left\lfloor \frac{t}{\beta} \right\rfloor, \qquad o = t \bmod \beta, \qquad \text{slot}(t) = \text{BT}[j] \cdot \beta + o \tag{134.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(j\)</dt><dd>the logical block that holds token \(t\)</dd>
+<dt>\(o\)</dt><dd>the offset of the token inside that block, from 0 to \(\beta - 1\)</dd>
+<dt>\(\text{BT}[j]\)</dt><dd>entry \(j\) of the block table: the physical block number</dd>
+<dt>\(\text{slot}(t)\)</dt><dd>the token’s position in the big physical pool, counted in token slots</dd></dl>
+<figure class="fig wide" id="mm-bt"><div class="fig-body">
+<div class="controls"><span class="seg" id="mm-bt-b"><button type="button" data-v="4" aria-pressed="false">β = 4</button><button type="button" data-v="8" aria-pressed="true">β = 8</button><button type="button" data-v="16" aria-pressed="false">β = 16</button></span></div>
+<div class="mm-grid">
+<label for="mm-bt-T">Sequence length \(T\)</label><input type="range" id="mm-bt-T" min="1" max="64" step="1" value="45"><output id="mm-bt-Tv"></output>
+<label for="mm-bt-t">Read token \(t\)</label><input type="range" id="mm-bt-t" min="0" max="44" step="1" value="27"><output id="mm-bt-tv"></output></div>
+<div class="scroll-x"><svg id="mm-bt-svg" viewBox="0 0 780 330" role="img" aria-label="A sequence split into logical blocks, its block table, and the physical block pool"></svg></div>
+<div class="readout" id="mm-bt-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Address translation with a block table. Top: the sequence in logical order, cut into blocks of \(\beta\) tokens. Middle: the block table. Bottom: the physical pool of 128 token slots, shared with other requests (gray). The chosen token is followed through formula (134.3).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Move \(t\) and watch the arrow jump from the logical block to a physical block that can be anywhere in the pool. Change \(\beta\): small blocks give a longer block table and less waste in the last block; large blocks give a short table and more waste. The readout shows the waste of this sequence from formula (134.2).</p></details></figure>
+
+<h3>Choosing the block size</h3>
+<p>The block size is a trade-off. Small blocks waste less memory, but each block is a separate small memory read for the attention kernel, and the block tables get longer. Large blocks read memory efficiently but waste more in the last block, and they share less (only full blocks can be shared, as we will see). The vLLM paper found that block sizes from 16 to 128 worked best on ShareGPT traces, while large blocks hurt on the Alpaca trace, where many sequences are shorter than one block. [Certain] SGLang goes to the other extreme: its RadixAttention uses a page size of one token. [Certain]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Every layer has its own K and V tensors, but in the vLLM code one block table per sequence serves all of them: block number 7 means “slot range 7” in every layer. [Likely] So one table entry covers \(\beta\) tokens in all layers at once. The paper notes that separate tables per layer or head would perform the same. [Certain]</aside>
+
+<h3>Attention that reads through the block table</h3>
+<p>The attention kernel no longer gets one K tensor and one V tensor per sequence. It gets the pool, the block table and the sequence length. For the query \(\mathbf{q}\) of the newest token, the paper writes attention block by block [Certain]:</p>
+<div class="eq">\[ \mathbf{a}_j = \frac{\exp\!\left(\mathbf{q}^\top K_j / \sqrt{d}\right)}{\sum_{m=0}^{n-1} \exp\!\left(\mathbf{q}^\top K_m / \sqrt{d}\right) \mathbf{1}}, \qquad \mathbf{o} = \sum_{j=0}^{n-1} V_j^\top \mathbf{a}_j^\top \tag{134.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(K_j, V_j\)</dt><dd>the \(\beta \times d\) keys and values stored in physical block \(\text{BT}[j]\); the kernel fetches them through the table</dd>
+<dt>\(\mathbf{a}_j\)</dt><dd>the \(1 \times \beta\) row of attention weights for the tokens of block \(j\)</dd>
+<dt>\(\mathbf{1}\)</dt><dd>a column of ones: it sums the \(\beta\) scores of block \(m\)</dd>
+<dt>\(n\)</dt><dd>the number of blocks of the sequence; slots after the last real token are masked</dd></dl>
+<p>This is the same math as ordinary attention: the sum over all tokens is just grouped by block. The cost is the indirection. The paper measured the PagedAttention kernel at 20–26% higher attention latency than the contiguous FasterTransformer kernel, which it calls acceptable because attention is only part of the step and the larger batch more than pays for it. [Certain] Modern kernels (FlashAttention, FlashInfer, the split-KV kernels of <a href="../inference/attention-operator-2-decode-attention-flashdecoding-and.html">session 125</a>) read paged caches directly.</p>
+
+<div class="worked"><div class="wt">Worked example: how many requests fit on one GPU?</div>
+<p>Llama 3 8B stores \(2 \times 32 \text{ layers} \times 8 \text{ KV heads} \times 128 \times 2 \text{ bytes} = 131{,}072\) bytes = 128 KiB per token. Suppose that after weights and activations, 60 GiB is left for the cache:</p>
+<div class="eq">\[ N_{\text{tok}} = \left\lfloor \frac{M_{\text{kv}}}{s} \right\rfloor = \frac{60 \times 2^{30}}{131{,}072} = 491{,}520 \text{ tokens} \tag{134.5} \]</div>
+<p><b>Contiguous</b>, with a reservation of 8,192 tokens per request (1 GiB each): \(491{,}520 / 8{,}192 = 60\) requests.</p>
+<p><b>Paged</b>, if a request really holds 600 tokens on average: \(\lceil 600/16 \rceil = 38\) blocks = 608 slots, so \(\lfloor 491{,}520 / 608 \rfloor = 808\) requests, 13.5× more. Utilization goes from \(600/8{,}192 = 7.3\%\) to \(600/608 = 98.7\%\).</p>
+<p>The real gain is smaller than 13.5×, because a request that grows must still find free blocks, and the batch is also limited by compute. But this is the reason paging raised throughput by 2–4× in the paper.</p></div>
+
+<div class="algo"><div class="algo-h">Algorithm 1: the block manager (append one token, with copy-on-write)</div><ol>
+<li><b>state:</b> free list \(F\) of physical blocks, reference count \(\text{ref}[b]\) per block, block table \(\text{BT}_s\) and length \(n_s\) per sequence \(s\)</li>
+<li><b>function</b> APPEND(\(s\), \(\mathbf{k}\), \(\mathbf{v}\)):</li>
+<li>&nbsp;&nbsp;\(j \leftarrow \lfloor n_s / \beta \rfloor\), \(o \leftarrow n_s \bmod \beta\) <span class="c">// formula (134.3)</span></li>
+<li>&nbsp;&nbsp;<b>if</b> \(j = |\text{BT}_s|\): <span class="c">// last block is full</span></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;<b>if</b> \(F\) is empty: preempt a sequence (swap it out or drop it for recompute), then retry</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(b \leftarrow F.\text{pop}()\); \(\text{ref}[b] \leftarrow 1\); append \(b\) to \(\text{BT}_s\)</li>
+<li>&nbsp;&nbsp;<b>else if</b> \(\text{ref}[\text{BT}_s[j]] \gt 1\): <span class="c">// block is shared: copy-on-write</span></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(b \leftarrow F.\text{pop}()\); copy block \(\text{BT}_s[j]\) into \(b\); \(\text{ref}[\text{BT}_s[j]] \mathrel{-}= 1\); \(\text{ref}[b] \leftarrow 1\); \(\text{BT}_s[j] \leftarrow b\)</li>
+<li>&nbsp;&nbsp;write \(\mathbf{k}, \mathbf{v}\) into slot \(o\) of block \(\text{BT}_s[j]\) in every layer; \(n_s \leftarrow n_s + 1\)</li>
+<li><b>function</b> FORK(\(s\)): new sequence \(s'\) with \(\text{BT}_{s'} \leftarrow \text{copy of } \text{BT}_s\), \(n_{s'} \leftarrow n_s\); \(\text{ref}[b] \mathrel{+}= 1\) for every \(b\) in \(\text{BT}_s\)</li>
+<li><b>function</b> FREE(\(s\)): for every \(b\) in \(\text{BT}_s\): \(\text{ref}[b] \mathrel{-}= 1\); if \(\text{ref}[b] = 0\), push \(b\) to \(F\)</li></ol></div>
+
+<h2>Sharing blocks: reference counts and copy-on-write</h2>
+<p>Paging gives a second gift: two block tables can point to the <b>same</b> physical block. This is how operating systems share memory between processes after <code>fork()</code>. Each physical block keeps a <b>reference count</b>: how many block tables point to it. [Certain]</p>
+<p><b>Parallel sampling</b> (the API parameter <code>n</code>, used for best-of-n and for RL rollouts that need many answers per prompt): the prompt is prefilled <b>once</b>. Then the sequence is forked into \(n\) samples. All of them point to the same prompt blocks, with reference count \(n\).</p>
+<p>A full shared block is never written again, so it can stay shared forever. The problem is the <b>last, partly filled</b> prompt block: every sample wants to write its own next token there. The rule is <b>copy-on-write</b> [Certain]: before writing into a block with reference count above 1, copy it to a fresh block, point this sample’s table to the copy, and decrease the old block’s count. The last sample to write finds a count of 1 and writes in place, without a copy.</p>
+<figure class="fig wide" id="mm-cow"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="mm-cow-prev">Back</button><button type="button" class="btn primary" id="mm-cow-play">Play</button><button type="button" class="btn" id="mm-cow-next">Next</button><span id="mm-cow-lab" class="mm-lab"></span></div>
+<div class="scroll-x"><svg id="mm-cow-svg" viewBox="0 0 780 320" role="img" aria-label="Three samples with block tables pointing to shared physical blocks, with reference counts and copy-on-write"></svg></div>
+<div class="readout" id="mm-cow-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Parallel sampling with \(n = 3\), a 10-token prompt and blocks of \(\beta = 4\). Left: the block table of each sample. Right: the physical blocks, with the number of tokens they hold and their reference count. The same steps are run by the PyTorch code later in this session.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Watch block P2, the partly filled prompt block. At steps 3 and 4 a sample wants to write into it while others still share it, so it is copied (P3, P4). At step 5 the third sample is the only user left (count 1) and writes in place. Blocks P0 and P1 stay shared until the end. At step 7 the readout counts 8 physical blocks, against 12 if every sample had its own copy. At step 8 one sample finishes and only its private blocks return to the free list.</p></details></figure>
+<aside class="note analogy side"><span class="nt">Analogy</span>Three students share one printed copy of the exam questions. Nobody needs their own copy just to read. But the moment a student wants to write on the last page, they photocopy that page first and write on the copy. The last student keeps the original.</aside>
+<p>How much does sharing save? For a prompt of \(P\) tokens and \(n\) samples of \(G\) tokens each:</p>
+<div class="eq">\[ \text{blocks}_{\text{no share}} = n \left\lceil \frac{P + G}{\beta} \right\rceil, \qquad \text{blocks}_{\text{share}} = \left\lfloor \frac{P}{\beta} \right\rfloor + n \left( \left\lceil \frac{P + G}{\beta} \right\rceil - \left\lfloor \frac{P}{\beta} \right\rfloor \right) \tag{134.6} \]</div>
+<p>Only the \(\lfloor P/\beta \rfloor\) <b>full</b> prompt blocks are stored once; everything after them belongs to one sample.</p>
+<div class="worked"><div class="wt">Worked example: sharing in parallel sampling</div>
+<p>\(P = 100\), \(G = 200\), \(n = 4\), \(\beta = 16\). Without sharing: \(4 \times \lceil 300/16 \rceil = 4 \times 19 = 76\) blocks. With sharing: \(\lfloor 100/16 \rfloor = 6\) shared blocks, plus \(4 \times (19 - 6) = 52\), so 58 blocks. Sharing saves \(18/76 = 23.7\%\). With a longer prompt and short answers (for example a RAG prompt of 4,000 tokens), the saving approaches \((n-1)/n = 75\%\).</p></div>
+<p><b>Beam search</b> shares even more. Beams share the prompt and also long stretches of generated text, and when a beam is dropped its blocks lose a reference and may return to the free list. With reference counts, this bookkeeping is the same code as for sampling. On OPT-13B the paper measured memory savings of 6.1–9.8% for parallel sampling and 37.6–55.2% for beam search on the Alpaca trace, and 16.2–30.5% and 44.3–66.3% on ShareGPT. [Certain]</p>
+<p><b>Token trees.</b> The same idea appears in speculative decoding. SpecInfer verifies a whole <b>tree</b> of draft tokens in one forward pass: candidates that share a prefix share its KV entries, and a tree-shaped attention mask makes each candidate attend only to its own ancestors. [Certain] See <a href="../inference/speculative-decoding-2-drafts-and-verification-medusa.html">session 129</a>.</p>
+
+<h3>When memory runs out: preemption</h3>
+<p>Paging lets the engine admit requests optimistically: it does not reserve their future tokens. So at some step there may be no free block for the next token. vLLM then <b>preempts</b> a request, with an all-or-nothing rule: all blocks of that request are evicted, because a sequence needs all of its tokens to continue. [Certain] Two ways to bring it back [Certain]:</p>
+<ul>
+<li><b>Swapping:</b> copy its blocks to CPU memory, and copy them back later. Costs PCIe bandwidth.</li>
+<li><b>Recomputation:</b> drop the blocks, and later run prefill again on prompt plus generated tokens. Costs GPU compute, but prefill is fast and parallel, so this is often cheaper for short sequences.</li></ul>
+<p>The paper schedules with first-come-first-served and preempts the latest arrivals first. [Certain] Scheduling policies are the topic of <a href="../inference/scheduling-fcfs-preemption-fairness-and-slos.html">session 136</a>.</p>
+
+<h2>Prefix caching: reuse the cache of repeated prompts</h2>
+<p>So far, sharing happened <b>inside</b> one request. But many different requests start with the same tokens:</p>
+<ul>
+<li>a system prompt of hundreds or thousands of tokens, the same for every user of a product;</li>
+<li>few-shot examples placed before every question;</li>
+<li>a long document, a code file or a video transcript that users ask several questions about;</li>
+<li>multi-turn chat, where turn 3 resends turns 1 and 2;</li>
+<li>agents, which resend the tool descriptions and the whole history at every step.</li></ul>
+<p>The KV entries of a token depend only on the token and on everything before it. So if two prompts agree on their first \(\ell\) tokens, the K and V of those \(\ell\) tokens are identical in both, and the second request can skip their prefill. <b>Prefix caching</b> keeps blocks of finished requests in memory and lets new requests point their block tables at them.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A translator who has to translate many letters that all begin with the same two pages of legal text. A smart translator translates those two pages once and keeps a copy. For every new letter, she checks how many pages match her copy, reuses them, and translates only the new part.</aside>
+
+<h3>How vLLM finds a matching prefix: a chain of block hashes</h3>
+<p>Comparing a new prompt token by token against every cached prompt would be slow. vLLM gives every <b>full</b> block a hash and keeps a dictionary from hash to physical block. [Certain] The hash of block \(j\) covers its own tokens <b>and</b> the hash of the block before it:</p>
+<div class="eq">\[ h_j = H\big(h_{j-1},\; x_{j\beta}, \dots, x_{(j+1)\beta - 1},\; e\big), \qquad h_{-1} = \text{salt} \tag{134.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(H\)</dt><dd>a hash function (the vLLM default is SHA-256 [Certain])</dd>
+<dt>\(x_{j\beta}, \dots\)</dt><dd>the \(\beta\) token ids inside block \(j\)</dd>
+<dt>\(h_{j-1}\)</dt><dd>the parent hash. Because it is included, \(h_j\) identifies the <b>whole prefix</b> up to the end of block \(j\), not only the block’s own tokens</dd>
+<dt>\(e\)</dt><dd>extra keys that change the KV values: the LoRA adapter id, hashes of images in the block, and so on</dd>
+<dt>salt</dt><dd>an optional per-tenant value, so that different users cannot share (or probe) each other’s cached blocks</dd></dl>
+<p>For a new prompt, the scheduler computes \(h_0, h_1, \dots\) and looks them up one by one until the first miss. Every hit is a block it can reuse: increase its reference count and put it in the block table. Only the tokens after the last hit go through prefill. With a shared prefix of \(\ell\) tokens:</p>
+<div class="eq">\[ r = \beta \left\lfloor \frac{\ell}{\beta} \right\rfloor \text{ tokens reused}, \qquad \text{prefill FLOPs saved} \approx 2 N r \tag{134.8} \]</div>
+<p>Here \(N\) is the number of model parameters (the \(2N\) FLOPs per token rule of <a href="../inference/the-generation-loop-prefill-and-decode.html">session 78</a>). The attention part of prefill, which grows with \(\ell^2\), is saved too. If every token of the prompt hits, the engine still recomputes the last token, because it needs that token’s logits to sample the first output token. [Likely]</p>
+<figure class="fig wide" id="mm-hash"><div class="fig-body">
+<div class="controls"><span class="seg" id="mm-hash-b"><button type="button" data-v="4" aria-pressed="false">β = 4</button><button type="button" data-v="8" aria-pressed="true">β = 8</button><button type="button" data-v="16" aria-pressed="false">β = 16</button></span></div>
+<div class="mm-grid">
+<label for="mm-hash-l">Position of the first different token, \(\ell\)</label><input type="range" id="mm-hash-l" min="0" max="48" step="1" value="21"><output id="mm-hash-lv"></output></div>
+<div class="scroll-x"><svg id="mm-hash-svg" viewBox="0 0 780 250" role="img" aria-label="Two prompts cut into blocks with chained hashes; matching hashes are cache hits"></svg></div>
+<div class="readout" id="mm-hash-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Prompt A (48 tokens) is already in the cache. Prompt B (52 tokens) is A with <b>one</b> token changed at position \(\ell\), plus 4 new tokens at the end. Each full block shows the first 4 hex digits of its chained hash, formula (134.7). Green blocks of B are cache hits.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Only one token of B differs from A, yet every block from that point on gets a new hash, even blocks whose own tokens are identical to A’s. That is correct: their keys and values depend on the changed token through attention, so they really are different. Move \(\ell\) to 48 (no token changed): B reuses all 48 tokens of A and computes only its 4 new tokens. Larger blocks lose more of the shared prefix to rounding.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: a shared system prompt</div>
+<p>A product sends a 1,000-token system prompt before a 50-token user message. With \(\beta = 16\), the first \(\lfloor 1000/16 \rfloor = 62\) blocks are full and identical across users: \(r = 992\) tokens are reused, and only \(8 + 50 = 58\) tokens are prefilled. That removes 94.5% of the prefill tokens. For Llama 3 8B (8.03B parameters), formula (134.8) gives \(2 \times 8.03 \times 10^9 \times 992 = 1.59 \times 10^{13}\) FLOPs saved per request, and the 62 blocks are stored once for all users.</p></div>
+
+<h3>Eviction: an LRU list of unused blocks</h3>
+<p>A cached block that no running request uses has reference count 0. vLLM does not free it right away. It goes to the tail of a <b>free queue</b>, still holding its data and its hash. [Certain] When the engine needs a new block, it pops the <b>head</b> of the queue: the least recently used block. If that block still has a hash, the hash is removed from the dictionary first (the cached prefix is evicted). If a new request hits a block that sits in the free queue, the block is taken out of the queue and reused. [Certain] So the cache uses all memory that running requests do not need, at no cost.</p>
+<p>One detail: when a request finishes, its blocks enter the queue in <b>reverse</b> order, so the last block of the request is evicted first. The last block covers the longest prefix and is the least likely to be shared. [Certain]</p>
+
+<h2>RadixAttention: a tree of every cached sequence</h2>
+<p>SGLang takes the same goal further. It treats the KV cache of all requests, running and finished, as one data structure: a <b>radix tree</b>. [Certain]</p>
+<ul>
+<li>A <b>radix tree</b> (also called a compressed trie) stores many sequences by their shared prefixes. Each edge is labeled with a run of tokens, not one token. Two sequences share the path for their common prefix and split into two branches where they first differ.</li>
+<li>Each node points to the KV cache of the tokens on its edge. Pages are one token, so a split can happen anywhere. [Certain]</li>
+<li>Each node has a <b>reference counter</b>: how many running requests use it. A node with counter 0 can be evicted. [Certain]</li>
+<li>Eviction is <b>LRU on leaves</b>: when memory is needed, remove the least recently used leaf, and repeat. Removing a leaf may make its parent a leaf. [Certain] There is no separate, fixed-size cache pool: all memory not used by running requests is cache. [Certain]</li></ul>
+<p>For a new request, SGLang walks down the tree as far as the prompt matches, reuses all those tokens, prefills the rest, and inserts the new tokens as a new branch. When the request ends, its generated tokens stay in the tree too. That is what makes multi-turn chat cheap: turn 2 finds turn 1’s prompt <b>and answer</b> in the tree.</p>
+<p>The difference from block hashes: the hash chain can only match whole blocks and only along one chain per prompt, while the tree matches to the exact token and naturally stores many branches (a few-shot header, then several documents, then many questions per document). vLLM’s hash table and SGLang’s tree are two ways to answer the same query, “what is the longest cached prefix of this prompt?”.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>The autocomplete in your phone’s contact list. Typing “Ma” walks to the node shared by “Mario”, “Maria” and “Mark”; one more letter picks a branch. RadixAttention walks the same way, but each step reuses already computed keys and values.</aside>
+
+<h3>Cache-aware scheduling: longest prefix first</h3>
+<p>With a small cache, the <b>order</b> of requests matters. If requests that share a prefix are spread out in time, the prefix is evicted between them and must be computed again. SGLang sorts waiting requests by the length of their matched prefix and runs the longest match first. [Certain] The paper proves that, for a batch of requests known in advance and a cache at least as large as the longest request, visiting the tree in depth-first order gives the best possible hit rate, and that longest-shared-prefix-first is equivalent to depth-first order. [Certain] The paper also warns that this greedy order can starve requests with no shared prefix, which a real server must guard against. [Certain]</p>
+<p>We measure the result with the <b>cache hit rate</b>:</p>
+<div class="eq">\[ \text{hit rate} = \frac{\sum_i m_i}{\sum_i P_i} \tag{134.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(m_i\)</dt><dd>prompt tokens of request \(i\) found in the cache (the length of the matched path)</dd>
+<dt>\(P_i\)</dt><dd>prompt tokens of request \(i\)</dd></dl>
+<p>On its benchmarks, SGLang reports hit rates from 50% to 99%, and its cache-aware scheduler reaching 96% of the optimal hit rate on average. When there is nothing to reuse, managing the tree cost less than 0.3% of the run time. [Certain]</p>
+<figure class="fig wide" id="mm-rx"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="mm-rx-prev">Back</button><button type="button" class="btn primary" id="mm-rx-play">Play</button><button type="button" class="btn" id="mm-rx-next">Next</button><span id="mm-rx-lab" class="mm-lab"></span></div>
+<div class="controls"><span class="seg" id="mm-rx-sch"><button type="button" data-v="fcfs" aria-pressed="true">First come, first served</button><button type="button" data-v="lpf" aria-pressed="false">Longest prefix first</button></span></div>
+<div class="mm-grid">
+<label for="mm-rx-c">Cache capacity (tokens)</label><input type="range" id="mm-rx-c" min="19" max="44" step="1" value="24"><output id="mm-rx-cv"></output></div>
+<div class="scroll-x"><svg id="mm-rx-svg" viewBox="0 0 780 330" role="img" aria-label="Radix tree of cached token sequences"></svg></div>
+<div class="mm-leg"><span style="--c:var(--k)">matched (reused) by this request</span><span style="--c:var(--q)">new tokens inserted by this request</span><span style="--c:var(--card)">cached, not used now</span></div>
+<div class="readout" id="mm-rx-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> RadixAttention on 8 requests for a video assistant: a 6-token system prompt (SYS…), two 4-token video clips (clipA, clipB), several questions per clip, and one second chat turn (request 6 continues request 1 with its answer). Each node shows its first tokens and its length. After each request, its prompt and answer stay in the tree. When the cache is full, LRU leaves are evicted.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Play through both schedules at capacity 24. With first-come-first-served, clipA and clipB requests alternate, so each clip’s branch is evicted before it is needed again: the final hit rate is 54 of 101 prompt tokens (53.5%). With longest-prefix-first, the requests on clipA run together, then those on clipB: 69 of 101 (68.3%), the best possible here. Raise the capacity to 44 and both orders reach 69, because nothing is evicted. Lower it to 19 (the longest request) and first-come-first-served falls to 46 while longest-prefix-first still gets 69.</p></details></figure>
+
+<div class="algo"><div class="algo-h">Algorithm 2: RadixAttention, one request</div><ol>
+<li><b>state:</b> radix tree with root \(\rho\); each node \(u\) has a token run \(u.\text{tok}\), KV indices, a reference counter \(u.\text{ref}\) and a last-access time \(u.\text{t}\)</li>
+<li><b>function</b> MATCH(prompt \(p\)): walk from \(\rho\), following the child whose run starts with the next token; compare token by token; if the match ends inside an edge, <b>split</b> that node in two; return matched length \(m\) and the path</li>
+<li><b>function</b> SERVE(request with prompt \(p\)):</li>
+<li>&nbsp;&nbsp;\((m, \text{path}) \leftarrow\) MATCH(\(p\)); \(u.\text{ref} \mathrel{+}= 1\) for \(u\) in path <span class="c">// lock: these cannot be evicted now</span></li>
+<li>&nbsp;&nbsp;need \(\leftarrow |p| - m\) plus room for the output</li>
+<li>&nbsp;&nbsp;<b>while</b> free memory \(\lt\) need: evict the leaf with \(\text{ref} = 0\) and the smallest \(\text{t}\) <span class="c">// LRU on leaves</span></li>
+<li>&nbsp;&nbsp;prefill tokens \(p_{m}, \dots, p_{|p|-1}\) using the cached KV of \(p_0, \dots, p_{m-1}\); decode the output \(y\)</li>
+<li>&nbsp;&nbsp;insert \(p \Vert y\) into the tree (a new leaf under the last matched node); set \(u.\text{t} \leftarrow\) now on the whole path</li>
+<li>&nbsp;&nbsp;\(u.\text{ref} \mathrel{-}= 1\) for \(u\) in path <span class="c">// unlock; the tokens stay cached</span></li>
+<li><b>scheduler:</b> among waiting requests, pick the one with the longest MATCH first (cache-aware), with a guard against starvation</li></ol></div>
+
+<h2>A complete example in PyTorch</h2>
+<p>The code builds a tiny paged KV cache: a pool of blocks, a free list, reference counts, block tables, APPEND with copy-on-write and FORK from Algorithm 1. It reproduces Figure 3, checks that attention read through the block tables equals ordinary attention on contiguous tensors, and computes chained block hashes as in Figure 4. It runs on a CPU in under a second.</p>
+<pre class="code"><span class="kw2">import</span> hashlib, math, torch
+torch.manual_seed(0)
+
+H, D, BLOCK, NUM_BLOCKS = 2, 8, 4, 32            <span class="cm"># kv heads, head dim, tokens per block, pool size</span>
+k_pool = torch.zeros(NUM_BLOCKS, BLOCK, H, D)    <span class="cm"># physical KV memory, shared by all sequences</span>
+v_pool = torch.zeros(NUM_BLOCKS, BLOCK, H, D)
+free = list(range(NUM_BLOCKS - 1, -1, -1))       <span class="cm"># free block ids (pop from the end)</span>
+ref = [0] * NUM_BLOCKS                           <span class="cm"># reference count per physical block</span>
+
+<span class="kw2">class</span> Seq:
+    <span class="kw2">def</span> __init__(self): self.table, self.n = [], 0   <span class="cm"># block table and number of tokens</span>
+
+<span class="kw2">def</span> alloc():
+    b = free.pop(); ref[b] = 1; <span class="kw2">return</span> b
+
+<span class="kw2">def</span> release(b):
+    ref[b] -= 1
+    <span class="kw2">if</span> ref[b] == 0: free.append(b)
+
+<span class="kw2">def</span> append(seq, k, v):                           <span class="cm"># write the KV of one new token</span>
+    j, o = divmod(seq.n, BLOCK)                  <span class="cm"># logical block, offset (formula 134.3)</span>
+    <span class="kw2">if</span> j == len(seq.table):                      <span class="cm"># last block full: get a new one</span>
+        seq.table.append(alloc())
+    <span class="kw2">elif</span> ref[seq.table[j]] &gt; 1:                  <span class="cm"># shared block: copy-on-write</span>
+        old, new = seq.table[j], alloc()
+        k_pool[new], v_pool[new] = k_pool[old], v_pool[old]
+        release(old); seq.table[j] = new
+    b = seq.table[j]
+    k_pool[b, o], v_pool[b, o] = k, v
+    seq.n += 1
+
+<span class="kw2">def</span> fork(seq):                                   <span class="cm"># parallel sampling: share every block</span>
+    child = Seq(); child.table, child.n = list(seq.table), seq.n
+    <span class="kw2">for</span> b <span class="kw2">in</span> seq.table: ref[b] += 1
+    <span class="kw2">return</span> child
+
+<span class="kw2">def</span> paged_attention(q, seq):                     <span class="cm"># q: (H, D); reads K and V through the block table</span>
+    idx = torch.tensor(seq.table)
+    K = k_pool[idx].reshape(-1, H, D)[: seq.n]   <span class="cm"># gather blocks, drop the empty tail</span>
+    V = v_pool[idx].reshape(-1, H, D)[: seq.n]
+    w = torch.softmax(torch.einsum(<span class="st">"hd,thd->ht"</span>, q, K) / math.sqrt(D), dim=-1)
+    <span class="kw2">return</span> torch.einsum(<span class="st">"ht,thd->hd"</span>, w, V)
+
+<span class="cm"># 1) a 10-token prompt, then 3 samples that share it</span>
+ks, vs = torch.randn(13, 3, H, D), torch.randn(13, 3, H, D)
+parent = Seq()
+<span class="kw2">for</span> t <span class="kw2">in</span> range(10): append(parent, ks[t, 0], vs[t, 0])
+samples = [parent, fork(parent), fork(parent)]
+print(<span class="st">"after fork  :"</span>, [s.table <span class="kw2">for</span> s <span class="kw2">in</span> samples], <span class="st">"refs"</span>, ref[:3])
+<span class="kw2">for</span> t <span class="kw2">in</span> range(10, 13):
+    <span class="kw2">for</span> i, s <span class="kw2">in</span> enumerate(samples): append(s, ks[t, i], vs[t, i])
+print(<span class="st">"after 3 more:"</span>, [s.table <span class="kw2">for</span> s <span class="kw2">in</span> samples])
+print(<span class="st">"blocks in use:"</span>, NUM_BLOCKS - len(free), <span class="st">"without sharing:"</span>, 3 * math.ceil(13 / BLOCK))
+
+<span class="cm"># 2) paged attention equals ordinary attention on a contiguous copy</span>
+q = torch.randn(H, D)
+<span class="kw2">for</span> i, s <span class="kw2">in</span> enumerate(samples):
+    Kc = torch.cat([ks[:10, 0], ks[10:, i]]); Vc = torch.cat([vs[:10, 0], vs[10:, i]])
+    ref_out = torch.einsum(<span class="st">"ht,thd->hd"</span>, torch.softmax(torch.einsum(<span class="st">"hd,thd->ht"</span>, q, Kc) / math.sqrt(D), -1), Vc)
+    print(<span class="st">"sample"</span>, i, <span class="st">"max diff:"</span>, (paged_attention(q, s) - ref_out).abs().max().item())
+
+<span class="cm"># 3) prefix caching: chained hashes of full blocks (formula 134.7)</span>
+<span class="kw2">def</span> block_hashes(tokens, extra=<span class="st">""</span>):
+    h, out = extra, []
+    <span class="kw2">for</span> j <span class="kw2">in</span> range(len(tokens) // BLOCK):        <span class="cm"># only full blocks get a hash</span>
+        h = hashlib.sha256((h + str(tokens[j*BLOCK:(j+1)*BLOCK])).encode()).hexdigest()[:8]
+        out.append(h)
+    <span class="kw2">return</span> out
+a = list(range(100, 118))                        <span class="cm"># 18 tokens</span>
+b = a[:9] + [999] + a[10:]                       <span class="cm"># one token changed at position 9</span>
+ha, hb = block_hashes(a), block_hashes(b)
+print(ha); print(hb)
+hit = 0
+<span class="kw2">while</span> hit &lt; min(len(ha), len(hb)) <span class="kw2">and</span> ha[hit] == hb[hit]: hit += 1
+print(<span class="st">"reusable blocks:"</span>, hit, <span class="st">"-> reuse"</span>, hit * BLOCK, <span class="st">"tokens, recompute"</span>, len(b) - hit * BLOCK)</pre>
+<p>Output (PyTorch 2.x, CPU):</p>
+<pre class="code">after fork  : [[0, 1, 2], [0, 1, 2], [0, 1, 2]] refs [3, 3, 3]
+after 3 more: [[0, 1, 3, 5], [0, 1, 4, 6], [0, 1, 2, 7]]
+blocks in use: 8 without sharing: 12
+sample 0 max diff: 0.0
+sample 1 max diff: 0.0
+sample 2 max diff: 0.0
+['947bbe4f', 'a4bb0caf', '2915ba54', 'b9328771']
+['947bbe4f', 'a4bb0caf', 'bcc4e3b1', '36b6f47b']
+reusable blocks: 2 -> reuse 8 tokens, recompute 10</pre>
+<p>Read the output. Sample 0 writes first into shared block 2 and gets a copy (block 3); sample 1 gets block 4; sample 2 is the last user and writes into block 2 in place. Blocks 0 and 1 stay shared. In part 3, blocks 2 and 3 of <code>b</code> have new hashes, although block 3 has exactly the same tokens as in <code>a</code>: the chain carries the change forward. A real engine does the gather inside the attention kernel instead of building <code>K</code> and <code>V</code> in memory.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What is shared or reused</th><th>Mechanism</th></tr></thead><tbody>
+<tr><td>Any LLM server under load</td><td>nothing shared; just no waste</td><td>Paged blocks; the default in vLLM, SGLang, TensorRT-LLM and others [Likely]</td></tr>
+<tr><td>Chat products with a fixed system prompt</td><td>the system prompt across all users</td><td>Prefix caching (hash chain) or RadixAttention</td></tr>
+<tr><td>Multi-turn chat and agents</td><td>earlier turns, tool descriptions, the whole history</td><td>Prefix caching; RadixAttention also keeps generated answers in the tree</td></tr>
+<tr><td>Best-of-n, self-consistency, RL rollouts (GRPO needs many answers per prompt)</td><td>the prompt across \(n\) samples</td><td>Fork with reference counts and copy-on-write</td></tr>
+<tr><td>Beam search, tree search, speculative decoding trees</td><td>prompt plus common generated prefixes</td><td>Shared blocks; tree attention masks (SpecInfer)</td></tr>
+<tr><td>RAG and long-document question answering</td><td>a popular document placed first in the prompt, asked about many times</td><td>Prefix caching, if the document comes before the question and its text is byte-identical [Likely]</td></tr>
+<tr><td>Video question answering and Video-RAG</td><td>the visual tokens of one video (often thousands of tokens) across many questions about it</td><td>Prefix caching keyed by the video’s hash as an extra key \(e\) in (134.7) (<a href="../video/index.html#row-video-question-answering-and-video-rag" title="Video question answering and Video-RAG (planned)">session 210</a>)</td></tr>
+<tr><td>Batch jobs: classify or tag thousands of clips or documents with one long instruction</td><td>the instruction and few-shot examples</td><td>RadixAttention with longest-prefix-first ordering</td></tr>
+<tr><td>Hosted LLM APIs</td><td>long prompt prefixes sent repeatedly by one customer</td><td>Prompt caching, often billed at a lower price for cached input tokens [Likely]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Putting the changing part first.</b> A timestamp, a user name or a request id at the top of the system prompt changes block 0, so the hash chain misses everything after it. Put fixed content first, variable content last.</li>
+<li><b>Assuming “same text” means “same tokens”.</b> A different chat template, an extra space, or a different tokenizer version gives different token ids, and nothing is shared. Prefix caching works on token ids, not on strings.</li>
+<li><b>Expecting a prefix of 15 tokens to be cached with \(\beta = 16\).</b> Hash-based prefix caching shares only full blocks (formula 134.8). Short prefixes give nothing.</li>
+<li><b>Forgetting that the cache depends on more than tokens.</b> A different LoRA adapter, different images, or a different model version produce different K and V for the same tokens. They must be part of the key (the \(e\) in formula 134.7).</li>
+<li><b>Sharing across tenants without thinking about privacy.</b> A cache hit makes the first token come back faster, and that timing can reveal that someone else sent the same prefix. Use a per-tenant salt where this matters.</li>
+<li><b>Writing into a shared block.</b> Any custom kernel or cache update must respect reference counts; writing in place into a block with count above 1 silently corrupts another sequence.</li>
+<li><b>Counting cache memory by tokens of one layer.</b> One block covers \(\beta\) tokens in every layer, so its size is \(\beta \cdot s\), with \(s\) the bytes per token for the whole model (128 KiB for Llama 3 8B, so 2 MiB per 16-token block).</li>
+<li><b>Ignoring starvation with longest-prefix-first.</b> Requests with no shared prefix can wait forever behind a stream of cache hits. Real schedulers mix in a fairness rule.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What problem does PagedAttention solve, and how?<span class="lvl">basic</span></summary><div class="ans">Contiguous per-request KV allocation must reserve the maximum length up front, which wastes memory three ways: reserved slots for future tokens, internal fragmentation (answers end early), and external fragmentation (holes between reservations). The vLLM paper measured only 20.4–38.2% useful memory in earlier systems. PagedAttention cuts the cache into fixed-size blocks (16 tokens by default), allocates them on demand, and keeps a block table per sequence that maps logical blocks to physical blocks anywhere in memory. Waste falls to less than one block per sequence, so many more requests fit in a batch, which gave 2–4× higher throughput.</div></details>
+<details class="qa"><summary>What is in a block table, and how does the kernel find token \(t\)?<span class="lvl">basic</span></summary><div class="ans">One entry per logical block: the physical block number (and, in the paper, the number of filled slots). For token \(t\): logical block \(j = \lfloor t/\beta \rfloor\), offset \(o = t \bmod \beta\), physical slot \(\text{BT}[j]\cdot\beta + o\). The kernel receives the block table and the sequence length, loads each block’s keys and values through this mapping, and masks the unused slots of the last block.</div></details>
+<details class="qa"><summary>How does copy-on-write work for parallel sampling?<span class="lvl">core</span></summary><div class="ans">The prompt is prefilled once; FORK creates \(n\) block tables that point to the same blocks and raises each block’s reference count to \(n\). Full blocks are never written again, so they stay shared. When a sample wants to write into a block whose count is above 1 (the partly filled last prompt block), the engine copies the block, points that sample’s table at the copy, and decrements the original’s count. The last sample finds count 1 and writes in place. Only the full prompt blocks, \(\lfloor P/\beta \rfloor\), are stored once, formula (134.6).</div></details>
+<details class="qa"><summary>Why is the block size a trade-off? What would you pick?<span class="lvl">core</span></summary><div class="ans">Small blocks: less waste in the last block, finer sharing (more of a prefix is in full blocks), but more table entries and smaller, less efficient memory reads in the kernel. Large blocks: efficient reads, short tables, but more waste and coarser prefix sharing. The vLLM paper found 16 to 128 best on ShareGPT traces and saw large blocks hurt on short Alpaca sequences; 16 is the common default. SGLang uses one-token pages in its radix tree, so matching is exact.</div></details>
+<details class="qa"><summary>How does vLLM detect that a new prompt shares a prefix with cached data?<span class="lvl">core</span></summary><div class="ans">Every full block gets a hash of (parent block hash, the block’s token ids, extra keys such as the LoRA id and image hashes). Because the parent hash is included, a block hash identifies the entire prefix up to that block. A dictionary maps hashes to physical blocks. For a new prompt the scheduler computes the hash chain and looks up blocks in order until the first miss; all hits are reused by raising their reference counts. Only full blocks are cached, so the reusable length is \(\beta\lfloor \ell/\beta\rfloor\).</div></details>
+<details class="qa"><summary>Why does the hash of block \(j\) include the hash of block \(j-1\)? Isn’t hashing the block’s own tokens enough?<span class="lvl">core</span></summary><div class="ans">No. The keys and values of a token depend on all earlier tokens (through attention in every layer below the top). Two blocks with identical tokens but different histories have different K and V. Including the parent hash makes the key represent the full prefix, so a hit guarantees that the cached KV is exactly what the model would compute. One changed token therefore invalidates every block after it.</div></details>
+<details class="qa"><summary>What happens when a GPU runs out of free blocks in the middle of decoding?<span class="lvl">core</span></summary><div class="ans">The engine preempts one or more running sequences, all-or-nothing, since a sequence needs all of its tokens to continue. It either swaps their blocks to CPU memory (costs PCIe transfers) or drops them and recomputes later by prefilling prompt plus generated tokens (costs compute, often cheaper for short sequences). vLLM schedules first-come-first-served and preempts the most recent requests first. Before that, it evicts cached blocks with reference count 0 from the free queue.</div></details>
+<details class="qa"><summary>Prefix caching with block hashes vs RadixAttention: what is the difference?<span class="lvl">advanced</span></summary><div class="ans">Both answer “what is the longest cached prefix of this prompt?” and both evict least-recently-used unused data. vLLM uses a flat hash table over full blocks plus an LRU free queue; it matches at block granularity and only along one chain. SGLang keeps one radix tree over all running and finished sequences with one-token pages: it matches to the exact token, splits nodes where sequences diverge, stores generated answers in the tree (multi-turn reuse), counts references per node, evicts LRU leaves, and lets the scheduler use the tree to run requests with long matches first. The tree also helps the frontend place forks of a program correctly.</div></details>
+<details class="qa"><summary>Why does longest-prefix-first scheduling raise the hit rate? What is the danger?<span class="lvl">advanced</span></summary><div class="ans">With a limited cache, a shared prefix may be evicted between two requests that need it. Running requests with the longest matches first groups requests on the same branch, which is a depth-first walk of the radix tree; for an offline batch and a cache at least as large as the longest request, the SGLang paper proves that depth-first order maximizes the hit rate. In Figure 5 at capacity 24 it raises the hit rate from 53.5% to 68.3%. The danger is starvation and unfairness: requests with no match can wait indefinitely, so production schedulers add priorities, aging or limits.</div></details>
+<details class="qa"><summary>Size it: Llama 3 8B, 60 GiB free for the cache, average 600 tokens per request, \(\beta = 16\). How many requests fit, paged vs contiguous with 8k reservations?<span class="lvl">core</span></summary><div class="ans">Per token: \(2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) bytes. Tokens: \(60 \cdot 2^{30} / 131{,}072 = 491{,}520\). Contiguous with 8,192-token reservations: 60 requests. Paged: 38 blocks = 608 slots per request, 808 requests (13.5×). In practice compute limits and growth headroom reduce the gain, but memory is no longer the first limit.</div></details>
+<details class="qa"><summary>Your prefix-cache hit rate is near zero although all requests use the same system prompt. What do you check?<span class="lvl">advanced</span></summary><div class="ans">(1) Is something variable placed before or inside the system prompt (date, user id, request id, shuffled tool list)? It changes an early block and breaks the chain. (2) Are the token ids really identical (same chat template, same whitespace, same tokenizer version)? (3) Is the shared part at least one full block? (4) Different LoRA adapters, cache salts or images change the extra keys. (5) Is prefix caching enabled, and is the cache large enough, or are blocks evicted between requests by memory pressure? (6) With many replicas, does the router send requests with the same prefix to the same replica? Each GPU has its own cache, so prefix-aware routing matters.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Four requests hold 37, 100, 260 and 513 tokens. With \(\beta = 16\), how many blocks does each use, and what is \(\eta_{\text{paged}}\)? With contiguous reservations of 1,024 tokens each, what is \(\eta_{\text{contig}}\)?</li>
+<li>With \(\beta = 16\) and a block table <code>[12, 3, 40, 7]</code>, where is token 50 stored (physical slot)?</li>
+<li>Parallel sampling with \(P = 4{,}000\), \(G = 100\), \(n = 8\), \(\beta = 16\). Blocks with and without sharing? Saving in percent?</li>
+<li>A system prompt has 1,500 tokens, and the user message 80. How many tokens are prefilled with prefix caching at \(\beta = 16\)? At \(\beta = 128\)?</li>
+<li>In Figure 5, set capacity 30. Read the final hit rate for both schedules. Why is first-come-first-served lower?</li>
+<li>Llama 3 70B has 80 layers, 8 KV heads and head dimension 128. What is the size of one 16-token block in BF16?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Blocks: 3, 7, 17, 33 = 60 blocks = 960 slots for 910 tokens, so \(\eta_{\text{paged}} = 94.8\%\). Contiguous: \(910 / 4{,}096 = 22.2\%\). 2. \(j = \lfloor 50/16 \rfloor = 3\), \(o = 2\), so physical block 7, slot \(7 \times 16 + 2 = 114\). 3. Without: \(8 \times \lceil 4100/16 \rceil = 8 \times 257 = 2{,}056\). With: \(\lfloor 4000/16 \rfloor = 250\) shared, plus \(8 \times (257 - 250) = 56\), total 306. Saving \(1 - 306/2056 = 85.1\%\). 4. At 16: \(\lfloor 1500/16 \rfloor = 93\) blocks = 1,488 tokens reused, so \(12 + 80 = 92\) prefilled. At 128: \(11\) blocks = 1,408 reused, so \(92 + 80 = 172\) prefilled. 5. First-come-first-served 62/101 = 61.4%, longest-prefix-first 69/101 = 68.3%. In arrival order, clipA and clipB requests alternate and the system prompt subtree is shared, so the less recently used clip branch is evicted just before it is needed. 6. \(2 \times 80 \times 8 \times 128 \times 2 = 327{,}680\) bytes = 320 KiB per token, so 5 MiB per block.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Contiguous KV reservations waste memory three ways (reserved slots, internal and external fragmentation); earlier systems used only 20–38% of it for real tokens (134.1).</li>
+<li>PagedAttention cuts the cache into blocks of \(\beta\) tokens (16 by default) with a block table per sequence; waste is less than one block per sequence (134.2), and kernels translate addresses with (134.3) and attend block by block (134.4).</li>
+<li>Reference counts let many block tables share blocks; copy-on-write copies a shared block only when someone writes into it. Parallel sampling stores the full prompt blocks once (134.6); beam search saves even more.</li>
+<li>Prefix caching hashes each full block together with its parent hash (134.7), so a hit means the whole prefix matches; only full blocks are reused (134.8), and unused cached blocks live in an LRU free queue.</li>
+<li>RadixAttention keeps all cached sequences, including answers, in a radix tree with one-token pages, reference counters and LRU leaf eviction; longest-prefix-first scheduling raises the hit rate (134.9).</li>
+<li>Design prompts for caching: fixed content first, variable content last, identical tokens, same adapter.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ n_i = \left\lceil \tfrac{T_i}{\beta} \right\rceil, \quad \text{slot}(t) = \text{BT}\!\left[\lfloor t/\beta \rfloor\right]\beta + (t \bmod \beta), \quad h_j = H(h_{j-1}, x_{j\beta:(j+1)\beta}, e), \quad r = \beta \left\lfloor \tfrac{\ell}{\beta} \right\rfloor \]</div>
+<h2 class="plain" id="memory-management-pagedattention-prefix-caching-radixattention-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Zheng et al. (2023). <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">SGLang: Efficient Execution of Structured Language Model Programs</a></li><li>Miao et al. (2023). <a href="https://arxiv.org/abs/2305.09781" target="_blank" rel="noopener">SpecInfer: Accelerating Generative LLM Serving with Tree-based Speculative Inference and Verification</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Zheng et al. (2023). <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">SGLang: Efficient Execution of Structured Language Model Programs</a></li><li>Miao et al. (2023). <a href="https://arxiv.org/abs/2305.09781" target="_blank" rel="noopener">SpecInfer: Accelerating Generative LLM Serving with Tree-based Speculative Inference and Verification</a></li><li>vLLM project (docs). <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM documentation</a></li><li>Ye et al. (2025). <a href="https://arxiv.org/abs/2501.01005" target="_blank" rel="noopener">FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>vLLM project (docs). <a href="https://docs.vllm.ai/en/latest/design/prefix_caching.html" target="_blank" rel="noopener">vLLM design document: Automatic Prefix Caching</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/the-serving-stack-and-the-life-of.html"><small>Previous · session 133</small>The serving stack and the life of a request</a><a class="next" href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html"><small>Next · session 135</small>Batching: continuous batching, chunked prefill, split-fuse</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="memory-management-pagedattention-prefix-caching-radixattention"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const esc=s=>String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+const pct=v=>(100*v).toFixed(1)+"%";
+const segVal=seg=>{const b=seg.querySelector('button[aria-pressed="true"]');return b?b.dataset.v:null;};
+function segInit(seg,cb){seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const T=(x,y,s,o)=>`<text x="${x}" y="${y}" ${o||""}>${s}</text>`;
+
+/* ---------- Figure 1: contiguous vs paged fragmentation ---------- */
+(function(){
+ const svg=$("#mm-frag-svg");if(!svg)return;const info=$("#mm-frag-info");
+ const BS=16,NC=64;
+ // name: reservation (cells) for contiguous, prompt length
+ const REQ={A:{res:20},B:{res:12},C:{res:16},D:{res:12},E:{res:20},F:{res:20},G:{res:20}};
+ const S=[
+  {len:{A:40,B:30,C:20,D:50},arr:["A","B","C","D"],t:"Requests A, B, C and D arrive with prompts of 40, 30, 20 and 50 tokens. Contiguous: each reserves prompt + <code>max_tokens</code> (20, 12, 16 and 12 cells). Paged: each gets only the blocks its prompt needs."},
+  {len:{A:90,B:150,C:60,D:120},arr:[],t:"Decoding. A, B, C and D grow to 90, 150, 60 and 120 tokens. Contiguous: the tokens fill the front of each reservation. Paged: a new block is taken from the free list each time a sequence fills its last block."},
+  {len:{A:90,C:60},arr:[],t:"B and D finish (they stopped long before <code>max_tokens</code>). Their memory is freed. Contiguous: this leaves two holes, of 12 and 16 cells."},
+  {len:{A:90,C:60,E:100},arr:["E"],t:"E arrives with a 100-token prompt and needs a 20-cell reservation. Contiguous: 28 cells are free, but the largest hole is only 16, so <b>E must wait</b> (external fragmentation). Paged: E takes 7 free blocks wherever they are."},
+  {len:{A:90,C:60,E:100,F:200,G:150},arr:["F","G"],t:"F (200 tokens) and G (150 tokens) arrive. Contiguous: none of E, F, G can start. Paged: all three run."}];
+ function layout(k){
+  // contiguous: replay first fit from step 0
+  const cont={},wait=[];let cells=new Array(NC).fill(null);
+  for(let s=0;s<=k;s++){const st=S[s];
+   Object.keys(cont).forEach(n=>{if(!(n in st.len)){for(let c=cont[n].a;c<cont[n].a+REQ[n].res;c++)cells[c]=null;delete cont[n];}});
+   const q=wait.splice(0).concat(st.arr);
+   q.forEach(n=>{const need=REQ[n].res;let run=0,at=-1;for(let c=0;c<NC;c++){run=cells[c]===null?run+1:0;if(run===need){at=c-need+1;break;}}
+    if(at<0){wait.push(n);return;}for(let c=at;c<at+need;c++)cells[c]=n;cont[n]={a:at};});}
+  // paged: replay block allocation (free list = lowest ids first, returned blocks go to the end)
+  let free=Array.from({length:NC},(_,i)=>i);const pg={};
+  for(let s=0;s<=k;s++){const st=S[s];
+   Object.keys(pg).forEach(n=>{if(!(n in st.len)){free=free.concat(pg[n]);delete pg[n];}});
+   Object.keys(st.len).forEach(n=>{if(!pg[n])pg[n]=[];const need=Math.ceil(st.len[n]/BS);while(pg[n].length<need)pg[n].push(free.shift());});}
+  return {cont,wait,pg,len:S[k].len};}
+ const CW=11.4,X0=12;
+ function row(y,fillFn,lab){let g=T(X0,y-8,lab,'font-size="13" font-weight="700" fill="var(--ink)"');
+  for(let c=0;c<NC;c++){const x=X0+c*CW;const f=fillFn(c);
+   g+=`<rect x="${x.toFixed(1)}" y="${y}" width="${(CW-1.2).toFixed(1)}" height="44" rx="2" fill="${f.bg}" stroke="var(--rule)" stroke-width=".8"/>`;
+   if(f.used>0)g+=`<rect x="${x.toFixed(1)}" y="${(y+44-44*f.used).toFixed(1)}" width="${(CW-1.2).toFixed(1)}" height="${(44*f.used).toFixed(1)}" rx="2" fill="var(--q)"/>`;}
+  return g;}
+ function draw(k){const L=layout(k);let g="";
+  // contiguous
+  const owner=new Array(NC).fill(null);Object.keys(L.cont).forEach(n=>{for(let c=L.cont[n].a;c<L.cont[n].a+REQ[n].res;c++)owner[c]=n;});
+  g+=row(34,c=>{const n=owner[c];if(!n)return{bg:"var(--card)",used:0};const off=(c-L.cont[n].a)*BS;const u=Math.max(0,Math.min(BS,L.len[n]-off))/BS;return{bg:"var(--q-soft)",used:u};},"Contiguous reservations");
+  Object.keys(L.cont).forEach(n=>{const a=L.cont[n].a,w=REQ[n].res;const x=X0+a*CW;g+=`<path d="M${x.toFixed(1)} 84 h${(w*CW-1.2).toFixed(1)}" stroke="var(--ink)" stroke-width="1.6"/>`+T((x+w*CW/2).toFixed(1),100,n,'text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)"');});
+  // holes
+  let holes=[],run=0;for(let c=0;c<=NC;c++){if(c<NC&&!owner[c])run++;else{if(run)holes.push(run);run=0;}}
+  // paged
+  const pown=new Array(NC).fill(null),pidx=new Array(NC).fill(0);Object.keys(L.pg).forEach(n=>L.pg[n].forEach((b,i)=>{pown[b]=n;pidx[b]=i;}));
+  g+=row(158,c=>{const n=pown[c];if(!n)return{bg:"var(--card)",used:0};const u=Math.max(0,Math.min(BS,L.len[n]-pidx[c]*BS))/BS;return{bg:"var(--q-soft)",used:u};},"Paged blocks (16 tokens each)");
+  for(let c=0;c<NC;c++)if(pown[c]&&(c===0||pown[c-1]!==pown[c]))g+=T((X0+c*CW+CW/2-0.6).toFixed(1),222,pown[c],'text-anchor="middle" font-size="12" font-weight="700" fill="var(--ink)"');
+  // stats
+  const cRun=Object.keys(L.cont),pRun=Object.keys(L.pg);
+  const cUsed=cRun.reduce((a,n)=>a+L.len[n],0),cAlloc=cRun.reduce((a,n)=>a+REQ[n].res*BS,0);
+  const pUsed=pRun.reduce((a,n)=>a+L.len[n],0),pAlloc=pRun.reduce((a,n)=>a+L.pg[n].length*BS,0);
+  g+=T(X0,262,`Contiguous: ${cRun.length} running${L.wait.length?", waiting: "+L.wait.join(", "):""}, utilization ${pct(cUsed/cAlloc)}`,'font-size="13" fill="var(--ink2)"');
+  g+=T(X0,284,`Paged: ${pRun.length} running, utilization ${pct(pUsed/pAlloc)}`,'font-size="13" fill="var(--ink2)"');
+  svg.innerHTML=g;
+  const free=NC-owner.filter(x=>x).length;
+  info.innerHTML=`${S[k].t}<br><b>Contiguous:</b> ${cRun.length} running (${cRun.join(", ")}), ${cUsed} tokens stored in ${cAlloc} reserved slots, utilization <b>${pct(cUsed/cAlloc)}</b>; free cells ${free}, largest hole ${holes.length?Math.max(...holes):0}${L.wait.length?`; waiting: <b>${L.wait.join(", ")}</b>`:""}.<br><b>Paged:</b> ${pRun.length} running (${pRun.join(", ")}), ${pUsed} tokens in ${pAlloc/BS} blocks (${pAlloc} slots), utilization <b>${pct(pUsed/pAlloc)}</b>; free blocks ${NC-pAlloc/BS}.`;}
+ B.stepper({n:S.length,prev:$("#mm-frag-prev"),next:$("#mm-frag-next"),play:$("#mm-frag-play"),label:$("#mm-frag-lab"),ms:3200,onStep:draw});
+})();
+
+/* ---------- Figure 2: block table address translation ---------- */
+(function(){
+ const svg=$("#mm-bt-svg");if(!svg)return;const info=$("#mm-bt-info"),Ts=$("#mm-bt-T"),ts=$("#mm-bt-t"),seg=$("#mm-bt-b");const POOL=128;
+ function perm(n,seed){const r=rng(seed),a=Array.from({length:n},(_,i)=>i);for(let i=n-1;i>0;i--){const j=Math.floor(r()*(i+1));[a[i],a[j]]=[a[j],a[i]];}return a;}
+ function draw(){const b=+segVal(seg),Tn=+Ts.value;ts.max=Tn-1;if(+ts.value>Tn-1)ts.value=Tn-1;const t=+ts.value;
+  $("#mm-bt-Tv").value=Tn;$("#mm-bt-tv").value=t;
+  const nb=POOL/b,P=perm(nb,11+b),n=Math.ceil(Tn/b),table=P.slice(0,n),others=new Set(P.slice(n,n+Math.floor((nb-n)*0.45)));
+  const j=Math.floor(t/b),o=t%b,phys=table[j],slot=phys*b+o;
+  const CW=11.4,X0=21;let g="";
+  g+=T(X0,18,`Logical view of the sequence (${Tn} tokens, ${n} blocks)`,'font-size="13" font-weight="700" fill="var(--ink)"');
+  for(let i=0;i<64;i++){const x=X0+i*CW,inb=i<Tn,blk=Math.floor(i/b);const fill=!inb?(blk<n?"var(--card)":"none"):(blk===j?"var(--k-soft)":"var(--q-soft)");
+   if(fill!=="none")g+=`<rect x="${x.toFixed(1)}" y="28" width="${(CW-1.2).toFixed(1)}" height="22" rx="2" fill="${fill}" stroke="${i===t?"var(--k)":"var(--rule)"}" stroke-width="${i===t?2.2:.8}"/>`;}
+  for(let k=0;k<n;k++){const x=X0+k*b*CW;g+=`<path d="M${x.toFixed(1)} 54 v6 h${(b*CW-1.2).toFixed(1)} v-6" fill="none" stroke="var(--muted)"/>`+T((x+b*CW/2).toFixed(1),74,"L"+k,'text-anchor="middle" font-size="11.5" fill="var(--muted)"');}
+  // block table
+  g+=T(X0,104,"Block table",'font-size="13" font-weight="700" fill="var(--ink)"');
+  const ew=Math.min(44,700/Math.max(n,1));
+  table.forEach((pb,k)=>{const x=X0+100+k*ew;g+=`<rect x="${x.toFixed(1)}" y="88" width="${(ew-3).toFixed(1)}" height="24" rx="4" fill="${k===j?"var(--k-soft)":"var(--card)"}" stroke="${k===j?"var(--k)":"var(--rule)"}" stroke-width="${k===j?2:1}"/>`+T((x+ew/2-1.5).toFixed(1),105,pb,`text-anchor="middle" font-size="${ew<30?10:12}" class="mm-mono" fill="var(--ink)"`);});
+  // pool
+  g+=T(X0,150,`Physical pool: ${POOL} slots = ${nb} blocks of ${b}`,'font-size="13" font-weight="700" fill="var(--ink)"');
+  const own=new Map();table.forEach((pb,k)=>own.set(pb,k));
+  for(let s=0;s<POOL;s++){const r=Math.floor(s/64),c=s%64,x=X0+c*CW,y=162+r*58,pb=Math.floor(s/b);
+   let fill="var(--card)";if(own.has(pb)){const k=own.get(pb),pos=k*b+(s%b);fill=pos<Tn?(pb===phys?"var(--k-soft)":"var(--q-soft)"):"var(--card)";}else if(others.has(pb))fill="var(--rule)";
+   g+=`<rect x="${x.toFixed(1)}" y="${y}" width="${(CW-1.2).toFixed(1)}" height="22" rx="2" fill="${fill}" stroke="${s===slot?"var(--k)":"var(--rule)"}" stroke-width="${s===slot?2.2:.8}"/>`;
+   if(s%b===0){g+=`<path d="M${x.toFixed(1)} ${y+26} v5" stroke="var(--muted)"/>`;if(b>=8||pb%2===0)g+=T((x+1).toFixed(1),y+42,pb,'font-size="10.5" class="mm-mono" fill="var(--muted)"');}}
+  // arrows
+  const lx=X0+t*CW+CW/2-0.6,ex=X0+100+j*ew+ew/2-1.5,sr=Math.floor(slot/64),sx=X0+(slot%64)*CW+CW/2-0.6,sy=162+sr*58;
+  g+=`<defs><marker id="mm-bt-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--k)"/></marker></defs>`;
+  g+=`<path d="M${lx.toFixed(1)} 51 C ${lx.toFixed(1)} 80, ${ex.toFixed(1)} 66, ${ex.toFixed(1)} 86" fill="none" stroke="var(--k)" stroke-width="2" marker-end="url(#mm-bt-ah)"/>`;
+  g+=`<path d="M${ex.toFixed(1)} 113 C ${ex.toFixed(1)} 140, ${sx.toFixed(1)} ${sy-30}, ${sx.toFixed(1)} ${sy-2}" fill="none" stroke="var(--k)" stroke-width="2" marker-end="url(#mm-bt-ah)"/>`;
+  g+=T(X0,318,`token ${t}: j = ⌊${t}/${b}⌋ = ${j}, o = ${t} mod ${b} = ${o}, BT[${j}] = ${phys}, slot = ${phys}×${b} + ${o} = ${slot}`,'font-size="13" class="mm-mono" fill="var(--ink2)"');
+  svg.innerHTML=g;
+  const waste=n*b-Tn;
+  info.innerHTML=`Token <b>${t}</b>: logical block j = ${j}, offset o = ${o}. The block table says BT[${j}] = <b>${phys}</b>, so the token is in physical slot ${phys} × ${b} + ${o} = <b>${slot}</b> (formula 134.3). This sequence uses ${n} blocks = ${n*b} slots for ${Tn} tokens: waste <b>${waste}</b> slots, utilization <b>${pct(Tn/(n*b))}</b> (formula 134.2). Gray blocks belong to other requests.`;}
+ [Ts,ts].forEach(e=>e.addEventListener("input",draw));segInit(seg,draw);draw();
+})();
+
+/* ---------- Figure 3: copy-on-write for parallel sampling ---------- */
+(function(){
+ const svg=$("#mm-cow-svg");if(!svg)return;const info=$("#mm-cow-info");const BS=4;
+ // build the states by running the allocator, exactly like the PyTorch code
+ const states=[];
+ (function(){let free=[];for(let i=31;i>=0;i--)free.push(i);const ref=new Array(32).fill(0),fill=new Array(32).fill(0);
+  const seqs=[{t:[],n:0,live:true}];let copied=[];
+  const alloc=()=>{const b=free.pop();ref[b]=1;fill[b]=0;return b;};
+  const rel=b=>{ref[b]--;if(ref[b]===0){free.push(b);fill[b]=0;}};
+  const append=s=>{const j=Math.floor(s.n/BS),o=s.n%BS;let ev="";if(j===s.t.length){s.t.push(alloc());ev="new";}else if(ref[s.t[j]]>1){const old=s.t[j],nw=alloc();fill[nw]=fill[old];rel(old);s.t[j]=nw;ev="cow:"+old+":"+nw;}else ev=o>0?"inplace":"";const b=s.t[j];fill[b]=Math.max(fill[b],o+1);s.n++;return ev;};
+  const snap=(txt,hl)=>{states.push({seqs:seqs.map(s=>({t:s.t.slice(),n:s.n,live:s.live})),ref:ref.slice(),fill:fill.slice(),inuse:32-free.length,txt,hl:hl||{}});};
+  for(let i=0;i<10;i++)append(seqs[0]);
+  snap("Prefill the 10-token prompt once. Blocks P0 and P1 are full (4 tokens each); P2 holds 2 tokens. One block table, every count is 1.",{});
+  for(let k=0;k<2;k++){const c={t:seqs[0].t.slice(),n:seqs[0].n,live:true};c.t.forEach(b=>ref[b]++);seqs.push(c);}
+  snap("FORK into 3 samples. All three block tables point to P0, P1, P2. Nothing is copied; each count becomes 3.",{shared:true});
+  const e1=append(seqs[0]).split(":");snap(`Sample 1 writes its token 10 into P2. P2 is shared (count 3), so <b>copy-on-write</b>: copy P2 into a new block P${e1[2]}, point sample 1’s table at P${e1[2]}, write there. P2’s count drops to 2.`,{cow:+e1[2],s:0});
+  const e2=append(seqs[1]).split(":");snap(`Sample 2 writes its token 10. P2 still has count 2, so it is copied again, into P${e2[2]}. P2’s count drops to 1.`,{cow:+e2[2],s:1});
+  append(seqs[2]);snap(`Sample 3 writes its token 10. P2 now has count 1: sample 3 is its only user, so it writes <b>in place</b>. No copy.`,{inp:2,s:2});
+  seqs.forEach(s=>append(s));snap("All samples write token 11. Each third block is now private and full (4 of 4). No copies are needed.",{});
+  const nb=seqs.map(s=>append(s));snap(`All samples write token 12. Their last blocks are full, so each takes a fresh block from the free list (P${seqs[0].t[3]}, P${seqs[1].t[3]}, P${seqs[2].t[3]}).`,{news:seqs.map(s=>s.t[3])});
+  seqs[1].t.forEach(rel);seqs[1].live=false;snap("Sample 2 finishes (or is dropped, as in beam search). Its counts go down: its private blocks return to the free list; P0 and P1 drop to count 2 and stay.",{});
+ })();
+ function draw(k){const st=states[k];let g="";const live=st.seqs.length;
+  g+=T(16,20,"Block tables",'font-size="13" font-weight="700" fill="var(--ink)"')+T(372,20,"Physical blocks (tokens held · count)",'font-size="13" font-weight="700" fill="var(--ink)"');
+  st.seqs.forEach((s,i)=>{const y=40+i*70;const nm=st.seqs.length===1?"Prompt":"Sample "+(i+1);
+   g+=T(16,y+20,nm+(s.live?"":" (done)"),`font-size="13" fill="${s.live?"var(--ink)":"var(--muted)"}"`);
+   if(s.live)s.t.forEach((b,j)=>{const x=104+j*58;const hl=(st.hl.s===i&&j===2)||(st.hl.news&&j===3);g+=`<rect x="${x}" y="${y+2}" width="52" height="28" rx="5" fill="${hl?"var(--k-soft)":"var(--card)"}" stroke="${hl?"var(--k)":"var(--rule)"}" stroke-width="${hl?2:1}"/>`+T(x+26,y+21,"P"+b,'text-anchor="middle" font-size="13" class="mm-mono" fill="var(--ink)"');});});
+  const used=[];for(let b=0;b<32;b++)if(st.ref[b]>0)used.push(b);
+  used.forEach((b,i)=>{const c=i%4,r=Math.floor(i/4),x=372+c*100,y=34+r*62;const sh=st.ref[b]>1,hl=st.hl.cow===b||st.hl.inp===b||(st.hl.news&&st.hl.news.includes(b));
+   g+=`<rect x="${x}" y="${y}" width="92" height="50" rx="7" fill="${sh?"var(--v-soft)":hl?"var(--k-soft)":"var(--card)"}" stroke="${hl?"var(--k)":sh?"var(--v)":"var(--rule)"}" stroke-width="${hl||sh?2:1}"/>`;
+   for(let s=0;s<BS;s++)g+=`<rect x="${x+8+s*13}" y="${y+8}" width="11" height="14" rx="2" fill="${s<st.fill[b]?"var(--q)":"none"}" stroke="var(--rule)"/>`;
+   g+=T(x+66,y+20,"P"+b,'font-size="13" font-weight="700" class="mm-mono" fill="var(--ink)"')+T(x+8,y+40,`${st.fill[b]}/4 · ref ${st.ref[b]}`,'font-size="12" class="mm-mono" fill="var(--ink2)"');});
+  const nlive=st.seqs.filter(s=>s.live);const noshare=nlive.reduce((a,s)=>a+Math.ceil(s.n/BS),0);
+  g+=T(372,300,`in use: ${st.inuse} blocks · without sharing: ${noshare}`,'font-size="13" fill="var(--ink2)"');
+  g+=`<rect x="16" y="290" width="14" height="14" rx="3" fill="var(--v-soft)" stroke="var(--v)"/>`+T(36,302,"shared (count > 1)",'font-size="12" fill="var(--muted)"');
+  g+=`<rect x="160" y="290" width="14" height="14" rx="3" fill="var(--k-soft)" stroke="var(--k)"/>`+T(180,302,"changed in this step",'font-size="12" fill="var(--muted)"');
+  svg.innerHTML=g;
+  info.innerHTML=`${st.txt}<br>Physical blocks in use: <b>${st.inuse}</b>. Without sharing, the live sequences would need <b>${noshare}</b>.`;}
+ B.stepper({n:states.length,prev:$("#mm-cow-prev"),next:$("#mm-cow-next"),play:$("#mm-cow-play"),label:$("#mm-cow-lab"),ms:3000,onStep:draw});
+})();
+
+/* ---------- Figure 4: chained block hashes ---------- */
+(function(){
+ const svg=$("#mm-hash-svg");if(!svg)return;const info=$("#mm-hash-info"),ls=$("#mm-hash-l"),seg=$("#mm-hash-b");
+ const r=rng(2024);const A=Array.from({length:48},()=>100+Math.floor(r()*900));const extra=[11,12,13,14];
+ function fnv(str){let h=0x811c9dc5;for(let i=0;i<str.length;i++){h^=str.charCodeAt(i);h=Math.imul(h,0x01000193)>>>0;}return h>>>0;}
+ function hashes(tok,b){const out=[];let h="salt";for(let j=0;j+b<=tok.length;j+=b){h=fnv(h+"|"+tok.slice(j,j+b).join(",")).toString(16).padStart(8,"0");out.push(h);}return out;}
+ function draw(){const b=+segVal(seg),l=+ls.value;$("#mm-hash-lv").value=l;
+  const Bt=A.slice();if(l<48)Bt[l]=A[l]===999?998:999;const Bfull=Bt.concat(extra);
+  const ha=hashes(A,b),hb=hashes(Bfull,b),set=new Set(ha);let hit=0;while(hit<hb.length&&set.has(hb[hit]))hit++;
+  const CW=14.4,X0=16;let g="";
+  const rowF=(y,tok,hs,lab,isB)=>{let s=T(X0,y-8,lab,'font-size="13" font-weight="700" fill="var(--ink)"');
+   tok.forEach((v,i)=>{const blk=Math.floor(i/b),full=blk<hs.length;const diff=isB&&i===l&&l<48,isNew=isB&&i>=48;
+    const fill=!isB?"var(--card)":(full&&blk<hit?"var(--ok-soft)":"var(--card)");
+    s+=`<rect x="${(X0+i*CW).toFixed(1)}" y="${y}" width="${(CW-1.4).toFixed(1)}" height="20" rx="2" fill="${diff?"var(--bad-soft)":isNew?"var(--q-soft)":fill}" stroke="${diff?"var(--bad)":"var(--rule)"}" stroke-width="${diff?2:.8}"/>`;});
+   hs.forEach((h,j)=>{const x=X0+j*b*CW,w=b*CW-1.4;const ok=isB&&j<hit;
+    s+=`<rect x="${x.toFixed(1)}" y="${y+24}" width="${w.toFixed(1)}" height="22" rx="4" fill="${isB?(ok?"var(--ok-soft)":"var(--bad-soft)"):"var(--paper2)"}" stroke="${isB?(ok?"var(--ok)":"var(--bad)"):"var(--rule)"}"/>`;
+    if(w>=30)s+=T((x+w/2).toFixed(1),y+39,h.slice(0,4),'text-anchor="middle" font-size="11.5" class="mm-mono" fill="var(--ink)"');});
+   return s;};
+  g+=rowF(30,A,ha,"Prompt A (cached): 48 tokens",false);
+  g+=rowF(130,Bfull,hb,`Prompt B: 52 tokens, ${l<48?"token "+l+" changed":"no token changed"}, 4 new at the end`,true);
+  g+=T(X0,226,`B: ${hit} of ${hb.length} full blocks hit → reuse ${hit*b} tokens, prefill ${52-hit*b}`,'font-size="13" fill="var(--ink2)"');
+  svg.innerHTML=g;
+  const sameTok=[];for(let j=hit;j<hb.length;j++){const s=j*b;if(s<48&&s+b<=48&&!(l>=s&&l<s+b))sameTok.push(j);}
+  info.innerHTML=`β = ${b}, ${l<48?"first different token at position "+l:"no token changed (all 48 shared)"}. Prompt B has ${hb.length} full blocks; the first <b>${hit}</b> have the same chained hash as A, so <b>${hit*b}</b> tokens are reused (formula 134.8 gives β⌊ℓ/β⌋ = ${b*Math.floor(Math.min(l,48)/b)}) and <b>${52-hit*b}</b> tokens are prefilled.${sameTok.length?` Blocks ${sameTok.join(", ")} of B hold exactly the same tokens as in A, yet miss: their parent hash changed.`:""}`;}
+ ls.addEventListener("input",draw);segInit(seg,draw);draw();
+})();
+
+/* ---------- Figure 5: RadixAttention ---------- */
+(function(){
+ const svg=$("#mm-rx-svg");if(!svg)return;const info=$("#mm-rx-info"),cs=$("#mm-rx-c"),seg=$("#mm-rx-sch");
+ const SYS=["SYS","You","are","a","video","helper"],CA=["clipA","f1","f2","f3"],CB=["clipB","f1","f2","f3"];
+ const RQ=[[SYS.concat(CA,["Who","scores","?"]),["Player","7"]],[SYS.concat(CB,["Count","cars"]),["Three"]],[SYS.concat(CA,["When","goal","?"]),["At","0:42"]],
+  [SYS.concat(["Hello"]),["Hi","!"]],[SYS.concat(CB,["Any","people","?"]),["No"]],null,[SYS.concat(CA,["Ball","color","?"]),["White"]],[SYS.concat(CB,["Count","cars","now"]),["Four"]]];
+ RQ[5]=[RQ[0][0].concat(RQ[0][1],["Why","?"]),["Fast","run"]];
+ let uid=0;const node=(t,p)=>({t,p,c:new Map(),last:0,lock:0,id:uid++});
+ function match(root,seq){let n=root,i=0;const path=[];
+  while(i<seq.length&&n.c.has(seq[i])){let ch=n.c.get(seq[i]),k=0;while(k<ch.t.length&&i+k<seq.length&&ch.t[k]===seq[i+k])k++;
+   if(k<ch.t.length){const mid=node(ch.t.slice(0,k),n);n.c.set(seq[i],mid);ch.t=ch.t.slice(k);ch.p=mid;mid.c.set(ch.t[0],ch);mid.last=ch.last;ch=mid;}
+   path.push(ch);i+=k;n=ch;if(k<n.t.length)break;}
+  return [i,n,path];}
+ function size(root){let s=0;const st=[root];while(st.length){const x=st.pop();s+=x.t.length;x.c.forEach(v=>st.push(v));}return s;}
+ function leaves(root){const out=[],st=[root];while(st.length){const x=st.pop();if(x!==root&&x.c.size===0)out.push(x);x.c.forEach(v=>st.push(v));}return out;}
+ function peek(root,seq){let n=root,i=0;while(i<seq.length&&n.c.has(seq[i])){const ch=n.c.get(seq[i]);let k=0;while(k<ch.t.length&&i+k<seq.length&&ch.t[k]===seq[i+k])k++;i+=k;if(k<ch.t.length)break;n=ch;}return i;}
+ function run(C,mode,upto){uid=0;const root=node([],null);const done=new Set();let hits=0,tot=0,last=null;
+  for(let step=1;step<=upto;step++){const av=[];for(let j=0;j<RQ.length;j++)if(!done.has(j)&&(j!==5||done.has(0)))av.push(j);
+   let j;if(mode==="fcfs")j=Math.min(...av);else{let best=-1;av.forEach(a=>{const m=peek(root,RQ[a][0]);if(m>best){best=m;j=a;}});}
+   const [p,o]=RQ[j];const [m,,path]=match(root,p);path.forEach(x=>x.lock++);const need=p.length+o.length-m;let ev=0;const evl=[];
+   while(size(root)+need>C){const cand=leaves(root).filter(x=>x.lock===0);if(!cand.length)break;let v=cand[0];cand.forEach(x=>{if(x.last<v.last)v=x;});v.p.c.delete(v.t[0]);ev+=v.t.length;evl.push(v.t[0]+(v.t.length>1?"…":""));}
+   const full=p.concat(o);const [m2,n2,path2]=match(root,full);let nn=null;if(m2<full.length){nn=node(full.slice(m2),n2);n2.c.set(full[m2],nn);path2.push(nn);}
+   path2.forEach(x=>x.last=step);path.forEach(x=>x.lock--);done.add(j);hits+=m;tot+=p.length;
+   last={j,m,P:p.length,ev,evl,matched:new Set(path.map(x=>x.id)),neu:nn?nn.id:-1,o};}
+  return {root,hits,tot,last,size:size(root)};}
+ function lab(t){let s=t.join(" ");if(s.length>13)s=s.slice(0,12)+"…";return s;}
+ function draw(k){const C=+cs.value,mode=segVal(seg);$("#mm-rx-cv").value=C;const r=run(C,mode,k);let g="";
+  // layout: leaves in DFS order
+  const pos=new Map();let leafX=0;const depthMax={v:0};
+  (function lay(n,d){depthMax.v=Math.max(depthMax.v,d);if(n.c.size===0){pos.set(n.id,{x:leafX++,d});return;}const xs=[];n.c.forEach(ch=>{lay(ch,d+1);xs.push(pos.get(ch.id).x);});pos.set(n.id,{x:(xs[0]+xs[xs.length-1])/2,d});})(r.root,0);
+  const nL=Math.max(1,leafX),W=780,colW=Math.min(112,(W-20)/nL),off=(W-colW*nL)/2;const X=x=>off+colW*(x+0.5),Y=d=>26+d*62;const Hh=Math.max(270,Y(depthMax.v)+60);svg.setAttribute("viewBox",`0 0 780 ${Hh}`);
+  const edges=[],boxes=[];
+  (function walk(n){const pn=pos.get(n.id);n.c.forEach(ch=>{const pc=pos.get(ch.id);edges.push(`<path d="M${X(pn.x).toFixed(1)} ${Y(pn.d)+(n===r.root?8:20)} C ${X(pn.x).toFixed(1)} ${Y(pc.d)-30}, ${X(pc.x).toFixed(1)} ${Y(pn.d)+40}, ${X(pc.x).toFixed(1)} ${Y(pc.d)-20}" fill="none" stroke="var(--muted)" stroke-width="1.4"/>`);walk(ch);});
+   if(n===r.root){boxes.push(`<circle cx="${X(pn.x).toFixed(1)}" cy="${Y(0)}" r="7" fill="var(--ink)"/>`+T((X(pn.x)+12).toFixed(1),Y(0)+4,"root",'font-size="12" fill="var(--muted)"'));return;}
+   const isM=r.last&&r.last.matched.has(n.id),isN=r.last&&r.last.neu===n.id;const w=Math.min(104,colW-6);
+   boxes.push(`<rect x="${(X(pn.x)-w/2).toFixed(1)}" y="${Y(pn.d)-20}" width="${w.toFixed(1)}" height="40" rx="7" fill="${isM?"var(--k-soft)":isN?"var(--q-soft)":"var(--card)"}" stroke="${isM?"var(--k)":isN?"var(--q)":"var(--rule)"}" stroke-width="${isM||isN?2:1.2}"/>`+
+    T(X(pn.x).toFixed(1),Y(pn.d)-3,esc(lab(n.t)),'text-anchor="middle" font-size="11" class="mm-mono" fill="var(--ink)"')+T(X(pn.x).toFixed(1),Y(pn.d)+13,n.t.length+" tok",'text-anchor="middle" font-size="10.5" fill="var(--muted)"'));})(r.root);
+  g+=edges.join("")+boxes.join("");
+  g+=T(10,Hh-8,`cached ${r.size} / ${C} tokens · hit rate so far ${r.hits} / ${r.tot}${r.tot?" = "+pct(r.hits/r.tot):""}`,'font-size="13" fill="var(--ink2)"');
+  svg.innerHTML=g;
+  if(!r.last){info.innerHTML=`Empty cache, capacity ${C} tokens, schedule: ${mode==="fcfs"?"first come, first served":"longest prefix first"}. Press Next to serve the first request.`;return;}
+  const L=r.last;const ptxt=esc(RQ[L.j][0].join(" "));
+  info.innerHTML=`Request <b>${L.j+1}</b> (served at step ${k+1}): <span class="mm-mono" style="font-family:var(--mono);font-variant-ligatures:none">${ptxt} → ${esc(L.o.join(" "))}</span>. Prompt ${L.P} tokens: <b>${L.m}</b> found in the tree, ${L.P-L.m} prefilled. ${L.ev?`Evicted ${L.ev} tokens (LRU leaves: ${esc(L.evl.join(", "))}).`:"Nothing evicted."} Cache holds ${r.size} of ${C} tokens. Hit rate so far (formula 134.9): <b>${r.hits} / ${r.tot} = ${pct(r.hits/r.tot)}</b>.`;}
+ const st=B.stepper({n:RQ.length+1,prev:$("#mm-rx-prev"),next:$("#mm-rx-next"),play:$("#mm-rx-play"),label:$("#mm-rx-lab"),ms:2600,onStep:draw});
+ cs.addEventListener("input",()=>draw(st.i));segInit(seg,()=>draw(st.i));
+})();
+})();
+</script></body></html>

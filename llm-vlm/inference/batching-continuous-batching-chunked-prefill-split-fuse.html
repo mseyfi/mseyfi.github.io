@@ -1,0 +1,829 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Batching: continuous batching, chunked prefill, split-fuse · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 135</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="batching-continuous-batching-chunked-prefill-split-fuse">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="batching-continuous-batching-chunked-prefill-split-fuse" data-session="batching-continuous-batching-chunked-prefill-split-fuse" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">135</span><span>Track 5: LLM inference and serving · session 58 of 65</span></div><h1 class="chap-title">Batching: continuous batching, chunked prefill, split-fuse</h1><p class="chap-sub">LLM requests start and end at different times, so a server that batches whole requests wastes the GPU and makes new users wait. Continuous batching (Orca) rebuilds the batch at every iteration; chunked prefill (Sarathi, Sarathi-Serve) and Dynamic SplitFuse (DeepSpeed-FastGen) cut long prompts into pieces that ride along with the decodes, so nobody’s next token is stalled by someone else’s prompt. This session builds the cost of one mixed iteration and measures the effect on TTFT, time between tokens and throughput in a small simulator.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises and code 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Session 84 (batching basics and the step-time model); sessions 78, 80 and 81 (prefill and decode, the KV cache, the metrics)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why request-level batching fails for generation, and how iteration-level scheduling and selective batching (Orca) fix it</li><li>The cost of one mixed iteration: why about 300 tokens per step on an H100 are almost free and every token after that costs about 16 µs for an 8B model</li><li>What a generation stall is, and why prefill-first and whole-prefill hybrid schedulers both cause long gaps between tokens</li><li>How chunked prefill works (Sarathi’s decode-maximal batching, Sarathi-Serve’s stall-free batching), what it costs, and how to pick the token budget from a TBT target</li><li>Dynamic SplitFuse in DeepSpeed-FastGen, and why equal-sized forward passes are best (a convexity argument)</li><li>How each scheduler moves TTFT, TBT, TPOT and throughput, measured in a seeded simulator</li><li>How to run a mixed batch of prefill chunks and decodes in PyTorch and check that it gives exactly the same tokens as running each request alone</li></ul></div></header><style>
+.cb-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.cb-grid input[type=range]{width:100%}
+.cb-grid input[type=range]:disabled{opacity:.4}
+.cb-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.cb-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.cb-svg text{font-family:var(--sans)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A chat server never sees a neat batch. Requests arrive one by one, their prompts have 50 or 5,000 tokens, and their answers end after 10 or 1,000 tokens. If the server batches <b>whole requests</b>, a finished answer leaves an empty row and a new user waits until the longest answer in the batch is done. In a small simulation in this session, that costs a mean time to first token of 4.6 seconds. Rebuilding the batch at <b>every iteration</b> brings it down to 65 ms, and cutting long prompts into chunks brings it to 49 ms, with the longest gap between two tokens of any user going from 113 ms to 9 ms.</p>
+<p>In <a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a> we built the cost of one batched decode step and saw that batching is the biggest lever on serving cost. We also saw its limit: static and dynamic batching treat a request as one unit, but an LLM request is hundreds of small steps. This session is about batching <b>steps</b> instead of requests. Three ideas, each fixing a problem the previous one left:</p>
+<ul>
+<li><b>Continuous batching</b> (also called iteration-level scheduling or in-flight batching; first in Orca, 2022): after every forward pass, finished requests leave and waiting requests join.</li>
+<li><b>Chunked prefill</b> (Sarathi, 2023, and Sarathi-Serve, 2024): a long prompt is split into chunks, and each chunk is processed in the same forward pass as the ongoing decodes. This removes the <b>generation stall</b>: the long pause that every running user sees when a new prompt is processed.</li>
+<li><b>Dynamic SplitFuse</b> (DeepSpeed-FastGen, 2024): the same split idea, plus packing short prompts so that every forward pass has about the same number of tokens.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “What is continuous batching and why does it help?”, “What is a generation stall?”, “How does chunked prefill trade TTFT against TBT?”, “How would you choose the chunk size or token budget?”, “Why can a prefill chunk ride along with decodes almost for free?” The cost model in this session answers all of them with two numbers: the weight-read time and the compute time per token.</aside>
+<p>All major open serving engines use these ideas: vLLM, SGLang, TensorRT-LLM (which calls it in-flight batching) and Hugging Face TGI implement continuous batching, and vLLM, SGLang and TensorRT-LLM support chunked prefill. [Likely: from their documentation; defaults change between versions.] The survey of efficient inference lists them under system-level serving optimization, in its section on batching. [Certain: Zhou et al., 2024, Section 6.2.] The memory side (PagedAttention) is in <a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>, and the policies that decide <em>who</em> goes next (FCFS, preemption, fairness) are in <a href="../inference/scheduling-fcfs-preemption-fairness-and-slos.html">session 136</a>. This session is about the <em>shape</em> of each iteration.</p>
+
+<h2>From requests to iterations: continuous batching</h2>
+<h3>The problem with request-level batching</h3>
+<p>Recall from <a href="../inference/the-generation-loop-prefill-and-decode.html">session 78</a> that a request has two phases. In <b>prefill</b>, the model reads the whole prompt in one forward pass, writes its KV cache, and produces the first token. In <b>decode</b>, it produces one token per forward pass. A forward pass of the whole model over the current batch is called an <b>iteration</b>.</p>
+<p>A request-level scheduler (static batching, or dynamic batching as in Triton) picks a set of requests and runs them together until all of them have finished. Orca’s paper describes the two costs: a request that finishes early cannot return or free its row until the whole batch ends, and a request that arrives after the batch has started must wait until the batch ends before even its prefill can begin. [Certain: Orca, OSDI 2022.] NVIDIA FasterTransformer, the baseline in the Orca paper, worked this way.</p>
+<h3>Iteration-level scheduling</h3>
+<p>Orca’s fix is simple to say. The scheduler does not hand the engine a batch of requests. It hands it <b>one iteration</b> at a time, and it picks the set of requests again before every iteration:</p>
+<div class="eq">\[ \mathcal{B}_{s+1} \;=\; \big(\mathcal{B}_s \setminus \mathcal{F}_s\big) \,\cup\, \mathcal{A}_s, \qquad |\mathcal{B}_{s+1}| \le B_{\max} \tag{135.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathcal{B}_s\)</dt><dd>the set of requests in iteration \(s\) (the running batch)</dd>
+<dt>\(\mathcal{F}_s\)</dt><dd>the requests that finished in iteration \(s\): they produced an end-of-sequence token or reached their length limit. Their result is returned at once and their KV cache is freed</dd>
+<dt>\(\mathcal{A}_s\)</dt><dd>the waiting requests admitted for the next iteration, usually first come, first served</dd>
+<dt>\(B_{\max}\)</dt><dd>the largest batch the engine allows; in practice it is set by the KV-cache memory (formula 84.7) and by a maximum number of sequences</dd></dl>
+<p>Nothing waits for a whole batch any more. A short answer leaves after its last token, and its row is reused at the next iteration. This is exactly the “refill” mode of Figure 3 in <a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>, which removed most of the padding waste of static batching without knowing the answer lengths in advance.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Request-level batching is a tour bus: everyone gets on at the start, and the bus returns only when the last passenger has been dropped off. Continuous batching is a city bus: at every stop some people get off and others get on, and the bus never waits to be empty. Chunked prefill is a rule for the city bus: a group of 40 tourists may not all board at one stop, because that would hold the bus for minutes; ten board at each stop, and the bus keeps its timetable.</aside>
+<h3>Selective batching: how a ragged batch runs on a GPU</h3>
+<p>There is a technical problem. In one iteration, request R1 may bring a prompt of 900 tokens, R2 one decode token at position 40, and R3 one decode token at position 2,000. Their tensors have different shapes, and the old way (pad everything to one rectangle) would waste most of the work. Orca’s answer is <b>selective batching</b>: batch only the operations where batching is easy. [Certain: Orca abstract.]</p>
+<ul>
+<li>For the matrix multiplies (QKV projection, output projection, the FFN), the position of a token does not matter. So all new tokens of all requests are stacked into one matrix of shape \((\sum_i n_i,\, d)\), with no padding, and each weight matrix is applied once. This is where batching saves weight reads.</li>
+<li>For attention, each request needs its own keys and values. So the stacked matrix is split by request, each part attends to its own KV cache, and the outputs are merged back into one matrix.</li></ul>
+<figure class="fig" id="cb-sel"><div class="fig-body">
+<div class="scroll-x"><svg class="cb-svg" viewBox="0 0 680 300" role="img" aria-label="Selective batching: tokens of all requests are stacked for the linear layers and split per request for attention">
+<text x="20" y="22" font-size="13" font-weight="700" fill="var(--ink)">new tokens of one iteration</text>
+<rect x="30" y="40" width="90" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)"/>
+<text x="75" y="53" text-anchor="middle" font-size="11" fill="var(--ink)">R1 t1</text>
+<rect x="30" y="61" width="90" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)"/>
+<text x="75" y="74" text-anchor="middle" font-size="11" fill="var(--ink)">R1 t2</text>
+<rect x="30" y="82" width="90" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)"/>
+<text x="75" y="95" text-anchor="middle" font-size="11" fill="var(--ink)">R1 t3</text>
+<rect x="30" y="103" width="90" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)"/>
+<text x="75" y="116" text-anchor="middle" font-size="11" fill="var(--ink)">R1 t4</text>
+<rect x="30" y="124" width="90" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)"/>
+<text x="75" y="137" text-anchor="middle" font-size="11" fill="var(--ink)">R2 t1</text>
+<rect x="30" y="145" width="90" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)"/>
+<text x="75" y="158" text-anchor="middle" font-size="11" fill="var(--ink)">R3 t1</text>
+<text x="75" y="180" text-anchor="middle" font-size="11" fill="var(--muted)">(6, d) stacked</text>
+<text x="30" y="210" font-size="11" fill="var(--muted)">R1: 4-token prefill chunk</text><text x="30" y="226" font-size="11" fill="var(--muted)">R2, R3: one decode token each</text>
+<rect x="160" y="40" width="110" height="122" rx="6" fill="var(--card)" stroke="var(--tc)" stroke-width="1.6"/>
+<text x="215" y="86" text-anchor="middle" font-size="12" font-weight="700" fill="var(--ink)">QKV GEMM</text><text x="215" y="104" text-anchor="middle" font-size="11" fill="var(--muted)">one matmul</text><text x="215" y="120" text-anchor="middle" font-size="11" fill="var(--muted)">(6, d)·(d, 3d)</text>
+<path d="M122 100 H156" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#cb-ar)"/>
+<path d="M272 100 C290 100 290 55 308 55" fill="none" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#cb-ar)"/>
+<rect x="312" y="40" width="150" height="32" rx="5" fill="var(--k-soft)" stroke="var(--k)"/>
+<text x="387" y="53" text-anchor="middle" font-size="11" font-weight="700" fill="var(--ink)">attention R1</text><text x="387" y="67" text-anchor="middle" font-size="10.5" fill="var(--ink2)">4 new + 9 cached keys</text>
+<path d="M464 55 C482 55 482 100 500 100" fill="none" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#cb-ar)"/>
+<path d="M272 100 C290 100 290 101 308 101" fill="none" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#cb-ar)"/>
+<rect x="312" y="86" width="150" height="32" rx="5" fill="var(--q-soft)" stroke="var(--q)"/>
+<text x="387" y="99" text-anchor="middle" font-size="11" font-weight="700" fill="var(--ink)">attention R2</text><text x="387" y="113" text-anchor="middle" font-size="10.5" fill="var(--ink2)">1 new + 20 cached</text>
+<path d="M464 101 C482 101 482 100 500 100" fill="none" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#cb-ar)"/>
+<path d="M272 100 C290 100 290 147 308 147" fill="none" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#cb-ar)"/>
+<rect x="312" y="132" width="150" height="32" rx="5" fill="var(--q-soft)" stroke="var(--q)"/>
+<text x="387" y="145" text-anchor="middle" font-size="11" font-weight="700" fill="var(--ink)">attention R3</text><text x="387" y="159" text-anchor="middle" font-size="10.5" fill="var(--ink2)">1 new + 7 cached</text>
+<path d="M464 147 C482 147 482 100 500 100" fill="none" stroke="var(--muted)" stroke-width="1.3" marker-end="url(#cb-ar)"/>
+<text x="387" y="184" text-anchor="middle" font-size="11" fill="var(--muted)">split: each request reads its own KV cache</text>
+<rect x="504" y="40" width="156" height="122" rx="6" fill="var(--card)" stroke="var(--tc)" stroke-width="1.6"/>
+<text x="582" y="82" text-anchor="middle" font-size="12" font-weight="700" fill="var(--ink)">merge (6, d)</text><text x="582" y="100" text-anchor="middle" font-size="11" fill="var(--muted)">output proj + FFN</text><text x="582" y="116" text-anchor="middle" font-size="11" fill="var(--muted)">one matmul each</text>
+<text x="340" y="250" text-anchor="middle" font-size="12" fill="var(--ink)">Weights are read once per iteration for all 6 tokens. Only attention is per request.</text>
+<text x="340" y="270" text-anchor="middle" font-size="11" fill="var(--muted)">No padding: requests of any length and in any phase share the same step.</text>
+<defs><marker id="cb-ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" fill="var(--muted)"/></marker></defs>
+</svg></div>
+</div><figcaption><b>Figure 1.</b> Selective batching in one iteration with a 4-token prefill chunk (R1) and two decodes (R2, R3). The six new tokens are stacked with no padding. The QKV projection, output projection and FFN each run as one matrix multiply over all six rows, so each weight is read once. Attention is done per request, because each request has its own KV cache of a different length. Modern engines do the per-request attention in one “varlen” or paged kernel rather than a loop, but the idea is the same.</figcaption></figure>
+<p>Selective batching is what makes iteration-level scheduling work on a GPU, and it is what makes the next two ideas possible: once the batch is a flat list of tokens, a prefill chunk and a decode token are just rows of the same matrix. Today’s engines do the split attention with one kernel that reads each request’s cache through a block table (PagedAttention, FlashInfer, FlashAttention’s variable-length mode; see <a href="../inference/attention-operator-2-decode-attention-flashdecoding-and.html">session 125</a>).</p>
+<p>Orca reported a 36.9 times throughput improvement over FasterTransformer on GPT-3 175B at the same latency. [Certain: Orca abstract, OSDI 2022.] Most of that gain comes from not waiting for whole batches, so the GPU always has a full batch of useful work.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: iteration-level scheduling (continuous batching)</div><ol>
+<li><b>state:</b> waiting queue \(W\) (FCFS), running set \(\mathcal{B}\), KV-cache pool</li>
+<li><b>loop</b> (one pass per model iteration):</li>
+<li>&nbsp;&nbsp;move newly arrived requests into \(W\)</li>
+<li>&nbsp;&nbsp;<b>while</b> \(W\) is not empty <b>and</b> \(|\mathcal{B}| \lt B_{\max}\) <b>and</b> the KV pool has room for the head of \(W\): move it into \(\mathcal{B}\) <span class="c">// admission</span></li>
+<li>&nbsp;&nbsp;build the iteration: one token for each request in decode, the prompt (or a chunk of it) for each request in prefill</li>
+<li>&nbsp;&nbsp;run one forward pass with selective batching; sample one token for each request whose prompt is complete</li>
+<li>&nbsp;&nbsp;<b>for</b> each request that produced end-of-sequence or reached its limit: return it, free its KV blocks, remove it from \(\mathcal{B}\) <span class="c">// formula (135.1)</span></li></ol></div>
+<p>Line 5 hides the question that the rest of this session answers: <b>how much prefill should one iteration carry?</b> Orca puts whole prompts into the iteration. vLLM, in its original design, ran prefill-only iterations and decode-only iterations, and gave priority to new prefills. [Certain: Sarathi-Serve describes Orca as allowing hybrid prefill-and-decode batches, and vLLM batches as all-prefill or all-decode, both admitting new prefills eagerly.] Both choices cause a problem we can now measure.</p>
+
+<h2>What one iteration costs</h2>
+<p>We reuse the cost model of <a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a> (formula 84.1) and extend it to an iteration that mixes decodes and prefill chunks. Let the iteration carry \(B\) decodes, decode \(i\) with \(T_i\) tokens in its cache, and some prefill chunks, chunk \(k\) with \(c_k\) new tokens after \(j_k\) tokens of the same prompt that are already cached (\(j_k = 0\) for a first or whole prefill). The number of tokens in the iteration is</p>
+<div class="eq">\[ n \;=\; B + \sum_k c_k \tag{135.2} \]</div>
+<p>The weights are read once for all \(n\) tokens. Every token needs about \(2N\) FLOPs for the matrix multiplies. Attention adds work that depends on how many keys each new token sees, and every request reads its own cache. The iteration takes at least the larger of the compute time and the memory time:</p>
+<div class="eq">\[ t \;=\; \max\!\left( \frac{2Nn + 4 L d \Big[\sum_i T_i + \sum_k c_k \big(j_k + \tfrac{c_k}{2}\big)\Big]}{\pi},\;\; \frac{bN + s_{\text{kv}} \Big[\sum_i T_i + \sum_k (j_k + c_k)\Big]}{\beta} \right) \tag{135.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\), \(b\)</dt><dd>number of parameters and bytes per weight; \(bN\) is the weight bytes, 16.06 GB for Llama 3 8B in BF16</dd>
+<dt>\(L\), \(d\)</dt><dd>number of layers and the attention width (32 and 4,096 for Llama 3 8B)</dd>
+<dt>\(4Ld\,T_i\)</dt><dd>attention FLOPs of one decode token over \(T_i\) cached positions (\(QK^\top\) plus the weighted sum of values, in all layers)</dd>
+<dt>\(4Ld\,c_k(j_k + c_k/2)\)</dt><dd>attention FLOPs of a chunk: each of its \(c_k\) tokens sees the \(j_k\) earlier tokens plus, on average, half of the chunk (causal mask)</dd>
+<dt>\(s_{\text{kv}}\)</dt><dd>KV-cache bytes per token, \(2 L n_{kv} d_h b = 131{,}072\) for Llama 3 8B</dd>
+<dt>\(\pi\), \(\beta\)</dt><dd>peak compute and memory bandwidth: 989 TFLOP/s (dense BF16) and 3.35 TB/s for an H100 SXM</dd></dl>
+<p>This is a <b>lower bound</b> from the roofline; it assumes perfect overlap of compute and memory and peak speed. Real kernels are slower, and the gap is larger for small, odd-shaped batches. We use it because it shows the shape of the trade-off with numbers anyone can check.</p>
+<h3>The knee: about 300 tokens are almost free</h3>
+<p>Ignore attention and the KV reads for a moment. Then the memory time is the weight-read time \(t_w = bN/\beta\), which does not depend on \(n\), and the compute time is \(2Nn/\pi\), which grows with \(n\). They are equal at</p>
+<div class="eq">\[ n^{*} \;=\; \frac{bN/\beta}{2N/\pi} \;=\; \frac{b\,\pi}{2\,\beta} \tag{135.4} \]</div>
+<p>For BF16 on an H100, \(n^{*} = 2 \times 989 / (2 \times 3.35) = 295\) tokens. Note that \(N\) cancels: the knee depends only on the hardware and the number format. An iteration with fewer than about 295 tokens is memory-bound and takes about \(t_w = 4.79\) ms for Llama 3 8B, however many tokens it has. Above the knee, every extra token costs \(2N/\pi = 16.2\,\mu\)s. A decode batch of 32 users has only 32 tokens, so it uses about a tenth of the compute that the weight read pays for. That idle compute is the opportunity: <b>prefill tokens can fill it</b>. This is the main observation of the Sarathi paper. [Certain: Sarathi abstract: decodes “piggyback” on a prefill chunk at a much lower cost than a decode-only batch.]</p>
+<div class="worked"><div class="wt">Worked example: what a prefill costs inside a decode iteration</div>
+<p>Llama 3 8B on one H100, 32 users in decode, each with 1,024 tokens in its cache. Formula (135.3):</p>
+<p><b>Decode only.</b> Memory: \(16.06 + 32 \times 1024 \times 131{,}072 / 10^9 = 20.36\) GB, so 6.08 ms. Compute: \(5.31 \times 10^{11}\) FLOPs, only 0.54 ms. The iteration is memory-bound by a factor of 11.</p>
+<p><b>Plus a 256-token chunk:</b> 6.09 ms. <b>Plus up to 340 tokens:</b> still below the memory time, so they are free (6.09 ms). The knee is higher than 295 here because the 32 caches add to the memory time.</p>
+<p><b>Plus a 512-token chunk:</b> 8.92 ms. <b>Plus a whole 2,048-token prompt:</b> 34.9 ms, 5.7 times longer than the decode-only iteration. Every one of the 32 users waits 34.9 ms for their next token instead of 6.1 ms.</p></div>
+<p>Figure 2 lets you move the decode batch, the context length and a target for the time between tokens.</p>
+<figure class="fig" id="cb-knee"><div class="fig-body">
+<div class="cb-grid">
+<label for="cb-knee-b">Decodes in the iteration \(B\)</label><input type="range" id="cb-knee-b" min="0" max="10" step="1" value="6"><output id="cb-knee-bv"></output>
+<label for="cb-knee-t">Context per decode \(T\)</label><input type="range" id="cb-knee-t" min="0" max="5" step="1" value="2"><output id="cb-knee-tv"></output>
+<label for="cb-knee-s">TBT target \(\tau\)</label><input type="range" id="cb-knee-s" min="5" max="60" step="1" value="10"><output id="cb-knee-sv"></output></div>
+<div class="scroll-x"><svg id="cb-knee-svg" class="cb-svg" viewBox="0 0 640 330" role="img" aria-label="Iteration time against the number of prefill tokens added to a decode batch, with the compute time, the memory time and the TBT target"></svg></div>
+<div class="cb-leg"><span style="--c:var(--tc)">iteration time (the max)</span><span style="--c:var(--k)">compute time</span><span style="--c:var(--v)">memory time</span><span style="--c:var(--ink2)">TBT target</span></div>
+<div class="readout" id="cb-knee-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Formula (135.3) for Llama 3 8B in BF16 on one H100 SXM (989 TFLOP/s, 3.35 TB/s): one iteration with \(B\) decodes at context \(T\) plus one prefill chunk of \(c\) tokens with no earlier cached part (\(j = 0\)). The green dot marks the last “free” chunk size, where the compute time reaches the memory time. The open circle marks the largest chunk that keeps the iteration within the TBT target; \(K = B + c\) is then the <b>token budget</b> of formula (135.6). Roofline lower bounds; real kernels are slower.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>The thick curve is flat at first (memory-bound: the weight read dominates) and then rises in a straight line (compute-bound: every token costs about 16 µs). With the defaults (32 decodes, \(T = 1024\), target 10 ms), the decode-only iteration takes 6.08 ms, 340 prefill tokens are free, and the largest iteration under 10 ms carries 577 prefill tokens, so \(K = 609\). Set \(B = 0\): the knee moves to 294 tokens, close to formula (135.4). Set \(T = 4096\): the 32 caches make the memory time 9.9 ms and the free part grows to 570 tokens; a 10 ms target now allows 574 prefill tokens, almost exactly the free part, because the decode-only iteration already takes 9.92 ms. Set the target to 5 ms with 32 decodes: no iteration can meet it.</p></details></figure>
+
+<h2>The problem left by continuous batching: generation stalls</h2>
+<p>Continuous batching admits a new request at the next iteration. But its prompt must be prefilled, and a long prefill is a long iteration. The two original designs handle this differently, and both hurt the users who are already decoding:</p>
+<ul>
+<li><b>Prefill-first, separate iterations</b> (original vLLM): when a request is waiting, the next iteration is a prefill-only iteration. The decodes are simply paused. Their next token comes after the prefill <em>and</em> the next decode iteration.</li>
+<li><b>Hybrid iterations with whole prompts</b> (Orca): the new prompt is added to the decode iteration. The decodes are not paused, but the iteration becomes as long as the prefill.</li></ul>
+<p>Sarathi-Serve calls this a <b>generation stall</b>, and notes that one stall can last several seconds for long prompts on large models. [Certain: Sarathi-Serve.] For the users who are decoding, the gap between two tokens is</p>
+<div class="eq">\[ \text{TBT}_{\text{stall}} \;\approx\; \underbrace{t_{\text{pre}}(P)}_{\text{prefill-first}} + \; t_{\text{dec}}(B) \qquad\text{or}\qquad t\big(B \text{ decodes} + P\big) \;\approx\; \frac{2N(P + B) + 2LdP^2}{\pi} \;\;\text{(hybrid)} \tag{135.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P\)</dt><dd>the number of prompt tokens of the new request</dd>
+<dt>\(t_{\text{pre}}(P)\)</dt><dd>the time of a prefill-only iteration, which is compute-bound for \(P\) above a few hundred</dd>
+<dt>\(2LdP^2\)</dt><dd>the causal attention FLOPs of the whole prompt, \(4Ld \cdot P \cdot P/2\)</dd></dl>
+<p>With 32 decodes at \(T = 1024\) and a new 2,048-token prompt: prefill-first gives \(34.37 + 6.08 = 40.4\) ms; the hybrid iteration gives 34.9 ms. The normal gap is 6.08 ms. And this happens every time any user sends a prompt. With many users, some prompt arrives almost every few iterations, so the tail of the gap distribution (p99 TBT) is set by prefills, not by decodes.</p>
+<p>Sarathi-Serve sorts schedulers into two groups. <b>Decode-prioritizing</b> schedulers (request-level batching, as in FasterTransformer) never stall a decode but admit new requests only when a batch is finished, so TTFT is long and throughput is low. <b>Prefill-prioritizing</b> schedulers (Orca, vLLM) admit new prompts at once, which gives high throughput and short TTFT, but causes stalls. [Certain: Sarathi-Serve.] Before chunked prefill, you had to choose between good TTFT and good TBT.</p>
+<figure class="fig" id="cb-three"><div class="fig-body">
+<div class="scroll-x"><svg class="cb-svg" viewBox="0 0 680 330" role="img" aria-label="Three schedules of the same five requests: request-level batching, iteration-level batching with whole prefills, and chunked prefill">
+<text x="20" y="18" font-size="14" font-weight="700" fill="var(--ink)">Request-level batching: D and E wait for the whole batch</text>
+<text x="62" y="42" text-anchor="end" font-size="11" fill="var(--muted)">slot 1</text>
+<text x="62" y="62" text-anchor="end" font-size="11" fill="var(--muted)">slot 2</text>
+<text x="62" y="82" text-anchor="end" font-size="11" fill="var(--muted)">slot 3</text>
+<rect x="71" y="29" width="68" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="105.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="71" y="49" width="68" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="105.0" y="62" text-anchor="middle" font-size="11" fill="var(--ink)">B</text>
+<rect x="71" y="69" width="68" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="105.0" y="82" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="141" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="152.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="141" y="49" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="152.0" y="62" text-anchor="middle" font-size="11" fill="var(--ink)">B</text>
+<rect x="141" y="69" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="152.0" y="82" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="165" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="176.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="165" y="49" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="176.0" y="62" text-anchor="middle" font-size="11" fill="var(--ink)">B</text>
+<rect x="165" y="69" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="176.0" y="82" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="189" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="200.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="189" y="49" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<rect x="189" y="69" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="200.0" y="82" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="213" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="224.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="213" y="49" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<rect x="213" y="69" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="224.0" y="82" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="237" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="248.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="237" y="49" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<rect x="237" y="69" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<rect x="261" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="272.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="261" y="49" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<rect x="261" y="69" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<rect x="285" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="296.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="285" y="49" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<rect x="285" y="69" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<rect x="309" y="29" width="82" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="350.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="309" y="49" width="82" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="350.0" y="62" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="393" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="404.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="393" y="49" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="404.0" y="62" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="417" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="428.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="417" y="49" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="428.0" y="62" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="441" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="452.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="441" y="49" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="452.0" y="62" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="465" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="476.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="465" y="49" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<rect x="489" y="29" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="500.0" y="42" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="489" y="49" width="22" height="18" rx="3" fill="var(--paper2)" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 2"/>
+<text x="520" y="46" font-size="12" fill="var(--ink)">ends at 442</text>
+<text x="520" y="62" font-size="12" fill="var(--muted)">longest gap 24</text>
+<path d="M164 90 l-4 7 h8 z" fill="var(--tc)"/><text x="170" y="99" font-size="10" fill="var(--tc)">D arrives</text>
+<path d="M212 90 l-4 7 h8 z" fill="var(--tc)"/><text x="218" y="99" font-size="10" fill="var(--tc)">E arrives</text>
+<text x="20" y="128" font-size="14" font-weight="700" fill="var(--ink)">Iteration-level (Orca): D and E join at once, but whole prefills stall A and C</text>
+<text x="62" y="152" text-anchor="end" font-size="11" fill="var(--muted)">slot 1</text>
+<text x="62" y="172" text-anchor="end" font-size="11" fill="var(--muted)">slot 2</text>
+<text x="62" y="192" text-anchor="end" font-size="11" fill="var(--muted)">slot 3</text>
+<rect x="71" y="139" width="68" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="105.0" y="152" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="71" y="159" width="68" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="105.0" y="172" text-anchor="middle" font-size="11" fill="var(--ink)">B</text>
+<rect x="71" y="179" width="68" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="105.0" y="192" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="141" y="139" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="152.0" y="152" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="141" y="159" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="152.0" y="172" text-anchor="middle" font-size="11" fill="var(--ink)">B</text>
+<rect x="141" y="179" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="152.0" y="192" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="165" y="139" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="176.0" y="152" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="165" y="159" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="176.0" y="172" text-anchor="middle" font-size="11" fill="var(--ink)">B</text>
+<rect x="165" y="179" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="176.0" y="192" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="189" y="139" width="82" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="230.0" y="152" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="189" y="159" width="82" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="230.0" y="172" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="189" y="179" width="82" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="230.0" y="192" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="273" y="139" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="284.0" y="152" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="273" y="159" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="284.0" y="172" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="273" y="179" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="284.0" y="192" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="297" y="139" width="42" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="318.0" y="152" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="297" y="159" width="42" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="318.0" y="172" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="297" y="179" width="42" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="318.0" y="192" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="341" y="139" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="352.0" y="152" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="341" y="159" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="352.0" y="172" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="341" y="179" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="352.0" y="192" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="365" y="139" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="376.0" y="152" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="365" y="159" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="376.0" y="172" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="365" y="179" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="376.0" y="192" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="389" y="159" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="400.0" y="172" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="389" y="179" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="400.0" y="192" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<text x="420" y="156" font-size="12" fill="var(--ink)">ends at 342</text>
+<text x="420" y="172" font-size="12" fill="var(--muted)">longest gap 84</text>
+<path d="M164 200 l-4 7 h8 z" fill="var(--tc)"/><text x="170" y="209" font-size="10" fill="var(--tc)">D arrives</text>
+<path d="M272 200 l-4 7 h8 z" fill="var(--tc)"/><text x="278" y="209" font-size="10" fill="var(--tc)">E arrives</text>
+<text x="20" y="238" font-size="14" font-weight="700" fill="var(--ink)">Chunked prefill: D’s prompt in 3 chunks rides along with the decodes</text>
+<text x="62" y="262" text-anchor="end" font-size="11" fill="var(--muted)">slot 1</text>
+<text x="62" y="282" text-anchor="end" font-size="11" fill="var(--muted)">slot 2</text>
+<text x="62" y="302" text-anchor="end" font-size="11" fill="var(--muted)">slot 3</text>
+<rect x="71" y="249" width="68" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="105.0" y="262" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="71" y="269" width="68" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="105.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">B</text>
+<rect x="71" y="289" width="68" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="105.0" y="302" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="141" y="249" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="152.0" y="262" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="141" y="269" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="152.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">B</text>
+<rect x="141" y="289" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="152.0" y="302" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="165" y="249" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="176.0" y="262" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="165" y="269" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="176.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">B</text>
+<rect x="165" y="289" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="176.0" y="302" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="189" y="249" width="34" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="206.0" y="262" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="189" y="269" width="34" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="206.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">D1</text>
+<rect x="189" y="289" width="34" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="206.0" y="302" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="225" y="249" width="34" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="242.0" y="262" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="225" y="269" width="34" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="242.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">D2</text>
+<rect x="225" y="289" width="34" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="242.0" y="302" text-anchor="middle" font-size="11" fill="var(--ink)">C</text>
+<rect x="261" y="249" width="34" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="278.0" y="262" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="261" y="269" width="34" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="278.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">D3</text>
+<rect x="261" y="289" width="34" height="18" rx="3" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1"/>
+<text x="278.0" y="302" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="297" y="249" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="308.0" y="262" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="297" y="269" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="308.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="297" y="289" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="308.0" y="302" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="321" y="249" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="332.0" y="262" text-anchor="middle" font-size="11" fill="var(--ink)">A</text>
+<rect x="321" y="269" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="332.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="321" y="289" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="332.0" y="302" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="345" y="269" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="356.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="345" y="289" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="356.0" y="302" text-anchor="middle" font-size="11" fill="var(--ink)">E</text>
+<rect x="369" y="269" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="380.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<rect x="393" y="269" width="22" height="18" rx="3" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1"/>
+<text x="404.0" y="282" text-anchor="middle" font-size="11" fill="var(--ink)">D</text>
+<text x="424" y="266" font-size="12" fill="var(--ink)">ends at 346</text>
+<text x="424" y="282" font-size="12" fill="var(--muted)">longest gap 36</text>
+<path d="M164 310 l-4 7 h8 z" fill="var(--tc)"/><text x="170" y="319" font-size="10" fill="var(--tc)">D arrives</text>
+<path d="M224 310 l-4 7 h8 z" fill="var(--tc)"/><text x="230" y="319" font-size="10" fill="var(--tc)">E arrives</text>
+</svg></div>
+<div class="cb-leg"><span style="--c:var(--k-soft)">prefill (whole prompt or chunk)</span><span style="--c:var(--q-soft)">decode (one token)</span><span style="--c:var(--paper2)">padding (row is finished but still computed)</span></div>
+</div><figcaption><b>Figure 3.</b> The same five requests under three schedulers. A, B and C start together; D (a long prompt) arrives during the third iteration and E (a short prompt) during the fifth. Column widths sketch the time of each iteration (decode-only = 24 units; not to scale with a real model). Request-level: D’s first token comes 228 units after it arrives, and finished rows are padding. Orca: D’s first token after 108 units, but the iteration with D’s whole prompt lasts 84 units, so A and C wait 84 units for their next token. Chunked prefill: D’s prompt in three chunks; D’s first token after 132 units (a little later), but no gap is longer than 36 units.</figcaption></figure>
+
+<h2>Chunked prefill: Sarathi and Sarathi-Serve</h2>
+<h3>The idea</h3>
+<p>Split each prompt into chunks of \(c\) tokens and process one chunk per iteration, together with the decodes. The chunk writes its keys and values into the KV cache; the next chunk attends to everything cached so far plus itself, with a causal mask inside the chunk. After the last chunk, the logits of the last prompt token give the first output token. The result is <b>exactly</b> the same as a whole prefill (up to floating-point rounding), because causal attention for token \(t\) only ever needs the keys and values of tokens \(\le t\). The PyTorch code below checks this.</p>
+<p><b>Sarathi</b> (2023) builds each batch around one prefill chunk and fills the rest with decodes, which it calls <b>decode-maximal batching</b>. [Certain: Sarathi paper.] It reports up to 10 times higher decode throughput and up to 1.33 times higher end-to-end throughput for LLaMA-13B on an A6000, and 1.25 times end-to-end (up to 4.25 times decode) for LLaMA-33B on an A100. With pipeline parallelism on GPT-3, the uniform batches cut pipeline bubbles by 6.29 times, for 1.91 times end-to-end throughput. [Certain: Sarathi abstract.]</p>
+<p><b>Sarathi-Serve</b> (2024) turns this into a serving scheduler with latency targets. Its <b>stall-free batching</b> puts all ongoing decodes into the iteration first, then fills the remaining <b>token budget</b> \(K\) with prefill chunks: first the chunks of prompts that are already partly done, then new requests. A decode is never paused for a prefill, and no iteration has more than \(K\) tokens. [Certain: Sarathi-Serve.]</p>
+<h3>Choosing the token budget</h3>
+<p>Sarathi-Serve sets the budget to the largest number of tokens that can be packed into a batch without violating the TBT target, found by profiling. [Certain: Sarathi-Serve.] With our cost model:</p>
+<div class="eq">\[ K(\tau) \;=\; \max\big\{\, n \;:\; t(n) \le \tau \,\big\}, \qquad \text{chunk room in an iteration} = K - B \tag{135.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\tau\)</dt><dd>the TBT target (the service-level objective for the gap between tokens)</dd>
+<dt>\(t(n)\)</dt><dd>formula (135.3) for an iteration of \(n\) tokens: the current decodes plus \(n - B\) prefill tokens</dd>
+<dt>\(K - B\)</dt><dd>how many prefill tokens this iteration may carry; it shrinks as the decode batch grows</dd></dl>
+<p>For 32 decodes at \(T = 1024\) on an H100: \(\tau = 8\) ms gives \(K = 488\), \(\tau = 10\) ms gives \(K = 609\), and \(\tau = 20\) ms gives \(K = 1{,}207\) (Figure 2). Sarathi-Serve used \(K = 512\) for its strict TBT targets and \(K = 2{,}048\) for relaxed ones (1,536 for LLaMA2-70B, to reduce pipeline bubbles). [Certain: Sarathi-Serve, evaluation setup.] Two more practical rules:</p>
+<ul>
+<li><b>Align chunks with GPU tiles.</b> Matrix-multiply kernels work on tiles of, for example, 128 or 256 rows. A chunk of 257 tokens needs a second, almost empty tile. Sarathi-Serve measured that a chunk size of 257 can increase prefill time by 32% compared with 256. [Certain: Sarathi-Serve.] This is the tile-quantization effect of <a href="../inference/linear-operators-gemm-gemv-and-flat-gemm.html">session 126</a>.</li>
+<li><b>Small chunks have a cost.</b> Each chunk must read the KV cache of all earlier chunks of its prompt. The next part computes how much.</li></ul>
+<h3>The cost of chunking</h3>
+<p>Split a prompt of \(P = mc\) tokens into \(m\) chunks of \(c\). Chunk \(k\) (counting from 0) has \(j = kc\) earlier tokens. Sum the attention FLOPs of all chunks and the KV bytes they read:</p>
+<div class="eq">\[ \sum_{k=0}^{m-1} 4Ld\, c\Big(kc + \frac{c}{2}\Big) = 4Ld\,\frac{P^2}{2}, \qquad \sum_{k=0}^{m-1} s_{\text{kv}}\,(kc + c) \;=\; s_{\text{kv}}\, c\,\frac{m(m+1)}{2} \;\approx\; s_{\text{kv}}\,\frac{P^2}{2c} \tag{135.7} \]</div>
+<p>The attention FLOPs are <b>exactly</b> the same as for one whole prefill: chunking moves work, it does not add work. The memory traffic does grow: instead of writing \(P\) cache entries once, the chunks read the earlier cache again and again, about \(P^2/(2c)\) entries in total. (Sarathi-Serve notes that the KV cache of the first chunk is read \(m - 1\) more times. [Certain].) The weights are also read once per chunk instead of once, but those reads are shared with the decodes, which needed them anyway.</p>
+<div class="worked"><div class="wt">Worked example: a 4,096-token prompt in chunks of 512</div>
+<p><b>Cost of chunking.</b> \(m = 8\). A whole prefill writes \(4096 \times 131{,}072 = 0.54\) GB of cache. The chunks touch \(131{,}072 \times 512 \times 36 = 2.42\) GB, so 1.88 GB extra, which is 0.56 ms at 3.35 TB/s. A whole prefill is compute-bound at 71.0 ms, so in the roofline model the extra reads hide under the compute completely: eight chunks alone also take 71.0 ms. On real hardware the overhead is larger, because attention kernels run less efficiently on short chunks: Sarathi-Serve measured at most about 25% extra prefill time with chunks of 512 on Yi-34B, and almost none with 2,048. [Certain: Sarathi-Serve.]</p>
+<p><b>Effect on TTFT.</b> With 32 decodes at \(T = 1024\) and \(K = 512\), each iteration has room for 480 prefill tokens, so the prompt needs \(\lceil 4096/480 \rceil = 9\) iterations of about 8.5 ms: 76.8 ms in total. In one hybrid iteration it would take 71.5 ms, but that iteration would stall the 32 other users for 71.5 ms. Chunking costs this request 5.3 ms of TTFT (7%) and saves every other user a 71.5 ms gap.</p></div>
+<p>In general, for a request that arrives to a queue with waiting time \(W\), the TTFT under chunked prefill is about</p>
+<div class="eq">\[ \text{TTFT} \;\approx\; W + \sum_{k=1}^{m} t_k, \qquad m = \left\lceil \frac{P}{K - B} \right\rceil \tag{135.8} \]</div>
+<p>where \(t_k\) is the time of the \(k\)-th iteration that carries a chunk of this prompt. This is the trade-off in one line: a <b>small budget</b> keeps every \(t_k\) short (good TBT for everyone) but needs many iterations (long TTFT, and more KV re-reads); a <b>large budget</b> gives short TTFT for the new request but long gaps for the others. When \(B\) approaches \(K\), the prefill room \(K - B\) goes to zero and new requests starve. That is why the budget must be clearly larger than the decode batch.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: stall-free batching with a token budget (Sarathi-Serve style)</div><ol>
+<li><b>input:</b> running decodes \(D\), partly prefilled requests \(Q\), waiting queue \(W\), token budget \(K\), \(B_{\max}\)</li>
+<li>batch \(\leftarrow\) one token for every request in \(D\); \(\;r \leftarrow K - |D|\) <span class="c">// decodes first: never stalled</span></li>
+<li><b>for</b> each request \(q\) in \(Q\) (oldest first) <b>while</b> \(r \gt 0\):</li>
+<li>&nbsp;&nbsp;\(c \leftarrow \min(r,\ \text{remaining prompt of } q)\); add the next \(c\) prompt tokens of \(q\); \(r \leftarrow r - c\)</li>
+<li><b>while</b> \(r \gt 0\) <b>and</b> \(W\) not empty <b>and</b> \(|D| + |Q| \lt B_{\max}\) <b>and</b> the KV pool has room:</li>
+<li>&nbsp;&nbsp;move the head of \(W\) into \(Q\); add its first \(\min(r, P)\) prompt tokens; reduce \(r\)</li>
+<li>run the iteration (selective batching, formula 135.3); a request whose last chunk was in it gets its first token and moves to \(D\)</li></ol></div>
+
+<h2>Dynamic SplitFuse in DeepSpeed-FastGen</h2>
+<p>DeepSpeed-FastGen (2024) arrived at almost the same scheduler from a throughput point of view. Its paper makes three observations about a forward pass [Certain: DeepSpeed-FastGen paper]:</p>
+<ul>
+<li>The time of a forward pass depends mainly on the <b>number of tokens</b> in it; how those tokens are split among sequences has a negligible effect.</li>
+<li>Throughput rises with the number of tokens at first and then saturates: a memory-bound region and a compute-bound region, the knee of formula (135.4).</li>
+<li>Because the throughput curve is concave, a fixed amount of work is processed fastest when it is divided into passes of <b>equal size</b>.</li></ul>
+<p>From this follows <b>Dynamic SplitFuse</b>: long prompts are split into smaller chunks spread over several forward passes, with only the final pass producing a token, and short prompts are composed (fused) to fill a target token budget exactly; a short prompt may also be split so the pass has exactly the target size. [Certain: DeepSpeed-FastGen.] The third observation has a short proof. Write the time of a pass as a function \(t(n)\) of its token count. With our cost model, \(t\) is the maximum of functions that are linear or convex in \(n\), so it is convex. For \(m\) passes that together process a fixed number of tokens, Jensen’s inequality gives</p>
+<div class="eq">\[ \sum_{k=1}^{m} t(n_k) \;\ge\; m\; t\!\left(\bar n\right), \qquad \bar n = \frac{1}{m}\sum_{k=1}^{m} n_k \tag{135.9} \]</div>
+<p>Equal passes are never slower than unequal ones. Intuition: a small pass wastes the compute that its weight read paid for (it sits on the flat part of Figure 2), and a large pass pays full price for every token above the knee. For Llama 3 8B on an H100, two passes with 580 and 20 tokens take 14.30 ms; two passes with 300 tokens each take 9.79 ms, for the same 600 tokens.</p>
+<p>So Sarathi-Serve and Dynamic SplitFuse are two routes to the same iteration shape: decodes plus a fixed-size share of prefill chunks. Sarathi-Serve derives the size from a latency target; DeepSpeed-FastGen derives it from the throughput curve. [Likely: this is our reading of the two papers; the implementations differ in details such as how many prompts may share one pass.] DeepSpeed-FastGen reports up to 2.3 times higher effective throughput, about 2 times lower average latency and up to 3.7 times lower token-level tail latency than vLLM, on Llama 2 models (for example, Llama 2 70B with tensor parallelism on four A100-80GB GPUs). [Certain: DeepSpeed-FastGen abstract and evaluation; the vLLM version compared was the one of late 2023, before vLLM added chunked prefill.] Sarathi-Serve reports, under tail-latency targets and also against vLLM, 2.6 times higher serving capacity for Mistral-7B on one A100, up to 3.7 times for Yi-34B on two A100s, and up to 5.6 times for Falcon-180B with pipeline parallelism. [Certain: Sarathi-Serve abstract.]</p>
+<aside class="note side"><span class="nt">Note</span>Chunked prefill is one answer to prefill–decode interference: share the GPU, but in small slices. The other answer is to give prefill and decode <b>separate GPUs</b> and move the KV cache between them (Splitwise, DistServe). That is called prefill–decode disaggregation and is the topic of <a href="../inference/distributed-serving-and-prefill-decode-disaggregation.html">session 137</a>.</aside>
+
+<h2>Effect on TTFT, TPOT and throughput</h2>
+<h3>The metrics</h3>
+<p><a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a> defined the latency metrics. Here we need them per request. Request \(i\) arrives at \(a_i\) and its tokens appear at times \(\tau_{i,1} \lt \tau_{i,2} \lt \dots \lt \tau_{i,n_i}\):</p>
+<div class="eq">\[ \text{TTFT}_i = \tau_{i,1} - a_i, \qquad \text{TBT}_{i,k} = \tau_{i,k} - \tau_{i,k-1}, \qquad \text{TPOT}_i = \frac{\tau_{i,n_i} - \tau_{i,1}}{n_i - 1}, \qquad X = \frac{\sum_i n_i}{\text{time span}} \tag{135.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>TTFT</dt><dd>time to first token: queueing plus the whole prefill (all chunks)</dd>
+<dt>TBT</dt><dd>time between tokens: one gap; its tail (p99, max) shows stalls</dd>
+<dt>TPOT</dt><dd>time per output token: the average gap of one request; a mean can hide a few long stalls, which is why Sarathi-Serve targets the p99 of TBT</dd>
+<dt>\(X\)</dt><dd>throughput: output tokens per second over the whole run</dd></dl>
+<p>Each scheduler moves these numbers in a different direction:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Scheduler</th><th>TTFT</th><th>TBT tail</th><th>Throughput</th></tr></thead><tbody>
+<tr><td>Request-level batching (FasterTransformer)</td><td>Very long: new requests wait for the whole batch</td><td>Low: decodes are never interrupted</td><td>Low: rows idle while the batch drains</td></tr>
+<tr><td>Continuous, prefill-first (vLLM before chunking)</td><td>Short at low load</td><td>Long: decodes pause for every prefill</td><td>High</td></tr>
+<tr><td>Continuous, hybrid with whole prompts (Orca)</td><td>Short</td><td>Long: the iteration is as long as the prefill</td><td>High</td></tr>
+<tr><td>Chunked prefill, stall-free (Sarathi-Serve, SplitFuse)</td><td>Short if \(K\) is not too small; slightly longer for one long prompt</td><td>Bounded by \(K\): about \(t(K)\)</td><td>High; compute and memory overlap in every iteration</td></tr></tbody></table></div>
+<h3>A small serving simulator</h3>
+<p>Figure 4 runs all four schedulers on the same seeded trace of 200 requests with formula (135.3) as the cost of each iteration. Prompt lengths are log-uniform between 64 and 4,096 tokens (mean 830), output lengths are exponential with mean 128 (cut to 8 to 512; mean 108), arrivals are Poisson, at most 64 requests run at once, and the whole-prompt schedulers put at most 8,192 prompt tokens into one iteration.</p>
+<figure class="fig" id="cb-sim"><div class="fig-body">
+<div class="controls"><span class="seg" id="cb-sim-mode"><button type="button" data-v="static" aria-pressed="false">Request-level</button><button type="button" data-v="prefill" aria-pressed="false">Prefill-first</button><button type="button" data-v="orca" aria-pressed="true">Orca hybrid</button><button type="button" data-v="chunked" aria-pressed="false">Chunked prefill</button></span></div>
+<div class="cb-grid">
+<label for="cb-sim-l">Arrival rate \(\lambda\)</label><input type="range" id="cb-sim-l" min="0" max="9" step="1" value="6"><output id="cb-sim-lv"></output>
+<label for="cb-sim-k">Token budget \(K\) (chunked only)</label><input type="range" id="cb-sim-k" min="0" max="8" step="1" value="3"><output id="cb-sim-kv"></output></div>
+<div class="scroll-x"><svg id="cb-sim-svg" class="cb-svg" viewBox="0 0 640 325" role="img" aria-label="Tokens per iteration and iteration length over half a second of a simulated server"></svg></div>
+<div class="cb-leg"><span style="--c:var(--q-soft)">decode tokens</span><span style="--c:var(--k-soft)">prefill tokens</span><span style="--c:var(--tc)">iteration length</span></div>
+<div class="readout" id="cb-sim-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A seeded event simulation of one Llama 3 8B server on an H100 (roofline cost of formula 135.3; real engines are slower, so read the numbers as a comparison, not as a prediction). Top: the tokens in each iteration between 1.0 and 1.5 s, split into decode and prefill tokens (square-root scale). Bottom: the length of each iteration, which is the gap every running user sees before their next token. Metrics are over all 200 requests.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Start with Orca at 45 requests/s: tall orange bars are whole prompts, and the iteration length jumps each time one is processed; mean TTFT is 64.6 ms, p99 TBT 68.0 ms, the longest gap 112.9 ms, throughput 3,326 tokens/s. Switch to prefill-first: the decodes now pause during prefill-only iterations, and the p99 TBT rises to 138.5 ms (max 315.7 ms), with TTFT 132.4 ms. Switch to request-level: no stalls at all (p99 TBT 7.4 ms), but the mean TTFT is 4,650 ms and throughput drops to 1,444 tokens/s. Now choose chunked prefill with \(K = 512\): every iteration has about 512 tokens, the gaps stay near 9 ms (p99 9.06 ms), TTFT is 49.1 ms and throughput 3,511 tokens/s. Move \(K\) to 128: the decodes use almost the whole budget, prompts starve, and TTFT explodes to about 1.8 s. Lower the rate to 12/s: all continuous schedulers reach the same throughput (about 1,290 tokens/s, the offered load), but their TBT tails still differ.</p></details></figure>
+<p>Three results from the simulator are worth remembering. First, at moderate and high load, chunked prefill with a sensible budget improves the TBT tail by almost an order of magnitude <b>and</b> does not hurt TTFT or throughput. In this model it even helps both, because every iteration overlaps the memory-bound decodes with compute-bound prefill tokens, instead of alternating memory-bound and compute-bound iterations. Second, the budget has a sweet spot: too small and prompts starve; too large and the stalls return. Third, at low load all continuous schedulers give the same throughput (they all keep up with the traffic), and the differences are only in latency. Figure 5 sweeps the budget.</p>
+<figure class="fig" id="cb-sweep"><div class="fig-body">
+<div class="cb-grid">
+<label for="cb-sweep-l">Arrival rate \(\lambda\)</label><input type="range" id="cb-sweep-l" min="0" max="9" step="1" value="6"><output id="cb-sweep-lv"></output>
+<label for="cb-sweep-s">p99 TBT target</label><input type="range" id="cb-sweep-s" min="5" max="60" step="1" value="10"><output id="cb-sweep-sv"></output></div>
+<div class="scroll-x"><svg id="cb-sweep-svg" class="cb-svg" viewBox="0 0 640 290" role="img" aria-label="Mean time to first token and 99th percentile time between tokens against the token budget, compared with Orca"></svg></div>
+<div class="cb-leg"><span style="--c:var(--k)">mean TTFT (chunked)</span><span style="--c:var(--q)">p99 TBT (chunked)</span><span style="--c:var(--v)">TBT target</span></div>
+<div class="readout" id="cb-sweep-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> The simulator of Figure 4 with chunked prefill for nine token budgets from 128 to 4,096 (log scales; values above 10 s are cut). Dashed lines: Orca with whole prompts at the same load. The green circle is the budget with the lowest mean TTFT among those that meet the p99 TBT target, which is how Sarathi-Serve frames the choice.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>At 45 requests/s the blue curve (p99 TBT) rises steadily with \(K\): 5.7 ms at 128, 9.1 ms at 512, 35.5 ms at 2,048, and at 4,096 it meets Orca’s 68 ms, because almost no prompt is longer than 4,096 tokens and chunking stops. The orange curve (TTFT) is U-shaped: 1.76 s at 128 (starvation), about 49 ms between 384 and 1,024, then slowly up towards Orca’s 64.6 ms. With a 10 ms target the best budget is 512 (TTFT 49.1 ms). Tighten the target to 6 ms: only 128 qualifies, at a TTFT of 1.76 s; a 7 ms target allows 384 (49.6 ms). At 60 requests/s the starvation part widens: 256 now gives a mean TTFT of 448 ms.</p></details></figure>
+
+<h2>The code</h2>
+<p>The first program is a tiny serving engine in PyTorch. One function, <code>step</code>, runs one iteration over any mix of prefill chunks and decode tokens, with selective batching: all new tokens are stacked for the linear layers, attention is done per request with its own KV cache and a causal mask that is offset by the number of cached tokens. A stall-free scheduler with a token budget of 6 serves three requests that arrive at different iterations. At the end, the program checks that every request got exactly the tokens and logits it gets when run alone with a whole prefill. It runs on a CPU in about a second.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+torch.set_default_dtype(torch.float64)            <span class="cm"># float64: batched and single runs agree to ~1e-15</span>
+V, d, H, L = 64, 32, 4, 2                         <span class="cm"># vocab, width, heads, layers</span>
+dh = d // H
+
+<span class="kw2">class</span> Block(torch.nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.n1, s.n2 = torch.nn.LayerNorm(d), torch.nn.LayerNorm(d)
+        s.qkv, s.o = torch.nn.Linear(d, 3 * d), torch.nn.Linear(d, d)
+        s.ff = torch.nn.Sequential(torch.nn.Linear(d, 4 * d), torch.nn.GELU(), torch.nn.Linear(4 * d, d))
+
+<span class="kw2">class</span> TinyLM(torch.nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.emb, s.pos = torch.nn.Embedding(V, d), torch.nn.Embedding(128, d)
+        s.blocks = torch.nn.ModuleList([Block() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)])
+        s.head = torch.nn.Linear(d, V)
+
+model = TinyLM().eval()
+
+@torch.no_grad()
+<span class="kw2">def</span> step(work, cache):
+    """One engine iteration. work: list of (rid, new_token_ids); any mix of prefill chunks and decodes.
+    cache[rid] = list of L (K, V) pairs, each (H, T_cached, dh). Returns the last logits of each item."""
+    sizes = [len(t) <span class="kw2">for</span> _, t <span class="kw2">in</span> work]
+    starts = [cache[r][0][0].shape[1] <span class="kw2">if</span> r <span class="kw2">in</span> cache <span class="kw2">else</span> 0 <span class="kw2">for</span> r, _ <span class="kw2">in</span> work]
+    ids = torch.tensor([x <span class="kw2">for</span> _, t <span class="kw2">in</span> work <span class="kw2">for</span> x <span class="kw2">in</span> t])                       <span class="cm"># flat: (n_tok,)</span>
+    pos = torch.cat([torch.arange(j, j + n) <span class="kw2">for</span> j, n <span class="kw2">in</span> zip(starts, sizes)])
+    x = model.emb(ids) + model.pos(pos)                                       <span class="cm"># (n_tok, d)</span>
+    <span class="kw2">for</span> l, blk <span class="kw2">in</span> enumerate(model.blocks):
+        qkv = blk.qkv(blk.n1(x))                     <span class="cm"># ONE matmul for all tokens of all requests</span>
+        outs = []
+        <span class="kw2">for</span> (r, _), part, j <span class="kw2">in</span> zip(work, qkv.split(sizes), starts):          <span class="cm"># attention: per request</span>
+            q, k, v = [t.view(-1, H, dh).transpose(0, 1) <span class="kw2">for</span> t <span class="kw2">in</span> part.split(d, -1)]
+            <span class="kw2">if</span> r <span class="kw2">in</span> cache <span class="kw2">and</span> l &lt; len(cache[r]):
+                k = torch.cat([cache[r][l][0], k], 1); v = torch.cat([cache[r][l][1], v], 1)
+            cache.setdefault(r, [])
+            <span class="kw2">if</span> l &lt; len(cache[r]): cache[r][l] = (k, v)
+            <span class="kw2">else</span>: cache[r].append((k, v))
+            n = q.shape[1]
+            mask = torch.arange(j + n)[<span class="kw2">None</span>, :] &lt;= (j + torch.arange(n))[:, <span class="kw2">None</span>]   <span class="cm"># causal with offset j</span>
+            outs.append(F.scaled_dot_product_attention(q, k, v, attn_mask=mask).transpose(0, 1).reshape(n, d))
+        x = x + blk.o(torch.cat(outs))               <span class="cm"># merge back, ONE matmul again</span>
+        x = x + blk.ff(blk.n2(x))
+    last = torch.tensor(sizes).cumsum(0) - 1
+    <span class="kw2">return</span> model.head(x[last])                       <span class="cm"># (n_items, V)</span>
+
+<span class="kw2">def</span> alone(prompt, n_new):
+    """Reference: one request, whole prompt in one step, then plain decode."""
+    cache, toks, logs = {}, [], []
+    lg = step([(0, prompt)], cache)[0]
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(n_new):
+        t = int(lg.argmax()); toks.append(t); logs.append(lg)
+        lg = step([(0, [t])], cache)[0]
+    <span class="kw2">return</span> toks, torch.stack(logs)
+
+<span class="cm"># requests: (arrival iteration, prompt, number of new tokens)</span>
+g = torch.Generator().manual_seed(1)
+reqs = {"A": (0, torch.randint(1, V, (11,), generator=g).tolist(), 5),
+        "B": (1, torch.randint(1, V, (7,), generator=g).tolist(), 5),
+        "C": (3, torch.randint(1, V, (13,), generator=g).tolist(), 5)}
+
+K = 6                                                <span class="cm"># token budget per iteration</span>
+cache, done_p, out, logs, it = {}, {}, {r: [] <span class="kw2">for</span> r <span class="kw2">in</span> reqs}, {r: [] <span class="kw2">for</span> r <span class="kw2">in</span> reqs}, 0
+<span class="kw2">while</span> any(len(out[r]) &lt; reqs[r][2] <span class="kw2">for</span> r <span class="kw2">in</span> reqs):
+    work = [(r, [out[r][-1]]) <span class="kw2">for</span> r <span class="kw2">in</span> reqs <span class="kw2">if</span> 0 &lt; len(out[r]) &lt; reqs[r][2]]    <span class="cm"># 1) all decodes first</span>
+    left = K - len(work)
+    <span class="kw2">for</span> r, (a, p, _) <span class="kw2">in</span> reqs.items():                                          <span class="cm"># 2) prefill chunks, FCFS</span>
+        <span class="kw2">if</span> a &lt;= it <span class="kw2">and</span> done_p.get(r, 0) &lt; len(p) <span class="kw2">and</span> left &gt; 0:
+            c = min(left, len(p) - done_p.get(r, 0))
+            work.append((r, p[done_p.get(r, 0):done_p.get(r, 0) + c])); left -= c
+    lg = step(work, cache)
+    <span class="kw2">for</span> (r, t), row <span class="kw2">in</span> zip(work, lg):
+        <span class="kw2">if</span> len(out[r]) == 0:                          <span class="cm"># a prefill chunk</span>
+            done_p[r] = done_p.get(r, 0) + len(t)
+            <span class="kw2">if</span> done_p[r] &lt; len(reqs[r][1]): <span class="kw2">continue</span>  <span class="cm"># not the last chunk: logits unused</span>
+        out[r].append(int(row.argmax())); logs[r].append(row)
+    print(f"iter {it}: " + " ".join(f"{r}{'+1' <span class="kw2">if</span> len(t) == 1 <span class="kw2">and</span> len(out[r]) &gt; 1 <span class="kw2">else</span> ':' + str(len(t))}" <span class="kw2">for</span> r, t <span class="kw2">in</span> work))
+    it += 1
+
+<span class="kw2">for</span> r, (a, p, n) <span class="kw2">in</span> reqs.items():
+    ref, ref_logs = alone(p, n)
+    diff = (torch.stack(logs[r]) - ref_logs).abs().max().item()
+    print(r, out[r], "same as alone:", out[r] == ref, f"max logit diff {diff:.1e}")</pre>
+<p>With PyTorch 2.8 on a CPU it prints the schedule, where <code>A:6</code> means six prompt tokens of A and <code>A+1</code> one decode token of A:</p>
+<pre class="code">iter 0: A:6
+iter 1: A:5 B:1
+iter 2: A+1 B:5
+iter 3: A+1 B:1 C:4
+iter 4: A+1 B+1 C:4
+iter 5: A+1 B+1 C:4
+iter 6: B+1 C:1
+iter 7: B+1 C+1
+iter 8: C+1
+iter 9: C+1
+iter 10: C+1
+A [11, 53, 21, 14, 42] same as alone: True max logit diff 6.7e-16
+B [8, 6, 55, 58, 41] same as alone: True max logit diff 6.7e-16
+C [53, 55, 11, 62, 19] same as alone: True max logit diff 4.4e-16</pre>
+<p>Read the schedule. A’s 11-token prompt is split 6 + 5; B’s 7-token prompt 1 + 5 + 1, filling whatever the decodes leave; C’s 13 tokens go 4 + 4 + 4 + 1 next to three decodes. No iteration has more than 6 tokens, and no decode is ever skipped. The token IDs may change with the PyTorch version; the equality checks should not. In float32 the logits differ by about \(10^{-7}\), and in rare cases this can flip a greedy argmax between two almost equal tokens. Real engines see the same effect: batched and unbatched runs are equal in exact arithmetic, not always bit for bit.</p>
+<p>The second program, in plain Python, is the simulator behind Figures 4 and 5 (the same seeded generator, so it prints the same numbers):</p>
+<pre class="code"><span class="kw2">import</span> math
+N, L, DA, SKV, BW, PI = 8.03e9, 32, 4096, 131072, 3.35e12, 989e12   <span class="cm"># Llama 3 8B, one H100 SXM</span>
+BMAX, PMAX = 64, 8192                         <span class="cm"># max running requests, max prompt tokens per step</span>
+
+<span class="kw2">def</span> step_time(dec, pre):
+    """Roofline time of one iteration. dec: contexts of decodes; pre: (c, j) prefill chunks."""
+    F = 2 * N * (len(dec) + sum(c <span class="kw2">for</span> c, _ <span class="kw2">in</span> pre)) + 4 * L * DA * (
+        sum(dec) + sum(c * (j + c / 2) <span class="kw2">for</span> c, j <span class="kw2">in</span> pre))
+    by = 2 * N + SKV * (sum(dec) + sum(j + c <span class="kw2">for</span> c, j <span class="kw2">in</span> pre))
+    <span class="kw2">return</span> max(F / PI, by / BW)
+
+<span class="kw2">def</span> mulberry32(a):                            <span class="cm"># the same seeded generator as the figures</span>
+    s = [a]
+    <span class="kw2">def</span> r():
+        s[0] = (s[0] + 0x6D2B79F5) &amp; 0xFFFFFFFF; a = s[0]
+        t = ((a ^ (a &gt;&gt; 15)) * (1 | a)) &amp; 0xFFFFFFFF
+        t = ((t + (((t ^ (t &gt;&gt; 7)) * (61 | t)) &amp; 0xFFFFFFFF)) &amp; 0xFFFFFFFF) ^ t
+        <span class="kw2">return</span> (t ^ (t &gt;&gt; 14)) / 4294967296
+    <span class="kw2">return</span> r
+
+<span class="kw2">def</span> trace(lam, n=200, seed=11):
+    r, t, out = mulberry32(seed), 0.0, []
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(n):
+        t += -math.log(1 - r()) / lam                                  <span class="cm"># Poisson arrivals</span>
+        P = round(64 * 64 ** r())                                      <span class="cm"># prompt 64..4096, log-uniform</span>
+        G = min(512, max(8, round(-128 * math.log(1 - r()))))          <span class="cm"># output: exponential, mean 128</span>
+        out.append(dict(a=t, P=P, G=G, done=0, times=[]))
+    <span class="kw2">return</span> out
+
+<span class="kw2">def</span> simulate(mode, lam, K=512):
+    R = trace(lam); n = len(R)
+    t, nxt, wait, run, pref, static, fin = 0.0, 0, [], [], [], <span class="kw2">None</span>, 0
+    <span class="kw2">def</span> emit(q):
+        <span class="kw2">nonlocal</span> fin
+        q["times"].append(t); fin += len(q["times"]) == q["G"]
+    <span class="kw2">while</span> fin &lt; n:
+        <span class="kw2">while</span> nxt &lt; n <span class="kw2">and</span> R[nxt]["a"] &lt;= t: wait.append(R[nxt]); nxt += 1
+        <span class="kw2">if</span> <span class="kw2">not</span> (wait <span class="kw2">or</span> run <span class="kw2">or</span> pref <span class="kw2">or</span> static): t = R[nxt]["a"]; <span class="kw2">continue</span>
+        <span class="kw2">if</span> mode == "static":                                           <span class="cm"># request-level batching</span>
+            <span class="kw2">if</span> static <span class="kw2">is</span> <span class="kw2">None</span>:
+                static, wait = wait[:BMAX], wait[BMAX:]
+                t += step_time([], [(q["P"], 0) <span class="kw2">for</span> q <span class="kw2">in</span> static])
+                <span class="kw2">for</span> q <span class="kw2">in</span> static: emit(q)
+            <span class="kw2">else</span>:                                                      <span class="cm"># finished rows still run</span>
+                t += step_time([q["P"] + len(q["times"]) <span class="kw2">for</span> q <span class="kw2">in</span> static], [])
+                <span class="kw2">for</span> q <span class="kw2">in</span> static:
+                    <span class="kw2">if</span> len(q["times"]) &lt; q["G"]: emit(q)
+            <span class="kw2">if</span> all(len(q["times"]) &gt;= q["G"] <span class="kw2">for</span> q <span class="kw2">in</span> static): static = <span class="kw2">None</span>
+            <span class="kw2">continue</span>
+        chunks = []
+        <span class="kw2">if</span> mode <span class="kw2">in</span> ("prefill", "orca"):                                <span class="cm"># whole prompts, FCFS</span>
+            tok = 0
+            <span class="kw2">while</span> wait <span class="kw2">and</span> len(run) + len(chunks) &lt; BMAX <span class="kw2">and</span> (<span class="kw2">not</span> chunks <span class="kw2">or</span> tok + wait[0]["P"] &lt;= PMAX):
+                q = wait.pop(0); chunks.append((q, q["P"])); tok += q["P"]
+            dec = [] <span class="kw2">if</span> (mode == "prefill" <span class="kw2">and</span> chunks) <span class="kw2">else</span> list(run)  <span class="cm"># prefill-first: decodes wait</span>
+        <span class="kw2">else</span>:                                                          <span class="cm"># stall-free chunked prefill</span>
+            dec, left = list(run), K - len(run)
+            <span class="kw2">for</span> q <span class="kw2">in</span> pref:
+                <span class="kw2">if</span> left &gt; 0: c = min(q["P"] - q["done"], left); chunks.append((q, c)); left -= c
+            <span class="kw2">while</span> left &gt; 0 <span class="kw2">and</span> wait <span class="kw2">and</span> len(run) + len(pref) &lt; BMAX:
+                q = wait.pop(0); pref.append(q); c = min(q["P"], left); chunks.append((q, c)); left -= c
+        t += step_time([q["P"] + len(q["times"]) <span class="kw2">for</span> q <span class="kw2">in</span> dec], [(c, q["done"]) <span class="kw2">for</span> q, c <span class="kw2">in</span> chunks])
+        <span class="kw2">for</span> q <span class="kw2">in</span> dec:
+            emit(q)
+            <span class="kw2">if</span> len(q["times"]) == q["G"]: run.remove(q)
+        <span class="kw2">for</span> q, c <span class="kw2">in</span> chunks:
+            q["done"] += c
+            <span class="kw2">if</span> q["done"] == q["P"]:
+                <span class="kw2">if</span> q <span class="kw2">in</span> pref: pref.remove(q)
+                emit(q)
+                <span class="kw2">if</span> len(q["times"]) &lt; q["G"]: run.append(q)
+    ttft = sum(q["times"][0] - q["a"] <span class="kw2">for</span> q <span class="kw2">in</span> R) / n
+    tbt = sorted(b - a <span class="kw2">for</span> q <span class="kw2">in</span> R <span class="kw2">for</span> a, b <span class="kw2">in</span> zip(q["times"], q["times"][1:]))
+    thr = sum(q["G"] <span class="kw2">for</span> q <span class="kw2">in</span> R) / (max(q["times"][-1] <span class="kw2">for</span> q <span class="kw2">in</span> R) - R[0]["a"])
+    <span class="kw2">return</span> ttft, tbt[int(0.99 * len(tbt))], tbt[-1], thr
+
+<span class="kw2">for</span> mode, K <span class="kw2">in</span> [("static", 0), ("prefill", 0), ("orca", 0), ("chunked", 256), ("chunked", 512), ("chunked", 2048)]:
+    ttft, p99, mx, thr = simulate(mode, 45, K)
+    print(f"{mode:8s} K={K:4d}  mean TTFT {ttft*1e3:7.1f} ms  p99 TBT {p99*1e3:6.1f} ms"
+          f"  max TBT {mx*1e3:6.1f} ms  {thr:5.0f} tokens/s")</pre>
+<p>With Python 3.9 it prints, at 45 requests per second:</p>
+<pre class="code">static   K=   0  mean TTFT  4649.9 ms  p99 TBT    7.4 ms  max TBT    7.4 ms   1444 tokens/s
+prefill  K=   0  mean TTFT   132.4 ms  p99 TBT  138.5 ms  max TBT  315.7 ms   3157 tokens/s
+orca     K=   0  mean TTFT    64.6 ms  p99 TBT   68.0 ms  max TBT  112.9 ms   3326 tokens/s
+chunked  K= 256  mean TTFT   126.5 ms  p99 TBT    6.3 ms  max TBT    6.3 ms   3540 tokens/s
+chunked  K= 512  mean TTFT    49.1 ms  p99 TBT    9.1 ms  max TBT    9.2 ms   3511 tokens/s
+chunked  K=2048  mean TTFT    56.3 ms  p99 TBT   35.5 ms  max TBT   36.1 ms   3345 tokens/s</pre>
+<p>The simulator leaves out many things a real engine has: kernel efficiency below the roofline, the CPU time of the scheduler itself, sampling, preemption when the KV cache is full, and prefix caching. It is a tool for intuition about the shape of the trade-off, not a benchmark.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What matters</th><th>Typical choice</th></tr></thead><tbody>
+<tr><td>Chat assistants and coding assistants (streaming)</td><td>TTFT and a smooth stream (p99 TBT)</td><td>Continuous batching with chunked prefill; a budget from the TBT target</td></tr>
+<tr><td>RAG and long-document question answering</td><td>Prompts of thousands of tokens arrive while others stream</td><td>Chunked prefill is essential: without it, every retrieval-heavy prompt stalls all users</td></tr>
+<tr><td>Offline batch jobs: synthetic data, evaluation, RL rollouts</td><td>Throughput only</td><td>Continuous batching with a large budget (less chunking overhead), large \(B_{\max}\)</td></tr>
+<tr><td>Agents and multi-turn tool use</td><td>Many short follow-up prompts on long shared contexts</td><td>Chunked prefill plus prefix caching (<a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>), so only the new part is prefilled</td></tr>
+<tr><td>Video question answering and Video-RAG with a VLM</td><td>A clip can become thousands of visual tokens in one prompt</td><td>Chunk the visual-token prefill so that a long video does not stall text users on the same GPU</td></tr>
+<tr><td>Live video: key-moment detection and captioning on many streams</td><td>Each stream sends new frames all the time; a per-stream deadline</td><td>Each new segment is a prefill chunk on that stream’s cache; the budget keeps every stream’s output on time</td></tr>
+<tr><td>Video retrieval and fingerprinting (embedding models)</td><td>One forward pass per clip, no decode</td><td>Plain dynamic batching (<a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>); continuous batching gives nothing without a decode phase</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Thinking continuous batching alone solves latency.</b> It fixes TTFT and idle rows, but whole-prompt prefills still stall every running user. You need chunked prefill (or disaggregation) for a good TBT tail.</li>
+<li><b>Looking only at mean TPOT.</b> A few 300 ms stalls hardly change the mean of a 1,000-token answer, but users see the stream freeze. Track p99 and max TBT.</li>
+<li><b>Choosing the token budget without the decode batch.</b> The prefill room is \(K - B\). A budget of 128 with 64 running decodes leaves 64 prefill tokens per iteration, and prompts starve (TTFT 1.76 s in Figure 5).</li>
+<li><b>Odd chunk sizes.</b> A chunk of 257 tokens wastes most of a second tile; Sarathi-Serve measured up to 32% slower prefill than with 256. Use multiples of the kernel tile size.</li>
+<li><b>Forgetting the offset in the causal mask or the positions of a chunk.</b> Chunk \(k\) must use positions \(j, \dots, j + c - 1\) and attend to all \(j\) cached tokens; otherwise the output changes silently. Test against a whole prefill, as the code does.</li>
+<li><b>Sampling a token after every chunk.</b> Only the last chunk of a prompt produces a token; the logits of earlier chunks must be discarded.</li>
+<li><b>Expecting chunking to save compute.</b> The attention FLOPs are exactly the same (formula 135.7); chunking only moves work to where the GPU has idle compute, and it adds KV-cache reads.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is continuous batching, and why does it beat request-level batching for LLMs?<span class="lvl">basic</span></summary><div class="ans">The scheduler rebuilds the batch at every iteration (one forward pass): finished requests leave at once, freeing their KV cache, and waiting requests join at the next iteration. Request-level batching keeps a batch until its longest request ends, so finished rows idle (padding) and new requests wait for the whole batch. Orca introduced it and reported 36.9 times the throughput of FasterTransformer on GPT-3 175B at the same latency. In the simulator of this session, mean TTFT drops from 4.6 s to 65 ms and throughput more than doubles.</div></details>
+<details class="qa"><summary>What is selective batching and why is it needed?<span class="lvl">core</span></summary><div class="ans">In one iteration the requests have different numbers of new tokens (a prompt or a chunk, or one decode token) and different cache lengths, so their tensors do not form a rectangle. Selective batching stacks all new tokens into one \((\sum n_i, d)\) matrix for the operations where position does not matter (QKV, output projection, FFN), so each weight is read once, and splits by request only for attention, where each request uses its own KV cache. No padding is needed. Modern engines do the split attention in one variable-length or paged kernel.</div></details>
+<details class="qa"><summary>What is a generation stall, and which schedulers cause it?<span class="lvl">core</span></summary><div class="ans">A long pause between two tokens of a running request because a prefill was processed. Prefill-first schedulers (original vLLM) pause decodes during a prefill-only iteration; hybrid schedulers with whole prompts (Orca) make the decode iteration as long as the prefill. For Llama 3 8B on an H100 with 32 decodes at 1,024 tokens, a 2,048-token prompt turns a 6.1 ms gap into 40.4 ms (prefill-first) or 34.9 ms (hybrid). Request-level batching never stalls decodes, but has very long TTFT.</div></details>
+<details class="qa"><summary>Why can a prefill chunk ride along with decodes almost for free?<span class="lvl">core</span></summary><div class="ans">A decode iteration is memory-bound: it reads all weights to process only \(B\) tokens. The compute is idle until the iteration has about \(n^{*} = b\pi/(2\beta)\) tokens, 295 for BF16 on an H100, independent of model size. Up to that point extra tokens cost almost nothing (only their KV traffic). With 32 decodes at \(T = 1024\), up to 340 prefill tokens add nothing to the 6.08 ms iteration in the roofline model. Above the knee each token costs \(2N/\pi\), about 16 µs for an 8B model.</div></details>
+<details class="qa"><summary>Is chunked prefill exact? What does it cost?<span class="lvl">core</span></summary><div class="ans">Yes, up to floating-point rounding: causal attention for each token only needs earlier keys and values, which are already in the cache, provided the chunk uses the right positions and a causal mask offset by the cached length. The attention FLOPs are unchanged (\(\sum 4Ldc(kc + c/2) = 2LdP^2\)). The costs are extra KV reads (about \(s_{\text{kv}} P^2/(2c)\) in total), weights read once per chunk (shared with decodes), lower kernel efficiency for small chunks (Sarathi-Serve: up to about 25% prefill overhead at chunk 512 on Yi-34B), and a slightly longer TTFT for the chunked request.</div></details>
+<details class="qa"><summary>How would you choose the token budget (chunk size)?<span class="lvl">advanced</span></summary><div class="ans">From the TBT target: \(K(\tau) = \max\{n : t(n) \le \tau\}\), measured by profiling the real iteration time for a typical decode batch (Sarathi-Serve uses a profiler for this). Then check three things: \(K\) must be clearly larger than the expected decode batch, or prompts starve; it should be a multiple of the matmul tile size; and it should not be so small that the KV re-reads and kernel inefficiency dominate. Sarathi-Serve used 512 for strict and 2,048 for relaxed targets. In the simulator at 45 requests/s with a 10 ms p99 TBT target, the best budget is 512 (mean TTFT 49.1 ms).</div></details>
+<details class="qa"><summary>What is Dynamic SplitFuse and how does it relate to Sarathi-Serve?<span class="lvl">core</span></summary><div class="ans">DeepSpeed-FastGen’s scheduler: long prompts are split into chunks over several forward passes (only the last one produces a token), and short prompts are packed together to fill a fixed token budget exactly. It is motivated by throughput: pass time depends mainly on the token count, and equal-size passes are best because pass time is convex in the token count (Jensen). Sarathi-Serve reaches almost the same iteration shape from a latency target. Both keep each forward pass near a fixed size with all decodes included.</div></details>
+<details class="qa"><summary>Prove that equal-sized forward passes are best.<span class="lvl">advanced</span></summary><div class="ans">Let \(t(n)\) be the time of a pass with \(n\) tokens. In the roofline model \(t(n) = \max(\text{compute}(n), \text{memory}(n))\), with compute linear plus a convex attention term and memory linear in \(n\); a maximum of convex functions is convex. For passes \(n_1, \dots, n_m\) with a fixed sum, Jensen gives \(\sum t(n_k) \ge m\,t(\bar n)\). Example: 600 tokens as 580 + 20 take 14.30 ms on an H100 for Llama 3 8B; as 300 + 300 they take 9.79 ms. The small pass wastes the compute its weight read paid for.</div></details>
+<details class="qa"><summary>How do TTFT, TBT and throughput change when you increase the token budget?<span class="lvl">core</span></summary><div class="ans">TBT grows roughly like the iteration time \(t(K)\) once \(K\) is above the knee. TTFT first falls fast (a tiny budget starves prefills, because the room is \(K - B\)), then flattens, and at very large budgets rises again towards the whole-prompt behaviour, because long prompts block the queue. Throughput is highest near the point where compute and memory are balanced in each iteration and changes little at low load, where all schedulers just keep up with the traffic. In the simulator at 45 requests/s: \(K = 128\) gives TTFT 1.76 s, \(K = 512\) gives 49.1 ms with p99 TBT 9.1 ms, \(K = 2048\) gives 56.3 ms with 35.5 ms.</div></details>
+<details class="qa"><summary>When would you use prefill–decode disaggregation instead of chunked prefill?<span class="lvl">advanced</span></summary><div class="ans">Chunked prefill shares each GPU between the phases; interference is reduced but not removed (a budget that is good for TBT can make TTFT worse, and the KV re-reads grow with prompt length). Disaggregation (Splitwise, DistServe) runs prefill and decode on different GPUs and sends the KV cache over the network, so each pool can be sized and tuned for its own SLO (TTFT for prefill, TBT for decode). It pays for KV transfer and needs enough traffic to keep both pools busy. Very long prompts and strict separate SLOs favour disaggregation; a single GPU or small deployment favours chunked prefill.</div></details>
+<details class="qa"><summary>Why does chunked prefill also help pipeline parallelism?<span class="lvl">advanced</span></summary><div class="ans">With pipeline parallelism, micro-batches flow through stages one after another. If one micro-batch is a long prefill and the next a short decode, the stages wait for each other and the pipeline has bubbles. Chunked prefill with a fixed budget makes every micro-batch about the same size and time, so the stages stay busy. Sarathi reported 6.29 times fewer bubbles and 1.91 times end-to-end throughput for GPT-3 with pipeline parallelism, and Sarathi-Serve up to 5.6 times higher serving capacity for Falcon-180B.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Compute the knee \(n^{*}\) of formula (135.4) for an H100 in FP8 (1,979 TFLOP/s dense, 3.35 TB/s, \(b = 1\)) and for an A100 in BF16 (312 TFLOP/s, 2.039 TB/s). What do you notice about the H100 numbers?</li>
+<li>Llama 3 8B on an H100 with 32 decodes at \(T = 1024\). A 4,096-token prompt arrives. What gap between tokens do the 32 users see with a prefill-first scheduler? With a hybrid whole-prompt iteration?</li>
+<li>For the same 32 decodes, use Figure 2 to find the token budget for a TBT target of 20 ms. How many iterations does a 4,096-token prompt then need?</li>
+<li>An 8,192-token prompt is prefilled in chunks of 512. How many bytes of KV cache do the chunks read and write in total (use formula 135.7 with \(s_{\text{kv}} = 131{,}072\))? How much more than a whole prefill, and how long does the extra take at 3.35 TB/s?</li>
+<li>Three passes process 900 tokens as 800 + 50 + 50. Using the simple model \(t(n) = \max(4.794 \text{ ms},\ 16.24\,\mu\text{s} \cdot n)\), compare with 300 + 300 + 300.</li>
+<li>In Figure 5 at 45 requests/s, which budget would you choose for a p99 TBT target of 20 ms, and why is it not the largest budget that meets the target?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. H100 FP8: \(1 \times 1979 / (2 \times 3.35) = 295\) tokens; A100 BF16: \(2 \times 312 / (2 \times 2.039) = 153\) tokens. The H100 knee is the same in FP8 and BF16: halving the bytes and doubling the FLOP rate cancel. 2. Prefill-first: the prefill-only iteration takes 70.96 ms, then the decode iteration 6.08 ms, so a gap of 77.0 ms. Hybrid: 71.5 ms. 3. \(K = 1{,}207\), so 1,175 prefill tokens per iteration and \(\lceil 4096/1175 \rceil = 4\) iterations. 4. \(m = 16\); \(131{,}072 \times 512 \times 16 \times 17/2 = 9.13\) GB, against \(8192 \times 131{,}072 = 1.07\) GB for a whole prefill; 8.05 GB extra, about 2.4 ms at 3.35 TB/s (hidden under about 151 ms of compute in the roofline model, but not on a real GPU). 5. \(12.99 + 4.79 + 4.79 = 22.58\) ms against \(3 \times 4.87 = 14.61\) ms: the two small passes each pay a full weight read for little work. 6. Budgets 128 to 1,024 meet 20 ms (p99 TBT from 5.7 ms at 128 to 17.9 ms at 1,024); 1,536 gives 26.7 ms and fails. Among them, the mean TTFT is lowest at 768 (48.9 ms, p99 TBT 13.6 ms), with 384 and 512 almost the same. The largest qualifying budget, 1,024, has a slightly worse TTFT (49.8 ms) and a longer TBT tail (17.9 ms), for no gain. The largest qualifying budget is not the best because, beyond the knee, a bigger budget only lengthens every iteration.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Continuous batching (Orca) rebuilds the batch at every iteration (135.1): finished requests leave, new ones join. Selective batching stacks all new tokens for the linear layers and splits only attention, so a ragged mix of prefills and decodes runs with no padding.</li>
+<li>An iteration costs \(\max(\text{compute}, \text{memory})\) (135.3). Up to about \(n^{*} = b\pi/(2\beta)\) tokens (295 on an H100) it costs one weight read; a decode batch leaves most of that compute idle (135.4).</li>
+<li>Whole-prompt prefills stall every running user: a 6 ms gap becomes 35 to 40 ms for a 2,048-token prompt on Llama 3 8B (135.5).</li>
+<li>Chunked prefill (Sarathi, Sarathi-Serve) splits prompts into chunks that ride along with the decodes under a token budget \(K(\tau)\) (135.6). It is exact, keeps attention FLOPs the same, and adds KV re-reads of about \(s_{\text{kv}}P^2/(2c)\) (135.7) and a slightly longer TTFT for the chunked request (135.8).</li>
+<li>Dynamic SplitFuse (DeepSpeed-FastGen) reaches the same shape from throughput: equal-size passes are optimal because pass time is convex in the token count (135.9).</li>
+<li>Measure per request (135.10): TTFT, the p99 and max of TBT, TPOT and throughput. In the simulator, chunked prefill with a good budget cuts the p99 TBT by 7 to 15 times without losing throughput; a budget that is too small starves prompts.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ t = \max\!\left(\frac{2Nn + 4Ld\,[\cdot]}{\pi}, \frac{bN + s_{\text{kv}}[\cdot]}{\beta}\right), \quad n^{*} = \frac{b\pi}{2\beta}, \quad K(\tau) = \max\{n : t(n) \le \tau\}, \quad \sum_k t(n_k) \ge m\,t(\bar n) \]</div>
+<h2 class="plain" id="batching-continuous-batching-chunked-prefill-split-fuse-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Yu et al. (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;Orca: A Distributed Serving System for Transformer-Based Generative Models&amp;quot;" target="_blank" rel="noopener">Orca: A Distributed Serving System for Transformer-Based Generative Models</a></li><li>Agrawal et al. (2023). <a href="https://arxiv.org/abs/2308.16369" target="_blank" rel="noopener">SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills</a></li><li>Agrawal et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve&amp;quot;" target="_blank" rel="noopener">Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></li><li>Holmes et al. (2024). <a href="https://arxiv.org/abs/2401.08671" target="_blank" rel="noopener">DeepSpeed-FastGen: High-throughput Text Generation for LLMs via MII and DeepSpeed-Inference</a></li><li>Yu et al. (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;Orca: A Distributed Serving System for Transformer-Based Generative Models&amp;quot;" target="_blank" rel="noopener">Orca: A Distributed Serving System for Transformer-Based Generative Models</a></li><li>Agrawal et al. (2023). <a href="https://arxiv.org/abs/2308.16369" target="_blank" rel="noopener">SARATHI: Efficient LLM Inference by Piggybacking Decodes with Chunked Prefills</a></li><li>Agrawal et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve&amp;quot;" target="_blank" rel="noopener">Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></li><li>Holmes et al. (2024). <a href="https://arxiv.org/abs/2401.08671" target="_blank" rel="noopener">DeepSpeed-FastGen: High-throughput Text Generation for LLMs via MII and DeepSpeed-Inference</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Zheng et al. (2023). <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">SGLang: Efficient Execution of Structured Language Model Programs</a></li><li>Zhong et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving&amp;quot;" target="_blank" rel="noopener">DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</a></li><li>Patel et al. (2023). <a href="https://arxiv.org/abs/2311.18677" target="_blank" rel="noopener">Splitwise: Efficient Generative LLM Inference Using Phase Splitting</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html"><small>Previous · session 134</small>Memory management: PagedAttention, prefix caching, RadixAttention</a><a class="next" href="../inference/scheduling-fcfs-preemption-fairness-and-slos.html"><small>Next · session 136</small>Scheduling: FCFS, preemption, fairness and SLOs</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="batching-continuous-batching-chunked-prefill-split-fuse"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const comma=n=>Math.round(n).toLocaleString("en-US");
+const fx=(v,d)=>Number(v).toFixed(d);
+function seg(el,cb){if(!el)return;el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+function setSeg(el,v){if(!el)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.v===String(v)?"true":"false"));}
+function mulberry32(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+
+/* ---------- shared cost model: Llama 3 8B (BF16) on one H100 SXM, roofline lower bound ---------- */
+const N=8.03e9,L=32,DA=4096,SKV=131072,BW=3.35e12,PI=989e12,BMAX=64,PMAX=8192;
+/* dec: array of decode contexts; pre: array of [c, j] chunks (c new tokens after j cached) */
+function stepTime(dec,pre){let nt=dec.length,sd=0,att=0,kv=0;
+ for(let i=0;i<dec.length;i++)sd+=dec[i];
+ for(let i=0;i<pre.length;i++){const c=pre[i][0],j=pre[i][1];nt+=c;att+=c*(j+c/2);kv+=j+c;}
+ const F=2*N*nt+4*L*DA*(sd+att),by=2*N+SKV*(sd+kv);return Math.max(F/PI,by/BW);}
+
+function trace(lam,n,seed){const r=mulberry32(seed);let t=0;const out=[];
+ for(let i=0;i<n;i++){t+=-Math.log(1-r())/lam;const P=Math.round(64*Math.pow(64,r()));
+  const G=Math.min(512,Math.max(8,Math.round(-128*Math.log(1-r()))));out.push({a:t,P,G,done:0,times:[]});}
+ return out;}
+
+function simulate(mode,lam,K,keep){const Rq=trace(lam,200,11),n=Rq.length;
+ let t=0,nxt=0,fin=0,stat=null;let wait=[],run=[],pref=[];const steps=[];
+ const emit=q=>{q.times.push(t);if(q.times.length===q.G)fin++;};
+ while(fin<n){
+  while(nxt<n&&Rq[nxt].a<=t){wait.push(Rq[nxt]);nxt++;}
+  if(!wait.length&&!run.length&&!pref.length&&!stat){t=Rq[nxt].a;continue;}
+  if(mode==="static"){
+   if(!stat){stat=wait.slice(0,BMAX);wait=wait.slice(BMAX);const pre=stat.map(q=>[q.P,0]);const dt=stepTime([],pre);t+=dt;
+    stat.forEach(emit);if(keep)steps.push([t-dt,dt,0,stat.reduce((s,q)=>s+q.P,0)]);}
+   else{const dec=stat.map(q=>q.P+q.times.length);const dt=stepTime(dec,[]);t+=dt;
+    stat.forEach(q=>{if(q.times.length<q.G)emit(q);});if(keep)steps.push([t-dt,dt,stat.length,0]);}
+   if(stat.every(q=>q.times.length>=q.G))stat=null;continue;}
+  const chunks=[];let dec;
+  if(mode==="prefill"||mode==="orca"){let tok=0;
+   while(wait.length&&run.length+chunks.length<BMAX&&(!chunks.length||tok+wait[0].P<=PMAX)){const q=wait.shift();chunks.push([q,q.P]);tok+=q.P;}
+   dec=(mode==="prefill"&&chunks.length)?[]:run.slice();}
+  else{dec=run.slice();let left=K-run.length;
+   for(const q of pref){if(left>0){const c=Math.min(q.P-q.done,left);chunks.push([q,c]);left-=c;}}
+   while(left>0&&wait.length&&run.length+pref.length<BMAX){const q=wait.shift();pref.push(q);const c=Math.min(q.P,left);chunks.push([q,c]);left-=c;}}
+  const dt=stepTime(dec.map(q=>q.P+q.times.length),chunks.map(([q,c])=>[c,q.done]));t+=dt;
+  if(keep)steps.push([t-dt,dt,dec.length,chunks.reduce((s,x)=>s+x[1],0)]);
+  for(const q of dec){emit(q);if(q.times.length===q.G)run.splice(run.indexOf(q),1);}
+  for(const [q,c] of chunks){q.done+=c;if(q.done===q.P){const k=pref.indexOf(q);if(k>=0)pref.splice(k,1);emit(q);if(q.times.length<q.G)run.push(q);}}}
+ let s=0;const tt=[],tbt=[],tp=[];
+ Rq.forEach(q=>{tt.push(q.times[0]-q.a);for(let i=1;i<q.times.length;i++)tbt.push(q.times[i]-q.times[i-1]);
+  if(q.times.length>1)tp.push((q.times[q.times.length-1]-q.times[0])/(q.times.length-1));});
+ tt.forEach(v=>s+=v);tbt.sort((a,b)=>a-b);const ts=tt.slice().sort((a,b)=>a-b);
+ let tot=0,last=0;Rq.forEach(q=>{tot+=q.G;last=Math.max(last,q.times[q.times.length-1]);});
+ let sp=0;tp.forEach(v=>sp+=v);
+ return{ttft:s/n,ttft99:ts[Math.min(n-1,Math.floor(0.99*n))],tbt50:tbt[Math.floor(0.5*tbt.length)],tbt99:tbt[Math.floor(0.99*tbt.length)],tbtmax:tbt[tbt.length-1],
+  tpot:sp/tp.length,thr:tot/(last-Rq[0].a),nsteps:t,steps};}
+
+/* ---------- Figure 2: cost of one iteration against the prefill tokens it carries ---------- */
+(function(){
+ const svg=$("#cb-knee-svg");if(!svg)return;
+ const bS=$("#cb-knee-b"),tS=$("#cb-knee-t"),sS=$("#cb-knee-s"),bV=$("#cb-knee-bv"),tV=$("#cb-knee-tv"),sV=$("#cb-knee-sv"),info=$("#cb-knee-info");
+ const BS=[0,1,2,4,8,16,32,48,64,96,128],TS=[256,512,1024,2048,4096,8192];
+ function parts(Bd,T,c){const tc=(2*N*(Bd+c)+4*L*DA*(Bd*T+c*c/2))/PI,tm=(2*N+SKV*(Bd*T+c))/BW;return[tc,tm];}
+ function calc(Bd,T,tau){const tdec=Math.max(...parts(Bd,T,0));let cf=0;while(cf<16384){const p=parts(Bd,T,cf+1);if(p[0]>p[1])break;cf++;}
+  let cm=-1;if(tdec<=tau){cm=0;while(cm<65536&&Math.max(...parts(Bd,T,cm+1))<=tau)cm++;}
+  return{tdec,cfree:cf,cmax:cm,K:cm>=0?cm+Bd:null};}
+ const X0=62,X1=620,Y0=290,Y1=30,CM=2048;
+ function draw(){const Bd=BS[+bS.value],T=TS[+tS.value],tau=+sS.value/1000;
+  bV.textContent=Bd;tV.textContent=comma(T);sV.textContent=sS.value+" ms";
+  const r=calc(Bd,T,tau);const tTop=Math.max(Math.max(...parts(Bd,T,CM)),tau)*1.08;
+  const X=c=>X0+c/CM*(X1-X0),Y=v=>Y0-v/tTop*(Y0-Y1);let g="";
+  g+=`<line x1="${X0}" y1="${Y1}" x2="${X0}" y2="${Y0}" stroke="var(--rule)"/><line x1="${X0}" y1="${Y0}" x2="${X1}" y2="${Y0}" stroke="var(--rule)"/>`;
+  const raw=tTop*1e3/4,e=Math.pow(10,Math.floor(Math.log10(raw))),f=raw/e,stp=(f<=1?1:f<=2?2:f<=5?5:10)*e;
+  for(let v=0;v<=tTop*1e3+1e-9;v+=stp){g+=`<line x1="${X0}" y1="${Y(v/1e3)}" x2="${X1}" y2="${Y(v/1e3)}" stroke="var(--rule)" stroke-dasharray="1 4"/><text x="${X0-6}" y="${Y(v/1e3)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${fx(v,stp<1?1:0)}</text>`;}
+  for(let c=0;c<=CM;c+=512)g+=`<line x1="${X(c)}" y1="${Y0}" x2="${X(c)}" y2="${Y0+4}" stroke="var(--muted)"/><text x="${X(c)}" y="${Y0+17}" text-anchor="middle" font-size="11" fill="var(--muted)">${c}</text>`;
+  g+=`<text x="${X1}" y="${Y0+32}" text-anchor="end" font-size="12" fill="var(--muted)">prefill tokens c added to the iteration</text>`;
+  g+=`<text x="${X0+4}" y="${Y1-10}" font-size="12" fill="var(--muted)">iteration time (ms)</text>`;
+  let dc="",dm="",dt="";for(let i=0;i<=200;i++){const c=CM*i/200,p=parts(Bd,T,c);const x=X(c).toFixed(1);
+   dc+=(i?"L":"M")+x+" "+Y(p[0]).toFixed(1);dm+=(i?"L":"M")+x+" "+Y(p[1]).toFixed(1);dt+=(i?"L":"M")+x+" "+Y(Math.max(p[0],p[1])).toFixed(1);}
+  g+=`<path d="${dm}" fill="none" stroke="var(--v)" stroke-width="1.6" stroke-dasharray="5 4"/>`;
+  g+=`<path d="${dc}" fill="none" stroke="var(--k)" stroke-width="1.6" stroke-dasharray="5 4"/>`;
+  g+=`<path d="${dt}" fill="none" stroke="var(--tc)" stroke-width="2.8"/>`;
+  g+=`<line x1="${X0}" y1="${Y(tau)}" x2="${X1}" y2="${Y(tau)}" stroke="var(--ink2)" stroke-width="1.5" stroke-dasharray="2 3"/><text x="${X1}" y="${Y(tau)-5}" text-anchor="end" font-size="11" fill="var(--ink2)">TBT target ${sS.value} ms</text>`;
+  if(r.cfree<=CM){g+=`<circle cx="${X(r.cfree)}" cy="${Y(Math.max(...parts(Bd,T,r.cfree)))}" r="5" fill="var(--v)"/><text x="${X(r.cfree)+7}" y="${Y(Math.max(...parts(Bd,T,r.cfree)))+16}" font-size="11" fill="var(--v)">free up to ${r.cfree}</text>`;}
+  if(r.cmax>=0&&r.cmax<=CM){g+=`<circle cx="${X(r.cmax)}" cy="${Y(tau)}" r="5.5" fill="none" stroke="var(--ink2)" stroke-width="2"/>`;}
+  svg.innerHTML=g;
+  const slope=(2*N+4*L*DA*1024)/PI;
+  let s=`<b>${Bd} decodes at context ${comma(T)}:</b> decode-only iteration <b id="cb-knee-dec">${fx(r.tdec*1e3,2)}</b> ms. Prefill tokens that ride along for free (compute still below memory time): <b id="cb-knee-free">${r.cfree}</b>.`;
+  s+=r.K!==null?`<br>Largest iteration that meets the TBT target: <b id="cb-knee-c">${r.cmax}</b> prefill tokens, so the token budget is K = <b id="cb-knee-k">${r.K}</b> tokens.`:`<br><b id="cb-knee-k">none</b>: even the decode-only iteration takes longer than the target.`;
+  s+=` Beyond the knee each extra prefill token costs ${fx(2*N/PI*1e6,1)} µs for the matrix multiplies plus its attention to the earlier tokens (${fx(slope*1e6,1)} µs in total for the 1,024th token).`;
+  info.innerHTML=s;}
+ [bS,tS,sS].forEach(e=>e.addEventListener("input",draw));
+ R.cbKnee={set:(bi,ti,s)=>{bS.value=bi;tS.value=ti;sS.value=s;draw();},calc:(Bd,T,ms)=>{const r=calc(Bd,T,ms/1000);return{tdec:+fx(r.tdec*1e3,3),cfree:r.cfree,K:r.K};}};
+ draw();
+})();
+
+/* ---------- Figure 3: a serving simulator with four schedulers ---------- */
+const KS=[128,256,384,512,768,1024,1536,2048,4096],LAMS=[6,12,18,24,30,36,45,60,75,90];
+(function(){
+ const svg=$("#cb-sim-svg");if(!svg)return;
+ const kS=$("#cb-sim-k"),lS=$("#cb-sim-l"),kV=$("#cb-sim-kv"),lV=$("#cb-sim-lv"),info=$("#cb-sim-info");let mode="orca";
+ const NAMES={static:"Request-level (static) batching",prefill:"Continuous, prefill-first (separate prefill steps)",orca:"Continuous, hybrid steps with whole prefills (Orca)",chunked:"Chunked prefill, stall-free (Sarathi-Serve / SplitFuse)"};
+ function draw(){const K=KS[+kS.value],lam=LAMS[+lS.value];kV.textContent=K;lV.textContent=lam+" /s";kS.disabled=mode!=="chunked";
+  const r=simulate(mode,lam,K,true);
+  const W0=1.0,W1=1.5,X0=62,X1=620,X=v=>X0+(v-W0)/(W1-W0)*(X1-X0);
+  const inW=r.steps.filter(s=>s[0]+s[1]>W0&&s[0]<W1);
+  const tokMax=Math.max(64,...inW.map(s=>s[2]+s[3]));const TT=0,TB=130;const Yt=v=>TB-Math.sqrt(v/tokMax)*(TB-26);
+  const dMax=Math.max(0.01,...inW.map(s=>s[1]));const dTop=Math.max(0.012,dMax*1.1);const DB=300,DT=180;const Yd=v=>DB-v/dTop*(DB-DT);
+  let g=`<text x="${X0}" y="16" font-size="12" font-weight="700" fill="var(--ink)">tokens in each iteration (square-root scale), time 1.0 to 1.5 s</text>`;
+  g+=`<line x1="${X0}" y1="${TB}" x2="${X1}" y2="${TB}" stroke="var(--rule)"/>`;
+  inW.forEach(s=>{const x=Math.max(X0,X(s[0])),w=Math.max(0.6,Math.min(X1,X(s[0]+s[1]))-x);const tot=s[2]+s[3];
+   const yTop=Yt(tot),yMid=Yt(s[2]);
+   if(s[2]>0)g+=`<rect x="${x.toFixed(2)}" y="${yMid.toFixed(1)}" width="${w.toFixed(2)}" height="${(TB-yMid).toFixed(1)}" fill="var(--q-soft)" stroke="var(--q)" stroke-width="0.4"/>`;
+   if(s[3]>0)g+=`<rect x="${x.toFixed(2)}" y="${yTop.toFixed(1)}" width="${w.toFixed(2)}" height="${(yMid-yTop).toFixed(1)}" fill="var(--k-soft)" stroke="var(--k)" stroke-width="0.4"/>`;});
+  [64,Math.round(tokMax)].forEach(v=>{g+=`<text x="${X0-6}" y="${Yt(v)+4}" text-anchor="end" font-size="10.5" fill="var(--muted)">${comma(v)}</text>`;});
+  g+=`<text x="${X0}" y="${DT-12}" font-size="12" font-weight="700" fill="var(--ink)">length of each iteration = gap between tokens (ms)</text>`;
+  g+=`<line x1="${X0}" y1="${DT}" x2="${X0}" y2="${DB}" stroke="var(--rule)"/><line x1="${X0}" y1="${DB}" x2="${X1}" y2="${DB}" stroke="var(--rule)"/>`;
+  for(let k=0;k<=2;k++){const v=dTop*k/2;g+=`<text x="${X0-6}" y="${Yd(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${fx(v*1e3,0)}</text>`;}
+  let d="";inW.forEach((s,i)=>{const x0=Math.max(X0,X(s[0])),x1=Math.min(X1,X(s[0]+s[1]));const y=Yd(s[1]).toFixed(1);d+=(i?"L":"M")+x0.toFixed(1)+" "+y+"L"+x1.toFixed(1)+" "+y;});
+  g+=`<path d="${d}" fill="none" stroke="var(--tc)" stroke-width="1.8"/>`;
+  if(r.tbt99<dTop)g+=`<line x1="${X0}" y1="${Yd(r.tbt99)}" x2="${X1}" y2="${Yd(r.tbt99)}" stroke="var(--k)" stroke-dasharray="5 4"/><text x="${X1}" y="${Yd(r.tbt99)-4}" text-anchor="end" font-size="11" fill="var(--k)">p99 TBT, whole run</text>`;
+  for(let k=0;k<=5;k++){const v=W0+k*0.1;g+=`<text x="${X(v)}" y="${DB+16}" text-anchor="middle" font-size="11" fill="var(--muted)">${fx(v,1)} s</text>`;}
+  svg.innerHTML=g;
+  info.innerHTML=`<b>${NAMES[mode]}</b>${mode==="chunked"?", token budget K = "+K:""}; 200 requests at ${lam} per second.<br>Mean TTFT <b id="cb-sim-ttft">${fx(r.ttft*1e3,1)}</b> ms (p99 ${fx(r.ttft99*1e3,0)} ms) · TBT p50 ${fx(r.tbt50*1e3,2)} ms, p99 <b id="cb-sim-tbt99">${fx(r.tbt99*1e3,2)}</b> ms, max <b id="cb-sim-tbtmax">${fx(r.tbtmax*1e3,1)}</b> ms · mean TPOT <b id="cb-sim-tpot">${fx(r.tpot*1e3,2)}</b> ms · throughput <b id="cb-sim-thr">${comma(r.thr)}</b> output tokens/s.`;}
+ seg($("#cb-sim-mode"),v=>{mode=v;draw();});[kS,lS].forEach(e=>e.addEventListener("input",draw));
+ R.cbSim={set:(m,ki,li)=>{mode=m;setSeg($("#cb-sim-mode"),m);kS.value=ki;lS.value=li;draw();},
+  stats:(m,lam,K)=>{const r=simulate(m,lam,K||512,false);return{ttft:+fx(r.ttft*1e3,1),tbt99:+fx(r.tbt99*1e3,2),tbtmax:+fx(r.tbtmax*1e3,1),thr:Math.round(r.thr)};}};
+ draw();
+})();
+
+/* ---------- Figure 4: sweep of the token budget ---------- */
+(function(){
+ const svg=$("#cb-sweep-svg");if(!svg)return;
+ const lS=$("#cb-sweep-l"),sS=$("#cb-sweep-s"),lV=$("#cb-sweep-lv"),sV=$("#cb-sweep-sv"),info=$("#cb-sweep-info");
+ function run(lam){return{ks:KS.map(K=>simulate("chunked",lam,K,false)),orca:simulate("orca",lam,0,false),pf:simulate("prefill",lam,0,false)};}
+ let cache={};
+ function draw(){const lam=LAMS[+lS.value],tau=+sS.value/1000;lV.textContent=lam+" /s";sV.textContent=sS.value+" ms";
+  const d=cache[lam]||(cache[lam]=run(lam));
+  const X0=62,X1=560,lx=k=>X0+(Math.log2(k)-7)/5*(X1-X0);const Y0=250,Y1=30,ly=v=>Y0-(Math.log10(Math.max(v,1e-3))+3)/4*(Y0-Y1);
+  let g=`<line x1="${X0}" y1="${Y1}" x2="${X0}" y2="${Y0}" stroke="var(--rule)"/><line x1="${X0}" y1="${Y0}" x2="${X1}" y2="${Y0}" stroke="var(--rule)"/>`;
+  [1e-3,1e-2,1e-1,1].forEach(v=>{g+=`<line x1="${X0}" y1="${ly(v)}" x2="${X1}" y2="${ly(v)}" stroke="var(--rule)" stroke-dasharray="1 4"/><text x="${X0-6}" y="${ly(v)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${v>=1?"1 s":fx(v*1e3,0)+" ms"}</text>`;});
+  KS.forEach(k=>{g+=`<text x="${lx(k)}" y="${Y0+16}" text-anchor="middle" font-size="11" fill="var(--muted)">${k}</text>`;});
+  g+=`<text x="${X1}" y="${Y0+32}" text-anchor="end" font-size="12" fill="var(--muted)">token budget K per iteration (log scale)</text>`;
+  const top=v=>Math.min(v,10);
+  const line=(f,c)=>{let p="";d.ks.forEach((r,i)=>{p+=(i?"L":"M")+lx(KS[i]).toFixed(1)+" "+ly(top(f(r))).toFixed(1);});return `<path d="${p}" fill="none" stroke="${c}" stroke-width="2.4"/>`+d.ks.map((r,i)=>`<circle cx="${lx(KS[i]).toFixed(1)}" cy="${ly(top(f(r))).toFixed(1)}" r="3.5" fill="${c}"/>`).join("");};
+  let yA=ly(top(d.orca.ttft)),yB=ly(d.orca.tbt99);let lA=yA+4,lB=yB+4;if(Math.abs(yA-yB)<13){if(yA<=yB){lA=yA-3;lB=yB+12;}else{lB=yB-3;lA=yA+12;}}
+  g+=`<line x1="${X0}" y1="${yA}" x2="${X1}" y2="${yA}" stroke="var(--k)" stroke-dasharray="6 4" stroke-width="1.2"/><text x="${X1+4}" y="${lA}" font-size="10.5" fill="var(--k)">Orca TTFT</text>`;
+  g+=`<line x1="${X0}" y1="${yB}" x2="${X1}" y2="${yB}" stroke="var(--q)" stroke-dasharray="6 4" stroke-width="1.2"/><text x="${X1+4}" y="${lB}" font-size="10.5" fill="var(--q)">Orca p99 TBT</text>`;
+  g+=`<line x1="${X0}" y1="${ly(tau)}" x2="${X1}" y2="${ly(tau)}" stroke="var(--v)" stroke-width="1.5"/><text x="${X0+4}" y="${ly(tau)-4}" font-size="10.5" fill="var(--v)">TBT target</text>`;
+  g+=line(r=>r.ttft,"var(--k)")+line(r=>r.tbt99,"var(--q)");
+  let best=-1;d.ks.forEach((r,i)=>{if(r.tbt99<=tau&&(best<0||r.ttft<d.ks[best].ttft))best=i;});
+  if(best>=0)g+=`<circle cx="${lx(KS[best])}" cy="${ly(top(d.ks[best].ttft))}" r="8" fill="none" stroke="var(--v)" stroke-width="2.2"/>`;
+  svg.innerHTML=g;
+  let s=`<b>${lam} requests/s.</b> Orca (whole prefills): mean TTFT ${fx(d.orca.ttft*1e3,1)} ms, p99 TBT ${fx(d.orca.tbt99*1e3,1)} ms, ${comma(d.orca.thr)} tokens/s. Prefill-first: ${fx(d.pf.ttft*1e3,1)} ms, ${fx(d.pf.tbt99*1e3,1)} ms, ${comma(d.pf.thr)} tokens/s.`;
+  if(best>=0){const r=d.ks[best];s+=`<br>Best budget for p99 TBT ≤ ${sS.value} ms: K = <b id="cb-sweep-best">${KS[best]}</b>, mean TTFT <b id="cb-sweep-ttft">${fx(r.ttft*1e3,1)}</b> ms, p99 TBT ${fx(r.tbt99*1e3,2)} ms, throughput <b id="cb-sweep-thr">${comma(r.thr)}</b> tokens/s.`;}
+  else s+=`<br><b id="cb-sweep-best">none</b>: no budget meets a p99 TBT of ${sS.value} ms at this load.`;
+  info.innerHTML=s;}
+ [lS,sS].forEach(e=>e.addEventListener("input",draw));
+ R.cbSweep={set:(li,s)=>{lS.value=li;sS.value=s;draw();},best:()=>{const b=$("#cb-sweep-best");return b?b.textContent:null;}};
+ draw();
+})();
+})();
+</script></body></html>
