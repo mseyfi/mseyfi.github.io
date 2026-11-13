@@ -1,0 +1,541 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Weight PTQ 2: AWQ, outliers and mixed precision · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 107</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="weight-ptq-2-awq-outliers-and-mixed">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="weight-ptq-2-awq-outliers-and-mixed" data-session="weight-ptq-2-awq-outliers-and-mixed" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">107</span><span>Track 5: LLM inference and serving · session 30 of 65</span></div><h1 class="chap-title">Weight PTQ 2: AWQ, outliers and mixed precision</h1><p class="chap-sub">At 3 or 4 bits, a few weights decide most of the quality loss: the ones that meet large activations, and a handful of very large or very sensitive values. This session shows three ways to protect them: scale them up before rounding (AWQ), keep them in 16 bits (OWQ, SpQR), or place the quantization levels where they matter (SqueezeLLM). It ends with LUT-GEMM, a kernel that runs such formats without turning the weights back into floats.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 82, 103 and 106 (why inference is slow, quantization math, GPTQ)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Explain why the output error of a quantized layer is the weight error weighted by the size of the activations, and why 1% of the input channels can cause most of it</li><li>Derive the AWQ scaling trick: multiply a salient weight column by s, divide its input by s, and see the error shrink by about 1/s until the group maximum changes</li><li>Run the AWQ search over s = s_X^α, know where the 1/s is folded (RMSNorm, v_proj, up_proj) and why it needs no backpropagation</li><li>Pick weights to keep in FP16 with a Hessian-based sensitivity (OWQ columns, SpQR single weights) and count the extra bits per weight</li><li>Build non-uniform levels with Fisher-weighted k-means and a dense-and-sparse split (SqueezeLLM), and say what they cost</li><li>Explain how LUT-GEMM multiplies binary-coded weights with table lookups, and why weight-only formats speed up decoding but not large-batch prefill</li><li>Read the published perplexity numbers of RTN, GPTQ, AWQ, OWQ, SpQR and SqueezeLLM without mixing up their settings</li></ul></div></header><style>
+.aq-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.aq-leg span::before{content:"";display:inline-block;width:18px;height:4px;border-radius:2px;margin-right:6px;vertical-align:3px;background:var(--c)}
+.aq-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.aq-grid input[type=range]{width:100%}
+[data-session="weight-ptq-2-awq-outliers-and-mixed"] pre.code,[data-session="weight-ptq-2-awq-outliers-and-mixed"] code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A 7B model has about 6.74 billion weights. In FP16 they take 13.5 GB. At 4 bits with one 16-bit scale and one 16-bit zero point per group of 128 weights, they take about 3.6 GB. During decoding the GPU must read every weight once per step, so fewer bytes means more tokens per second.</p>
+<p>The previous session (<a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>) showed GPTQ: round one column at a time and let the not-yet-rounded columns correct the error, using second-order (Hessian) information. This session asks a different question: <b>which weights matter most?</b> At 4 bits plain rounding is almost fine. At 3 bits it is not, and most of the damage comes from a very small set of weights. There are three practical answers, and each became a widely used method:</p>
+<ul>
+<li><b>Scale the important weights up before rounding</b>, so they get relatively finer steps. This is AWQ (Activation-aware Weight Quantization, Lin et al.), which won the MLSys 2024 best paper award. [Certain]</li>
+<li><b>Keep the important weights in 16 bits</b> and quantize the rest: OWQ keeps whole columns, SpQR keeps single weights in a sparse list.</li>
+<li><b>Put the quantization levels where the important weights are</b>: SqueezeLLM learns non-uniform levels with a weighted k-means and keeps outliers in a sparse list.</li></ul>
+<p>Non-uniform or binary-coded weights then need a special kernel. LUT-GEMM replaces multiplications by table lookups. In the efficient-inference survey (Zhou et al.) these methods sit in Section 5.2.1, weight-only post-training quantization.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Expect: “Why does AWQ look at activations and not at weights?”, “Why does scaling a weight up reduce its error?”, “Where does the 1/s go at inference time?”, “AWQ or GPTQ?”, “Why does a 4-bit model decode faster but not prefill faster?”. All are answered below with numbers.</aside>
+<p>This is not only a research topic. The AWQ authors list integrations in vLLM, Hugging Face TGI, TensorRT-LLM, LMDeploy and Hugging Face transformers (<code>from_pretrained</code>). [Certain] Many 4-bit checkpoints on the Hugging Face Hub are AWQ or GPTQ files. [Likely]</p>
+
+<h2>Not all weights are equal: the output view</h2>
+<p>A quantizer rounds each weight \(w_j\) to a nearby value \(Q(w_j)\). We do not care about the weight error itself. We care about the error of the layer <b>output</b>. For one output \(y = \sum_j w_j x_j\):</p>
+<div class="eq">\[ \Delta y = \sum_{j} \big(Q(w_j) - w_j\big)\, x_j, \qquad \E\big[(\Delta y)^2\big] \approx \sum_{j} \big(Q(w_j) - w_j\big)^2\, \E\big[x_j^2\big] \tag{107.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(w_j, x_j\)</dt><dd>the weight on input channel \(j\), and the activation that arrives on that channel</dd>
+<dt>\(Q(w_j) - w_j\)</dt><dd>the rounding error of that weight</dd>
+<dt>\(\E[x_j^2]\)</dt><dd>how large channel \(j\)’s activations are on average (over tokens of a calibration set)</dd>
+<dt>\(\approx\)</dt><dd>we drop the cross terms; this is exact if different channels are uncorrelated, and a good first picture otherwise</dd></dl>
+<p>Formula (107.1) says: <b>a weight’s rounding error counts in proportion to the size of its input</b>. In LLMs a few input channels carry activations that are 10 to 100 times larger than the rest. This is the same outlier effect that LLM.int8() found (<a href="../inference/weight-activation-quantization-llm-int8-smoothquant-zeroquant.html">session 108</a>). Weights in those channels are the <b>salient</b> weights. The same weight error there costs 100 to 10,000 times more output error.</p>
+<p>The AWQ paper tested this directly on OPT models at INT3 with groups of 128. It kept a small share of input channels in FP16 and rounded the rest, choosing the channels three ways:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>OPT-6.7B, WikiText-2 perplexity (FP16: 10.86, plain INT3 rounding: 23.54)</th><th>keep 0.1%</th><th>keep 1%</th><th>keep 3%</th></tr></thead><tbody>
+<tr><td>channels with the largest activations</td><td>11.58</td><td>11.39</td><td>11.36</td></tr>
+<tr><td>channels with the largest weight norm</td><td>23.41</td><td>22.37</td><td>22.45</td></tr>
+<tr><td>random channels</td><td>23.54</td><td>24.23</td><td>24.22</td></tr></tbody></table></div>
+<p>Source: AWQ paper, Table 1. [Certain] Keeping 1% of the channels picked by activation size removes almost the whole gap. Picking by weight size is no better than random. The weights themselves look ordinary; it is their <b>inputs</b> that make them important.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A shop rounds prices to the nearest euro. For most products that is fine. But for the one product that sells 10,000 times a day, a rounding of 40 cents is a big loss. You should not judge a price by its size, but by how many times it is multiplied.</aside>
+<p>But keeping 1% of the columns in FP16 is a problem for the hardware: the matrix now has two data types, and the kernel must handle both. AWQ’s key idea is to get the same protection <b>without</b> mixed precision.</p>
+
+<h2>AWQ: scale the salient weights before rounding</h2>
+<p>Start with the quantizer. For a group of weights (for example 128 weights of one output row), a symmetric \(b\)-bit quantizer uses one step size \(\Delta\):</p>
+<div class="eq">\[ Q(w) = \Delta \cdot \operatorname{round}\!\left(\frac{w}{\Delta}\right), \qquad \Delta = \frac{\max_{\text{group}} |w|}{2^{b-1} - 1} \tag{107.2} \]</div>
+<p>(The AWQ paper writes \(2^{b-1}\) in the denominator; the exact integer range does not change the argument.) The rounding error is at most \(\Delta/2\), and on average its root mean square is \(\Delta/\sqrt{12}\). Its size depends only on \(\Delta\), not on \(w\).</p>
+<p>Now the trick. Multiply weight column \(j\) by a number \(s \gt 1\) and divide its input by the same \(s\). The product does not change:</p>
+<div class="eq">\[ w_j x_j = (s\, w_j) \cdot \frac{x_j}{s} \quad\Longrightarrow\quad \text{quantized: } \; Q(s\, w_j) \cdot \frac{x_j}{s} \tag{107.3} \]</div>
+<p>The error of the scaled weight is still about the size of the step \(\Delta'\) of its group. But in the output it is divided by \(s\). If scaling one weight in a group of 128 does not change the group maximum, then \(\Delta' = \Delta\), and the output error from this weight shrinks by the factor \(1/s\). In general:</p>
+<div class="eq">\[ \frac{\text{error with scaling}}{\text{error without}} = \frac{\Delta'}{\Delta} \cdot \frac{1}{s} \tag{107.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(s\)</dt><dd>the scale applied to one input channel: its weight column is multiplied by \(s\), its activation divided by \(s\)</dd>
+<dt>\(\Delta, \Delta'\)</dt><dd>the step size of the group before and after scaling; \(\Delta' \gt \Delta\) only if the scaled weight becomes the new group maximum</dd></dl>
+<p>So scaling helps as long as \(\Delta'/\Delta\) stays near 1. If \(s\) is too large, the scaled salient weight becomes the largest in its group, \(\Delta'\) grows, and <b>every other weight in the group</b> gets a coarser grid. The AWQ paper measured this on OPT-6.7B (1% salient channels, INT3):</p>
+<div class="tblw"><table class="tb"><thead><tr><th>s</th><th>1</th><th>1.25</th><th>1.5</th><th>2</th><th>4</th></tr></thead><tbody>
+<tr><td>groups where \(\Delta' \ne \Delta\)</td><td>0%</td><td>2.8%</td><td>4.4%</td><td>8.2%</td><td>21.2%</td></tr>
+<tr><td>average \(\Delta'/\Delta\)</td><td>1</td><td>1.005</td><td>1.013</td><td>1.038</td><td>1.213</td></tr>
+<tr><td>average \((\Delta'/\Delta)\cdot(1/s)\)</td><td>1</td><td>0.804</td><td>0.676</td><td>0.519</td><td>0.303</td></tr>
+<tr><td>WikiText-2 perplexity</td><td>23.54</td><td>12.87</td><td>12.48</td><td>11.92</td><td>12.36</td></tr></tbody></table></div>
+<p>Source: AWQ paper, Table 2. [Certain] Scaling by 2 brings perplexity from 23.54 to 11.92, close to the 11.39 of keeping 1% in FP16, with a single data type. At \(s = 4\) the salient error is smaller still, but the other weights suffer and perplexity goes up again.</p>
+<div class="worked"><div class="wt">Worked example: one salient weight in a group</div>
+<p>A group has largest weight \(|w| = 0.75\). With INT3 symmetric levels \(-3 \dots 3\), \(\Delta = 0.75/3 = 0.25\). One weight, \(w_1 = 0.3\), sits on a channel whose activations have size 10 (the others have size 1).</p>
+<p><b>No scaling.</b> The RMS rounding error is \(0.25/\sqrt{12} = 0.0722\). In the output it is multiplied by 10: \(0.722\).</p>
+<p><b>\(s = 2\).</b> \(s w_1 = 0.6 \lt 0.75\), so \(\Delta' = 0.25\). The weight error in original units is \(0.0722/2 = 0.0361\); in the output \(0.361\). Half the error, and no other weight changed.</p>
+<p><b>\(s = 4\).</b> \(s w_1 = 1.2 \gt 0.75\): the group maximum changes, \(\Delta' = 1.2/3 = 0.4\), which is 1.6 times larger. The salient error falls to \(0.4/\sqrt{12}/4 = 0.0289\) (output \(0.289\)), but the RMS error of all 127 other weights grows by 1.6, so their squared error grows by \(1.6^2 = 2.56\). This is the trade-off of formula (107.4).</p></div>
+<p>Figure 1 runs this on 128 rows of 128 random weights, with input channel 0 salient. Move \(s\) and watch the two parts of the error.</p>
+<figure class="fig" id="aq-sc"><div class="fig-body">
+<div class="controls"><span style="font:600 14px var(--sans);color:var(--ink2)">salient activation size</span><span class="seg" id="aq-sc-m"><button type="button" data-v="5" aria-pressed="false">5×</button><button type="button" data-v="10" aria-pressed="true">10×</button><button type="button" data-v="20" aria-pressed="false">20×</button></span></div>
+<div class="aq-grid"><label for="aq-sc-s">scale s</label><input type="range" id="aq-sc-s" min="1" max="8" step="0.25" value="2"><output id="aq-sc-sv"></output></div>
+<div class="scroll-x"><svg id="aq-sc-svg" viewBox="0 0 640 275" role="img" aria-label="Output error of the salient weight, of the other weights, and the total, as the scale s grows"></svg></div>
+<div class="aq-leg"><span style="--c:var(--q)">salient weight’s part</span><span style="--c:var(--k)">the other 127 weights’ part</span><span style="--c:var(--v)">total</span></div>
+<div class="readout" id="aq-sc-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Scaling one salient weight per group (INT3, one group of 128 per row, 128 rows of Gaussian weights). The error is formula (107.1) with activation size 1 on every channel except the salient one. All values are divided by the total error at \(s = 1\).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>At \(s = 1\) the one salient weight causes 47.1% of the total error (with 10× activations), although it is 1 of 128 weights. As \(s\) grows, the dark red curve falls (formula 107.4), while the orange curve stays flat until the scaled weight starts to become the group maximum, then rises fast. With 10× activations the best grid point is \(s = 2\): total error ×0.670, with 18.8% of rows having a changed \(\Delta\), average \(\Delta'/\Delta = 1.048\) and \((\Delta'/\Delta)/s = 0.524\). These are close to the paper’s 1.038 and 0.519. With 20× the best \(s\) moves to 2.5; with 5× it moves to 1.5. The more salient the channel, the more scaling it can use.</p></details></figure>
+
+<h3>Where does the 1/s go?</h3>
+<p>Dividing the activation by \(s\) must cost nothing at inference, or the trick is useless. AWQ folds the division into the operation that <b>produces</b> the activation. In a Llama block, the reference code does this (llm-awq, <code>auto_scale.py</code>): [Certain]</p>
+<ul>
+<li>q, k and v projections: the 1/s goes into the weight of the RMSNorm before attention (<code>input_layernorm</code>).</li>
+<li>gate and up projections: into the RMSNorm before the MLP (<code>post_attention_layernorm</code>).</li>
+<li>down projection: into the output rows of the up projection (the SwiGLU product is linear in the up output).</li>
+<li>output projection o: into the output rows of v, but only when v and o have matching shapes. With grouped-query attention, v has fewer output rows than o has inputs, and the code skips this pair.</li></ul>
+<p>After folding, the model has the same architecture and the same number of weights. Only the quantized matrices change. This is why AWQ needs no special kernel beyond normal INT4 group dequantization.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>All matrices that read the same activation share one scale vector, because the 1/s is folded into one place. q, k and v use one \(\mathbf{s}\); gate and up use one \(\mathbf{s}\). The search must measure the error of all of them together.</aside>
+
+<h2>Searching the scale</h2>
+<p>For each layer, AWQ looks for the per-input-channel scale vector \(\mathbf{s}\) that makes the quantized output closest to the original output on a small calibration set:</p>
+<div class="eq">\[ \mathbf{s}^{*} = \argmin_{\mathbf{s}} \Big\lVert\, Q\big(W \operatorname{diag}(\mathbf{s})\big)\big(\operatorname{diag}(\mathbf{s})^{-1} X\big) - W X \,\Big\rVert^2 \tag{107.5} \]</div>
+<p>\(Q\) is not differentiable (it rounds), so AWQ does not use gradients. It shrinks the search to one number \(\alpha\) per layer, using the average activation size per channel:</p>
+<div class="eq">\[ \mathbf{s} = \mathbf{s}_X^{\,\alpha}, \qquad s_{X,j} = \frac{1}{T}\sum_{t=1}^{T} |X_{t j}|, \qquad \alpha^{*} = \argmin_{\alpha \in [0, 1]} \mathcal{L}\big(\mathbf{s}_X^{\,\alpha}\big) \tag{107.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W\)</dt><dd>the weight matrix, one row per output, one column per input channel</dd>
+<dt>\(X\)</dt><dd>calibration inputs of the layer, \(T\) tokens; \(X_{tj}\) is the value of channel \(j\) at token \(t\)</dd>
+<dt>\(\mathbf{s}_X\)</dt><dd>the mean absolute activation of each input channel</dd>
+<dt>\(\alpha\)</dt><dd>how strongly to follow \(\mathbf{s}_X\): \(\alpha = 0\) means no scaling (plain rounding), \(\alpha = 1\) means scale each channel by its full activation size</dd>
+<dt>\(\mathcal{L}\)</dt><dd>the output error of formula (107.5)</dd></dl>
+<p>The reference code tries 20 values, \(\alpha = 0, 0.05, \dots, 0.95\), and keeps the one with the smallest mean squared output error of the whole block (for example, the full attention module for q, k and v). It divides \(\mathbf{s}\) by \(\sqrt{\max \mathbf{s} \cdot \min \mathbf{s}}\) to keep numbers near 1; with absmax quantization this does not change the result, because a common factor on a whole group cancels. [Certain] After the scales, AWQ also searches a <b>clipping</b> range per group: shrinking the group maximum a little can lower the mean squared error, because it gives finer steps to the many small weights. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Turning the volume knob on each microphone in a band before recording on a cheap recorder. Turn up the singer (the loud, important channel) and the recorder’s hiss matters less for her. But if you turn her up so far that she clips, everyone else is recorded with less room. \(\alpha\) is how far you turn the knobs.</aside>
+<p>Figure 2 runs the search on a toy layer: 64 rows, 128 input channels with log-normal activation sizes, and two outlier channels whose size you can change.</p>
+<figure class="fig" id="aq-al"><div class="fig-body">
+<div class="controls"><span style="font:600 14px var(--sans);color:var(--ink2)">bits</span><span class="seg" id="aq-al-b"><button type="button" data-v="3" aria-pressed="true">INT3</button><button type="button" data-v="4" aria-pressed="false">INT4</button></span></div>
+<div class="aq-grid"><label for="aq-al-o">outlier channel size</label><input type="range" id="aq-al-o" min="1" max="50" step="1" value="10"><output id="aq-al-ov"></output></div>
+<div class="scroll-x"><svg id="aq-al-svg" viewBox="0 0 640 275" role="img" aria-label="Output error as a function of the AWQ exponent alpha"></svg></div>
+<div class="readout" id="aq-al-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The AWQ grid search of formula (107.6). Filled dots are the 20 grid values the reference code tries; the green dot is the best one. The hollow dot at \(\alpha = 1\) is shown for comparison. The error is formula (107.1) summed over 64 rows.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With the defaults (INT3, outliers 10×) the best \(\alpha\) is 0.35 and the error is 0.360 times that of plain rounding; full scaling (\(\alpha = 1\)) is worse than no scaling (1.81×), because the outlier columns become the group maximum and coarsen everything else. Set the outliers to 1× (no outliers): the best \(\alpha\) is 0.2 and the gain is small (0.915×). Set them to 50×: the gain is large (0.091×) and the best \(\alpha\) moves up to 0.45. The curve is bowl-shaped, so a coarse grid of 20 points is enough.</p></details></figure>
+
+<h3>Why AWQ generalizes well</h3>
+<p>GPTQ changes the remaining weights to fit the calibration data. AWQ only chooses one \(\alpha\) per layer (and clipping ranges) from activation <b>statistics</b>. It does no backpropagation and no reconstruction, so it has little room to overfit. The paper reports that AWQ needs a smaller calibration set (16 sequences in an OPT-6.7B experiment, against 192 for GPTQ) and is less sensitive to which domain the calibration text comes from. [Certain] It also reports good results on instruction-tuned models and on multimodal models such as VILA and OpenFlamingo. [Likely]</p>
+<div class="algo"><div class="algo-h">Algorithm 1: AWQ for one transformer block</div><ol>
+<li><b>input:</b> block weights, calibration activations from the previous (already quantized) blocks, bits \(b\), group size \(g = 128\)</li>
+<li><b>for each</b> group of linear layers that read one activation \(X\) (qkv; o; gate+up; down) <b>do</b></li>
+<li>&nbsp;&nbsp;\(\mathbf{s}_X \leftarrow\) mean of \(|X|\) over tokens, per channel <span class="c">// formula (107.6)</span></li>
+<li>&nbsp;&nbsp;<b>for</b> \(\alpha\) in \(0, 0.05, \dots, 0.95\) <b>do</b></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(\mathbf{s} \leftarrow \mathbf{s}_X^{\alpha}\), normalized; \(\hat W \leftarrow Q(W \operatorname{diag}(\mathbf{s}))\operatorname{diag}(\mathbf{s})^{-1}\) for every layer in the group</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(\mathcal{L}(\alpha) \leftarrow\) MSE between the module output with \(\hat W\) and with \(W\) <span class="c">// formula (107.5)</span></li>
+<li>&nbsp;&nbsp;keep the best \(\alpha\); multiply the weights by \(\mathbf{s}\); divide the previous op (RMSNorm, up, v) by \(\mathbf{s}\)</li>
+<li><b>for each</b> linear layer: search a clipping ratio per group that minimizes output MSE</li>
+<li>quantize every weight with RTN in groups of \(g\), store INT codes + FP16 scales and zeros</li></ol></div>
+
+<h3>Results on Llama 2</h3>
+<div class="tblw"><table class="tb"><thead><tr><th>WikiText-2 perplexity</th><th>Llama-2 7B</th><th>Llama-2 13B</th><th>Llama-2 70B</th></tr></thead><tbody>
+<tr><td>FP16</td><td>5.47</td><td>4.88</td><td>3.32</td></tr>
+<tr><td>INT3-g128 RTN</td><td>6.66</td><td>5.52</td><td>3.98</td></tr>
+<tr><td>INT3-g128 GPTQ</td><td>6.43</td><td>5.48</td><td>3.88</td></tr>
+<tr><td>INT3-g128 GPTQ with reordering</td><td>6.42</td><td>5.41</td><td>3.86</td></tr>
+<tr><td>INT3-g128 AWQ</td><td>6.24</td><td>5.32</td><td>3.74</td></tr>
+<tr><td>INT4-g128 RTN</td><td>5.73</td><td>4.98</td><td>3.46</td></tr>
+<tr><td>INT4-g128 GPTQ</td><td>5.69</td><td>4.98</td><td>3.42</td></tr>
+<tr><td>INT4-g128 GPTQ with reordering</td><td>5.63</td><td>4.99</td><td>3.43</td></tr>
+<tr><td>INT4-g128 AWQ</td><td>5.60</td><td>4.97</td><td>3.41</td></tr></tbody></table></div>
+<p>Source: AWQ paper, Table 4. [Certain] Two lessons. At INT4-g128 all methods are close to FP16, and even plain rounding loses only 0.26 perplexity on the 7B model; the method matters much more at 3 bits. And the bigger the model, the smaller the loss.</p>
+
+<h2>Keep the outliers in high precision</h2>
+<p>AWQ avoids mixed precision. The other family accepts it: keep a tiny set of weights in FP16 and quantize the rest more aggressively. The questions are <b>which</b> weights, and <b>how</b> to store them cheaply.</p>
+<h3>Which weights: a second-order sensitivity</h3>
+<p>Formula (107.1) only looks at activations. A better score also looks at how much the weight actually loses when rounded. With the layer Hessian \(H = 2XX^\top\) from the previous session, OWQ (Lee et al.) gives each input column \(j\) a sensitivity:</p>
+<div class="eq">\[ \text{sens}_j = \lambda_j \, \big\lVert \Delta W_{:,j} \big\rVert_2^2, \qquad \lambda_j = H_{jj} = 2 \sum_{t} X_{tj}^2 \tag{107.7} \]</div>
+<p>\(\Delta W_{:,j}\) is the rounding error of column \(j\). Because \(\lambda_j\) is the sum of squared activations of channel \(j\), outlier channels get large scores; OWQ calls their columns <b>weak columns</b>. Formula (107.7) is formula (107.1) summed over the rows, so it is the exact contribution of column \(j\) when channels are uncorrelated. SpQR (Dettmers et al.) works at the level of single weights and uses the Optimal Brain Surgeon form from GPTQ, which also counts the help that other weights can give by compensating:</p>
+<div class="eq">\[ \text{sens}_{ij} = \frac{\big(w_{ij} - Q(w_{ij})\big)^2}{2\,\big[H^{-1}\big]_{jj}} \tag{107.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(H\)</dt><dd>the Hessian of the layer’s squared output error, \(2XX^\top\), one row and column per input channel</dd>
+<dt>\(\lambda_j = H_{jj}\)</dt><dd>its diagonal entry: twice the total squared activation of channel \(j\)</dd>
+<dt>\([H^{-1}]_{jj}\)</dt><dd>diagonal of the inverse Hessian: small when channel \(j\) is hard to compensate for with other channels, which makes the weight more sensitive</dd></dl>
+<h3>OWQ: whole columns in FP16</h3>
+<p>OWQ keeps the weak columns in FP16 and quantizes the rest with GPTQ (it moves the weak columns to the end of the matrix so GPTQ’s error compensation is absorbed by them). Whole columns keep the memory access regular. If a fraction \(f\) of the weights is kept in FP16 instead of \(b\) bits, the average is about</p>
+<div class="eq">\[ \bar b \approx b + f\,(16 - b) \tag{107.9} \]</div>
+<p>So OWQ’s “3.01-bit” setting means \(0.01/13 \approx 0.077\%\) of the weights are in FP16. OWQ’s low-bit matrix also stores zeros in those places, which adds \(f \cdot b \approx 0.002\) bits; the paper calls this 3.012 bits. [Certain] On LLaMA it gives these WikiText-2 perplexities (OWQ paper; the OPTQ rows are GPTQ with its options turned on): [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>LLaMA</th><th>7B</th><th>13B</th><th>30B</th><th>65B</th></tr></thead><tbody>
+<tr><td>FP16</td><td>5.68</td><td>5.09</td><td>4.10</td><td>3.53</td></tr>
+<tr><td>OPTQ (GPTQ), 3 bits</td><td>8.13</td><td>6.67</td><td>5.67</td><td>5.41</td></tr>
+<tr><td>OWQ, 3.01 bits</td><td>6.66</td><td>5.66</td><td>4.75</td><td>4.25</td></tr>
+<tr><td>OPTQ (GPTQ), 4 bits</td><td>6.10</td><td>5.36</td><td>4.45</td><td>4.10</td></tr>
+<tr><td>OWQ, 4.01 bits</td><td>5.94</td><td>5.25</td><td>4.25</td><td>3.74</td></tr></tbody></table></div>
+<p>OWQ also proposes <b>weak column tuning</b>: for task adaptation, fine-tune only the FP16 weak columns and leave the low-bit part frozen, a cheap alternative to QLoRA (<a href="../posttraining/qlora-and-training-with-quantized-weights.html">session 58</a>).</p>
+<h3>SpQR: small groups plus a sparse list</h3>
+<p>SpQR (“Sparse-Quantized Representation”) goes further, aiming at near-lossless 3 to 4 bits. It combines three ideas:</p>
+<ul>
+<li><b>Very small groups</b>, \(\beta_1 = 8\) to 32 weights, so one outlier spoils few neighbors.</li>
+<li><b>Bilevel quantization</b>: the per-group scales and zero points are themselves quantized to 3 bits, in groups of \(\beta_2\), with FP16 second-level statistics. Small groups would be too expensive otherwise.</li>
+<li><b>Outliers</b>: weights whose sensitivity (107.8) is above a threshold are stored in FP16 in a CSR-like sparse list: a 16-bit value and a 16-bit column index each, about 32 bits per outlier. The paper finds an outlier rate of about 0.2% to 0.5% works best, below 1%. [Certain]</li></ul>
+<p>The average cost per weight is (SpQR paper, Eq. 4):</p>
+<div class="eq">\[ \bar b \approx b_w + \frac{b_s + b_z}{\beta_1} + \frac{64}{\beta_1 \beta_2} + 32\, r_o \tag{107.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(b_w\)</dt><dd>bits per weight code</dd><dt>\(b_s, b_z\)</dt><dd>bits of each quantized scale and zero point</dd>
+<dt>\(\beta_1, \beta_2\)</dt><dd>first-level group size (weights), second-level group size (scales)</dd>
+<dt>\(64\)</dt><dd>two FP16 second-level statistics for scales and two for zeros, shared by \(\beta_1\beta_2\) weights</dd>
+<dt>\(r_o\)</dt><dd>the share of weights that are outliers, each costing about 32 bits</dd></dl>
+<div class="worked"><div class="wt">Worked example: SpQR’s bit budget</div>
+<p>With \(b_w = 3\), \(b_s = b_z = 3\), \(\beta_1 = 16\), \(\beta_2 = 32\) and \(r_o = 0.4\%\): \(3 + 6/16 + 64/512 + 32 \times 0.004 = 3 + 0.375 + 0.125 + 0.128 = 3.628\) bits per weight. The outliers cost only 0.128 bits, although each one takes 32 bits. Compare with plain INT3 with groups of 128 and FP16 scale and zero: \(3 + 32/128 = 3.25\) bits.</p></div>
+<p>SpQR on LLaMA (WikiText-2; FP16 5.68 / 5.09 / 4.10 / 3.53 for 7B / 13B / 30B / 65B): at about 3.9 bits it reaches 5.87 / 5.22 / 4.25 / 3.68, and at about 4.6 to 4.7 bits it reaches 5.73 / 5.13 / 4.14 / 3.57. GPTQ at 4 bits gave 6.13 / 5.40 / 4.48 / 3.83 in the same table. [Certain] The paper reports that a 33B model fits on one 24 GB GPU this way.</p>
+<p>Figure 3 shows the selection problem on a toy layer: 256 input channels, 128 outputs, INT3 with groups of 128, and four outlier channels.</p>
+<figure class="fig" id="aq-mx"><div class="fig-body">
+<div class="aq-grid">
+<label for="aq-mx-f">outlier channel size</label><input type="range" id="aq-mx-f" min="1" max="30" step="1" value="20"><output id="aq-mx-fv"></output>
+<label for="aq-mx-k">columns kept in FP16</label><input type="range" id="aq-mx-k" min="0" max="16" step="1" value="4"><output id="aq-mx-kv"></output></div>
+<div class="scroll-x"><svg id="aq-mx-svg" viewBox="0 0 640 265" role="img" aria-label="Remaining output error as more columns are kept in FP16, for four selection rules"></svg></div>
+<div class="aq-leg" id="aq-mx-leg"></div>
+<div class="readout" id="aq-mx-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Mixed precision by columns, as in OWQ. Each rule ranks the 256 input columns and keeps the top ones in FP16; the rest stay INT3. The error is formula (107.7) summed over the remaining columns, divided by the error of plain INT3. The four outlier channels get \(1 + (F-1)\cdot r\) times their normal size, with \(F\) the slider value and \(r = 1, 0.75, 0.6, 0.5\). With strong outliers the activation and sensitivity lines lie on top of each other, and so do the weight-norm and random lines.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>With outliers at 20×, the four outlier channels cause 78.0% of the error. Keeping 4 columns (1.56% of the weights, 3.5 bits per weight) chosen by activation or by sensitivity leaves 0.220 of the error; chosen by weight norm or at random it leaves 0.997. This is the AWQ table in miniature. Now set the outliers to 1×: no column stands out, and even 16 FP16 columns (4.25 bits) only bring the error to 0.822 (sensitivity) or 0.827 (activation). Mixed precision is powerful only when the error is concentrated. The sensitivity rule is never worse than the activation rule, because it also counts the column’s own rounding error.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 2: outlier-aware quantization (OWQ columns, SpQR weights)</div><ol>
+<li><b>input:</b> weights \(W\), calibration inputs \(X\), base bits \(b\), outlier budget (columns \(k\) or rate \(r_o\))</li>
+<li>\(H \leftarrow 2XX^\top\) (plus a small damping on the diagonal)</li>
+<li>\(\Delta W \leftarrow W - Q(W)\) with a first quantization pass</li>
+<li><b>OWQ:</b> \(\text{sens}_j \leftarrow H_{jj}\lVert\Delta W_{:,j}\rVert^2\) <span class="c">// formula (107.7)</span>; keep the top \(k\) columns in FP16; move them to the end; run GPTQ on the rest</li>
+<li><b>SpQR:</b> run GPTQ column by column with small groups; for each weight compute \(\text{sens}_{ij}\) <span class="c">// formula (107.8)</span>; if above the threshold \(\tau\), store \((w_{ij}, j)\) in the sparse list and do not round it</li>
+<li>quantize the group scales and zeros again (SpQR, bilevel)</li>
+<li><b>at inference:</b> \(y = \hat W_{\text{dense}}\,\mathbf{x} + W_{\text{sparse}}\,\mathbf{x}\) with a dense low-bit kernel plus a sparse FP16 kernel</li></ol></div>
+
+<h2>Non-uniform levels: SqueezeLLM</h2>
+<p>Uniform INT levels are evenly spaced. But weights are not evenly spread: most are near 0, a few are far out. A few outliers stretch the range, so most levels sit where almost no weights are. SqueezeLLM (Kim et al.) fixes both problems.</p>
+<h3>Sensitivity-weighted k-means</h3>
+<p>Give each output row its own table of \(2^b\) levels (8 levels for 3 bits), and choose the levels by k-means, so they follow the weight distribution. Plain k-means minimizes the weight error. SqueezeLLM weights each weight’s error by its sensitivity, estimated by the diagonal of the Fisher information (the average squared gradient):</p>
+<div class="eq">\[ \min_{c_1, \dots, c_K} \; \sum_{i} F_{ii} \, \big(w_i - c(w_i)\big)^2, \qquad F_{ii} = \frac{1}{|D|} \sum_{d \in D} g_{d,i}^2 \tag{107.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(c_1, \dots, c_K\)</dt><dd>the \(K = 2^b\) levels of one row; \(c(w_i)\) is the level closest to \(w_i\)</dd>
+<dt>\(F_{ii}\)</dt><dd>sensitivity of weight \(i\): its squared gradient of the training loss, averaged over calibration samples \(D\)</dd>
+<dt>\(g_{d,i}\)</dt><dd>gradient of the loss with respect to weight \(i\) on sample \(d\)</dd></dl>
+<p>The Fisher diagonal approximates the Hessian of the <b>final loss</b>, not of one layer’s output. It needs one backward pass per calibration sample (the paper uses 100 samples and reports that about 10 are usually enough). [Certain] The weighted k-means is Lloyd’s algorithm where each center is a weighted average: \(c_k = \sum_{i \in k} F_{ii} w_i / \sum_{i \in k} F_{ii}\). Sensitive weights pull the levels toward themselves.</p>
+<h3>Dense-and-sparse decomposition</h3>
+<div class="eq">\[ W = D + S, \qquad W\mathbf{x} = D\mathbf{x} + S\mathbf{x} \tag{107.12} \]</div>
+<p>\(S\) is a sparse FP16 matrix (CSR format) holding the outliers (the largest-magnitude weights, about 0.4%) and the most sensitive weights (0.05%); \(D\) holds the rest. Taking the outliers out makes the range of \(D\) much smaller, so the levels can be packed where the weights are. SqueezeLLM keeps 0.45% of the weights in \(S\) in its main sparse setting. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Placing 8 bus stops along a road. Evenly spaced stops waste most of them in empty fields. k-means puts them where people live. Weighting by sensitivity puts them closer to hospitals and schools. And the two farm houses 50 km away get a taxi (the sparse list) instead of a bus stop.</aside>
+<figure class="fig" id="aq-nu"><div class="fig-body">
+<div class="controls"><span class="seg" id="aq-nu-b"><button type="button" data-v="2" aria-pressed="false">2 bits</button><button type="button" data-v="3" aria-pressed="true">3 bits</button><button type="button" data-v="4" aria-pressed="false">4 bits</button></span>
+<span class="seg" id="aq-nu-m"><button type="button" data-v="uniform" aria-pressed="false">Uniform</button><button type="button" data-v="kmeans" aria-pressed="false">k-means</button><button type="button" data-v="weighted" aria-pressed="true">Weighted k-means</button></span>
+<label class="sl"><input type="checkbox" id="aq-nu-ds"> Dense-and-sparse (0.45% in FP16)</label></div>
+<div class="scroll-x"><svg id="aq-nu-svg" viewBox="0 0 640 260" role="img" aria-label="Histogram of one row of weights with the chosen quantization levels, and the error of three level choices"></svg></div>
+<div class="readout" id="aq-nu-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> One row of 2,000 weights: Gaussian, with 1% of them 6 times larger (heavy tails). Each weight has a Fisher sensitivity (log-normal, with 3% of the weights 40 times more sensitive). The bars at the bottom compare the sensitivity-weighted error of formula (107.11) for the three ways to place levels.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At 3 bits without the sparse part, uniform levels have error 0.4837: the outliers stretch the range and most levels fall in empty space. k-means brings it to 0.0642, and Fisher-weighted k-means to 0.0587. Turn on dense-and-sparse: 9 values (0.45%) move to FP16, and the errors drop to 0.0801, 0.0285 and 0.0240. The weighted version wins every time, but by less than the jump from uniform to k-means. Try 2 bits: with only 4 levels, removing outliers matters most.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 3: SqueezeLLM for one weight matrix</div><ol>
+<li><b>input:</b> weights \(W\), Fisher diagonal \(F\) (squared gradients on about 10 to 100 samples), bits \(b\), sparse rates (0.4% outliers, 0.05% sensitive)</li>
+<li>\(S \leftarrow\) weights beyond the outlier thresholds, plus the top 0.05% by \(F\); \(D \leftarrow W - S\) <span class="c">// formula (107.12)</span></li>
+<li><b>for each</b> output row \(r\) of \(D\) <b>do</b></li>
+<li>&nbsp;&nbsp;initialize \(2^b\) levels (for example at quantiles); repeat Lloyd steps:</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;assign each weight to its nearest level</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(c_k \leftarrow \sum_{i \in k} F_{ii} w_i / \sum_{i \in k} F_{ii}\) <span class="c">// formula (107.11)</span></li>
+<li>&nbsp;&nbsp;store \(b\)-bit indices and a table of \(2^b\) FP16 levels for row \(r\)</li>
+<li>store \(S\) in CSR (FP16 values, column indices, row pointers)</li></ol></div>
+<p>On LLaMA-7B (FP16 WikiText-2: 5.68), the SqueezeLLM paper reports 6.32 at 3.02 bits and 6.13 at 3.24 bits with the 0.45% sparse part; at about 4 bits, 5.79 (4.05 bits) and 5.77 (4.27 bits). [Certain] Its 3-bit kernel ran up to about 2.3× faster than FP16 on an A6000 at batch size 1 (the abstract says 2.3×, the main text 2.4×). [Certain]</p>
+
+<h2>Kernels for non-uniform formats: LUT-GEMM</h2>
+<p>Uniform INT4 has a simple kernel: load 4-bit codes, dequantize with scale and zero inside the matrix product, multiply in FP16. A non-uniform format needs a table lookup per weight to dequantize. LUT-GEMM (Park et al.) goes one step further: it removes the dequantization and most multiplications.</p>
+<p>It uses <b>binary-coding quantization</b> (BCQ). Each weight is a sum of \(q\) signed bits with real scales:</p>
+<div class="eq">\[ w \approx \sum_{i=1}^{q} \alpha_i\, b_i + z, \qquad b_i \in \{-1, +1\} \tag{107.13} \]</div>
+<p>Uniform quantization is a special case: choose \(\alpha_i = 2^{i-1}\, s\) (half the bit weights of the INT code times the scale) and absorb the rest into the offset \(z\) (LUT-GEMM paper, Appendix C). [Certain] Non-uniform levels can be fitted directly with free \(\alpha_i\).</p>
+<p>Now the dot product of one row with the input \(\mathbf{x}\). Cut \(\mathbf{x}\) into chunks of \(\mu\) inputs. For each bit-plane, the row’s bits inside one chunk are just a sign pattern, and there are only \(2^\mu\) possible patterns. So precompute, once per chunk, all \(2^\mu\) signed sums \(\pm x_1 \pm \dots \pm x_\mu\). Then every row and every bit-plane only <b>looks up</b> its partial sum:</p>
+<div class="eq">\[ y_r = \sum_{i=1}^{q} \alpha_{r,i} \sum_{c=1}^{n/\mu} \mathrm{LUT}_c\big[\, \mathbf{b}_{r,i,c} \,\big] \;+\; z_r \sum_j x_j \tag{107.14} \]</div>
+<p>Building the tables costs about \(2^\mu \cdot n/\mu\) additions and is shared by all \(m\) rows; reading costs \(m \cdot n/\mu \cdot q\) lookups, against \(m \cdot n\) multiply-adds for a dense product. The saving is about \(\mu/q\) when \(m\) is large. [Certain] The tables live in GPU shared memory and are shared by the threads of a block.</p>
+<figure class="fig" id="aq-lut"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="aq-lut-prev">Back</button><button type="button" class="btn primary" id="aq-lut-play">Play</button><button type="button" class="btn" id="aq-lut-next">Next</button><span id="aq-lut-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="aq-lut-svg" viewBox="0 0 640 260" role="img" aria-label="LUT-GEMM example: input chunk, the table of all signed sums, and four rows computed by lookups"></svg></div>
+<div class="readout" id="aq-lut-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> LUT-GEMM on a tiny example: \(\mu = 3\) inputs, 4 rows, 2 bit-planes with scales 0.6 and 0.2 (offset \(z = 0\)). The last two columns show the result from the table and from a normal dot product; they always agree.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Step through. The table is built once for the chunk (8 entries). Row 1 then needs only two reads: LUT[101] = 3.5 and LUT[110] = −2.5, so \(y_1 = 0.6 \times 3.5 + 0.2 \times (-2.5) = 1.6\), the same as the direct product with weights 0.8, −0.4, 0.4. With 12,288 rows, the same 8 entries would be reused 12,288 times per bit-plane; that reuse is where the saving comes from.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: how much work does the table save?</div>
+<p>One FFN-sized matrix with \(m = n = 12{,}288\), \(q = 3\) bits and \(\mu = 8\). Dense: \(m n = 151{,}000{,}000\) multiply-adds (rounded). Tables: \(2^8 \times 12{,}288/8 = 393{,}216\) entries. Lookups: \(12{,}288 \times 1{,}536 \times 3 = 56{,}623{,}104\). The ratio is 2.65, close to \(\mu/q = 8/3\). In the paper’s measurement for the first FFN layer of OPT-175B on an A100 (\(m = 12{,}288\), group size 128), cuBLAS FP16 took 0.7256 ms, the GPTQ 3-bit kernel 0.3599 ms and LUT-GEMM 3-bit 0.2250 ms (3.22× faster than FP16). [Certain]</p></div>
+<p>End to end, LUT-GEMM ran OPT-175B in 3 bits on a single A100 at 51.6 ms per token, against 106.5 ms for the GPTQ kernel (about 2.1×). [Certain]</p>
+<h3>Why weight-only helps decoding, not prefill</h3>
+<p>During decoding with a small batch, each weight is read once and used for only a few tokens, so the matrix product is limited by memory bandwidth (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>). Reading 3 or 4 bits instead of 16 is then a direct speedup, and the extra dequantization or lookup work is hidden. During prefill, or at large batch, the same weight is reused by hundreds of tokens; the product becomes compute-bound and runs on FP16 tensor cores after dequantization. Weight-only formats then save memory but little time, and can even be slower. To speed up compute-bound phases you must also quantize activations (<a href="../inference/weight-activation-quantization-llm-int8-smoothquant-zeroquant.html">session 108</a>). [Certain]</p>
+
+<h2>All methods side by side</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Method</th><th>What it protects</th><th>How</th><th>Storage</th><th>Kernel</th></tr></thead><tbody>
+<tr><td>RTN</td><td>nothing</td><td>round each group</td><td>INT3/4 + scale, zero per group</td><td>standard dequant GEMV/GEMM</td></tr>
+<tr><td>GPTQ</td><td>the output, via error feedback</td><td>Hessian-based updates of unrounded weights</td><td>same as RTN</td><td>same as RTN</td></tr>
+<tr><td>AWQ</td><td>weights on large-activation channels</td><td>per-channel scale \(\mathbf{s}_X^\alpha\), folded into the previous op; clipping search</td><td>same as RTN</td><td>same as RTN</td></tr>
+<tr><td>OWQ</td><td>weak columns (outlier channels)</td><td>Hessian column sensitivity (107.7); FP16 columns + GPTQ</td><td>INT + a few FP16 columns</td><td>dense low-bit + small FP16 part</td></tr>
+<tr><td>SpQR</td><td>single sensitive weights</td><td>OBS sensitivity (107.8); small groups, bilevel scales</td><td>INT3 + 3-bit stats + CSR outliers</td><td>custom dense + sparse</td></tr>
+<tr><td>SqueezeLLM</td><td>sensitive and outlier weights</td><td>Fisher-weighted k-means levels; dense-and-sparse</td><td>3/4-bit indices + per-row LUT + CSR</td><td>LUT dequant + sparse</td></tr>
+<tr><td>LUT-GEMM</td><td>(a kernel, not a selection rule)</td><td>binary coding, table of signed sums</td><td>bit-planes + scales per group</td><td>lookups, no dequant</td></tr></tbody></table></div>
+<p>The numbers in different papers are <b>not</b> directly comparable. For LLaMA-7B at INT3 with groups of 128, the AWQ paper reports 6.35 for AWQ while the SqueezeLLM paper reports 6.44 for AWQ; the SpQR paper reports 4-bit RTN at 6.43, but the AWQ paper reports INT4-g128 RTN at 5.96. [Certain] The most likely reason is the group size: SpQR’s RTN and GPTQ baselines appear to use one scale per row. [Likely] Always check the bits (including scales), the group size, the calibration set and the evaluation context length before comparing.</p>
+
+<h2>A runnable experiment</h2>
+<p>The code builds a linear layer with 1% outlier input channels, then compares plain INT3 rounding, keeping 1% of the columns in FP16 by four rules, and the AWQ search. It runs on a CPU in a few seconds and prints the same numbers every time.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+
+<span class="kw2">def</span> quantize(w, bits=3, group=128):
+    <span class="cm">"""Asymmetric min-max round-to-nearest, one scale and one zero point per group of `group` inputs."""</span>
+    rows, cols = w.shape
+    g = w.reshape(rows, cols // group, group)
+    lo, hi = g.amin(-1, keepdim=True), g.amax(-1, keepdim=True)
+    scale = (hi - lo).clamp(min=1e-8) / (2**bits - 1)
+    zero = torch.round(-lo / scale)
+    q = torch.clamp(torch.round(g / scale) + zero, 0, 2**bits - 1)
+    <span class="kw2">return</span> ((q - zero) * scale).reshape(rows, cols)
+
+<span class="cm"># a toy linear layer y = W x with a few "outlier" input channels</span>
+d_in, d_out, n = 1024, 512, 2048
+W = torch.randn(d_out, d_in) * 0.02
+mag = torch.exp(0.3 * torch.randn(d_in))          <span class="cm"># normal channels: size about 1</span>
+out_ch = torch.randperm(d_in)[:10]                 <span class="cm"># 1% of the channels ...</span>
+mag[out_ch] *= 20.0                                <span class="cm"># ... are 20x larger</span>
+X = torch.randn(d_in, n) * mag[:, None]            <span class="cm"># calibration activations</span>
+Y = W @ X
+
+<span class="kw2">def</span> err(W_hat):                                    <span class="cm"># relative output error</span>
+    <span class="kw2">return</span> ((W_hat @ X - Y).pow(2).mean() / Y.pow(2).mean()).item()
+
+bits, k = 3, d_in // 100
+W_rtn = quantize(W, bits)
+print(f"RTN INT{bits} g128            : {err(W_rtn):.4f}")
+
+<span class="kw2">def</span> keep_fp16(idx):                                <span class="cm"># mixed precision: some columns stay exact</span>
+    W_hat = W_rtn.clone(); W_hat[:, idx] = W[:, idx]; <span class="kw2">return</span> W_hat
+act = X.abs().mean(1)                              <span class="cm"># s_X, formula (107.6)</span>
+lam = (X * X).sum(1)                               <span class="cm"># diagonal of X X^T (H up to a factor 2)</span>
+sens = lam * (W - W_rtn).pow(2).sum(0)             <span class="cm"># OWQ sensitivity, formula (107.7)</span>
+print(f"keep 1% by activation       : {err(keep_fp16(act.topk(k).indices)):.4f}")
+print(f"keep 1% by OWQ sensitivity  : {err(keep_fp16(sens.topk(k).indices)):.4f}")
+print(f"keep 1% by weight norm      : {err(keep_fp16(W.norm(dim=0).topk(k).indices)):.4f}")
+print(f"keep 1% at random           : {err(keep_fp16(torch.randperm(d_in)[:k])):.4f}")
+
+<span class="cm"># AWQ: s = s_X^alpha, search alpha on a grid of 20 values in [0, 1)</span>
+best = (float("inf"), None)
+<span class="kw2">for</span> i <span class="kw2">in</span> range(20):
+    alpha = i / 20
+    s = act.pow(alpha)
+    s = s / (s.max() * s.min()).sqrt()             <span class="cm"># keeps numbers in a safe range</span>
+    W_hat = quantize(W * s[None, :], bits) / s[None, :]   <span class="cm"># scale columns, quantize, fold 1/s back</span>
+    best = min(best, (err(W_hat), alpha))
+print(f"AWQ, best alpha = {best[1]:.2f}     : {best[0]:.4f}")</pre>
+<p>Output with PyTorch 2.8 on a CPU: RTN 0.0463; keep 1% by activation 0.0087, by OWQ sensitivity 0.0087, by weight norm 0.0462, at random 0.0462; AWQ best \(\alpha = 0.35\), 0.0176. Scaling alone (one data type) removes about 62% of the error; keeping the 10 outlier columns exact removes 81%. In this toy, activation and sensitivity pick the same columns, because the outliers dominate everything. Other PyTorch versions may differ in the last digits.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical choice</th><th>Why</th></tr></thead><tbody>
+<tr><td>Serving a 4-bit chat model with vLLM, TGI or TensorRT-LLM</td><td>AWQ or GPTQ, INT4, groups of 128</td><td>Same storage as RTN, standard kernels, near-FP16 quality at 4 bits</td></tr>
+<tr><td>A model on a laptop or a Jetson board</td><td>AWQ INT4 with TinyChat or similar runtimes</td><td>Batch size 1 decoding is memory-bound; the AWQ paper reports 2.7 to 3.9× over FP16 on an RTX 4090 [Certain]</td></tr>
+<tr><td>Video captioning, video question answering or key-moment detection with a VLM on an edge device</td><td>AWQ on the language model of a VLM such as VILA</td><td>The paper reports VILA-7B on Jetson Orin going from 11.5 to 35.6 tokens/s [Certain]; the vision encoder often stays in FP16 [Likely]</td></tr>
+<tr><td>Fitting a larger model into one consumer GPU</td><td>SpQR or SqueezeLLM near 3 to 4 bits</td><td>Near-lossless quality per bit; SpQR reports a 33B model on one 24 GB GPU</td></tr>
+<tr><td>Cheap task adaptation of a quantized model</td><td>OWQ weak-column tuning</td><td>Train only the FP16 columns; the low-bit part stays frozen</td></tr>
+<tr><td>Video-RAG or video retrieval: a quantized LLM reads retrieved clip captions</td><td>4-bit AWQ/GPTQ LLM, FP16 embedding model</td><td>Frees memory for long contexts and the KV cache; embeddings need precise distances [Likely]</td></tr>
+<tr><td>Very low bits (2 to 3) on non-standard hardware</td><td>Binary-coded weights with LUT-GEMM</td><td>No dequantization; work scales with the number of bit-planes</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Choosing salient weights by weight size.</b> The AWQ table shows this is no better than random. Use activation size or a Hessian or Fisher sensitivity.</li>
+<li><b>Scaling too hard.</b> \(\alpha = 1\) is often worse than no scaling (Figure 2): once the scaled column becomes the group maximum, the whole group loses resolution.</li>
+<li><b>Forgetting to fold 1/s.</b> If you scale the weights but do not divide the RMSNorm (or v, up) by the same \(\mathbf{s}\), the model output changes. Check that the FP16 model with scales folded gives the same logits before you quantize.</li>
+<li><b>Different scales for layers that share an input.</b> q, k and v read one normalized activation; they must use one \(\mathbf{s}\), because there is only one RMSNorm to fold it into.</li>
+<li><b>Counting bits without the overhead.</b> “3-bit” with groups of 128 and FP16 scale and zero is 3.25 bits; SpQR’s small groups and outliers add more (formula 107.10). Compare methods at equal total bits.</li>
+<li><b>Comparing perplexities across papers.</b> RTN at 4 bits is 6.43 in one paper and 5.96 in another for the same LLaMA-7B, most likely because of group size. Re-run baselines yourself.</li>
+<li><b>Expecting speedups at large batch.</b> Weight-only formats speed up memory-bound decoding. Prefill and large-batch serving are compute-bound; there the benefit is mostly memory.</li>
+<li><b>Calibrating on the wrong layer inputs.</b> Collect the inputs of block \(\ell\) from the already quantized blocks \(1 \dots \ell-1\), so each block corrects for the errors before it.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why does AWQ choose salient channels by activation size and not by weight size?<span class="lvl">basic</span></summary><div class="ans">The output error is the weight error times the input (formula 107.1). A weight’s rounding error has about the same size no matter how large the weight is (it depends on the group’s step \(\Delta\)), but it is multiplied by the activation of its channel. Channels with 10 to 100 times larger activations therefore cause most of the output error. The AWQ paper shows that keeping 1% of channels in FP16 chosen by activation brings OPT-6.7B INT3 from 23.54 to 11.39 perplexity, while choosing by weight norm gives 22.37, no better than random.</div></details>
+<details class="qa"><summary>Explain mathematically why scaling a weight by s before quantization reduces its error.<span class="lvl">core</span></summary><div class="ans">Write \(w x = (s w)(x/s)\). After quantization we compute \(Q(sw)\, x/s\). The rounding error of \(sw\) is about the step \(\Delta'\) of its group, independent of the value. In the output it is divided by \(s\), so the error ratio is \((\Delta'/\Delta)(1/s)\) (formula 107.4). If scaling one weight among 128 does not change the group maximum, \(\Delta' = \Delta\) and the error falls by \(1/s\). If \(s\) is too large, the weight becomes the group maximum, \(\Delta'\) grows and all other weights in the group get coarser steps. That is why the best \(s\) in the paper is about 2, not 4.</div></details>
+<details class="qa"><summary>Where does the 1/s go at inference time? Does AWQ change the model architecture?<span class="lvl">core</span></summary><div class="ans">It is folded into the operation that produces the activation: the RMSNorm weight before q/k/v and before gate/up, the up projection’s output rows before down, and the v projection’s output rows before o (only when v and o shapes match, so not with GQA). After folding the architecture is unchanged and the quantized weights use the normal INT4 group format, so any AWQ-compatible INT4 kernel can run them.</div></details>
+<details class="qa"><summary>How does AWQ search the scales, and why not optimize s with gradients?<span class="lvl">core</span></summary><div class="ans">It uses \(\mathbf{s} = \mathbf{s}_X^\alpha\), where \(\mathbf{s}_X\) is the mean absolute activation per channel, and tries 20 values of \(\alpha\) in \([0, 1)\), keeping the one with the smallest output MSE of the module on calibration data. Quantization contains rounding, which has zero gradient almost everywhere, so direct gradient descent does not work without tricks like the straight-through estimator. A one-parameter grid search is cheap, stable, and hard to overfit, which is why AWQ needs only a small calibration set.</div></details>
+<details class="qa"><summary>AWQ or GPTQ: how do they differ and when would you pick each?<span class="lvl">core</span></summary><div class="ans">GPTQ rounds columns one by one and updates the remaining weights with the inverse Hessian to compensate; it reconstructs the layer output on calibration data. AWQ only rescales channels and clips, using activation statistics, with no reconstruction. Both produce the same storage format. AWQ is faster to run, needs less calibration data and is reported to be more robust to calibration domain shift; on the AWQ paper’s Llama-2 tables it is slightly better at INT3 and INT4. GPTQ can be stronger at very low bits on some models. They are complementary: the scaling can be applied first and GPTQ run afterwards. [Likely]</div></details>
+<details class="qa"><summary>What is a “weak column” in OWQ, and how many bits does OWQ 3.01 really use?<span class="lvl">core</span></summary><div class="ans">A weak column is an input column whose sensitivity \(H_{jj}\lVert\Delta W_{:,j}\rVert^2\) is large, usually because its input channel has activation outliers (\(H_{jj} = 2\sum_t X_{tj}^2\)). OWQ keeps those columns in FP16 and quantizes the rest with GPTQ. The average is \(b + f(16-b)\); for 3.01 bits, \(f = 0.01/13 \approx 0.077\%\) of weights. Column indices and the zero-filled low-bit entries add a little more (the paper mentions 3.012 bits).</div></details>
+<details class="qa"><summary>How does SpQR keep the bit cost low while using groups as small as 16?<span class="lvl">advanced</span></summary><div class="ans">Small groups normally cost a lot: two FP16 numbers per 16 weights is 2 bits per weight. SpQR quantizes the scales and zero points themselves to 3 bits in second-level groups, with FP16 second-level statistics. With \(\beta_1 = 16\), \(\beta_2 = 32\), the statistics cost \(6/16 + 64/512 = 0.5\) bits. Outliers (about 0.2 to 0.5% of weights) are stored in a sparse list at about 32 bits each, so 0.4% costs 0.128 bits. Total with 3-bit codes: about 3.63 bits per weight (formula 107.10).</div></details>
+<details class="qa"><summary>Why does SqueezeLLM use the Fisher information instead of the layer Hessian, and what does weighted k-means change?<span class="lvl">advanced</span></summary><div class="ans">The layer Hessian \(2XX^\top\) measures the effect on one layer’s output; the Fisher diagonal (mean squared gradient of the final loss) measures the effect on the model’s loss, which is what we care about, and it is per weight, so it fits a 1-D k-means. Weighted k-means replaces each center by the sensitivity-weighted mean of its weights, pulling levels toward sensitive weights. The cost is a few backward passes on calibration samples. In Figure 4 the weighting lowers the weighted error from 0.0642 to 0.0587 at 3 bits; the larger gains come from non-uniform levels and from removing outliers.</div></details>
+<details class="qa"><summary>How does LUT-GEMM compute a matrix-vector product without dequantizing?<span class="lvl">advanced</span></summary><div class="ans">Weights are stored as bit-planes: \(w = \sum_i \alpha_i b_i\) with \(b_i \in \{\pm1\}\). For each chunk of \(\mu\) inputs, it precomputes all \(2^\mu\) signed sums and keeps them in shared memory. For every row and bit-plane, the \(\mu\) bits form an index into that table, so the partial dot product is one lookup, then multiplied by \(\alpha_i\). Cost: \(m \cdot n/\mu \cdot q\) lookups plus a table build shared by all rows, against \(m n\) multiply-adds, a saving of about \(\mu/q\). Uniform INT codes can be written in this binary form too.</div></details>
+<details class="qa"><summary>Your INT4 AWQ model decodes 3× faster but prefill is no faster. Why?<span class="lvl">core</span></summary><div class="ans">At batch size 1, decoding reads every weight for one token: the matrix-vector product is memory-bound, and reading 4.25 bits instead of 16 cuts time almost proportionally. Prefill multiplies the same weights with hundreds or thousands of tokens at once; it is compute-bound, and the kernel dequantizes to FP16 and uses the same tensor-core math as before, plus dequantization work. To speed it up you need low-precision activations too (INT8 or FP8 weight–activation quantization).</div></details>
+<details class="qa"><summary>You must quantize a model to about 3 bits and quality drops badly with RTN. What do you try, in order?<span class="lvl">advanced</span></summary><div class="ans">First, smaller groups (128 or 64) and count the extra bits. Second, AWQ scaling and clipping, cheap and kernel-compatible. Third, GPTQ (possibly after AWQ scaling). If the quality is still not enough and you can afford a custom kernel, keep outliers in FP16 (OWQ columns, SpQR sparse weights) or use non-uniform levels with a dense-and-sparse split (SqueezeLLM). Measure perplexity and task accuracy at equal total bits, and check the speed of the kernel you will actually deploy. Rotation methods (<a href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html">session 109</a>) are another option for 2 to 3 bits.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A group has largest weight 1.2 and uses INT4 symmetric (levels \(-7 \dots 7\)). What is \(\Delta\)? A salient weight is 0.4. What is the largest \(s\) that does not change \(\Delta\)?</li>
+<li>Using the AWQ Table 2, by what factor does \((\Delta'/\Delta)(1/s)\) improve from \(s = 2\) to \(s = 4\), and why does perplexity still get worse?</li>
+<li>In a Llama 3 block with 8 KV heads and 32 query heads (head size 128, hidden size 4096), can AWQ fold a scale for o_proj into v_proj? Give the two shapes.</li>
+<li>Compute the SpQR bit cost (formula 107.10) for \(b_w = 3\), \(b_s = b_z = 3\), \(\beta_1 = \beta_2 = 16\), \(r_o = 0.3\%\).</li>
+<li>OWQ uses 4-bit base weights and wants 4.05 bits on average. What share of the weights can stay in FP16?</li>
+<li>LUT-GEMM with \(\mu = 8\): how many table entries per chunk, and how many lookups does a 4,096-wide row need for \(q = 4\)?</li>
+<li>In Figure 1, set the salient activation to 20×. Read the best \(s\) and the total error. Why can it use a larger \(s\) than at 10×?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(\Delta = 1.2/7 = 0.171\). The scaled weight must stay at most 1.2: \(0.4\,s \le 1.2\), so \(s \le 3\). 2. \(0.519 / 0.303 = 1.71\) times smaller for the salient weights, but at \(s = 4\) 21.2% of the groups have a larger \(\Delta\) (average \(\Delta'/\Delta = 1.213\)), so all the other weights in those groups get coarser steps; perplexity goes from 11.92 to 12.36. 3. No. v_proj has \(8 \times 128 = 1024\) output rows, while o_proj has \(32 \times 128 = 4096\) input columns; each v row feeds 4 query heads’ positions in o’s input, so one row scale cannot give 4096 different column scales. The reference code skips the pair when the shapes differ. 4. \(3 + 6/16 + 64/256 + 32 \times 0.003 = 3 + 0.375 + 0.25 + 0.096 = 3.721\) bits. 5. \(f = 0.05/12 \approx 0.42\%\). 6. \(2^8 = 256\) entries; \(4096/8 = 512\) chunks, times 4 bit-planes = 2,048 lookups (against 4,096 multiply-adds). 7. Best \(s = 2.5\), total ×0.347 (salient share at \(s = 1\) is 78.1%). The salient part is a bigger share of the error, so paying a larger price on the other weights is worth it.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>The output error of a quantized layer is the weight error weighted by the activation size (107.1). A few outlier channels cause most of it; keeping 1% of channels by activation fixes most of the INT3 loss, choosing by weight size does not.</li>
+<li>AWQ scales salient columns up and their inputs down (107.3); the error falls by \((\Delta'/\Delta)/s\) (107.4). The scale \(\mathbf{s}_X^\alpha\) is found by a 20-point grid search (107.6) and folded into RMSNorm, up or v, so storage and kernels stay standard.</li>
+<li>Mixed precision keeps sensitive weights in FP16: OWQ by columns (107.7), SpQR by single weights with an OBS score (107.8), small groups and bilevel scales; count the bits with (107.9) and (107.10).</li>
+<li>SqueezeLLM places non-uniform levels with Fisher-weighted k-means (107.11) and moves 0.45% of weights to a sparse FP16 matrix (107.12).</li>
+<li>LUT-GEMM turns binary-coded weights (107.13) into table lookups (107.14), saving about \(\mu/q\) of the work. All weight-only formats help memory-bound decoding most, not compute-bound prefill.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \E[(\Delta y)^2] \approx \sum_j (Q(w_j)-w_j)^2\,\E[x_j^2], \quad \frac{\text{err}'}{\text{err}} = \frac{\Delta'}{\Delta}\cdot\frac1s, \quad \mathbf{s} = \mathbf{s}_X^{\alpha} \]</div>
+<div class="eq">\[ \text{sens}_j = H_{jj}\lVert\Delta W_{:,j}\rVert^2, \quad \bar b \approx b_w + \frac{b_s+b_z}{\beta_1} + \frac{64}{\beta_1\beta_2} + 32\,r_o, \quad \min_c \sum_i F_{ii}(w_i - c(w_i))^2 \]</div>
+<h2 class="plain" id="weight-ptq-2-awq-outliers-and-mixed-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Dettmers et al. (2023). <a href="https://arxiv.org/abs/2306.03078" target="_blank" rel="noopener">SpQR: A Sparse-Quantized Representation for Near-Lossless LLM Weight Compression</a></li><li>Lee et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;OWQ: Outlier-Aware Weight Quantization for Efficient Fine-Tuning and Inference of Large Language Models&amp;quot;" target="_blank" rel="noopener">OWQ: Outlier-Aware Weight Quantization for Efficient Fine-Tuning and Inference of Large Language Models</a></li><li>Kim et al. (2023). <a href="https://arxiv.org/abs/2306.07629" target="_blank" rel="noopener">SqueezeLLM: Dense-and-Sparse Quantization</a></li><li>Park et al. (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;LUT-GEMM: Quantized Matrix Multiplication based on LUTs for Efficient Inference in Large-Scale Generative Language Models&amp;quot;" target="_blank" rel="noopener">LUT-GEMM: Quantized Matrix Multiplication based on LUTs for Efficient Inference in Large-Scale Generative Language Models</a></li><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Dettmers et al. (2023). <a href="https://arxiv.org/abs/2306.03078" target="_blank" rel="noopener">SpQR: A Sparse-Quantized Representation for Near-Lossless LLM Weight Compression</a></li><li>Lee et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;OWQ: Outlier-Aware Weight Quantization for Efficient Fine-Tuning and Inference of Large Language Models&amp;quot;" target="_blank" rel="noopener">OWQ: Outlier-Aware Weight Quantization for Efficient Fine-Tuning and Inference of Large Language Models</a></li><li>Kim et al. (2023). <a href="https://arxiv.org/abs/2306.07629" target="_blank" rel="noopener">SqueezeLLM: Dense-and-Sparse Quantization</a></li><li>Park et al. (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;LUT-GEMM: Quantized Matrix Multiplication based on LUTs for Efficient Inference in Large-Scale Generative Language Models&amp;quot;" target="_blank" rel="noopener">LUT-GEMM: Quantized Matrix Multiplication based on LUTs for Efficient Inference in Large-Scale Generative Language Models</a></li><li>Frantar et al. (2022). <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</a></li><li>Dettmers et al. (2022). <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</a></li><li>Xiao et al. (2022). <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>MIT HAN Lab (code). <a href="https://github.com/mit-han-lab/llm-awq" target="_blank" rel="noopener">llm-awq: AWQ and TinyChat reference implementation (awq/quantize/auto_scale.py)</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/weight-ptq-1-from-obq-to-gptq.html"><small>Previous · session 106</small>Weight PTQ 1: from OBQ to GPTQ</a><a class="next" href="../inference/weight-activation-quantization-llm-int8-smoothquant-zeroquant.html"><small>Next · session 108</small>Weight–activation quantization: LLM.int8(), SmoothQuant, ZeroQuant, OmniQuant</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="weight-ptq-2-awq-outliers-and-mixed"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const T_=(x,y,s,o)=>`<text x="${x}" y="${y}" ${o||""}>${s}</text>`;
+/* symmetric absmax quantizer, formula (107.2): levels -L..L with L = 2^(b-1)-1 */
+function qsym(w,bits,out){const L=Math.pow(2,bits-1)-1;let m=0;for(let i=0;i<w.length;i++){const a=Math.abs(w[i]);if(a>m)m=a;}const d=Math.max(m,1e-12)/L;
+ for(let i=0;i<w.length;i++){let q=Math.round(w[i]/d);if(q>L)q=L;if(q<-L)q=-L;out[i]=q*d;}return d;}
+function axes(x0,y0,x1,y1){return `<path d="M${x0} ${y1} V${y0} H${x1}" fill="none" stroke="var(--muted)"/>`;}
+function poly(pts,col,w,dash){return `<polyline points="${pts.map(p=>p[0].toFixed(1)+","+p[1].toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="${w||2}" ${dash?`stroke-dasharray="${dash}"`:""}/>`;}
+
+/* ---------- Figure 1: scale one salient channel ---------- */
+(function(){
+ const svg=$("#aq-sc-svg");if(!svg)return;const info=$("#aq-sc-info"),sS=$("#aq-sc-s");let m0=10;
+ const Rr=128,G=128;const g=gauss(rng(11));const W=[];for(let r=0;r<Rr;r++){const row=new Float64Array(G);for(let j=0;j<G;j++)row[j]=g();W.push(row);}
+ const buf=new Float64Array(G),tmp=new Float64Array(G),buf0=new Float64Array(G);
+ function point(s){let sal=0,oth=0,ch=0,ra=0,ra2=0;
+  for(const row of W){const d0=qsym(row,3,buf0);tmp.set(row);tmp[0]=row[0]*s;const d1=qsym(tmp,3,buf);
+   if(Math.abs(d1-d0)>1e-12)ch++;ra+=d1/d0;ra2+=d1/d0/s;const e=buf[0]/s-row[0];sal+=m0*m0*e*e;
+   for(let j=1;j<G;j++){const f=buf[j]-row[j];oth+=f*f;}}
+  return {sal,oth,ch:ch/Rr,ra:ra/Rr,ra2:ra2/Rr};}
+ const grid=[];for(let k=0;k<=28;k++)grid.push(1+0.25*k);
+ let curve=null,base=null,bestS=1;
+ function recompute(){base=point(1);curve=grid.map(s=>point(s));const T0=base.sal+base.oth;let bi=0;curve.forEach((p,i)=>{if(p.sal+p.oth<curve[bi].sal+curve[bi].oth)bi=i;});bestS=grid[bi];}
+ function draw(){const s=+sS.value;$("#aq-sc-sv").value=s.toFixed(2);const T0=base.sal+base.oth;const cur=point(s);
+  const x0=60,x1=620,y0=230,y1=20,ymax=2;const X=v=>x0+(v-1)/7*(x1-x0),Y=v=>y0-Math.min(v,ymax)/ymax*(y0-y1);
+  let o=axes(x0,y0,x1,y1);
+  [0,0.5,1,1.5,2].forEach(v=>{o+=`<line x1="${x0}" y1="${Y(v)}" x2="${x1}" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/>`+T_(x0-6,Y(v)+4,v.toFixed(1),'text-anchor="end" class="svgs" font-size="12"');});
+  [1,2,3,4,5,6,7,8].forEach(v=>{o+=T_(X(v),y0+18,v,'text-anchor="middle" class="svgs" font-size="12"');});
+  o+=T_((x0+x1)/2,y0+36,"scale s on the salient weight",'text-anchor="middle" class="svgs" font-size="12.5"');
+  o+=T_(x0+4,y1-6,"output error ÷ total error at s = 1",'class="svgs" font-size="12"');
+  o+=poly(grid.map((v,i)=>[X(v),Y(curve[i].sal/T0)]),"var(--q)",2);
+  o+=poly(grid.map((v,i)=>[X(v),Y(curve[i].oth/T0)]),"var(--k)",2);
+  o+=poly(grid.map((v,i)=>[X(v),Y((curve[i].sal+curve[i].oth)/T0)]),"var(--v)",3);
+  o+=`<line x1="${X(s)}" y1="${y1}" x2="${X(s)}" y2="${y0}" stroke="var(--muted)" stroke-dasharray="4 3"/>`;
+  [[cur.sal/T0,"var(--q)"],[cur.oth/T0,"var(--k)"],[(cur.sal+cur.oth)/T0,"var(--v)"]].forEach(([v,c])=>{o+=`<circle cx="${X(s)}" cy="${Y(v)}" r="5" fill="${c}" stroke="var(--card)" stroke-width="1.5"/>`;});
+  const bt=(()=>{const p=curve[grid.indexOf(bestS)];return (p.sal+p.oth)/T0;})();o+=T_(X(bestS),Y(bt)-12,"best",'text-anchor="middle" font-size="12" font-weight="700" fill="var(--v)" font-family="var(--sans)"');
+  svg.innerHTML=o;
+  const tot=(cur.sal+cur.oth)/T0;
+  info.innerHTML=`s = <b>${s.toFixed(2)}</b>, salient activation ${m0}× the others. Rows whose step Δ changed: <b>${(100*cur.ch).toFixed(1)}%</b>; average Δ′/Δ = <b>${cur.ra.toFixed(3)}</b>; average (Δ′/Δ)·(1/s) = <b>${cur.ra2.toFixed(3)}</b>. Salient part of the error ×<b>${(cur.sal/base.sal).toFixed(3)}</b>, other weights ×<b>${(cur.oth/base.oth).toFixed(3)}</b>, total output error ×<b>${tot.toFixed(3)}</b>. At s = 1 the single salient weight caused <b>${(100*base.sal/T0).toFixed(1)}%</b> of the error. Best s on the grid: <b>${bestS.toFixed(2)}</b>.`;
+  svg.dataset.total=tot.toFixed(3);svg.dataset.best=bestS.toFixed(2);svg.dataset.changed=(100*cur.ch).toFixed(1);}
+ seg($("#aq-sc-m"),v=>{m0=+v;recompute();draw();});sS.addEventListener("input",draw);recompute();draw();
+})();
+
+/* ---------- Figure 2: search alpha ---------- */
+(function(){
+ const svg=$("#aq-al-svg");if(!svg)return;const info=$("#aq-al-info"),oS=$("#aq-al-o");let bits=3;
+ const C=128,Rr=64;const g=gauss(rng(21));const W=[];for(let r=0;r<Rr;r++){const row=new Float64Array(C);for(let j=0;j<C;j++)row[j]=g();W.push(row);}
+ const g2=gauss(rng(22));const M0=new Float64Array(C);for(let j=0;j<C;j++)M0[j]=Math.exp(0.5*g2());
+ const OUT=[5,37];const tmp=new Float64Array(C),q=new Float64Array(C);
+ function loss(a,m){const s=new Float64Array(C);for(let j=0;j<C;j++)s[j]=Math.pow(m[j],a);let L=0;
+  for(const row of W){for(let j=0;j<C;j++)tmp[j]=row[j]*s[j];qsym(tmp,bits,q);for(let j=0;j<C;j++){const e=q[j]/s[j]-row[j];L+=m[j]*m[j]*e*e;}}return {L,s};}
+ function draw(){const st=+oS.value;$("#aq-al-ov").value=st+"×";const m=new Float64Array(C);for(let j=0;j<C;j++)m[j]=M0[j]*(OUT.includes(j)?st:1);
+  const pts=[];for(let k=0;k<=20;k++)pts.push(loss(k/20,m));const L0=pts[0].L;let bi=0;for(let k=0;k<20;k++)if(pts[k].L<pts[bi].L)bi=k;
+  const x0=60,x1=620,y0=230,y1=20,ymax=2.5;const X=a=>x0+a*(x1-x0),Y=v=>y0-Math.min(v,ymax)/ymax*(y0-y1);
+  let o=axes(x0,y0,x1,y1);
+  [0,0.5,1,1.5,2,2.5].forEach(v=>{o+=`<line x1="${x0}" y1="${Y(v)}" x2="${x1}" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/>`+T_(x0-6,Y(v)+4,v.toFixed(1),'text-anchor="end" class="svgs" font-size="12"');});
+  [0,0.2,0.4,0.6,0.8,1].forEach(v=>{o+=T_(X(v),y0+18,v.toFixed(1),'text-anchor="middle" class="svgs" font-size="12"');});
+  o+=T_((x0+x1)/2,y0+36,"exponent α in s = s_X^α (0 = plain round-to-nearest)",'text-anchor="middle" class="svgs" font-size="12.5"');
+  o+=T_(x0+4,y1-6,"output error L(α) ÷ L(0)",'class="svgs" font-size="12"');
+  o+=poly(pts.map((p,k)=>[X(k/20),Y(p.L/L0)]),"var(--q)",2);
+  pts.forEach((p,k)=>{const on=k===bi,last=k===20;o+=`<circle cx="${X(k/20).toFixed(1)}" cy="${Y(p.L/L0).toFixed(1)}" r="${on?7:4}" fill="${last?"var(--card)":on?"var(--v)":"var(--q)"}" stroke="${last?"var(--q)":"var(--card)"}" stroke-width="1.5"><title>α = ${(k/20).toFixed(2)}: ${(p.L/L0).toFixed(3)}</title></circle>`;});
+  if(pts[20].L/L0>ymax)o+=T_(X(1)-4,Y(ymax)+14,"α = 1: "+(pts[20].L/L0).toFixed(2),'text-anchor="end" class="svgs" font-size="11.5"');
+  svg.innerHTML=o;
+  const sb=pts[bi].s;let smax=0,smin=1e9;for(let j=0;j<C;j++){smax=Math.max(smax,sb[j]);smin=Math.min(smin,sb[j]);}
+  info.innerHTML=`INT${bits}, two outlier channels at ${st}× their normal size. Best α on the grid of 20 values (0, 0.05, …, 0.95): <b>${(bi/20).toFixed(2)}</b>, error <b>${(pts[bi].L/L0).toFixed(3)}</b> × plain rounding. Full scaling (α = 1) gives <b>${(pts[20].L/L0).toFixed(3)}</b> ×. At the best α the largest scale is <b>${(smax/smin).toFixed(1)}</b> times the smallest.`;
+  svg.dataset.best=(bi/20).toFixed(2);svg.dataset.ratio=(pts[bi].L/L0).toFixed(3);svg.dataset.full=(pts[20].L/L0).toFixed(3);}
+ seg($("#aq-al-b"),v=>{bits=+v;draw();});oS.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: keep a few columns in FP16 ---------- */
+(function(){
+ const svg=$("#aq-mx-svg");if(!svg)return;const info=$("#aq-mx-info"),fS=$("#aq-mx-f"),kS=$("#aq-mx-k");
+ const DI=256,DO=128,G=128;let g=gauss(rng(31));const sig=new Float64Array(DI);for(let j=0;j<DI;j++)sig[j]=Math.exp(0.35*g());
+ g=gauss(rng(32));const W=[];for(let i=0;i<DO;i++){const row=new Float64Array(DI);for(let j=0;j<DI;j++)row[j]=sig[j]*g();W.push(row);}
+ const r=rng(33);g=gauss(r);const mb=new Float64Array(DI);for(let j=0;j<DI;j++)mb[j]=Math.exp(0.3*g());
+ const OUT=[];while(OUT.length<4){const j=Math.floor(r()*DI);if(!OUT.includes(j))OUT.push(j);}const OW=[1,0.75,0.6,0.5];
+ const e=new Float64Array(DI),q=new Float64Array(G);
+ for(const row of W)for(let g0=0;g0<DI;g0+=G){const seg_=row.subarray(g0,g0+G);qsym(seg_,3,q);for(let t=0;t<G;t++){const d=q[t]-row[g0+t];e[g0+t]+=d*d;}}
+ const wn=new Float64Array(DI);for(const row of W)for(let j=0;j<DI;j++)wn[j]+=row[j]*row[j];
+ const rp=rng(34);const perm=[];for(let j=0;j<DI;j++)perm.push(j);for(let i=DI-1;i>0;i--){const k=Math.floor(rp()*(i+1));const t=perm[i];perm[i]=perm[k];perm[k]=t;}
+ const RULES=[["sens","largest sensitivity λⱼ‖ΔW:,ⱼ‖² (OWQ)","var(--v)"],["act","largest activation (AWQ observation), dashed","var(--q)"],["wn","largest weight norm","var(--k)"],["rand","random columns","var(--muted)"]];
+ const idx=[...Array(DI).keys()];
+ function draw(){const F=+fS.value,K=+kS.value;$("#aq-mx-fv").value=F+"×";$("#aq-mx-kv").value=K+" of 256";
+  const m=Float64Array.from(mb);OUT.forEach((j,k)=>{m[j]*=1+(F-1)*OW[k];});
+  const c=new Float64Array(DI);let T=0;for(let j=0;j<DI;j++){c[j]=m[j]*m[j]*e[j];T+=c[j];}
+  const ord={act:idx.slice().sort((a,b)=>m[b]-m[a]),sens:idx.slice().sort((a,b)=>c[b]-c[a]),wn:idx.slice().sort((a,b)=>wn[b]-wn[a]),rand:perm};
+  const curves={};for(const k in ord){let left=T;const arr=[1];for(let i=0;i<16;i++){left-=c[ord[k][i]];arr.push(left/T);}curves[k]=arr;}
+  const x0=60,x1=620,y0=220,y1=20;const X=k=>x0+k/16*(x1-x0),Y=v=>y0-v*(y0-y1);
+  let o=axes(x0,y0,x1,y1);
+  [0,0.25,0.5,0.75,1].forEach(v=>{o+=`<line x1="${x0}" y1="${Y(v)}" x2="${x1}" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/>`+T_(x0-6,Y(v)+4,v.toFixed(2),'text-anchor="end" class="svgs" font-size="12"');});
+  [0,2,4,6,8,10,12,14,16].forEach(k=>{o+=T_(X(k),y0+18,k,'text-anchor="middle" class="svgs" font-size="12"');});
+  o+=T_((x0+x1)/2,y0+36,"input columns kept in FP16 (out of 256)",'text-anchor="middle" class="svgs" font-size="12.5"');
+  o+=T_(x0+4,y1-6,"output error ÷ error of plain INT3",'class="svgs" font-size="12"');
+  RULES.forEach(([k,,col])=>{o+=poly(curves[k].map((v,i)=>[X(i),Y(v)]),col,k==="sens"?3:2,k==="act"?"7 4":"");o+=`<circle cx="${X(K)}" cy="${Y(curves[k][K])}" r="5" fill="${col}" stroke="var(--card)" stroke-width="1.5"/>`;});
+  o+=`<line x1="${X(K)}" y1="${y1}" x2="${X(K)}" y2="${y0}" stroke="var(--muted)" stroke-dasharray="4 3"/>`;
+  svg.innerHTML=o;
+  const bits=3+32/G+16*K/DI;let share=0;OUT.forEach(j=>share+=c[j]);
+  info.innerHTML=`Keeping <b>${K}</b> columns (${(100*K/DI).toFixed(2)}% of the weights) costs about <b>${bits.toFixed(3)}</b> bits per weight (3 + 0.25 for the group scales + 16 per kept weight). Remaining error: `+RULES.map(([k,lab])=>`${lab.split(" (")[0]} <b>${curves[k][K].toFixed(3)}</b>`).join(", ")+`. The 4 outlier channels cause <b>${(100*share/T).toFixed(1)}%</b> of the error.`;
+  svg.dataset.act=curves.act[K].toFixed(3);svg.dataset.sens=curves.sens[K].toFixed(3);svg.dataset.wn=curves.wn[K].toFixed(3);svg.dataset.rand=curves.rand[K].toFixed(3);svg.dataset.bits=bits.toFixed(4);}
+ const leg=$("#aq-mx-leg");if(leg)leg.innerHTML=RULES.map(([,lab,col])=>`<span style="--c:${col}">${lab}</span>`).join("");
+ [fS,kS].forEach(x=>x.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: non-uniform levels and dense-and-sparse ---------- */
+(function(){
+ const svg=$("#aq-nu-svg");if(!svg)return;const info=$("#aq-nu-info"),dsC=$("#aq-nu-ds");let bits=3,meth="weighted";
+ const N=2000;const r=rng(41),g=gauss(r);const Wt=new Float64Array(N);for(let i=0;i<N;i++){let v=g()*0.5;if(r()<0.01)v*=6;Wt[i]=v;}
+ const r3=rng(42),g3=gauss(r3);const F=new Float64Array(N);for(let i=0;i<N;i++){const e=Math.exp(0.8*g3());F[i]=e*(r3()<0.03?40:1);}
+ let tot=0;for(let i=0;i<N;i++)tot+=F[i]*Wt[i]*Wt[i];
+ function nearest(c,w){let lo=0,hi=c.length-1;while(lo<hi){const mid=(lo+hi)>>1;if(w>(c[mid]+c[mid+1])/2)lo=mid+1;else hi=mid;}return lo;}
+ function kmeans(w,f,K,c0){const srt=Array.from(w).sort((a,b)=>a-b);let c=c0?c0.slice():[...Array(K).keys()].map(k=>srt[Math.floor((k+0.5)/K*srt.length)]);
+  for(let it=0;it<30;it++){const num=new Float64Array(K),den=new Float64Array(K);for(let i=0;i<w.length;i++){const k=nearest(c,w[i]);num[k]+=f[i]*w[i];den[k]+=f[i];}
+   c=c.map((v,k)=>den[k]>0?num[k]/den[k]:v);}return c.slice().sort((a,b)=>a-b);}
+ const cache={};
+ function run(b,ds){const key=b+"|"+ds;if(cache[key])return cache[key];const K=1<<b;const keep=new Set();
+  if(ds){const byMag=[...Array(N).keys()].sort((a,c)=>Math.abs(Wt[c])-Math.abs(Wt[a]));byMag.slice(0,8).forEach(i=>keep.add(i));
+   const rest=[...Array(N).keys()].filter(i=>!keep.has(i)).sort((a,c)=>F[c]-F[a]);keep.add(rest[0]);}
+  const D=[...Array(N).keys()].filter(i=>!keep.has(i));const w=D.map(i=>Wt[i]),f=D.map(i=>F[i]),ones=D.map(()=>1);
+  let lo=Infinity,hi=-Infinity;w.forEach(v=>{lo=Math.min(lo,v);hi=Math.max(hi,v);});
+  const uni=[...Array(K).keys()].map(k=>lo+(hi-lo)*k/(K-1));const km=kmeans(w,ones,K);const wk=kmeans(w,f,K,km);
+  const err=c=>{let s=0;for(let i=0;i<w.length;i++){const d=w[i]-c[nearest(c,w[i])];s+=f[i]*d*d;}return s/tot;};
+  return cache[key]={levels:{uniform:uni,kmeans:km,weighted:wk},err:{uniform:err(uni),kmeans:err(km),weighted:err(wk)},keep};}
+ let wmin=Infinity,wmax=-Infinity;for(let i=0;i<N;i++){wmin=Math.min(wmin,Wt[i]);wmax=Math.max(wmax,Wt[i]);}
+ const HB=96,lo=-6.5,hi=6.5,h=new Array(HB).fill(0);for(let i=0;i<N;i++){const k=Math.min(HB-1,Math.max(0,Math.floor((Wt[i]-lo)/(hi-lo)*HB)));h[k]++;}
+ const NAME={uniform:"uniform (evenly spaced)",kmeans:"k-means",weighted:"Fisher-weighted k-means (SqueezeLLM)"};
+ function draw(){const ds=dsC.checked;const Rz=run(bits,ds);const c=Rz.levels[meth];
+  const X=v=>30+(v-lo)/(hi-lo)*580;const base=170,top=24;const hm=Math.max(...h);
+  let o=`<line x1="30" y1="${base}" x2="610" y2="${base}" stroke="var(--muted)"/>`;
+  h.forEach((v,k)=>{const x=X(lo+(hi-lo)*k/HB),wd=580/HB-0.6;const hh=Math.sqrt(v/hm)*(base-top);if(v>0)o+=`<rect x="${x.toFixed(1)}" y="${(base-hh).toFixed(1)}" width="${wd.toFixed(1)}" height="${hh.toFixed(1)}" fill="var(--rule)"/>`;});
+  c.forEach(v=>{o+=`<line x1="${X(v).toFixed(1)}" y1="${top-6}" x2="${X(v).toFixed(1)}" y2="${base+8}" stroke="var(--q)" stroke-width="2.5"><title>level ${v.toFixed(3)}</title></line>`;});
+  Rz.keep.forEach(i=>{o+=`<circle cx="${X(Wt[i]).toFixed(1)}" cy="${base+16}" r="4" fill="var(--k)"><title>kept in FP16: ${Wt[i].toFixed(3)}${F[i]>100?" (high Fisher weight)":""}</title></circle>`;});
+  [-6,-4,-2,0,2,4,6].forEach(v=>{o+=T_(X(v),base+38,v,'text-anchor="middle" class="svgs" font-size="12"');});
+  o+=T_(32,14,"histogram of one row of 2,000 weights (square-root height), levels as dark red lines, FP16 values as orange dots",'class="svgs" font-size="11.5"');
+  const ks=["uniform","kmeans","weighted"];const bw=110;
+  ks.forEach((k,i)=>{const v=Rz.err[k],x=60+i*190;const mx=Math.max(...ks.map(z=>Rz.err[z]));const ww=v/mx*bw;
+   o+=`<rect x="${x}" y="232" width="${ww.toFixed(1)}" height="16" rx="3" fill="${k===meth?"var(--q)":"var(--rule)"}"/>`+T_(x,226,NAME[k].split(" (")[0],'class="svgs" font-size="11.5"')+T_(x+Math.max(ww,4)+4,245,v.toFixed(4),'class="svgm" font-size="11.5"');});
+  svg.innerHTML=o;
+  const nk=Rz.keep.size;const lutBits=(1<<bits)*16/N,spBits=nk*32/N;const all=bits+lutBits+spBits;
+  info.innerHTML=`${bits}-bit codes, ${NAME[meth]}${ds?", dense-and-sparse ("+nk+" values = "+(100*nk/N).toFixed(2)+"% kept in FP16)":""}. Sensitivity-weighted error (Fisher weight × squared error, ÷ Σ F w²): uniform <b>${Rz.err.uniform.toFixed(4)}</b>, k-means <b>${Rz.err.kmeans.toFixed(4)}</b>, weighted k-means <b>${Rz.err.weighted.toFixed(4)}</b>. Storage: ${bits} bits per code + ${lutBits.toFixed(3)} for this row's table of ${1<<bits} FP16 levels${ds?" + "+spBits.toFixed(3)+" for the sparse values (32 bits each)":""} = <b>${all.toFixed(3)}</b> bits per weight.`;
+  svg.dataset.uni=Rz.err.uniform.toFixed(5);svg.dataset.km=Rz.err.kmeans.toFixed(5);svg.dataset.wk=Rz.err.weighted.toFixed(5);svg.dataset.bits=all.toFixed(3);}
+ seg($("#aq-nu-b"),v=>{bits=+v;draw();});seg($("#aq-nu-m"),v=>{meth=v;draw();});dsC.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 5: LUT-GEMM, step by step ---------- */
+(function(){
+ const svg=$("#aq-lut-svg");if(!svg)return;const info=$("#aq-lut-info");
+ const x=[0.5,-1.0,2.0],a1=0.6,a2=0.2;
+ const B1=["101","001","110","011"],B2=["110","101","100","111"];
+ const keys=["000","001","010","011","100","101","110","111"];
+ const lut={};keys.forEach(k=>{lut[k]=[...k].reduce((s,b,i)=>s+(b==="1"?1:-1)*x[i],0);});
+ const wrow=r=>[0,1,2].map(i=>a1*(B1[r][i]==="1"?1:-1)+a2*(B2[r][i]==="1"?1:-1));
+ const yD=[0,1,2,3].map(r=>wrow(r).reduce((s,w,i)=>s+w*x[i],0));
+ const yL=[0,1,2,3].map(r=>a1*lut[B1[r]]+a2*lut[B2[r]]);
+ const f=v=>(Math.abs(v)<1e-9?0:v).toFixed(1);const f2=v=>(Math.abs(v)<1e-9?0:v).toFixed(2);
+ const ST=[
+  {t:`<b>The task.</b> Compute \\(y = W\\mathbf{x}\\) for 4 rows and a chunk of \\(\\mu = 3\\) inputs \\(\\mathbf{x} = (0.5, -1, 2)\\). Each weight is stored in 2-bit binary coding: \\(w = 0.6\\,b_1 + 0.2\\,b_2\\) with \\(b_1, b_2 \\in \\{-1, +1\\}\\). Row 1 holds bit-planes 101 and 110 (1 means +1), so its weights are 0.8, −0.4, 0.4.`,lut:false,row:-1},
+  {t:`<b>Build the table once.</b> For every one of the \\(2^3 = 8\\) sign patterns, add up \\(\\pm x_1 \\pm x_2 \\pm x_3\\). This costs 8 entries for this chunk, no matter how many rows the matrix has. Every row of \\(W\\) will reuse the same table.`,lut:true,row:-1},
+  {t:`<b>Row 1, bit-plane 1.</b> The bits 101 are a table index. Read LUT[101] = ${f(lut["101"])} and multiply by the scale 0.6: ${f2(a1*lut["101"])}. No multiplication by the inputs at all.`,lut:true,row:0,pl:1},
+  {t:`<b>Row 1, bit-plane 2.</b> Read LUT[110] = ${f(lut["110"])}, times 0.2 gives ${f2(a2*lut["110"])}. Sum: \\(y_1 = ${f2(yL[0])}\\). Check directly: \\(0.8 \\cdot 0.5 - 0.4 \\cdot (-1) + 0.4 \\cdot 2 = ${f2(yD[0])}\\).`,lut:true,row:0,pl:2},
+  {t:`<b>All rows.</b> Each row needs 2 table reads (one per bit-plane) and 2 scale multiplies instead of 3 multiply-adds on dequantized weights. With a real chunk of \\(\\mu = 8\\) and \\(q = 3\\) bits, a row does 3 reads per 8 inputs; the table (256 entries) is shared by thousands of rows in fast shared memory.`,lut:true,row:4}];
+ function draw(k){const S=ST[k];let o="";
+  o+=T_(20,22,"input chunk x",'class="svgs" font-size="12.5"');
+  x.forEach((v,i)=>{o+=`<rect x="${20+i*52}" y="32" width="46" height="30" rx="6" fill="var(--q-soft)" stroke="var(--q)"/>`+T_(43+i*52,52,f(v),'text-anchor="middle" class="svgm" font-size="13"');});
+  o+=T_(200,22,"LUT for this chunk",'class="svgs" font-size="12.5"');
+  keys.forEach((kk,i)=>{const y=32+i*27;const hl=S.row>=0&&S.row<4&&((S.pl===1&&B1[S.row]===kk)||(S.pl===2&&B2[S.row]===kk));
+   o+=`<rect x="200" y="${y}" width="140" height="24" rx="5" fill="${hl?"var(--k-soft)":"var(--card)"}" stroke="${hl?"var(--k)":"var(--rule)"}" stroke-width="${hl?2:1}" opacity="${S.lut?1:0.35}"/>`;
+   o+=T_(212,y+17,kk,'class="svgm" font-size="12.5"')+(S.lut?T_(330,y+17,f(lut[kk]),'text-anchor="end" class="svgm" font-size="12.5"'):"");});
+  o+=T_(380,22,"row  b₁   b₂    y (LUT)   y (direct)",'class="svgs" font-size="12" xml:space="preserve"');
+  [0,1,2,3].forEach(r=>{const y=32+r*34;const on=S.row===r||S.row===4;
+   o+=`<rect x="380" y="${y}" width="250" height="28" rx="6" fill="${on?"var(--v-soft)":"var(--card)"}" stroke="${on?"var(--v)":"var(--rule)"}"/>`;
+   o+=T_(392,y+19,r+1,'class="svgm" font-size="12.5"')+T_(418,y+19,B1[r],`class="svgm" font-size="12.5" ${S.row===r&&S.pl===1?'font-weight="700" fill="var(--k)"':""}`)+T_(460,y+19,B2[r],`class="svgm" font-size="12.5" ${S.row===r&&S.pl===2?'font-weight="700" fill="var(--k)"':""}`);
+   const show=S.row===4||(S.row===r&&S.pl===2);if(show)o+=T_(540,y+19,f2(yL[r]),'text-anchor="end" class="svgm" font-size="12.5"')+T_(616,y+19,f2(yD[r]),'text-anchor="end" class="svgm" font-size="12.5"');
+   else if(S.row===r&&S.pl===1)o+=T_(540,y+19,f2(a1*lut[B1[r]])+" + …",'text-anchor="end" class="svgm" font-size="12.5"');});
+  o+=T_(380,190,"weights in row r: w = 0.6·b₁ + 0.2·b₂",'class="svgs" font-size="12"');
+  o+=T_(380,210,"1 in a bit-plane means +1, 0 means −1",'class="svgs" font-size="12"');
+  if(S.row===4)o+=T_(380,240,"all 4 rows: LUT result = direct result",'font-family="var(--sans)" font-size="12.5" font-weight="700" fill="var(--v)"');
+  svg.innerHTML=o;info.innerHTML=S.t;if(window.MathJax&&MathJax.typesetPromise)MathJax.typesetPromise([info]).catch(()=>{});
+  svg.dataset.y=yL.map(f2).join(",");svg.dataset.yd=yD.map(f2).join(",");svg.dataset.step=k;}
+ B.stepper({n:ST.length,prev:$("#aq-lut-prev"),next:$("#aq-lut-next"),play:$("#aq-lut-play"),label:$("#aq-lut-lab"),onStep:draw,ms:3200});
+})();
+})();
+</script></body></html>

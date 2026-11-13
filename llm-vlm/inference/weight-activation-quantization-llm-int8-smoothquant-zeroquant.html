@@ -1,0 +1,597 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Weight–activation quantization: LLM.int8(), SmoothQuant, ZeroQuant, OmniQuant · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 108</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="weight-activation-quantization-llm-int8-smoothquant-zeroquant">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="weight-activation-quantization-llm-int8-smoothquant-zeroquant" data-session="weight-activation-quantization-llm-int8-smoothquant-zeroquant" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">108</span><span>Track 5: LLM inference and serving · session 31 of 65</span></div><h1 class="chap-title">Weight–activation quantization: LLM.int8(), SmoothQuant, ZeroQuant, OmniQuant</h1><p class="chap-sub">Weight-only quantization makes the weights small, but the matrix multiply still runs in 16-bit. To use INT8 or INT4 tensor cores, the activations must be quantized too, and that is hard because a few channels carry huge outliers. This session shows four answers: keep the outlier channels in FP16 (LLM.int8()), move the difficulty into the weights with a per-channel scale (SmoothQuant), use finer scales per token and per group (ZeroQuant), and learn the clipping and the scales (OmniQuant), up to Atom's 4-bit mixed-precision recipe.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 103 to 107 (quantization math, where quantization helps, number formats, GPTQ, AWQ)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Explain why activation outliers sit in a few fixed channels, and why that breaks per-tensor and per-token INT8 but not per-channel scales</li><li>Write the integer GEMM with per-token and per-output-channel scales, and say which scales an INT8 kernel can and cannot handle</li><li>Apply LLM.int8(): threshold the outlier channels, run them in FP16, and know when it is slower than FP16</li><li>Derive SmoothQuant's per-channel factor s, fold it into the previous layer, and choose the migration strength α</li><li>Describe ZeroQuant's group-wise weights, dynamic per-token activations, kernel fusion and layer-by-layer distillation</li><li>Describe OmniQuant's learnable weight clipping and learnable equivalent transformation, and Atom's 4-bit recipe (128 INT8 outlier channels, groups of 128)</li><li>Read the papers' accuracy and speed tables and pick a method for a given model, batch size and GPU</li></ul></div></header><style>
+.wa-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px;justify-content:center}
+.wa-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.wa-lab{font:500 14px var(--sans);color:var(--muted)}
+[data-session="weight-activation-quantization-llm-int8-smoothquant-zeroquant"] pre.code,[data-session="weight-activation-quantization-llm-int8-smoothquant-zeroquant"] code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Weight-only quantization (GPTQ, AWQ) makes a model small, but the matrix multiply still runs in 16-bit: the weights are turned back into FP16 just before they are used. To run the multiply itself on fast integer units (INT8 or INT4 tensor cores), the <b>activations</b> must be quantized too. Activations of large language models are hard to quantize, because a few channels carry values that are 20 to 100 times larger than the rest. This session is about the four standard answers to that problem.</p>
+<p><a href="../inference/where-quantization-helps-weight-only-vs-weight.html">Session 104</a> showed when this matters: weight-only quantization helps when decoding is limited by memory traffic (small batch), and <b>weight–activation</b> quantization (written W8A8, W4A4, …: weight bits, activation bits) helps when the multiply is limited by compute (prefill, large batches, serving many users). An A100 does 312 TFLOPS in FP16, 624 TOPS in INT8 and 1,248 TOPS in INT4 on its tensor cores. [Certain, as quoted in the Atom paper] Those factors of 2 and 4 are only available if both inputs of the multiply are integers.</p>
+<ul><li><b>Outliers live in a few channels.</b> We look at the data first: where the large values are, and why the usual scales fail (Figure 1).</li>
+<li><b>LLM.int8()</b> keeps the few outlier channels in FP16 and runs more than 99.9% of the values in INT8 (Figure 2).</li>
+<li><b>SmoothQuant</b> divides each activation channel by a factor and multiplies the matching weight row by the same factor. The output does not change, but both sides become easy to quantize (Figure 3).</li>
+<li><b>ZeroQuant</b> uses finer scales (groups for weights, one scale per token for activations), fuses them into kernels, and adds a cheap layer-by-layer distillation.</li>
+<li><b>OmniQuant</b> learns the clipping range and the smoothing factors by gradient descent (Figure 4); <b>Atom</b> combines mixed precision, groups and reordering to reach 4-bit weights and activations (Figure 5).</li></ul>
+<aside class="note analogy side"><span class="nt">Analogy</span>A shop prints all prices with three digits. If one item costs 9,000 and everything else costs between 1 and 9, a single price format (one scale) must cover 9,000, and all the cheap items print as “0”. You can print the expensive item on a separate tag (LLM.int8()), sell it in smaller units so its price shrinks while the others grow (SmoothQuant), or give each shelf its own format (per-token and group scales).</aside>
+<p>In the efficient-inference survey this is the weight–activation part of post-training quantization (its section 5.2.1). [Certain] Typical interview questions: “Why are activations harder to quantize than weights?”, “Why can’t you just use a per-channel scale for activations?”, “Derive the SmoothQuant scale”, “When is LLM.int8() slower than FP16?”, “What does W4A4 need to work?”. They all come back to one fact: outliers sit in fixed channels, and a fast integer GEMM can only take scales on its outer dimensions.</p>
+
+<h2>Outliers live in a few channels</h2>
+<h3>The quantizer and the integer GEMM</h3>
+<p>We use the symmetric quantizer from <a href="../inference/quantization-math-scale-zero-point-granularity-and.html">session 103</a>. A group of numbers shares one <b>scale</b> \(\Delta\) (a step size). Each number becomes a small integer:</p>
+<div class="eq">\[ \bar{x} = \operatorname{clamp}\!\left(\left\lfloor \frac{x}{\Delta} \right\rceil, -Q, Q\right), \qquad \Delta = \frac{\max |x|}{Q}, \qquad Q = 2^{b-1} - 1 \tag{108.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\bar{x}\)</dt><dd>the stored integer; we read it back as \(\Delta \bar{x}\)</dd>
+<dt>\(\lfloor \cdot \rceil\)</dt><dd>round to the nearest integer</dd>
+<dt>\(b\)</dt><dd>the number of bits: \(Q = 127\) for INT8, \(Q = 7\) for INT4</dd>
+<dt>\(\max |x|\)</dt><dd>the largest magnitude in the group that shares the scale (this rule is called <b>absmax</b>)</dd></dl>
+<p>The rounding error of one number is at most \(\Delta / 2\). So the error of <b>every</b> number in a group is set by the <b>largest</b> number in that group. That is the whole problem of this session.</p>
+<p>A linear layer computes \(Y = X W\) with activations \(X \in \R^{T \times C}\) (\(T\) tokens, \(C\) input channels) and weights \(W \in \R^{C \times O}\). Which groups can share a scale? Give each <b>row</b> of \(X\) (one token) its own scale \(\Delta^x_t\) and each <b>column</b> of \(W\) (one output channel) its own scale \(\Delta^w_o\). Then</p>
+<div class="eq">\[ Y_{to} = \sum_{j=1}^{C} X_{tj} W_{jo} \approx \Delta^x_t \, \Delta^w_o \sum_{j=1}^{C} \bar{X}_{tj} \bar{W}_{jo} \tag{108.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\Delta^x_t\)</dt><dd>the scale of token \(t\) (<b>per-token</b> scale); one scale for all of \(X\) is <b>per-tensor</b></dd>
+<dt>\(\Delta^w_o\)</dt><dd>the scale of output channel \(o\) (<b>per-channel</b> weight scale)</dd>
+<dt>\(\sum_j \bar{X}_{tj} \bar{W}_{jo}\)</dt><dd>a pure integer dot product, accumulated in INT32 on the tensor cores</dd></dl>
+<p>Both scales sit <b>outside</b> the sum, so the GEMM runs on integers and the scales are applied once per output, in the <b>epilogue</b> (the last step of the kernel that writes the result). LLM.int8() calls this <b>vector-wise</b> quantization. [Certain]</p>
+<p>Now try a scale per <b>input</b> channel \(j\) of \(X\), \(\Delta^x_j\). It would sit inside the sum: \(\sum_j \Delta^x_j \bar{X}_{tj} \bar{W}_{jo}\). The kernel would have to multiply by a different float inside its inner loop, and the integer GEMM is gone.</p>
+<div class="eq">\[ \sum_{j} \Delta^x_j \, \bar{X}_{tj} \bar{W}_{jo} \ \ne\ (\text{scale}) \times \sum_{j} \bar{X}_{tj} \bar{W}_{jo} \quad \text{unless all } \Delta^x_j \text{ are equal} \tag{108.3} \]</div>
+<p>So the rule is: <b>scales may depend on the token or on the output channel, not on the input channel.</b> Keep this in mind; every method below works around it.</p>
+
+<h3>What the activations look like</h3>
+<p>Dettmers et al. measured the hidden states that enter the linear layers of OPT-style models and found <b>emergent outlier features</b>. [Certain, from the LLM.int8() paper]</p>
+<ul><li>Most values are small: the non-outlier feature dimensions usually stay in about \([-3.5, 3.5]\). The outliers are 3 to 20 times larger than that.</li>
+<li>They sit in <b>fixed feature dimensions</b> (columns of \(X\)): in a 6.7B model about 150,000 outlier values per 2,048-token sequence, but in only 6 hidden dimensions. Up to 13B parameters, at most 7 dimensions.</li>
+<li>Around 6.7B parameters there is a <b>phase shift</b>: the same outlier dimensions appear in all layers and in about 75% of all tokens. Smaller models have them in some layers only.</li>
+<li>They are <b>important</b>: setting those few dimensions to zero drops the mean top-1 softmax probability from about 40% to about 20% and raises validation perplexity by 600 to 1000%. Removing 7 random dimensions changes perplexity by about 0.1%.</li>
+<li>They are mostly <b>one-sided</b>: in most models an outlier dimension is always positive or always negative.</li></ul>
+<p>The SmoothQuant paper adds two more observations: outliers are about 100 times larger than most activation values, and weights are flat and easy to quantize; INT8 and even INT4 weights were already known to keep accuracy. [Certain] Why the outliers exist is not fully settled; later work links them to attention heads that learn to “do nothing” and to the residual stream needing a few huge directions. [Speculation, as far as one cause is concerned]</p>
+<p>What do outliers do to the quantizer? With one scale for the whole tensor, \(\Delta = m / Q\) with \(m\) the global maximum. A normal channel \(j\) with maximum \(m_j\) only uses a few of the integer levels:</p>
+<div class="eq">\[ \text{levels}_j \approx 2 Q \, \frac{m_j}{m} \tag{108.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(m_j\)</dt><dd>the largest magnitude in input channel \(j\) (over the tokens of a calibration set)</dd>
+<dt>\(m\)</dt><dd>the largest magnitude in the whole quantization group (here the whole tensor)</dd>
+<dt>\(\text{levels}_j\)</dt><dd>the number of distinct integers channel \(j\) can reach; INT8 has \(2Q + 1 = 255\)</dd></dl>
+<p>With \(m_j = 1.2\) and \(m = 45\), INT8 gives channel \(j\) only \(2 \times 127 \times 1.2 / 45 \approx 6.8\) levels: the channel is quantized with less than 3 bits. The SmoothQuant paper reports 2 to 3 effective levels for non-outlier channels of real models. [Certain] A per-token scale does not help, because the outlier channel is large in <b>almost every token</b>, so every row still has an outlier in it. Only a per-input-channel scale would fix it, and (108.3) says the INT8 GEMM cannot use one.</p>
+<figure class="fig" id="wa-out"><div class="fig-body">
+<div class="controls"><label class="sl">Outlier channels <input type="range" id="wa-out-n" min="0" max="6" step="1" value="4"><output id="wa-out-nv">4</output></label><label class="sl">Outlier size <input type="range" id="wa-out-m" min="10" max="80" step="10" value="40"><output id="wa-out-mv">40</output></label><span class="seg" id="wa-out-b"><button type="button" data-b="8" aria-pressed="true">INT8</button><button type="button" data-b="4" aria-pressed="false">INT4</button></span></div>
+<div class="scroll-x"><svg id="wa-out-svg" viewBox="0 0 640 330" role="img" aria-label="Heat map of a 16 by 64 activation matrix with outlier channels, and the quantization error of three scale choices"></svg></div>
+<div class="wa-leg"><span style="--c:var(--k)">per-tensor scale</span><span style="--c:var(--q)">per-token scale (usable)</span><span style="--c:var(--v)">per-input-channel scale (not usable in INT8 GEMM)</span></div>
+<div class="readout" id="wa-out-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> A synthetic activation matrix: 16 tokens × 64 channels, normal values from a seeded Gaussian (largest magnitude 3.77), plus a few outlier channels whose values have the same sign in every token. Top: the magnitude of each value (darker = larger). Bottom: the relative quantization error, measured on the <b>normal</b> channels only, for three choices of scale (108.1).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with 0 outlier channels: all three scales give under 1% error in INT8. Now move to 4 outlier channels of size 40: the dark columns appear, and the per-tensor and per-token errors jump to about 9%, ten times higher, while the per-channel error stays at 0.5%. The readout shows why: the median normal channel now gets only about 12 of the 255 INT8 levels (108.4). Per-token does not help, because every token contains the outliers. Switch to INT4: with outliers, per-tensor and per-token errors are about 98%, which means almost every normal value is rounded to zero. Per-channel would work, but its scale sits on the inner dimension of the GEMM (108.3).</p></details></figure>
+
+<h2>LLM.int8(): keep the outlier channels in FP16</h2>
+<h3>The idea</h3>
+<p>If at most 7 of thousands of channels are the problem, take them out. LLM.int8() (Dettmers, Lewis, Belkada, Zettlemoyer, 2022) splits the multiply by input channel: the outlier channels go through an FP16 GEMM, and the rest through an INT8 GEMM with vector-wise scales (108.2). [Certain]</p>
+<div class="eq">\[ Y \approx X_{:,\mathcal{O}} \, W_{\mathcal{O},:} \;+\; \operatorname{diag}(\Delta^x)\,\big(\bar{X}_{:,\bar{\mathcal{O}}}\, \bar{W}_{\bar{\mathcal{O}},:}\big)\,\operatorname{diag}(\Delta^w), \qquad \mathcal{O} = \{\, j : \max_t |X_{tj}| \ge \alpha \,\} \tag{108.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathcal{O}\)</dt><dd>the set of outlier input channels: any channel with at least one value of magnitude \(\alpha\) or more in the current input</dd>
+<dt>\(\bar{\mathcal{O}}\)</dt><dd>all other channels; they are quantized to INT8 with per-token and per-output-channel scales</dd>
+<dt>\(X_{:,\mathcal{O}}, W_{\mathcal{O},:}\)</dt><dd>the outlier columns of \(X\) and the matching rows of \(W\), kept in FP16</dd>
+<dt>\(\alpha\)</dt><dd>the threshold; the paper uses \(\alpha = 6.0\)</dd></dl>
+<p>Because both halves split the sum over \(j\), their outputs simply add: no approximation comes from the split itself. The outlier set is found <b>at run time</b> from the current input, so no calibration data is needed. The weights are stored in INT8; the FP16 rows for the outlier channels are dequantized on the fly. [Certain for the method; the storage detail follows the bitsandbytes implementation, Likely]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A post office sorts letters by machine. A few parcels do not fit the machine, so a person carries them by hand. The hand route is slow, but it handles less than one item in a thousand, and the machine can keep its small slots.</aside>
+<div class="worked"><div class="wt">Worked example: one tiny LLM.int8() multiply</div>
+<p>Two tokens, four channels, two outputs. Channel 3 is an outlier channel:</p>
+<p>\(X = \begin{pmatrix} 0.5 & -1.2 & 45 & 0.8 \\ 1.1 & 0.3 & -38 & -0.6 \end{pmatrix}\), \(\ W = \begin{pmatrix} 0.2 & -0.1 \\ 0.4 & 0.3 \\ 0.05 & -0.02 \\ -0.3 & 0.25 \end{pmatrix}\), exact \(Y = \begin{pmatrix} 1.63 & -1.11 \\ -1.38 & 0.59 \end{pmatrix}\).</p>
+<p><b>Vector-wise INT8 only.</b> Token 1 has \(\Delta^x_1 = 45/127 = 0.3543\). Its normal values become \(0.5 \to 1 \to 0.354\), \(-1.2 \to -3 \to -1.063\), \(0.8 \to 2 \to 0.709\): errors of up to 29%. The result is \(\begin{pmatrix} 1.701 & -1.027 \\ -1.379 & 0.539 \end{pmatrix}\), a relative error of 4.85%.</p>
+<p><b>LLM.int8().</b> Channel 3 has \(\max |x| = 45 \ge 6\), so it goes to FP16. The other three channels now have \(\Delta^x_1 = 1.2/127\) and \(\Delta^x_2 = 1.1/127\), so they are quantized finely. The result is \(\begin{pmatrix} 1.629 & -1.109 \\ -1.382 & 0.592 \end{pmatrix}\), a relative error of 0.13%: 37 times smaller, with 3 of 4 channels still in INT8.</p></div>
+<h3>What the threshold does</h3>
+<p>A low \(\alpha\) sends many channels to FP16: very accurate, but the FP16 part grows and the speed-up shrinks. A high \(\alpha\) keeps everything in INT8 and the outliers come back. Because the gap between normal values (at most about 3.5) and outliers (often 20 to 60) is wide, any \(\alpha\) in a wide middle range finds the same few channels. Figure 2 shows this.</p>
+<figure class="fig" id="wa-dec"><div class="fig-body">
+<div class="controls"><label class="sl">Threshold \(\alpha\) <input type="range" id="wa-dec-a" min="0" max="15" step="1" value="7"><output id="wa-dec-av">6</output></label></div>
+<div class="scroll-x"><svg id="wa-dec-svg" viewBox="0 0 640 300" role="img" aria-label="Per-channel maximum of the activations on a log scale with the LLM.int8 threshold"></svg></div>
+<div class="wa-leg"><span style="--c:var(--k)">FP16 channel (outlier)</span><span style="--c:var(--q)">INT8 channel</span></div>
+<div class="readout" id="wa-dec-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Mixed-precision decomposition (108.5) on the matrix of Figure 1 (4 outlier channels of size about 40) times a seeded weight matrix (64 × 32). Bars: \(\max_t |X_{tj}|\) for each input channel, log scale; the dashed line is \(\alpha\). The readout gives the output error of LLM.int8() against the plain vector-wise INT8 multiply (108.2).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>At the paper’s \(\alpha = 6\) the 4 outlier channels turn orange and go to FP16; 93.75% of the channels stay in INT8, and the output error falls from 6.78% (vector-wise) to 0.60%, about 11 times lower. Move \(\alpha\) anywhere from 4 to 30: nothing changes, because no channel lies in that range. Below 4 the normal channels start to leave INT8 (at \(\alpha = 2\), 30 channels are FP16: better accuracy, but half the work is now in the slow path). Above 40, the outliers return to INT8 and the error is back to 6.78%. In a real 4,096-wide model, 6 or 7 FP16 channels are 0.15 to 0.17% of the channels.</p></details></figure>
+<h3>What it achieved, and what it costs</h3>
+<p>On C4 perplexity, plain INT8 methods broke down as models grew, while LLM.int8() matched the 32-bit model at every size. [Certain, Table 1 of the paper]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>C4 perplexity (lower is better)</th><th>125M</th><th>1.3B</th><th>2.7B</th><th>6.7B</th><th>13B</th></tr></thead><tbody>
+<tr><td>32-bit float</td><td>25.65</td><td>15.91</td><td>14.43</td><td>13.30</td><td>12.45</td></tr>
+<tr><td>INT8 absmax, per-tensor</td><td>87.76</td><td>16.55</td><td>15.11</td><td>14.59</td><td>19.08</td></tr>
+<tr><td>INT8 absmax, vector-wise</td><td>35.84</td><td>16.82</td><td>14.98</td><td>14.13</td><td>16.48</td></tr>
+<tr><td>INT8 zero-point, vector-wise</td><td>25.72</td><td>15.94</td><td>14.36</td><td>13.38</td><td>13.47</td></tr>
+<tr><td>LLM.int8() (vector-wise + decomposition)</td><td>25.83</td><td>15.93</td><td>14.44</td><td>13.24</td><td>12.45</td></tr></tbody></table></div>
+<p>Asymmetric (zero-point) quantization does better than absmax because outliers are one-sided: an always-positive channel wastes half of a symmetric range. It still fails at 13B.</p>
+<p>The price is <b>speed</b>. The method was built to save memory (a 175B model in INT8 needs about 175 GB instead of 350 GB, so OPT-175B or BLOOM-176B fits on one server of consumer GPUs). Its kernels are slower than FP16 for small matrices. Measured speed of the first feed-forward layer of GPT-3-sized models, relative to FP16 [Certain, Table 5 of the paper]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model size (model dimension)</th><th>2.7B (2,560)</th><th>6.7B (4,096)</th><th>13B (5,140)</th><th>175B (12,288)</th></tr></thead><tbody>
+<tr><td>INT8 GEMM alone, no quantization overhead</td><td>1.63×</td><td>1.67×</td><td>2.13×</td><td>2.29×</td></tr>
+<tr><td>Vector-wise INT8 (with quantize and dequantize)</td><td>0.94×</td><td>1.18×</td><td>1.59×</td><td>2.00×</td></tr>
+<tr><td>LLM.int8() (vector-wise + decomposition)</td><td>0.64×</td><td>0.86×</td><td>1.22×</td><td>1.81×</td></tr></tbody></table></div>
+<p>Numbers below 1 are slow-downs. The overhead comes from finding the outlier columns, gathering them, running two GEMMs and adding the results. End to end, BLOOM-176B in INT8 was “slightly slower but close” to 16-bit in the paper’s Hugging Face benchmark. [Certain] So LLM.int8() is a <b>memory</b> method: use it to fit a model, not to make it faster. It is the 8-bit mode of the bitsandbytes library (<code>load_in_8bit=True</code> in Hugging Face Transformers). [Certain]</p>
+
+<h2>SmoothQuant: move the difficulty into the weights</h2>
+<h3>The idea: an exact rescaling</h3>
+<p>LLM.int8() needs two GEMMs because the scale for the outlier channels cannot go inside one INT8 GEMM (108.3). SmoothQuant (Xiao, Lin, Seznec, Wu, Demouth, Han, 2022) takes the per-input-channel scale and moves it <b>out of the kernel</b>: it divides input channel \(j\) of \(X\) by a factor \(s_j\) and multiplies row \(j\) of \(W\) by the same factor. [Certain]</p>
+<div class="eq">\[ Y = X W = \big(X \operatorname{diag}(s)^{-1}\big)\,\big(\operatorname{diag}(s)\, W\big) = \hat{X} \hat{W} \tag{108.6} \]</div>
+<p>This is exact in real numbers. After the change, the outlier channel of \(\hat{X}\) is \(s_j\) times smaller, and row \(j\) of \(\hat{W}\) is \(s_j\) times larger. Weights are easy to quantize, so they can absorb some of the difficulty. Both \(\hat{X}\) and \(\hat{W}\) then go through a normal W8A8 GEMM with scales on the outer dimensions only.</p>
+<p>The division by \(s\) is free at run time. \(X\) is the output of a LayerNorm (or RMSNorm), whose last step multiplies each channel by a learned weight \(\gamma_j\). Replace \(\gamma_j\) by \(\gamma_j / s_j\) once, offline, and the norm produces \(\hat{X}\) directly. The weight \(\hat{W}\) is also computed once and then quantized. Inputs that come from a residual add need an extra scaling on that branch. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A recipe says “3,000 grams of flour and 2 teaspoons of salt”, and your scale shows only two digits. Write “3 kg of flour” and change the cooking instruction from “per gram” to “per kilogram”. The dish is the same; the number you have to measure is now small. SmoothQuant changes the units of each channel, and the weights carry the conversion.</aside>
+<h3>Choosing the factor</h3>
+<p>If we choose \(s_j = \max |X_j|\), all activation channels end with maximum 1: perfect for the activations, but the outlier is now in the weights, and the weight error is large. If we choose \(s_j = 1 / \max |W_j|\), the weights are perfect and the activations are untouched. SmoothQuant interpolates between the two with a <b>migration strength</b> \(\alpha\):</p>
+<div class="eq">\[ s_j = \frac{\max_t |X_{tj}|^{\alpha}}{\max_o |W_{jo}|^{1-\alpha}} \tag{108.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(s_j\)</dt><dd>the smoothing factor of input channel \(j\); \(\hat{X}_{:j} = X_{:j} / s_j\), \(\hat{W}_{j:} = s_j W_{j:}\)</dd>
+<dt>\(\max_t |X_{tj}|\)</dt><dd>the largest activation in channel \(j\), measured on calibration data (512 random sentences from the Pile in the paper)</dd>
+<dt>\(\max_o |W_{jo}|\)</dt><dd>the largest weight in row \(j\) (the row that multiplies channel \(j\))</dd>
+<dt>\(\alpha\)</dt><dd>how much of the difficulty moves to the weights: 0 moves none to the weights, 1 moves all</dd></dl>
+<p>With \(\alpha = 0.5\) the two maxima become equal:</p>
+<div class="eq">\[ \max_t |\hat{X}_{tj}| = \max_o |\hat{W}_{jo}| = \sqrt{\max_t |X_{tj}| \cdot \max_o |W_{jo}|} \qquad (\alpha = 0.5) \tag{108.8} \]</div>
+<p>Each channel then splits its “difficulty” evenly between the two sides. The paper uses \(\alpha = 0.5\) for all OPT and BLOOM models and 0.75 for GLM-130B, whose activations are harder. For Llama-2 and Mistral models with per-token activations it reports 0.8 to 0.9. [Certain] \(\alpha\) is chosen by a small grid search on held-out data.</p>
+<div class="worked"><div class="wt">Worked example: smoothing two channels</div>
+<p>Channel A is an outlier channel: \(\max |X_A| = 64\), \(\max |W_A| = 0.25\). Channel B is normal: \(\max |X_B| = 2\), \(\max |W_B| = 0.5\).</p>
+<p>\(\alpha = 0.5\): \(s_A = \sqrt{64} / \sqrt{0.25} = 8 / 0.5 = 16\). Then \(\max |\hat{X}_A| = 64/16 = 4\) and \(\max |\hat{W}_A| = 0.25 \times 16 = 4\). For B: \(s_B = \sqrt{2}/\sqrt{0.5} = 2\), giving 1 and 1.</p>
+<p>Per-tensor INT8 activations before smoothing: the global maximum is 64, so channel B gets \(127 \times 2 / 64 \approx 3.97\) steps on each side of zero. After smoothing the maximum is 4, so B gets \(127 \times 1 / 4 = 31.75\) steps: 8 times finer, 3 more bits of resolution.</p>
+<p>\(\alpha = 0.75\): \(s_A = 64^{0.75} / 0.25^{0.25} = 22.63 / 0.7071 = 32\); \(\hat{X}_A\) has maximum 2 and \(\hat{W}_A\) has maximum 8. The activations are easier still; the weight row of channel A is now 16 times larger than channel B’s (8 against 0.5), and if the weights use one scale per output column, the other rows lose resolution. That is the trade-off \(\alpha\) controls.</p></div>
+<figure class="fig" id="wa-sq"><div class="fig-body">
+<div class="controls"><label class="sl">Migration \(\alpha\) <input type="range" id="wa-sq-a" min="0" max="20" step="1" value="10"><output id="wa-sq-av">0.50</output></label><span class="seg" id="wa-sq-b"><button type="button" data-b="8" aria-pressed="true">W8A8</button><button type="button" data-b="6" aria-pressed="false">W6A6</button><button type="button" data-b="4" aria-pressed="false">W4A4</button></span><span class="seg" id="wa-sq-m"><button type="button" data-m="tensor" aria-pressed="true">per-tensor A</button><button type="button" data-m="row" aria-pressed="false">per-token A</button></span></div>
+<div class="scroll-x"><svg id="wa-sq-svg" viewBox="0 0 640 380" role="img" aria-label="Per-channel maxima of the smoothed activations and weights, and the output error against the migration strength"></svg></div>
+<div class="wa-leg"><span style="--c:var(--q)">smoothed activations, channel max</span><span style="--c:var(--v)">smoothed weights, row max</span><span style="--c:var(--k)">current α</span></div>
+<div class="readout" id="wa-sq-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> SmoothQuant (108.6)–(108.7) on the same layer as Figure 2. The weights of the outlier rows are 10 times smaller than the others, as is common when a channel is large. Top: per-channel maxima after smoothing, log scale (orange marks the 4 outlier channels). Bottom: relative output error \(\lVert \hat{X}_q \hat{W}_q - XW \rVert / \lVert XW \rVert\) against \(\alpha\); weights use one per-tensor scale, as in SmoothQuant-O3; the dashed line is the same quantization without smoothing.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Start at W8A8, per-tensor, \(\alpha = 0.5\): both rows of bars line up (108.8) at a common maximum of 0.90, and the output error is 1.10%, against 7.81% without smoothing (dashed line). Move \(\alpha\) to 0: the activations keep their outliers relative to the others (error 1.38%); move it to 1: all activations become flat, but the weights inherit the outliers (1.53%). The curve is a shallow valley: the best point here is \(\alpha = 0.4\). Switch to W4A4: smoothing still helps (95% error without, 20% with), but 20% is far from usable. SmoothQuant alone is an 8-bit method; Figure 5 and the next session show what 4 bits need.</p></details></figure>
+<h3>Three levels of speed: O1, O2, O3</h3>
+<p>After smoothing, the paper offers three settings that trade accuracy for speed. [Certain, Table 2 of the paper] Weights always use one scale per tensor.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Weights</th><th>Activations</th><th>What it costs at run time</th></tr></thead><tbody>
+<tr><td>SmoothQuant-O1</td><td>per-tensor</td><td>per-token, dynamic</td><td>compute a max for each token</td></tr>
+<tr><td>SmoothQuant-O2</td><td>per-tensor</td><td>per-tensor, dynamic</td><td>compute one max per tensor</td></tr>
+<tr><td>SmoothQuant-O3</td><td>per-tensor</td><td>per-tensor, static</td><td>nothing: the scale is fixed from calibration</td></tr></tbody></table></div>
+<p><b>Static</b> means the activation scale is computed once on calibration data and frozen; <b>dynamic</b> means it is computed from the actual input at run time. O3 is the fastest because the kernel needs no reduction over the input before it starts.</p>
+<h3>Results</h3>
+<p>On OPT-175B, zero-shot accuracy averaged over 7 tasks, and WikiText perplexity [Certain, Table 3 of the paper]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>OPT-175B</th><th>Average accuracy</th><th>WikiText perplexity</th></tr></thead><tbody>
+<tr><td>FP16</td><td>66.9%</td><td>10.99</td></tr>
+<tr><td>W8A8, naive per-tensor</td><td>35.5%</td><td>93,080</td></tr>
+<tr><td>ZeroQuant</td><td>35.8%</td><td>84,648</td></tr>
+<tr><td>LLM.int8()</td><td>66.7%</td><td>11.10</td></tr>
+<tr><td>SmoothQuant-O1</td><td>66.5%</td><td>11.11</td></tr>
+<tr><td>SmoothQuant-O3</td><td>66.8%</td><td>11.17</td></tr></tbody></table></div>
+<p>Naive W8A8 destroys the model; SmoothQuant even in its fastest setting stays within 0.1 points of FP16. On Llama-2-7B with per-token activations and per-channel weights, WikiText-2 perplexity went from 5.474 to 5.515 (\(\alpha = 0.85\)); on Llama-2-70B from 3.320 to 3.359 (\(\alpha = 0.9\)). [Certain] Speed: up to 1.51× faster and 1.96× less memory in PyTorch, up to 1.56× faster with half the memory in FasterTransformer, OPT-175B served on half the GPUs, and a 530B model on one 8-GPU node. [Certain, as reported] SmoothQuant’s W8A8 path is supported in production engines such as TensorRT-LLM and vLLM. [Likely]</p>
+
+<h2>ZeroQuant: finer scales and kernel fusion</h2>
+<p>ZeroQuant (Yao et al., Microsoft, 2022) came a few months before SmoothQuant and took a different route: keep the data as it is, but use finer scales, and make those scales cheap with custom kernels. [Certain] It has three parts.</p>
+<ul><li><b>Group-wise weights.</b> The weight matrix is split into groups that each get their own scale (rows of the matrix grouped so that they fit the tensor-core tiles of the A100).</li>
+<li><b>Token-wise activations, dynamic.</b> One scale per token, computed at run time, exactly the per-token scale of (108.2). It needs no calibration of activation ranges. Computing it naively costs extra memory traffic, so ZeroQuant <b>fuses</b> the quantization into the previous operator (for example the LayerNorm) and the dequantization into the GEMM epilogue, which scales the INT32 result by both scales before writing FP16.</li>
+<li><b>Layer-by-layer knowledge distillation (LKD).</b> For lower bits (INT4 weights in the feed-forward layers), each quantized layer is trained to copy the original layer’s output, one layer at a time, using the original model’s outputs of the previous layers as inputs.</li></ul>
+<p>Group scales on the weights are fine for an integer GEMM when each group spans a block of the <b>inner</b> dimension: the kernel multiplies a block in integers, scales that partial sum in float, and accumulates. This costs more than (108.2), but much less than one scale per element. With \(g\) values per group and a 16-bit scale per group, storage per weight is</p>
+<div class="eq">\[ b_{\text{eff}} = b + \frac{16}{g} \tag{108.9} \]</div>
+<p>so INT4 with \(g = 128\) costs 4.125 bits per weight. The LKD loss for layer \(k\) is</p>
+<div class="eq">\[ \mathcal{L}_k = \operatorname{MSE}\Big( L_k\big(L_{k-1} \cdots L_1(X)\big) \,-\, \hat{L}_k\big(L_{k-1} \cdots L_1(X)\big) \Big) \tag{108.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(L_k, \hat{L}_k\)</dt><dd>the original layer \(k\) and its quantized copy, the only part that is trained</dd>
+<dt>\(L_{k-1} \cdots L_1(X)\)</dt><dd>the input of layer \(k\), computed with the original earlier layers</dd>
+<dt>\(\operatorname{MSE}\)</dt><dd>mean squared error; the paper notes KL divergence can be used too</dd></dl>
+<p>Only one layer and its optimizer states are in memory at a time, no labels are needed, and the data does not have to be the original training data. [Certain] This idea, “minimize the output error of one block”, reappears in GPTQ, AWQ’s scale search and OmniQuant.</p>
+<p>Reported results [Certain, as reported in the ZeroQuant paper]: INT8 weights and activations with up to 5.19× (BERT-base) and 4.16× (GPT-3-style 350M) speed-up over FP16 on A100; INT4 feed-forward weights with INT8 attention weights and INT8 activations, with LKD, for 3× less memory; GPT-J-6B 3.67× faster; GPT-NeoX-20B served on 1 GPU instead of 2 with latency from 65 ms to 25 ms. But per-token scales do not fix channel outliers: in the SmoothQuant paper’s test, ZeroQuant’s W8A8 failed on OPT-175B (35.8% accuracy, table above). ZeroQuant works on models without strong emergent outliers. [Likely, as a reading of the two papers together]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Instead of one ruler for the whole workshop, ZeroQuant gives each workbench its own ruler (group scales) and each part its own caliper (token scales), and builds the measuring into the machines so nobody walks to a shelf to fetch a ruler (kernel fusion).</aside>
+
+<h2>OmniQuant: learn the clipping and the scales</h2>
+<p>SmoothQuant’s \(s\) comes from a formula with one hand-tuned \(\alpha\). The clipping range of the weights is usually the full min–max. OmniQuant (Shao et al., 2023) makes both <b>learnable</b> and trains them, block by block, to minimize the output error of each transformer block (the same objective as (108.10), applied to a whole block). [Certain] The model weights themselves stay frozen; only a few quantization parameters are trained, so it keeps the cost of post-training quantization.</p>
+<h3>Learnable weight clipping (LWC)</h3>
+<p>For each output channel, OmniQuant learns how much of the range to keep. With \(N\) bits and asymmetric (zero-point) quantization:</p>
+<div class="eq">\[ h = \frac{\gamma \max(W) - \beta \min(W)}{2^N - 1}, \qquad z = -\left\lfloor \frac{\beta \min(W)}{h} \right\rceil, \qquad W_q = \operatorname{clamp}\!\left(\left\lfloor \frac{W}{h} \right\rceil + z,\ 0,\ 2^N - 1\right) \tag{108.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\gamma, \beta \in [0, 1]\)</dt><dd>clipping strengths for the upper and the lower bound; stored as sigmoids of free parameters, so they stay in \((0, 1)\)</dd>
+<dt>\(h\)</dt><dd>the step size; \(\gamma = \beta = 1\) gives ordinary min–max quantization</dd>
+<dt>\(z\)</dt><dd>the zero point: the integer that represents the real number 0</dd>
+<dt>\(W_q\)</dt><dd>the stored integers; read back as \((W_q - z) h\)</dd></dl>
+<p>Clipping trades two errors. A smaller range gives a smaller step, so normal weights are rounded more finely, but the few largest weights are cut off. The gradient through the rounding is passed with the <b>straight-through estimator</b> (treat \(\lfloor \cdot \rceil\) as the identity in the backward pass; see <a href="../inference/index.html#row-quantization-aware-training-fake-quant-ste-llm" title="Quantization-aware training: fake quant, STE, LLM-QAT, QLoRA, LoftQ (planned)">session 111</a>).</p>
+<figure class="fig" id="wa-lwc"><div class="fig-body">
+<div class="controls"><label class="sl">Clipping \(\gamma = \beta\) <input type="range" id="wa-lwc-c" min="60" max="200" step="1" value="200"><output id="wa-lwc-cv">1.000</output></label><span class="seg" id="wa-lwc-b"><button type="button" data-b="4" aria-pressed="true">4-bit</button><button type="button" data-b="3" aria-pressed="false">3-bit</button></span><button type="button" class="btn primary" id="wa-lwc-learn">Learn the clipping</button></div>
+<div class="scroll-x"><svg id="wa-lwc-svg" viewBox="0 0 640 330" role="img" aria-label="One weight column with its quantization grid, and the quantization error against the clipping strength"></svg></div>
+<div class="wa-leg"><span style="--c:var(--q)">weights</span><span style="--c:var(--k)">clipping range and grid</span><span style="--c:var(--v)">mean squared error</span></div>
+<div class="readout" id="wa-lwc-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Learnable weight clipping (108.11) on one column of 128 seeded weights (standard deviation 0.02) with three large weights (0.11, −0.085, 0.075). Top: the weights (dots) and the quantization levels (ticks) inside the clipping range. Bottom: the mean squared quantization error against the clipping strength, with one shared \(\gamma = \beta\). “Learn the clipping” starts from \(\operatorname{sigmoid}(4) = 0.982\) and runs 200 Adam steps (learning rate 0.05) with the straight-through gradient.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At 1.000 (min–max) the grid spans all weights, and the step is wide. In 4-bit, lowering the clipping to about 0.905 reduces the error by 12% (ratio 1.13): the largest weight is clipped, but all the others are rounded more finely. In 3-bit, the gain is larger: the best clipping is about 0.67, and the error is 1.55 times lower than min–max. Press “Learn the clipping”: gradient descent finds 0.898 (4-bit) or 0.711 (3-bit), close to the grid optimum. Real OmniQuant minimizes the <b>block output</b> error, not the weight error, so it also takes into account which weights meet large activations.</p></details></figure>
+<h3>Learnable equivalent transformation (LET)</h3>
+<p>For the activations, OmniQuant generalizes SmoothQuant with a learnable scale \(s\) and a learnable <b>shift</b> \(\delta\) per channel (the shift idea comes from Outlier Suppression+):</p>
+<div class="eq">\[ Y = XW + B = \big[(X - \delta) \oslash s\big]\,\big[s \odot W\big] + \big[B + \delta W\big] \tag{108.12} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\delta, s \in \R^{1 \times C}\)</dt><dd>per-channel shift and scale, trained by gradient descent</dd>
+<dt>\(\oslash, \odot\)</dt><dd>element-wise division of each column of \(X - \delta\) by \(s_j\), and multiplication of each row \(j\) of \(W\) by \(s_j\)</dd>
+<dt>\(B + \delta W\)</dt><dd>the new bias; it absorbs the shift exactly</dd></dl>
+<p>The shift helps one-sided outliers: an always-positive channel is moved to be centred around zero, so a symmetric quantizer stops wasting half its range. OmniQuant also applies a scale between queries and keys inside attention (\(Q K^\top = (Q \oslash s)(s \odot K)^\top\)), which helps when the KV cache is quantized. [Certain]</p>
+<p>Recipe and results [Certain, from the paper]: 128 random 2,048-token segments of WikiText-2 as calibration data, 20 epochs, learning rate 5e-3 for LWC and 1e-2 for LET, on a single A100; 1 to 16 hours for LLaMA-2 7B to 70B. WikiText-2 perplexity of LLaMA-1-7B (FP16 5.68): W6A6 SmoothQuant 6.03, OmniQuant 5.96; W4A4 SmoothQuant 25.25, OmniQuant 11.26. At W4A4, learning the parameters halves the perplexity, but 11.26 is still twice the FP16 value. 4-bit activations need more than smoothing.</p>
+
+<h2>Atom: 4-bit weights and activations</h2>
+<p>Atom (Zhao et al., 2023) asks what it takes to make W4A4 accurate <b>and</b> fast for serving, where large batches make the GEMMs compute-bound. It combines the ideas above into one system. [Certain]</p>
+<ul><li><b>Mixed precision with reordering.</b> 128 outlier channels, chosen offline as the channels with the largest sum of squares on 128 calibration sentences, are kept in <b>INT8</b>; all other channels use INT4. Irregular mixed precision is slow (that was LLM.int8()’s problem), so Atom <b>reorders</b> channels: outlier channels are moved to the end of the activation (by a reorder fused into the previous operator, under 0.5% of run time) and the weight rows are permuted the same way, once, offline. Now the INT4 part and the INT8 part are both dense blocks.</li>
+<li><b>Group quantization</b> with groups of 128 for both weights and activations, with the group dequantization fused into the GEMM pipeline.</li>
+<li><b>Dynamic</b> per-group activation scales, <b>clipping</b> (factors 0.9 for activations and 0.85 for weights, found by grid search), <b>GPTQ</b> for the INT4 weights, and an <b>INT4 KV cache</b>.</li></ul>
+<p>The storage per value with \(C\) channels, \(k\) INT8 outlier channels and one 16-bit scale per group of \(g\):</p>
+<div class="eq">\[ b_{\text{eff}} = \frac{4\,(C - k) + 8\,k}{C} + \frac{16}{g} = \frac{4 \cdot 3968 + 8 \cdot 128}{4096} + \frac{16}{128} = 4.25 \tag{108.13} \]</div>
+<p>for Llama-7B (\(C = 4{,}096\)); the paper reports 4.251 effective bits. [Certain for the reported value; our formula is a simplification]</p>
+<p>The ablation on Llama-7B (WikiText-2 perplexity, FP16 = 5.68) shows what each step buys [Certain, Table 3 of the Atom paper]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Step</th><th>Perplexity</th></tr></thead><tbody>
+<tr><td>W4A4 round-to-nearest</td><td>2,315.52</td></tr>
+<tr><td>+ keep 128 outlier channels in FP16</td><td>11.34</td></tr>
+<tr><td>+ quantize those outliers to INT8</td><td>11.39</td></tr>
+<tr><td>+ group size 128</td><td>6.22</td></tr>
+<tr><td>+ clipping</td><td>6.13</td></tr>
+<tr><td>+ GPTQ for the weights</td><td>6.04</td></tr>
+<tr><td>+ INT4 KV cache</td><td>6.16</td></tr></tbody></table></div>
+<p>Two lessons. First, outliers in INT8 are almost as good as FP16 (+0.05), which is what makes the dense mixed-precision kernel possible. Second, at 4 bits, outlier handling alone is not enough (11.39); the fine group scales close most of the remaining gap. In serving, Atom reports up to 7.73× the throughput of FP16 and 2.53× that of INT8 at the same latency target, with a 1.4% average zero-shot accuracy drop and 0.3 perplexity increase on Llama-65B. [Certain, as reported] These speeds need INT4 tensor cores (A100 and RTX-class GPUs); NVIDIA’s Hopper H100 dropped INT4 tensor-core support, which pushed later 4-bit work toward FP8 and FP4 formats. [Likely]</p>
+<figure class="fig" id="wa-atom"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="wa-atom-prev">Back</button><button type="button" class="btn primary" id="wa-atom-play">Play</button><button type="button" class="btn" id="wa-atom-next">Next</button><span id="wa-atom-lab" class="wa-lab"></span></div>
+<div class="scroll-x"><svg id="wa-atom-svg" viewBox="0 0 640 300" role="img" aria-label="Step by step 4-bit weight and activation quantization recipe and its output error"></svg></div>
+<div class="readout" id="wa-atom-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Atom’s recipe in miniature, on the layer of Figures 2 and 3 (64 input channels, 4 of them outliers). Top: the layout of the activation matrix’s channels after each step (orange = 8-bit, crimson = 4-bit, each box one scale group; the 4 outlier channels are drawn darker). Bottom: relative output error of each step; bars appear as you step. The W8A8 vector-wise bar is the reference.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Step 1 is the W8A8 vector-wise reference: 6.78% error. Step 2 drops to 4 bits with the same per-token and per-channel scales: the error is 94%; almost every normal activation rounds to zero, because each token’s scale is set by its outliers. Step 3 reorders the 4 channels with the largest sum of squares to the end and keeps them in INT8: 11.8%. Step 4 splits the other 60 channels into 4 groups of 15 with their own scales for activations and weights: 9.5%, now below the INT8 error without outlier handling (step 1). The order of the steps and the size of each jump follow the Atom ablation table; the numbers are from this toy layer, not from Llama.</p></details></figure>
+
+<h2>Putting the methods side by side</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Method</th><th>Weights</th><th>Activations</th><th>How it handles outliers</th><th>Needs data?</th><th>Main benefit</th></tr></thead><tbody>
+<tr><td>LLM.int8()</td><td>INT8 per-channel</td><td>INT8 per-token, dynamic</td><td>FP16 GEMM for channels with \(|x| \ge 6\)</td><td>no</td><td>memory (2× smaller), no accuracy loss</td></tr>
+<tr><td>SmoothQuant</td><td>INT8 (per-tensor or per-channel)</td><td>INT8 per-tensor static (O3) to per-token</td><td>per-channel factor \(s\) moved into the weights</td><td>calibration (512 sentences)</td><td>speed (up to 1.56×) and memory</td></tr>
+<tr><td>ZeroQuant</td><td>INT8 or INT4, group-wise</td><td>INT8 per-token, dynamic</td><td>finer scales only; LKD for INT4</td><td>optional (LKD)</td><td>speed via fused kernels</td></tr>
+<tr><td>OmniQuant</td><td>INT4 to INT6, learned clipping</td><td>INT4 to INT6 per-token</td><td>learned scale and shift (LET)</td><td>128 segments, 1–16 GPU hours</td><td>best PTQ accuracy at W6A6 in 2023</td></tr>
+<tr><td>Atom</td><td>INT4 groups of 128 (GPTQ)</td><td>INT4 groups of 128 + 128 INT8 channels</td><td>reorder + mixed precision + clipping</td><td>128 sentences</td><td>serving throughput (up to 7.73× FP16)</td></tr></tbody></table></div>
+<p>All quality numbers above come from the papers themselves, with different models and tasks; compare methods only inside one table. [Certain that these are the reported numbers] The next session, <a href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html">session 109</a>, takes the other road: instead of handling outliers channel by channel, it rotates the activations so that no channel is an outlier. That is how QuaRot reaches 4-bit weights, activations and KV cache without mixed precision.</p>
+
+<h2>Pseudo-code</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: LLM.int8() forward pass of one linear layer</div><ol>
+<li><b>input:</b> activations \(X\) (FP16, \(T \times C\)); INT8 weights \(\bar{W}\) with column scales \(\Delta^w\); threshold \(\alpha = 6\)</li>
+<li>\(\mathcal{O} \leftarrow \{ j : \max_t |X_{tj}| \ge \alpha \}\) <span class="c">// found per input, no calibration</span></li>
+<li>\(Y_{16} \leftarrow X_{:,\mathcal{O}} \cdot \operatorname{dequant}(\bar{W}_{\mathcal{O},:})\) <span class="c">// FP16 GEMM, few columns</span></li>
+<li>\(\Delta^x_t \leftarrow \max_{j \notin \mathcal{O}} |X_{tj}| / 127\) for every token \(t\); \(\bar{X} \leftarrow \lfloor X_{:,\bar{\mathcal{O}}} / \Delta^x \rceil\)</li>
+<li>\(A \leftarrow \bar{X}\, \bar{W}_{\bar{\mathcal{O}},:}\) <span class="c">// INT8 GEMM, INT32 accumulate</span></li>
+<li><b>return</b> \(Y_{16} + \operatorname{diag}(\Delta^x)\, A\, \operatorname{diag}(\Delta^w)\) <span class="c">// formula (108.5)</span></li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: SmoothQuant calibration and conversion (offline)</div><ol>
+<li><b>input:</b> model, calibration texts (for example 512 sentences), migration strength \(\alpha\)</li>
+<li>run the model on the texts; for each linear layer record \(m^x_j = \max_t |X_{tj}|\) over all tokens</li>
+<li><b>for</b> each norm followed by linear layers (QKV after the attention norm, up/gate after the FFN norm) <b>do</b></li>
+<li class="i1">\(m^w_j \leftarrow \max_o |W_{jo}|\) over all the linear layers that read this norm <span class="c">// they share one s</span></li>
+<li class="i1">\(s_j \leftarrow (m^x_j)^\alpha / (m^w_j)^{1-\alpha}\) <span class="c">// formula (108.7)</span></li>
+<li class="i1">norm weight \(\gamma_j \leftarrow \gamma_j / s_j\) (and bias \(\leftarrow\) bias \(/ s_j\)); each \(W_{j:} \leftarrow s_j W_{j:}\) <span class="c">// formula (108.6), exact</span></li>
+<li>quantize all weights to INT8; for O3, run calibration again to fix static activation scales</li>
+<li>grid-search \(\alpha \in \{0.4, 0.45, \dots, 0.9\}\) on held-out perplexity and keep the best</li></ol></div>
+<p>The ideas of this session in PyTorch, on a synthetic layer with 4 outlier channels. The script is deterministic and runs on a CPU in a few seconds. Integers are kept in float tensors, which is exact here because the integer products are small. The printed values are at the end.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+T, C, O = 64, 256, 128
+X = torch.randn(T, C) * (0.6 + 0.4 * torch.rand(C))          <span class="cm"># 256 normal channels</span>
+out = torch.tensor([3, 50, 120, 200])                          <span class="cm"># 4 outlier channels</span>
+X[:, out] = torch.tensor([-1., 1., -1., -1.]) * 40 * (0.7 + 0.3 * torch.rand(T, 4))
+W = 0.05 * torch.randn(C, O)
+W[out] *= 0.1                                                  <span class="cm"># small weights read the outliers</span>
+Y = X @ W
+
+<span class="kw2">def</span> q_absmax(x, bits=8, dim=<span class="kw2">None</span>):
+    <span class="st">""</span><span class="st">"Symmetric absmax quantization. dim=None: one scale; dim=1: per row; dim=0: per column."</span><span class="st">""</span>
+    qmax = 2 ** (bits - 1) - 1
+    m = x.abs().amax() <span class="kw2">if</span> dim is <span class="kw2">None</span> <span class="kw2">else</span> x.abs().amax(dim=dim, keepdim=True)
+    d = m.clamp(min=1e-12) / qmax
+    <span class="kw2">return</span> (x / d).round().clamp(-qmax, qmax), d               <span class="cm"># integers (kept as float), scales</span>
+
+<span class="kw2">def</span> rel(a, b):
+    <span class="kw2">return</span> ((a - b).norm() / b.norm()).item()
+
+<span class="kw2">def</span> wxax(X, W, act=<span class="st">"tensor"</span>, wgt=<span class="st">"tensor"</span>, bits=8):
+    xq, dx = q_absmax(X, bits, <span class="kw2">None</span> <span class="kw2">if</span> act == <span class="st">"tensor"</span> <span class="kw2">else</span> 1)     <span class="cm"># per-token = one scale per row</span>
+    wq, dw = q_absmax(W, bits, <span class="kw2">None</span> <span class="kw2">if</span> wgt == <span class="st">"tensor"</span> <span class="kw2">else</span> 0)     <span class="cm"># per-channel = one per output column</span>
+    <span class="kw2">return</span> (xq @ wq) * dx * dw              <span class="cm"># integer GEMM, then scale the outer dims (108.2)</span>
+
+<span class="kw2">def</span> llm_int8(X, W, alpha=6.0):
+    o = X.abs().amax(0) &gt;= alpha                                   <span class="cm"># outlier channels (108.5)</span>
+    <span class="kw2">return</span> X[:, o] @ W[o] + wxax(X[:, ~o], W[~o], <span class="st">"token"</span>, <span class="st">"channel"</span>), int(o.sum())
+
+<span class="kw2">def</span> smooth(X, W, a=0.5):
+    s = X.abs().amax(0).pow(a) / W.abs().amax(1).pow(1 - a)      <span class="cm"># (108.7)</span>
+    <span class="kw2">return</span> X / s, W * s[:, <span class="kw2">None</span>]                                   <span class="cm"># (108.6): same product</span>
+
+<span class="kw2">def</span> group_fake_quant(W, bits=4, g=64):
+    <span class="st">""</span><span class="st">"Group-wise weights: one scale per output column and per group of g input rows."</span><span class="st">""</span>
+    Wg = W.reshape(C // g, g, O)
+    q, d = q_absmax(Wg, bits, 1)
+    <span class="kw2">return</span> (q * d).reshape(C, O)
+
+<span class="kw2">print</span>(<span class="st">"1) per-tensor W8A8 :"</span>, round(rel(wxax(X, W), Y), 4))
+<span class="kw2">print</span>(<span class="st">"   per-token  W8A8 :"</span>, round(rel(wxax(X, W, <span class="st">"token"</span>, <span class="st">"channel"</span>), Y), 4))
+Yd, n = llm_int8(X, W)
+<span class="kw2">print</span>(<span class="st">"2) LLM.int8()      :"</span>, round(rel(Yd, Y), 4), <span class="st">"with"</span>, n, <span class="st">"FP16 channels"</span>)
+<span class="kw2">for</span> a <span class="kw2">in</span> [0.25, 0.5, 0.75]:
+    Xs, Ws = smooth(X, W, a)
+    <span class="kw2">print</span>(f<span class="st">"3) SmoothQuant a={a}: per-tensor"</span>, round(rel(wxax(Xs, Ws), Y), 4),
+          <span class="st">" per-token"</span>, round(rel(wxax(Xs, Ws, <span class="st">"token"</span>), Y), 4))
+
+<span class="cm"># 4) 4-bit weights and activations: the Atom recipe in miniature</span>
+<span class="kw2">def</span> a4_token(X, bits=4):
+    q, d = q_absmax(X, bits, 1); <span class="kw2">return</span> q * d
+<span class="kw2">def</span> a4_group(X, bits=4, g=64):
+    q, d = q_absmax(X.reshape(T, C // g, g), bits, 2); <span class="kw2">return</span> (q * d).reshape(T, C)
+<span class="kw2">print</span>(<span class="st">"4) W4A4 per-token/per-channel:"</span>, round(rel(wxax(X, W, <span class="st">"token"</span>, <span class="st">"channel"</span>, 4), Y), 4))
+keep = X.abs().amax(0).topk(8).indices                             <span class="cm"># 8 outlier channels (Atom: 128)</span>
+rest = torch.ones(C, dtype=torch.bool); rest[keep] = False
+Xo, Wo = wxax(X[:, keep], W[keep], <span class="st">"token"</span>, <span class="st">"channel"</span>, 8), <span class="kw2">None</span>
+Y_mix = Xo + wxax(X[:, rest], W[rest], <span class="st">"token"</span>, <span class="st">"channel"</span>, 4)
+<span class="kw2">print</span>(<span class="st">"   + outliers in INT8       :"</span>, round(rel(Y_mix, Y), 4))
+Xr, Wr = X[:, rest], W[rest]
+Cr = Xr.shape[1]
+<span class="kw2">def</span> grp(M, bits, g, dim):
+    shp = M.shape
+    <span class="kw2">if</span> dim == 1:   <span class="cm"># activations: groups along the channel axis of each token</span>
+        q, d = q_absmax(M.reshape(shp[0], -1, g), bits, 2)
+    <span class="kw2">else</span>:          <span class="cm"># weights: groups along the input axis of each output column</span>
+        q, d = q_absmax(M.reshape(-1, g, shp[1]), bits, 1)
+    <span class="kw2">return</span> (q * d).reshape(shp)
+Y_grp = Xo + grp(Xr, 4, 31, 1) @ grp(Wr, 4, 31, 0)               <span class="cm"># 248 = 8 groups of 31</span>
+<span class="kw2">print</span>(<span class="st">"   + group quantization     :"</span>, round(rel(Y_grp, Y), 4))
+
+<span class="cm"># 5) OmniQuant-style learnable weight clipping (one strength per output column), 4-bit</span>
+<span class="kw2">def</span> lwc_quant(W, gamma, beta, bits=4):
+    L = 2 ** bits - 1
+    hi, lo = torch.sigmoid(gamma) * W.amax(0), torch.sigmoid(beta) * W.amin(0)
+    h = (hi - lo) / L                                              <span class="cm"># (108.11)</span>
+    z = (-lo / h).round()
+    ste = <span class="kw2">lambda</span> v: (v.round() - v).detach() + v                   <span class="cm"># straight-through round</span>
+    q = torch.clamp(ste(W / h) + z, 0, L)
+    <span class="kw2">return</span> (q - z) * h
+gamma = torch.full((O,), 4.0, requires_grad=True)                  <span class="cm"># sigmoid(4) = 0.982</span>
+beta = torch.full((O,), 4.0, requires_grad=True)
+opt = torch.optim.AdamW([gamma, beta], lr=5e-2, weight_decay=0.0)
+<span class="kw2">with</span> torch.no_grad():
+    <span class="kw2">print</span>(<span class="st">"5) W4 MinMax output error  :"</span>, round(rel(X @ lwc_quant(W, gamma + 99, beta + 99), Y), 4))
+<span class="kw2">for</span> step <span class="kw2">in</span> range(300):
+    loss = ((X @ lwc_quant(W, gamma, beta) - Y) ** 2).mean()       <span class="cm"># output error, not weight error</span>
+    opt.zero_grad(); loss.backward(); opt.step()
+<span class="kw2">with</span> torch.no_grad():
+    <span class="kw2">print</span>(<span class="st">"   W4 learned clipping     :"</span>, round(rel(X @ lwc_quant(W, gamma, beta), Y), 4),
+          <span class="st">" mean clip strength"</span>, round(torch.sigmoid(gamma).mean().item(), 3))
+
+<span class="cm"># Printed (PyTorch 2.8, CPU):</span>
+<span class="cm"># 1) per-tensor W8A8 : 0.1045</span>
+<span class="cm">#    per-token  W8A8 : 0.0939</span>
+<span class="cm"># 2) LLM.int8()      : 0.0089 with 4 FP16 channels</span>
+<span class="cm"># 3) SmoothQuant a=0.25: per-tensor 0.0115  per-token 0.0107</span>
+<span class="cm"># 3) SmoothQuant a=0.5: per-tensor 0.0114  per-token 0.0109</span>
+<span class="cm"># 3) SmoothQuant a=0.75: per-tensor 0.0118  per-token 0.0115</span>
+<span class="cm"># 4) W4A4 per-token/per-channel: 0.9843</span>
+<span class="cm">#    + outliers in INT8       : 0.159</span>
+<span class="cm">#    + group quantization     : 0.1206</span>
+<span class="cm"># 5) W4 MinMax output error  : 0.3888</span>
+<span class="cm">#    W4 learned clipping     : 0.2565  mean clip strength 0.665</span>
+</pre>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>Method and why</th><th>Link</th></tr></thead><tbody>
+<tr><td>Loading a model too big for your GPU</td><td>LLM.int8() through bitsandbytes halves weight memory with no calibration; accept the slower GEMMs.</td><td><a href="../posttraining/qlora-and-training-with-quantized-weights.html">session 58</a></td></tr>
+<tr><td>High-throughput chat serving</td><td>W8A8 (SmoothQuant-style) uses INT8 tensor cores in prefill and in large decode batches, where GEMMs are compute-bound.</td><td><a href="../inference/index.html#row-batching-continuous-batching-chunked-prefill-split-fuse" title="Batching: continuous batching, chunked prefill, split-fuse (planned)">session 135</a></td></tr>
+<tr><td>Long-prompt prefill: RAG, long documents</td><td>Prefill is compute-bound even at batch 1, so W8A8 speeds up time to first token; weight-only quantization does not.</td><td><a href="../inference/where-quantization-helps-weight-only-vs-weight.html">session 104</a></td></tr>
+<tr><td>Video understanding: video QA, Video-RAG, key-moment detection</td><td>A video adds thousands of visual tokens per request; prefill over them is a large compute-bound GEMM where W8A8 or W4A4 pays off. Vision encoders have activation outliers too, so smoothing is applied there as well. [Likely]</td><td><a href="../inference/index.html#row-lab-compare-rtn-gptq-awq-smoothquant-and" title="compare RTN, GPTQ, AWQ, SmoothQuant and FP8 on one model (planned)">session 112</a></td></tr>
+<tr><td>Video retrieval, classification and fingerprinting at scale</td><td>Embedding millions of clips is pure batched throughput: integer GEMMs with static (O3-style) scales give the lowest cost per clip.</td><td><a href="../inference/index.html#row-hardware-accelerators-and-edge-deployment" title="Hardware accelerators and edge deployment (planned)">session 140</a></td></tr>
+<tr><td>Edge and mobile inference</td><td>NPUs often run integer arithmetic only; static per-tensor activation scales after smoothing match what such hardware supports. [Likely]</td><td><a href="../inference/index.html#row-hardware-accelerators-and-edge-deployment" title="Hardware accelerators and edge deployment (planned)">session 140</a></td></tr>
+<tr><td>4-bit serving on INT4-capable GPUs</td><td>Atom-style mixed precision with groups and reordering, or rotations (QuaRot) to remove outliers first.</td><td><a href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html">session 109</a></td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Expecting LLM.int8() to be faster.</b> It is a memory method. For 6.7B-sized layers its GEMM ran at 0.86× of FP16 in the paper; only the 13B and 175B shapes were faster.</li>
+<li><b>Using a per-input-channel activation scale in an INT8 GEMM.</b> It sits inside the dot product (108.3). Either migrate it into the weights (SmoothQuant) or split the GEMM (LLM.int8()).</li>
+<li><b>Thinking per-token scales fix outliers.</b> Outlier channels are large in almost every token, so each token’s scale is still set by them (Figure 1: 8.6% error per-token against 9.2% per-tensor).</li>
+<li><b>Forgetting that several linear layers share one smoothing factor.</b> Q, K and V all read the same norm output, so they must use the same \(s\), computed from the maximum over all three weight matrices. A different \(s\) per projection cannot be folded into one norm.</li>
+<li><b>Calibrating on the wrong data.</b> Static (O3) scales are frozen from calibration; if the deployed traffic (code, another language, long contexts) has larger activations, values clip. Use dynamic per-token scales when traffic is unknown.</li>
+<li><b>Pushing α to 1.</b> All activation channels become flat, but the outliers move into the weights (Figure 3, right end of the curve).</li>
+<li><b>Mixed precision without reordering.</b> Gathering scattered outlier channels at run time makes the kernel irregular and slow; Atom reorders once offline and fuses the activation reorder.</li>
+<li><b>Comparing W4A4 results across papers.</b> Some papers keep some layers or the KV cache in higher precision, or use groups; check exactly what was quantized before comparing perplexities.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why are activations harder to quantize than weights in LLMs?<span class="lvl">basic</span></summary><div class="ans">Weights are fixed and roughly Gaussian with few extremes, so a per-channel scale fits them well, and they can be quantized offline with care (GPTQ). Activations change with every input and, in large models, a few fixed channels carry values 20 to 100 times larger than the rest. With absmax scaling, the error of all values in a group is set by its largest value (108.1), so the outliers ruin the resolution of every other channel in the same token (108.4).</div></details>
+<details class="qa"><summary>Why can you use per-token activation scales and per-channel weight scales in an INT8 GEMM, but not per-channel activation scales?<span class="lvl">core</span></summary><div class="ans">The GEMM sums over the input channel \(j\). A scale that depends on the token \(t\) or the output channel \(o\) is constant inside that sum and can be applied once per output element in the epilogue (108.2). A scale that depends on \(j\) changes inside the sum (108.3), so the products cannot be accumulated as plain integers.</div></details>
+<details class="qa"><summary>Explain LLM.int8(). How does it choose the outliers and what does it cost?<span class="lvl">basic</span></summary><div class="ans">Vector-wise INT8 (per-token, per-output-channel scales) plus mixed-precision decomposition: any input channel with a value of magnitude at least \(\alpha = 6\) in the current input goes into a separate FP16 GEMM, the rest into INT8, and the outputs are added (108.5). It needs no calibration and kept full accuracy up to 175B (OPT-175B average 66.7% against 66.9%). Cost: finding and gathering outlier columns and running two GEMMs; in the paper it was slower than FP16 below the 13B shape (0.86× at 6.7B), 1.81× faster only at 175B.</div></details>
+<details class="qa"><summary>Derive the SmoothQuant factor and show that the output is unchanged.<span class="lvl">core</span></summary><div class="ans">\(XW = X \operatorname{diag}(s)^{-1} \operatorname{diag}(s) W\) for any positive \(s\) (108.6). We want both \(\hat{X} = X/s\) and \(\hat{W} = sW\) to have small channel maxima: \(\max |\hat{X}_j| = m^x_j / s_j\) and \(\max |\hat{W}_j| = s_j m^w_j\). Choosing \(s_j = (m^x_j)^\alpha / (m^w_j)^{1-\alpha}\) (108.7) interpolates; at \(\alpha = 0.5\), both maxima equal \(\sqrt{m^x_j m^w_j}\) (108.8). The division is folded into the previous norm’s weights and the multiplication into \(W\), offline, so there is no run-time cost.</div></details>
+<details class="qa"><summary>How do you pick α for SmoothQuant, and what happens at the extremes?<span class="lvl">core</span></summary><div class="ans">Grid search on held-out perplexity. At \(\alpha = 0\) with \(s_j = 1/m^w_j\) the weights are flat and all difficulty stays in the activations; at \(\alpha = 1\) the activations are flat and the outliers move to the weights. The paper used 0.5 for OPT and BLOOM, 0.75 for GLM-130B and 0.8 to 0.9 for Llama-2 and Mistral with per-token activations. Models with stronger outliers need larger \(\alpha\).</div></details>
+<details class="qa"><summary>What are SmoothQuant O1, O2 and O3?<span class="lvl">basic</span></summary><div class="ans">Three activation granularities, all with per-tensor INT8 weights: O1 per-token dynamic, O2 per-tensor dynamic, O3 per-tensor static (scale fixed from calibration). O3 is fastest because the kernel needs no reduction over the input; on OPT-175B it kept 66.8% average accuracy against 66.9% for FP16.</div></details>
+<details class="qa"><summary>ZeroQuant reports 5× speed-ups but fails on OPT-175B. Why?<span class="lvl">advanced</span></summary><div class="ans">Its speed comes from fused kernels for token-wise activation quantization and group-wise weights, tested mainly on BERT and GPT-3-style models up to 20B. Per-token scales do not remove channel outliers, which are present in every token of large OPT models after the phase shift around 6.7B parameters. In the SmoothQuant paper’s test, ZeroQuant W8A8 on OPT-175B gave 35.8% average accuracy, as bad as naive W8A8.</div></details>
+<details class="qa"><summary>What does OmniQuant learn, and how is it trained?<span class="lvl">advanced</span></summary><div class="ans">Two sets of quantization parameters, with the model weights frozen: LWC learns per-channel clipping strengths \(\gamma, \beta\) through sigmoids (108.11), and LET learns per-channel scales and shifts for activations (108.12), including a scale between queries and keys. They are trained block by block to minimize the MSE between the full-precision and the quantized block outputs, with straight-through gradients for rounding; 128 calibration segments, 1 to 16 hours on one A100 for LLaMA-2 7B to 70B.</div></details>
+<details class="qa"><summary>Why does clipping weights ever help, if it throws away information?<span class="lvl">core</span></summary><div class="ans">With \(N\) bits, the step is the range divided by \(2^N - 1\). A few large weights make the range, and thus the step, large for all weights. Clipping them costs a large error on a few values but reduces the rounding error of all the others. The best clipping balances the two; it is stronger at fewer bits (Figure 4: about 0.9 in 4-bit, about 0.67 in 3-bit).</div></details>
+<details class="qa"><summary>What does Atom do to make W4A4 accurate and fast?<span class="lvl">advanced</span></summary><div class="ans">It keeps 128 outlier channels (largest sum of squares on calibration data) in INT8 and the rest in INT4; it reorders channels so both parts are dense blocks (weights permuted offline, activation reorder fused into the previous operator); it uses groups of 128 with fused dequantization, dynamic activation scales, clipping, GPTQ for weights and an INT4 KV cache. Effective storage is about 4.25 bits (108.13). On Llama-7B the ablation goes from 2,315 perplexity (RTN W4A4) to 6.16 (FP16 5.68); in serving it reported up to 7.73× FP16 throughput.</div></details>
+<details class="qa"><summary>You serve an 8B model at batch 1 with short prompts. Should you use W8A8 or W4A16?<span class="lvl">core</span></summary><div class="ans">W4A16 (weight-only). At batch 1, decode is memory-bound: each step reads all weights to produce one token, so time scales with weight bytes. 4-bit weights move 4 times fewer bytes than FP16; W8A8 moves only 2 times fewer and its faster integer math does not matter when the GPU is waiting for memory. W8A8 wins at large batches and in long prefills, where the GEMMs become compute-bound.</div></details>
+<details class="qa"><summary>Several projections read the same LayerNorm output. How does that constrain SmoothQuant?<span class="lvl">advanced</span></summary><div class="ans">The factor \(s\) is folded into the norm, so all consumers of that norm output see the same \(\hat{X}\) and must all be multiplied by the same \(s\). So \(m^w_j\) is taken as the maximum over the stacked Q, K and V weight rows (or up and gate for the FFN). The down projection in the FFN reads the output of the activation function, not a norm, so smoothing it needs the factor folded into the up projection’s output columns, which works for ReLU-like or gated paths but needs care. [Likely, as implementations differ]</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A token has values 0.9, −2.1, 1.4 and an outlier of 60. Quantize it to INT8 with one per-token scale. What are the integers for the three normal values, and their relative errors?</li>
+<li>Using (108.4), how many INT8 levels does a channel with \(m_j = 3.5\) get if the tensor maximum is 60? How many with INT4?</li>
+<li>Compute the SmoothQuant factor for a channel with \(m^x = 50\), \(m^w = 0.04\) at \(\alpha = 0.5\) and \(\alpha = 0.8\), and the resulting maxima on both sides.</li>
+<li>In LLM.int8(), a 4,096-wide model has 7 outlier channels. What fraction of the multiply-adds run in FP16? Why can the layer still be slower than FP16?</li>
+<li>Compute the effective bits (108.9) of INT4 weights with group size 64 and 128, and of an Atom-style layer with \(C = 5{,}120\), \(k = 128\), \(g = 128\).</li>
+<li>Show that OmniQuant’s shift (108.12) gives exactly the same output. Then explain why a shift helps an always-positive channel under symmetric quantization.</li>
+<li>Why does Atom quantize the outlier channels to INT8 instead of keeping them in FP16, if FP16 is more accurate?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(\Delta = 60/127 = 0.4724\). \(0.9/0.4724 = 1.905 \to 2 \to 0.945\) (error 5.0%); \(-2.1/0.4724 = -4.445 \to -4 \to -1.890\) (10.0%); \(1.4/0.4724 = 2.963 \to 3 \to 1.417\) (1.2%). 2. \(2 \times 127 \times 3.5/60 = 14.8\) levels in INT8; \(2 \times 7 \times 3.5/60 = 0.82\), so in INT4 the channel rounds to 0 or \(\pm 1\) step, and most of its values become 0. 3. \(\alpha = 0.5\): \(s = \sqrt{50}/\sqrt{0.04} = 7.071/0.2 = 35.36\); both maxima become \(\sqrt{50 \times 0.04} = 1.414\). \(\alpha = 0.8\): \(s = 50^{0.8}/0.04^{0.2} = 22.87/0.5253 = 43.53\); activations \(50/43.53 = 1.149\), weights \(0.04 \times 43.53 = 1.741\). 4. \(7/4096 = 0.17\%\). Overheads: finding the outlier columns needs a pass over \(X\), gathering them breaks memory layout, there are two GEMM launches and an add, and quantizing \(X\) and dequantizing the output costs memory traffic; for medium-size matrices these dominate (Table 5 of the paper: 0.86× at 6.7B). 5. \(4 + 16/64 = 4.25\) and \(4 + 16/128 = 4.125\). Atom-style: \((4 \times 4992 + 8 \times 128)/5120 + 16/128 = 4.1 + 0.125 = 4.225\) bits. 6. \([(X - \delta) \oslash s][s \odot W] = (X - \delta) W = XW - \delta W\), and the bias adds back \(\delta W\), so the output is \(XW + B\). An always-positive channel with values in \([a, b]\), \(a \gt 0\), uses only the positive half of a symmetric grid with scale \(b/Q\); after subtracting \(\delta = (a + b)/2\) it spans \([-(b - a)/2, (b - a)/2]\), and the step becomes \((b - a)/(2Q)\), less than half as large. 7. An FP16 part would need a separate FP16 GEMM, and mixing FP16 and INT4 GEMMs is the same slow path as LLM.int8(). INT8 outliers run on integer tensor cores in the same fused kernel, and the ablation shows INT8 outliers cost only 0.05 perplexity (11.34 to 11.39).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Weight–activation quantization is needed to use integer tensor cores; it pays off when GEMMs are compute-bound (prefill, large batches), not in batch-1 decoding.</li>
+<li>LLM activations have outliers in a few fixed channels, present in almost every token. They crush the resolution of per-tensor and per-token scales (108.4), and a per-input-channel scale does not fit an integer GEMM (108.3).</li>
+<li>LLM.int8() runs channels with \(|x| \ge 6\) in FP16 and the rest in vector-wise INT8 (108.5): no accuracy loss up to 175B, half the memory, but often slower than FP16.</li>
+<li>SmoothQuant divides activation channels by \(s_j = m_x^\alpha / m_w^{1-\alpha}\) and multiplies weight rows by the same factor (108.6)–(108.7), folded offline into the norm. W8A8 with static per-tensor scales then keeps OPT-175B within 0.1 points of FP16, with up to 1.56× speed-up.</li>
+<li>ZeroQuant uses group-wise weights, dynamic per-token activations and fused kernels, plus layer-by-layer distillation (108.10); finer scales alone do not fix channel outliers.</li>
+<li>OmniQuant learns clipping (108.11) and scale-and-shift transformations (108.12) by minimizing block output error; Atom reaches W4A4 with 128 INT8 outlier channels, reordering and groups of 128 (about 4.25 bits, 108.13).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \bar{x} = \operatorname{clamp}\!\big(\lfloor x/\Delta \rceil, -Q, Q\big), \quad Y_{to} \approx \Delta^x_t \Delta^w_o \textstyle\sum_j \bar{X}_{tj} \bar{W}_{jo}, \quad \text{levels}_j \approx 2Q\, m_j / m \]</div>
+<div class="eq">\[ Y \approx X_{:,\mathcal{O}} W_{\mathcal{O},:} + \operatorname{diag}(\Delta^x) \bar{X}_{:,\bar{\mathcal{O}}} \bar{W}_{\bar{\mathcal{O}},:} \operatorname{diag}(\Delta^w), \qquad Y = (X \operatorname{diag}(s)^{-1})(\operatorname{diag}(s) W), \quad s_j = \frac{m_{x,j}^{\alpha}}{m_{w,j}^{1-\alpha}} \]</div>
+<div class="eq">\[ h = \frac{\gamma \max W - \beta \min W}{2^N - 1}, \qquad Y = [(X - \delta) \oslash s][s \odot W] + [B + \delta W], \qquad b_{\text{eff}} = \frac{4(C - k) + 8k}{C} + \frac{16}{g} \]</div>
+<h2 class="plain" id="weight-activation-quantization-llm-int8-smoothquant-zeroquant-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Dettmers et al. (2022). <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</a></li><li>Xiao et al. (2022). <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</a></li><li>Yao et al. (2022). <a href="https://arxiv.org/abs/2206.01861" target="_blank" rel="noopener">ZeroQuant: Efficient and Affordable Post-Training Quantization for Large-Scale Transformers</a></li><li>Shao et al. (2023). <a href="https://arxiv.org/abs/2308.13137" target="_blank" rel="noopener">OmniQuant: Omnidirectionally Calibrated Quantization for Large Language Models</a></li><li>Zhao et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Atom: Low-bit Quantization for Efficient and Accurate LLM Serving&amp;quot;" target="_blank" rel="noopener">Atom: Low-bit Quantization for Efficient and Accurate LLM Serving</a></li><li>Dettmers et al. (2022). <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</a></li><li>Xiao et al. (2022). <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</a></li><li>Yao et al. (2022). <a href="https://arxiv.org/abs/2206.01861" target="_blank" rel="noopener">ZeroQuant: Efficient and Affordable Post-Training Quantization for Large-Scale Transformers</a></li><li>Shao et al. (2023). <a href="https://arxiv.org/abs/2308.13137" target="_blank" rel="noopener">OmniQuant: Omnidirectionally Calibrated Quantization for Large Language Models</a></li><li>Zhao et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Atom: Low-bit Quantization for Efficient and Accurate LLM Serving&amp;quot;" target="_blank" rel="noopener">Atom: Low-bit Quantization for Efficient and Accurate LLM Serving</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Frantar et al. (2022). <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</a></li><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Jacob et al. (2017). <a href="https://arxiv.org/abs/1712.05877" target="_blank" rel="noopener">Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference</a></li><li>Wei et al. (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;Outlier Suppression: Pushing the Limit of Low-bit Transformer Language Models&amp;quot;" target="_blank" rel="noopener">Outlier Suppression: Pushing the Limit of Low-bit Transformer Language Models</a></li><li>Wei et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Outlier Suppression+: Accurate quantization of large language models by equivalent and optimal shifting and scaling&amp;quot;" target="_blank" rel="noopener">Outlier Suppression+: Accurate quantization of large language models by equivalent and optimal shifting and scaling</a></li><li>Yuan et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;RPTQ: Reorder-based Post-training Quantization for Large Language Models&amp;quot;" target="_blank" rel="noopener">RPTQ: Reorder-based Post-training Quantization for Large Language Models</a></li><li>Dettmers et al. (code). <a href="https://github.com/bitsandbytes-foundation/bitsandbytes" target="_blank" rel="noopener">bitsandbytes: k-bit quantization for PyTorch (LLM.int8() implementation)</a></li><li>Ashkboos et al. (2024). <a href="https://arxiv.org/abs/2404.00456" target="_blank" rel="noopener">QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/weight-ptq-2-awq-outliers-and-mixed.html"><small>Previous · session 107</small>Weight PTQ 2: AWQ, outliers and mixed precision</a><a class="next" href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html"><small>Next · session 109</small>Rotations against outliers: QuIP, QuIP#, QuaRot, SpinQuant</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="weight-activation-quantization-llm-int8-smoothquant-zeroquant"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const pct=(x,d)=>(100*x).toFixed(d===undefined?2:d)+"%";
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let spare=null;return()=>{if(spare!==null){const v=spare;spare=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));spare=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+const jr=x=>Math.floor(x+0.5);
+const T_=(x,y,s,o)=>`<text x="${x}" y="${y}" ${o||""}>${s}</text>`;
+function segInit(seg,attr,cb){seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+
+/* ---------- shared synthetic layer (same seeds as the Python check) ---------- */
+const T=16,C=64,O=32,OUT=[9,27,44,58,17,36],SGN=[-1,1,-1,-1,1,-1];
+const g0=gauss(rng(11));const sc=[];for(let j=0;j<C;j++)sc.push(0.6+0.4*Math.abs(g0()));
+const X0=[];for(let t=0;t<T;t++){const r=[];for(let j=0;j<C;j++)r.push(g0()*sc[j]);X0.push(r);}
+const u1=rng(12);const F=[];for(let t=0;t<T;t++){const r=[];for(let k=0;k<6;k++)r.push(0.7+0.3*u1());F.push(r);}
+const gw=gauss(rng(21));const W0=[];for(let j=0;j<C;j++){const r=[];const f=OUT.includes(j)?0.1:1;for(let o=0;o<O;o++)r.push(0.05*gw()*f);W0.push(r);}
+function makeX(n,mag){const X=X0.map(r=>r.slice());for(let k=0;k<n;k++){const j=OUT[k];for(let t=0;t<T;t++)X[t][j]=SGN[k]*mag*F[t][k];}return X;}
+function qv(x,d,qm){if(d<=0)return 0;let q=jr(x/d);q=Math.max(-qm,Math.min(qm,q));return q*d;}
+function quantM(M,mode,bits,c){c=c||1;const qm=2**(bits-1)-1,n=M.length,m=M[0].length;
+ if(mode==="tensor"){let mx=0;for(const r of M)for(const v of r)mx=Math.max(mx,Math.abs(v));const d=c*mx/qm;return M.map(r=>r.map(v=>qv(v,d,qm)));}
+ if(mode==="row")return M.map(r=>{let mx=0;for(const v of r)mx=Math.max(mx,Math.abs(v));const d=c*mx/qm;return r.map(v=>qv(v,d,qm));});
+ const ds=[];for(let j=0;j<m;j++){let mx=0;for(let i=0;i<n;i++)mx=Math.max(mx,Math.abs(M[i][j]));ds.push(c*mx/qm);}
+ return M.map(r=>r.map((v,j)=>qv(v,ds[j],qm)));}
+function matmul(A,Bm){const n=A.length,k=Bm.length,m=Bm[0].length,Z=[];for(let i=0;i<n;i++){const z=new Array(m).fill(0),a=A[i];for(let p=0;p<k;p++){const ap=a[p];if(ap===0)continue;const b=Bm[p];for(let j=0;j<m;j++)z[j]+=ap*b[j];}Z.push(z);}return Z;}
+function relerr(A,Bm){let nu=0,de=0;for(let i=0;i<A.length;i++)for(let j=0;j<A[0].length;j++){nu+=(A[i][j]-Bm[i][j])**2;de+=Bm[i][j]**2;}return Math.sqrt(nu/de);}
+const XL=makeX(4,40),YL=matmul(XL,W0);
+const mxL=[],mwL=[];for(let j=0;j<C;j++){let a=0,b=0;for(let t=0;t<T;t++)a=Math.max(a,Math.abs(XL[t][j]));for(let o=0;o<O;o++)b=Math.max(b,Math.abs(W0[j][o]));mxL.push(a);mwL.push(b);}
+const VEC=relerr(matmul(quantM(XL,"row",8),quantM(W0,"col",8)),YL);
+
+/* ---------- Figure 1: outliers and three scale choices ---------- */
+(function(){
+ const svg=$("#wa-out-svg");if(!svg)return;const info=$("#wa-out-info"),sn=$("#wa-out-n"),sm=$("#wa-out-m"),on=$("#wa-out-nv"),om=$("#wa-out-mv");
+ let bits=8;
+ function draw(){
+  const n=+sn.value,mag=+sm.value;on.textContent=n;om.textContent=mag;
+  const X=makeX(n,mag),os=new Set(OUT.slice(0,n));let mx=0;for(const r of X)for(const v of r)mx=Math.max(mx,Math.abs(v));
+  const res={};
+  for(const md of["tensor","row","col"]){const Q=quantM(X,md,bits);let nu=0,de=0;for(let t=0;t<T;t++)for(let j=0;j<C;j++){if(os.has(j))continue;nu+=(X[t][j]-Q[t][j])**2;de+=X[t][j]**2;}res[md]=Math.sqrt(nu/de);}
+  const cm=[];for(let j=0;j<C;j++){if(os.has(j))continue;let a=0;for(let t=0;t<T;t++)a=Math.max(a,Math.abs(X[t][j]));cm.push(a);}cm.sort((a,b)=>a-b);
+  const med=cm[Math.floor(cm.length/2)],qm=2**(bits-1)-1,lev=2*qm*med/mx;
+  let g="";const x0=64,cw=8,y0=26,ch=9;
+  g+=T_(x0,16,"activations X: 16 tokens × 64 channels (darker = larger |x|)",'font-size="13" class="svgs"');
+  for(let t=0;t<T;t++)for(let j=0;j<C;j++){const a=Math.abs(X[t][j])/mx;g+=`<rect x="${x0+j*cw}" y="${y0+t*ch}" width="${cw-0.6}" height="${ch-0.6}" fill="var(--q)" fill-opacity="${(0.04+0.96*a).toFixed(3)}"/>`;}
+  g+=T_(x0-6,y0+ch*0.8,"t=1",'text-anchor="end" font-size="11" class="svgs"')+T_(x0-6,y0+T*ch-2,"t=16",'text-anchor="end" font-size="11" class="svgs"');
+  for(const j of os)g+=`<path d="M${x0+j*cw+cw/2-4} ${y0+T*ch+9}l4 -6l4 6z" fill="var(--k)"/>`;
+  g+=T_(x0+C*cw,16,`max |x| = ${mx.toFixed(2)}`,'text-anchor="end" font-size="12" class="svgt"');
+  const by=214,bh=22,bx=230,bw=320,top=Math.max(0.1,Math.max(res.tensor,res.row,res.col)*1.08);
+  g+=T_(x0,by-14,`relative ${bits}-bit error on the normal channels`,'font-size="13" class="svgs"');
+  [["per-tensor","tensor","var(--k)"],["per-token","row","var(--q)"],["per-input-channel","col","var(--v)"]].forEach((r,i)=>{const y=by+i*(bh+12),w=Math.max(2,bw*res[r[1]]/top);
+   g+=T_(bx-8,y+15,r[0],'text-anchor="end" font-size="13" class="svgt"')+`<rect x="${bx}" y="${y}" width="${w}" height="${bh}" rx="4" fill="${r[2]}"/>`+T_(Math.min(bx+w+6,600),y+15,pct(res[r[1]]),`font-size="12" class="svgs" ${bx+w+6>560?'text-anchor="end"':""}`);});
+  svg.innerHTML=g;
+  info.dataset.tensor=res.tensor.toFixed(4);info.dataset.row=res.row.toFixed(4);info.dataset.col=res.col.toFixed(4);info.dataset.levels=lev.toFixed(2);
+  info.innerHTML=`${n} outlier channel${n===1?"":"s"} of size about ${mag}; tensor maximum m = ${mx.toFixed(2)}. Error on normal channels with ${bits}-bit absmax: per-tensor <b>${pct(res.tensor)}</b>, per-token <b>${pct(res.row)}</b>, per-input-channel <b>${pct(res.col)}</b>.<br>The median normal channel has m<sub>j</sub> = ${med.toFixed(2)}, so with one scale it reaches about 2Q·m<sub>j</sub>/m = <b>${lev.toFixed(1)}</b> of the ${2*qm+1} levels (108.4).${lev<2?" Most of its values round to zero.":""}`;}
+ sn.addEventListener("input",draw);sm.addEventListener("input",draw);segInit($("#wa-out-b"),"b",v=>{bits=+v;draw();});draw();
+})();
+
+/* ---------- Figure 2: LLM.int8() decomposition ---------- */
+(function(){
+ const svg=$("#wa-dec-svg");if(!svg)return;const info=$("#wa-dec-info"),sl=$("#wa-dec-a"),out=$("#wa-dec-av");
+ const AL=[1,1.5,2,2.5,3,4,5,6,8,10,15,20,30,40,45,50];
+ function decomp(alpha){const Os=[],Ns=[];for(let j=0;j<C;j++)(mxL[j]>=alpha?Os:Ns).push(j);
+  const Y=[];for(let t=0;t<T;t++){const z=new Array(O).fill(0);for(const j of Os){const x=XL[t][j];for(let o=0;o<O;o++)z[o]+=x*W0[j][o];}Y.push(z);}
+  if(Ns.length){const XN=XL.map(r=>Ns.map(j=>r[j])),WN=Ns.map(j=>W0[j]);const P=matmul(quantM(XN,"row",8),quantM(WN,"col",8));for(let t=0;t<T;t++)for(let o=0;o<O;o++)Y[t][o]+=P[t][o];}
+  return [Y,Os.length];}
+ const x0=60,x1=620,yt=24,yb=220,lo=Math.log(0.5),hi=Math.log(100);const Yv=v=>yb-(Math.log(Math.max(v,0.5))-lo)/(hi-lo)*(yb-yt);
+ function draw(){
+  const a=AL[+sl.value];out.textContent=String(a);
+  const [Yd,n]=decomp(a),e=relerr(Yd,YL),bw=(x1-x0)/C;let g="";
+  [0.5,1,10,100].forEach(v=>{const y=Yv(v);g+=`<line x1="${x0}" y1="${y}" x2="${x1}" y2="${y}" stroke="var(--rule)"/>`+T_(x0-6,y+4,String(v),'text-anchor="end" font-size="11" class="svgs"');});
+  for(let j=0;j<C;j++){const y=Yv(mxL[j]),isO=mxL[j]>=a;g+=`<rect x="${(x0+j*bw+0.6).toFixed(2)}" y="${y.toFixed(1)}" width="${(bw-1.2).toFixed(2)}" height="${(yb-y).toFixed(1)}" fill="${isO?"var(--k)":"var(--q)"}" fill-opacity="${isO?1:0.75}"/>`;}
+  const ya=Yv(a);g+=`<line x1="${x0}" y1="${ya}" x2="${x1}" y2="${ya}" stroke="var(--ink)" stroke-width="2" stroke-dasharray="6 4"/>`+T_(x1,ya-6,`α = ${a}`,'text-anchor="end" font-size="13" class="svgt" font-weight="700"');
+  g+=T_(x0,14,"max over tokens of |X_tj| for each input channel j (log scale)",'font-size="13" class="svgs"')+T_((x0+x1)/2,236,"input channel j",'text-anchor="middle" font-size="12" class="svgs"');
+  const bx=250,bwid=330,top=Math.max(VEC,e)*1.1;
+  [["vector-wise INT8",VEC,"var(--muted)"],["LLM.int8()",e,"var(--k)"]].forEach((r,i)=>{const y=250+i*24,w=Math.max(2,bwid*r[1]/top);g+=T_(bx-8,y+13,r[0],'text-anchor="end" font-size="13" class="svgt"')+`<rect x="${bx}" y="${y}" width="${w}" height="18" rx="4" fill="${r[2]}"/>`+T_(bx+w+6,y+13,pct(r[1]),'font-size="12" class="svgs"');});
+  svg.innerHTML=g;
+  info.dataset.n=String(n);info.dataset.err=e.toFixed(5);info.dataset.vec=VEC.toFixed(5);
+  info.innerHTML=`α = ${a}: <b>${n}</b> of 64 channels go to the FP16 GEMM; ${pct(1-n/C)} of the channels stay in INT8. Output error: LLM.int8() <b>${pct(e)}</b> against vector-wise INT8 <b>${pct(VEC)}</b>${e>0&&e<VEC?` (${(VEC/e).toFixed(1)}× lower)`:""}.${n>8?" Many normal channels are now in the slow FP16 path.":""}${n===0?" No channel passes the threshold: this is plain vector-wise INT8.":""}`;}
+ sl.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: SmoothQuant migration strength ---------- */
+(function(){
+ const svg=$("#wa-sq-svg");if(!svg)return;const info=$("#wa-sq-info"),sl=$("#wa-sq-a"),out=$("#wa-sq-av");
+ let bits=8,am="tensor";
+ function run(alpha,smooth){const s=mxL.map((m,j)=>smooth?Math.pow(m,alpha)/Math.pow(mwL[j],1-alpha):1);
+  const Xh=XL.map(r=>r.map((v,j)=>v/s[j])),Wh=W0.map((r,j)=>r.map(v=>v*s[j]));
+  return {s,Xh,Wh,e:relerr(matmul(quantM(Xh,am,bits),quantM(Wh,"tensor",bits)),YL)};}
+ function draw(){
+  const a=+sl.value/20;out.textContent=a.toFixed(2);
+  const cur=run(a,true),none=run(0,false).e,curve=[];for(let i=0;i<=20;i++)curve.push(run(i/20,true).e);
+  let best=0;curve.forEach((v,i)=>{if(v<curve[best])best=i;});
+  const mxh=[],mwh=[];for(let j=0;j<C;j++){let p=0,q=0;for(let t=0;t<T;t++)p=Math.max(p,Math.abs(cur.Xh[t][j]));for(let o=0;o<O;o++)q=Math.max(q,Math.abs(cur.Wh[j][o]));mxh.push(p);mwh.push(q);}
+  const x0=60,x1=620,bw=(x1-x0)/C;let g="";
+  const yt=26,yb=160,lo=Math.log(0.01),hi=Math.log(100);const Yv=v=>yb-(Math.log(Math.min(100,Math.max(v,0.01)))-lo)/(hi-lo)*(yb-yt);
+  g+=T_(x0,14,"per-channel maxima after smoothing (log scale)",'font-size="13" class="svgs"');
+  [0.01,0.1,1,10,100].forEach(v=>{const y=Yv(v);g+=`<line x1="${x0}" y1="${y}" x2="${x1}" y2="${y}" stroke="var(--rule)"/>`+T_(x0-6,y+4,String(v),'text-anchor="end" font-size="11" class="svgs"');});
+  for(let j=0;j<C;j++){const xa=x0+j*bw,y1=Yv(mxh[j]),y2=Yv(mwh[j]);g+=`<rect x="${(xa+0.5).toFixed(2)}" y="${y1.toFixed(1)}" width="${(bw/2-0.6).toFixed(2)}" height="${(yb-y1).toFixed(1)}" fill="var(--q)"/><rect x="${(xa+bw/2).toFixed(2)}" y="${y2.toFixed(1)}" width="${(bw/2-0.6).toFixed(2)}" height="${(yb-y2).toFixed(1)}" fill="var(--v)"/>`;}
+  for(const j of OUT.slice(0,4))g+=`<path d="M${(x0+j*bw+bw/2-4).toFixed(1)} ${yb+10}l4 -6l4 6z" fill="var(--k)"/>`;
+  // error curve
+  const cy0=206,cy1=348,mn=Math.min(...curve)*0.8,mxv=Math.max(none,...curve)*1.25,clo=Math.log(mn),chi=Math.log(mxv);
+  const Ye=v=>cy1-(Math.log(v)-clo)/(chi-clo)*(cy1-cy0),Xa=al=>x0+al*(x1-x0);
+  g+=T_(x0,cy0-10,`output error, W${bits}A${bits}, ${am==="tensor"?"per-tensor":"per-token"} activations, per-tensor weights (log scale)`,'font-size="13" class="svgs"');
+  g+=`<line x1="${x0}" y1="${cy1}" x2="${x1}" y2="${cy1}" stroke="var(--rule)"/>`;
+  for(let i=0;i<=4;i++){const x=Xa(i/4);g+=T_(x,cy1+16,(i/4).toFixed(2),'text-anchor="middle" font-size="11" class="svgs"');}
+  g+=T_(x1,cy1+30,"α",'text-anchor="end" font-size="12" class="svgs"');
+  const yn=Ye(none);g+=`<line x1="${x0}" y1="${yn}" x2="${x1}" y2="${yn}" stroke="var(--muted)" stroke-dasharray="5 4"/>`+T_(x0+4,yn-5,`no smoothing: ${pct(none)}`,'font-size="12" class="svgs"');
+  g+=`<polyline fill="none" stroke="var(--ink2)" stroke-width="2.5" points="${curve.map((v,i)=>Xa(i/20).toFixed(1)+","+Ye(v).toFixed(1)).join(" ")}"/>`;
+  [Ye(mn/0.8),Ye(Math.max(...curve))].forEach((y,i)=>{g+=T_(x0-6,y+4,pct(i?Math.max(...curve):Math.min(...curve),1),'text-anchor="end" font-size="11" class="svgs"');});
+  g+=`<circle cx="${Xa(a)}" cy="${Ye(cur.e)}" r="6" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;
+  svg.innerHTML=g;
+  const sx=cur.s[OUT[0]];
+  info.dataset.err=cur.e.toFixed(4);info.dataset.none=none.toFixed(4);info.dataset.best=(best/20).toFixed(2);info.dataset.maxx=Math.max(...mxh).toFixed(3);info.dataset.maxw=Math.max(...mwh).toFixed(3);
+  info.innerHTML=`α = ${a.toFixed(2)}: output error <b>${pct(cur.e)}</b>, without smoothing ${pct(none)}. Largest |X̂| = ${Math.max(...mxh).toFixed(3)}, largest |Ŵ| = ${Math.max(...mwh).toFixed(3)} (before: ${Math.max(...mxL).toFixed(2)} and ${Math.max(...mwL).toFixed(3)}).<br>Outlier channel ${OUT[0]+1}: s = ${sx.toFixed(1)}, its activations shrink from ${mxL[OUT[0]].toFixed(1)} to ${(mxL[OUT[0]]/sx).toFixed(3)}. Best α on this grid: ${(best/20).toFixed(2)} (${pct(curve[best])}).`;}
+ sl.addEventListener("input",draw);segInit($("#wa-sq-b"),"b",v=>{bits=+v;draw();});segInit($("#wa-sq-m"),"m",v=>{am=v;draw();});draw();
+})();
+
+/* ---------- Figure 4: OmniQuant learnable weight clipping ---------- */
+(function(){
+ const svg=$("#wa-lwc-svg");if(!svg)return;const info=$("#wa-lwc-info"),sl=$("#wa-lwc-c"),out=$("#wa-lwc-cv"),btn=$("#wa-lwc-learn");
+ const g3=gauss(rng(31));const w=[];for(let i=0;i<128;i++)w.push(0.02*g3());w[17]=0.11;w[64]=-0.085;w[101]=0.075;
+ const wmax=Math.max(...w),wmin=Math.min(...w);let bits=4,timer=null,learned=null;
+ function fq(c){const L=2**bits-1,lo=c*wmin,hi=c*wmax,h=(hi-lo)/L,z=jr(-lo/h);let mse=0,gr=0,clip=0;
+  for(const v of w){const uu=jr(v/h)+z;let d;if(uu<0||uu>L){const q=uu<0?0:L;d=(q-z)*h;gr+=2*(d-v)*(d/c);clip++;}else{d=(uu-z)*h;gr+=2*(d-v)*((d-v)/c);}mse+=(d-v)**2;}
+  return {mse:mse/128,gr:gr/128,clip,h,z,lo,hi};}
+ const CS=[];for(let i=0;i<=140;i++)CS.push(0.3+i*0.005);
+ function draw(){
+  const c=+sl.value/200;out.textContent=c.toFixed(3);
+  const r=fq(c),L=2**bits-1,m1=fq(1).mse;const curve=CS.map(x=>fq(x).mse);let bi=0;curve.forEach((v,i)=>{if(v<curve[bi])bi=i;});
+  const x0=60,x1=620,W=v=>x0+(v+0.12)/0.24*(x1-x0);let g="";
+  g+=T_(x0,14,`one weight column (128 values) and the ${bits}-bit grid inside the clipping range`,'font-size="13" class="svgs"');
+  g+=`<rect x="${W(r.lo)}" y="26" width="${W(r.hi)-W(r.lo)}" height="70" fill="var(--k)" fill-opacity="0.08" stroke="var(--k)"/>`;
+  for(let q=0;q<=L;q++){const x=W((q-r.z)*r.h);g+=`<line x1="${x}" y1="84" x2="${x}" y2="96" stroke="var(--k)" stroke-width="1.5"/>`;}
+  w.forEach((v,i)=>{const cl=v>r.hi+r.h/2||v<r.lo-r.h/2;g+=`<circle cx="${W(v).toFixed(1)}" cy="${(34+(i%8)*6).toFixed(1)}" r="${cl?4.5:3}" fill="${cl?"var(--bad)":"var(--q)"}" fill-opacity="${cl?1:0.7}"/>`;});
+  [-0.1,-0.05,0,0.05,0.1].forEach(v=>{g+=T_(W(v),112,String(v),'text-anchor="middle" font-size="11" class="svgs"');});
+  const cy0=150,cy1=300,Xc=c=>x0+(c-0.3)/0.7*(x1-x0),mx=Math.max(...curve),mn=Math.min(...curve),Yc=v=>cy1-(v-mn*0.9)/(mx-mn*0.9)*(cy1-cy0);
+  g+=T_(x0,cy0-12,"mean squared quantization error against clipping strength",'font-size="13" class="svgs"');
+  g+=`<line x1="${x0}" y1="${cy1}" x2="${x1}" y2="${cy1}" stroke="var(--rule)"/>`;
+  [0.3,0.5,0.7,0.9,1].forEach(v=>{g+=T_(Xc(v),cy1+16,v.toFixed(1),'text-anchor="middle" font-size="11" class="svgs"');});
+  g+=`<polyline fill="none" stroke="var(--v)" stroke-width="2.5" points="${curve.map((v,i)=>Xc(CS[i]).toFixed(1)+","+Yc(v).toFixed(1)).join(" ")}"/>`;
+  g+=`<line x1="${Xc(CS[bi])}" y1="${cy0}" x2="${Xc(CS[bi])}" y2="${cy1}" stroke="var(--v)" stroke-dasharray="4 4"/>`+T_(Xc(CS[bi])+4,cy0+10,`grid best ${CS[bi].toFixed(3)}`,'font-size="12" class="svgs"');
+  if(c>=0.3)g+=`<circle cx="${Xc(c)}" cy="${Yc(r.mse)}" r="6" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;
+  svg.innerHTML=g;
+  info.dataset.c=c.toFixed(3);info.dataset.mse=r.mse.toExponential(4);info.dataset.ratio=(m1/r.mse).toFixed(3);info.dataset.best=CS[bi].toFixed(3);if(learned!==null)info.dataset.learned=learned.toFixed(3);
+  info.innerHTML=`${bits}-bit, γ = β = ${c.toFixed(3)}: step h = ${r.h.toExponential(2)}, ${r.clip} weight${r.clip===1?"":"s"} clipped, MSE = <b>${r.mse.toExponential(3)}</b>, which is <b>${(m1/r.mse).toFixed(3)}×</b> lower than min–max (γ = β = 1).<br>Grid optimum: ${CS[bi].toFixed(3)} (${(m1/curve[bi]).toFixed(3)}× lower).${learned!==null?` Learned by Adam: <b>${learned.toFixed(3)}</b>.`:""}`;}
+ function learn(){if(timer){clearInterval(timer);timer=null;}let uu=4,m=0,v=0,step=0;learned=null;btn.disabled=true;
+  timer=setInterval(()=>{for(let k=0;k<10&&step<200;k++){step++;const c=1/(1+Math.exp(-uu)),gu=fq(c).gr*c*(1-c);m=0.9*m+0.1*gu;v=0.999*v+0.001*gu*gu;uu-=0.05*(m/(1-0.9**step))/(Math.sqrt(v/(1-0.999**step))+1e-12);}
+   const c=1/(1+Math.exp(-uu));sl.value=String(Math.round(Math.max(60,Math.min(200,c*200))));
+   if(step>=200){clearInterval(timer);timer=null;learned=c;btn.disabled=false;}draw();},40);}
+ sl.addEventListener("input",()=>{learned=null;draw();});segInit($("#wa-lwc-b"),"b",x=>{bits=+x;learned=null;sl.value="200";draw();});btn.addEventListener("click",learn);draw();
+})();
+
+/* ---------- Figure 5: Atom recipe, step by step ---------- */
+(function(){
+ const svg=$("#wa-atom-svg");if(!svg)return;const info=$("#wa-atom-info");
+ const ss=[];for(let j=0;j<C;j++){let a=0;for(let t=0;t<T;t++)a+=XL[t][j]**2;ss.push(a);}
+ const keep=[...Array(C).keys()].sort((a,b)=>ss[b]-ss[a]).slice(0,4).sort((a,b)=>a-b),rest=[...Array(C).keys()].filter(j=>!keep.includes(j));
+ const XK=XL.map(r=>keep.map(j=>r[j])),WK=keep.map(j=>W0[j]),XR=XL.map(r=>rest.map(j=>r[j])),WR=rest.map(j=>W0[j]);
+ const add=(A,Bm)=>A.map((r,i)=>r.map((v,j)=>v+Bm[i][j]));
+ function grpX(M,b,g){return M.map(r=>{const o=[];for(let k=0;k<r.length;k+=g)o.push(...quantM([r.slice(k,k+g)],"row",b)[0]);return o;});}
+ function grpW(M,b,g){const o=[];for(let k=0;k<M.length;k+=g)o.push(...quantM(M.slice(k,k+g),"col",b));return o;}
+ const P8=matmul(quantM(XK,"row",8),quantM(WK,"col",8));
+ const E=[VEC,relerr(matmul(quantM(XL,"row",4),quantM(W0,"col",4)),YL),relerr(add(P8,matmul(quantM(XR,"row",4),quantM(WR,"col",4))),YL),relerr(add(P8,matmul(grpX(XR,4,15),grpW(WR,4,15))),YL)];
+ const S=[["W8A8, vector-wise (reference)","All 64 channels in INT8, one scale per token and per output column (108.2)."],
+  ["W4A4, round to nearest","Same scales, 4 bits. Each token’s scale is set by its outliers (about 40 / 7 = 5.7 per step), so almost every normal value rounds to zero."],
+  ["+ 4 outlier channels in INT8, reordered","Channels "+keep.map(j=>j+1).join(", ")+" have the largest sum of squares. They move to the end (weights permuted offline) and stay in INT8; the other 60 use INT4 with their own per-token scale."],
+  ["+ groups of 15 for the INT4 part","The 60 normal channels are split into 4 groups of 15, each with its own scale per token and per output column (Atom uses groups of 128)."]];
+ function draw(i){
+  let g="";const x0=40,cw=8.5,y0=34,h=40;
+  g+=T_(x0,18,i===0?"channel layout of X (64 channels)":"channel layout of X after this step",'font-size="13" class="svgs"');
+  const order=i>=2?rest.concat(keep):[...Array(C).keys()];
+  order.forEach((j,p)=>{const is8=i===0||(i>=2&&keep.includes(j)),isO=keep.includes(j);g+=`<rect x="${x0+p*cw}" y="${y0}" width="${cw-1}" height="${h}" fill="${is8?"var(--k)":"var(--q)"}" fill-opacity="${isO?1:(is8?0.45:0.6)}"/>`;});
+  const boxes=i===3?[[0,15],[15,30],[30,45],[45,60],[60,64]]:i===2?[[0,60],[60,64]]:[[0,64]];
+  boxes.forEach(b=>{g+=`<rect x="${x0+b[0]*cw-1.5}" y="${y0-4}" width="${(b[1]-b[0])*cw+2}" height="${h+8}" fill="none" stroke="var(--ink)" stroke-width="1.5" rx="3"/>`;});
+  g+=T_(x0,y0+h+20,i===0?"INT8, one scale per token":i===1?"INT4, one scale per token":i===2?"INT4 (60 channels) | INT8 outliers (4)":"4 INT4 groups of 15 | INT8 outliers",'font-size="12" class="svgs"');
+  const bx=250,bw=320,top=1.0;
+  for(let k=0;k<4;k++){const y=136+k*38;g+=T_(bx-8,y+15,S[k][0].replace(/,.*$/,"").replace("(reference)",""),'text-anchor="end" font-size="12.5" class="svgt" '+(k===i?'font-weight="700"':""));
+   if(k<=i){const ww=Math.max(2,bw*Math.min(1,E[k]/top));g+=`<rect x="${bx}" y="${y}" width="${ww}" height="22" rx="4" fill="${k===0?"var(--muted)":"var(--q)"}" fill-opacity="${k===i?1:0.55}"/>`+T_(bx+ww+6,y+15,pct(E[k],1),'font-size="12" class="svgs"');}}
+  g+=T_(bx,128,"relative output error (0 to 100%)",'font-size="12" class="svgs"');
+  svg.innerHTML=g;
+  info.dataset.step=String(i);info.dataset.err=E[i].toFixed(4);info.dataset.all=E.map(e=>e.toFixed(4)).join(",");
+  info.innerHTML=`<b>${S[i][0]}</b>: output error <b>${pct(E[i])}</b>. ${S[i][1]}`;}
+ B.stepper({n:4,prev:$("#wa-atom-prev"),next:$("#wa-atom-next"),play:$("#wa-atom-play"),label:$("#wa-atom-lab"),ms:2600,onStep:draw});
+})();
+})();
+</script></body></html>
