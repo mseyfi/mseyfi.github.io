@@ -1,0 +1,554 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Vector search at scale · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../applications/index.html">LLM applications</a><span class="sep">/</span><span>Session 151</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="vector-search-at-scale">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="vector-search-at-scale" data-session="vector-search-at-scale" style="--tc:var(--t6)"><header class="chap-head"><div class="chap-kicker"><span class="num">151</span><span>Track 6: LLM applications · session 9 of 20</span></div><h1 class="chap-title">Vector search at scale</h1><p class="chap-sub">A retrieval system turns every document, image or video frame into a vector, and then must find the closest vectors to a query among millions or billions, in a few milliseconds. This session shows why exact search is too slow and too big at that scale, and how three ideas fix it: clusters (IVF), compression (PQ) and graphs (HNSW). We do the memory and speed math, measure the recall versus latency trade-off, and end with FAISS on CPU and GPU, filters and updates.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 11 and 150 (embeddings and semantic search), basic k-means</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Exact k-nearest-neighbor search: inner product, cosine and L2, why it is one matrix multiply, and what it costs in memory and time</li><li>Approximate nearest neighbor (ANN) search and its one quality number, recall@k</li><li>IVF: cluster the database with k-means, search only nprobe lists, and choose nlist from the cost formula</li><li>Product quantization: store each vector in a few bytes, and score it with table lookups (asymmetric distance computation)</li><li>HNSW: a layered small-world graph, greedy search from the top, and the parameters M, efConstruction and efSearch</li><li>Memory and speed math for 100 million vectors, and how to read a recall versus latency curve</li><li>FAISS index strings, CPU vs GPU, metadata filters, adds, deletes and re-training</li></ul></div></header><style>
+[data-session="vector-search-at-scale"] code,[data-session="vector-search-at-scale"] pre{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.vs-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.vs-grid input[type=range]{width:100%}
+.vs-grid output{font:600 14px var(--mono);min-width:70px;text-align:right}
+.vs-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.vs-leg span::before{content:"";display:inline-block;width:12px;height:12px;border-radius:50%;margin-right:6px;vertical-align:-1px;background:var(--c);border:2px solid var(--b,transparent);box-sizing:border-box}
+.vs-svg{display:block;width:100%;height:auto;touch-action:manipulation}
+#vs-ivf-svg{cursor:crosshair}
+.vs-tb td,.vs-tb th{font-variant-numeric:tabular-nums}
+.vs-tb td.ok{color:var(--ok);font-weight:700}.vs-tb td.no{color:var(--bad);font-weight:700}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../applications/text-embeddings-and-semantic-search.html">session 150</a> we turned text into vectors and found the best documents by comparing a query vector with every document vector. That works for ten thousand documents. A real company has one hundred million documents, a photo app has billions of images, and a video platform has one vector for every second of every video. Comparing with all of them for every query is too slow and needs too much memory.</p>
+<p><b>Vector search</b> is the job of finding the \(k\) stored vectors closest to a query vector. At scale we accept a small loss of quality to win a large gain in speed and memory: we find <em>most</em> of the true nearest neighbors, not always all of them. This is called <b>approximate nearest neighbor (ANN)</b> search. Every retrieval-augmented generation (RAG) system (<a href="../applications/rag-part-1-the-basic-pipeline.html">session 152</a>), every image and video search engine, every recommendation system and every duplicate detector has an ANN index inside it.</p>
+<p>Three ideas carry almost all of the field, and this session builds each one by hand:</p>
+<ul><li><b>IVF</b> (inverted file): cluster the vectors, and at query time look only inside the few clusters closest to the query.</li>
+<li><b>PQ</b> (product quantization): compress each vector from thousands of bytes to a few dozen bytes, and compute distances on the compressed codes.</li>
+<li><b>HNSW</b> (hierarchical navigable small world): link the vectors into a graph and walk the graph toward the query.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Design semantic search over 100 million documents” is a common system-design question. The interviewer wants numbers: how many GB is the raw index, does it fit on one machine, which index type, what recall at what latency, and how you handle filters and updates. Every one of these is computed below.</aside>
+<p>The tools are mature. FAISS, the library from Meta, implements all three ideas on CPU and GPU [Certain]. Vector databases (Milvus, Qdrant, Weaviate, pgvector, Elasticsearch and others) wrap the same algorithms with storage, filters and replication. [Likely] If you understand IVF, PQ and HNSW, you can read the settings of any of them.</p>
+
+<h2>Exact search and what it costs</h2>
+<p>We have \(N\) database vectors \(\mathbf{x}_1, \dots, \mathbf{x}_N \in \R^d\) and a query \(\mathbf{q} \in \R^d\). A <b>similarity</b> \(s(\mathbf{q}, \mathbf{x})\) says how close two vectors are (larger means closer). The exact <b>k-nearest-neighbor (kNN)</b> answer is the set of the \(k\) indices with the largest similarity:</p>
+<div class="eq">\[ \mathcal{N}_k(\mathbf{q}) = \operatorname{top-}k_{\,i \in \{1..N\}} \; s(\mathbf{q}, \mathbf{x}_i) \tag{151.1} \]</div>
+<p>Three similarities are common. <b>Inner product</b> \(\mathbf{q}^\top \mathbf{x}\). <b>Cosine</b> \(\mathbf{q}^\top \mathbf{x} / (\lVert \mathbf{q} \rVert \lVert \mathbf{x} \rVert)\). <b>Negative L2 distance</b> \(-\lVert \mathbf{q} - \mathbf{x} \rVert\). They are closely related:</p>
+<div class="eq">\[ \lVert \mathbf{q} - \mathbf{x} \rVert^2 = \lVert \mathbf{q} \rVert^2 + \lVert \mathbf{x} \rVert^2 - 2\, \mathbf{q}^\top \mathbf{x} \tag{151.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{q}, \mathbf{x}\)</dt><dd>the query vector and one database vector, both with \(d\) numbers</dd>
+<dt>\(\lVert \cdot \rVert\)</dt><dd>the length (L2 norm) of a vector</dd>
+<dt>\(\mathbf{q}^\top \mathbf{x}\)</dt><dd>the inner product: multiply the numbers pairwise and add them up</dd></dl>
+<p>If all vectors are <b>normalized</b> to length 1, then \(\lVert \mathbf{q} - \mathbf{x} \rVert^2 = 2 - 2\,\mathbf{q}^\top \mathbf{x}\), and the three similarities give the same ranking. That is why most text-embedding pipelines normalize once and then use inner product everywhere. [Certain]</p>
+<h3>Exact search is one matrix multiply</h3>
+<p>Put the database in a matrix \(X \in \R^{N \times d}\) and a batch of \(B\) queries in \(Q \in \R^{B \times d}\). All similarities at once are \(S = Q X^\top \in \R^{B \times N}\), followed by a top-\(k\) per row. On a GPU this is a large matrix multiply, the operation GPUs do best (<a href="../inference/linear-operators-gemm-gemv-and-flat-gemm.html">session 126</a>). FAISS calls this a <b>flat</b> index: no structure, just the raw vectors.</p>
+<p>The cost has two parts. The <b>work</b> is \(N d\) multiply-adds per query. The <b>memory traffic</b> is reading all \(N d\) numbers. For one query at a time, reading memory is the bottleneck, so the time is about</p>
+<div class="eq">\[ t_{\text{flat}} \approx \frac{N \cdot d \cdot b}{\text{BW}} \tag{151.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N, d\)</dt><dd>number of stored vectors and their dimension</dd>
+<dt>\(b\)</dt><dd>bytes per number: 4 for FP32, 2 for FP16, 1 for INT8</dd>
+<dt>\(\text{BW}\)</dt><dd>memory bandwidth in bytes per second</dd></dl>
+<p>A batch of \(B\) queries reads the database once and reuses it \(B\) times, so batching makes exact search compute-bound and much cheaper per query. This is the same reuse argument as for decode in LLM serving (<a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>).</p>
+<div class="worked"><div class="wt">Worked example: 100 million documents, exact search</div>
+<p>Take \(N = 10^8\) vectors with \(d = 768\) in FP32. Storage: \(10^8 \times 768 \times 4 = 307.2\) GB. In FP16 it is 153.6 GB. Neither fits in one 80 GB GPU.</p>
+<p>One query needs \(10^8 \times 768 = 7.68 \times 10^{10}\) multiply-adds. If it reads the FP32 data at the 3.35 TB/s of an H100 (if the data could fit there), formula (151.3) gives \(307.2 / 3350 \approx 0.092\) s, so 92 ms. On a CPU server, assume about 100 GB/s: 3.07 s per query. A search engine needs a few milliseconds. We need to look at fewer vectors, store fewer bytes per vector, or both.</p></div>
+<p>Exact search is still the right choice more often than people think. Below a few million vectors, or with large query batches on a GPU, a flat index is simple, has perfect recall, and is fast enough. [Likely] It is also always needed to compute the <b>ground truth</b> that you measure every ANN index against.</p>
+
+<h2>Approximate search and recall@k</h2>
+<p>An ANN index returns a set \(\mathcal{A}_k(\mathbf{q})\) of \(k\) results that may differ from the true set \(\mathcal{N}_k(\mathbf{q})\). Its quality is measured by <b>recall@k</b>: the fraction of the true \(k\) nearest neighbors that the index found, averaged over many test queries:</p>
+<div class="eq">\[ \text{recall@}k = \frac{1}{|\mathcal{Q}|} \sum_{\mathbf{q} \in \mathcal{Q}} \frac{|\mathcal{A}_k(\mathbf{q}) \cap \mathcal{N}_k(\mathbf{q})|}{k} \tag{151.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathcal{Q}\)</dt><dd>a set of test queries (a few hundred to a few thousand)</dd>
+<dt>\(\mathcal{A}_k, \mathcal{N}_k\)</dt><dd>the approximate answer and the exact answer, each with \(k\) items</dd>
+<dt>\(|\cdot \cap \cdot|\)</dt><dd>how many items the two sets share</dd></dl>
+<p>Note that this recall is about the <b>index</b>, not about relevance. In session 150, recall@k compared the results with human labels. Here we compare with what exact search would return. A perfect index (recall 1.0) still returns wrong documents if the embedding model is bad. In practice, an ANN recall of 0.9 to 0.95 costs little end-to-end quality, because a reranker or the LLM sees the top results anyway. [Likely] Measure it on your own data.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A library with ten million books. Exact search reads every spine. IVF is the floor plan: walk only to the two or three shelves whose topic is closest to your question. PQ is the card catalog: a tiny card per book, so the whole catalog fits on one desk. HNSW is asking people: each reader knows a few others with similar taste, and you keep asking whoever is closer to what you want.</aside>
+<p>Why not use a tree, like a k-d tree, to search exactly but fast? In 2 or 3 dimensions trees work very well. In hundreds of dimensions they do not: almost every branch can contain a near neighbor, so the tree ends up visiting most of the data. This is part of the <b>curse of dimensionality</b>. [Certain] ANN methods give up exactness and gain speed.</p>
+
+<h2>IVF: search only the nearby clusters</h2>
+<p><b>Training.</b> Run k-means on (a sample of) the database to get \(n_{\text{list}}\) <b>centroids</b> \(\mathbf{c}_1, \dots, \mathbf{c}_{n_\text{list}}\). The centroids are called the <b>coarse quantizer</b>. <b>Adding.</b> Put each vector into the list of its nearest centroid. Each list is an <b>inverted list</b> (the name comes from text search, where a word points to the list of documents that contain it). <b>Searching.</b> Compare the query with all centroids, open the \(n_{\text{probe}}\) closest lists, and search exactly inside them.</p>
+<p>The cost of one query in multiply-adds, if lists have about equal size:</p>
+<div class="eq">\[ C_{\text{IVF}} = n_{\text{list}} \cdot d \;+\; n_{\text{probe}} \cdot \frac{N}{n_{\text{list}}} \cdot d \tag{151.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n_{\text{list}}\)</dt><dd>number of clusters (inverted lists)</dd>
+<dt>\(n_{\text{probe}}\)</dt><dd>number of lists opened per query; the main speed/recall knob</dd>
+<dt>\(N / n_{\text{list}}\)</dt><dd>the average number of vectors in one list</dd></dl>
+<p>The first term grows with \(n_\text{list}\), the second shrinks. Setting the derivative to zero gives the best number of lists and the smallest cost:</p>
+<div class="eq">\[ n_{\text{list}}^{*} = \sqrt{n_{\text{probe}} \, N}, \qquad C_{\text{IVF}}^{*} = 2\, d \sqrt{n_{\text{probe}}\, N} \tag{151.6} \]</div>
+<p>So the cost grows with \(\sqrt{N}\), not with \(N\). The FAISS guidelines recommend \(n_\text{list}\) between \(4\sqrt{N}\) and \(16\sqrt{N}\), and between \(30\) and \(256\) training vectors per centroid for k-means. [Certain] (More lists than the formula's optimum is fine, because the centroid search can itself be made fast, for example with a small HNSW over the centroids.)</p>
+<p>The weakness of IVF is the <b>border problem</b>. The true nearest neighbor of a query near the edge of a cell often lives in the cell next door. With \(n_\text{probe} = 1\) it is missed. Try it in Figure 1: put the query on a border between two clusters.</p>
+<figure class="fig" id="vs-ivf"><div class="fig-body">
+<div class="vs-grid">
+<label for="vs-ivf-nl">\(n_\text{list}\) (clusters)</label><input type="range" id="vs-ivf-nl" min="2" max="24" step="1" value="12"><output id="vs-ivf-nlv"></output>
+<label for="vs-ivf-np">\(n_\text{probe}\) (lists opened)</label><input type="range" id="vs-ivf-np" min="1" max="12" step="1" value="1"><output id="vs-ivf-npv"></output></div>
+<svg id="vs-ivf-svg" class="vs-svg" viewBox="0 0 640 360" role="img" aria-label="600 points in two dimensions, clustered by k-means. The query and the opened clusters are highlighted."></svg>
+<div class="vs-leg"><span style="--c:var(--q)">query (click to move)</span><span style="--c:var(--k)">scanned point</span><span style="--c:var(--rule)">not scanned</span><span style="--c:transparent;--b:var(--ok)">true top-10, found</span><span style="--c:transparent;--b:var(--bad)">true top-10, missed</span></div>
+<div class="readout" id="vs-ivf-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> IVF on 600 points in two dimensions. Crosses are the k-means centroids; the shaded area is the set of cells that the query opens. Only the points in opened cells are compared with the query.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Click or tap anywhere to move the query. The readout counts the work (centroid comparisons plus scanned points) and the recall@10. Start with \(n_\text{probe} = 1\) and put the query near the line between two cells: red rings appear, because some true neighbors sit in the next cell. Raise \(n_\text{probe}\) to 2 or 3 and they turn green, at the price of scanning more points. Then change \(n_\text{list}\): more lists means smaller cells, so each opened cell is cheaper, but you need a larger \(n_\text{probe}\) for the same recall. Two dimensions are kind to IVF; in hundreds of dimensions most points are near some border, which is why real systems use \(n_\text{probe}\) of 16 to 128. [Likely]</p></details></figure>
+<div class="worked"><div class="wt">Worked example: IVF for 100 million vectors</div>
+<p>\(\sqrt{N} = 10{,}000\), so the guideline range is 40,000 to 160,000 lists. Take \(n_\text{list} = 65{,}536\) (\(= 2^{16}\), which is \(6.55\sqrt{N}\)). Training needs at least \(30 \times 65{,}536 \approx 2.0\) million sample vectors.</p>
+<p>With \(n_\text{probe} = 64\), a query scans \(64 / 65{,}536 = 0.098\%\) of the data, about 97,656 vectors, plus 65,536 centroid comparisons. Total work by formula (151.5): \(1.25 \times 10^8\) multiply-adds instead of \(7.68 \times 10^{10}\), about 613 times less. Memory does not shrink: IVF-Flat still stores every full vector (307.2 GB), plus an 8-byte id per vector.</p></div>
+<div class="algo"><div class="algo-h">Algorithm 1: IVF index (train, add, search)</div><ol>
+<li><b>train</b>(sample \(S\)): \(\{\mathbf{c}_j\} \leftarrow\) k-means\((S, n_\text{list})\) <span class="c">// 30 to 256 sample vectors per centroid</span></li>
+<li><b>add</b>(\(\mathbf{x}_i\), id \(i\)): \(j \leftarrow \argmax_j s(\mathbf{x}_i, \mathbf{c}_j)\); append \((i, \mathbf{x}_i)\) to list \(L_j\)</li>
+<li><b>search</b>(\(\mathbf{q}, k, n_\text{probe}\)):</li>
+<li class="i1">\(P \leftarrow\) the \(n_\text{probe}\) centroids with the largest \(s(\mathbf{q}, \mathbf{c}_j)\) <span class="c">// \(n_\text{list} \cdot d\) work</span></li>
+<li class="i1">\(H \leftarrow\) empty top-\(k\) heap</li>
+<li class="i1"><b>for</b> \(j \in P\), <b>for</b> \((i, \mathbf{x}) \in L_j\): push \((s(\mathbf{q}, \mathbf{x}), i)\) into \(H\), keep only the best \(k\)</li>
+<li class="i1"><b>return</b> the ids in \(H\), best first</li></ol></div>
+
+<h2>PQ: store each vector in a few bytes</h2>
+<p>IVF reduces the work but not the memory. <b>Product quantization</b> (Jégou et al., 2011) reduces the memory. The idea: split each vector into \(M\) short <b>sub-vectors</b> of \(d/M\) numbers. For each of the \(M\) positions, learn a small <b>codebook</b> of \(K\) centroids with k-means (usually \(K = 256\)). Replace each sub-vector by the index of its nearest centroid. With \(K = 256\), each index fits in one byte:</p>
+<div class="eq">\[ \mathbf{x} \approx \big[\, \mathbf{c}^{1}_{i_1},\; \mathbf{c}^{2}_{i_2},\; \dots,\; \mathbf{c}^{M}_{i_M} \,\big], \qquad \text{bytes per vector} = \frac{M \log_2 K}{8} \tag{151.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(M\)</dt><dd>number of sub-vectors (sub-spaces); each has \(d/M\) dimensions</dd>
+<dt>\(K\)</dt><dd>centroids per codebook; \(K = 256\) gives 8 bits per sub-vector</dd>
+<dt>\(\mathbf{c}^{m}_{j}\)</dt><dd>centroid number \(j\) of codebook \(m\)</dd>
+<dt>\(i_m\)</dt><dd>the stored code: which centroid is closest to sub-vector \(m\)</dd></dl>
+<p>Why “product”? The \(M\) codebooks together describe \(K^M\) different vectors (with \(M = 96\) and \(K = 256\), that is \(256^{96}\)), but we only store and train \(M \times K\) small centroids. A single k-means with that many centroids would be impossible.</p>
+<figure class="fig" id="vs-pq"><div class="fig-body"><div class="scroll-x">
+<svg id="vs-pq-svg" class="vs-svg" viewBox="0 0 660 330" style="min-width:560px" role="img" aria-label="A vector of 8 numbers is split into 4 sub-vectors of 2 numbers. Each sub-vector is replaced by the id of its nearest codebook centroid, giving 4 bytes. At query time a table of query-to-centroid scores is built, and the score of a stored vector is the sum of 4 table lookups."></svg></div>
+</div><figcaption><b>Figure 2.</b> Product quantization with \(d = 8\), \(M = 4\) sub-vectors and \(K = 256\) centroids per codebook. Top: encoding a database vector into 4 one-byte codes. Bottom: at search time, the query fills one table row per sub-space once; then every stored vector costs only \(M\) lookups and additions.</figcaption></figure>
+<h3>Distances on codes: asymmetric distance computation</h3>
+<p>At search time we do <b>not</b> decompress the database. The query stays exact (not quantized; this is why it is called <b>asymmetric</b>). For each sub-space \(m\), we compute the score of the query's sub-vector \(\mathbf{q}^m\) with all \(K\) centroids once, and store them in a table \(T_m\). Then the score of any stored vector is a sum of \(M\) table lookups:</p>
+<div class="eq">\[ \mathbf{q}^\top \mathbf{x} \;\approx\; \sum_{m=1}^{M} T_m[\, i_m \,], \qquad T_m[j] = (\mathbf{q}^{m})^\top \mathbf{c}^{m}_{j} \tag{151.8} \]</div>
+<p>Building the tables costs \(M \cdot K \cdot (d/M) = K d\) multiply-adds per query, the same as comparing with only \(K\) full vectors. After that, each database vector costs \(M\) lookups instead of \(d\) multiply-adds. For L2 distance it works the same way, with squared distances in the tables. FAISS also has a fast-scan variant with \(K = 16\) (4 bits), where the tables fit in CPU vector registers. [Certain]</p>
+<div class="worked"><div class="wt">Worked example: ADC by hand, then at scale</div>
+<p>Tiny case: \(d = 4\), \(M = 2\), \(K = 2\). Codebook 1 has \(\mathbf{c}^1_0 = (1, 1)\) and \(\mathbf{c}^1_1 = (0, 2)\). Codebook 2 has \(\mathbf{c}^2_0 = (0, 1)\) and \(\mathbf{c}^2_1 = (1, 0)\). The stored vector \(\mathbf{x} = (0.8, 1.3, 0.9, 0.2)\) is encoded as codes \((0, 1)\): \((0.8, 1.3)\) is closest to \((1, 1)\), and \((0.9, 0.2)\) is closest to \((1, 0)\).</p>
+<p>Query \(\mathbf{q} = (1, 0, 0.5, 2)\). Tables: \(T_1 = [\,1 \cdot 1 + 0 \cdot 1,\; 0\,] = [1, 0]\) and \(T_2 = [\,0.5 \cdot 0 + 2 \cdot 1,\; 0.5 \cdot 1 + 2 \cdot 0\,] = [2, 0.5]\). Score: \(T_1[0] + T_2[1] = 1 + 0.5 = 1.5\). The exact score is \(\mathbf{q}^\top\mathbf{x} = 0.8 + 0 + 0.45 + 0.4 = 1.65\). The error comes from the compression.</p>
+<p>At scale: \(d = 768\) with \(M = 96\) gives 96 bytes per vector instead of 3,072 (FP32), a factor of 32. For \(10^8\) vectors: 9.6 GB of codes plus 0.8 GB of 8-byte ids, small enough for one GPU or one server. The tables have \(96 \times 256 = 24{,}576\) entries and cost \(256 \times 768 = 196{,}608\) multiply-adds to build.</p></div>
+<h3>IVF-PQ and re-ranking</h3>
+<p>The standard billion-scale index combines both ideas: <b>IVF-PQ</b>. IVF chooses the lists. Inside the lists, vectors are stored as PQ codes. Usually PQ encodes the <b>residual</b> \(\mathbf{x} - \mathbf{c}_j\) (the vector minus its IVF centroid), which is smaller and easier to compress than \(\mathbf{x}\) itself. [Certain]</p>
+<p>PQ scores are approximate, so the top-10 by PQ score are often not the true top-10. The fix is <b>re-ranking</b> (FAISS calls it refine): take the top \(k' \gg k\) by PQ score (for example \(k' = 10k\)), load their full vectors (from RAM, SSD, or a cheaper FP16 copy), compute exact scores, and keep the best \(k\). Compression decides which candidates you keep; the exact vectors decide the final order.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: IVF-PQ search with re-ranking</div><ol>
+<li><b>input:</b> query \(\mathbf{q}\), \(k\), \(n_\text{probe}\), re-rank depth \(k'\)</li>
+<li>\(P \leftarrow\) the \(n_\text{probe}\) nearest IVF centroids to \(\mathbf{q}\)</li>
+<li><b>for</b> \(j \in P\):</li>
+<li class="i1">\(\mathbf{r} \leftarrow \mathbf{q} - \mathbf{c}_j\) <span class="c">// for L2 with residual encoding</span></li>
+<li class="i1">build tables \(T_m[\cdot]\) from \(\mathbf{r}\), \(m = 1..M\) <span class="c">// formula (151.8)</span></li>
+<li class="i1"><b>for</b> each code \((i, i_1..i_M)\) in list \(L_j\): score \(\leftarrow \sum_m T_m[i_m]\); keep the best \(k'\)</li>
+<li>load full vectors of the \(k'\) candidates; compute exact scores <span class="c">// re-rank</span></li>
+<li><b>return</b> the best \(k\) by exact score</li></ol></div>
+
+<h2>HNSW: walk a graph toward the query</h2>
+<p>IVF and PQ change <b>what</b> we compare. Graph methods change <b>the order</b>: start somewhere and repeatedly move to a neighbor that is closer to the query. If every vector is linked to its near neighbors, this greedy walk reaches the right area quickly. A graph where a few hops connect any two nodes, like a social network, is a <b>small world</b>.</p>
+<p><b>HNSW</b> (Malkov and Yashunin) adds layers, like a highway system. Every vector is in layer 0. A random few are also in layer 1, fewer in layer 2, and so on. Upper layers have few nodes and long links, so a search can cross the space in a few hops. Lower layers are dense and give the fine detail. When a vector is inserted, its top layer is drawn at random:</p>
+<div class="eq">\[ \ell = \big\lfloor -\ln(u) \cdot m_L \big\rfloor, \quad u \sim \mathcal{U}(0, 1), \quad m_L = \frac{1}{\ln M} \;\Rightarrow\; P(\ell \ge L) = M^{-L} \tag{151.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\ell\)</dt><dd>the highest layer this vector appears in</dd>
+<dt>\(M\)</dt><dd>the number of links each node keeps per layer (layer 0 usually keeps \(2M\))</dd>
+<dt>\(m_L\)</dt><dd>the level multiplier; \(1/\ln M\) is the choice suggested in the paper</dd>
+<dt>\(P(\ell \ge L)\)</dt><dd>with \(M = 32\): 1 node in 32 reaches layer 1, 1 in 1,024 reaches layer 2</dd></dl>
+<p>So each layer has about \(M\) times fewer nodes than the one below, and the number of layers grows like \(\log_M N\): about 5.3 for \(N = 10^8\) and \(M = 32\). Search cost grows roughly with \(\log N\) for well-behaved data. [Likely]</p>
+<p><b>Search</b>: start at the single entry node in the top layer. In each upper layer, move greedily to the closest neighbor until no neighbor is closer; then go down one layer and continue from there. In layer 0, run a <b>beam search</b> that keeps the best \(ef\) nodes found so far (\(ef\) = efSearch), not just one. A larger \(ef\) explores more and finds more true neighbors. <b>Insertion</b> is a search too: find the \(ef_\text{construction}\) nearest nodes of the new vector in each of its layers, and link it to \(M\) of them (with a heuristic that prefers neighbors in different directions). Step through a search in Figure 3.</p>
+<figure class="fig" id="vs-hnsw"><div class="fig-body">
+<div class="controls"><span class="seg" id="vs-hnsw-ef"><button type="button" data-v="1" aria-pressed="false">ef = 1</button><button type="button" data-v="4" aria-pressed="true">ef = 4</button><button type="button" data-v="10" aria-pressed="false">ef = 10</button></span><button type="button" class="btn" id="vs-hnsw-q">Next query</button></div>
+<div class="controls"><button type="button" class="btn" id="vs-hnsw-prev">Back</button><button type="button" class="btn primary" id="vs-hnsw-play">Play</button><button type="button" class="btn" id="vs-hnsw-next">Next</button><span id="vs-hnsw-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<svg id="vs-hnsw-svg" class="vs-svg" viewBox="0 0 640 360" role="img" aria-label="An HNSW graph of 90 points with three layers. A search path goes from the entry node in the top layer down to the query's neighborhood."></svg>
+<div class="vs-leg"><span style="--c:var(--q)">query</span><span style="--c:var(--k)">current node</span><span style="--c:var(--v)">in the result list (ef best)</span><span style="--c:var(--muted)">distance computed</span></div>
+<div class="readout" id="vs-hnsw-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> A small HNSW graph (90 points, \(M = 4\), layer 0 keeps up to 8 links). Larger dots live in higher layers. Only the edges of the current layer are drawn. The search moves from the top layer down; in layer 0 it keeps the best \(ef\) nodes.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Press Next. In the upper layers, the orange node jumps far with each hop: that is the highway. In layer 0 the steps become short. Count the gray dots at the end: they are all the vectors whose distance was computed, usually a small part of the 90. With \(ef = 1\) the search can stop in a <b>local minimum</b>: a node whose neighbors are all farther from the query, even though the true nearest neighbor is elsewhere. Press “Next query” until you see a miss with \(ef = 1\), then switch to \(ef = 4\) or \(10\): the beam explores more and finds it.</p></details></figure>
+<p>HNSW has very good recall at low latency, which made it the default index in many vector databases. [Likely] Its costs: the graph must live in RAM, with random memory access; links add memory; building is slow; and deleting nodes is hard, because removing a node can cut paths through the graph. FAISS gives the memory of an HNSW index with full vectors as</p>
+<div class="eq">\[ \text{bytes per vector} = 4d + 8M \tag{151.10} \]</div>
+<p>(\(4d\) for the FP32 vector, and \(2M\) links of 4 bytes each in layer 0; upper layers add little). [Certain] The FAISS guidelines suggest \(4 \le M \le 64\): larger \(M\) is more accurate but uses more memory. HNSW can also store compressed vectors (for example <code>HNSW32,PQ64</code> or <code>HNSW32,SQ8</code>) to save memory.</p>
+<p>Graphs also scale beyond RAM. <b>DiskANN</b> keeps a graph and full vectors on SSD and only PQ codes in RAM, so one machine can serve a billion vectors. <b>CAGRA</b> builds and searches graphs on GPUs. <b>ScaNN</b> from Google uses partitioning with an improved (anisotropic) quantization. [Certain]</p>
+
+<h2>Memory and speed math</h2>
+<p>Now put the pieces together. For any design, compute two numbers first: <b>bytes per vector</b> (does it fit?) and <b>bytes or vectors touched per query</b> (how fast can it be?). Figure 4 does this for each index family.</p>
+<figure class="fig" id="vs-calc"><div class="fig-body">
+<div class="vs-grid">
+<label for="vs-calc-n">Number of vectors \(N\)</label><input type="range" id="vs-calc-n" min="4" max="10" step="0.5" value="8"><output id="vs-calc-nv"></output>
+<label for="vs-calc-d">Dimension \(d\)</label><input type="range" id="vs-calc-d" min="0" max="5" step="1" value="2"><output id="vs-calc-dv"></output>
+<label for="vs-calc-m">PQ bytes per vector \(M\)</label><input type="range" id="vs-calc-m" min="8" max="192" step="8" value="96"><output id="vs-calc-mv"></output>
+<label for="vs-calc-p">IVF: share of lists probed</label><input type="range" id="vs-calc-p" min="0" max="4" step="1" value="1"><output id="vs-calc-pv"></output></div>
+<div class="tblw"><table class="tb vs-tb" id="vs-calc-tb"></table></div>
+<div class="readout" id="vs-calc-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Memory of each index family, and the bytes one query must read. Time is a lower bound for one query, from formula (151.3), at 3.35 TB/s (an H100's memory bandwidth) and at 100 GB/s (an assumed CPU server). IVF lists store an 8-byte id per vector; the centroid comparisons are not counted. HNSW uses formula (151.10) with \(M = 32\).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Start at the default: 100 million vectors of 768 numbers. Flat FP32 needs 307.2 GB, and a single query would read all of it. IVF-Flat reads only the probed share, but stores the same bytes. IVF-PQ shrinks both. HNSW stores the most, but it touches only the vectors along its search path (a few thousand, depending on efSearch), so its time per query is not a simple share; we show “path” instead. Move \(N\) to \(10^{10}\): even PQ needs about a terabyte, and you must split the index over many machines (sharding). [Likely]</p></details></figure>
+<p>Some rules of thumb follow from these numbers. [Likely]</p>
+<ul><li>Up to a few million vectors: Flat (exact) or HNSW. Memory is not a problem.</li>
+<li>Tens to hundreds of millions, enough RAM: HNSW with full or 8-bit vectors, or IVF with SQ8. Fast and high recall.</li>
+<li>Hundreds of millions to billions, or GPU: IVF-PQ with re-ranking, or an SSD graph like DiskANN.</li>
+<li>Always: reduce \(d\) if the embedding model allows it (Matryoshka embeddings, session 150), and use FP16 or INT8 where recall allows. Halving \(d\) halves every number in Figure 4. Scalar quantization (SQ8: one byte per number, with a per-dimension scale) is the same idea as weight quantization in LLMs (<a href="../inference/quantization-math-scale-zero-point-granularity-and.html">session 103</a>).</li></ul>
+
+<h2>The recall versus latency trade-off</h2>
+<p>Every ANN index has a knob that trades speed for recall: \(n_\text{probe}\) for IVF, \(ef\) (efSearch) for HNSW, the re-rank depth \(k'\) for PQ. Plotting recall@k against queries per second (or against work per query) for many knob values gives a curve. The best index for you is the one whose curve is highest at <b>your</b> latency budget. This is how the public ANN-Benchmarks compare libraries. [Certain]</p>
+<p>Figure 5 builds three indexes in your browser on 4,000 random vectors with 32 dimensions (clustered, normalized, like small embeddings) and measures recall@10 on 60 queries against exact search. The PQ here uses 8 sub-vectors with 16 centroids each, so each vector is stored in 4 bytes instead of 128 (32 times smaller).</p>
+<figure class="fig" id="vs-curve"><div class="fig-body">
+<div class="controls"><span class="seg" id="vs-curve-nl"><button type="button" data-v="16" aria-pressed="false">nlist 16</button><button type="button" data-v="32" aria-pressed="false">nlist 32</button><button type="button" data-v="64" aria-pressed="true">nlist 64</button><button type="button" data-v="128" aria-pressed="false">nlist 128</button></span></div>
+<div class="vs-grid"><label for="vs-curve-np">\(n_\text{probe}\)</label><input type="range" id="vs-curve-np" min="1" max="64" step="1" value="4"><output id="vs-curve-npv"></output></div>
+<div class="scroll-x"><svg id="vs-curve-svg" class="vs-svg" viewBox="0 0 640 300" style="min-width:420px" role="img" aria-label="Recall at 10 against the share of the database scanned, for IVF-Flat, IVF-PQ and IVF-PQ with re-ranking."></svg></div>
+<div class="vs-leg"><span style="--c:var(--k)">IVF-Flat (full vectors)</span><span style="--c:var(--v)">IVF-PQ, 4 bytes, no re-rank</span><span style="--c:var(--q)">IVF-PQ + exact re-rank of top 50</span></div>
+<div class="readout" id="vs-curve-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Recall@10 against the share of the database scanned (log scale), one point per value of \(n_\text{probe}\). Exact search is the top-right corner: recall 1 at 100% scanned. Everything is computed in your browser from a fixed random seed.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Move the \(n_\text{probe}\) slider and watch the marked points climb each curve. IVF-Flat reaches recall 1.0 when every list is opened: it is then exact search. IVF-PQ without re-ranking flattens out well below 1.0: compression errors reorder close candidates, and no amount of probing fixes that. Re-ranking the top 50 with exact vectors recovers a large part of the gap, for a small extra cost (50 exact scores per query); a deeper re-rank recovers more. Change nlist: with more lists, the same share scanned gives slightly better recall, because cells follow the data more closely, but you need a larger \(n_\text{probe}\).</p></details></figure>
+
+<h2>FAISS on CPU and GPU</h2>
+<p>FAISS describes an index with a short <b>factory string</b>. Read it from left to right: optional transform, then the coarse structure, then the vector encoding. [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Factory string</th><th>Meaning</th><th>Bytes per vector (\(d = 768\))</th></tr></thead><tbody>
+<tr><td><code>Flat</code></td><td>exact search, FP32 vectors</td><td>3,072</td></tr>
+<tr><td><code>HNSW32,Flat</code></td><td>HNSW graph, \(M = 32\), full vectors</td><td>3,072 + 256 = 3,328</td></tr>
+<tr><td><code>IVF65536,Flat</code></td><td>IVF with \(2^{16}\) lists, full vectors</td><td>3,072 + 8 (id)</td></tr>
+<tr><td><code>IVF65536,SQ8</code></td><td>IVF, one byte per number</td><td>768 + 8</td></tr>
+<tr><td><code>IVF65536,PQ96</code></td><td>IVF-PQ, 96 one-byte codes</td><td>96 + 8</td></tr>
+<tr><td><code>OPQ96,IVF65536,PQ96</code></td><td>first a learned rotation (OPQ) that makes PQ more accurate</td><td>96 + 8</td></tr>
+<tr><td><code>IVF65536,PQ96,RFlat</code></td><td>IVF-PQ, then exact re-rank (refine) with stored full vectors</td><td>96 + 8 + 3,072</td></tr></tbody></table></div>
+<p><b>CPU vs GPU.</b> On GPU, FAISS supports Flat, IVF-Flat, IVF-SQ and IVF-PQ, and a fast k-selection (top-\(k\)) kernel, which was a key part of the original FAISS paper. HNSW is <b>not</b> supported on GPU; the FAISS guidelines list it as CPU-only. [Certain] Newer FAISS versions can use NVIDIA cuVS, which adds the CAGRA graph index on GPU. [Likely] GPUs shine for large query batches and for building indexes quickly (k-means on millions of vectors). For single queries at low traffic, a CPU HNSW is often cheaper. GPU memory (80 GB on an H100) limits the index size unless you shard over GPUs or use compression.</p>
+<p>The PyTorch code below builds exact search, IVF and PQ from scratch on 20,000 random 64-dimensional vectors, and measures recall@10 on 200 queries. It is deterministic; the printed numbers are from a real run (torch 2.8, CPU).</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+N, d, nq, k = 20000, 64, 200, 10
+
+<span class="cm"># synthetic "embeddings": 200 topics plus noise, L2-normalized (cosine = inner product)</span>
+topics = torch.randn(200, d)
+<span class="kw2">def</span> sample(n):
+    x = topics[torch.randint(0, 200, (n,))] + 1.5 * torch.randn(n, d)
+    <span class="kw2">return</span> torch.nn.functional.normalize(x, dim=1)
+xb, xq = sample(N), sample(nq)
+
+<span class="cm"># 1) exact search: one matrix multiply plus top-k, formula (151.1)</span>
+<span class="kw2">def</span> exact(q, x, k):
+    <span class="kw2">return</span> (q @ x.T).topk(k, dim=1).indices
+gt = exact(xq, xb, k)
+
+<span class="kw2">def</span> recall_at_k(found, gt):                    <span class="cm"># formula (151.4)</span>
+    <span class="kw2">return</span> sum(len(set(f.tolist()) &amp; set(g.tolist())) <span class="kw2">for</span> f, g <span class="kw2">in</span> zip(found, gt)) / gt.numel()
+
+<span class="cm"># 2) k-means (used by IVF and by PQ)</span>
+<span class="kw2">def</span> kmeans(x, K, iters=20, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    C = x[torch.randperm(len(x), generator=g)[:K]].clone()
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(iters):
+        a = torch.cdist(x, C).argmin(dim=1)
+        <span class="kw2">for</span> c <span class="kw2">in</span> range(K):
+            m = a == c
+            <span class="kw2">if</span> m.any():
+                C[c] = x[m].mean(0)
+    <span class="kw2">return</span> C, torch.cdist(x, C).argmin(dim=1)
+
+<span class="cm"># 3) IVF: cluster the database, search only the nprobe closest lists</span>
+nlist = 256
+C, assign = kmeans(xb, nlist)
+lists = [torch.nonzero(assign == c).squeeze(1) <span class="kw2">for</span> c <span class="kw2">in</span> range(nlist)]
+<span class="kw2">def</span> ivf_search(q, nprobe):
+    out, scanned = [], 0
+    <span class="kw2">for</span> qi <span class="kw2">in</span> q:
+        probe = (C @ qi).topk(nprobe).indices
+        cand = torch.cat([lists[c] <span class="kw2">for</span> c <span class="kw2">in</span> probe.tolist()])
+        scanned += len(cand)
+        out.append(cand[(xb[cand] @ qi).topk(min(k, len(cand))).indices])
+    <span class="kw2">return</span> out, scanned / (len(q) * N)
+<span class="kw2">for</span> nprobe <span class="kw2">in</span> [1, 4, 16, 64]:
+    found, frac = ivf_search(xq, nprobe)
+    print(f"IVF nprobe={nprobe:3d}  recall@10={recall_at_k(found, gt):.3f}  scanned={100*frac:.1f}%")
+
+<span class="cm"># 4) PQ: M sub-vectors, 256 centroids each -> M bytes per vector, formula (151.7)</span>
+M, ks = 8, 256
+ds = d // M
+books, codes = [], torch.empty(N, M, dtype=torch.uint8)
+<span class="kw2">for</span> m <span class="kw2">in</span> range(M):
+    Cm, am = kmeans(xb[:, m*ds:(m+1)*ds], ks, iters=15, seed=m)
+    books.append(Cm); codes[:, m] = am.to(torch.uint8)
+books = torch.stack(books)                       <span class="cm"># (M, 256, ds)</span>
+<span class="kw2">def</span> pq_search(q, kk):                          <span class="cm"># ADC, formula (151.8)</span>
+    T = torch.einsum(<span class="st">'qmd,mkd->qmk'</span>, q.view(-1, M, ds), books)   <span class="cm"># tables (nq, M, 256)</span>
+    cidx = codes.long()                                          <span class="cm"># (N, M)</span>
+    scores = sum(T[:, m, cidx[:, m]] <span class="kw2">for</span> m <span class="kw2">in</span> range(M))          <span class="cm"># M lookups per vector</span>
+    <span class="kw2">return</span> scores.topk(kk, dim=1).indices
+pq_top = pq_search(xq, k)
+print(f"PQ  M={M} ({M} bytes/vector vs {4*d})  recall@10={recall_at_k(pq_top, gt):.3f}")
+cand = pq_search(xq, 100)                        <span class="cm"># re-rank 100 PQ candidates with exact vectors</span>
+rr = torch.stack([c[(xb[c] @ qi).topk(k).indices] <span class="kw2">for</span> c, qi <span class="kw2">in</span> zip(cand, xq)])
+print(f"PQ + exact re-rank of top 100  recall@10={recall_at_k(rr, gt):.3f}")
+
+<span class="cm"># Output of this run:</span>
+<span class="cm"># IVF nprobe=  1  recall@10=0.671  scanned=0.4%</span>
+<span class="cm"># IVF nprobe=  4  recall@10=0.814  scanned=1.6%</span>
+<span class="cm"># IVF nprobe= 16  recall@10=0.914  scanned=6.4%</span>
+<span class="cm"># IVF nprobe= 64  recall@10=0.984  scanned=25.2%</span>
+<span class="cm"># PQ  M=8 (8 bytes/vector vs 256)  recall@10=0.376</span>
+<span class="cm"># PQ + exact re-rank of top 100  recall@10=0.848</span></pre>
+<p>Read the output like an engineer. IVF reaches 0.914 recall while scanning 6.4% of the data. PQ with 8 bytes (32 times smaller) alone finds only 0.376 of the true top-10, but re-ranking 100 PQ candidates with the exact vectors lifts it to 0.848. The same experiment with the FAISS library (faiss-cpu 1.13, run in a separate process from torch, on the same kind of data drawn with NumPy):</p>
+<pre class="code"><span class="kw2">import</span> faiss, numpy <span class="kw2">as</span> np
+N, d, nq, k = 20000, 64, 200, 10
+rng = np.random.default_rng(0)
+topics = rng.standard_normal((200, d)).astype(<span class="st">"float32"</span>)
+<span class="kw2">def</span> sample(n):
+    x = topics[rng.integers(0, 200, n)] + 1.5 * rng.standard_normal((n, d)).astype(<span class="st">"float32"</span>)
+    <span class="kw2">return</span> x / np.linalg.norm(x, axis=1, keepdims=True)
+xb, xq = sample(N), sample(nq)
+faiss.omp_set_num_threads(1)                     <span class="cm"># one thread: same result every run</span>
+
+flat = faiss.IndexFlatIP(d); flat.add(xb)        <span class="cm"># exact search = ground truth</span>
+_, gt = flat.search(xq, k)
+<span class="kw2">def</span> recall(I): <span class="kw2">return</span> np.mean([len(set(a) &amp; set(b)) / k <span class="kw2">for</span> a, b <span class="kw2">in</span> zip(I, gt)])
+
+ivf = faiss.index_factory(d, <span class="st">"IVF256,Flat"</span>, faiss.METRIC_INNER_PRODUCT)
+ivf.train(xb); ivf.add(xb)
+<span class="kw2">for</span> p <span class="kw2">in</span> [1, 4, 16, 64]:
+    ivf.nprobe = p; print(<span class="st">"IVF256,Flat nprobe"</span>, p, round(recall(ivf.search(xq, k)[1]), 3))
+
+hnsw = faiss.index_factory(d, <span class="st">"HNSW32,Flat"</span>, faiss.METRIC_INNER_PRODUCT)
+hnsw.hnsw.efConstruction = 40; hnsw.add(xb)      <span class="cm"># HNSW needs no training</span>
+<span class="kw2">for</span> ef <span class="kw2">in</span> [10, 20, 40, 80]:
+    hnsw.hnsw.efSearch = ef; print(<span class="st">"HNSW32 efSearch"</span>, ef, round(recall(hnsw.search(xq, k)[1]), 3))
+
+ivfpq = faiss.index_factory(d, <span class="st">"IVF256,PQ8"</span>, faiss.METRIC_INNER_PRODUCT)
+ivfpq.train(xb); ivfpq.add(xb); ivfpq.nprobe = 16
+print(<span class="st">"IVF256,PQ8 nprobe 16"</span>, round(recall(ivfpq.search(xq, k)[1]), 3))
+ivfpqr = faiss.index_factory(d, <span class="st">"IVF256,PQ8,RFlat"</span>, faiss.METRIC_INNER_PRODUCT)
+ivfpqr.train(xb); ivfpqr.add(xb)
+faiss.extract_index_ivf(ivfpqr).nprobe = 16
+params = faiss.IndexRefineSearchParameters(k_factor=10)   <span class="cm"># re-rank top 10*k</span>
+print(<span class="st">"IVF256,PQ8,RFlat k_factor 10"</span>, round(recall(ivfpqr.search(xq, k, params=params)[1]), 3))
+
+<span class="cm"># Output of this run:</span>
+<span class="cm"># IVF256,Flat nprobe 1 0.647      IVF256,Flat nprobe 4 0.803</span>
+<span class="cm"># IVF256,Flat nprobe 16 0.904     IVF256,Flat nprobe 64 0.985</span>
+<span class="cm"># HNSW32 efSearch 10 0.812        HNSW32 efSearch 20 0.888</span>
+<span class="cm"># HNSW32 efSearch 40 0.94         HNSW32 efSearch 80 0.973</span>
+<span class="cm"># IVF256,PQ8 nprobe 16 0.44       IVF256,PQ8,RFlat k_factor 10 0.879</span></pre>
+<p>The library numbers agree with our hand-written version. Note that this tiny dataset uses \(n_\text{list} = 256\), above the \(\sqrt{N} \approx 141\) of formula (151.6) and below the \(4\sqrt{N}\) of the guideline; for a demo this does not matter. On macOS we saw importing torch and faiss in the same Python process crash (two copies of the OpenMP runtime); run them in separate processes if that happens.</p>
+
+<h2>Filters and updates</h2>
+<h3>Metadata filters</h3>
+<p>Real queries come with conditions: “only documents this user may read”, “only videos from 2025”, “only products in stock”. The fraction of the database that passes the filter is the <b>selectivity</b> \(s\). There are three ways to combine a filter with ANN search:</p>
+<ul><li><b>Post-filtering</b>: run ANN search for more results, then drop those that fail the filter. To still get \(k\) results you must ask for about</li></ul>
+<div class="eq">\[ k' \approx \frac{k}{s} \tag{151.11} \]</div>
+<p>results. With \(k = 10\) and a filter that keeps 1% of the data, that is 1,000 results, and for a filter that keeps 0.01%, it is 100,000. Post-filtering is simple but breaks down for strict filters.</p>
+<ul><li><b>Pre-filtering</b>: compute the set of allowed ids first, then search only among them. For very strict filters, just do exact search over the allowed vectors; it is small. FAISS supports this with an <code>IDSelector</code> passed in the search parameters, which skips vectors that are not allowed. [Certain]</li>
+<li><b>Filter during the search</b>: the graph walk or list scan skips disallowed vectors but still uses them for navigation. This is what most vector databases do. With HNSW it has a known failure: if few nodes pass the filter, the allowed nodes are poorly connected, and the search gets stuck. Databases detect strict filters and switch to exact search, or add extra links (Filtered-DiskANN builds the graph with labels in mind). [Likely]</li></ul>
+<p>A practical alternative for a few big categories (for example, one per language or per customer) is <b>partitioning</b>: one index per category. Then the filter costs nothing.</p>
+<h3>Adds, deletes and drift</h3>
+<p><b>Adds.</b> IVF and PQ indexes accept new vectors without retraining: each new vector goes into its nearest list. HNSW inserts with a search, which is slower but online. <b>Deletes.</b> IVF can remove an id from its list. HNSW usually marks a deleted node with a <b>tombstone</b> (it stays in the graph for navigation but is never returned), and rebuilds the graph when too many tombstones collect. [Likely] <b>Drift.</b> The IVF centroids and PQ codebooks were trained on old data. If new data looks different (a new product line, a new language), lists become unbalanced and recall drops. Monitor list sizes and recall on fresh queries, and retrain when needed. <b>Model change.</b> If you change the embedding model, every vector must be re-embedded and the whole index rebuilt: vectors from two models are not comparable. Plan for it; it is often the largest cost of a model upgrade.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Many production systems keep a small exact “fresh” index for recent additions and merge its results with the large ANN index, then rebuild the large index in the background on a schedule. [Likely]</aside>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>What is indexed</th><th>Typical index choice</th></tr></thead><tbody>
+<tr><td>RAG over company documents (<a href="../applications/rag-part-1-the-basic-pipeline.html">session 152</a>)</td><td>one vector per text chunk, millions of chunks</td><td>HNSW or IVF with SQ8 in a vector database, with access-control filters</td></tr>
+<tr><td>Web-scale or e-commerce search</td><td>billions of documents or products</td><td>IVF-PQ or a disk graph (DiskANN), sharded over many machines, then a reranker</td></tr>
+<tr><td>Image search and near-duplicate photos</td><td>one CLIP-style vector per image</td><td>IVF-PQ on GPU for batch de-duplication; HNSW for online search</td></tr>
+<tr><td>Text-to-video retrieval (<a href="../video/index.html#row-text-to-video-retrieval" title="Text-to-video retrieval (planned)">session 208</a>)</td><td>one vector per clip or per second of video: 3,600 per hour at 1 frame per second</td><td>IVF-PQ for large archives; then group frame hits into clips</td></tr>
+<tr><td>Video fingerprinting and copy detection (<a href="../video/index.html#row-video-fingerprinting-and-near-duplicate-detection" title="Video fingerprinting and near-duplicate detection (planned)">session 209</a>)</td><td>compact per-frame descriptors of a huge reference library</td><td>PQ codes (memory-bound), exact re-rank and a temporal check of matched frames</td></tr>
+<tr><td>Key-moment detection and Video-RAG (<a href="../video/index.html#row-video-question-answering-and-video-rag" title="Video question answering and Video-RAG (planned)">session 210</a>)</td><td>vectors of frames, captions and transcript pieces</td><td>HNSW with a filter on video id and time range</td></tr>
+<tr><td>Recommendation (candidate generation)</td><td>item vectors from a two-tower model</td><td>IVF or ScaNN-style partitioning, very high query rates</td></tr>
+<tr><td>Data pipelines for LLM pretraining</td><td>embeddings of web documents</td><td>GPU k-means and IVF to find and remove near-duplicates at scale (<a href="../pretraining/pretraining-data-from-web-crawl-to-training.html">session 34</a>)</td></tr></tbody></table></div>
+<p>A video example in numbers: 10,000 hours of video at one 512-dimensional FP16 vector per second is 36 million vectors and 36.9 GB. That fits in RAM as HNSW or on one GPU as IVF-PQ, but not as Flat FP32 on one GPU.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Mixing metrics.</b> Building an L2 index on vectors that the model trained for cosine, without normalizing. Normalize both database and queries, then use inner product, or the ranking is wrong.</li>
+<li><b>Measuring recall against the wrong thing.</b> Index recall must be measured against exact search on the same vectors. Do not report human-label recall as if it measured the index, and do not skip the exact baseline.</li>
+<li><b>Training IVF or PQ on too little or unrepresentative data.</b> Use 30 to 256 vectors per centroid, drawn from the same distribution as the data (not the first million rows, which may be sorted by date or source).</li>
+<li><b>Leaving \(n_\text{probe}\) or efSearch at the default.</b> FAISS's default \(n_\text{probe}\) is 1, which often gives poor recall. [Certain] Always sweep the knob and pick the point on the curve that meets your recall target.</li>
+<li><b>Using PQ scores as the final ranking.</b> Compression reorders close candidates. Re-rank the top few hundred with full or FP16 vectors.</li>
+<li><b>Post-filtering with strict filters.</b> With 0.1% selectivity, a top-100 ANN search returns almost nothing that passes. Detect strict filters and pre-filter or switch to exact search.</li>
+<li><b>Forgetting HNSW memory and build time.</b> The links add \(8M\) bytes per vector, the graph needs RAM, and building 100 million nodes takes hours. [Likely] Deletes need tombstones and rebuilds.</li>
+<li><b>Mixing embeddings from two model versions in one index.</b> Distances between them are meaningless. Re-embed everything when the model changes.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is the difference between exact kNN and ANN search, and how do you measure an ANN index?<span class="lvl">basic</span></summary><div class="ans">Exact kNN compares the query with every vector and returns the true top-\(k\); it costs \(N d\) per query. ANN uses a structure (clusters, compressed codes, or a graph) to look at far fewer vectors and returns most, not all, of the true top-\(k\). Measure it with recall@k against exact search on a set of held-out queries (formula 151.4), together with latency or queries per second, and memory. Report a curve over the speed knob, not one point.</div></details>
+<details class="qa"><summary>Why do cosine, inner product and L2 give the same ranking for normalized vectors?<span class="lvl">basic</span></summary><div class="ans">\(\lVert \mathbf{q} - \mathbf{x} \rVert^2 = \lVert\mathbf{q}\rVert^2 + \lVert\mathbf{x}\rVert^2 - 2\mathbf{q}^\top\mathbf{x}\). With unit vectors this is \(2 - 2\mathbf{q}^\top\mathbf{x}\), a decreasing function of the inner product, and cosine equals the inner product. So all three orderings are identical. Without normalization, inner product favors long vectors, and the choice matters.</div></details>
+<details class="qa"><summary>Explain IVF. How do you choose nlist and nprobe?<span class="lvl">core</span></summary><div class="ans">Train k-means with \(n_\text{list}\) centroids; assign each vector to the list of its nearest centroid; at query time compare with all centroids and scan the \(n_\text{probe}\) nearest lists. Cost is \(n_\text{list} d + n_\text{probe} (N/n_\text{list}) d\), minimized at \(n_\text{list} = \sqrt{n_\text{probe} N}\), so it grows like \(\sqrt N\). FAISS suggests \(4\sqrt N\) to \(16\sqrt N\) lists and 30 to 256 training points per centroid. Then sweep \(n_\text{probe}\) on held-out queries and pick the smallest value that meets the recall target, because queries near cell borders need several lists.</div></details>
+<details class="qa"><summary>How does product quantization compress vectors, and how are distances computed without decompressing?<span class="lvl">core</span></summary><div class="ans">Split each \(d\)-dimensional vector into \(M\) sub-vectors, learn a k-means codebook of \(K\) (often 256) centroids for each sub-space, and store the centroid index of each sub-vector: \(M\) bytes per vector. At query time, compute a table of the query sub-vector's score with each centroid (\(K d\) work in total), then the score of a stored vector is the sum of \(M\) lookups (asymmetric distance computation; the query stays exact). For 768 dimensions and \(M = 96\), that is 96 bytes instead of 3,072, 32 times smaller.</div></details>
+<details class="qa"><summary>Explain HNSW search. What do M, efConstruction and efSearch control?<span class="lvl">core</span></summary><div class="ans">HNSW is a stack of proximity graphs; each node's top layer is random with \(P(\ell \ge L) = M^{-L}\), so upper layers are sparse with long links. Search starts at the entry node in the top layer, moves greedily to closer neighbors, drops a layer when stuck, and in layer 0 runs a beam search keeping the best \(ef\) candidates. \(M\) is the number of links per node (memory and accuracy), efConstruction is the beam width during insertion (build time and graph quality), efSearch is the beam width at query time (the recall/latency knob). Memory with FP32 vectors is about \(4d + 8M\) bytes per vector.</div></details>
+<details class="qa"><summary>You have 1 billion 768-dimensional vectors. Size the index.<span class="lvl">advanced</span></summary><div class="ans">Flat FP32 is \(10^9 \times 3{,}072\) bytes = 3.07 TB: too big for one machine's RAM, and a query would read it all. HNSW with full vectors is even larger. IVF-PQ with \(M = 64\) is 64 GB of codes plus 8 GB of ids, which fits on one large server or a few GPUs. Use \(n_\text{list}\) around \(4\sqrt N\) to \(16\sqrt N\) (126k to 506k; for example \(2^{18}\)), train on a few tens of millions of samples, sweep \(n_\text{probe}\), and re-rank the top few hundred with FP16 vectors stored on SSD. Alternatively DiskANN: graph and vectors on SSD, PQ codes in RAM. Shard over machines for throughput and replicate for availability, merge per-shard top-\(k\).</div></details>
+<details class="qa"><summary>Why does PQ-only search have a recall ceiling, and how do you remove it?<span class="lvl">core</span></summary><div class="ans">PQ scores have errors that are often larger than the score gaps between close neighbors, so the order among the top candidates is partly random. Probing more lists adds candidates but does not fix their order, so recall flattens below 1.0 (Figure 5). Re-ranking takes the top \(k'\) (for example \(10k\) to \(100k\)) by PQ score and rescores them with exact or FP16 vectors. Other help: more bytes per vector, encoding IVF residuals, and a rotation such as OPQ that spreads information evenly across sub-spaces.</div></details>
+<details class="qa"><summary>How do you combine ANN search with a metadata filter?<span class="lvl">advanced</span></summary><div class="ans">Post-filter (search for \(k/s\) results and drop failures; fine for loose filters), pre-filter (build the allowed id set and search only it; for strict filters, exact search on the allowed set is cheap), or filter during the search (skip disallowed nodes while still navigating through them). HNSW with strict filters can get stuck because allowed nodes are poorly connected; systems switch to exact search below a selectivity threshold, or partition the index by the filter field when there are a few large categories.</div></details>
+<details class="qa"><summary>When would you use FAISS on GPU instead of CPU?<span class="lvl">advanced</span></summary><div class="ans">GPU wins for large query batches (throughput), for exact or IVF search over a few hundred million compressed vectors that fit in GPU memory, and for fast index building (k-means, encoding) and offline jobs like de-duplication. FAISS GPU supports Flat, IVF-Flat, IVF-SQ and IVF-PQ but not HNSW; newer versions add CAGRA through cuVS. CPU HNSW is often better for low-traffic, low-latency single queries, for very large indexes in RAM, and when you need online inserts and deletes.</div></details>
+<details class="qa"><summary>How do you handle updates and deletes in a vector index?<span class="lvl">core</span></summary><div class="ans">IVF and PQ accept adds without retraining, and IVF can remove ids from lists. HNSW inserts online with a search, and deletes are tombstones until a rebuild. Over time, data drift makes centroids and codebooks stale, so monitor list balance and recall on fresh queries and retrain on a schedule. A common pattern is a small exact index for fresh data, merged with the main index, plus periodic full rebuilds. A new embedding model always means re-embedding and rebuilding everything.</div></details>
+<details class="qa"><summary>Why do trees like k-d trees not work for 768-dimensional embeddings?<span class="lvl">basic</span></summary><div class="ans">A k-d tree splits on one coordinate at a time and prunes branches that cannot contain a closer point. In high dimensions, distances concentrate (the nearest and the farthest points are at similar distances), so almost no branch can be pruned and the search visits most of the data, no better than exact search. ANN methods accept approximate answers instead.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>How many GB does a flat FP16 index of 50 million 1,024-dimensional vectors need? Does it fit on one 80 GB GPU?</li>
+<li>For \(N = 10^6\) and \(n_\text{probe} = 16\), what \(n_\text{list}\) minimizes formula (151.5), and what is the cost relative to exact search?</li>
+<li>A 1,536-dimensional FP32 embedding is compressed with PQ, \(M = 192\), \(K = 256\). Bytes per vector and compression factor?</li>
+<li>HNSW with \(M = 16\) on \(10^7\) vectors: about how many nodes are in layer 1 and in layer 2?</li>
+<li>Your filter keeps 0.5% of the data, and you need \(k = 20\) results. How many results must a post-filtering search ask for?</li>
+<li>In Figure 1, set \(n_\text{list} = 12\). Find a query position where \(n_\text{probe} = 1\) gives recall below 0.5. What \(n_\text{probe}\) brings it to 1.0?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(5 \times 10^7 \times 1{,}024 \times 2 = 102.4\) GB: no, it does not fit (shard over 2 GPUs, use SQ8 at 51.2 GB, or PQ). 2. \(n_\text{list}^* = \sqrt{16 \times 10^6} = 4{,}000\); cost \(2d\sqrt{1.6 \times 10^7} = 8{,}000\,d\) versus \(10^6 d\) for exact search: 125 times less work. 3. 192 bytes instead of \(1{,}536 \times 4 = 6{,}144\): a factor of 32. 4. Layer 1: \(10^7 / 16 = 625{,}000\); layer 2: \(10^7 / 256 \approx 39{,}000\). 5. \(k' = 20 / 0.005 = 4{,}000\). 6. Any point near a cell border works; usually \(n_\text{probe} = 2\) or 3 brings recall to 1.0, because the missed neighbors sit in the adjacent cell.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Exact search is one matrix multiply (151.1) with perfect recall, but at 100 million 768-dimensional vectors it needs 307.2 GB and reads all of it per query (151.3). Normalize and use inner product (151.2).</li>
+<li>ANN quality is recall@k against exact search (151.4); always report it as a curve over the speed knob, with memory.</li>
+<li>IVF scans only \(n_\text{probe}\) lists; cost grows like \(\sqrt{N}\) (151.5, 151.6). It cuts work, not memory.</li>
+<li>PQ stores \(M\) bytes per vector (151.7) and scores with table lookups (151.8). It cuts memory 10 to 100 times, but needs re-ranking for high recall.</li>
+<li>HNSW walks a layered graph (151.9); it gives high recall at low latency, costs \(4d + 8M\) bytes per vector (151.10), and is CPU-only in FAISS.</li>
+<li>Filters: post-filter needs \(k/s\) results (151.11); strict filters need pre-filtering or exact search. Plan for adds, deletes, drift and full rebuilds.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ C_{\text{IVF}} = n_\text{list} d + n_\text{probe} \frac{N}{n_\text{list}} d, \quad n_\text{list}^* = \sqrt{n_\text{probe} N} \]</div>
+<div class="eq">\[ \mathbf{q}^\top\mathbf{x} \approx \sum_{m=1}^{M} T_m[i_m], \quad \text{PQ bytes} = \frac{M \log_2 K}{8}, \quad \text{HNSW bytes} = 4d + 8M \]</div>
+<h2 class="plain" id="vector-search-at-scale-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Malkov &amp; Yashunin (2016). <a href="https://arxiv.org/abs/1603.09320" target="_blank" rel="noopener">Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs</a></li><li>Johnson et al. (2017). <a href="https://arxiv.org/abs/1702.08734" target="_blank" rel="noopener">Billion-scale similarity search with GPUs</a></li><li>Jégou et al. (2011). <a href="https://scholar.google.com/scholar?q=&amp;quot;Product Quantization for Nearest Neighbor Search&amp;quot;" target="_blank" rel="noopener">Product Quantization for Nearest Neighbor Search</a></li><li>Meta (code). <a href="https://github.com/facebookresearch/faiss" target="_blank" rel="noopener">FAISS library</a></li><li>Malkov &amp; Yashunin (2016). <a href="https://arxiv.org/abs/1603.09320" target="_blank" rel="noopener">Efficient and robust approximate nearest neighbor search using Hierarchical Navigable Small World graphs</a></li><li>Johnson et al. (2017). <a href="https://arxiv.org/abs/1702.08734" target="_blank" rel="noopener">Billion-scale similarity search with GPUs</a></li><li>Jégou et al. (2011). <a href="https://scholar.google.com/scholar?q=&amp;quot;Product Quantization for Nearest Neighbor Search&amp;quot;" target="_blank" rel="noopener">Product Quantization for Nearest Neighbor Search</a></li><li>Meta (code). <a href="https://github.com/facebookresearch/faiss" target="_blank" rel="noopener">FAISS library</a></li><li>Douze et al. (2024). <a href="https://arxiv.org/abs/2401.08281" target="_blank" rel="noopener">The Faiss library</a></li><li>Guo et al. (2019). <a href="https://arxiv.org/abs/1908.10396" target="_blank" rel="noopener">Accelerating Large-Scale Inference with Anisotropic Vector Quantization</a></li><li>Subramanya et al. (2019). <a href="https://scholar.google.com/scholar?q=&amp;quot;DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node&amp;quot;" target="_blank" rel="noopener">DiskANN: Fast Accurate Billion-point Nearest Neighbor Search on a Single Node</a></li><li>Ootomo et al. (2023). <a href="https://arxiv.org/abs/2308.15136" target="_blank" rel="noopener">CAGRA: Highly Parallel Graph Construction and Approximate Nearest Neighbor Search for GPUs</a></li><li>Aumüller, Bernhardsson &amp; Faithfull (2018). <a href="https://arxiv.org/abs/1807.05614" target="_blank" rel="noopener">ANN-Benchmarks: A Benchmarking Tool for Approximate Nearest Neighbor Algorithms</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../applications/text-embeddings-and-semantic-search.html"><small>Previous · session 150</small>Text embeddings and semantic search</a><a class="next" href="../applications/rag-part-1-the-basic-pipeline.html"><small>Next · session 152</small>RAG, part 1: the basic pipeline</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="vector-search-at-scale"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+const fmtInt=n=>Math.round(n).toLocaleString("en-US");
+function svgPt(svg,ev){const p=svg.createSVGPoint();p.x=ev.clientX;p.y=ev.clientY;const m=svg.getScreenCTM();return m?p.matrixTransform(m.inverse()):{x:0,y:0};}
+
+/* ---------- Figure 1: IVF in 2-D ---------- */
+(function(){
+ const svg=$("#vs-ivf-svg");if(!svg)return;const NL=$("#vs-ivf-nl"),NP=$("#vs-ivf-np"),info=$("#vs-ivf-info");
+ const r=rng(11),g=gauss(r),P=[];
+ const blobs=[[110,90,26],[230,70,20],[420,80,30],[540,120,22],[150,250,34],[300,200,24],[460,250,30],[580,290,18],[330,310,20]];
+ blobs.forEach(([cx,cy,s])=>{for(let i=0;i<55;i++){P.push([Math.min(630,Math.max(10,cx+s*g())),Math.min(350,Math.max(10,cy+s*g()))]);}});
+ while(P.length<600)P.push([15+r()*610,15+r()*330]);
+ const d2=(a,b)=>(a[0]-b[0])**2+(a[1]-b[1])**2;const cache={};
+ function km(K){if(cache[K])return cache[K];const rr=rng(5+K),idx=P.map((_,i)=>i);for(let i=idx.length-1;i>0;i--){const j=Math.floor(rr()*(i+1));[idx[i],idx[j]]=[idx[j],idx[i]];}
+  let C=idx.slice(0,K).map(i=>P[i].slice());const A=new Array(P.length).fill(0);
+  for(let it=0;it<25;it++){P.forEach((p,i)=>{let b=0,bd=1e18;C.forEach((c,j)=>{const v=d2(p,c);if(v<bd){bd=v;b=j;}});A[i]=b;});
+   const S=C.map(()=>[0,0,0]);P.forEach((p,i)=>{S[A[i]][0]+=p[0];S[A[i]][1]+=p[1];S[A[i]][2]++;});C=C.map((c,j)=>S[j][2]?[S[j][0]/S[j][2],S[j][1]/S[j][2]]:c);}
+  P.forEach((p,i)=>{let b=0,bd=1e18;C.forEach((c,j)=>{const v=d2(p,c);if(v<bd){bd=v;b=j;}});A[i]=b;});
+  return cache[K]={C,A};}
+ let q=[318,140];
+ function draw(){const K=+NL.value;NP.max=K;if(+NP.value>K)NP.value=K;const np=+NP.value;$("#vs-ivf-nlv").value=K;$("#vs-ivf-npv").value=np;
+  const {C,A}=km(K);const order=C.map((c,j)=>[d2(q,c),j]).sort((a,b)=>a[0]-b[0]).map(x=>x[1]);const probed=new Set(order.slice(0,np));
+  const near=(x,y)=>{let b=0,bd=1e18;for(let j=0;j<K;j++){const v=(x-C[j][0])**2+(y-C[j][1])**2;if(v<bd){bd=v;b=j;}}return b;};
+  const st=5,W=640/st,H=360/st;const grid=[];for(let gy=0;gy<H;gy++){const row=[];for(let gx=0;gx<W;gx++)row.push(near(gx*st+st/2,gy*st+st/2));grid.push(row);}
+  let shade="",edge="";for(let gy=0;gy<H;gy++){let run=-1;for(let gx=0;gx<=W;gx++){const on=gx<W&&probed.has(grid[gy][gx]);if(on&&run<0)run=gx;if(!on&&run>=0){shade+=`M${run*st} ${gy*st}h${(gx-run)*st}v${st}h${-(gx-run)*st}z`;run=-1;}}
+   for(let gx=0;gx<W;gx++){if(gx+1<W&&grid[gy][gx]!==grid[gy][gx+1])edge+=`M${(gx+1)*st} ${gy*st}v${st}`;if(gy+1<H&&grid[gy][gx]!==grid[gy+1][gx])edge+=`M${gx*st} ${(gy+1)*st}h${st}`;}}
+  const dist=P.map((p,i)=>[d2(q,p),i]).sort((a,b)=>a[0]-b[0]);const top=dist.slice(0,10).map(x=>x[1]);const scanned=P.reduce((s,_,i)=>s+(probed.has(A[i])?1:0),0);
+  const found=top.filter(i=>probed.has(A[i])).length;
+  let s=`<rect x="0" y="0" width="640" height="360" fill="transparent"/><path d="${shade}" fill="var(--k-soft)" opacity=".75"/><path d="${edge}" stroke="var(--muted)" stroke-width="1" fill="none" opacity=".55"/>`;
+  P.forEach((p,i)=>{s+=`<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="2.6" fill="${probed.has(A[i])?"var(--k)":"var(--rule)"}"/>`;});
+  top.forEach(i=>{const p=P[i],ok=probed.has(A[i]);s+=`<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="6" fill="none" stroke="${ok?"var(--ok)":"var(--bad)"}" stroke-width="2.2"/>`;});
+  C.forEach((c,j)=>{const on=probed.has(j),z=on?7:5;s+=`<path d="M${c[0]-z} ${c[1]-z}L${c[0]+z} ${c[1]+z}M${c[0]-z} ${c[1]+z}L${c[0]+z} ${c[1]-z}" stroke="var(--ink)" stroke-width="${on?3:1.8}"/>`;});
+  s+=`<circle cx="${q[0]}" cy="${q[1]}" r="8" fill="var(--q)" stroke="var(--card)" stroke-width="2.5"/>`;svg.innerHTML=s;
+  const rec=found/10;svg.dataset.recall=rec.toFixed(1);svg.dataset.scanned=scanned;
+  info.innerHTML=`Opened <b>${np}</b> of ${K} lists. Scanned <b>${scanned}</b> of 600 points (${(100*scanned/600).toFixed(1)}%), plus ${K} centroid comparisons: <b>${scanned+K}</b> distance computations instead of 600. Recall@10 = <b>${rec.toFixed(1)}</b> (${found} of the 10 true nearest neighbors found${found<10?`; ${10-found} ${10-found===1?"sits":"sit"} in lists that were not opened`:""}).`;}
+ svg.addEventListener("click",e=>{const p=svgPt(svg,e);q=[Math.round(Math.max(5,Math.min(635,p.x))),Math.round(Math.max(5,Math.min(355,p.y)))];draw();});
+ [NL,NP].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: PQ diagram (static) ---------- */
+(function(){
+ const svg=$("#vs-pq-svg");if(!svg)return;const x=[0.8,1.3,0.9,0.2,-0.4,0.7,1.1,-0.6],codes=[17,203,5,88],T=[0.62,0.18,0.41,0.05];
+ const col=["var(--t1)","var(--t3)","var(--t5)","var(--t7)"];const X0=24,CW=46;
+ let s=`<defs><marker id="vs-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+ s+=`<text x="${X0}" y="20" font-family="var(--sans)" font-size="13" font-weight="700" fill="var(--ink)">Database vector x (d = 8, FP32: 32 bytes)</text>`;
+ x.forEach((v,i)=>{const m=Math.floor(i/2);s+=`<rect x="${X0+i*CW}" y="30" width="${CW-4}" height="30" rx="5" fill="color-mix(in srgb,${col[m]} 18%,var(--card))" stroke="${col[m]}" stroke-width="1.6"/><text x="${X0+i*CW+(CW-4)/2}" y="50" text-anchor="middle" font-family="var(--mono)" font-size="12.5" fill="var(--ink)">${v.toFixed(1).replace("-","−")}</text>`;});
+ for(let m=0;m<4;m++){const cx=X0+m*2*CW+CW-2;s+=`<text x="${cx}" y="76" text-anchor="middle" font-family="var(--sans)" font-size="11.5" fill="var(--muted)">sub-vector ${m+1}</text><path d="M${cx} 82V104" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vs-ah)"/>`;
+  s+=`<rect x="${cx-40}" y="108" width="80" height="40" rx="7" fill="var(--paper2)" stroke="${col[m]}" stroke-width="1.6"/><text x="${cx}" y="124" text-anchor="middle" font-family="var(--sans)" font-size="11.5" fill="var(--ink)">codebook ${m+1}</text><text x="${cx}" y="140" text-anchor="middle" font-family="var(--sans)" font-size="10.5" fill="var(--muted)">256 centroids</text>`;
+  s+=`<path d="M${cx} 150V166" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vs-ah)"/><rect x="${cx-22}" y="170" width="44" height="26" rx="5" fill="var(--card)" stroke="${col[m]}" stroke-width="2"/><text x="${cx}" y="188" text-anchor="middle" font-family="var(--mono)" font-size="13" font-weight="700" fill="var(--ink)">${codes[m]}</text>`;}
+ s+=`<text x="${X0+8*CW+14}" y="128" font-family="var(--sans)" font-size="12.5" fill="var(--ink2)">nearest centroid id</text><text x="${X0+8*CW+14}" y="146" font-family="var(--sans)" font-size="12.5" fill="var(--ink2)">in each sub-space</text>`;
+ s+=`<text x="${X0+8*CW+14}" y="182" font-family="var(--sans)" font-size="13" font-weight="700" fill="var(--ink)">stored code: 4 bytes</text><text x="${X0+8*CW+14}" y="198" font-family="var(--sans)" font-size="12" fill="var(--muted)">(8 times smaller here; 32 for d = 768, M = 96)</text>`;
+ s+=`<line x1="${X0}" y1="214" x2="640" y2="214" stroke="var(--rule)" stroke-dasharray="4 4"/><text x="${X0}" y="234" font-family="var(--sans)" font-size="13" font-weight="700" fill="var(--q)">Query time: tables T_m[j] = score of query sub-vector m with centroid j (built once per query)</text>`;
+ for(let m=0;m<4;m++){const y=244+m*19;s+=`<text x="${X0}" y="${y+13}" font-family="var(--mono)" font-size="11.5" fill="var(--muted)">T${m+1}</text>`;
+  for(let j=0;j<12;j++){const hl=j===6;s+=`<rect x="${X0+28+j*24}" y="${y}" width="21" height="16" rx="3" fill="${hl?`color-mix(in srgb,${col[m]} 45%,var(--card))`:"var(--paper2)"}" stroke="${hl?col[m]:"var(--rule)"}" stroke-width="${hl?2:1}"/>`;}
+  s+=`<text x="${X0+28+6*24+10}" y="${y+12}" text-anchor="middle" font-family="var(--mono)" font-size="9" fill="var(--ink)">${codes[m]}</text><text x="${X0+28+12*24+8}" y="${y+13}" font-family="var(--mono)" font-size="11.5" fill="var(--ink2)">T${m+1}[${codes[m]}] = ${T[m].toFixed(2)}</text>`;}
+ s+=`<text x="${X0+470}" y="270" font-family="var(--sans)" font-size="12.5" fill="var(--ink2)">score of x ≈ sum of</text><text x="${X0+470}" y="288" font-family="var(--sans)" font-size="12.5" fill="var(--ink2)">4 lookups (example):</text><text x="${X0+470}" y="310" font-family="var(--mono)" font-size="12.5" font-weight="700" fill="var(--ink)">${T.map(v=>v.toFixed(2)).join("+")}</text><text x="${X0+470}" y="326" font-family="var(--mono)" font-size="12.5" font-weight="700" fill="var(--ink)">= ${T.reduce((a,b)=>a+b,0).toFixed(2)}</text>`;
+ svg.innerHTML=s;
+})();
+
+/* ---------- Figure 3: HNSW search stepper ---------- */
+(function(){
+ const svg=$("#vs-hnsw-svg");if(!svg)return;const info=$("#vs-hnsw-info"),lab=$("#vs-hnsw-lab"),bPrev=$("#vs-hnsw-prev"),bNext=$("#vs-hnsw-next"),bPlay=$("#vs-hnsw-play"),bQ=$("#vs-hnsw-q"),seg=$("#vs-hnsw-ef");
+ const r=rng(4),gg=gauss(r),Np=90,M=4,MMAX0=8,EFC=12,mL=1/Math.log(M);const P=[],LV=[];const CL=[[120,110],[300,90],[500,120],[180,270],[400,260],[560,300]];
+ for(let i=0;i<Np;i++){let p;if(i%5===4)p=[30+r()*580,40+r()*300];else{const c=CL[Math.floor(r()*CL.length)];p=[c[0]+38*gg(),c[1]+30*gg()];}P.push([Math.max(20,Math.min(620,p[0])),Math.max(50,Math.min(345,p[1]))]);LV.push(Math.min(3,Math.floor(-Math.log(Math.max(1e-9,r()))*mL)));}
+ const D=(a,b)=>Math.hypot(a[0]-b[0],a[1]-b[1]);const G=[0,1,2,3].map(()=>P.map(()=>[]));
+ function searchLayer(q,eps,ef,lc,dist){const vis=new Set(eps);let C=eps.map(e=>[dist(e),e]),W=C.slice();
+  while(C.length){C.sort((a,b)=>a[0]-b[0]);const [dc,c]=C.shift();W.sort((a,b)=>a[0]-b[0]);if(dc>W[W.length-1][0])break;
+   G[lc][c].forEach(e=>{if(vis.has(e))return;vis.add(e);const de=dist(e);W.sort((a,b)=>a[0]-b[0]);if(W.length<ef||de<W[W.length-1][0]){C.push([de,e]);W.push([de,e]);W.sort((a,b)=>a[0]-b[0]);if(W.length>ef)W.pop();}});}
+  return W.sort((a,b)=>a[0]-b[0]);}
+ function heur(p,cands,m){const out=[];for(const [dc,c] of cands){if(out.length>=m)break;if(out.every(o=>dc<D(P[c],P[o])))out.push(c);}
+  for(const [,c] of cands){if(out.length>=m)break;if(!out.includes(c))out.push(c);}return out;}
+ let entry=0,maxL=LV[0];
+ for(let i=1;i<Np;i++){const l=LV[i],dist=e=>D(P[i],P[e]);let ep=entry;
+  for(let lc=maxL;lc>l;lc--){ep=searchLayer(P[i],[ep],1,lc,dist)[0][1];}
+  for(let lc=Math.min(l,maxL);lc>=0;lc--){const W=searchLayer(P[i],[ep],EFC,lc,dist);const nb=heur(P[i],W,M);const mx=lc===0?MMAX0:M;
+   nb.forEach(e=>{G[lc][i].push(e);G[lc][e].push(i);if(G[lc][e].length>mx){const cs=G[lc][e].map(o=>[D(P[e],P[o]),o]).sort((a,b)=>a[0]-b[0]);G[lc][e]=heur(P[e],cs,mx);}});ep=W[0][1];}
+  if(l>maxL){maxL=l;entry=i;}}
+ const cnt=[0,1,2,3].map(L=>LV.filter(v=>v>=L).length);
+ function run(q,ef){const dist=e=>D(q,P[e]);const comp=new Set([entry]);const S=[];let cur=entry,path=[entry];
+  S.push({L:maxL,cur,path:path.slice(),W:[],comp:new Set(comp),t:`Start at the entry node in the top layer ${maxL} (only ${cnt[maxL]} node${cnt[maxL]>1?"s":""} live here). Distance to the query: <b>${dist(cur).toFixed(0)}</b>.`});
+  for(let lc=maxL;lc>=1;lc--){for(;;){let best=cur,bd=dist(cur);G[lc][cur].forEach(e=>{comp.add(e);const de=dist(e);if(de<bd){bd=de;best=e;}});
+    if(best!==cur){const from=cur;cur=best;path.push(cur);S.push({L:lc,cur,path:path.slice(),W:[],comp:new Set(comp),t:`Layer ${lc}: checked the ${G[lc][from].length} neighbors of the current node and jumped to the closest one, distance <b>${bd.toFixed(0)}</b>. Long links make big jumps.`});}
+    else{S.push({L:lc-1,cur,path:path.slice(),W:[],comp:new Set(comp),t:`Layer ${lc}: no neighbor is closer to the query (distance ${dist(cur).toFixed(0)}). Go down to layer ${lc-1}, starting from the same node.`});break;}}}
+  const vis=new Set([cur]);let C=[[dist(cur),cur]],W=[[dist(cur),cur]];
+  while(C.length){C.sort((a,b)=>a[0]-b[0]);const [dc,c]=C.shift();W.sort((a,b)=>a[0]-b[0]);
+   if(dc>W[W.length-1][0]){S.push({L:0,cur:c,path:path.slice(),W:W.map(w=>w[1]),comp:new Set(comp),t:`Layer 0: the closest unexplored candidate (distance ${dc.toFixed(0)}) is farther than the worst of the ${W.length} kept results (${W[W.length-1][0].toFixed(0)}). Stop.`});break;}
+   let added=0;G[0][c].forEach(e=>{if(vis.has(e))return;vis.add(e);comp.add(e);const de=dist(e);W.sort((a,b)=>a[0]-b[0]);if(W.length<ef||de<W[W.length-1][0]){C.push([de,e]);W.push([de,e]);W.sort((a,b)=>a[0]-b[0]);if(W.length>ef)W.pop();added++;}});
+   if(c!==path[path.length-1])path.push(c);
+   S.push({L:0,cur:c,path:path.slice(),W:W.map(w=>w[1]),comp:new Set(comp),t:`Layer 0: expand the node at distance ${dc.toFixed(0)}. ${added} of its new neighbors entered the result list, which keeps the best <b>ef = ${ef}</b>. Best so far: <b>${W[0][0].toFixed(0)}</b>.`});}
+  W.sort((a,b)=>a[0]-b[0]);let tn=0;P.forEach((p,i)=>{if(dist(i)<dist(tn))tn=i;});const hit=W[0][1]===tn;
+  S.push({L:0,cur:W[0][1],path:path.slice(),W:W.map(w=>w[1]),comp:new Set(comp),tn,end:true,hit,t:`Result: nearest found at distance <b>${W[0][0].toFixed(0)}</b>; the true nearest neighbor is at distance <b>${dist(tn).toFixed(0)}</b>, so the search ${hit?"<b style='color:var(--ok)'>found it</b>":"<b style='color:var(--bad)'>missed it</b> (stuck in a local minimum)"}. Distances computed: <b>${comp.size}</b> of ${Np}.`});
+  return {S,hit};}
+ const qr=rng(99),cand=[];for(let i=0;i<80;i++)cand.push([40+qr()*560,50+qr()*280]);
+ const miss=cand.filter(q=>!run(q,1).hit),hitq=cand.filter(q=>run(q,1).hit);const Q=[];for(let i=0;i<4;i++){if(hitq[i])Q.push(hitq[i]);if(miss[i])Q.push(miss[i]);}
+ let qi=0,ef=4,steps=[],i=0,timer=null;svg.dataset.nmiss=miss.length;
+ function draw(){const st=steps[i],L=st.L,q=Q[qi];let s=`<text x="12" y="22" font-family="var(--sans)" font-size="14" font-weight="700" fill="var(--ink)">Layer ${L}</text><text x="12" y="40" font-family="var(--sans)" font-size="12" fill="var(--muted)">${cnt[L]} nodes, ${L===0?"up to "+MMAX0:"up to "+M} links each</text>`;
+  const seen=new Set();P.forEach((p,a)=>{if(LV[a]<L)return;G[L][a].forEach(b=>{const k=a<b?a+"-"+b:b+"-"+a;if(seen.has(k))return;seen.add(k);s+=`<line x1="${p[0].toFixed(1)}" y1="${p[1].toFixed(1)}" x2="${P[b][0].toFixed(1)}" y2="${P[b][1].toFixed(1)}" stroke="var(--rule)" stroke-width="${L?2:1.2}"/>`;});});
+  s+=`<polyline points="${st.path.map(n=>P[n][0].toFixed(1)+","+P[n][1].toFixed(1)).join(" ")}" fill="none" stroke="var(--k)" stroke-width="2.6" stroke-linejoin="round" opacity=".85"/>`;
+  const Wset=new Set(st.W);P.forEach((p,a)=>{const inL=LV[a]>=L,rad=2.6+1.6*LV[a];const fill=Wset.has(a)?"var(--v)":st.comp.has(a)?"var(--muted)":inL?"var(--card)":"var(--paper2)";
+   s+=`<circle cx="${p[0].toFixed(1)}" cy="${p[1].toFixed(1)}" r="${rad}" fill="${fill}" stroke="${inL?"var(--ink2)":"var(--rule)"}" stroke-width="${inL?1.3:0.8}" opacity="${inL||st.comp.has(a)?1:.55}"/>`;});
+  if(st.end){const t=P[st.tn];s+=`<circle cx="${t[0].toFixed(1)}" cy="${t[1].toFixed(1)}" r="11" fill="none" stroke="${st.hit?"var(--ok)":"var(--bad)"}" stroke-width="2.5" stroke-dasharray="4 3"/>`;}
+  const c=P[st.cur];s+=`<circle cx="${c[0].toFixed(1)}" cy="${c[1].toFixed(1)}" r="9" fill="none" stroke="var(--k)" stroke-width="3.2"/>`;
+  s+=`<path d="M${q[0]} ${q[1]-10}L${q[0]+3} ${q[1]-3}L${q[0]+10} ${q[1]}L${q[0]+3} ${q[1]+3}L${q[0]} ${q[1]+10}L${q[0]-3} ${q[1]+3}L${q[0]-10} ${q[1]}L${q[0]-3} ${q[1]-3}Z" fill="var(--q)" stroke="var(--card)" stroke-width="1.5"/>`;
+  svg.innerHTML=s;info.innerHTML=st.t;lab.textContent=`Step ${i+1} of ${steps.length} (query ${qi+1} of ${Q.length})`;bPrev.disabled=i===0;bNext.disabled=i===steps.length-1;svg.dataset.end=st.end?(st.hit?"hit":"miss"):"";svg.dataset.comp=st.comp.size;}
+ const stop=()=>{if(timer){clearInterval(timer);timer=null;bPlay.textContent="Play";}};
+ function rebuild(){stop();steps=run(Q[qi],ef).S;i=0;draw();}
+ bPrev.addEventListener("click",()=>{stop();if(i>0){i--;draw();}});bNext.addEventListener("click",()=>{stop();if(i<steps.length-1){i++;draw();}});
+ bPlay.addEventListener("click",()=>{if(timer){stop();return;}if(i===steps.length-1){i=0;draw();}bPlay.textContent="Pause";timer=setInterval(()=>{if(i>=steps.length-1){stop();return;}i++;draw();},1500);});
+ bQ.addEventListener("click",()=>{qi=(qi+1)%Q.length;rebuild();});
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;ef=+b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));rebuild();});
+ rebuild();
+})();
+
+/* ---------- Figure 4: memory and speed calculator ---------- */
+(function(){
+ const tb=$("#vs-calc-tb");if(!tb)return;const iN=$("#vs-calc-n"),iD=$("#vs-calc-d"),iM=$("#vs-calc-m"),iP=$("#vs-calc-p"),info=$("#vs-calc-info");
+ const DS=[256,384,768,1024,1536,3072],PS=[0.0001,0.001,0.01,0.05,0.1],GPU=3.35e12,CPU=100e9,HM=32;
+ const fB=b=>{const u=[["TB",1e12],["GB",1e9],["MB",1e6],["KB",1e3]];for(const [n,v] of u)if(b>=v)return(b/v).toFixed(b/v>=1000?0:1)+" "+n;return Math.round(b)+" B";};
+ const fT=s=>s>=1?s.toFixed(2)+" s":s>=1e-3?(s*1e3).toFixed(s>=0.1?0:1)+" ms":(s*1e6).toFixed(s>=1e-4?0:1)+" µs";
+ const fN=v=>{const e=Math.round(v*2)/2,m=Math.pow(10,e);if(Number.isInteger(e)){const names={4:"10 thousand",5:"100 thousand",6:"1 million",7:"10 million",8:"100 million",9:"1 billion",10:"10 billion"};return names[e];}return fmtInt(m);};
+ function draw(){const N=Math.pow(10,+iN.value),d=DS[+iD.value],M=+iM.value,p=PS[+iP.value];
+  $("#vs-calc-nv").value=fN(+iN.value);$("#vs-calc-dv").value=d;$("#vs-calc-mv").value=M+" B";$("#vs-calc-pv").value=(100*p)+"%";
+  const rows=[["Flat FP32",N*4*d,N*4*d],["Flat FP16",N*2*d,N*2*d],["IVF-Flat FP32",N*(4*d+8),p*N*(4*d+8)],["IVF-SQ8",N*(d+8),p*N*(d+8)],[`IVF-PQ${M}`,N*(M+8),p*N*(M+8)],[`HNSW${HM},Flat`,N*(4*d+8*HM),null]];
+  let h=`<thead><tr><th>Index</th><th>Memory</th><th>Fits 80 GB?</th><th>Read per query</th><th>GPU time</th><th>CPU time</th></tr></thead><tbody>`;
+  rows.forEach(([n,mem,rd])=>{const fit=mem<=80e9;h+=`<tr><td>${n}</td><td>${fB(mem)}</td><td class="${fit?"ok":"no"}">${fit?"yes":"no"}</td><td>${rd===null?"path":fB(rd)}</td><td>${rd===null?"path":fT(rd/GPU)}</td><td>${rd===null?"path":fT(rd/CPU)}</td></tr>`;});
+  tb.innerHTML=h+"</tbody>";const f32=rows[0][1],pq=rows[4][1];tb.dataset.flat=fB(f32);tb.dataset.pq=fB(pq);tb.dataset.hnsw=fB(rows[5][1]);
+  info.innerHTML=`${fN(+iN.value)} vectors of ${d} numbers. Flat FP32 needs <b>${fB(f32)}</b> and one query reads all of it (<b>${fT(f32/GPU)}</b> even at H100 bandwidth). IVF-PQ${M} is <b>${(f32/pq).toFixed(1)}×</b> smaller (${fB(pq)}) and, probing ${100*p}% of the lists, reads only <b>${fB(p*pq)}</b> per query. HNSW${HM} adds ${fB(N*8*HM)} of links to the full vectors.`;}
+ [iN,iD,iM,iP].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 5: recall vs work curve ---------- */
+(function(){
+ const svg=$("#vs-curve-svg");if(!svg)return;const seg=$("#vs-curve-nl"),NP=$("#vs-curve-np"),info=$("#vs-curve-info");
+ const d=32,N=4000,NQ=60,K=10,TOP=40,PM=8,PK=16,SD=d/PM,RR=50;const r=rng(2024),g=gauss(r);
+ const topics=Array.from({length:TOP},()=>Float64Array.from({length:d},()=>g()));
+ function sample(){const t=topics[Math.floor(r()*TOP)];const v=new Float64Array(d);let n=0;for(let j=0;j<d;j++){v[j]=t[j]+1.5*g();n+=v[j]*v[j];}n=Math.sqrt(n);for(let j=0;j<d;j++)v[j]/=n;return v;}
+ const X=Array.from({length:N},sample),Qs=Array.from({length:NQ},sample);
+ const dot=(a,b)=>{let s=0;for(let j=0;j<a.length;j++)s+=a[j]*b[j];return s;};
+ function kmeans(vecs,k,iters,seed,off,len){const rr=rng(seed);const idx=vecs.map((_,i)=>i);for(let i=idx.length-1;i>0;i--){const j=Math.floor(rr()*(i+1));[idx[i],idx[j]]=[idx[j],idx[i]];}
+  let C=idx.slice(0,k).map(i=>vecs[i].slice(off,off+len));const A=new Int32Array(vecs.length);
+  const asg=()=>{for(let i=0;i<vecs.length;i++){const v=vecs[i];let b=0,bd=1e18;for(let c=0;c<k;c++){const cc=C[c];let s=0;for(let j=0;j<len;j++){const t=v[off+j]-cc[j];s+=t*t;}if(s<bd){bd=s;b=c;}}A[i]=b;}};
+  for(let it=0;it<iters;it++){asg();const S=Array.from({length:k},()=>new Float64Array(len)),n=new Int32Array(k);for(let i=0;i<vecs.length;i++){const a=A[i];n[a]++;for(let j=0;j<len;j++)S[a][j]+=vecs[i][off+j];}
+   C=C.map((c,ci)=>n[ci]?S[ci].map(v=>v/n[ci]):c);}asg();return {C,A};}
+ /* ground truth and exact scores */
+ const ES=Qs.map(q=>X.map(x=>dot(q,x)));const GT=ES.map(s=>s.map((v,i)=>[v,i]).sort((a,b)=>b[0]-a[0]).slice(0,K).map(x=>x[1]));
+ /* PQ: 8 sub-vectors x 16 centroids (4 bits each) -> 4 bytes per vector */
+ const books=[],codes=Array.from({length:N},()=>new Int32Array(PM));
+ for(let m=0;m<PM;m++){const {C,A}=kmeans(X,PK,12,100+m,m*SD,SD);books.push(C);for(let i=0;i<N;i++)codes[i][m]=A[i];}
+ const PQord=Qs.map(q=>{const T=books.map((C,m)=>C.map(c=>{let s=0;for(let j=0;j<SD;j++)s+=q[m*SD+j]*c[j];return s;}));
+  const sc=codes.map(cd=>{let s=0;for(let m=0;m<PM;m++)s+=T[m][cd[m]];return s;});return sc.map((v,i)=>[v,i]).sort((a,b)=>b[0]-a[0]).map(x=>x[1]);});
+ const cache={};
+ function curve(nl){if(cache[nl])return cache[nl];const {C,A}=kmeans(X,nl,7,7+nl,0,d);const sizes=new Int32Array(nl);for(let i=0;i<N;i++)sizes[A[i]]++;
+  const res=[];for(let n=1;n<=nl;n++)res.push({f:0,a:0,b:0,c:0});
+  Qs.forEach((q,qi)=>{const ord=C.map((c,j)=>{let s=0;for(let t=0;t<d;t++){const u=q[t]-c[t];s+=u*u;}return [s,j];}).sort((a,b)=>a[0]-b[0]).map(x=>x[1]);
+   const rank=new Int32Array(nl);ord.forEach((j,k2)=>rank[j]=k2);const gt=new Set(GT[qi]);let cum=0;
+   for(let n=1;n<=nl;n++){cum+=sizes[ord[n-1]];const o=res[n-1];o.f+=cum/N;
+    o.a+=GT[qi].filter(i=>rank[A[i]]<n).length/K;
+    const pqTop=[],pqR=[];for(const i of PQord[qi]){if(rank[A[i]]<n){if(pqTop.length<K)pqTop.push(i);pqR.push(i);if(pqR.length>=RR)break;}}
+    o.b+=pqTop.filter(i=>gt.has(i)).length/K;
+    const rr=pqR.map(i=>[ES[qi][i],i]).sort((x,y)=>y[0]-x[0]).slice(0,K);o.c+=rr.filter(x=>gt.has(x[1])).length/K;}});
+  res.forEach(o=>{o.f/=NQ;o.a/=NQ;o.b/=NQ;o.c/=NQ;});return cache[nl]=res;}
+ let nl=64;const xs=f=>60+(Math.log10(Math.max(f,10**-2.5))+2.5)/2.5*560,ys=v=>262-v*235;
+ function draw(){NP.max=nl;if(+NP.value>nl)NP.value=nl;const np=+NP.value;$("#vs-curve-npv").value=np;const res=curve(nl);
+  let s=`<path d="M60 20V262H625" fill="none" stroke="var(--muted)"/>`;
+  [0.01,0.1,1].forEach(f=>{s+=`<line x1="${xs(f)}" y1="20" x2="${xs(f)}" y2="262" stroke="var(--rule2)"/><text x="${xs(f)}" y="280" text-anchor="middle" class="svgs" font-size="12">${f*100}%</text>`;});
+  [0,0.25,0.5,0.75,1].forEach(v=>{s+=`<line x1="60" y1="${ys(v)}" x2="625" y2="${ys(v)}" stroke="var(--rule2)"/><text x="52" y="${ys(v)+4}" text-anchor="end" class="svgs" font-size="12">${v.toFixed(2)}</text>`;});
+  s+=`<text x="342" y="297" text-anchor="middle" class="svgs" font-size="12.5">share of the database scanned (log scale)</text><text x="16" y="141" transform="rotate(-90 16 141)" text-anchor="middle" class="svgs" font-size="12.5">recall@10</text>`;
+  [["a","var(--k)"],["b","var(--v)"],["c","var(--q)"]].forEach(([k,c])=>{s+=`<polyline points="${res.map(o=>xs(o.f).toFixed(1)+","+ys(o[k]).toFixed(1)).join(" ")}" fill="none" stroke="${c}" stroke-width="2.4" stroke-linejoin="round"/>`;
+   const o=res[np-1];s+=`<circle cx="${xs(o.f).toFixed(1)}" cy="${ys(o[k]).toFixed(1)}" r="6" fill="${c}" stroke="var(--card)" stroke-width="2"/>`;});
+  svg.innerHTML=s;const o=res[np-1];svg.dataset.vals=[o.f,o.a,o.b,o.c].map(v=>v.toFixed(3)).join(",");
+  info.innerHTML=`nlist = ${nl}, n<sub>probe</sub> = <b>${np}</b>: on average <b>${(100*o.f).toFixed(1)}%</b> of the 4,000 vectors scanned. Recall@10: IVF-Flat <b>${o.a.toFixed(3)}</b>, IVF-PQ (4 bytes) <b>${o.b.toFixed(3)}</b>, IVF-PQ + re-rank of top ${RR} <b>${o.c.toFixed(3)}</b>.`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;nl=+b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ NP.addEventListener("input",draw);draw();
+})();
+})();
+</script></body></html>

@@ -1,0 +1,516 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>SigLIP and SigLIP 2 · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 167</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="siglip-and-siglip-2">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="siglip-and-siglip-2" data-session="siglip-and-siglip-2" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">167</span><span>Track 7: Vision and VLMs · session 5 of 38</span></div><h1 class="chap-title">SigLIP and SigLIP 2</h1><p class="chap-sub">SigLIP keeps CLIP’s two towers but changes the loss: every image–caption pair in the batch becomes its own yes/no question, scored with a sigmoid. There is no softmax over the batch, so the loss is cheaper to split across devices and works better with small batches. SigLIP 2 adds a captioning decoder, self-distillation and masked prediction, many languages and a native-aspect-ratio variant, and it is the image encoder inside many open VLMs.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 3 (cross-entropy), 164 (the Vision Transformer) and 166 (CLIP)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The sigmoid loss: one binary classification per image–caption pair, its gradient, and how it differs from CLIP’s softmax</li><li>Why SigLIP needs a learned bias, and why −10 is close to the best start −ln(N − 1)</li><li>The chunked ring implementation: only a b × b block of logits in memory, with collective permutes instead of all-gathers</li><li>What the batch-size study found: sigmoid wins below 16k, both saturate around 32k</li><li>Sigmoid scores at inference: multi-label answers and “none of these”</li><li>SigLIP 2: LocCa decoder, SILC and TIPS losses, multilingual data, ACID distillation and NaFlex resizing</li><li>Why PaliGemma, LLaVA-OneVision, Idefics2, SmolVLM and Gemma 3 use SigLIP-shaped encoders, and how resolution sets the visual token count</li></ul></div></header><style>
+.sg-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.sg-grid input[type=range]{width:100%;min-width:0}
+.sg-grid output{font-family:var(--mono);font-size:14px;min-width:4.5em;text-align:right}
+.sg-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.sg-leg span::before{content:"";display:inline-block;width:18px;height:4px;border-radius:2px;margin-right:6px;vertical-align:3px;background:var(--c)}
+.sg-cell{cursor:pointer}
+.sg-cell:hover rect{stroke:var(--tc);stroke-width:2}
+.sg-caps{display:flex;flex-wrap:wrap;gap:4px 16px;font:500 14px var(--sans);margin-top:6px}
+.sg-lab{font:500 14px var(--sans);color:var(--muted)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">CLIP (<a href="../vision/clip-learning-images-and-text-together.html">session 166</a>) taught us to put images and captions into one shared space with a softmax over the whole batch. SigLIP (Sigmoid Loss for Language–Image Pre-training, Zhai et al., 2023) changes one thing: the loss. Instead of asking “which of these \(N\) captions belongs to this image?”, it asks, for <b>every</b> image–caption pair separately, “do these two belong together, yes or no?”. That small change removes the batch-wide normalization, makes the loss cheaper to compute across many GPUs, and works better when the batch is small.</p>
+<p>SigLIP 2 (Tschannen et al., 2025) keeps the same architecture and the same sigmoid loss, and adds three training signals that CLIP-style models lacked: a small captioning decoder that also predicts boxes, self-distillation and masked prediction for better per-patch features, and data curation for the small models. It is trained on many languages and comes in a variant that keeps the image’s own aspect ratio (NaFlex).</p>
+<p>Why should an LLM engineer care? Because the image encoder inside many open vision-language models (VLMs) is a SigLIP-family model. PaliGemma uses SigLIP So400m/14 [Certain]; LLaVA-OneVision, Idefics2 and SmolVLM use SigLIP-shaped encoders, and Gemma 3 uses a 400M SigLIP-style encoder at 896 pixels (their <code>config.json</code> files, checked below) [Certain]. When you choose, fine-tune or serve a VLM (<a href="../vision/index.html#row-case-studies-2-qwen2-5-vl-internvl" title="Case studies 2: Qwen2.5-VL, InternVL, PaliGemma and Gemma, SmolVLM (planned)">session 182</a>, <a href="../vision/index.html#row-anatomy-of-a-vision-language-model" title="Anatomy of a vision-language model (planned)">session 177</a>), you are choosing a SigLIP checkpoint, a resolution and a patch size, and that choice fixes the number of visual tokens your language model must read.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “Write the SigLIP loss.”, “What is the bias term for, and why −10?”, “Why is the sigmoid loss easier to distribute than CLIP’s?”, “Does SigLIP still need a huge batch?”, “What does SigLIP 2 add?”, “Why do VLMs use SigLIP and not CLIP?”. Each is answered below with a formula and real numbers.</aside>
+
+<h2>From “pick one” to “yes or no”</h2>
+<p>Start from the CLIP setup. A batch has \(N\) pairs \((x_i, y_i)\): image \(x_i\) and its caption \(y_i\). Each tower produces a vector, and the vectors are scaled to length 1 (L2 normalization):</p>
+<div class="eq">\[ \mathbf{u}_i = \frac{f(x_i)}{\lVert f(x_i) \rVert}, \qquad \mathbf{v}_j = \frac{g(y_j)}{\lVert g(y_j) \rVert}, \qquad \ell_{ij} = t\, \mathbf{u}_i^\top \mathbf{v}_j + b, \quad t = e^{t'} \tag{167.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(f, g\)</dt><dd>the image tower (a ViT) and the text tower (a transformer), each ending in a pooling head</dd>
+<dt>\(\mathbf{u}_i^\top \mathbf{v}_j\)</dt><dd>the cosine similarity of image \(i\) and caption \(j\), a number between −1 and 1</dd>
+<dt>\(t = e^{t'}\)</dt><dd>the temperature scale; the model learns \(t'\), so \(t\) stays positive. SigLIP starts at \(t = 10\)</dd>
+<dt>\(b\)</dt><dd>a learned bias, one number for the whole model. This is new compared with CLIP. SigLIP starts at \(b = -10\)</dd>
+<dt>\(\ell_{ij}\)</dt><dd>the <b>logit</b> of the pair: a large positive value means “these match”</dd></dl>
+<p>CLIP turns each row (and each column) of the \(N \times N\) logit matrix into a softmax: “among these \(N\) captions, pick the one for image \(i\)”. The probability of the right caption depends on <b>all</b> the other captions in the batch, because they share the denominator.</p>
+<p>SigLIP treats each cell as its own binary classification. The label is \(z_{ij} = +1\) when \(i = j\) (a true pair) and \(z_{ij} = -1\) otherwise. The probability that a pair matches is the <b>sigmoid</b> \(\sigma(\ell) = 1/(1 + e^{-\ell})\), and the loss is the usual logistic (binary cross-entropy) loss, summed over all \(N^2\) cells and divided by \(N\):</p>
+<div class="eq">\[ \mathcal{L}_{\text{SigLIP}} = -\frac{1}{N} \sum_{i=1}^{N} \sum_{j=1}^{N} \log \sigma\!\big(z_{ij}\, \ell_{ij}\big) = \frac{1}{N} \sum_{i=1}^{N} \sum_{j=1}^{N} \log\!\big(1 + e^{-z_{ij} \ell_{ij}}\big) \tag{167.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(z_{ij}\)</dt><dd>+1 for the \(N\) true pairs on the diagonal, −1 for the \(N^2 - N\) other cells (the negatives)</dd>
+<dt>\(\sigma(z\ell)\)</dt><dd>the probability the model gives to the correct answer for this cell: \(\sigma(\ell)\) for a true pair, \(1 - \sigma(\ell) = \sigma(-\ell)\) for a negative</dd>
+<dt>\(1/N\)</dt><dd>the sum is divided by the batch size, not by \(N^2\), as in the paper</dd></dl>
+<p>Two things follow at once. First, there is no denominator that couples the cells: each term \(\log\sigma(z_{ij}\ell_{ij})\) depends on one image and one caption only. Second, the loss is symmetric by construction. CLIP must average an image-to-text softmax and a text-to-image softmax; SigLIP has one term per pair, and it is the same in both directions.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>CLIP gives each image a multiple-choice question: “Which of these 32,768 captions is yours?”. The answer is only as hard as the other choices on that exam. SigLIP gives a stack of true/false questions: “Is this caption yours? Is this one?”. Each card is graded alone. You can split the stack between many graders and add up their scores at the end.</aside>
+<p>Figure 1 shows both losses on the same small batch. Click any cell and move its cosine: watch which loss terms change.</p>
+<figure class="fig" id="sg-mat"><div class="fig-body">
+<div class="sg-grid">
+<label for="sg-mat-t">Temperature \(t\)</label><input type="range" id="sg-mat-t" min="1" max="40" step="1" value="20"><output id="sg-mat-tv"></output>
+<label for="sg-mat-b">Bias \(b\)</label><input type="range" id="sg-mat-b" min="-15" max="5" step="0.5" value="-4"><output id="sg-mat-bv"></output>
+<label for="sg-mat-c">Cosine of the selected pair</label><input type="range" id="sg-mat-c" min="-0.2" max="0.6" step="0.01" value="0.22"><output id="sg-mat-cv"></output></div>
+<div class="scroll-x"><svg id="sg-mat-svg" viewBox="0 0 720 330" role="img" aria-label="A 4 by 4 matrix of image-caption pairs with the sigmoid match probability in each cell"></svg></div>
+<div class="sg-leg"><span style="--c:var(--ok)">true pair (label +1)</span><span style="--c:var(--k)">negative (label −1)</span><span style="--c:var(--tc)">selected cell</span></div>
+<div class="readout" id="sg-mat-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> One batch of four image–caption pairs. Each cell shows its cosine and its sigmoid match probability \(\sigma(\ell_{ij})\); the shading is the size of that cell’s loss term. Image 1 (a dog) and image 4 (a puppy) are similar, so the off-diagonal cells between them are hard negatives.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Click a cell to select it, then move the third slider. In SigLIP only that one cell’s term changes, so “terms changed” is always 1. In CLIP, the cell sits inside the softmax of its row (image → text) and of its column (text → image), so two of the \(2N = 8\) CLIP terms change, and if the selected cell is a negative, the right answers of its row and column become less likely. Now try the bias slider at \(t = 20\): with \(b = 0\) most negatives get \(\sigma \gt 0.5\), and the SigLIP loss is large; around \(b = -4\) the negatives are near 0 and the true pairs near 1. The dog/puppy cells stay uncertain: they are real near-duplicates that the batch labels as negatives.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: a 3 × 3 batch by hand</div>
+<p>Use the cosine matrix from the CLIP session (dog, cat, car): rows are images, columns captions,
+\(\begin{pmatrix} 0.30 & 0.10 & 0.05 \\ 0.12 & 0.28 & 0.15 \\ 0.02 & 0.20 & 0.25 \end{pmatrix}\), with \(t = 10\) and \(b = -2\).</p>
+<p>Logits \(\ell = 10\cos - 2\): the diagonal is \(1.0, 0.8, 0.5\); the off-diagonal cells are \(-1.0, -1.5, -0.8, -0.5, -1.8, 0.0\).</p>
+<p>Diagonal terms \(\log(1 + e^{-\ell})\): \(0.313, 0.371, 0.474\). Negative terms \(\log(1 + e^{\ell})\): \(0.313, 0.201, 0.371, 0.474, 0.153, 0.693\). The worst cell is image 3 with caption 2 (logit 0: the model says “50% match” to a wrong pair).</p>
+<p>Sum of all nine terms: \(3.364\); divided by \(N = 3\): \(\mathcal{L}_{\text{SigLIP}} = 1.121\). (CLIP’s loss with scale 10 on the same matrix is 0.368. The two numbers are on different scales and cannot be compared directly: SigLIP sums \(N^2\) terms, CLIP averages \(2N\).)</p></div>
+
+<h3>What the gradient does</h3>
+<p>For one cell, the derivative of \(\log(1 + e^{-z\ell})\) with respect to \(\ell\) is simple. Write the 0/1 label \(y_{ij} = (1 + z_{ij})/2\), so \(y = 1\) on the diagonal and 0 elsewhere:</p>
+<div class="eq">\[ \frac{\partial \mathcal{L}_{\text{SigLIP}}}{\partial \ell_{ij}} = \frac{1}{N} \big( \sigma(\ell_{ij}) - y_{ij} \big), \qquad \frac{\partial \mathcal{L}_{\text{SigLIP}}}{\partial b} = \frac{1}{N} \sum_{i,j} \big( \sigma(\ell_{ij}) - y_{ij} \big) \tag{167.3} \]</div>
+<p>“Predicted probability minus label”: the same form as logistic regression. A true pair is pulled up with force \(1 - \sigma(\ell_{ii})\); a negative is pushed down with force \(\sigma(\ell_{ij})\). Compare CLIP’s gradient \(\tfrac{1}{2N}(P_{ij} + Q_{ij} - 2\delta_{ij})\) (formula 166.6): there \(P_{ij}\) is a softmax over the row, so the push on one negative depends on every other caption in the row. In SigLIP the push depends on that cell alone. An easy negative (\(\sigma \approx 0\)) gets almost no gradient in both losses; a hard negative gets a large one in both. In the worked example, the cell with logit 0 gets the largest push: \((0.5 - 0)/3 = 0.167\).</p>
+<aside class="note watch side"><span class="nt">Watch out</span>“Independent terms” does not mean “independent of the batch”. The negatives of image \(i\) are still the other captions in its batch, and a duplicate caption in the batch is still wrongly labeled −1. SigLIP changes how the batch is <b>normalized</b>, not where the negatives come from.</aside>
+
+<h2>Probabilities that do not have to sum to 1</h2>
+<p>The two losses produce different kinds of numbers at test time. With CLIP, zero-shot classification is a softmax over the class prompts (formula 166.9): the probabilities sum to 1, so the model must pick one class even when none fits. With SigLIP, \(\sigma(t\, \mathbf{u}^\top \mathbf{v}_k + b)\) is a separate “yes” probability for each prompt \(k\). Several prompts can be likely at once (a photo with a dog <b>and</b> a ball), and all of them can be unlikely (“none of these”). This is what you want for multi-label tagging, for filtering, and for detection-style scoring where each region–text pair needs its own score.</p>
+<figure class="fig" id="sg-yn"><div class="fig-body">
+<div class="sg-grid">
+<label for="sg-yn-t">Temperature \(t\)</label><input type="range" id="sg-yn-t" min="1" max="40" step="1" value="20"><output id="sg-yn-tv"></output>
+<label for="sg-yn-b">Bias \(b\)</label><input type="range" id="sg-yn-b" min="-12" max="2" step="0.5" value="-5"><output id="sg-yn-bv"></output></div>
+<div class="sg-caps" id="sg-yn-caps"></div>
+<svg id="sg-yn-svg" viewBox="0 0 640 250" role="img" aria-label="Softmax and sigmoid probabilities for one image and five candidate captions"></svg>
+<div class="sg-leg"><span style="--c:var(--q)">softmax over the chosen captions (CLIP style)</span><span style="--c:var(--k)">sigmoid per caption (SigLIP style)</span></div>
+<div class="readout" id="sg-yn-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> One image of a dog on a beach, scored against up to five captions. The cosines are fixed (0.32, 0.27, 0.15, 0.10, 0.05). The softmax uses the same scale \(t\); the sigmoid adds the bias \(b\).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With all five captions, both methods rank the dog captions first. Now untick the two dog captions. The softmax still gives about 0.67 to “a cat on a sofa”, because its three probabilities must sum to 1. The sigmoid scores do not move: the cat caption stays at 0.12, below 0.5, so the model is saying “no match here”. The bias sets the threshold: \(\sigma(\ell) = 0.5\) exactly when \(t\cos = -b\), that is at cosine \(-b/t = 0.25\) with the default sliders.</p></details></figure>
+<p>A practical warning: the sigmoid score is only as calibrated as the training data. A threshold of 0.5 is a good start, but tune it on your own data before you use it for filtering [Likely].</p>
+
+<h2>The bias term and the start of training</h2>
+<p>In a batch of \(N\) pairs there are \(N\) positives and \(N^2 - N\) negatives. With \(N = 16{,}384\) that is 268 million negatives for 16 thousand positives [Certain, Section 4.8 of the paper]. At the start of training the embeddings are random, so all cosines are close to 0 and every logit is close to \(b\). Put \(\ell_{ij} = b\) into (167.2), using \(\operatorname{sp}(a) = \log(1 + e^{a})\) (the softplus):</p>
+<div class="eq">\[ \mathcal{L}_0(b) = \operatorname{sp}(-b) + (N - 1)\, \operatorname{sp}(b), \qquad \frac{d \mathcal{L}_0}{d b} = N \sigma(b) - 1 = 0 \;\Rightarrow\; b^\star = -\ln(N - 1) \tag{167.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathcal{L}_0(b)\)</dt><dd>the loss at initialization (all cosines 0), per row: one positive term and \(N - 1\) negative terms</dd>
+<dt>\(b^\star\)</dt><dd>the bias that is best <b>before</b> the model has learned anything: it says “a random pair matches with probability \(1/N\)”, the true base rate</dd></dl>
+<div class="worked"><div class="wt">Worked example: why \(b = -10\)</div>
+<p>With \(N = 32{,}768\) (SigLIP’s usual batch): \(b^\star = -\ln 32{,}767 = -10.40\). The paper’s choice \(b = -10\) is very close to this prior.</p>
+<p>At \(b = -10\): \(\sigma(-10) = 4.54 \times 10^{-5}\). The positive term is \(\operatorname{sp}(10) = 10.00\), the negatives add \(32{,}767 \times 4.54\times10^{-5} = 1.49\), so \(\mathcal{L}_0 = 11.49\), and the gradient on \(b\) is only \(+0.49\).</p>
+<p>At \(b = 0\): every term is \(\ln 2 = 0.693\), so \(\mathcal{L}_0 = 32{,}768 \times 0.693 = 22{,}713\), and the gradient on \(b\) is \(+16{,}383\). Almost all of it comes from the negatives. The first optimizer steps would spend their effort pushing every pair apart (correcting the base rate) instead of learning which pairs match. That is the “massive over-correction” the paper avoids with \(b = -10\).</p></div>
+<figure class="fig" id="sg-bias"><div class="fig-body">
+<div class="sg-grid">
+<label for="sg-bias-n">Batch size \(N = 2^k\)</label><input type="range" id="sg-bias-n" min="8" max="20" step="1" value="15"><output id="sg-bias-nv"></output>
+<label for="sg-bias-b">Initial bias \(b\)</label><input type="range" id="sg-bias-b" min="-16" max="4" step="0.1" value="-10"><output id="sg-bias-bv"></output></div>
+<svg id="sg-bias-svg" viewBox="0 0 640 260" role="img" aria-label="Loss at initialization as a function of the bias, split into the positive and negative parts"></svg>
+<div class="sg-leg"><span style="--c:var(--ok)">positive part sp(−b)</span><span style="--c:var(--k)">negative part (N − 1)·sp(b)</span><span style="--c:var(--tc)">total \(\mathcal{L}_0\)</span></div>
+<div class="readout" id="sg-bias-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> The loss at initialization (formula 167.4), on a log scale, as a function of the starting bias. The dashed line marks the best start \(b^\star = -\ln(N-1)\).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The green curve (one positive per row) wants \(b\) large; the orange curve (\(N - 1\) negatives) wants \(b\) very negative. Their sum has its minimum at \(b^\star\), which moves left by \(\ln 2 = 0.69\) every time you double the batch. Note that the temperature does not appear: at initialization the cosines are near 0, so \(t\) multiplies almost nothing. At \(b = 0\) the loss and the gradient on \(b\) are thousands of times larger than at \(b^\star\).</p></details></figure>
+<p>The paper’s ablation (base model, batch 8k, 900M examples) shows that this matters [Certain, their Table 4]. Zero-shot ImageNet accuracy was 63.0% with \(b = -10\), \(t' = \log 10\); 62.0% with no bias at all; 61.7% with \(b = 0\); and only 53.7% with \(b = 0\) together with \(t' = \log 1\) (\(t = 1\)).</p>
+
+<h2>No softmax over the batch: the chunked implementation</h2>
+<p>Contrastive training uses data parallelism: the global batch \(|B|\) is split over \(D\) devices, each holding \(b_d = |B|/D\) pairs. (We write \(b_d\) to keep it apart from the bias \(b\).) To compute CLIP’s softmax for one image, a device needs the logits against <b>all</b> \(|B|\) captions, because the normalizer is a sum over the whole row. The usual way is to all-gather every embedding onto every device. A naive implementation then builds the full \(|B| \times |B|\) matrix; a careful one builds \(b_d \times |B|\) logits per device.</p>
+<p>The sigmoid loss is a plain sum of independent cell terms, so it can be cut into \(D \times D\) blocks and summed in any order:</p>
+<div class="eq">\[ \mathcal{L}_{\text{SigLIP}} = -\frac{1}{|B|} \sum_{d_i = 1}^{D} \;\sum_{d_j = 1}^{D} \;\sum_{i \in d_i} \;\sum_{j \in d_j} \log \sigma\!\big(z_{ij}\, \ell_{ij}\big) \tag{167.5} \]</div>
+<p>The outer sum runs on each device in parallel (sum over \(d_i\)). The middle sum is a ring: at each step every device passes its captions to its neighbour (a <b>collective permute</b>), computes the \(b_d \times b_d\) block of logits against the captions it holds now, adds the block’s loss, and throws the block away. After \(D\) steps every image has met every caption, and one final cross-device sum gives the loss. At no time does a device hold more than \(b_d \times b_d\) logits. The paper reports that \(D\) collective permutes are typically faster than two all-gathers [Certain, Section 3.3].</p>
+<figure class="fig wide" id="sg-ring"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="sg-ring-prev">Back</button><button type="button" class="btn primary" id="sg-ring-play">Play</button><button type="button" class="btn" id="sg-ring-next">Next</button><span id="sg-ring-lab" class="sg-lab"></span></div>
+<div class="scroll-x"><svg id="sg-ring-svg" viewBox="0 0 720 330" role="img" aria-label="A 12 by 12 matrix of pairs split over three devices, filled block by block"></svg></div>
+<div class="sg-leg"><span style="--c:var(--q)">device 1</span><span style="--c:var(--k)">device 2</span><span style="--c:var(--v)">device 3</span><span style="--c:var(--ink)">block in memory now</span></div>
+<div class="readout" id="sg-ring-info" aria-live="polite"></div>
+<div class="sg-grid" style="margin-top:10px">
+<label for="sg-ring-B">Real global batch \(|B| = 2^k\)</label><input type="range" id="sg-ring-B" min="12" max="20" step="1" value="15"><output id="sg-ring-Bv"></output>
+<label for="sg-ring-D">Devices \(D = 2^k\)</label><input type="range" id="sg-ring-D" min="1" max="10" step="1" value="8"><output id="sg-ring-Dv"></output></div>
+<div class="readout" id="sg-ring-mem" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The chunked sigmoid loss with \(D = 3\) devices and 4 pairs per device (the same mock setup as Figure 1 of the SigLIP paper). Columns are images, rows are captions. The sliders below compute the memory for a real batch: logits in FP32 (4 bytes each).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Step 1: each device holds its own images and captions. Step 2: each device computes its diagonal block, which contains its positives. Steps 3 and 4: captions move one device along the ring, and each device computes a block of pure negatives. The bright block is the only thing in memory; finished blocks are faded. The last step adds the three per-device sums. With the default real numbers, \(|B| = 32{,}768\) on 256 devices, each block is \(128 \times 128\): 65.5 kB, compared with 16.8 MB for one device’s \(128 \times 32{,}768\) slice and 4.29 GB for the full matrix.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>A softmax can also be computed in chunks, with a running maximum and a running sum, as FlashAttention does (<a href="../inference/attention-operator-1-flashattention-1-2-and.html">session 124</a>). So the chunked trick is not impossible for CLIP; it is just more work, and the softmax still needs its two directions handled separately. With the sigmoid it is trivial. The other benefit is the quadratic-memory one: per-device memory depends on \(b_d\), which stays fixed when you grow \(|B|\) by adding devices.</aside>
+<div class="algo"><div class="algo-h">Algorithm 1: the SigLIP loss on one device (plain version)</div><ol>
+<li><b>input:</b> image embeddings \(F \in \R^{n \times d}\), text embeddings \(G \in \R^{n \times d}\), parameters \(t', b\)</li>
+<li>\(U \leftarrow\) normalize rows of \(F\); \(\;V \leftarrow\) normalize rows of \(G\)</li>
+<li>\(L \leftarrow e^{t'}\, U V^\top + b\) <span class="c">// n × n logits, formula (167.1)</span></li>
+<li>\(Z \leftarrow 2I - \mathbf{1}\mathbf{1}^\top\) <span class="c">// +1 on the diagonal, −1 elsewhere</span></li>
+<li><b>return</b> \(-\tfrac{1}{n} \sum_{i,j} \log\sigma(Z_{ij} L_{ij})\) <span class="c">// formula (167.2); use a stable log-sigmoid</span></li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: the chunked ring version on device k of D</div><ol>
+<li><b>input:</b> local images \(U_k\) and captions \(V_k\) (\(b_d\) each), \(t, b\)</li>
+<li>\(\text{acc} \leftarrow 0\); \(\;V \leftarrow V_k\)</li>
+<li><b>for</b> step \(s = 0, \dots, D - 1\):</li>
+<li class="i1">\(L \leftarrow t\, U_k V^\top + b\) <span class="c">// only b_d × b_d in memory</span></li>
+<li class="i1">labels: \(Z \leftarrow 2I - \mathbf{1}\mathbf{1}^\top\) if \(s = 0\) (own captions), else \(Z \leftarrow -\mathbf{1}\mathbf{1}^\top\)</li>
+<li class="i1">\(\text{acc} \leftarrow \text{acc} - \sum \log\sigma(Z \odot L)\)</li>
+<li class="i1">\(V \leftarrow\) captions received from the neighbour device <span class="c">// collective permute</span></li>
+<li><b>return</b> \(\tfrac{1}{|B|}\,\text{all-reduce-sum}(\text{acc})\) <span class="c">// formula (167.5)</span></li></ol></div>
+
+<h2>Does SigLIP still need a huge batch?</h2>
+<p>CLIP used a batch of 32,768, and the CLIP session showed why softmax training likes big batches: the bound \(I \ge \ln N - \mathcal{L}\) (formula 166.8) cannot certify more than \(\ln N\) nats of shared information. Removing the batch-wide softmax lets us ask the question directly. The SigLIP paper trained with batches from 512 up to one million and found [Certain, Sections 4.1 and 4.2]:</p>
+<ul>
+<li><b>Small batches:</b> below 16k, the sigmoid loss is clearly better than the softmax loss.</li>
+<li><b>Saturation:</b> both losses saturate. SigLIP was best at batch 32k; the softmax baseline needed 98k for its best result and still did not beat it. A batch of 307k hurt both. In the frozen-image setup (SigLiT), performance saturated around 32k, and the model peaked at 256k with only a small gain.</li>
+<li><b>Many languages:</b> for multilingual SigLIP (100+ languages, 30 billion examples), ImageNet zero-shot was 71.6%, 73.2%, 73.2%, 73.2% and 73.1% for batches 16k, 32k, 64k, 128k and 240k; average cross-lingual retrieval got worse above 32k (34.9% at 32k, 32.7% at 240k).</li>
+<li><b>Cheap training:</b> because the loss needs less memory, four TPUv4 chips could fit batch 4,096 for a base SigLIP but only 2,048 for the CLIP version. With a frozen ViT-g image tower, SigLiT reached 84.5% ImageNet zero-shot on four TPUv4 chips in two days; SigLIP from scratch reached 73.4% with 32 TPUv4 chips in five days.</li></ul>
+<p>Two training details from the paper are worth knowing. Large batches made training unstable, with spikes in the gradient norm; lowering Adam’s \(\beta_2\) from 0.999 to 0.95 fixed it (the same reason LLMs use 0.95, see <a href="../foundations/optimization-backprop-adamw.html">session 4</a>). And when the image tower starts from a pretrained checkpoint, turning <b>off</b> weight decay on the pretrained weights was needed for good results [Certain, Sections 4.5 and 4.7].</p>
+<p>The paper also tested the imbalance between positives and negatives by masking negatives. Removing negatives at random hurt; keeping only the easiest ones did not work at all; keeping only the hardest ones almost kept the quality. So the imbalance itself is not a problem, and most of what the model learns from negatives comes from the hard ones [Certain, Section 4.8]. Finally, with corrupted images, corrupted texts or shuffled pairs, models trained with the sigmoid loss stayed better than softmax models as the corruption grew [Certain, Section 4.10]. A plausible reason: a wrong pair only spoils its own term, not a whole softmax row [Speculation].</p>
+
+<h2>The released SigLIP models</h2>
+<p>For the public models, SigLIP was trained for 40 billion examples at batch 32k, with 64 text tokens, then adapted to each resolution with 5 billion more examples at a 100 times smaller learning rate [Certain]. Vision and text representations are pooled with a <b>MAP head</b> (multihead attention pooling): a small attention layer with one learned query that attends over all patch tokens and returns one vector. It replaces the CLS token. The most used size is <b>So400m</b>, a “shape-optimized” ViT (Alabdulmohsin et al., 2023) whose width, depth and MLP size were chosen by a scaling study instead of copying ViT-L or ViT-H. Its <code>config.json</code> on Hugging Face: 27 layers, width 1,152, MLP width 4,304, 16 heads, patch 14 [Certain]. The 27 blocks alone hold 411 million weights (our count from those shapes).</p>
+<p>The number of visual tokens is fixed by the resolution \(R\) and the patch size \(p\):</p>
+<div class="eq">\[ n_{\text{tokens}} = \left\lfloor \frac{R}{p} \right\rfloor^{2} \qquad \text{e.g. } \lfloor 384/14 \rfloor^2 = 27^2 = 729, \quad (224/14)^2 = 256, \quad (512/16)^2 = 1024 \tag{167.6} \]</div>
+<div class="tblw"><table class="tb"><thead><tr><th>Model (ImageNet zero-shot, SigLIP paper Table 3)</th><th>Patch tokens</th><th>ImageNet 0-shot</th><th>COCO image → text R@1</th></tr></thead><tbody>
+<tr><td>CLIP B/16 (OpenAI)</td><td>196</td><td>68.3</td><td>52.4</td></tr>
+<tr><td>SigLIP B/16 at 224</td><td>196</td><td>76.2</td><td>64.4</td></tr>
+<tr><td>SigLIP B/16 at 512</td><td>1,024</td><td>79.2</td><td>67.6</td></tr>
+<tr><td>CLIP L/14 at 336 (OpenAI)</td><td>576</td><td>76.6</td><td>57.9</td></tr>
+<tr><td>SigLIP L/16 at 384</td><td>576</td><td>82.1</td><td>70.6</td></tr>
+<tr><td>SigLIP So400m/14 at 384</td><td>729</td><td>83.2</td><td>70.2</td></tr></tbody></table></div>
+<p>These SigLIP models were trained on WebLI, Google’s web image–text dataset, while CLIP used its own 400M pairs, so the table mixes the effect of the loss with the effect of data and training length [Certain]. The loss alone is measured by the batch-size study above, where both losses saw the same data.</p>
+
+<h2>SigLIP 2: same towers, more training signals</h2>
+<p>CLIP-style training has two known weaknesses. The pooled vector is good for “what is in this image” but the per-patch features are weak for “where is it” (localization, segmentation, depth). And the models are mostly English. SigLIP 2 keeps the SigLIP architecture (so you can swap the weights and the tokenizer into existing code) and fixes both with a staged recipe [Certain, SigLIP 2 Section 2]:</p>
+<ol>
+<li><b>Sigmoid loss + LocCa decoder (whole run).</b> A small transformer decoder reads the un-pooled patch tokens through cross-attention and learns three tasks: write the caption, predict the box for a region description (referring expressions), and write a caption for a given box (grounded captioning). The region–caption pairs are made automatically with an open-vocabulary detector. The decoder has half the layers of the text tower, and it is thrown away after training. The two losses get equal weight.</li>
+<li><b>Self-distillation and masked prediction (last 20%).</b> At 80% of training, an EMA teacher (an exponential moving average of the student’s weights, as in DINO, see <a href="../vision/self-supervised-vision-mae-dino-dinov2-dinov3.html">session 165</a>) is added. SILC loss: the student sees 8 small local crops and must match the teacher’s features of the full image. TIPS loss: 50% of the student’s patches are replaced by a mask token and the student must match the teacher’s per-patch features at those places.</li>
+<li><b>Resolution variants.</b> Fixed-resolution checkpoints branch off at 95% and finish at their target resolution. The NaFlex variant branches off at 90% (next section).</li>
+<li><b>Small models: distillation through data.</b> B/16 and B/32 get 4 billion more examples with the ACID method: a strong teacher and the student score a super-batch of 64k examples by “learnability”, and the best 32k form the training batch.</li></ol>
+<div class="eq">\[ \mathcal{L}_{\text{SigLIP 2}} = \mathcal{L}_{\text{sigmoid}} + \mathcal{L}_{\text{LocCa}} + \mathbb{1}[\text{progress} \ge 80\%]\; w_{\text{size}} \big( \mathcal{L}_{\text{SILC}} + 0.25\, \mathcal{L}_{\text{TIPS}} \big) \tag{167.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathcal{L}_{\text{LocCa}}\)</dt><dd>next-token loss of the decoder on captions, referring expressions (box coordinates as text) and grounded captions</dd>
+<dt>\(\mathcal{L}_{\text{SILC}}\)</dt><dd>local-to-global self-distillation on pooled features</dd>
+<dt>\(\mathcal{L}_{\text{TIPS}}\)</dt><dd>masked prediction on per-patch features</dd>
+<dt>\(w_{\text{size}}\)</dt><dd>0.25, 0.5, 1.0 and 0.5 for the B, L, So400m and g sizes: a balance between global and dense quality</dd></dl>
+<p>Other settings [Certain]: WebLI with 10 billion images and 12 billion alt-texts in 109 languages, mixed 90% English and 10% other languages, with de-biasing filters; the multilingual Gemma tokenizer (256k vocabulary), text lower-cased, 64 tokens; Adam with learning rate \(10^{-3}\), decoupled weight decay \(10^{-4}\), gradient clipping at 1, batch 32k, cosine schedule with 20k warmup steps, 40 billion examples, up to 2,048 TPUv5e chips with FSDP (<a href="../pretraining/fsdp-version-1.html">session 46</a>). Sizes: ViT-B (86M), L (303M), So400m (400M) and g (1B).</p>
+<figure class="fig wide" id="sg-rec"><div class="fig-body">
+<div class="sg-grid">
+<label for="sg-rec-p">Training progress</label><input type="range" id="sg-rec-p" min="0" max="110" step="1" value="50"><output id="sg-rec-pv"></output></div>
+<div class="controls" style="margin-top:6px"><span class="seg" id="sg-rec-size"><button type="button" data-v="B" aria-pressed="false">B (86M)</button><button type="button" data-v="L" aria-pressed="false">L (303M)</button><button type="button" data-v="So400m" aria-pressed="true">So400m</button><button type="button" data-v="g" aria-pressed="false">g (1B)</button></span></div>
+<div class="scroll-x"><svg id="sg-rec-svg" viewBox="0 0 720 300" role="img" aria-label="The SigLIP 2 training recipe with the losses that are active at the chosen point of training"></svg></div>
+<div class="readout" id="sg-rec-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> The SigLIP 2 recipe. Boxes light up when their loss is active at the chosen point of training. Progress above 100% is the extra distillation stage that only the B-sized models get.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>From 0 to 80% only the sigmoid loss and the LocCa decoder train the image tower. At 80% the EMA teacher and the two self-supervised losses switch on, with the weight that depends on the model size (try B versus So400m). At 90% the NaFlex variant leaves the main run; at 95% the fixed-resolution variants leave. The decoder and the teacher are only training tools: the released checkpoint is just the two towers.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 3: the SigLIP 2 schedule (one model size)</div><ol>
+<li><b>for</b> each step, with progress \(p\) from 0 to 1:</li>
+<li class="i1">embed images and captions; \(\mathcal{L} \leftarrow \mathcal{L}_{\text{sigmoid}}\) <span class="c">// formula (167.2)</span></li>
+<li class="i1">run the decoder on the un-pooled patch tokens; \(\mathcal{L} \leftarrow \mathcal{L} + \mathcal{L}_{\text{LocCa}}\) <span class="c">// caption, referring expression, grounded caption</span></li>
+<li class="i1"><b>if</b> \(p \ge 0.8\): build 1 global and 8 local augmented views; teacher \(\leftarrow\) EMA of student</li>
+<li class="i2">\(\mathcal{L} \leftarrow \mathcal{L} + w_{\text{size}}(\mathcal{L}_{\text{SILC}} + 0.25\,\mathcal{L}_{\text{TIPS}})\) <span class="c">// formula (167.7); the image–text losses use the original image</span></li>
+<li class="i1">Adam step with clipping at 1, cosine learning rate</li>
+<li class="i1"><b>if</b> \(p = 0.90\): fork the NaFlex run; <b>if</b> \(p = 0.95\): fork one run per fixed resolution</li>
+<li><b>for</b> B/16 and B/32 only: 4B more examples with sigmoid loss, lr \(10^{-5}\), no weight decay, batches picked by ACID from 64k candidates</li></ol></div>
+<p>What did it buy? A few numbers from the SigLIP 2 paper [Certain, Tables 1–3]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Task</th><th>Model</th><th>SigLIP</th><th>SigLIP 2</th></tr></thead><tbody>
+<tr><td>ImageNet zero-shot (%)</td><td>B/16 at 224</td><td>76.2</td><td>78.2</td></tr>
+<tr><td>ImageNet zero-shot (%)</td><td>So400m/14 at 384</td><td>83.2</td><td>84.1</td></tr>
+<tr><td>XM3600 text → image R@1 (%, 36 languages)</td><td>So400m/14 at 384</td><td>17.8</td><td>48.4</td></tr>
+<tr><td>PASCAL segmentation, frozen features (mIoU)</td><td>So400m/14 at 224</td><td>72.0</td><td>77.1</td></tr>
+<tr><td>ADE20k segmentation, frozen features (mIoU)</td><td>So400m/14 at 224</td><td>37.6</td><td>41.8</td></tr>
+<tr><td>NYUv2 depth, frozen features (RMSE, lower is better)</td><td>So400m/14 at 224</td><td>0.576</td><td>0.493</td></tr>
+<tr><td>Open-vocabulary segmentation ADE-150 with Cat-Seg (mIoU)</td><td>L/16</td><td>37.5</td><td>38.8</td></tr></tbody></table></div>
+<p>The global numbers move by 1–2 points; the multilingual and dense numbers move a lot. That matches the design: the new losses target per-patch features and the data targets languages. The paper also reports that SigLIP 2 beats SigLIP and AIMv2 as the frozen encoder of a PaliGemma-style VLM, and improves referring-expression and open-vocabulary detection results [Certain, Sections 3.2–3.4].</p>
+
+<h2>NaFlex: native aspect ratio, several sequence lengths</h2>
+<p>A fixed-resolution model squashes every image to a square, for example 256 × 256. A wide receipt or a tall phone screenshot gets distorted, and small text becomes unreadable. NaFlex combines two older ideas: NaViT (keep the native aspect ratio, see <a href="../vision/index.html#row-high-resolution-and-native-aspect-ratio" title="High resolution and native aspect ratio (planned)">session 180</a>) and FlexiViT (one model for several sequence lengths). Given a patch size \(p\) and a token budget \(S_{\max}\), it resizes the image by one scale factor \(s\) and rounds each side up to a multiple of \(p\):</p>
+<div class="eq">\[ H' = p \left\lceil \frac{s H}{p} \right\rceil, \quad W' = p \left\lceil \frac{s W}{p} \right\rceil, \qquad s = \max \Big\{ s : \frac{H'}{p} \cdot \frac{W'}{p} \le S_{\max} \Big\} \tag{167.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(H, W\)</dt><dd>the original height and width in pixels</dd>
+<dt>\(H', W'\)</dt><dd>the resized sides, multiples of the patch size \(p = 16\)</dd>
+<dt>\(S_{\max}\)</dt><dd>the token budget; NaFlex was trained with \(S_{\max} \in \{128, 256, 576, 784, 1024\}\), sampled per mini-batch</dd></dl>
+<p>Because of the rounding, the aspect ratio changes a little: by at most \((p-1)/W'\) in width and \((p-1)/H'\) in height. Unused token slots are padding, and a mask hides them from attention and from the MAP head. The learned position embedding is a \(16 \times 16\) grid, resized bilinearly to the actual patch grid, for example \(21 \times 12\) [Certain, SigLIP 2 Section 2.4.2]. The Hugging Face processor finds \(s\) with a binary search; Figure 6 runs the same search.</p>
+<figure class="fig" id="sg-nf"><div class="fig-body">
+<div class="sg-grid">
+<label for="sg-nf-w">Image width (px)</label><input type="range" id="sg-nf-w" min="64" max="2400" step="8" value="1920"><output id="sg-nf-wv"></output>
+<label for="sg-nf-h">Image height (px)</label><input type="range" id="sg-nf-h" min="64" max="2400" step="8" value="1080"><output id="sg-nf-hv"></output></div>
+<div class="controls" style="margin-top:6px"><span class="sg-lab">Token budget \(S_{\max}\):</span><span class="seg" id="sg-nf-s"><button type="button" data-v="128" aria-pressed="false">128</button><button type="button" data-v="256" aria-pressed="true">256</button><button type="button" data-v="576" aria-pressed="false">576</button><button type="button" data-v="784" aria-pressed="false">784</button><button type="button" data-v="1024" aria-pressed="false">1024</button></span></div>
+<div class="scroll-x"><svg id="sg-nf-svg" viewBox="0 0 640 280" role="img" aria-label="The patch grid chosen by NaFlex next to the square grid of a fixed-resolution model"></svg></div>
+<div class="readout" id="sg-nf-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 6.</b> NaFlex resizing (formula 167.8, patch size 16). Left: the patch grid NaFlex uses, with the aspect ratio kept. Right: a fixed-resolution model with the same budget, which squashes the image into a square grid.</figcaption>
+<details class="howto"><summary>How to read Figure 6</summary><p>A 1920 × 1080 frame with budget 256 becomes 336 × 192 pixels: a 21 × 12 grid, 252 tokens, 4 padding slots. The aspect ratio goes from 1.778 to 1.750. The square model would use 16 × 16 and stretch the image vertically by 1.78. Try a long strip (2400 × 200): NaFlex gives it a wide, short grid, while the square model squeezes it horizontally by a factor of 12. The paper found NaFlex better on OCR, document and screen retrieval, especially at small budgets, while the square B-sized model was slightly better on natural-image benchmarks [Certain, SigLIP 2 Section 3.1.1].</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 4: NaFlex preprocessing for one image</div><ol>
+<li><b>input:</b> image \(H \times W\), patch size \(p\), budget \(S_{\max}\)</li>
+<li>binary search the largest scale \(s\) with \(\lceil sH/p\rceil \cdot \lceil sW/p\rceil \le S_{\max}\) <span class="c">// formula (167.8)</span></li>
+<li>resize to \(H' \times W'\); cut into \(n = H'W'/p^2\) patches, row by row</li>
+<li>resize the \(16 \times 16\) position-embedding grid bilinearly to \(H'/p \times W'/p\)</li>
+<li>pad the patch sequence to \(S_{\max}\); mask \(\leftarrow\) 1 for real patches, 0 for padding</li>
+<li>run the ViT and the MAP head with the mask in every attention layer</li></ol></div>
+
+<h2>The PyTorch version</h2>
+<p>The code builds the loss of Algorithm 1, checks it against binary cross-entropy and against the gradient formula (167.3), checks that the ring version of Algorithm 2 gives the same number, prints the start-of-training loss for both biases, and trains a tiny SigLIP on toy pairs. It needs only PyTorch and runs in a few seconds on a CPU.</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+<span class="kw2">import</span> torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="cm"># 1) the sigmoid loss, formula (167.2): every image-text pair is one yes/no question</span>
+<span class="kw2">def</span> siglip_loss(img_emb, txt_emb, t_prime, b):
+    x = F.normalize(img_emb, dim=-1)                 <span class="cm"># (n, d) unit vectors</span>
+    y = F.normalize(txt_emb, dim=-1)
+    logits = t_prime.exp() * x @ y.T + b             <span class="cm"># (n, n) scores</span>
+    n = logits.shape[0]
+    z = 2 * torch.eye(n) - 1                          <span class="cm"># +1 on the diagonal, -1 elsewhere</span>
+    <span class="kw2">return</span> -F.logsigmoid(z * logits).sum() / n, logits
+
+n, d = 8, 32
+img, txt = torch.randn(n, d), torch.randn(n, d)
+t_prime = torch.tensor(math.log(10.0), requires_grad=True)   <span class="cm"># t = 10 at start</span>
+b = torch.tensor(-10.0, requires_grad=True)                  <span class="cm"># b = -10 at start</span>
+loss, logits = siglip_loss(img, txt, t_prime, b)
+
+<span class="cm"># 2) the same loss as plain binary cross-entropy with 0/1 labels</span>
+bce = F.binary_cross_entropy_with_logits(logits, torch.eye(n), reduction="sum") / n
+print(f"loss {loss.item():.4f}  as BCE {bce.item():.4f}")   <span class="cm"># identical</span>
+
+<span class="cm"># 3) gradient on each logit, formula (167.3): (sigmoid(l) - label) / n</span>
+logits.retain_grad(); loss.backward()
+expected = (torch.sigmoid(logits) - torch.eye(n)) / n
+print("grad matches:", torch.allclose(logits.grad, expected, atol=1e-7))
+print(f"dL/db = {b.grad.item():.4f}   (n*sigmoid(b) - 1 when all cosines are 0: {n*torch.sigmoid(b).item()-1:.4f})")
+
+<span class="cm"># 4) the chunked "ring" version, formula (167.5): D devices, only b x b logits at a time</span>
+<span class="kw2">def</span> siglip_chunked(img_emb, txt_emb, t, bias, D):
+    x, y = F.normalize(img_emb, dim=-1), F.normalize(txt_emb, dim=-1)
+    xs, ys = x.chunk(D), y.chunk(D)                  <span class="cm"># device k holds xs[k], ys[k]</span>
+    total = 0.0
+    <span class="kw2">for</span> k <span class="kw2">in</span> range(D):                               <span class="cm"># (runs in parallel on real devices)</span>
+        <span class="kw2">for</span> step <span class="kw2">in</span> range(D):                        <span class="cm"># texts move one device per step</span>
+            j = (k + step) % D
+            l = t * xs[k] @ ys[j].T + bias           <span class="cm"># only (n/D) x (n/D) in memory</span>
+            z = (2 * torch.eye(len(xs[k])) - 1) <span class="kw2">if</span> j == k <span class="kw2">else</span> -torch.ones_like(l)
+            total = total - F.logsigmoid(z * l).sum()
+    <span class="kw2">return</span> total / len(img_emb)
+
+<span class="kw2">with</span> torch.no_grad():
+    full, _ = siglip_loss(img, txt, t_prime, b)
+    ring = siglip_chunked(img, txt, t_prime.exp(), b, D=4)
+print(f"full {full.item():.6f}  chunked {ring.item():.6f}")
+
+<span class="cm"># 5) why b starts at -10: loss at the start for a batch of 32,768 with cosines near 0</span>
+N = 32768
+<span class="kw2">for</span> b0 <span class="kw2">in</span> [-10.0, 0.0]:
+    s = torch.tensor(b0)
+    start = F.softplus(-s) + (N - 1) * F.softplus(s)       <span class="cm"># 1 positive + (N-1) negatives per row</span>
+    print(f"b = {b0:5.1f}: start loss {start.item():10.2f}, best b = -ln(N-1) = {-math.log(N-1):.2f}")
+
+<span class="cm"># 6) a tiny SigLIP on toy pairs: two linear towers, batch 16</span>
+torch.manual_seed(0)
+K, d_img, d_txt = 64, 20, 12
+concepts = torch.randn(K, 8)
+A, Bm = torch.randn(8, d_img), torch.randn(8, d_txt)
+<span class="kw2">def</span> batch(m):
+    c = torch.randint(0, K, (m,))
+    <span class="kw2">return</span> concepts[c] @ A + 0.3 * torch.randn(m, d_img), concepts[c] @ Bm + 0.3 * torch.randn(m, d_txt), c
+f, g = torch.nn.Linear(d_img, 16), torch.nn.Linear(d_txt, 16)
+tp, bb = torch.nn.Parameter(torch.tensor(math.log(10.0))), torch.nn.Parameter(torch.tensor(-10.0))
+opt = torch.optim.AdamW([*f.parameters(), *g.parameters(), tp, bb], lr=1e-2, betas=(0.9, 0.95))
+<span class="kw2">for</span> step <span class="kw2">in</span> range(1500):
+    xi, yi, _ = batch(16)
+    loss, _ = siglip_loss(f(xi), g(yi), tp, bb)
+    opt.zero_grad(); loss.backward(); opt.step()
+<span class="kw2">with</span> torch.no_grad():
+    xi, yi, c = batch(256)
+    sims = F.normalize(f(xi), dim=-1) @ F.normalize(g(yi), dim=-1).T
+    acc = (c[sims.argmax(1)] == c).float().mean()          <span class="cm"># retrieved text has the same concept</span>
+print(f"final loss {loss.item():.3f}, t = {tp.exp().item():.1f}, b = {bb.item():.2f}, retrieval accuracy: {acc.item():.2f}")</pre>
+<p>Output on CPU (we ran it twice; the output is identical): the loss is 10.8495 both ways; the gradient check prints <code>True</code>; \(dL/db = -0.9990\) (close to \(8\sigma(-10) - 1 = -0.9996\), because random cosines are not exactly 0); full and chunked losses agree (10.849527 and 10.849526, a float rounding difference); the start loss is 11.49 for \(b = -10\) and 22,713.05 for \(b = 0\), with \(b^\star = -10.40\); after 1,500 steps of batch 16 the loss is 0.244, \(t = 12.1\), \(b = -10.18\), and retrieval accuracy over 256 toy pairs is 1.00. A batch of 16 is far below what CLIP-style training likes, and the toy still learns; real data is much harder, so do not read more into this than “the code works”. In real code, the Hugging Face <code>SiglipModel</code> returns <code>logits_per_image</code>; apply <code>torch.sigmoid</code> to it, not a softmax.</p>
+
+<h2>Why open VLMs use a SigLIP-family encoder</h2>
+<p>A VLM does not use SigLIP’s final pooled vector. It takes the patch tokens from the last (or second-to-last) layer, passes them through a connector, and feeds them to the language model as “visual words” (<a href="../vision/index.html#row-connectors-projector-q-former-perceiver-resampler-pixel" title="Connectors: projector, Q-Former, Perceiver resampler, pixel shuffle (planned)">session 178</a>). What makes SigLIP a good choice for that job?</p>
+<ul>
+<li><b>Strong features per patch and per image.</b> Image–text training gives features that already line up with words. SigLIP 2 adds the dense and localization signals that VLM tasks (OCR, grounding, counting) need.</li>
+<li><b>Open weights in many sizes and resolutions.</b> B, L, So400m and g; 224 to 512 pixels; patch 14 or 16; and NaFlex. You choose the token count with formula (167.6).</li>
+<li><b>Good quality for its size.</b> So400m is about the size of ViT-L but scored higher than much larger CLIP-style models in the SigLIP paper (83.2% vs 82.0% for a 5B EVA-CLIP, Table 3) [Certain].</li>
+<li><b>Cheaper to train and to continue training.</b> The sigmoid loss works at smaller batches and needs little memory, which matters when a lab wants its own variant.</li></ul>
+<div class="tblw"><table class="tb"><thead><tr><th>VLM</th><th>Vision encoder</th><th>Input</th><th>Visual tokens</th></tr></thead><tbody>
+<tr><td>PaliGemma</td><td>SigLIP So400m/14 [Certain, PaliGemma paper]</td><td>224 (also 448, 896)</td><td>256 at 224</td></tr>
+<tr><td>LLaVA-OneVision</td><td>SigLIP So400m/14 shape, 26 of the 27 layers (<code>num_hidden_layers: 26</code> in its config) [Certain]</td><td>384 tiles</td><td>729 per tile</td></tr>
+<tr><td>Idefics2</td><td>So400m/14 shape (1,152 wide, 27 layers) [Certain, config]; initialized from SigLIP [Likely]</td><td>up to 980</td><td>70 × 70 = 4,900 patches, then a resampler</td></tr>
+<tr><td>SmolVLM (2.2B)</td><td>So400m/14 shape at 384 [Certain, config]</td><td>384 tiles</td><td>729, pixel shuffle by 3 → 81 (<code>image_seq_len: 81</code>)</td></tr>
+<tr><td>SmolVLM-256M</td><td>SigLIP B/16 shape at 512 (12 layers, width 768) [Certain, config]</td><td>512 tiles</td><td>1,024, pixel shuffle by 4 → 64</td></tr>
+<tr><td>Gemma 3</td><td>400M SigLIP-style encoder, So400m/14 shape [Certain, config]</td><td>896</td><td>64 × 64 = 4,096 patches, pooled to 256 (<code>mm_tokens_per_image: 256</code>)</td></tr></tbody></table></div>
+<p>Notice how the token budget drives the design: an 896-pixel Gemma 3 image would be 4,096 tokens without pooling, so each VLM adds pooling, pixel shuffle or a resampler to cut the count (<a href="../vision/index.html#row-visual-token-efficiency" title="Visual token efficiency (planned)">session 183</a>). Other families use other encoders: Qwen2-VL and InternVL train their own ViTs (<a href="../vision/index.html#row-case-studies-2-qwen2-5-vl-internvl" title="Case studies 2: Qwen2.5-VL, InternVL, PaliGemma and Gemma, SmolVLM (planned)">session 182</a>).</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>How SigLIP is used</th></tr></thead><tbody>
+<tr><td>Vision encoder of VLMs</td><td>Patch tokens from a frozen or fine-tuned SigLIP tower feed the connector and the LLM (table above)</td></tr>
+<tr><td>Multi-label tagging and filtering</td><td>One sigmoid score per tag prompt; keep every tag above a tuned threshold; “no tag” is a valid answer (Figure 2)</td></tr>
+<tr><td>Multilingual image search</td><td>SigLIP 2 embeds queries in 100+ languages into the same space; XM3600 retrieval rose from 17.8 to 48.4 R@1 for So400m/384</td></tr>
+<tr><td>Document, screen and receipt retrieval</td><td>NaFlex keeps the aspect ratio, so small text survives (Figure 6)</td></tr>
+<tr><td>Open-vocabulary detection and segmentation</td><td>OWL-ViT-style heads and Cat-Seg on SigLIP 2 patch features (<a href="../vision/index.html#row-open-vocabulary-detection-and-segmentation" title="Open-vocabulary detection and segmentation (planned)">session 168</a>)</td></tr>
+<tr><td>Text-to-video retrieval and video classification</td><td>Embed sampled frames, pool over time, score against text prompts (<a href="../video/index.html#row-text-to-video-retrieval" title="Text-to-video retrieval (planned)">session 208</a>, <a href="../video/index.html#row-action-recognition" title="Action recognition (planned)">session 203</a>); motion-heavy actions need a video encoder [Likely]</td></tr>
+<tr><td>Key-moment detection</td><td>Sigmoid score of every frame against “a goal is scored”; the absolute score lets you threshold moments instead of only ranking frames (<a href="../video/index.html#row-temporal-grounding-and-key-moment-detection" title="Temporal grounding and key-moment detection (planned)">session 207</a>)</td></tr>
+<tr><td>Video fingerprinting and Video-RAG</td><td>Per-frame image embeddings as a robust fingerprint and as the retrieval index for video question answering (<a href="../video/index.html#row-video-fingerprinting-and-near-duplicate-detection" title="Video fingerprinting and near-duplicate detection (planned)">session 209</a>, <a href="../video/index.html#row-video-question-answering-and-video-rag" title="Video question answering and Video-RAG (planned)">session 210</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Softmax over SigLIP logits.</b> Ranking is unchanged, but the probabilities lose their meaning, and “none of these” disappears. Use <code>torch.sigmoid(logits_per_image)</code>.</li>
+<li><b>Wrong text preprocessing.</b> SigLIP text towers were trained with captions padded to a fixed length (64 tokens for the released models), and SigLIP 2 lower-cases text. Hugging Face recommends <code>padding="max_length"</code> for SigLIP [Likely]. Different padding gives silently worse embeddings.</li>
+<li><b>Starting with \(b = 0\).</b> The loss starts in the tens of thousands and the first steps only fix the base rate (Figure 3). Start near \(-\ln N\) (the paper uses −10).</li>
+<li><b>Dividing by \(N^2\) instead of \(N\).</b> The loss becomes \(N\) times smaller and so do the gradients; with Adam the effect is partly hidden, with SGD the learning rate is effectively wrong.</li>
+<li><b>Thinking the sigmoid removes false negatives.</b> Duplicates and near-duplicates in a batch are still labeled −1 (the dog/puppy cells in Figure 1). Deduplicate data, or accept the noise.</li>
+<li><b>Weight decay on a pretrained image tower.</b> When you continue training SigLIP from pretrained weights, the paper needed to switch weight decay off for those weights.</li>
+<li><b>Mismatched resolution.</b> Feeding 512-pixel images to a 224 checkpoint without resizing the position embeddings, or mixing up patch 14 and 16 checkpoints, changes the token count (formula 167.6) and the quality.</li>
+<li><b>Using the pooled vector for dense tasks.</b> The MAP-head output is one vector per image. Segmentation, grounding and VLMs need the un-pooled patch tokens.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Write the SigLIP loss and explain each part.<span class="lvl">basic</span></summary><div class="ans">With unit embeddings \(\mathbf{u}_i, \mathbf{v}_j\), logits \(\ell_{ij} = t\,\mathbf{u}_i^\top\mathbf{v}_j + b\) and labels \(z_{ij} = +1\) if \(i = j\), else −1: \(\mathcal{L} = -\frac1N\sum_{i,j}\log\sigma(z_{ij}\ell_{ij})\). Each of the \(N^2\) pairs is a binary classification (“match or not”); \(t = e^{t'}\) is a learned scale, \(b\) a learned bias. There is no normalization across the batch, and one term per pair makes the loss symmetric in images and texts.</div></details>
+<details class="qa"><summary>What is the bias for, and why is it initialized to −10?<span class="lvl">core</span></summary><div class="ans">There are \(N\) positives and \(N^2 - N\) negatives, so the base rate of a match is \(1/N\). At initialization all cosines are near 0 and every logit equals \(b\). The start loss \(\operatorname{sp}(-b) + (N-1)\operatorname{sp}(b)\) is minimized at \(b^\star = -\ln(N-1)\), which is −10.40 for \(N = 32{,}768\). With \(b = 0\) the start loss is 22,713 and the gradient on \(b\) is 16,383, so early steps would only fix the base rate. In the paper’s ablation, \(b = -10\) gave 63.0% ImageNet zero-shot against 61.7% for \(b = 0\) and 53.7% for \(b = 0, t = 1\).</div></details>
+<details class="qa"><summary>Why is the sigmoid loss easier to distribute across devices than CLIP’s?<span class="lvl">core</span></summary><div class="ans">CLIP’s softmax for an image needs the normalizer over all \(|B|\) captions, so implementations all-gather embeddings and hold at least \(b_d \times |B|\) logits per device. The sigmoid loss is a sum of independent pair terms, so each device can pass its captions around a ring (D collective permutes), compute a \(b_d \times b_d\) block, add it and discard it. Peak memory is \(b_d^2\), constant as you add devices. For \(|B| = 32{,}768\) on 256 devices: 65.5 kB per block instead of 16.8 MB per slice, or 4.29 GB for the full matrix in FP32.</div></details>
+<details class="qa"><summary>Does SigLIP remove the need for large batches?<span class="lvl">core</span></summary><div class="ans">Partly. Below 16k the sigmoid loss is clearly better than the softmax, so smaller batches work better. But both losses still improve up to a point and then saturate: SigLIP peaked at 32k, the softmax baseline at 98k (and was still lower), and 307k hurt both. For multilingual training, more than 32k made retrieval worse. The practical message: 32k is enough, and you can go lower with less loss than CLIP.</div></details>
+<details class="qa"><summary>Compare the gradients of the sigmoid and softmax losses with respect to one negative logit.<span class="lvl">advanced</span></summary><div class="ans">Sigmoid: \(\partial\mathcal{L}/\partial\ell_{ij} = \sigma(\ell_{ij})/N\), which depends only on that pair. Softmax (CLIP): \((P_{ij} + Q_{ij})/(2N)\), where \(P_{ij}\) is the row softmax and \(Q_{ij}\) the column softmax, so the push on one negative depends on all logits in its row and column, and the negatives compete for a fixed probability budget. Both give tiny gradients to easy negatives and large ones to hard negatives. Only the softmax creates interactions between cells; with the sigmoid, adding more negatives just adds more independent terms.</div></details>
+<details class="qa"><summary>When would you prefer sigmoid scores over softmax scores at inference?<span class="lvl">core</span></summary><div class="ans">When the answer can be “several” or “none”: multi-label tagging, content filtering, open-vocabulary detection where each region–text pair needs its own score, and key-moment detection where you threshold frames. Softmax probabilities over a class list always sum to 1 and change when you add or remove classes; a SigLIP score \(\sigma(t\cos + b)\) for one pair does not depend on the other candidates. Thresholds still need tuning on your data.</div></details>
+<details class="qa"><summary>What does SigLIP 2 add to SigLIP, and what does each addition fix?<span class="lvl">core</span></summary><div class="ans">(1) A LocCa decoder on the un-pooled patch tokens, trained on captioning, referring expressions (predict a box) and grounded captioning: better localization and OCR. (2) From 80% of training, SILC self-distillation (8 local student views match a global EMA teacher) and TIPS masked prediction (50% of patches masked): better dense features, for example PASCAL segmentation 72.0 → 77.1 mIoU and NYUv2 depth RMSE 0.576 → 0.493 for So400m/224. (3) Multilingual, de-biased WebLI (90% English) with the 256k Gemma tokenizer: XM3600 retrieval 17.8 → 48.4. (4) NaFlex for native aspect ratio. (5) ACID data-curation distillation for the B-sized models. The architecture is unchanged, so checkpoints are drop-in replacements.</div></details>
+<details class="qa"><summary>Why do many open VLMs use a SigLIP encoder, and which outputs do they use?<span class="lvl">core</span></summary><div class="ans">SigLIP towers give features aligned with language, are openly released in many sizes and resolutions, and So400m gives very high quality for its size (83.2% ImageNet zero-shot at 384 pixels). VLMs drop the MAP-head pooled vector and use the patch tokens from the last or second-to-last layer (LLaVA-OneVision keeps 26 of 27 layers), then reduce their number with a projector, pixel shuffle or pooling. PaliGemma, LLaVA-OneVision, Idefics2, SmolVLM and Gemma 3 all use SigLIP-shaped encoders.</div></details>
+<details class="qa"><summary>How does NaFlex handle different aspect ratios and sequence lengths in one model?<span class="lvl">advanced</span></summary><div class="ans">It picks the largest scale whose rounded patch grid fits the token budget (128 to 1024 tokens during training), so the aspect ratio is kept up to the rounding to multiples of 16. The learned 16 × 16 position-embedding grid is resized bilinearly to the actual grid, and padding tokens are masked in attention and in the MAP head. One checkpoint serves all budgets. It helps OCR and document tasks, interpolates well between trained lengths, but does not extrapolate well beyond them.</div></details>
+<details class="qa"><summary>Is the heavy positive/negative imbalance a problem for the sigmoid loss?<span class="lvl">advanced</span></summary><div class="ans">The bias term handles the base rate. Beyond that, the paper masked negatives to change the ratio: random removal hurt, keeping only easy negatives failed, keeping only the hardest negatives almost kept the quality, and training longer on hard negatives to match the total number of pairs was slightly better. So the imbalance is not harmful; the hard negatives carry most of the signal, and better negative mining might help.</div></details>
+<details class="qa"><summary>You continue training SigLIP from a pretrained image tower and quality drops. What do you check?<span class="lvl">basic</span></summary><div class="ans">Weight decay on the pretrained weights: the paper found that decaying them destroys their quality (10-shot ImageNet barely beat training from scratch) and that disabling weight decay for pretrained weights fixed it, together with a 0.1 learning-rate multiplier on the image tower. Also check \(\beta_2\) (0.95 was needed for stability at large batch), the bias initialization, and that the text preprocessing matches the checkpoint.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A true pair has logit 2 and a negative pair has logit −1. Compute both loss terms of (167.2) and both gradients of (167.3) for \(N = 1\).</li>
+<li>For a batch of 4,096, what is the best starting bias \(b^\star\)? What is \(\sigma(b^\star)\)?</li>
+<li>Your global batch is 65,536 on 512 devices. How much memory does the full logit matrix need in FP32? How much does one block of the ring version need?</li>
+<li>How many patch tokens does SigLIP So400m/14 produce at 224 and at 384 pixels? What NaFlex grid does a 1000 × 200 image get with budget 256 (patch 16)? Use Figure 6 to check.</li>
+<li>In Figure 2 with \(t = 20\), which bias makes a caption with cosine 0.20 sit exactly at 50%?</li>
+<li>Explain in two sentences why gradient accumulation over micro-batches is closer to the real large-batch loss for SigLIP than for CLIP, and what is still different.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. True pair: \(\log(1 + e^{-2}) = 0.127\), gradient \(\sigma(2) - 1 = 0.881 - 1 = -0.119\). Negative: \(\log(1 + e^{-1}) = 0.313\), gradient \(\sigma(-1) = 0.269\). 2. \(b^\star = -\ln 4095 = -8.32\); \(\sigma(b^\star) = 1/4096 = 2.44\times10^{-4}\). 3. \(65{,}536^2 \times 4\) bytes \(= 17.2\) GB; per device \(b_d = 128\), so a block is \(128^2 \times 4 = 65{,}536\) bytes (65.5 kB). 4. \((224/14)^2 = 256\) and \(\lfloor 384/14\rfloor^2 = 27^2 = 729\). The strip becomes 560 × 112 pixels, a 35 × 7 grid, 245 tokens and 11 padding slots, aspect ratio exactly 5. 5. \(\sigma = 0.5\) when \(20 \times 0.20 + b = 0\), so \(b = -4\). 6. For SigLIP the full-batch loss is a sum over all pairs, so a micro-batch computes an exact subset of its terms (the pairs inside the micro-batch). What is missing are the cross-micro-batch negative pairs, unless you also compute those blocks as in the ring; for CLIP even the terms you do compute are wrong, because each softmax normalizer would need all \(|B|\) captions.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>SigLIP replaces CLIP’s batch softmax with one sigmoid yes/no question per image–caption pair (167.1, 167.2). The gradient is “probability minus label” per cell (167.3).</li>
+<li>A learned bias, started near \(-\ln N\) (the paper uses −10), matches the base rate of a match and avoids a huge loss at the start (167.4).</li>
+<li>Independent terms make the loss easy to split: a ring of collective permutes keeps only a \(b_d \times b_d\) block in memory (167.5).</li>
+<li>The sigmoid loss is clearly better below batch 16k; both losses saturate around 32k. Use \(\beta_2 = 0.95\) and no weight decay on pretrained towers.</li>
+<li>SigLIP 2 keeps the towers and adds a captioning/grounding decoder, self-distillation and masked prediction late in training, multilingual data and NaFlex (167.7, 167.8). The biggest gains are in dense features and in non-English retrieval.</li>
+<li>Many open VLMs (PaliGemma, LLaVA-OneVision, Idefics2, SmolVLM, Gemma 3) use SigLIP-shaped encoders; the resolution and patch size fix the visual token count (167.6).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \mathcal{L} = -\frac{1}{N}\sum_{i,j}\log\sigma\big(z_{ij}(t\,\mathbf{u}_i^\top\mathbf{v}_j + b)\big), \quad \frac{\partial\mathcal{L}}{\partial\ell_{ij}} = \frac{\sigma(\ell_{ij}) - y_{ij}}{N}, \quad b^\star = -\ln(N-1), \quad n_{\text{tokens}} = \lfloor R/p \rfloor^2 \]</div>
+<h2 class="plain" id="siglip-and-siglip-2-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhai et al. (2023). <a href="https://arxiv.org/abs/2303.15343" target="_blank" rel="noopener">Sigmoid Loss for Language Image Pre-Training</a></li><li>Tschannen et al. (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;SigLIP 2: Multilingual Vision-Language Encoders with Improved Semantic Understanding, Localization, and Dense Features&amp;quot;" target="_blank" rel="noopener">SigLIP 2: Multilingual Vision-Language Encoders with Improved Semantic Understanding, Localization, and Dense Features</a></li><li>Radford et al. (2021). <a href="https://arxiv.org/abs/2103.00020" target="_blank" rel="noopener">Learning Transferable Visual Models From Natural Language Supervision</a></li><li>Zhai et al. (2022). <a href="https://arxiv.org/abs/2111.07991" target="_blank" rel="noopener">LiT: Zero-Shot Transfer with Locked-image text Tuning</a></li><li>Alabdulmohsin, Zhai, Kolesnikov &amp; Beyer (2023). <a href="https://arxiv.org/abs/2305.13035" target="_blank" rel="noopener">Getting ViT in Shape: Scaling Laws for Compute-Optimal Model Design</a></li><li>Chen et al. (2022). <a href="https://arxiv.org/abs/2209.06794" target="_blank" rel="noopener">PaLI: A Jointly-Scaled Multilingual Language-Image Model</a></li><li>Wan et al. (2024). <a href="https://arxiv.org/abs/2403.19596" target="_blank" rel="noopener">LocCa: Visual Pretraining with Location-aware Captioners</a></li><li>Naeem et al. (2024). <a href="https://arxiv.org/abs/2310.13355" target="_blank" rel="noopener">SILC: Improving Vision Language Pretraining with Self-Distillation</a></li><li>Maninis et al. (2025). <a href="https://arxiv.org/abs/2410.16512" target="_blank" rel="noopener">TIPS: Text-Image Pretraining with Spatial awareness</a></li><li>Beyer et al. (2023). <a href="https://arxiv.org/abs/2212.08013" target="_blank" rel="noopener">FlexiViT: One Model for All Patch Sizes</a></li><li>Dehghani et al. (2023). <a href="https://arxiv.org/abs/2307.06304" target="_blank" rel="noopener">Patch n’ Pack: NaViT, a Vision Transformer for any Aspect Ratio and Resolution</a></li><li>Udandarao et al. (2025). <a href="https://arxiv.org/abs/2411.18674" target="_blank" rel="noopener">Active Data Curation Effectively Distills Large-Scale Multimodal Models</a></li><li>Beyer et al. (2024). <a href="https://arxiv.org/abs/2407.07726" target="_blank" rel="noopener">PaliGemma: A versatile 3B VLM for transfer</a></li><li>Li et al. (2024). <a href="https://arxiv.org/abs/2408.03326" target="_blank" rel="noopener">LLaVA-OneVision: Easy Visual Task Transfer</a></li><li>Laurençon et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;What matters when building vision-language models?&amp;quot;" target="_blank" rel="noopener">What matters when building vision-language models?</a></li><li>Marafioti et al. (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;SmolVLM: Redefining small and efficient multimodal models&amp;quot;" target="_blank" rel="noopener">SmolVLM: Redefining small and efficient multimodal models</a></li><li>Gemma Team (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;Gemma 3 Technical Report&amp;quot;" target="_blank" rel="noopener">Gemma 3 Technical Report</a></li><li>Minderer et al. (2022). <a href="https://arxiv.org/abs/2205.06230" target="_blank" rel="noopener">Simple Open-Vocabulary Object Detection with Vision Transformers</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/clip-learning-images-and-text-together.html"><small>Previous · session 166</small>CLIP: learning images and text together</a><span class="next"><small>Next · session 168, planned</small>Open-vocabulary detection and segmentation</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="siglip-and-siglip-2"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fm=(v,d)=>{const s=(Math.abs(v)<0.5*Math.pow(10,-d)?0:v).toFixed(d);return s.replace("-","−");};
+const nf=v=>Math.round(v).toLocaleString("en-US");
+const sig=x=>1/(1+Math.exp(-x));
+const sp=x=>x>30?x:Math.log1p(Math.exp(x));                 /* softplus log(1+e^x) */
+const lse=a=>{const m=Math.max(...a);return m+Math.log(a.reduce((s,x)=>s+Math.exp(x-m),0));};
+const bytes=b=>b>=1e9?fm(b/1e9,2)+" GB":b>=1e6?fm(b/1e6,1)+" MB":b>=1e3?fm(b/1e3,1)+" kB":nf(b)+" B";
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+
+/* ---------- Figure 1: the 4 x 4 batch, sigmoid vs softmax ---------- */
+(function(){
+ const svg=$("#sg-mat-svg");if(!svg)return;const T=$("#sg-mat-t"),Bb=$("#sg-mat-b"),Cs=$("#sg-mat-c"),info=$("#sg-mat-info");
+ const IMG=["dog on grass","cat on sofa","red car","puppy on beach"],TXT=["“dog on grass”","“cat on sofa”","“red car”","“puppy on beach”"];
+ const C=[[0.31,0.12,0.05,0.22],[0.10,0.29,0.06,0.09],[0.04,0.07,0.33,0.03],[0.24,0.11,0.02,0.30]];
+ let sel=[0,3];const N=4,x0=190,y0=62,cw=110,ch=60;
+ function losses(t,b){let sl=0;const term=[];for(let i=0;i<N;i++){term.push([]);for(let j=0;j<N;j++){const l=t*C[i][j]+b,z=i===j?1:-1,v=sp(-z*l);term[i].push(v);sl+=v;}}
+  let li=0,lt=0;for(let i=0;i<N;i++){li+=-(t*C[i][i]-lse(C[i].map(c=>t*c)));lt+=-(t*C[i][i]-lse(C.map(r=>t*r[i])));}
+  return{sl:sl/N,term,clip:(li/N+lt/N)/2};}
+ function draw(){const t=+T.value,b=+Bb.value;C[sel[0]][sel[1]]=+Cs.value;$("#sg-mat-tv").value=t;$("#sg-mat-bv").value=fm(b,1);$("#sg-mat-cv").value=fm(+Cs.value,2);
+  const L=losses(t,b);let g=`<text x="${x0+2*cw}" y="18" text-anchor="middle" font-size="13" class="svgs">captions (text tower) →</text>`;
+  TXT.forEach((s,j)=>g+=`<text x="${x0+j*cw+cw/2}" y="${y0-12}" text-anchor="middle" font-size="12.5" fill="var(--k)" font-weight="600">${s}</text>`);
+  IMG.forEach((s,i)=>g+=`<text x="${x0-10}" y="${y0+i*ch+ch/2+5}" text-anchor="end" font-size="13" fill="var(--q)" font-weight="600">image: ${s}</text>`);
+  let nneg=0;
+  for(let i=0;i<N;i++)for(let j=0;j<N;j++){const l=t*C[i][j]+b,p=sig(l),tm=L.term[i][j],a=Math.min(0.85,tm/(1+tm));const dia=i===j,isSel=i===sel[0]&&j===sel[1];if(!dia&&p>0.5)nneg++;
+   g+=`<g class="sg-cell" data-i="${i}" data-j="${j}"><rect x="${x0+j*cw+2}" y="${y0+i*ch+2}" width="${cw-4}" height="${ch-4}" rx="8" fill="${dia?"var(--ok)":"var(--k)"}" fill-opacity="${(0.08+a).toFixed(3)}" stroke="${isSel?"var(--tc)":dia?"var(--ok)":"var(--rule)"}" stroke-width="${isSel?3:dia?2:1.2}"/>`+
+   `<text x="${x0+j*cw+cw/2}" y="${y0+i*ch+25}" text-anchor="middle" font-size="12.5" font-family="var(--mono)" fill="var(--ink)">cos ${fm(C[i][j],2)}</text>`+
+   `<text x="${x0+j*cw+cw/2}" y="${y0+i*ch+44}" text-anchor="middle" font-size="12.5" font-family="var(--mono)" fill="var(--ink)" font-weight="700">σ = ${fm(p,3)}</text></g>`;}
+  g+=`<text x="${x0+2*cw}" y="${y0+4*ch+24}" text-anchor="middle" font-size="12.5" class="svgs">cell shading = size of that cell’s loss term log(1 + e^(−z·ℓ))</text>`;
+  svg.innerHTML=g;
+  const [i,j]=sel,l=t*C[i][j]+b,dia=i===j;
+  info.innerHTML=`Selected: image “${IMG[i]}” with caption ${TXT[j]} (${dia?"true pair, label +1":"negative, label −1"}). Logit ℓ = ${t} × ${fm(C[i][j],2)} + (${fm(b,1)}) = <b>${fm(l,2)}</b>, σ(ℓ) = <b>${fm(sig(l),3)}</b>, its SigLIP term = ${fm(L.term[i][j],3)}.<br>SigLIP loss = <b>${fm(L.sl,3)}</b> (moving this cell changes 1 of the 16 terms). CLIP loss with scale ${t} = <b>${fm(L.clip,3)}</b> (this cell sits in the softmax of row ${i+1} and column ${j+1}: 2 of the 8 terms change). Negatives with σ &gt; 0.5: <b>${nneg}</b> of 12.`;}
+ svg.addEventListener("click",e=>{const c=e.target.closest(".sg-cell");if(!c)return;sel=[+c.dataset.i,+c.dataset.j];Cs.value=C[sel[0]][sel[1]];draw();});
+ [T,Bb,Cs].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: yes/no vs pick-one ---------- */
+(function(){
+ const svg=$("#sg-yn-svg");if(!svg)return;const T=$("#sg-yn-t"),Bb=$("#sg-yn-b"),info=$("#sg-yn-info"),box=$("#sg-yn-caps");
+ const CAP=["a dog running on a beach","a puppy on the sand","a cat on a sofa","a red car","a bowl of soup"],COS=[0.32,0.27,0.15,0.10,0.05];
+ box.innerHTML=CAP.map((c,k)=>`<label class="sl"><input type="checkbox" data-k="${k}" checked> ${Book.esc(c)}</label>`).join("");
+ const on=()=>[...box.querySelectorAll("input")].map(x=>x.checked);
+ function draw(){const t=+T.value,b=+Bb.value,act=on();$("#sg-yn-tv").value=t;$("#sg-yn-bv").value=fm(b,1);
+  const idx=CAP.map((_,k)=>k).filter(k=>act[k]);const sm=idx.length?B.softmax(idx.map(k=>t*COS[k])):[];const P={};idx.forEach((k,n)=>P[k]=sm[n]);
+  const X0=250,W=330;let g=`<line x1="${X0}" y1="8" x2="${X0}" y2="236" stroke="var(--muted)"/><line x1="${X0+W/2}" y1="8" x2="${X0+W/2}" y2="236" stroke="var(--rule)" stroke-dasharray="4 4"/>`+
+   `<text x="${X0}" y="248" text-anchor="middle" font-size="11.5" class="svgs">0</text><text x="${X0+W/2}" y="248" text-anchor="middle" font-size="11.5" class="svgs">0.5</text><text x="${X0+W}" y="248" text-anchor="middle" font-size="11.5" class="svgs">1</text>`;
+  CAP.forEach((c,k)=>{const y=12+k*45,ps=sig(t*COS[k]+b);
+   g+=`<text x="${X0-10}" y="${y+14}" text-anchor="end" font-size="13" fill="${act[k]?"var(--ink)":"var(--muted)"}">${Book.esc(c)}</text><text x="${X0-10}" y="${y+31}" text-anchor="end" font-size="11.5" class="svgs">cos ${fm(COS[k],2)}</text>`;
+   if(act[k])g+=`<rect x="${X0}" y="${y}" width="${(W*P[k]).toFixed(1)}" height="16" fill="var(--q)" rx="3"/><text x="${X0+W*P[k]+6}" y="${y+13}" font-size="12" font-family="var(--mono)" fill="var(--q)">${fm(P[k],3)}</text>`;
+   else g+=`<text x="${X0+6}" y="${y+13}" font-size="12" class="svgs">not a candidate</text>`;
+   g+=`<rect x="${X0}" y="${y+19}" width="${(W*ps).toFixed(1)}" height="16" fill="var(--k)" rx="3" opacity="${act[k]?1:0.35}"/><text x="${X0+W*ps+6}" y="${y+32}" font-size="12" font-family="var(--mono)" fill="var(--k)">${fm(ps,3)}</text>`;});
+  svg.innerHTML=g;
+  let top=-1;idx.forEach(k=>{if(top<0||P[k]>P[top])top=k;});const yes=idx.filter(k=>sig(t*COS[k]+b)>0.5);
+  info.innerHTML=idx.length?`Softmax over ${idx.length} caption${idx.length>1?"s":""}: the top is “${Book.esc(CAP[top])}” with <b>${fm(P[top],3)}</b>, and the probabilities sum to 1. Sigmoid: captions above 0.5: <b>${yes.length?yes.map(k=>"“"+Book.esc(CAP[k])+"”").join(", "):"none"}</b>${yes.length?"":" (the model says no caption fits)"}. The 50% point is at cosine −b/t = <b>${fm(-b/t,3)}</b>.`:"Tick at least one caption.";}
+ box.addEventListener("change",draw);[T,Bb].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: the bias at initialization ---------- */
+(function(){
+ const svg=$("#sg-bias-svg");if(!svg)return;const Nn=$("#sg-bias-n"),Bb=$("#sg-bias-b"),info=$("#sg-bias-info");
+ const bx=b=>60+(b+16)/20*560,ly=v=>{const l=Math.log10(Math.max(v,1e-3));return 220-(Math.max(-2,Math.min(7,l))+2)/9*200;};
+ function draw(){const N=Math.pow(2,+Nn.value),b=+Bb.value;$("#sg-bias-nv").value=nf(N);$("#sg-bias-bv").value=fm(b,1);
+  const pos=v=>sp(-v),neg=v=>(N-1)*sp(v),tot=v=>pos(v)+neg(v),bs=-Math.log(N-1);
+  let g=`<path d="M60 20 V220 H620" fill="none" stroke="var(--muted)"/>`;
+  [-2,0,2,4,6].forEach(e=>g+=`<line x1="60" x2="620" y1="${ly(Math.pow(10,e))}" y2="${ly(Math.pow(10,e))}" stroke="var(--rule)" stroke-dasharray="3 5"/><text x="54" y="${ly(Math.pow(10,e))+4}" text-anchor="end" font-size="11.5" class="svgs">10${e<0?"⁻²":e===0?"⁰":e===2?"²":e===4?"⁴":"⁶"}</text>`);
+  [-16,-12,-8,-4,0,4].forEach(v=>g+=`<text x="${bx(v)}" y="236" text-anchor="middle" font-size="11.5" class="svgs">${fm(v,0)}</text>`);
+  g+=`<text x="340" y="254" text-anchor="middle" font-size="12.5" class="svgs">initial bias b</text>`;
+  const path=f=>{let d="";for(let k=0;k<=200;k++){const v=-16+k*0.1;d+=(k?"L":"M")+bx(v).toFixed(1)+" "+ly(f(v)).toFixed(1);}return d;};
+  g+=`<path d="${path(pos)}" fill="none" stroke="var(--ok)" stroke-width="2"/><path d="${path(neg)}" fill="none" stroke="var(--k)" stroke-width="2"/><path d="${path(tot)}" fill="none" stroke="var(--tc)" stroke-width="3"/>`;
+  if(bs>=-16)g+=`<line x1="${bx(bs)}" x2="${bx(bs)}" y1="20" y2="220" stroke="var(--muted)" stroke-dasharray="5 4"/><text x="${bx(bs)+4}" y="32" font-size="12" class="svgs">b* = ${fm(bs,2)}</text>`;
+  g+=`<circle cx="${bx(b)}" cy="${ly(tot(b))}" r="6" fill="var(--tc)" stroke="var(--card)" stroke-width="2"/>`;svg.innerHTML=g;
+  const grad=N*sig(b)-1;
+  info.innerHTML=`N = ${nf(N)}. At b = ${fm(b,1)}: start loss L₀ = <b>${tot(b)<1e4?fm(tot(b),2):nf(tot(b))}</b> (positive part ${fm(pos(b),2)}, negatives ${neg(b)<1e4?fm(neg(b),2):nf(neg(b))}); gradient dL₀/db = <b>${Math.abs(grad)<1e4?fm(grad,2):nf(grad)}</b>. Best start b* = −ln(N − 1) = <b>${fm(bs,2)}</b>, where L₀ = ${fm(tot(bs),2)}. With b = 0 the start loss would be ${nf(tot(0))}.`;}
+ [Nn,Bb].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: the chunked ring ---------- */
+(function(){
+ const svg=$("#sg-ring-svg");if(!svg)return;const info=$("#sg-ring-info"),mem=$("#sg-ring-mem"),Bs=$("#sg-ring-B"),Ds=$("#sg-ring-D");
+ const D=3,bd=4,n=D*bd,cs=19,x0=210,y0=50,COL=["var(--q)","var(--k)","var(--v)"];
+ function draw(s){let g="";
+  for(let k=0;k<D;k++){g+=`<rect x="${x0+k*bd*cs}" y="${y0-24}" width="${bd*cs-3}" height="16" rx="4" fill="${COL[k]}" opacity="0.85"/><text x="${x0+k*bd*cs+bd*cs/2}" y="${y0-12}" text-anchor="middle" font-size="11" font-family="var(--sans)" fill="var(--card)" font-weight="700">device ${k+1}</text>`;}
+  for(let j=0;j<D;j++){const holder=s===0?j:s>D?j:((j-(s-1))%D+D)%D;
+   g+=`<rect x="${x0-150}" y="${y0+j*bd*cs+2}" width="142" height="${bd*cs-6}" rx="6" fill="${COL[holder]}" fill-opacity="0.18" stroke="${COL[holder]}"/><text x="${x0-79}" y="${y0+j*bd*cs+bd*cs/2-2}" text-anchor="middle" font-size="12" fill="var(--ink)">captions ${j*bd+1}–${j*bd+bd}</text><text x="${x0-79}" y="${y0+j*bd*cs+bd*cs/2+14}" text-anchor="middle" font-size="11.5" class="svgs">${s>D?"done":"held by device "+(holder+1)}</text>`;}
+  const state=(ib,jb)=>{if(s===0)return 0;if(s>D)return 1;const step=((jb-ib)%D+D)%D;return step<s-1?1:step===s-1?2:0;};
+  for(let i=0;i<n;i++)for(let j=0;j<n;j++){const ib=Math.floor(i/bd),jb=Math.floor(j/bd),st=state(ib,jb),dia=i===j;
+   const fill=st===2?"var(--ink)":st===1?COL[ib]:"var(--card)",op=st===2?0.6:st===1?0.3:1;
+   g+=`<rect x="${x0+i*cs}" y="${y0+j*cs}" width="${cs-2}" height="${cs-2}" rx="2" fill="${fill}" fill-opacity="${op}" stroke="var(--rule)" stroke-width="0.8"/>`;
+   if(dia)g+=`<text x="${x0+i*cs+cs/2-1}" y="${y0+j*cs+cs/2+4}" text-anchor="middle" font-size="11" fill="var(--ink)" font-weight="700">+</text>`;}
+  g+=`<text x="${x0+n*cs+14}" y="${y0+30}" font-size="12.5" fill="var(--ink)">columns: images</text><text x="${x0+n*cs+14}" y="${y0+48}" font-size="12.5" fill="var(--ink)">rows: captions</text><text x="${x0+n*cs+14}" y="${y0+66}" font-size="12.5" fill="var(--ink)">+ = true pair</text>`;
+  const done=s===0?0:s>D?n*n:s*bd*bd*D;
+  g+=`<text x="${x0+n*cs+14}" y="${y0+110}" font-size="12.5" fill="var(--ink)">pairs scored:</text><text x="${x0+n*cs+14}" y="${y0+130}" font-size="14" font-weight="700" fill="var(--ink)">${done} of ${n*n}</text>`;
+  svg.innerHTML=g;
+  const T=["Start: each device holds 4 images and their 4 captions. To get the full loss, every image must meet all 12 captions.",
+   "Step s = 0: each device scores its own 4 × 4 block. This block holds its 4 positives and 12 negatives.",
+   "Captions move one device along the ring (a collective permute). Each device scores a new 4 × 4 block: 16 negatives.",
+   "One more permute. Now every image has met every caption. Only one 4 × 4 block was in memory at any time.",
+   "A final cross-device sum adds the three per-device totals and divides by |B| = 12 (formula 167.5). No all-gather was needed."];
+  info.innerHTML=`${T[s]} Logits in memory per device: <b>${s>0&&s<=D?bd*bd:0}</b>; with an all-gather softmax it would be ${bd}×${n} = ${bd*n}.`;}
+ B.stepper({n:D+2,prev:$("#sg-ring-prev"),next:$("#sg-ring-next"),play:$("#sg-ring-play"),label:$("#sg-ring-lab"),ms:2400,onStep:draw});
+ function calc(){const Bt=Math.pow(2,+Bs.value);let Dk=+Ds.value;if(Dk>+Bs.value)Dk=+Bs.value;const Dv=Math.pow(2,Dk),b=Bt/Dv;$("#sg-ring-Bv").value=nf(Bt);$("#sg-ring-Dv").value=nf(Dv);
+  mem.innerHTML=`|B| = ${nf(Bt)} on D = ${nf(Dv)} devices: b<sub>d</sub> = ${nf(b)} pairs per device. Full |B| × |B| logits: <b>${bytes(Bt*Bt*4)}</b>. One device’s b<sub>d</sub> × |B| slice (all-gather softmax): <b>${bytes(b*Bt*4)}</b>. One ring block b<sub>d</sub> × b<sub>d</sub>: <b>${bytes(b*b*4)}</b>, with ${nf(Dv)} ring steps.`;}
+ [Bs,Ds].forEach(e=>e.addEventListener("input",calc));calc();
+})();
+
+/* ---------- Figure 5: the SigLIP 2 recipe ---------- */
+(function(){
+ const svg=$("#sg-rec-svg");if(!svg)return;const P=$("#sg-rec-p"),info=$("#sg-rec-info");let size="So400m";const W={B:0.25,L:0.5,So400m:1.0,g:0.5};
+ const box=(x,y,w,h,t1,t2,on,c)=>`<rect x="${x}" y="${y}" width="${w}" height="${h}" rx="10" fill="${on?c:"var(--card)"}" fill-opacity="${on?0.22:1}" stroke="${on?c:"var(--rule)"}" stroke-width="${on?2.2:1.2}"/><text x="${x+w/2}" y="${y+h/2-(t2?3:-5)}" text-anchor="middle" font-size="13" font-weight="700" fill="${on?"var(--ink)":"var(--muted)"}">${t1}</text>`+(t2?`<text x="${x+w/2}" y="${y+h/2+14}" text-anchor="middle" font-size="11.5" fill="${on?"var(--ink2)":"var(--muted)"}">${t2}</text>`:"");
+ const ar=(x1,y1,x2,y2,on)=>`<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${on?"var(--ink2)":"var(--rule)"}" stroke-width="1.6" marker-end="url(#sg-ah)"/>`;
+ function draw(){const p=+P.value;$("#sg-rec-pv").value=p+"%";
+  const main=p<=100,acid=p>100&&size==="B",sigOn=main||acid,loc=main,ssl=main&&p>=80;
+  let g=`<defs><marker id="sg-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+  g+=box(20,20,150,50,"Image encoder","ViT (student)",sigOn,"var(--q)")+box(20,110,150,50,"Text encoder","Gemma tokenizer, 64 tok",sigOn,"var(--k)");
+  g+=box(240,20,150,50,"Sigmoid loss","weight 1",sigOn,"var(--ok)")+box(240,110,150,50,"LocCa decoder","caption, box, region",loc,"var(--v)");
+  g+=box(460,20,120,50,"EMA teacher","avg. of student",ssl,"var(--tc)")+box(600,20,105,50,"SILC","weight w",ssl,"var(--tc)")+box(600,110,105,50,"TIPS","weight 0.25w",ssl,"var(--tc)");
+  g+=ar(170,45,238,45,sigOn)+ar(170,135,238,55,sigOn)+ar(170,55,238,128,loc)+ar(580,45,598,45,ssl)+ar(520,70,598,128,ssl);
+  const tx=v=>30+v/110*660;g+=`<line x1="${tx(0)}" y1="230" x2="${tx(110)}" y2="230" stroke="var(--muted)" stroke-width="2"/>`;
+  g+=`<rect x="${tx(0)}" y="222" width="${tx(80)-tx(0)}" height="16" fill="var(--ok)" fill-opacity="0.25"/><rect x="${tx(80)}" y="222" width="${tx(100)-tx(80)}" height="16" fill="var(--tc)" fill-opacity="0.3"/><rect x="${tx(100)}" y="222" width="${tx(110)-tx(100)}" height="16" fill="var(--k)" fill-opacity="0.25"/>`;
+  [[0,"0%","start",206],[80,"80%: + SILC, TIPS","end",206],[90,"90%: NaFlex fork","start",206],[95,"95%: fixed-res forks","end",262],[100,"100%: release","start",262]].forEach(([v,l,an,y])=>g+=`<line x1="${tx(v)}" x2="${tx(v)}" y1="214" y2="246" stroke="var(--ink2)"/><text x="${tx(v)+(an==="start"&&v>0?3:an==="end"?-3:0)}" y="${y}" text-anchor="${an}" font-size="11.5" fill="var(--ink2)">${l}</text>`);
+  g+=`<text x="${tx(110)}" y="284" text-anchor="end" font-size="11.5" fill="var(--ink2)">100–110%: ACID (B only)</text><circle cx="${tx(p)}" cy="230" r="7" fill="var(--tc)" stroke="var(--card)" stroke-width="2"/>`;
+  svg.innerHTML=g;const w=W[size];
+  let t;if(main){t=`At ${p}% (${size}): active losses: sigmoid (1), LocCa (1)`+(ssl?`, SILC (${+w.toFixed(4)}), TIPS (${+(0.25*w).toFixed(4)}); w<sub>size</sub> = ${w}.`:`. Self-distillation and masked prediction start at 80%.`)+(p>=90&&p<95?" The NaFlex variant has left the main run (it trains without SILC and TIPS).":p>=95?" NaFlex and the fixed-resolution variants have branched off.":"");}
+  else t=size==="B"?`After the main run (${size}): 4B more examples with the sigmoid loss only, learning rate 10⁻⁵, no weight decay; ACID picks 32k of a 64k super-batch (filtering ratio 0.5; 0.75 for B/32).`:`After the main run (${size}): no extra stage. Only B/16 and B/32 get ACID distillation.`;
+  info.innerHTML=t;}
+ seg($("#sg-rec-size"),v=>{size=v;draw();});P.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 6: NaFlex resizing ---------- */
+(function(){
+ const svg=$("#sg-nf-svg");if(!svg)return;const Wd=$("#sg-nf-w"),Ht=$("#sg-nf-h"),info=$("#sg-nf-info");let S=256;const p=16;
+ function naflex(h,w,mx){const f=(s,z)=>Math.max(p,Math.ceil(z*s/p)*p);let lo=1e-6,hi=100;while(hi-lo>=1e-5){const s=(lo+hi)/2;if((f(s,h)/p)*(f(s,w)/p)<=mx)lo=s;else hi=s;}return[f(lo,h),f(lo,w)];}
+ function grid(x,y,gw,gh,maxW,maxH,c){const sc=Math.min(maxW/gw,maxH/gh),w=gw*sc,h=gh*sc,ox=x+(maxW-w)/2,oy=y+(maxH-h)/2;let g=`<rect x="${ox}" y="${oy}" width="${w}" height="${h}" fill="${c}" fill-opacity="0.14" stroke="${c}" stroke-width="2"/>`;
+  if(sc>=3){let d="";for(let i=1;i<gw;i++)d+=`M${(ox+i*sc).toFixed(1)} ${oy}V${(oy+h).toFixed(1)}`;for(let j=1;j<gh;j++)d+=`M${ox} ${(oy+j*sc).toFixed(1)}H${(ox+w).toFixed(1)}`;g+=`<path d="${d}" stroke="${c}" stroke-opacity="0.45" stroke-width="0.8"/>`;}return g;}
+ function draw(){const w=+Wd.value,h=+Ht.value;$("#sg-nf-wv").value=w;$("#sg-nf-hv").value=h;
+  const [H2,W2]=naflex(h,w,S),gw=W2/p,gh=H2/p,nt=gw*gh,side=Math.floor(Math.sqrt(S)),a=w/h,a2=W2/H2;
+  let g=`<text x="160" y="18" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">NaFlex: ${gw} × ${gh} patches</text><text x="480" y="18" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">Fixed square: ${side} × ${side} patches</text>`;
+  g+=grid(10,30,gw,gh,300,210,"var(--q)");
+  /* the square model: the same image squashed into a square */
+  g+=grid(340,30,side,side,280,210,"var(--k)");
+  const st=Math.max(a,1/a);
+  g+=`<text x="160" y="266" text-anchor="middle" font-size="12" class="svgs">${W2} × ${H2} px, aspect ${fm(a2,3)} (original ${fm(a,3)})</text><text x="480" y="266" text-anchor="middle" font-size="12" class="svgs">${side*p} × ${side*p} px, image ${a>=1?"squeezed horizontally":"squeezed vertically"} ×${fm(st,2)}</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`Image ${w} × ${h} (aspect ${fm(a,3)}), budget ${S}, patch ${p}. NaFlex resizes to <b>${W2} × ${H2}</b> px: a <b>${gw} × ${gh}</b> grid, <b>${nt}</b> tokens and <b>${S-nt}</b> padding slots (masked). Aspect after rounding: ${fm(a2,3)}. A square model with ${side*side} tokens would distort the aspect ratio by a factor of ${fm(st,2)}.`;}
+ seg($("#sg-nf-s"),v=>{S=+v;draw();});[Wd,Ht].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>
