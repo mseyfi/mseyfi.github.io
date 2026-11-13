@@ -1,0 +1,540 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Quantization-aware training: fake quant, STE, LLM-QAT, QLoRA, LoftQ · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 111</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="quantization-aware-training-fake-quant-ste-llm">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="quantization-aware-training-fake-quant-ste-llm" data-session="quantization-aware-training-fake-quant-ste-llm" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">111</span><span>Track 5: LLM inference and serving · session 34 of 65</span></div><h1 class="chap-title">Quantization-aware training: fake quant, STE, LLM-QAT, QLoRA, LoftQ</h1><p class="chap-sub">Post-training quantization rounds a finished model and hopes for the best. Quantization-aware training lets the model see the rounding while it trains, so the weights can move to places where rounding hurts less. This session builds fake quantization and the straight-through estimator from scratch, then shows how LLM-QAT, QLoRA, QA-LoRA and LoftQ make the idea affordable for large models, and when it is worth the cost.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 58 (QLoRA), 59 (knowledge distillation), 103 (quantization math) and 106 (GPTQ)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Fake quantization: quantize then dequantize in the forward pass, while FP32 latent weights receive the updates</li><li>Why rounding has no useful gradient, and how the straight-through estimator (STE) and learned step sizes (LSQ) get around it</li><li>Why QAT beats round-to-nearest: weights learn to cancel each other's rounding errors, and why lr decay matters against oscillation</li><li>LLM-QAT: data-free QAT that distills the FP16 model on text it generates itself, with quantized weights, activations and KV cache</li><li>QLoRA, QA-LoRA and LoftQ: a frozen low-bit base plus trainable low-rank adapters, and how each handles merging and initialization</li><li>The cost of QAT in memory, data and GPU time, and a decision rule for when PTQ is enough</li></ul></div></header><style>
+.qat-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.qat-grid input[type=range]{width:100%}
+.qat-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.qat-leg span::before{content:"";display:inline-block;width:18px;height:4px;border-radius:2px;margin-right:6px;vertical-align:3px;background:var(--c)}
+.qat-ctl{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;font:500 14px var(--sans);color:var(--ink2)}
+[data-session="quantization-aware-training-fake-quant-ste-llm"] svg text:not([font-family]){font-family:var(--sans)}
+[data-session="quantization-aware-training-fake-quant-ste-llm"] pre.code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">The sessions before this one were about <b>post-training quantization (PTQ)</b>: take a finished model, round its numbers to a few bits, and fix what you can with a little calibration data. GPTQ and AWQ make 4-bit weights work well. But PTQ has a limit. At 2 or 3 bits, or when the activations and the KV cache must also be 4 or 8 bits, the rounding damage becomes too large to repair after the fact.</p>
+<p><b>Quantization-aware training (QAT)</b> takes a different road. It puts the rounding <b>inside training</b>. The model sees, in every forward pass, the same rounded numbers it will see at deployment, and gradient descent moves the weights to places where rounding hurts less. The cost is real training: gradients, optimizer states, data and GPU time. This session is about how QAT works, why it is hard for LLMs, and four ways to make it affordable:</p>
+<ul><li><b>Fake quantization</b> and the <b>straight-through estimator (STE)</b>: the two tricks that make rounding trainable at all.</li>
+<li><b>LLM-QAT</b>: full QAT of LLaMA models without the original training data, by distilling the FP16 model on text it writes itself.</li>
+<li><b>QLoRA</b> and <b>QA-LoRA</b>: freeze a low-bit base and train only small adapters; QA-LoRA arranges things so the adapters can be merged back into a low-bit model.</li>
+<li><b>LoftQ</b>: choose the adapters' starting values so that “low-bit base + adapter” starts close to the original model.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “What is fake quantization?”, “How do you backpropagate through round()?”, “PTQ or QAT for this model?”, “Why can you not merge a QLoRA adapter into a 4-bit model?”, “What does LoftQ fix?”. Each has a short answer below, with numbers.</aside>
+<p>This is not only research. Google released Gemma 3 QAT checkpoints in 2025: about 5,000 QAT steps, using the probabilities of the unquantized checkpoint as targets, which cut the perplexity drop of 4-bit (Q4_0) quantization by 54%. The 27B model then needs 14.1 GB for its weights instead of 54 GB in BF16. [Certain] Meta’s quantized Llama 3.2 1B and 3B models for phones were made with QAT followed by LoRA adapters. [Certain] The efficient-inference survey (Zhou et al., Section 5.2.1) divides model quantization into PTQ and QAT in the same way. [Certain]</p>
+
+<h2>PTQ versus QAT: the idea</h2>
+<p>A quantized weight can take only a few values: the points of a <b>grid</b>. PTQ takes each trained weight and moves it to a nearby grid point. Each weight’s error may be small, but the errors were never trained against. They add up through the layers, and the model has no chance to adapt.</p>
+<p>In QAT, the network is trained (or fine-tuned) <b>while</b> its weights are rounded. If rounding one weight up hurts, the loss goes up, and the gradient pushes other weights to compensate. The model ends up at a set of grid points that work well <b>together</b>, not just a set of points that are each near the original.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A runner trains in normal shoes, then races in heavy boots: that is PTQ. The runner who trains in the boots learns a stride that works with them: that is QAT. The boots are the same on race day; only the training was different.</aside>
+<p>Two problems must be solved for this to work. First, the weights must stay in high precision during training, or small gradient steps would vanish below the grid spacing. Second, the rounding function has a gradient of zero almost everywhere, so backpropagation through it gives nothing. Fake quantization solves the first problem; the straight-through estimator solves the second.</p>
+
+<h2>Fake quantization</h2>
+<p>Keep a full-precision copy of each weight: the <b>latent weight</b> \(w\), usually in FP32. In every forward pass, quantize it and <b>immediately dequantize</b> it back to a floating-point number. The result \(\hat w\) is a float, but it can only take grid values. The rest of the network runs in normal floating point on \(\hat w\). Nothing is stored as integers yet; that is why it is called <b>fake</b> (or <b>simulated</b>) quantization. For a symmetric signed \(b\)-bit grid with step size (scale) \(s\):</p>
+<div class="eq">\[ \hat{x} = \operatorname{fq}(x; s) = s \cdot \operatorname{clamp}\!\left( \left\lfloor \frac{x}{s} \right\rceil,\ -Q,\ Q \right), \qquad Q = 2^{b-1} - 1 \tag{111.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(x\)</dt><dd>a latent weight or an activation, in full precision</dd>
+<dt>\(s\)</dt><dd>the step size (scale): the distance between two neighbouring grid points</dd>
+<dt>\(\lfloor \cdot \rceil\)</dt><dd>round to the nearest integer</dd>
+<dt>\(\operatorname{clamp}(k, -Q, Q)\)</dt><dd>cut \(k\) to the range \([-Q, Q]\); values outside are <b>clipped</b></dd>
+<dt>\(Q\)</dt><dd>the largest integer code: 7 for 4 bits, 127 for 8 bits (one code, \(-2^{b-1}\), is left unused to keep the grid symmetric)</dd>
+<dt>\(\hat x\)</dt><dd>the fake-quantized value: a float that lies exactly on the grid</dd></dl>
+<p>At deployment, the integer code \(k = \operatorname{clamp}(\lfloor x/s \rceil, -Q, Q)\) and the scale \(s\) are stored, and the kernel computes with them. Because the training forward pass used exactly \(s \cdot k\), the deployed model computes the same numbers the trained model saw (up to the order of floating-point additions). Asymmetric grids add a zero point; <a href="../inference/quantization-math-scale-zero-point-granularity-and.html">session 103</a> covers the general form.</p>
+<div class="worked"><div class="wt">Worked example: fake quantization of five numbers to 4 bits</div>
+<p>Take \(x = (0.42, -1.30, 0.07, 2.10, -0.55)\) and the MinMax scale \(s = \max|x| / Q = 2.10 / 7 = 0.3\). Then \(x/s = (1.40, -4.33, 0.23, 7.00, -1.83)\), the codes are \(k = (1, -4, 0, 7, -2)\), and \(\hat x = (0.3, -1.2, 0.0, 2.1, -0.6)\). The errors are \((-0.12, 0.10, -0.07, 0, -0.05)\), with mean squared error 0.00636.</p>
+<p>Now use a smaller step, \(s = 0.25\). The range shrinks to \(\pm 7 \times 0.25 = \pm 1.75\), so \(2.10\) is clipped to \(1.75\), while the other values get a finer grid: \(\hat x = (0.5, -1.25, 0.0, 1.75, -0.5)\). Choosing \(s\) is a trade-off between <b>rounding error</b> (fine grid) and <b>clipping error</b> (wide range). Figure 1 measures it.</p></div>
+<figure class="fig" id="qat-fq"><div class="fig-body">
+<div class="qat-grid">
+<label for="qat-fq-b">Bit width \(b\)</label><input type="range" id="qat-fq-b" min="2" max="8" step="1" value="4"><output id="qat-fq-bv"></output>
+<label for="qat-fq-c">Clip ratio (range ÷ max |x|)</label><input type="range" id="qat-fq-c" min="0.05" max="1" step="0.01" value="1"><output id="qat-fq-cv"></output></div>
+<div class="scroll-x"><svg id="qat-fq-svg" viewBox="0 0 640 310" role="img" aria-label="The fake-quantization staircase, the data histogram and the straight-through gradient"></svg></div>
+<div class="qat-leg"><span style="--c:var(--q)">fake-quantized output x̂</span><span style="--c:var(--k)">STE gradient and clipping range</span><span style="--c:var(--rule)">histogram of 4,096 Gaussian values</span></div>
+<div class="readout" id="qat-fq-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Formula (111.1) on 4,096 seeded standard-normal values. Top: the staircase \(\hat x\) against \(x\). Bottom: the gradient the straight-through estimator uses (1 inside the range, 0 outside). The clip ratio sets \(s = \text{ratio} \cdot \max|x| / Q\); ratio 1 is the MinMax scale.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start at 4 bits and ratio 1.00 (MinMax): no value is clipped, and the MSE is 0.0246, all from rounding. Move the ratio down: the steps get finer and the MSE falls until about 0.70 (MSE 0.0144), then clipping error takes over. At 2 bits the grid has only three values, \(\{-s, 0, s\}\), and the best ratio is 0.33: clipping 22% of the values is better than a grid that is too coarse. The readout also shows the LSQ gradient of the MSE with respect to \(s\) (formula 111.4): it is positive when \(s\) is too large, so a learned scale moves toward the best ratio by itself. Real LLM activations are not Gaussian: rare outliers carry important information, and LLM-QAT found that clipping them hurts (below).</p></details></figure>
+
+<h2>The gradient problem and the straight-through estimator</h2>
+<p>The staircase in Figure 1 is flat between its jumps. Its true derivative is 0 almost everywhere and undefined at the jumps. If we backpropagate honestly, every gradient that reaches a fake-quantized weight becomes 0, and nothing trains.</p>
+<p>The <b>straight-through estimator (STE)</b>, named and studied by Bengio, Léonard and Courville (2013), simply <b>pretends</b> that the rounding step is the identity in the backward pass. The forward pass uses the rounded value; the backward pass passes the gradient straight through. With clipping, the usual version passes the gradient only where the value is inside the range:</p>
+<div class="eq">\[ \frac{\partial \mathcal{L}}{\partial x} \approx \frac{\partial \mathcal{L}}{\partial \hat x} \cdot \mathbb{1}\!\left[ -Q \le \frac{x}{s} \le Q \right] \tag{111.2} \]</div>
+<p>Why is this not crazy? Over a range of many steps, the staircase follows the line \(\hat x = x\) closely; the identity is its average slope. The STE gives the gradient of that smooth line. The gradient tells the latent weight which way to move; once it has moved far enough, the rounded value jumps to the next grid point. The latent weights then take normal optimizer steps:</p>
+<div class="eq">\[ w \leftarrow w - \eta \, \frac{\partial \mathcal{L}(\operatorname{fq}(w; s))}{\partial \hat w} \cdot \mathbb{1}\!\left[\,|w / s| \le Q\,\right] \tag{111.3} \]</div>
+<p>This is why the latent weights must be kept in high precision. With \(s = 0.01\) and a learning rate of \(10^{-5}\), one step moves a weight by about \(10^{-5}\), a thousandth of a grid step. If we stored only the rounded weight, the change would be rounded away every time. The latent weight <b>accumulates</b> many small steps until it crosses a rounding boundary.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>The STE gives a biased gradient: it describes a smooth function the network never computes. It works well at 4 to 8 bits. At 1 to 2 bits the mismatch is large, and tricks such as learned scales, careful learning rates and distillation from a full-precision teacher matter much more. [Likely]</aside>
+<h3>Learning the step size (LSQ)</h3>
+<p>The scale \(s\) can be learned too. <b>Learned step size quantization (LSQ)</b>, by Esser et al. (2019), applies the same STE idea to \(s\). Write \(u = x/s\) and \(k = \operatorname{clamp}(\lfloor u \rceil, -Q, Q)\). Treating rounding as the identity gives:</p>
+<div class="eq">\[ \frac{\partial \hat x}{\partial s} = \begin{cases} \lfloor u \rceil - u & \text{if } -Q \le u \le Q \\ k = \pm Q & \text{if the value is clipped} \end{cases} \tag{111.4} \]</div>
+<p>Inside the range, the gradient is the signed rounding error in units of \(s\): values near a grid point barely care about \(s\); values halfway between two points care most. Clipped values push \(s\) up with weight \(Q\). In the second worked example (\(s = 0.25\)), formula (111.4) gives \((0.32, 0.20, -0.28, 7, 0.20)\): the clipped value \(2.10\) dominates and asks for a larger range. LSQ also scales this gradient down by a factor that depends on the number of weights and on \(Q\), so that \(s\) learns at a speed similar to the weights. [Likely]</p>
+<div class="algo"><div class="algo-h">Algorithm 1: one QAT training step with fake quantization and the STE</div><ol>
+<li><b>input:</b> latent FP32 weights \(W\) for every linear layer, scales \(s\) (fixed or learned), a batch, optimizer state</li>
+<li><b>for</b> each linear layer: \(\hat W \leftarrow \operatorname{fq}(W; s_W)\) <span class="c">// formula (111.1), per output channel or per group</span></li>
+<li>\(\quad\) \(\hat X \leftarrow \operatorname{fq}(X; s_X)\) <span class="c">// only if activations will also be quantized at deployment</span></li>
+<li>\(\quad\) \(Y \leftarrow \hat X \hat W^\top\) <span class="c">// normal floating-point matmul</span></li>
+<li>\(\mathcal{L} \leftarrow\) loss on the batch (task loss, or distillation loss from an FP teacher)</li>
+<li>backward pass; at every \(\operatorname{fq}\), pass the gradient straight through inside the range, 0 outside <span class="c">// formula (111.2)</span></li>
+<li>gradient for each scale \(s\) by formula (111.4), if scales are learned</li>
+<li>optimizer step on the latent \(W\) (and \(s\)) <span class="c">// formula (111.3); \(W\) stays FP32</span></li>
+<li><b>after training:</b> store \(k = \operatorname{clamp}(\lfloor W/s \rceil, -Q, Q)\) and \(s\); throw away the latent \(W\)</li></ol></div>
+<p>Jacob et al. (2017) made this recipe standard for integer-only inference on phones. Their version keeps running averages (exponential moving averages) of each activation’s min and max during training to set the activation scales, and folds batch normalization into the weights before quantizing them, so the trained model matches the integer model exactly. [Certain]</p>
+
+<h2>Why QAT beats rounding to nearest</h2>
+<p>Round-to-nearest (RTN) minimizes the error of each weight <b>separately</b>. But the loss does not care about each weight separately; it cares about the layer’s <b>output</b>. If two inputs are strongly correlated, an error of \(+0.1\) on one weight can be cancelled by \(-0.1\) on the other. RTN cannot do this. QAT can, because the gradient sees the output error. (GPTQ, from <a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>, does the same compensation in closed form, one column at a time.)</p>
+<p>Figure 2 shows this on the smallest possible model: one output that is a weighted sum of 16 inputs. The FP weights \(\mathbf{w}^*\) are given. The inputs have correlation \(\rho\) with each other, so the covariance is \(\Sigma = (1-\rho) I + \rho \mathbf{1}\mathbf{1}^\top\), and the expected output error of quantized weights \(\hat{\mathbf{w}}\) is \((\hat{\mathbf{w}} - \mathbf{w}^*)^\top \Sigma\, (\hat{\mathbf{w}} - \mathbf{w}^*)\). PTQ rounds \(\mathbf{w}^*\) once. QAT starts from \(\mathbf{w}^*\) and runs Algorithm 1 (full-batch gradient descent with the STE, fixed MinMax scale) for 300 steps.</p>
+<figure class="fig" id="qat-toy"><div class="fig-body">
+<div class="qat-ctl"><span>Bits</span><span class="seg" id="qat-toy-b"><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="3" aria-pressed="false">3</button><button type="button" data-v="4" aria-pressed="true">4</button></span>
+<label class="sl"><input type="checkbox" id="qat-toy-an" checked> cosine learning-rate decay</label></div>
+<div class="qat-grid" style="margin-top:8px">
+<label for="qat-toy-r">Input correlation \(\rho\)</label><input type="range" id="qat-toy-r" min="0" max="0.95" step="0.05" value="0.9"><output id="qat-toy-rv"></output>
+<label for="qat-toy-lr">Learning rate (× 1/λ<sub>max</sub>)</label><input type="range" id="qat-toy-lr" min="0.05" max="1.5" step="0.05" value="0.3"><output id="qat-toy-lrv"></output></div>
+<div class="scroll-x"><svg id="qat-toy-svg" viewBox="0 0 640 262" role="img" aria-label="Error of the quantized layer during QAT, compared with round-to-nearest"></svg></div>
+<div class="qat-leg"><span style="--c:var(--q)">QAT (fake quant + STE)</span><span style="--c:var(--k)">PTQ: round to nearest, no training</span></div>
+<div class="readout" id="qat-toy-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> A 16-weight linear layer with seeded FP weights (standard deviation 0.5). The y-axis is the output error after quantization as a share of the output variance, on a log scale. The learning rate is given in units of \(1/\lambda_{\max}\), where \(\lambda_{\max} = 1 + 15\rho\) is the largest eigenvalue of \(\Sigma\).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With the defaults (4 bits, \(\rho = 0.9\)), PTQ leaves 1.267% error and QAT ends at 0.090%, about 14 times less. Now set \(\rho = 0\): the inputs are independent, \(\Sigma = I\), the error is a sum over weights, and rounding each weight to its nearest grid point is already the best possible answer. QAT cannot win; it ends slightly worse (0.659% against 0.643%) because weights jump around their grid points. Turn off the learning-rate decay at \(\rho = 0.9\): the lowest error seen is still 0.090%, but the final error is back at 1.267%, and the count of grid flips rises from 184 to 430. Weights near a rounding boundary flip back and forth every step. Nagel et al. (2022) call this <b>oscillation</b> and show it is a real problem in QAT; decaying the learning rate, or freezing weights that oscillate, helps. [Certain]</p></details></figure>
+<p>Two lessons carry over to real models. QAT helps most when errors can cancel, which is the normal case in a network, because inputs and channels are correlated. And QAT needs a learning-rate schedule that ends small, or the model ends in the middle of an oscillation.</p>
+
+<h2>Why QAT is hard for LLMs</h2>
+<p>For a CNN on a phone, QAT means fine-tuning a few million weights on ImageNet for a few epochs. For an LLM, all three ingredients become expensive:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Problem</th><th>Why it bites for LLMs</th><th>What helps</th></tr></thead><tbody>
+<tr><td>Memory</td><td>QAT is training: BF16 weights, gradients, FP32 latent weights and two Adam moments are about 16 bytes per parameter. LLaMA 7B (6.74B parameters) needs about 108 GB before activations.</td><td>Sharding (FSDP, ZeRO); or freeze the base and train adapters (QLoRA, QA-LoRA, LoftQ)</td></tr>
+<tr><td>Data</td><td>The pretraining data is usually not available, or is trillions of tokens. A small fine-tuning set covers a narrow domain, and QAT on it can damage general skills.</td><td>Distill from the FP16 model on its own generated text (LLM-QAT); use the FP model’s probabilities as targets (Gemma 3 QAT)</td></tr>
+<tr><td>Outliers</td><td>Some activation channels are 10 to 100 times larger than the rest (<a href="../inference/weight-activation-quantization-llm-int8-smoothquant-zeroquant.html">session 108</a>). Clipping them, which works for CNNs, hurts LLMs.</td><td>Per-token activation scales, MinMax without clipping, rotations (<a href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html">session 109</a>)</td></tr>
+<tr><td>Time</td><td>Each QAT step is a full forward and backward pass of the model, plus quantize–dequantize work.</td><td>Short QAT runs (thousands of steps, not a new pretraining run)</td></tr></tbody></table></div>
+
+<h2>LLM-QAT: data-free QAT by self-distillation</h2>
+<p>LLM-QAT (Liu et al., Meta, 2023) was one of the first works to run full QAT on LLaMA 7B, 13B and 30B. [Certain] It solves the data problem with a simple idea: <b>let the FP16 model write its own training data</b>, then train the quantized student to match the FP16 model’s output distribution on that data.</p>
+<h3>Step 1: generate data from the model itself</h3>
+<p>Start from a random first token from the vocabulary and let the FP16 model generate the rest. The paper tried pure greedy (top-1) decoding and found it produces repetitive text; pure sampling is more diverse. Its best choice is a <b>hybrid</b>: take the top-1 token for the first 3 to 5 tokens, then sample the rest from the model’s distribution. It generates about 100,000 sequences, up to 1,024 tokens long (or until an end-of-sentence token). [Certain] Because the text comes from the model, it covers what the model knows, across all topics, with no need for the pretraining set.</p>
+<h3>Step 2: distill with the teacher’s full distribution</h3>
+<p>The student is the same network with fake-quantized weights, activations and KV cache. It is trained to match the teacher’s next-token distribution at every position, with a cross-entropy against the teacher’s soft predictions (<a href="../posttraining/knowledge-distillation.html">session 59</a>):</p>
+<div class="eq">\[ \mathcal{L}_{\text{CE}} = -\frac{1}{n} \sum_{i=1}^{n} \sum_{c=1}^{V} p^{\mathcal{T}}_c(X_i) \, \log p^{\mathcal{S}}_c(X_i) \tag{111.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(X_i\)</dt><dd>the context at position \(i\) of a generated sequence; \(n\) positions in the batch</dd>
+<dt>\(p^{\mathcal{T}}_c\)</dt><dd>the FP16 teacher’s probability for token \(c\) (fixed; no gradient)</dd>
+<dt>\(p^{\mathcal{S}}_c\)</dt><dd>the quantized student’s probability for token \(c\)</dd>
+<dt>\(V\)</dt><dd>the vocabulary size: the loss uses all \(V\) probabilities, not only the token that was generated</dd></dl>
+<p>Minus the teacher’s entropy (a constant), this is the KL divergence from teacher to student. The paper found that also matching attention maps or hidden states made results worse, so it uses the logits only. [Certain]</p>
+<figure class="fig" id="qat-gen"><div class="fig-body">
+<div class="qat-ctl"><span>Decoding</span><span class="seg" id="qat-gen-s"><button type="button" data-v="greedy" aria-pressed="false">Greedy (top-1)</button><button type="button" data-v="sample" aria-pressed="false">Sampling</button><button type="button" data-v="hybrid" aria-pressed="true">Hybrid: top-1 ×3, then sample</button></span></div>
+<div class="controls" style="margin-top:8px"><button type="button" class="btn" id="qat-gen-prev">Back</button><button type="button" class="btn primary" id="qat-gen-play">Play</button><button type="button" class="btn" id="qat-gen-next">Next</button><span id="qat-gen-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="qat-gen-svg" viewBox="0 0 640 244" role="img" aria-label="A generated token sequence and the teacher and student next-token distributions"></svg></div>
+<div class="readout" id="qat-gen-info" aria-live="polite"></div>
+<div class="readout" id="qat-gen-sum"></div>
+</div><figcaption><b>Figure 3.</b> A toy version of LLM-QAT’s data generation. The “teacher” is a seeded bigram model over 8 words (each row of its logit table is a next-token distribution). The “student” is the same table with each row fake-quantized to 3 bits. Each step adds one token and shows the distillation loss (111.5) at that position.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Choose Greedy: from the start word, the sequence falls into the loop “a sat a sat …”, and 300 greedy sequences contain only 8 distinct 3-grams (one per start word). Training data like this would teach the student only a few contexts. Sampling gives 341 distinct 3-grams. The hybrid gives 291 here; in a bigram toy it cannot show its real advantage, which is that a confident start makes long LLM generations more coherent. The second point: at every position, the loss compares the whole blue and orange distributions. The student learns about every possible next token, not only the one that was written, which is why a modest amount of generated text is enough.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 2: LLM-QAT</div><ol>
+<li><b>input:</b> FP16 model \(\mathcal{T}\), bit widths for weights, activations and KV cache</li>
+<li><b>repeat</b> about 100,000 times: pick a random first token; for each next position, take the top-1 token of \(\mathcal{T}\) for the first 3–5 tokens, then sample from \(p^{\mathcal{T}}\); stop at end-of-sentence or 1,024 tokens</li>
+<li>student \(\mathcal{S} \leftarrow\) copy of \(\mathcal{T}\) with fake quantization on every linear layer’s weights (per output channel), its input activations (per token), and the keys and values (per token)</li>
+<li><b>for</b> each batch of generated text: run \(\mathcal{T}\) (no gradient) and \(\mathcal{S}\); loss (111.5) on all positions</li>
+<li>\(\quad\) backward with the STE (111.2); AdamW step on the latent weights (paper: lr \(2 \times 10^{-5}\), cosine decay, no weight decay, batch size 1 per GPU on 8 GPUs)</li>
+<li><b>output:</b> integer weights and scales; activation and KV quantizers fixed by the same rules</li></ol></div>
+<h3>Quantizers: MinMax, no clipping</h3>
+<p>LLM-QAT uses symmetric MinMax quantization: the scale of each group is set by its largest absolute value, so nothing is clipped:</p>
+<div class="eq">\[ s = \frac{\max |X_{\text{group}}|}{2^{b-1} - 1}, \qquad \text{group} = \text{one output channel (weights) or one token (activations, keys, values)} \tag{111.6} \]</div>
+<p>This is the opposite of Figure 1’s lesson for Gaussian data. In LLMs, the large values are rare but carry information, and the paper found that clipping them hurt. A learned-scale method (StatsQ for weights) scored 56.8 against 64.4 for MinMax at 4-bit weights and 8-bit activations on LLaMA 7B. [Certain]</p>
+<h3>Results</h3>
+<p>Zero-shot common-sense accuracy (average over the paper’s tasks, higher is better), written as bits for weights–activations–KV cache: [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model</th><th>Setting (W-A-KV)</th><th>RTN</th><th>GPTQ</th><th>SmoothQuant</th><th>LLM-QAT</th><th>FP16</th></tr></thead><tbody>
+<tr><td>LLaMA 7B</td><td>4-16-16 (weights only)</td><td>63.0</td><td>60.9</td><td>–</td><td><b>64.4</b></td><td>66.2</td></tr>
+<tr><td>LLaMA 7B</td><td>4-8-4</td><td>41.2</td><td>–</td><td>43.2</td><td><b>60.7</b></td><td>66.2</td></tr>
+<tr><td>LLaMA 30B</td><td>4-8-4</td><td>42.5</td><td>–</td><td>40.7</td><td><b>69.9</b></td><td>71.4</td></tr></tbody></table></div>
+<p>Read the table carefully. With 4-bit weights only, LLM-QAT is better than PTQ, but the gap is small (1.4 points over RTN). The big win is in the hard setting with 4-bit KV cache and 8-bit activations: PTQ collapses to about 41–43, while QAT keeps 60.7 on 7B and 69.9 on 30B (1.5 points below FP16). QAT pays off most exactly where PTQ fails.</p>
+
+<h2>A low-bit base plus trainable adapters</h2>
+<p>Full QAT updates every weight, so it costs as much memory as full fine-tuning. A cheaper family freezes a low-bit base and trains a small <b>low-rank adapter</b> \(BA\) on top (<a href="../posttraining/lora-and-other-peft-methods.html">session 57</a>). The base never changes; only the adapter learns to work around the base’s rounding errors. This is a weaker form of quantization awareness: the base was rounded without training, but the trainable part is trained through the quantized base.</p>
+<h3>QLoRA, in one formula</h3>
+<p><a href="../posttraining/qlora-and-training-with-quantized-weights.html">Session 58</a> built QLoRA in detail. In short: store the frozen base in 4-bit NF4 with double-quantized scales, dequantize it to BF16 on the fly, and train a BF16 LoRA adapter:</p>
+<div class="eq">\[ Y = X \hat{W}^{\top} + s \, X A^{\top} B^{\top}, \qquad \hat{W} = \operatorname{dequant}(W_{\text{NF4}}), \quad A \in \R^{r \times d_{\text{in}}},\ B \in \R^{d_{\text{out}} \times r} \tag{111.7} \]</div>
+<p>Only \(A\) and \(B\) get gradients. For LLaMA 7B, the NF4 base takes about \(6.74 \times 10^9 \times 4.127 / 8 \approx 3.5\) GB instead of 13.5 GB in BF16. QLoRA has two weak spots, and the next two methods fix one each:</p>
+<ul><li><b>Merging.</b> After training, the serving model is \(\hat W + sBA\). The update \(sBA\) changes every weight by a different amount, so the sum is no longer on the 4-bit grid. Either you serve the 4-bit base and a 16-bit adapter side by side (slower, two code paths), or you quantize \(\hat W + sBA\) again and lose part of what the adapter learned. QA-LoRA fixes this.</li>
+<li><b>Initialization.</b> LoRA starts with \(B = 0\), so training starts from the quantized model \(\hat W\), not from the original \(W\). At 2 or 3 bits, \(\hat W\) is far from \(W\), and training starts from a damaged model. LoftQ fixes this.</li></ul>
+<h3>QA-LoRA: adapters that merge into a low-bit model</h3>
+<p>QA-LoRA (Xu et al., 2023) starts from one observation. Use <b>group-wise</b> asymmetric quantization: each group of \(G\) consecutive input weights in a row has its own scale \(\alpha\) and zero point \(\beta\), and \(\tilde w = \alpha k + \beta\) with integer \(k\). If an update adds the <b>same</b> number \(c\) to every weight of a group, then \(\tilde w + c = \alpha k + (\beta + c)\): the codes \(k\) and the scale stay; only the zero point moves. The merged weight is still exactly on a (shifted) low-bit grid.</p>
+<p>So QA-LoRA constrains the adapter to give one value per (output row, group). The easy way to do that: <b>sum the input inside each group</b> before the adapter. The adapter’s \(A\) then sees \(d_{\text{in}}/G\) numbers instead of \(d_{\text{in}}\):</p>
+<div class="eq">\[ Y = X \tilde{W}^{\top} + s\, \mathcal{P}(X)\, A^{\top} B^{\top}, \qquad \mathcal{P}(X)_{:,g} = \sum_{j \in \text{group } g} X_{:,j}, \qquad A \in \R^{r \times d_{\text{in}}/G} \tag{111.8} \]</div>
+<p>Each input in group \(g\) is multiplied by the same adapter weight \((sBA)_{o,g}\) for output \(o\). That is exactly a shift of the group’s zero point, so after training the adapter disappears into the zero points:</p>
+<div class="eq">\[ \beta'_{o,g} = \beta_{o,g} + s\,(BA)_{o,g}, \qquad \tilde{W}' = \alpha \, k + \beta' \quad \text{(same integer codes } k\text{, same scales } \alpha) \tag{111.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(G\)</dt><dd>the group size along the input dimension (32 in the paper’s main experiments)</dd>
+<dt>\(\alpha_{o,g}, \beta_{o,g}\)</dt><dd>scale and zero point of group \(g\) in output row \(o\); \(\tilde w = \alpha k + \beta\) with \(k \in \{0, \dots, 2^b - 1\}\)</dd>
+<dt>\(\mathcal{P}(X)\)</dt><dd>the input summed over each group: a parameter-free pooling from \(d_{\text{in}}\) to \(d_{\text{in}}/G\) numbers</dd>
+<dt>\((BA)_{o,g}\)</dt><dd>one adapter value per output row and group; \(BA\) has shape \(d_{\text{out}} \times d_{\text{in}}/G\)</dd></dl>
+<p>The paper’s Algorithm 1 writes the zero point in a different convention, so its update looks different; the idea is the same. [Likely] A side effect: \(A\) is \(G\) times smaller. For a 4096 × 4096 layer with \(r = 16\) and \(G = 32\), the adapter has \(16 \times 128 + 4096 \times 16 = 67{,}584\) parameters instead of \(16 \times 8192 = 131{,}072\). The constraint costs flexibility, but group-wise quantization gives the base more freedom (more scales) in return.</p>
+<div class="worked"><div class="wt">Worked example: merging into a 2-bit group of four weights</div>
+<p>Take one group \(w = (0.10, -0.20, 0.04, 0.30)\) with 2 bits (codes 0 to 3). Then \(\beta = -0.20\), \(\alpha = 0.50 / 3 = 0.1667\), the codes are \(k = (2, 0, 1, 3)\), and \(\tilde w = (0.1333, -0.2000, -0.0333, 0.3000)\).</p>
+<p><b>QA-LoRA:</b> the adapter adds \(c = 0.012\) to the whole group. Merged: \((0.1453, -0.1880, -0.0213, 0.3120)\), which is exactly \(\alpha k + \beta'\) with \(\beta' = -0.188\). Same codes, same scale, no error.</p>
+<p><b>A LoRA-style adapter</b> adds a different change to each weight: \((+0.012, -0.006, +0.009, +0.003)\). Merged: \((0.1453, -0.2060, -0.0243, 0.3030)\), off the grid. Re-quantize with MinMax: \(\beta = -0.206\), \(\alpha = 0.1697\), codes \((2, 0, 1, 3)\), giving \((0.1333, -0.2060, -0.0363, 0.3030)\). The first weight’s change of \(+0.012\) is completely lost, and the third weight’s \(+0.009\) became \(-0.003\): the wrong sign.</p></div>
+<figure class="fig" id="qat-mg"><div class="fig-body">
+<div class="qat-ctl"><span>Adapter</span><span class="seg" id="qat-mg-a"><button type="button" data-v="lora" aria-pressed="true">LoRA (as in QLoRA)</button><button type="button" data-v="qa" aria-pressed="false">QA-LoRA</button></span></div>
+<div class="qat-ctl" style="margin-top:6px"><span>Group size</span><span class="seg" id="qat-mg-g"><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="true">8</button><button type="button" data-v="16" aria-pressed="false">16</button></span>
+<span>Bits</span><span class="seg" id="qat-mg-b"><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="3" aria-pressed="true">3</button><button type="button" data-v="4" aria-pressed="false">4</button></span></div>
+<div class="scroll-x"><svg id="qat-mg-svg" viewBox="0 0 640 262" role="img" aria-label="Sixteen quantized weights, their grid lines, and the weights after merging an adapter"></svg></div>
+<div class="qat-leg"><span style="--c:var(--q)">base weight on its grid</span><span style="--c:var(--k)">after merging the adapter</span><span style="--c:var(--rule)">grid lines of each group</span></div>
+<div class="readout" id="qat-mg-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Sixteen seeded weights of one output row (standard deviation 0.02), quantized with min–max per group. The adapter’s change per weight is seeded noise (standard deviation 0.006); the QA-LoRA adapter can only give one shared change per group, here the group mean of the same changes. Re-quantization uses min–max again.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>With the LoRA adapter, every orange circle sits between grid lines: all 16 merged weights are off the grid. At 3 bits and groups of 8, re-quantizing moves them by 29% of the adapter’s own change; at 2 bits it is 87%, so the adapter is mostly erased. Switch to QA-LoRA: the whole grid of each group slides (dashed orange lines), and every merged weight sits exactly on it. Smaller groups give QA-LoRA more freedom (more independent shifts) and the base more scales, at the cost of storing more zero points.</p></details></figure>
+<p>Does it work? On LLaMA 7B fine-tuned on FLAN v2, 5-shot MMLU accuracy (%) from the QA-LoRA paper, Table 1: [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Method</th><th>Model at inference</th><th>Alpaca</th><th>FLAN v2</th></tr></thead><tbody>
+<tr><td>LLaMA 7B, no fine-tuning</td><td>16-bit</td><td colspan="2">34.6</td></tr>
+<tr><td>QLoRA</td><td>NF4 base + 16-bit adapter (“4+16”)</td><td>38.4</td><td>44.3</td></tr>
+<tr><td>QLoRA, then GPTQ on the merged model</td><td>4-bit</td><td>36.0</td><td>41.4</td></tr>
+<tr><td>QA-LoRA</td><td>4-bit, merged</td><td><b>39.4</b></td><td><b>47.0</b></td></tr>
+<tr><td>QLoRA, then GPTQ</td><td>3-bit</td><td>34.0</td><td>36.9</td></tr>
+<tr><td>QA-LoRA</td><td>3-bit, merged</td><td><b>37.4</b></td><td><b>44.7</b></td></tr>
+<tr><td>QLoRA, then GPTQ</td><td>2-bit</td><td>25.8</td><td>25.0</td></tr>
+<tr><td>QA-LoRA</td><td>2-bit, merged</td><td><b>27.5</b></td><td><b>33.2</b></td></tr></tbody></table></div>
+<p>Re-quantizing a QLoRA model after training (row 3) loses 2.4 to 2.9 points at 4 bits; QA-LoRA’s merged 4-bit model is even slightly better than QLoRA’s unmerged one in this table. The QA-LoRA base uses group size 32 and GPTQ for the initial quantization. [Certain] At 2 bits, both are poor on Alpaca: an adapter cannot rescue a base that is too damaged.</p>
+
+<h3>LoftQ: start the adapter where the error is</h3>
+<p>LoftQ (Li et al., 2023) attacks the second weak spot. With \(B = 0\), training starts from \(\hat W\), whose error \(W - \hat W\) is large at low bits. But the adapter \(BA\) is a rank-\(r\) matrix we are free to initialize. Why not choose it to cancel as much of the quantization error as possible? LoftQ chooses the quantized base \(Q\) and the adapter together:</p>
+<div class="eq">\[ \min_{Q,\, B,\, A} \ \big\lVert W - Q - BA \big\rVert_F, \qquad Q \text{ on the low-bit grid}, \quad \operatorname{rank}(BA) \le r \tag{111.10} \]</div>
+<p>This is hard to solve jointly, but each half is easy when the other is fixed. With \(BA\) fixed, the best \(Q\) (approximately) quantizes what the adapter does not cover. With \(Q\) fixed, the best rank-\(r\) \(BA\) is the truncated SVD of the residual (the Eckart–Young theorem). LoftQ alternates:</p>
+<div class="eq">\[ Q_t = q\big(W - B_{t-1} A_{t-1}\big), \qquad B_t A_t = \operatorname{SVD}_r\big(W - Q_t\big) = \sum_{i=1}^{r} \sigma_i \mathbf{u}_i \mathbf{v}_i^{\top}, \qquad B_0 A_0 = 0 \tag{111.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(q(\cdot)\)</dt><dd>the quantize–dequantize function of the base (NF4, NF2 or uniform in the paper)</dd>
+<dt>\(\sigma_i, \mathbf{u}_i, \mathbf{v}_i\)</dt><dd>the \(i\)-th singular value and singular vectors of the residual \(W - Q_t\)</dd>
+<dt>\(B_t, A_t\)</dt><dd>the split of the rank-\(r\) part: LoftQ uses \(B = [\sqrt{\sigma_i}\,\mathbf{u}_i]\) and \(A = [\sqrt{\sigma_i}\,\mathbf{v}_i]^{\top}\)</dd>
+<dt>\(t = 1, \dots, T\)</dt><dd>alternating steps; the paper uses \(T = 5\) for its GLUE experiments and \(T = 1\) for BART</dd></dl>
+<p>Note that \(t = 1\) already gives most of the gain: \(Q_1\) is the plain quantization of \(W\) (as in QLoRA), and \(B_1 A_1\) is the best rank-\(r\) fix of its error. After this, \(Q_T\) is frozen and \(A, B\) are trained exactly as in QLoRA. Only the starting point changes; training cost is the same.</p>
+<div class="algo"><div class="algo-h">Algorithm 3: LoftQ initialization (once per weight matrix, before fine-tuning)</div><ol>
+<li><b>input:</b> pretrained \(W\), bit width \(b\), rank \(r\), steps \(T\)</li>
+<li>\(BA \leftarrow 0\)</li>
+<li><b>for</b> \(t = 1, \dots, T\):</li>
+<li>\(\quad\) \(Q \leftarrow q(W - BA)\) <span class="c">// quantize what the adapter does not cover</span></li>
+<li>\(\quad\) \(U, \Sigma, V^\top \leftarrow \operatorname{SVD}(W - Q)\)</li>
+<li>\(\quad\) \(B \leftarrow U_{:, :r} \Sigma_{:r}^{1/2}\), \(\ A \leftarrow \Sigma_{:r}^{1/2} V^\top_{:r, :}\) <span class="c">// formula (111.11)</span></li>
+<li><b>output:</b> frozen low-bit \(Q\) and trainable \(A, B\); then fine-tune as in QLoRA</li></ol></div>
+<figure class="fig" id="qat-lq"><div class="fig-body">
+<div class="qat-ctl"><span>Bits of the base</span><span class="seg" id="qat-lq-b"><button type="button" data-v="2" aria-pressed="true">2</button><button type="button" data-v="3" aria-pressed="false">3</button><button type="button" data-v="4" aria-pressed="false">4</button></span></div>
+<div class="qat-grid" style="margin-top:8px">
+<label for="qat-lq-r">Adapter rank \(r\)</label><input type="range" id="qat-lq-r" min="0" max="32" step="1" value="16"><output id="qat-lq-rv"></output>
+<label for="qat-lq-t">Alternating steps \(T\)</label><input type="range" id="qat-lq-t" min="1" max="5" step="1" value="5"><output id="qat-lq-tv"></output></div>
+<div class="scroll-x"><svg id="qat-lq-svg" viewBox="0 0 640 240" role="img" aria-label="Initial error of QLoRA and of LoftQ after each alternating step"></svg></div>
+<div class="readout" id="qat-lq-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> LoftQ, formula (111.11), on a seeded 64 × 64 Gaussian matrix. The base uses uniform quantization with \(2^b\) levels in \([-c, c]\), where \(c\) is each row’s largest absolute value. The SVD is computed in your browser (Jacobi eigenvalue method). Grey bar: the QLoRA start (\(BA = 0\)). Orange bars: LoftQ after each step.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>At 2 bits, the QLoRA start is 50.6% away from \(W\) (relative Frobenius error). One LoftQ step with rank 16 brings it to 30.4%. At 4 bits the start is 10.2% and LoftQ reaches 6.0%: a similar share closed, but a much smaller absolute damage, which is why LoftQ matters most at low bits. Set the rank to 0: no adapter, no change. Look at the later steps: here the error at 2 bits rises slightly after step 2, because re-quantizing \(W - BA\) does not always lower the joint error. More steps are not always better; this toy matrix has no low-rank structure, so treat its numbers as an illustration, not a prediction for real weights.</p></details></figure>
+<p>The paper’s results on LLaMA 2 with rank 64 show the same pattern: at 4 bits, LoftQ and QLoRA are close (WikiText-2 perplexity 5.24 against 5.70 on 7B; GSM8K 35.0 against 35.1); at 2 bits, QLoRA fine-tuning did not converge, while LoftQ reached perplexity 7.85 (7B) and 7.69 (13B). On DeBERTaV3 with 2-bit NF2 and rank 16, MNLI accuracy was 84.7 for LoftQ against 75.4 for QLoRA. [Certain]</p>
+
+<h2>When PTQ is enough, and when QAT is worth the cost</h2>
+<p>QAT costs training; PTQ costs minutes to hours on one GPU. Use the cheapest method that meets your quality target. A rough rule, from the evidence in this and earlier sessions: [Likely]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Target</th><th>Usually enough</th><th>Consider QAT when</th></tr></thead><tbody>
+<tr><td>8-bit weights (W8A16), or FP8 weights and activations</td><td>PTQ (often plain RTN or per-channel scales)</td><td>almost never</td></tr>
+<tr><td>4-bit weights, 16-bit activations, 7B+ model</td><td>GPTQ or AWQ (<a href="../inference/weight-ptq-2-awq-outliers-and-mixed.html">session 107</a>)</td><td>you need the last 1–2 points, or the model is small (1–3B) where errors matter more</td></tr>
+<tr><td>W8A8 with outlier handling</td><td>SmoothQuant or rotations (QuaRot, SpinQuant)</td><td>accuracy drop is still too large for the task</td></tr>
+<tr><td>4-bit activations or 4-bit KV cache</td><td>rotations + PTQ may work (<a href="../inference/kv-cache-quantization-kivi-and-kvquant.html">session 110</a>)</td><td>PTQ collapses, as in LLM-QAT’s W4A8KV4 row</td></tr>
+<tr><td>2–3-bit weights</td><td>PTQ is fragile</td><td>almost always: QAT, or LoftQ/QA-LoRA if you fine-tune anyway</td></tr>
+<tr><td>You are fine-tuning anyway</td><td>QLoRA, then serve NF4 + adapter</td><td>QA-LoRA if you need one merged low-bit model; LoftQ at low bits</td></tr>
+<tr><td>A model you will ship to millions of devices</td><td>PTQ as a baseline</td><td>the one-time training cost is small next to the serving cost (Gemma 3 QAT, Llama 3.2 quantized)</td></tr></tbody></table></div>
+<p>At the extreme end, QAT is not a repair step at all. BitNet b1.58 (Ma et al., 2024) trains a model from scratch with ternary weights \(\{-1, 0, +1\}\), using fake quantization and the STE throughout pretraining, and reports matching an FP16 model of the same size and training tokens. [Certain] for the method; how well this holds at the largest scales is still being studied. [Speculation]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>When asked “PTQ or QAT?”, answer with three questions: How many bits, and for what (weights, activations, KV cache)? How large is the model? Do I have training compute and representative data (or can I distill on generated data)? Then name the cheapest method that meets the target and how you would measure it (<a href="../inference/lab-compare-rtn-gptq-awq-smoothquant-and.html">session 112</a>).</aside>
+
+<h2>Runnable code: fake quant, STE, QAT, LoftQ and QA-LoRA</h2>
+<p>This code runs on a CPU in under 10 seconds (most of it in the 1024 × 1024 SVDs) and prints the numbers shown in the comments. Part 1 checks the worked example and the LSQ gradient. Part 2 compares PTQ and QAT (by distillation) for a 3-bit MLP. Part 3 is LoftQ. Part 4 trains nothing but checks that a QA-LoRA adapter merges into the zero points exactly.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="cm"># 1) fake quantization with a straight-through estimator, formulas (111.1) and (111.2)</span>
+<span class="kw2">def</span> round_ste(u):
+    <span class="kw2">return</span> u + (torch.round(u) - u).detach()      <span class="cm"># forward: round(u); backward: identity</span>
+
+<span class="kw2">def</span> fake_quant(x, s, bits):
+    Q = 2 ** (bits - 1) - 1                        <span class="cm"># symmetric signed range [-Q, Q]</span>
+    <span class="kw2">return</span> s * torch.clamp(round_ste(x / s), -Q, Q)  <span class="cm"># clamp passes gradient only inside the range</span>
+
+x = torch.tensor([0.42, -1.30, 0.07, 2.10, -0.55], requires_grad=True)
+s = torch.tensor(0.25, requires_grad=True)         <span class="cm"># small scale, so 2.10 is clipped</span>
+y = fake_quant(x, s, bits=4)
+y.sum().backward()
+print(y.tolist())          <span class="cm"># [0.5, -1.25, 0.0, 1.75, -0.5]</span>
+print(x.grad.tolist())     <span class="cm"># [1.0, 1.0, 1.0, 0.0, 1.0]: STE, zero where clipped</span>
+<span class="cm"># LSQ-style gradient for the scale, formula (111.4): one value per element</span>
+print([round(v, 2) <span class="kw2">for</span> v <span class="kw2">in</span> torch.autograd.functional.jacobian(
+    <span class="kw2">lambda</span> s_: fake_quant(x.detach(), s_, 4), s.detach()).tolist()])   <span class="cm"># [0.32, 0.2, -0.28, 7.0, 0.2]</span>
+
+<span class="cm"># 2) a QAT linear layer: FP32 latent weights, fake-quantized per output channel in every forward</span>
+<span class="kw2">class</span> QATLinear(nn.Linear):
+    <span class="kw2">def</span> __init__(self, n_in, n_out, bits=3):
+        super().__init__(n_in, n_out); self.bits = bits
+    <span class="kw2">def</span> forward(self, x):
+        Q = 2 ** (self.bits - 1) - 1
+        s = self.weight.detach().abs().amax(dim=1, keepdim=True) / Q   <span class="cm"># MinMax scale, formula (111.6)</span>
+        <span class="kw2">return</span> F.linear(x, fake_quant(self.weight, s, self.bits), self.bias)
+
+<span class="kw2">def</span> quantize_weights_(model, bits):                <span class="cm"># PTQ baseline: round once, no training</span>
+    Q = 2 ** (bits - 1) - 1
+    <span class="kw2">with</span> torch.no_grad():
+        <span class="kw2">for</span> m <span class="kw2">in</span> model.modules():
+            <span class="kw2">if</span> isinstance(m, nn.Linear):
+                s = m.weight.abs().amax(dim=1, keepdim=True) / Q
+                m.weight.copy_(s * torch.clamp(torch.round(m.weight / s), -Q, Q))
+
+teacher = nn.Sequential(nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 32))
+X = torch.randn(4096, 32) @ (torch.eye(32) + 0.5 * torch.randn(32, 32))  <span class="cm"># correlated inputs</span>
+<span class="kw2">with</span> torch.no_grad(): Y = teacher(X)
+
+ptq = nn.Sequential(nn.Linear(32, 64), nn.GELU(), nn.Linear(64, 32)); ptq.load_state_dict(teacher.state_dict())
+quantize_weights_(ptq, bits=3)
+<span class="kw2">with</span> torch.no_grad(): print("PTQ  3-bit MSE", round(F.mse_loss(ptq(X), Y).item(), 4))    <span class="cm"># 0.025</span>
+
+student = nn.Sequential(QATLinear(32, 64), nn.GELU(), QATLinear(64, 32))
+student.load_state_dict(teacher.state_dict())      <span class="cm"># start QAT from the FP weights</span>
+opt = torch.optim.AdamW(student.parameters(), lr=1e-3, weight_decay=0.0)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=600)   <span class="cm"># decay: fewer oscillations</span>
+<span class="kw2">for</span> step <span class="kw2">in</span> range(600):                            <span class="cm"># distill: match the FP teacher's outputs</span>
+    idx = torch.randint(0, 4096, (256,))
+    loss = F.mse_loss(student(X[idx]), Y[idx])
+    opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+<span class="kw2">with</span> torch.no_grad(): print("QAT  3-bit MSE", round(F.mse_loss(student(X), Y).item(), 4))  <span class="cm"># 0.0132</span>
+
+<span class="cm"># 3) LoftQ initialization, formulas (111.10) and (111.11)</span>
+<span class="kw2">def</span> quant_uniform(W, bits):                        <span class="cm"># 2^bits levels in [-c, c], c = absmax per row</span>
+    K = 2 ** bits - 1
+    c = W.abs().amax(dim=1, keepdim=True)
+    k = torch.clamp(torch.round((W / c + 1) / 2 * K), 0, K)
+    <span class="kw2">return</span> c * (-1 + 2 * k / K)
+
+<span class="kw2">def</span> loftq_init(W, bits, r, T):
+    BA = torch.zeros_like(W)
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(T):
+        Qw = quant_uniform(W - BA, bits)               <span class="cm"># quantize what the adapter does not cover</span>
+        U, S, Vh = torch.linalg.svd(W - Qw)            <span class="cm"># best rank-r fit of the residual</span>
+        B, A = U[:, :r] * S[:r].sqrt(), S[:r].sqrt()[:, None] * Vh[:r]
+        BA = B @ A
+    <span class="kw2">return</span> Qw, B, A
+
+W = torch.randn(1024, 1024, dtype=torch.float64) * 0.02
+<span class="kw2">for</span> bits <span class="kw2">in</span> (2, 4):
+    e_qlora = (W - quant_uniform(W, bits)).norm() / W.norm()
+    Qw, B, A = loftq_init(W, bits, r=64, T=5)
+    print(bits, "bit  QLoRA init", round(e_qlora.item(), 4),
+          " LoftQ init", round(((W - Qw - B @ A).norm() / W.norm()).item(), 4))
+<span class="cm"># 2 bit  QLoRA init 0.6762  LoftQ init 0.6208</span>
+<span class="cm"># 4 bit  QLoRA init 0.1327  LoftQ init 0.1059</span>
+
+<span class="cm"># 4) QA-LoRA: pool inputs per group, then merge the adapter into the zero points, (111.8) and (111.9)</span>
+d_in, d_out, G, r, bits, sc = 256, 128, 32, 8, 4, 2.0
+Wf = torch.randn(d_out, d_in, dtype=torch.float64) * 0.02
+Wg = Wf.view(d_out, d_in // G, G)                  <span class="cm"># groups along the input dimension</span>
+K = 2 ** bits - 1
+beta = Wg.amin(-1, keepdim=True); alpha = (Wg.amax(-1, keepdim=True) - beta) / K
+Wint = torch.clamp(torch.round((Wg - beta) / alpha), 0, K)    <span class="cm"># integer codes, never change</span>
+A = torch.randn(r, d_in // G, dtype=torch.float64) * 0.1     <span class="cm"># input dimension is d_in / G, not d_in</span>
+Bm = torch.randn(d_out, r, dtype=torch.float64) * 0.1        <span class="cm"># pretend these were trained</span>
+xin = torch.randn(4, d_in, dtype=torch.float64)
+pooled = xin.view(4, d_in // G, G).sum(-1)                   <span class="cm"># sum inside each group</span>
+y_train = xin @ (alpha * Wint + beta).view(d_out, d_in).T + sc * pooled @ A.T @ Bm.T
+beta_new = beta + sc * (Bm @ A).unsqueeze(-1)                <span class="cm"># one shift per (row, group)</span>
+y_merged = xin @ (alpha * Wint + beta_new).view(d_out, d_in).T
+print("QA-LoRA merge max error", (y_train - y_merged).abs().max().item())   <span class="cm"># about 3e-15</span></pre>
+<p>A 1024 × 1024 Gaussian matrix has no low-rank structure, so rank 64 closes only a small part of the gap in part 3 (from 0.676 to 0.621 at 2 bits). In production you would use a library: PyTorch’s torchao has QAT “quantizers” that insert fake quantization into a model and later convert it to real low-bit kernels, and the PEFT library supports LoftQ initialization. [Likely]</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>Method</th><th>Why</th></tr></thead><tbody>
+<tr><td>Gemma 3 QAT checkpoints (1B to 27B)</td><td>about 5,000 QAT steps with the unquantized model’s probabilities as targets; int4 and Q4_0</td><td>54% smaller perplexity drop than plain 4-bit; 27B fits a 24 GB GPU [Certain]</td></tr>
+<tr><td>Llama 3.2 1B and 3B on phones</td><td>QAT during SFT, then LoRA adapters in BF16, then DPO; 4-bit group-wise weights (group 32), 8-bit per-token activations</td><td>Meta reports 2–4× speed-ups on device [Certain]</td></tr>
+<tr><td>Fine-tuning a 7B–70B model on one GPU</td><td>QLoRA; LoftQ initialization at 2–3 bits</td><td>Memory; LoftQ gives a better start at low bits</td></tr>
+<tr><td>Shipping one merged low-bit fine-tuned model</td><td>QA-LoRA</td><td>No 16-bit adapter path at inference; one INT4 kernel</td></tr>
+<tr><td>Very low-bit LLMs trained from scratch</td><td>BitNet b1.58 (ternary weights, STE in pretraining)</td><td>Matmuls become additions [Certain]; the hardware to exploit this is still emerging [Likely]</td></tr>
+<tr><td>On-device video classification and action recognition</td><td>INT8 QAT of the CNN or ViT backbone (Jacob et al. recipe)</td><td>Integer-only kernels on phone DSPs and NPUs; frames per second and battery matter</td></tr>
+<tr><td>Video-RAG and video retrieval at scale</td><td>QAT or QAT-style fine-tuning of the embedding model to INT8 or binary codes</td><td>Billions of stored frame or clip embeddings; smaller codes make search cheaper [Likely]</td></tr>
+<tr><td>Video LLMs on edge devices</td><td>QAT plus LoRA on the language model; PTQ often enough for the vision encoder</td><td>Long visual-token contexts make 4-bit KV cache attractive, which is where PTQ is weakest [Speculation]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Storing only the rounded weights during QAT.</b> Small updates are rounded away and nothing learns. Keep FP32 (or at least BF16) latent weights and fake-quantize them in the forward pass.</li>
+<li><b>A training quantizer that differs from the deployment kernel.</b> Different granularity (per channel versus per group), a different rounding rule, or a symmetric grid in training and asymmetric in deployment: the model was trained for numbers it will never see. Match the kernel exactly.</li>
+<li><b>Forgetting to fake-quantize activations or the KV cache</b> when they will be quantized at deployment. Weight-only QAT does not prepare the model for 4-bit KV cache.</li>
+<li><b>No learning-rate decay.</b> Weights oscillate around rounding boundaries (Figure 2); the last checkpoint can be worse than PTQ. Decay to a small learning rate, and evaluate the fake-quantized model, not the latent one.</li>
+<li><b>QAT on a narrow task set only.</b> The model adapts to rounding on that data and may forget the rest. Distill from the FP model on broad data, or on its own generations (LLM-QAT).</li>
+<li><b>Clipping LLM activation outliers</b> because it helped for CNNs. For LLMs, MinMax per token was better in LLM-QAT; clip only if you measured that it helps.</li>
+<li><b>Merging a QLoRA adapter and re-quantizing without measuring.</b> As the worked example showed, re-quantization can erase or even flip the adapter’s changes. Measure the merged low-bit model, or use QA-LoRA.</li>
+<li><b>Skipping the PTQ baseline.</b> At 4-bit weights, GPTQ or AWQ is often within a point of QAT for a fraction of the cost. Always know what PTQ gives first.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is fake quantization, and why is it called “fake”?<span class="lvl">basic</span></summary><div class="ans">In the forward pass, each weight (and optionally activation) is quantized to the low-bit grid and immediately dequantized back to a float: \(\hat x = s \cdot \operatorname{clamp}(\lfloor x/s \rceil, -Q, Q)\). The network computes in normal floating point, but only with values that the integer model could represent. Nothing is stored as integers during training, so the quantization is simulated (“fake”). After training, the codes and scales are exported for real integer kernels.</div></details>
+<details class="qa"><summary>How do you backpropagate through round()? What is the straight-through estimator?<span class="lvl">basic</span></summary><div class="ans">The derivative of round is 0 almost everywhere, so honest backprop gives no signal. The STE treats rounding as the identity in the backward pass: \(\partial \mathcal{L}/\partial x \approx \partial \mathcal{L}/\partial \hat x\), usually masked to 0 where the value was clipped. In PyTorch: <code>u + (u.round() - u).detach()</code>. It is a biased estimate: the gradient of the smooth line the staircase follows on average.</div></details>
+<details class="qa"><summary>Why must QAT keep full-precision latent weights?<span class="lvl">core</span></summary><div class="ans">Optimizer steps are tiny compared with the grid spacing (for example \(10^{-5}\) against a step size of 0.01). If you stored only grid values, every update would be rounded back to the same point. The latent weight accumulates many small steps until it crosses a rounding boundary, and then the quantized value changes. This also means QAT needs the full training memory: about 16 bytes per parameter with AdamW and mixed precision.</div></details>
+<details class="qa"><summary>Why can QAT beat round-to-nearest even with the same grid?<span class="lvl">core</span></summary><div class="ans">RTN minimizes each weight’s error separately, but the loss depends on the layer output. When inputs are correlated, errors on different weights can cancel, and the best set of grid points is not the set of nearest points. QAT’s gradient sees the output error and moves weights to a combination that cancels well. In the 16-weight toy with correlation 0.9 at 4 bits, the error falls from 1.27% (RTN) to 0.09%. With independent inputs, RTN is already optimal and QAT cannot help. GPTQ exploits the same effect in closed form.</div></details>
+<details class="qa"><summary>What does LSQ learn, and what is its gradient?<span class="lvl">advanced</span></summary><div class="ans">LSQ learns the step size \(s\) of each quantizer. With the STE, \(\partial \hat x/\partial s = \lfloor x/s \rceil - x/s\) for values inside the range and \(\pm Q\) for clipped values. So clipped values push the range wider and in-range values push it toward a finer grid; the balance finds the rounding–clipping trade-off from the loss, not from a fixed rule. LSQ also scales the gradient down so \(s\) does not move too fast. For LLMs, LLM-QAT found that MinMax scales worked better than a learned-scale method (StatsQ), because outliers matter.</div></details>
+<details class="qa"><summary>Explain LLM-QAT. Why does it generate its own data?<span class="lvl">core</span></summary><div class="ans">LLM-QAT runs QAT on LLaMA with quantized weights, activations and KV cache. The original pretraining data is not available, and a small task set would narrow the model. So the FP16 model generates about 100K sequences from random first tokens (top-1 for the first 3–5 tokens, then sampling), and the quantized student is trained to match the teacher’s full next-token distribution (logit distillation, formula 111.5). Because the text comes from the model, it covers the model’s own knowledge. At W4A8KV4 on LLaMA 7B it keeps 60.7 average zero-shot accuracy against 41.2 for RTN and 43.2 for SmoothQuant (FP16: 66.2).</div></details>
+<details class="qa"><summary>Why is greedy decoding a bad way to generate QAT data?<span class="lvl">core</span></summary><div class="ans">Greedy decoding is deterministic and falls into repetitive loops, so it covers few contexts; for a given first token it always produces the same text. The student then learns to match the teacher only on that narrow set. Sampling gives diverse contexts. LLM-QAT uses top-1 for the first few tokens (a confident, coherent start) and sampling after that. The distillation loss uses the full teacher distribution at every position, so each position teaches the student about every possible next token.</div></details>
+<details class="qa"><summary>Why can you not simply merge a QLoRA adapter into a 4-bit model? How does QA-LoRA fix it?<span class="lvl">advanced</span></summary><div class="ans">\(sBA\) changes every weight by a different amount, so \(\hat W + sBA\) is off the 4-bit grid; re-quantizing it erases part of the adapter and can flip small changes (in QA-LoRA’s table, QLoRA plus GPTQ loses about 2.4–2.9 MMLU points at 4 bits). QA-LoRA uses group-wise quantization and sums the inputs inside each group before the adapter, so the adapter adds one value per (row, group). Adding a constant to a group only shifts its zero point: \(\beta' = \beta + s(BA)_{o,g}\), with the same codes and scales. The merged model is exactly low-bit, and \(A\) is \(G\) times smaller.</div></details>
+<details class="qa"><summary>What does LoftQ change compared with QLoRA, and when does it matter?<span class="lvl">core</span></summary><div class="ans">Only the initialization. QLoRA starts with \(B = 0\), so the starting model is the quantized \(\hat W\). LoftQ alternates \(Q_t = q(W - B_{t-1}A_{t-1})\) and \(B_tA_t = \operatorname{SVD}_r(W - Q_t)\), so \(Q + BA\) starts close to the original \(W\). Training then runs exactly as in QLoRA. It matters most at low bits: on LLaMA 2 at 2 bits, QLoRA did not converge while LoftQ did (WikiText-2 perplexity 7.85 on 7B); at 4 bits the two are close.</div></details>
+<details class="qa"><summary>Your team wants 4-bit weights for a 70B chat model. PTQ or QAT?<span class="lvl">advanced</span></summary><div class="ans">Start with PTQ: GPTQ or AWQ with per-group scales is usually close to the BF16 model at 4-bit weights for large models, and costs hours, while full QAT of 70B needs about 1.1 TB of training state (16 bytes per parameter) plus data. Measure on your real tasks, including long-context and reasoning evals, not only perplexity. Move to QAT (or distillation-based QAT like Gemma 3’s, or LoRA-based recovery) only if the drop is too large for the product, if you also need 4-bit activations or KV cache, or if the model will be served at such scale that a one-time training cost is negligible.</div></details>
+<details class="qa"><summary>What is QAT oscillation and how do you reduce it?<span class="lvl">advanced</span></summary><div class="ans">A latent weight near a rounding boundary gets a gradient that pushes it across; on the other side the gradient pushes it back, so its quantized value flips every few steps. The final checkpoint can then be noticeably worse than the best one seen. Remedies: decay the learning rate to a small value at the end, freeze weights that oscillate, add a small penalty that pulls latent weights toward their grid points, or re-estimate statistics such as batch-norm after training (Nagel et al., 2022). In the toy of Figure 2, removing the decay leaves the final error at the PTQ level even though the best step reached 14× less.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>3-bit symmetric fake quantization with \(s = 0.5\). Compute \(\hat x\) and the STE gradient \(\partial \hat x/\partial x\) for \(x = 1.3\) and \(x = 2.2\).</li>
+<li>For the same two values, compute the LSQ gradient \(\partial \hat x / \partial s\) (formula 111.4). Which one asks for a larger scale?</li>
+<li>A LLaMA MLP up-projection has \(d_{\text{in}} = 4096\), \(d_{\text{out}} = 11008\). Count the adapter parameters for LoRA and for QA-LoRA with \(r = 64\) and group size 32.</li>
+<li>Estimate the memory for full QAT of a 13B model with AdamW and mixed precision, before activations. Why is QA-LoRA or LoftQ attractive here?</li>
+<li>In Figure 2, set \(\rho = 0\). Explain, without running anything, why QAT cannot end below the PTQ line.</li>
+<li>In Figure 5, what does LoftQ give with rank 0? With \(T = 1\), which part of the LoftQ result is identical to QLoRA?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(Q = 3\), range \(\pm 1.5\). For \(1.3\): \(1.3/0.5 = 2.6 \to 3\), \(\hat x = 1.5\), gradient 1 (inside the range). For \(2.2\): \(4.4 \to\) clamped to 3, \(\hat x = 1.5\), gradient 0 (clipped). 2. For \(1.3\): \(3 - 2.6 = 0.4\). For \(2.2\): clipped, so \(Q = 3\). The clipped value has the larger gradient; with a positive upstream error it pushes \(s\) up to widen the range. 3. LoRA: \(64 \times (4096 + 11008) = 966{,}656\). QA-LoRA: \(A\) is \(64 \times 128 = 8{,}192\) and \(B\) is \(11008 \times 64 = 704{,}512\), total \(712{,}704\). 4. \(13 \times 10^9 \times 16\) bytes \(\approx 208\) GB: several 80 GB GPUs with sharding. QA-LoRA and LoftQ keep a frozen low-bit base (about 7 GB at 4 bits) and train about 2% of the parameters (rank 64 on every linear layer of LLaMA 13B is about 250M). 5. With \(\Sigma = I\), the error is \(\sum_i (\hat w_i - w_i^*)^2\), a sum of independent terms. Each term is smallest at the nearest grid point, which is exactly what RTN chooses, so RTN is the global optimum for this grid; QAT can only match it or end on a worse point. 6. Rank 0 means no adapter: LoftQ equals QLoRA. With \(T = 1\), \(Q_1 = q(W)\) is the same quantized base as QLoRA; only the adapter differs (\(B_1A_1 = \operatorname{SVD}_r(W - q(W))\) instead of 0).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>QAT puts rounding inside training: fake quantization (111.1) in the forward pass on FP32 latent weights, and the straight-through estimator (111.2) in the backward pass.</li>
+<li>Scales can be learned (LSQ, 111.4); the rounding–clipping trade-off depends on the data, and LLM outliers favour MinMax without clipping (111.6).</li>
+<li>QAT beats round-to-nearest because weights learn to cancel each other’s errors; decay the learning rate to avoid oscillation.</li>
+<li>LLM-QAT makes full QAT data-free: the FP16 model generates its own text, and the student matches its full distribution (111.5). It shines where PTQ collapses (W4A8KV4).</li>
+<li>Adapters on a frozen low-bit base are the cheap form: QLoRA (111.7) trains through the quantized base; QA-LoRA (111.8–111.9) merges into zero points; LoftQ (111.10–111.11) starts \(Q + BA\) close to \(W\).</li>
+<li>Try PTQ first. Use QAT for 2–3 bits, low-bit activations or KV cache, small models, or models served at very large scale.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \hat x = s\,\operatorname{clamp}\!\left(\left\lfloor \tfrac{x}{s} \right\rceil, -Q, Q\right), \qquad \frac{\partial \mathcal{L}}{\partial x} \approx \frac{\partial \mathcal{L}}{\partial \hat x}\,\mathbb{1}\!\left[\left|\tfrac{x}{s}\right| \le Q\right], \qquad \frac{\partial \hat x}{\partial s} = \lfloor u \rceil - u \]</div>
+<div class="eq">\[ \mathcal{L}_{\text{CE}} = -\tfrac{1}{n}\sum_i \sum_c p^{\mathcal{T}}_c \log p^{\mathcal{S}}_c, \qquad \beta' = \beta + s\,(BA)_{o,g}, \qquad Q_t = q(W - B_{t-1}A_{t-1}),\ \ B_tA_t = \operatorname{SVD}_r(W - Q_t) \]</div>
+<h2 class="plain" id="quantization-aware-training-fake-quant-ste-llm-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Bengio et al. (2013). <a href="https://arxiv.org/abs/1308.3432" target="_blank" rel="noopener">Estimating or Propagating Gradients Through Stochastic Neurons for Conditional Computation</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2305.17888" target="_blank" rel="noopener">LLM-QAT: Data-Free Quantization Aware Training for Large Language Models</a></li><li>Dettmers et al. (2023). <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">QLoRA: Efficient Finetuning of Quantized LLMs</a></li><li>Xu et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;QA-LoRA: Quantization-Aware Low-Rank Adaptation of Large Language Models&amp;quot;" target="_blank" rel="noopener">QA-LoRA: Quantization-Aware Low-Rank Adaptation of Large Language Models</a></li><li>Li et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;LoftQ: LoRA-Fine-Tuning-Aware Quantization for Large Language Models&amp;quot;" target="_blank" rel="noopener">LoftQ: LoRA-Fine-Tuning-Aware Quantization for Large Language Models</a></li><li>Jacob et al. (2017). <a href="https://arxiv.org/abs/1712.05877" target="_blank" rel="noopener">Quantization and Training of Neural Networks for Efficient Integer-Arithmetic-Only Inference</a></li><li>Esser et al. (2019). <a href="https://arxiv.org/abs/1902.08153" target="_blank" rel="noopener">Learned Step Size Quantization</a></li><li>Nagel et al. (2022). <a href="https://arxiv.org/abs/2203.11086" target="_blank" rel="noopener">Overcoming Oscillations in Quantization-Aware Training</a></li><li>Ma et al. (2024). <a href="https://arxiv.org/abs/2402.17764" target="_blank" rel="noopener">The Era of 1-bit LLMs: All Large Language Models are in 1.58 Bits</a></li><li>Google (Gemma team) (2025). <a href="https://developers.googleblog.com/en/gemma-3-quantized-aware-trained-state-of-the-art-ai-to-consumer-gpus/" target="_blank" rel="noopener">Gemma 3 QAT Models: Bringing state-of-the-Art AI to consumer GPUs</a></li><li>Meta AI (2024). <a href="https://ai.meta.com/blog/meta-llama-quantized-lightweight-models/" target="_blank" rel="noopener">Introducing quantized Llama models with increased speed and a reduced memory footprint</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Hinton et al. (2015). <a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">Distilling the Knowledge in a Neural Network</a></li><li>Frantar et al. (2022). <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</a></li><li>Xiao et al. (2022). <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</a></li><li>Hu et al. (2021). <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">LoRA: Low-Rank Adaptation of Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/kv-cache-quantization-kivi-and-kvquant.html"><small>Previous · session 110</small>KV-cache quantization: KIVI and KVQuant</a><a class="next" href="../inference/lab-compare-rtn-gptq-awq-smoothquant-and.html"><small>Next · session 112</small>compare RTN, GPTQ, AWQ, SmoothQuant and FP8 on one model</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="quantization-aware-training-fake-quant-ste-llm"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const pct=(v,d)=>(100*v).toFixed(d===undefined?2:d)+"%";
+function segInit(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segVal=el=>el.querySelector('button[aria-pressed="true"]').dataset.v;
+
+/* ---------- Figure 1: fake quantization and the STE ---------- */
+(function(){
+ const svg=$("#qat-fq-svg");if(!svg)return;const Bt=$("#qat-fq-b"),Cl=$("#qat-fq-c"),info=$("#qat-fq-info");
+ const g=gauss(rng(7));const X=Array.from({length:4096},()=>g());let mx=0;X.forEach(v=>{if(Math.abs(v)>mx)mx=Math.abs(v);});
+ function stats(b,c){const Q=2**(b-1)-1,s=c*mx/Q;let mse=0,mr=0,mc=0,nc=0,gs=0;
+  for(const x of X){const u=x/s,k=clamp(Math.round(u),-Q,Q),e=k*s-x,inr=Math.abs(u)<=Q;mse+=e*e;if(inr){mr+=e*e;gs+=2*e*(k-u);}else{mc+=e*e;nc++;gs+=2*e*k;}}
+  const n=X.length;return{Q,s,mse:mse/n,mr:mr/n,mc:mc/n,fc:nc/n,gs:gs/n};}
+ const H=new Array(48).fill(0);X.forEach(v=>{const i=Math.floor((v+4)/8*48);if(i>=0&&i<48)H[i]++;});const Hm=Math.max(...H);
+ const XS=x=>40+(x+4)/8*580,YS=y=>130-y*26;
+ function draw(){const b=+Bt.value,c=+Cl.value;$("#qat-fq-bv").value=b+" bits";$("#qat-fq-cv").value=c.toFixed(2);
+  const st=stats(b,c);let best={mse:1e9,c:1};for(let k=5;k<=100;k++){const cc=k/100,m=stats(b,cc).mse;if(m<best.mse)best={mse:m,c:cc};}
+  let o=`<rect x="40" y="26" width="580" height="208" fill="none" stroke="var(--rule)"/>`;
+  H.forEach((h,i)=>{const x0=40+i*580/48,hh=h/Hm*90;o+=`<rect x="${x0.toFixed(1)}" y="${(234-hh).toFixed(1)}" width="${(580/48-1).toFixed(1)}" height="${hh.toFixed(1)}" fill="var(--rule)" opacity=".55"/>`;});
+  o+=`<line x1="${XS(-4)}" y1="${YS(-4)}" x2="${XS(4)}" y2="${YS(4)}" stroke="var(--muted)" stroke-dasharray="5 4"/>`;
+  let d="";const N=800;for(let i=0;i<=N;i++){const x=-4+8*i/N,y=clamp(Math.round(x/st.s),-st.Q,st.Q)*st.s;d+=(i?"L":"M")+XS(x).toFixed(1)+" "+YS(clamp(y,-4,4)).toFixed(1);}
+  o+=`<path d="${d}" fill="none" stroke="var(--q)" stroke-width="2.6"/>`;
+  const lo=-st.Q*st.s,hi=st.Q*st.s;[lo,hi].forEach(v=>{if(v>-4&&v<4)o+=`<line x1="${XS(v)}" y1="26" x2="${XS(v)}" y2="234" stroke="var(--k)" stroke-dasharray="3 3"/>`;});
+  o+=`<line x1="40" y1="130" x2="620" y2="130" stroke="var(--rule)"/>`;
+  [-4,-2,0,2,4].forEach(v=>o+=`<text x="${XS(v)}" y="248" text-anchor="middle" class="svgs" font-size="12">${v}</text>`);
+  o+=`<text x="330" y="16" text-anchor="middle" class="svgs" font-size="12.5">forward: x̂ = s · clamp(round(x/s)) (blue), identity (dashed), data histogram (grey)</text>`;
+  const y0=300,y1=270;o+=`<text x="34" y="${y0+4}" text-anchor="end" class="svgs" font-size="11.5">0</text><text x="34" y="${y1+4}" text-anchor="end" class="svgs" font-size="11.5">1</text><line x1="40" y1="${y0}" x2="620" y2="${y0}" stroke="var(--rule)"/>`;
+  const a=XS(Math.max(-4,lo)),bb=XS(Math.min(4,hi));
+  o+=`<path d="M${XS(-4)} ${y0} H${a} V${y1} H${bb} V${y0} H${XS(4)}" fill="none" stroke="var(--k)" stroke-width="2.6"/>`;
+  for(let k=-st.Q;k<st.Q;k++){const v=(k+0.5)*st.s;if(v>-4&&v<4)o+=`<line x1="${XS(v).toFixed(1)}" y1="${y0}" x2="${XS(v).toFixed(1)}" y2="${y0-22}" stroke="var(--muted)" stroke-width="1.4"/>`;}
+  o+=`<text x="330" y="262" text-anchor="middle" class="svgs" font-size="12.5">backward: STE gradient ∂x̂/∂x (orange); the true derivative is 0 except spikes at the grey ticks</text>`;
+  svg.innerHTML=o;
+  info.innerHTML=`Levels: <b>${2*st.Q+1}</b> (−${st.Q} … ${st.Q}), step s = <b>${st.s.toFixed(4)}</b>, range ±${(st.Q*st.s).toFixed(3)}. MSE on 4,096 Gaussian values: <b>${st.mse.toFixed(4)}</b> = rounding ${st.mr.toFixed(4)} + clipping ${st.mc.toFixed(4)}; clipped: ${pct(st.fc)} (their STE gradient is 0). LSQ-style gradient ∂MSE/∂s = <b>${st.gs.toFixed(4)}</b>, so a learned scale would move ${st.gs>0?"down (clip more)":"up (clip less)"}. Best clip ratio for ${b} bits: <b>${best.c.toFixed(2)}</b> (MSE ${best.mse.toFixed(4)}).`;
+  info.dataset.mse=st.mse.toFixed(4);info.dataset.best=best.c.toFixed(2);}
+ [Bt,Cl].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: PTQ vs QAT on a toy layer ---------- */
+(function(){
+ const svg=$("#qat-toy-svg");if(!svg)return;const Bs=$("#qat-toy-b"),Rh=$("#qat-toy-r"),Lr=$("#qat-toy-lr"),An=$("#qat-toy-an"),info=$("#qat-toy-info");
+ const d=16,T=300;const g=gauss(rng(3));const ws=Array.from({length:d},()=>g()*0.5);
+ function run(bits,rho,lr0,anneal){const Q=2**(bits-1)-1;let m=0;ws.forEach(v=>{if(Math.abs(v)>m)m=Math.abs(v);});const s=m/Q,lam=1+(d-1)*rho;
+  const q=w=>w.map(v=>s*clamp(Math.round(v/s),-Q,Q));
+  const Sx=v=>{let sum=0;v.forEach(a=>sum+=a);return v.map(a=>(1-rho)*a+rho*sum);};
+  const L=v=>{const e=v.map((a,i)=>a-ws[i]);const Se=Sx(e);let r=0;e.forEach((a,i)=>r+=a*Se[i]);return r;};
+  const vr=L(ws.map(()=>0));const ptq=L(q(ws))/vr;let w=ws.slice(),hist=[],flips=0,prev=w.map(v=>Math.round(v/s));
+  for(let t=0;t<T;t++){const lr=lr0/lam*(anneal?0.5*(1+Math.cos(Math.PI*t/T)):1);const qw=q(w);const gq=Sx(qw.map((a,i)=>a-ws[i])).map(a=>2*a);
+   w=w.map((v,i)=>Math.abs(v/s)<=Q?v-lr*gq[i]:v);const cur=w.map(v=>Math.round(v/s));if(t>=0.8*T)cur.forEach((c,i)=>{if(c!==prev[i])flips++;});prev=cur;hist.push(L(q(w))/vr);}
+  return{ptq,hist,flips,best:Math.min(...hist)};}
+ const XS=t=>56+t/T*560;
+ function draw(){const bits=+segVal(Bs),rho=+Rh.value,lr=+Lr.value,an=An.checked;$("#qat-toy-rv").value=rho.toFixed(2);$("#qat-toy-lrv").value=lr.toFixed(2);
+  const r=run(bits,rho,lr,an);const all=r.hist.concat([r.ptq]).map(v=>Math.max(v,1e-5));let lo=Math.floor(Math.log10(Math.min(...all))),hi=Math.ceil(Math.log10(Math.max(...all)));if(hi<=lo)hi=lo+1;
+  const YS=v=>220-(Math.log10(Math.max(v,1e-5))-lo)/(hi-lo)*190;
+  let o=`<path d="M56 30 V220 H616" fill="none" stroke="var(--muted)"/>`;
+  for(let e=lo;e<=hi;e++)o+=`<line x1="56" y1="${YS(10**e)}" x2="616" y2="${YS(10**e)}" stroke="var(--rule)" stroke-dasharray="2 4"/><text x="50" y="${YS(10**e)+4}" text-anchor="end" class="svgs" font-size="11.5">${(100*10**e).toFixed(Math.max(0,-e-2))+"%"}</text>`;
+  [0,100,200,300].forEach(t=>o+=`<text x="${XS(t)}" y="238" text-anchor="middle" class="svgs" font-size="12">${t}</text>`);
+  o+=`<line x1="56" y1="${YS(r.ptq)}" x2="616" y2="${YS(r.ptq)}" stroke="var(--k)" stroke-width="2.4" stroke-dasharray="7 5"/>`;
+  o+=`<polyline points="${r.hist.map((v,t)=>XS(t+1).toFixed(1)+","+YS(v).toFixed(1)).join(" ")}" fill="none" stroke="var(--q)" stroke-width="2.2"/>`;
+  o+=`<text x="336" y="254" text-anchor="middle" class="svgs" font-size="12.5">QAT step</text><text x="14" y="125" transform="rotate(-90 14 125)" text-anchor="middle" class="svgs" font-size="12">error after quantization (log)</text>`;
+  svg.innerHTML=o;const fin=r.hist[T-1];
+  info.innerHTML=`Error of the quantized layer, as a share of the output variance. PTQ (round to nearest): <b>${pct(r.ptq,3)}</b>. QAT after ${T} steps: <b>${pct(fin,3)}</b>${fin<r.ptq?` (${(r.ptq/fin).toFixed(1)}× smaller)`:fin>r.ptq*1.0001?" (<b style='color:var(--bad)'>worse than PTQ</b>)":" (same as PTQ)"}; best seen during training ${pct(r.best,3)}. Grid flips in the last 20% of steps: <b>${r.flips}</b>${r.flips>40?" (the weights oscillate between grid points)":""}.`;
+  info.dataset.ptq=(100*r.ptq).toFixed(3);info.dataset.qat=(100*fin).toFixed(3);info.dataset.flips=r.flips;}
+ segInit(Bs,draw);[Rh,Lr].forEach(e=>e.addEventListener("input",draw));An.addEventListener("change",draw);draw();
+})();
+
+/* ---------- Figure 3: LLM-QAT data generation and distillation (toy) ---------- */
+(function(){
+ const svg=$("#qat-gen-svg");if(!svg)return;const St=$("#qat-gen-s"),info=$("#qat-gen-info"),sum=$("#qat-gen-sum");
+ const V=["the","cat","dog","sat","ran","on","a","mat"],n=V.length,Lq=12;const g=gauss(rng(33));
+ const TL=Array.from({length:n},()=>Array.from({length:n},()=>1.5*g()));
+ const SL=TL.map(row=>{let m=0;row.forEach(v=>{if(Math.abs(v)>m)m=Math.abs(v);});const s=m/3;return row.map(v=>s*clamp(Math.round(v/s),-3,3));});
+ const PT=TL.map(r=>B.softmax(r)),PS=SL.map(r=>B.softmax(r));
+ const KLr=PT.map((p,i)=>p.reduce((a,v,j)=>a+v*Math.log(v/PS[i][j]),0));
+ const amax=p=>p.indexOf(Math.max(...p));
+ function gen(strat,r){const seq=[Math.floor(r()*n)];for(let t=1;t<Lq;t++){const p=PT[seq[t-1]];let nx;
+   if(strat==="greedy"||(strat==="hybrid"&&t<=3))nx=amax(p);else{let u=r(),c=0;nx=n-1;for(let j=0;j<n;j++){c+=p[j];if(u<c){nx=j;break;}}}seq.push(nx);}return seq;}
+ const S={};["greedy","sample","hybrid"].forEach((k,ki)=>{const r=rng(41+ki);const seqs=Array.from({length:300},()=>gen(k,r));const tri=new Set(),bi=new Set();let kl=0,cnt=0;
+  seqs.forEach(s=>{for(let t=1;t<Lq;t++){bi.add(s[t-1]+","+s[t]);kl+=KLr[s[t-1]];cnt++;if(t>=2)tri.add(s[t-2]+","+s[t-1]+","+s[t]);}});
+  const ctx=new Array(n).fill(0);seqs.forEach(s=>{for(let t=0;t<Lq-1;t++)ctx[s[t]]++;});S[k]={seq:seqs[0],tri:tri.size,bi:bi.size,kl:kl/cnt,ctx:ctx.filter(c=>c>0).length};});
+ sum.innerHTML=`Over 300 generated sequences of ${Lq} tokens: greedy gives <b>${S.greedy.tri}</b> distinct 3-grams, pure sampling <b>${S.sample.tri}</b>, hybrid (top-1 for 3 tokens, then sampling) <b>${S.hybrid.tri}</b>. Distinct bigrams: ${S.greedy.bi}, ${S.sample.bi}, ${S.hybrid.bi} of ${n*n}.`;
+ sum.dataset.tri=[S.greedy.tri,S.sample.tri,S.hybrid.tri].join(",");
+ let strat="hybrid",step=0;
+ function draw(k){step=k;const sq=S[strat].seq,t=k+1,ctx=sq[t-1],pT=PT[ctx],pS=PS[ctx];const ce=-pT.reduce((a,v,j)=>a+v*Math.log(pS[j]),0),H=-pT.reduce((a,v)=>a+v*Math.log(v),0);
+  let o="";sq.forEach((tok,i)=>{const x=10+i*52.5,on=i<=t;o+=`<rect x="${x}" y="8" width="49" height="30" rx="7" fill="${i===t?"var(--k-soft)":i===t-1?"var(--q-soft)":"var(--card)"}" stroke="${i===t?"var(--k)":i===t-1?"var(--q)":"var(--rule)"}" opacity="${on?1:0.35}"/><text x="${x+24.5}" y="28" text-anchor="middle" font-size="12.5" fill="var(--ink)" opacity="${on?1:0.35}">${on?V[tok]:"…"}</text>`;});
+  const bw=64,y0=220;o+=`<line x1="40" y1="${y0}" x2="620" y2="${y0}" stroke="var(--muted)"/>`;
+  for(let j=0;j<n;j++){const x=48+j*72,hT=pT[j]*150,hS=pS[j]*150;o+=`<rect x="${x}" y="${y0-hT}" width="${bw/2-2}" height="${hT}" fill="var(--q)" opacity=".85"/><rect x="${x+bw/2}" y="${y0-hS}" width="${bw/2-2}" height="${hS}" fill="var(--k)" opacity=".85"/><text x="${x+bw/2}" y="${y0+16}" text-anchor="middle" font-size="12.5" fill="${j===sq[t]?"var(--k)":"var(--ink2)"}" font-weight="${j===sq[t]?700:400}">${V[j]}</text>`;}
+  o+=`<text x="330" y="60" text-anchor="middle" class="svgs" font-size="12.5">next-token probabilities after “${V[ctx]}”: teacher FP16 (blue), 3-bit student (orange)</text>`;
+  svg.innerHTML=o;const how=strat==="greedy"||(strat==="hybrid"&&t<=3)?"top-1 of the teacher":"sampled from the teacher";
+  info.innerHTML=`Position ${t}: context “${V[ctx]}”, next token “<b>${V[sq[t]]}</b>” (${how}). Distillation loss at this position: cross-entropy −Σ p<sub>T</sub> log p<sub>S</sub> = <b>${ce.toFixed(4)}</b> = teacher entropy ${H.toFixed(4)} + KL ${(ce-H).toFixed(4)}. The student learns from the whole teacher distribution, not only from the chosen token.`;
+  info.dataset.ce=ce.toFixed(4);}
+ const stp=B.stepper({n:Lq-1,prev:$("#qat-gen-prev"),next:$("#qat-gen-next"),play:$("#qat-gen-play"),label:$("#qat-gen-lab"),ms:1800,onStep:draw});
+ segInit(St,v=>{strat=v;stp.go(stp.i);});
+})();
+
+/* ---------- Figure 4: why QA-LoRA can merge into a low-bit model ---------- */
+(function(){
+ const svg=$("#qat-mg-svg");if(!svg)return;const Gs=$("#qat-mg-g"),Bs=$("#qat-mg-b"),Ad=$("#qat-mg-a"),info=$("#qat-mg-info");
+ const N=16;const g1=gauss(rng(21)),g2=gauss(rng(22));const w=Array.from({length:N},()=>0.02*g1());const dl=Array.from({length:N},()=>0.006*g2());
+ function quant(v,b){const K=2**b-1;const mn=Math.min(...v),mx=Math.max(...v),a=(mx-mn)/K;return{a,b0:mn,k:v.map(x=>clamp(Math.round((x-mn)/a),0,K)),K};}
+ function compute(G,b,mode){const base=[],merged=[],grids=[],mgrids=[];let off=0,rq=0,dn=0;
+  for(let s=0;s<N;s+=G){const v=w.slice(s,s+G),q=quant(v,b);const wt=q.k.map(k=>q.a*k+q.b0);let del=dl.slice(s,s+G);
+   if(mode==="qa"){const m=del.reduce((x,y)=>x+y,0)/G;del=del.map(()=>m);}
+   const mg=wt.map((x,i)=>x+del[i]);const sh=mode==="qa"?del[0]:0;
+   mg.forEach((x,i)=>{const kk=(x-(q.b0+sh))/q.a;if(Math.abs(kk-Math.round(kk))>1e-9||kk<-1e-9||kk>q.K+1e-9)off++;});
+   const q2=quant(mg,b),rqv=q2.k.map(k=>q2.a*k+q2.b0);mg.forEach((x,i)=>{rq+=(rqv[i]-x)**2;dn+=del[i]**2;});
+   base.push(...wt);merged.push(...mg);grids.push({s,G,a:q.a,b0:q.b0,K:q.K});mgrids.push({s,G,a:q.a,b0:q.b0+sh,K:q.K});}
+  return{base,merged,grids,mgrids,off,rq:Math.sqrt(rq/N),dn:Math.sqrt(dn/N)};}
+ function draw(){const G=+segVal(Gs),b=+segVal(Bs),mode=segVal(Ad);const r=compute(G,b,mode);
+  const all=r.base.concat(r.merged);const lo=Math.min(...all)-0.004,hi=Math.max(...all)+0.004;const YS=v=>230-(v-lo)/(hi-lo)*200,XS=i=>52+i*35.5;
+  let o=`<line x1="40" y1="236" x2="620" y2="236" stroke="var(--muted)"/>`;
+  r.grids.forEach((gr,gi)=>{const x0=XS(gr.s)-15,x1=XS(gr.s+gr.G-1)+15;o+=`<rect x="${x0}" y="24" width="${x1-x0}" height="212" fill="${gi%2?"var(--paper2)":"none"}" opacity=".7"/>`;
+   for(let k=0;k<=gr.K;k++)o+=`<line x1="${x0}" y1="${YS(gr.a*k+gr.b0).toFixed(1)}" x2="${x1}" y2="${YS(gr.a*k+gr.b0).toFixed(1)}" stroke="var(--rule)" stroke-width="1.4"/>`;
+   if(mode==="qa"){const mg=r.mgrids[gi];for(let k=0;k<=mg.K;k++)o+=`<line x1="${x0}" y1="${YS(mg.a*k+mg.b0).toFixed(1)}" x2="${x1}" y2="${YS(mg.a*k+mg.b0).toFixed(1)}" stroke="var(--k)" stroke-width="1.1" stroke-dasharray="4 3"/>`;}
+   o+=`<text x="${(x0+x1)/2}" y="18" text-anchor="middle" class="svgs" font-size="11.5">group ${gi+1}</text>`;});
+  for(let i=0;i<N;i++){o+=`<line x1="${XS(i)}" y1="${YS(r.base[i])}" x2="${XS(i)}" y2="${YS(r.merged[i])}" stroke="var(--muted)"/><circle cx="${XS(i)}" cy="${YS(r.base[i]).toFixed(1)}" r="4.2" fill="var(--q)"/><circle cx="${XS(i)}" cy="${YS(r.merged[i]).toFixed(1)}" r="4.2" fill="none" stroke="var(--k)" stroke-width="2.2"/>`;}
+  o+=`<text x="330" y="254" text-anchor="middle" class="svgs" font-size="12.5">16 weights of one output row (input index →)</text>`;svg.innerHTML=o;
+  const din=4096,rk=16,lora=rk*(din+din),qa=rk*(din/G)+din*rk;
+  info.innerHTML=mode==="qa"?`QA-LoRA: the adapter adds one number per group, so each group’s grid just shifts (dashed orange): new zero point β′ = β + s·Δ<sub>group</sub>. Merged weights off the ${b}-bit grid: <b>${r.off} of ${N}</b>; no re-quantization needed. For a 4096 × 4096 layer with r = 16 and groups of ${G}, the adapter has ${qa.toLocaleString("en-US")} parameters (LoRA: ${lora.toLocaleString("en-US")}).`
+   :`QLoRA-style adapter: every weight gets its own change, so merged weights land between grid lines. Off the ${b}-bit grid: <b>${r.off} of ${N}</b>. Re-quantizing them to ${b} bits moves them by RMS <b>${r.rq.toExponential(2)}</b>, which is <b>${(100*r.rq/r.dn).toFixed(0)}%</b> of the size of the adapter’s own change (RMS ${r.dn.toExponential(2)}).`;
+  info.dataset.off=r.off;info.dataset.ratio=(100*r.rq/r.dn).toFixed(0);}
+ [Gs,Bs,Ad].forEach(e=>segInit(e,draw));draw();
+})();
+
+/* ---------- Figure 5: LoftQ initialization ---------- */
+(function(){
+ const svg=$("#qat-lq-svg");if(!svg)return;const Bs=$("#qat-lq-b"),Rk=$("#qat-lq-r"),Tt=$("#qat-lq-t"),info=$("#qat-lq-info");
+ const n=64;const g=gauss(rng(11));const W=Array.from({length:n},()=>Float64Array.from({length:n},()=>g()/8));
+ const fro=M=>{let s=0;M.forEach(r=>r.forEach(v=>s+=v*v));return Math.sqrt(s);};const nW=fro(W);
+ function quant(M,b){const K=2**b-1;return M.map(row=>{let c=0;row.forEach(v=>{if(Math.abs(v)>c)c=Math.abs(v);});return row.map(v=>{const k=clamp(Math.round((v/c+1)/2*K),0,K);return c*(-1+2*k/K);});});}
+ function topV(Rm,r){const M=Array.from({length:n},()=>new Float64Array(n));for(let i=0;i<n;i++)for(let j=i;j<n;j++){let s=0;for(let k=0;k<n;k++)s+=Rm[k][i]*Rm[k][j];M[i][j]=s;M[j][i]=s;}
+  const Vv=Array.from({length:n},(_,i)=>{const a=new Float64Array(n);a[i]=1;return a;});
+  for(let sw=0;sw<30;sw++){let off=0;for(let p=0;p<n;p++)for(let q=p+1;q<n;q++)off+=M[p][q]*M[p][q];if(off<1e-22)break;
+   for(let p=0;p<n-1;p++)for(let q=p+1;q<n;q++){const apq=M[p][q];if(Math.abs(apq)<1e-300)continue;const th=(M[q][q]-M[p][p])/(2*apq),t=Math.sign(th||1)/(Math.abs(th)+Math.sqrt(th*th+1)),c=1/Math.sqrt(t*t+1),s=t*c;
+    for(let k=0;k<n;k++){const mkp=M[k][p],mkq=M[k][q];M[k][p]=c*mkp-s*mkq;M[k][q]=s*mkp+c*mkq;}
+    for(let k=0;k<n;k++){const mpk=M[p][k],mqk=M[q][k];M[p][k]=c*mpk-s*mqk;M[q][k]=s*mpk+c*mqk;}
+    for(let k=0;k<n;k++){const vp=Vv[k][p],vq=Vv[k][q];Vv[k][p]=c*vp-s*vq;Vv[k][q]=s*vp+c*vq;}}}
+  const idx=Array.from({length:n},(_,i)=>i).sort((a,b)=>M[b][b]-M[a][a]).slice(0,r);return idx.map(j=>Float64Array.from({length:n},(_,k)=>Vv[k][j]));}
+ function lowrank(Rm,r){if(r===0)return Rm.map(row=>new Float64Array(n));const Vs=topV(Rm,r);return Rm.map(row=>{const out=new Float64Array(n);Vs.forEach(v=>{let d=0;for(let k=0;k<n;k++)d+=row[k]*v[k];for(let k=0;k<n;k++)out[k]+=d*v[k];});return out;});}
+ const cache={};
+ function run(b,r,T){const key=b+"_"+r+"_"+T;if(cache[key])return cache[key];let A=W.map(()=>new Float64Array(n));const errs=[];const Q0=quant(W,b);errs.push(fro(W.map((row,i)=>row.map((v,j)=>v-Q0[i][j])))/nW);
+  for(let t=0;t<T;t++){const Q=quant(W.map((row,i)=>row.map((v,j)=>v-A[i][j])),b);const Rm=W.map((row,i)=>row.map((v,j)=>v-Q[i][j]));A=lowrank(Rm,r);errs.push(fro(Rm.map((row,i)=>row.map((v,j)=>v-A[i][j])))/nW);}
+  return(cache[key]=errs);}
+ function draw(){const b=+segVal(Bs),r=+Rk.value,T=+Tt.value;$("#qat-lq-rv").value=r;$("#qat-lq-tv").value=T;const e=run(b,r,T);
+  const top=Math.max(0.1,Math.ceil(e[0]*10)/10+0.05),YS=v=>214-v/top*186,bw=Math.min(80,520/(T+1)-14);
+  let o=`<path d="M60 24 V214 H620" fill="none" stroke="var(--muted)"/>`;for(let k=0;k<=4;k++){const v=top*k/4;o+=`<text x="54" y="${YS(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${(100*v).toFixed(0)}%</text><line x1="60" y1="${YS(v)}" x2="620" y2="${YS(v)}" stroke="var(--rule)" stroke-dasharray="2 4"/>`;}
+  e.forEach((v,t)=>{const x=80+t*(540/(T+1));o+=`<rect x="${x}" y="${YS(v)}" width="${bw}" height="${214-YS(v)}" rx="4" fill="${t===0?"var(--muted)":"var(--k)"}" opacity=".85"/><text x="${x+bw/2}" y="${YS(v)-6}" text-anchor="middle" font-size="12" fill="var(--ink)">${(100*v).toFixed(1)}%</text><text x="${x+bw/2}" y="232" text-anchor="middle" class="svgs" font-size="12">${t===0?"QLoRA (BA = 0)":"LoftQ t = "+t}</text>`;});
+  o+=`<text x="16" y="120" transform="rotate(-90 16 120)" text-anchor="middle" class="svgs" font-size="12">‖W − Q − BA‖ / ‖W‖</text>`;svg.innerHTML=o;
+  const last=e[e.length-1];const bestT=e.slice(1).indexOf(Math.min(...e.slice(1)))+1;
+  info.innerHTML=`${b}-bit, rank ${r}. Starting error with the QLoRA initialization: <b>${pct(e[0],1)}</b>. LoftQ after ${T} step${T>1?"s":""}: <b>${pct(last,1)}</b> (gap closed: ${pct(1-last/e[0],0)}). Lowest after step ${bestT}.${r===0?" With rank 0 there is no adapter, so LoftQ cannot help.":""}`;
+  info.dataset.e0=(100*e[0]).toFixed(1);info.dataset.e=(100*last).toFixed(1);}
+ segInit(Bs,draw);[Rk,Tt].forEach(x=>x.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

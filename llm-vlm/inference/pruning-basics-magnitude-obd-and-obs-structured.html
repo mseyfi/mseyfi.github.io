@@ -1,0 +1,545 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Pruning basics: magnitude, OBD and OBS; structured vs unstructured · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 113</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="pruning-basics-magnitude-obd-and-obs-structured">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="pruning-basics-magnitude-obd-and-obs-structured" data-session="pruning-basics-magnitude-obd-and-obs-structured" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">113</span><span>Track 5: LLM inference and serving · session 36 of 65</span></div><h1 class="chap-title">Pruning basics: magnitude, OBD and OBS; structured vs unstructured</h1><p class="chap-sub">Pruning removes weights from a trained model. The simplest rule removes the smallest weights; better rules use the curvature of the loss (the Hessian) to choose which weights to remove and to move the remaining weights so the model keeps working. This session builds magnitude pruning, Optimal Brain Damage and Optimal Brain Surgeon step by step, and explains why removing single weights rarely makes a GPU faster while removing whole channels, heads or layers does.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Weight PTQ 1 (session 106), why inference is slow (session 82), basic linear algebra</span></div><div class="learn"><h3>What you will learn</h3><ul><li>What pruning is: masks, sparsity, granularity, one-shot versus gradual pruning</li><li>Magnitude pruning, the train-prune-retrain loop, and why it collapses on LLMs at 50% sparsity</li><li>The second-order view: the Taylor expansion of the loss and the OBD saliency ½·H_qq·w_q²</li><li>OBS: remove one weight and move all the others with the inverse Hessian, with a full derivation</li><li>Why OBS needs the layer-wise form H = 2XXᵀ to scale, and how OBD then becomes the Wanda score</li><li>Unstructured, N:M, channel, head and layer sparsity, and a simple memory model of real GPU speed-up</li><li>Why structured pruning gives real speed-up but loses more accuracy, and how recovery training helps</li></ul></div></header><h2>Why this matters</h2>
+<p class="lead">A trained network has many weights that do almost nothing. Pruning removes them. If you remove the right ones, the model keeps its quality and becomes smaller. If you remove the wrong ones, or remove them in the wrong pattern, you get a model that is worse and not faster at all. This session gives you the tools to tell the two cases apart.</p>
+<p>The quantization sessions (<a href="../inference/quantization-math-scale-zero-point-granularity-and.html">session 103</a> to <a href="../inference/lab-compare-rtn-gptq-awq-smoothquant-and.html">session 112</a>) kept every weight and stored it in fewer bits. In the last lab, GPTQ beat round-to-nearest at the same INT4 format only because it used the layer Hessian to correct errors. The same Hessian is the main tool of this session. Pruning is the other main way to compress weights: it keeps the bits but sets many weights to exactly zero. The efficient-inference survey puts both under “model compression” and splits pruning into two kinds by <b>granularity</b> (the size of the piece that is removed). [Certain, survey Section 5.2.2]</p>
+<ul><li><b>Unstructured pruning</b> removes single weights anywhere. It reaches high sparsity with little loss, but the zeros have no regular pattern, so memory access and computation are irregular and the real speed-up on hardware is limited.</li>
+<li><b>Structured pruning</b> removes whole channels, attention heads or layers. What is left is a smaller dense model, so it runs faster on any hardware. But it usually costs more accuracy.</li></ul>
+<p>This session builds the ideas that every LLM pruning method is made of. First the simplest rule, magnitude pruning, and why it collapses on LLMs. Then the second-order view from 1990 and 1993: <b>Optimal Brain Damage</b> (OBD) and <b>Optimal Brain Surgeon</b> (OBS) use the curvature of the loss to choose which weights to remove, and OBS also moves the kept weights to repair the damage. You saw the same OBS update in <a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>, where GPTQ uses it to fix rounding errors. Here it fixes removals. Finally we look at the hardware question: why 50% of zeros often gives no speed-up, and what 2:4, channel, head and layer sparsity change.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A company must cut half its staff. Firing the people with the lowest salaries (magnitude) is simple but may remove the only person who runs payroll. A better plan asks how much work stops when each person leaves (OBD). The best plan also gives that work to the colleagues who are most similar (OBS). And if the goal is to close whole offices to save rent, removing scattered people saves nothing: you must close entire offices (structured pruning), even if a few good people go with them.</aside>
+<p>Interview questions on this topic: “Why does magnitude pruning fail on LLMs?”, “Derive the OBS update”, “Why is my 50% sparse model not faster?”, “Structured or unstructured: which would you ship?”. By the end you can answer each with a formula and a number. The next two sessions, <a href="../inference/unstructured-and-2-4-pruning-sparsegpt-wanda.html">session 114</a> and <a href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html">session 115</a>, apply these tools to real LLMs.</p>
+
+<h2>What pruning is</h2>
+<h3>Masks and sparsity</h3>
+<p>Take one weight matrix \(W\). Pruning chooses a <b>mask</b> \(M\) of the same shape with entries 0 or 1, and replaces \(W\) by the elementwise product. The <b>sparsity</b> is the fraction of zeros:</p>
+<div class="eq">\[ \hat W = M \odot W, \qquad s = 1 - \frac{\lVert M \rVert_0}{N} \tag{113.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(M\)</dt><dd>the mask: 1 means “keep this weight”, 0 means “remove it”</dd>
+<dt>\(\odot\)</dt><dd>elementwise product</dd>
+<dt>\(\lVert M \rVert_0\)</dt><dd>the number of non-zero entries of \(M\), so the number of kept weights</dd>
+<dt>\(N\)</dt><dd>the total number of weights in \(W\)</dd>
+<dt>\(s\)</dt><dd>sparsity. \(s = 0.5\) means half the weights are zero.</dd></dl>
+<p>A pruning method answers three questions.</p>
+<ol><li><b>Which weights?</b> The <b>score</b> (also called saliency): a number per weight or per group; low score means “safe to remove”.</li>
+<li><b>In which pattern?</b> The <b>granularity</b>: single weights, N:M groups, rows, columns, heads or whole layers. This decides the speed-up.</li>
+<li><b>What happens to the kept weights?</b> Nothing, a closed-form <b>update</b> (OBS), or <b>retraining</b> (fine-tuning with the mask fixed).</li></ol>
+<p>And one question about time: <b>one-shot</b> pruning removes everything at once after training, usually with a small calibration set and no gradient steps. <b>Gradual</b> pruning removes weights a little at a time during (re)training. LLM pruning is mostly one-shot, because retraining a 70B model is very expensive.</p>
+
+<h3>The patterns</h3>
+<div class="tblw"><table class="tb"><thead><tr><th>Granularity</th><th>What is removed</th><th>Result</th><th>Runs faster on a GPU?</th></tr></thead><tbody>
+<tr><td>Unstructured</td><td>any single weight</td><td>same shape, irregular zeros</td><td>only with special kernels, mostly at high sparsity</td></tr>
+<tr><td>Semi-structured N:M</td><td>N of every M consecutive weights (2:4: two of four)</td><td>same shape, regular zeros + small index</td><td>yes on sparse tensor cores (NVIDIA Ampere and later), up to 2× math</td></tr>
+<tr><td>Channel / neuron</td><td>a whole row or column of a matrix</td><td>smaller dense matrices</td><td>yes, everywhere</td></tr>
+<tr><td>Attention head</td><td>one head: its slices of \(W_Q, W_K, W_V, W_O\)</td><td>fewer heads</td><td>yes, everywhere</td></tr>
+<tr><td>Layer (depth)</td><td>a whole transformer block</td><td>fewer blocks</td><td>yes, everywhere</td></tr></tbody></table></div>
+
+<h2>Magnitude pruning and its limits</h2>
+<h3>The rule</h3>
+<p>The oldest and simplest score is the absolute value: remove the weights with the smallest \(|w|\). The idea is that a small weight changes the output little. Han et al. (2015) made it work at scale with a loop: <b>train</b>, <b>prune</b> the smallest weights, <b>retrain</b> the rest with the mask fixed, and repeat. They reduced AlexNet from 61 million to 6.7 million parameters (9×) and VGG-16 from 138 million to 10.3 million (13×) with no loss of accuracy on ImageNet. [Certain, paper abstract]</p>
+<p>Zhu and Gupta (2017) made the loop smooth. Instead of a few big pruning steps, the sparsity grows during training along a cubic curve, fast at first (many weights are clearly useless) and slowly at the end:</p>
+<div class="eq">\[ s_t = s_f + \big(s_i - s_f\big) \left(1 - \frac{t - t_0}{n\,\Delta t}\right)^{3}, \qquad t \in \{t_0,\ t_0 + \Delta t,\ \dots,\ t_0 + n\Delta t\} \tag{113.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(s_i, s_f\)</dt><dd>initial and final sparsity (for example 0 and 0.9)</dd>
+<dt>\(t_0\)</dt><dd>the training step where pruning starts</dd>
+<dt>\(\Delta t\)</dt><dd>the number of steps between two pruning updates</dd>
+<dt>\(n\)</dt><dd>the number of pruning updates</dd></dl>
+<p>At each update the smallest weights are masked until the layer has sparsity \(s_t\); training continues in between, so the network adapts. They found that a large sparse model beats a small dense model with the same number of non-zero weights, with up to 10× fewer non-zero parameters at small accuracy loss. [Certain, paper abstract]</p>
+<div class="algo"><div class="algo-h">Algorithm 1: gradual magnitude pruning (Zhu and Gupta)</div><ol>
+<li><b>input:</b> a network, target sparsity \(s_f\), schedule \(t_0, \Delta t, n\)</li>
+<li><b>for</b> each training step \(t\):</li>
+<li>&nbsp;&nbsp;<b>if</b> \(t = t_0 + j\Delta t\) for some \(j \le n\):</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;compute \(s_t\) with (113.2)</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;<b>for</b> each layer: set \(M = 0\) for the \(s_t N\) smallest \(|w|\), \(M = 1\) elsewhere</li>
+<li>&nbsp;&nbsp;take one optimizer step on the loss with \(\hat W = M \odot W\) <span class="c">// masked weights get no update</span></li>
+<li><b>return</b> \(M \odot W\)</li></ol></div>
+<aside class="note side"><span class="nt">Lottery tickets</span>Frankle and Carbin (2018) took the mask found by magnitude pruning, reset the kept weights to their values at initialization, and trained this small network alone. It reached the accuracy of the full network. On MNIST and CIFAR-10 they found such “winning tickets” at less than 10 to 20% of the original size. [Certain, paper abstract] The lesson for us: a good sparse network exists inside the dense one; the hard part is to find it without much training.</aside>
+
+<h3>Where magnitude fails</h3>
+<p>Magnitude pruning looks only at the weight. But the output of a neuron is \(y = \sum_j w_j x_j\): what matters is the product \(w_j x_j\). Wanda’s paper gives the simplest case: if \(|w_1| \le |w_2|\) but \(|x_1| \gg |x_2|\), magnitude removes \(w_1\), which changes \(y\) much more than removing \(w_2\). [Certain, Wanda paper] In LLMs this is not a corner case. From about 6B parameters, a few hidden-state features are about 100× larger than the others (<a href="../inference/weight-activation-quantization-llm-int8-smoothquant-zeroquant.html">session 108</a>, LLM.int8()). [Certain, as cited in the Wanda paper] The weights that read those features may be small and still very important.</p>
+<p>The results on LLMs are clear:</p>
+<ul><li>On OPT-175B, one-shot magnitude pruning keeps accuracy only up to about 10% sparsity and collapses beyond 30%. At 50% the WikiText-2 perplexity is \(4.3 \times 10^4\), against 8.35 for the dense model. SparseGPT, a second-order method, reaches 8.21 at 50%. [Certain, SparseGPT paper, Table and Figure 1]</li>
+<li>On LLaMA-7B at 50% unstructured sparsity: dense 5.68, magnitude 17.29, Wanda 7.26, SparseGPT 7.22 (WikiText perplexity). With 2:4 sparsity magnitude gives 42.13. [Certain, Wanda paper Table 3]</li></ul>
+<p>So retraining is what made magnitude pruning work on CNNs; without retraining, on an LLM, the score is simply not good enough. We need a score that knows how much the <b>loss</b> changes when a weight is removed.</p>
+
+<h2>The second-order view: OBD</h2>
+<h3>The loss near a trained model</h3>
+<p>Let \(\mathbf{w}\) be all the weights of a trained model and \(L(\mathbf{w})\) the loss. Removing weights changes \(\mathbf{w}\) by some \(\delta\mathbf{w}\). The Taylor expansion of the change in loss is</p>
+<div class="eq">\[ \delta L = \underbrace{\mathbf{g}^{\top} \delta\mathbf{w}}_{\approx\, 0 \text{ at a minimum}} + \tfrac{1}{2}\, \delta\mathbf{w}^{\top} H\, \delta\mathbf{w} + O\big(\lVert \delta\mathbf{w} \rVert^{3}\big) \tag{113.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{g}\)</dt><dd>the gradient \(\partial L / \partial \mathbf{w}\). After training to a minimum it is close to zero, so the first term is dropped.</dd>
+<dt>\(H\)</dt><dd>the Hessian, the matrix of second derivatives \(H_{ij} = \partial^2 L / \partial w_i \partial w_j\). It measures the <b>curvature</b> of the loss: a large \(H_{ii}\) means the loss rises fast when \(w_i\) moves.</dd>
+<dt>\(O(\cdot)\)</dt><dd>higher-order terms, assumed small</dd></dl>
+<p>Both OBD and OBS start from this quadratic model. They differ in how much of \(H\) they use.</p>
+
+<h3>Optimal Brain Damage</h3>
+<p>LeCun, Denker and Solla (1990) made one more simplification: keep only the diagonal of \(H\). Then removing weight \(q\) alone, \(\delta\mathbf{w} = -w_q \mathbf{e}_q\), changes the loss by</p>
+<div class="eq">\[ s_q^{\text{OBD}} = \tfrac{1}{2}\, H_{qq}\, w_q^{2} \tag{113.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{e}_q\)</dt><dd>the unit vector with a 1 at position \(q\)</dd>
+<dt>\(s_q^{\text{OBD}}\)</dt><dd>the <b>saliency</b> of weight \(q\): the predicted rise of the loss when it is set to zero and nothing else moves</dd>
+<dt>\(H_{qq}\)</dt><dd>the curvature in the direction of \(w_q\)</dd></dl>
+<p>Note that for a single weight with all others fixed, (113.4) is the <b>exact</b> quadratic term: \(\tfrac12 \mathbf{e}_q^{\top} H \mathbf{e}_q\, w_q^2 = \tfrac12 H_{qq} w_q^2\). The diagonal assumption enters when we remove <b>many</b> weights and add their saliencies as if they did not interact. The paper states its assumptions: the loss is near a minimum (no gradient term), it is quadratic, and the change from removing several weights is the sum of the single changes (diagonal). [Certain, OBD paper] Magnitude pruning is the special case where all \(H_{qq}\) are equal. OBD then prunes, retrains, and repeats, like Han et al.</p>
+<p>OBD has one weakness: it never moves the kept weights. If two weights do almost the same job (their inputs are correlated), removing one could be repaired by making the other larger. OBD cannot see this.</p>
+
+<h2>Optimal Brain Surgeon: remove one weight, move the others</h2>
+<h3>The problem</h3>
+<p>Hassibi and Stork (1993) kept the full Hessian. They ask: if weight \(q\) must become zero, what is the best change \(\delta\mathbf{w}\) of <b>all</b> weights, and how much does the loss then rise?</p>
+<div class="eq">\[ \min_{\delta\mathbf{w}}\ \tfrac{1}{2}\, \delta\mathbf{w}^{\top} H\, \delta\mathbf{w} \quad \text{subject to} \quad \mathbf{e}_q^{\top} \delta\mathbf{w} + w_q = 0 \tag{113.5} \]</div>
+<p>The constraint says “the new value of weight \(q\) is zero”. Write the Lagrangian \(\mathcal{L} = \tfrac12 \delta\mathbf{w}^{\top} H \delta\mathbf{w} + \lambda(\mathbf{e}_q^{\top}\delta\mathbf{w} + w_q)\). Setting its gradient in \(\delta\mathbf{w}\) to zero gives \(H\delta\mathbf{w} + \lambda \mathbf{e}_q = 0\), so \(\delta\mathbf{w} = -\lambda H^{-1}\mathbf{e}_q\). Put this into the constraint: \(-\lambda [H^{-1}]_{qq} + w_q = 0\), so \(\lambda = w_q / [H^{-1}]_{qq}\). This gives the OBS update and the OBS saliency:</p>
+<div class="eq">\[ \delta\mathbf{w} = -\frac{w_q}{[H^{-1}]_{qq}}\, H^{-1} \mathbf{e}_q, \qquad s_q^{\text{OBS}} = \frac{w_q^{2}}{2\,[H^{-1}]_{qq}} \tag{113.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(H^{-1}\mathbf{e}_q\)</dt><dd>column \(q\) of the inverse Hessian. It says in which direction the other weights should move to cover for \(w_q\).</dd>
+<dt>\([H^{-1}]_{qq}\)</dt><dd>the diagonal entry \(q\) of the <b>inverse</b> Hessian (not \(1/H_{qq}\))</dd>
+<dt>\(s_q^{\text{OBS}}\)</dt><dd>the loss rise after removing \(q\) <b>and</b> making the best correction: \(\tfrac12 \delta\mathbf{w}^{\top} H \delta\mathbf{w}\) at the optimum</dd></dl>
+<p>Because \([H^{-1}]_{qq} \ge 1/H_{qq}\) for any positive definite \(H\), we always have \(s_q^{\text{OBS}} \le s_q^{\text{OBD}}\), with equality when weight \(q\) is not coupled to the others. [Certain, a standard matrix inequality] The OBS score is the more honest one: it is the cost of removing a weight after the best repair.</p>
+
+<div class="worked"><div class="wt">Worked example: two weights</div>
+<p>Take \(\mathbf{w} = (0.5,\ 0.9)\) and \(H = \begin{pmatrix} 4 & 1.8 \\ 1.8 & 1 \end{pmatrix}\). The two weights are strongly coupled: the correlation \(\rho = 1.8/\sqrt{4 \cdot 1} = 0.9\). We may remove one weight.</p>
+<p><b>Magnitude:</b> \(|0.5| \lt |0.9|\), so remove \(w_1\). The loss rises by \(\tfrac12 \cdot 4 \cdot 0.25 = 0.5\).</p>
+<p><b>OBD:</b> \(s_1 = \tfrac12 \cdot 4 \cdot 0.25 = 0.5\) and \(s_2 = \tfrac12 \cdot 1 \cdot 0.81 = 0.405\). Remove \(w_2\): loss \(+0.405\). Magnitude and OBD disagree, because the small weight sits on the steep direction.</p>
+<p><b>OBS:</b> \(\det H = 0.76\), \(H^{-1} = \begin{pmatrix} 1.316 & -2.368 \\ -2.368 & 5.263 \end{pmatrix}\). Then \(s_1 = 0.25/(2 \cdot 1.316) = 0.095\) and \(s_2 = 0.81/(2 \cdot 5.263) = 0.077\). Remove \(w_2\) and apply (113.6): \(\delta\mathbf{w} = (0.405,\ -0.9)\), so the new weights are \((0.905,\ 0)\). The loss rises by only 0.077, 5.3× less than OBD.</p>
+<p>In two dimensions there is a neat check: \(s_2^{\text{OBS}} = s_2^{\text{OBD}} (1 - \rho^2) = 0.405 \times 0.19 = 0.077\). The stronger the coupling, the more the repair helps. [Certain, computed]</p></div>
+
+<figure class="fig" id="pb-2d"><div class="fig-body">
+<div class="controls"><label class="sl">coupling \(\rho\) <input type="range" id="pb-2d-r" min="-0.9" max="0.9" step="0.05" value="0.9"><output id="pb-2d-rv">0.90</output></label><label class="sl">curvature \(H_{11}\) <input type="range" id="pb-2d-h" min="0" max="4" step="1" value="3"><output id="pb-2d-hv">4</output></label></div>
+<div class="scroll-x"><svg id="pb-2d-svg" viewBox="0 0 660 380" role="img" aria-label="Contours of a quadratic loss over two weights, with the points reached by removing one weight with and without the OBS correction"></svg></div>
+<div class="readout" id="pb-2d-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> A quadratic loss \(\tfrac12 (\mathbf{w}-\mathbf{w}^*)^{\top} H (\mathbf{w}-\mathbf{w}^*)\) over two weights, with \(\mathbf{w}^* = (0.5, 0.9)\) and \(H_{22} = 1\). The ellipses are contours of equal loss. Pruning must land on one of the two axes: the vertical line (\(w_1 = 0\)) or the horizontal line (\(w_2 = 0\)). Open circles: set one weight to zero and keep the other (magnitude, OBD). Filled circles: the OBS point, the lowest loss on that axis. The table on the right gives the three scores and the choice of each method.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start at \(\rho = 0.90\), \(H_{11} = 4\): this is the worked example. Magnitude removes \(w_1\) (loss 0.500), OBD removes \(w_2\) (0.405), and OBS removes \(w_2\) and moves \(w_1\) to 0.905 (0.077). The filled circle is where the line \(w_2 = 0\) touches the smallest ellipse. Now set \(\rho = 0\): the ellipses line up with the axes, the filled and open circles meet, and OBS equals OBD (0.405). Set \(H_{11} = 1\) with \(\rho = 0\): now all three methods remove \(w_1\) with loss 0.125, because equal curvature makes OBD the same as magnitude. Negative \(\rho\) gives the same losses but moves \(w_1\) the other way (to 0.095).</p></details></figure>
+
+<h3>Removing many weights</h3>
+<p>OBS removes weights one at a time. After weight \(q\) is gone, the problem for the remaining weights has a Hessian without row and column \(q\). Its inverse does not need a new inversion: it is one rank-one update of the old inverse (Gaussian elimination of \(q\)):</p>
+<div class="eq">\[ H^{-1}_{-q} = \Big( H^{-1} - \frac{H^{-1}\mathbf{e}_q\, \mathbf{e}_q^{\top} H^{-1}}{[H^{-1}]_{qq}} \Big)_{-q,\,-q} \tag{113.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(H^{-1}_{-q}\)</dt><dd>the inverse of the Hessian of the remaining weights</dd>
+<dt>\((\cdot)_{-q,-q}\)</dt><dd>drop row \(q\) and column \(q\). The rest of the matrix is the new inverse.</dd></dl>
+<p>One update costs \(O(d^2)\) for \(d\) weights, much less than the \(O(d^3)\) of a new inversion. The original OBS paper used a different way to build \(H^{-1}\) (a recursive outer-product formula) and recomputed it between retraining rounds. [Likely] The rank-one form (113.7) is the one used by OBC and GPTQ (<a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>).</p>
+<div class="algo"><div class="algo-h">Algorithm 2: greedy OBS on a weight vector</div><ol>
+<li><b>input:</b> weights \(\mathbf{w} \in \R^{d}\), Hessian \(H\), number of weights to remove \(k\)</li>
+<li>\(H^{-1} \leftarrow \text{inverse}(H + \lambda I)\) <span class="c">// small dampening \(\lambda\) for stability</span></li>
+<li><b>repeat</b> \(k\) times:</li>
+<li>&nbsp;&nbsp;for every kept weight \(j\): \(s_j \leftarrow w_j^2 / (2[H^{-1}]_{jj})\) <span class="c">// (113.6)</span></li>
+<li>&nbsp;&nbsp;\(q \leftarrow \argmin_j s_j\)</li>
+<li>&nbsp;&nbsp;\(\mathbf{w} \leftarrow \mathbf{w} - \dfrac{w_q}{[H^{-1}]_{qq}} H^{-1}\mathbf{e}_q\); set \(w_q \leftarrow 0\) exactly <span class="c">// move the others</span></li>
+<li>&nbsp;&nbsp;\(H^{-1} \leftarrow H^{-1} - H^{-1}\mathbf{e}_q\mathbf{e}_q^{\top}H^{-1} / [H^{-1}]_{qq}\); remove \(q\) from the kept set <span class="c">// (113.7)</span></li>
+<li><b>return</b> \(\mathbf{w}\)</li></ol></div>
+<p>Hassibi and Stork showed on small networks that OBS removes more weights than magnitude pruning or OBD for the same error, and that OBD can remove the wrong weights. [Likely, OBS paper, qualitative claim]</p>
+
+<h2>Making OBS fit an LLM: the layer-wise problem</h2>
+<h3>The full Hessian is impossible</h3>
+<p>For a model with \(N\) weights, \(H\) has \(N^2\) entries. For \(N = 7 \times 10^9\), that is \(4.9 \times 10^{19}\) numbers, 196 exabytes in FP32. [Certain, computed] No version of (113.6) with the full Hessian can run.</p>
+<p>The way out, used by OBC, SparseGPT and Wanda, is to prune <b>one linear layer at a time</b> and to change the objective. Instead of the model loss, keep the output of the layer close to the original on some calibration inputs:</p>
+<div class="eq">\[ \min_{\hat W}\ \big\lVert W X - \hat W X \big\rVert_F^{2} = \sum_{i} (\hat{\mathbf{w}}_i - \mathbf{w}_i)^{\top} \big(X X^{\top}\big) (\hat{\mathbf{w}}_i - \mathbf{w}_i), \qquad H = 2\, X X^{\top} \tag{113.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W \in \R^{d_{\text{row}} \times d_{\text{col}}}\)</dt><dd>the weight matrix of the layer; row \(i\) is \(\mathbf{w}_i^{\top}\), the weights of output \(i\)</dd>
+<dt>\(X \in \R^{d_{\text{col}} \times n}\)</dt><dd>\(n\) calibration inputs to this layer, one per column (for example 128 sequences of 2048 tokens)</dd>
+<dt>\(\lVert\cdot\rVert_F\)</dt><dd>the Frobenius norm: the square root of the sum of all squared entries</dd>
+<dt>\(H\)</dt><dd>the Hessian of this squared error with respect to one row. It is the same for every row and has size \(d_{\text{col}} \times d_{\text{col}}\).</dd></dl>
+<p>This is the same objective as GPTQ in <a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>. Three things make it practical. The objective is exactly quadratic, so the Taylor expansion (113.3) has no error. The Hessian is small: \(4096 \times 4096\) is 67 MB in FP32. And the problem splits into independent rows that share one \(H\). [Certain] The price: a layer-wise objective ignores how the error grows through later layers.</p>
+
+<h3>OBD on a layer is the Wanda score</h3>
+<p>With \(H = 2XX^{\top}\), the diagonal is \(H_{jj} = 2 \lVert \mathbf{x}_j \rVert^2\), where \(\mathbf{x}_j\) is row \(j\) of \(X\): all the values of input channel \(j\) over the calibration set. Put this into the OBD saliency (113.4):</p>
+<div class="eq">\[ s_{ij}^{\text{OBD}} = \tfrac{1}{2} \cdot 2 \lVert \mathbf{x}_j \rVert^{2}\, w_{ij}^{2} = \big( |w_{ij}| \cdot \lVert \mathbf{x}_j \rVert_2 \big)^{2} \tag{113.9} \]</div>
+<p>The square root, \(|w_{ij}| \cdot \lVert \mathbf{x}_j \rVert_2\), is exactly the Wanda score: “the elementwise product between the weight magnitude and the norm of input activations”, compared within each output row. [Certain, Wanda paper; the link to OBD is algebra] So Wanda is layer-wise OBD: it uses the diagonal of the layer Hessian and does not update the kept weights. SparseGPT is layer-wise OBS made fast. Both are the topic of <a href="../inference/unstructured-and-2-4-pruning-sparsegpt-wanda.html">session 114</a>.</p>
+<p>The score also fixes the failure of magnitude pruning: a small weight on an outlier channel has a large \(\lVert \mathbf{x}_j \rVert\) and is kept. Figure 2 shows this on a toy layer.</p>
+
+<figure class="fig wide" id="pb-layer"><div class="fig-body">
+<div class="controls"><label class="sl">weights removed per row <input type="range" id="pb-layer-k" min="0" max="28" step="1" value="16"><output id="pb-layer-kv">16/32 = 50.0%</output></label><span class="seg" id="pb-layer-o"><button type="button" data-o="on" aria-pressed="true">4 outlier input channels</button><button type="button" data-o="off" aria-pressed="false">equal input scales</button></span></div>
+<div class="scroll-x"><svg id="pb-layer-svg" viewBox="0 0 610 320" role="img" aria-label="Relative output error of a pruned toy layer against sparsity for magnitude, OBD (Wanda) and OBS pruning, on a log scale"></svg></div>
+<div class="readout" id="pb-layer-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> A toy linear layer with \(W\) of size 8 × 32 and 256 calibration inputs (seeded, computed in your browser). Neighbouring input channels are correlated (\(\rho = 0.8\)); in the first setting, input channels 1, 9, 17 and 25 are 6× larger, like LLM outlier features. Each curve prunes the same number of weights in every row with one score: magnitude \(|w_{ij}|\), OBD/Wanda (113.9), or greedy OBS (Algorithm 2 with \(H = 2XX^{\top}\)), and plots \(\lVert WX - \hat W X\rVert^2 / \lVert WX \rVert^2\) on a log scale.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>At 50% (16 of 32 per row) with outlier channels, magnitude has error 0.1433, OBD/Wanda 0.0280 and OBS 0.0050: the input scale gives a 5.1× gain and the OBS repair another 5.6×. Switch to equal input scales: magnitude (0.0921) and OBD (0.0852) are now almost the same, because all \(\lVert \mathbf{x}_j \rVert\) are similar; OBS is still 5× better (0.0163), because the inputs are correlated and the kept weights can take over. Move the slider: the gap between the curves grows with sparsity, and every method breaks down when few weights are left.</p></details></figure>
+
+<h3>The cost of exact OBS on a layer</h3>
+<p>Greedy OBS per row costs \(O(d_{\text{col}}^2)\) per removed weight. A \(4096 \times 4096\) layer at 50% needs \(4096 \times 2048\) removals of \(4096^2\) each: about \(1.4 \times 10^{14}\) multiply-adds for one layer, and the rows cannot share their inverse because each row removes different weights. [Certain, computed] This is why exact OBS does not scale to LLMs, and why SparseGPT changes the order of work so that all rows can share one sequence of inverses (<a href="../inference/unstructured-and-2-4-pruning-sparsegpt-wanda.html">session 114</a>).</p>
+
+<h2>Unstructured sparsity: why zeros are not free</h2>
+<h3>The memory view</h3>
+<p>A zero still costs time if the kernel does not skip it. To skip it, the kernel must know where the non-zeros are, so a sparse matrix stores the values plus some <b>metadata</b> (indices). Recall from <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a> that decoding with a small batch is <b>memory-bound</b>: the time is set by the bytes of weights read per token, not by the math. So a simple model of the best possible decode speed-up is the ratio of bytes:</p>
+<div class="eq">\[ \text{speed-up}_{\text{decode}} \le \frac{b_{\text{dense}}}{(1 - s)\, b_{\text{nz}} + b_{\text{meta}}} \tag{113.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(b_{\text{dense}}\)</dt><dd>bytes per weight in the dense format: 2 for FP16/BF16</dd>
+<dt>\(b_{\text{nz}}\)</dt><dd>bytes per stored non-zero, value plus its index. CSR (compressed sparse row) with 16-bit column indices: \(2 + 2 = 4\).</dd>
+<dt>\(b_{\text{meta}}\)</dt><dd>metadata per original weight that does not depend on \(s\). A bitmask (one bit per weight saying zero or not) costs \(1/8\) byte; then \(b_{\text{nz}} = 2\).</dd></dl>
+<div class="worked"><div class="wt">Worked example: bytes of a 50% and a 70% sparse FP16 matrix</div>
+<p><b>CSR</b> at \(s = 0.5\): \(0.5 \times 4 = 2\) bytes per weight, exactly the dense size: speed-up 1.0×. CSR only wins above 50%. At 70%: 1.2 bytes, at best 1.67×. At 90%: 0.4 bytes, 5×.</p>
+<p><b>Bitmask</b> at \(s = 0.5\): \(0.5 \times 2 + 0.125 = 1.125\) bytes, at best 1.78×. At 70%: 0.725 bytes, 2.76×. It beats dense once \(s \gt 1/16 = 6.25\%\).</p>
+<p><b>2:4</b>: in every group of 4 weights, 2 values of 2 bytes and 2 indices of 2 bits each: 36 bits per 4 weights = 1.125 bytes per weight, at best 1.78× in memory. [Certain, computed]</p></div>
+<p>These are upper bounds. Real sparse kernels lose part of this to irregular memory access: two neighbouring threads read non-zeros from far-apart places, and the GPU loads memory in large aligned chunks. The survey says that unstructured sparse patterns “lack high-level regularity”, which leads to irregular memory access and computation and limits the practical speed-up. [Certain, survey Section 5.2.2]</p>
+
+<h3>The compute view</h3>
+<p>In prefill or at large batch, the work is <b>compute-bound</b> and runs on tensor cores, which multiply dense tiles. An unstructured sparse tile is still a dense tile for the tensor core unless the zeros are removed first, and general sparse matrix kernels (cuSPARSE, Sputnik) run on the slower CUDA cores. Flash-LLM (2023) turns this around: “Load-as-Sparse and Compute-as-Dense”. It reads the weights from memory in a sparse format (saving bandwidth) and expands them to dense tiles in fast on-chip memory for the tensor cores. It reports an average 2.9× kernel speed-up over Sputnik and 1.5× over SparTA, and end-to-end up to 3.6× over FasterTransformer on OPT-30B/66B/175B (tokens per GPU-second). [Certain, Flash-LLM abstract] So unstructured sparsity can help, but through memory, and mostly at high sparsity.</p>
+
+<h3>The middle way: 2:4</h3>
+<p>NVIDIA sparse tensor cores (Ampere and later) support one fixed pattern: in every group of 4 consecutive weights along the reduction dimension, at most 2 are non-zero. The hardware stores the 2 values and 2-bit indices and skips the zeros in the math: twice the math throughput of the dense tensor core. [Certain, Mishra et al.] Measured gains are smaller. Wanda reports about 1.6× for the linear layers of LLaMA-65B (CUTLASS kernel, A6000, batch 1) and 1.24× end-to-end for LLaMA-7B (251 ms instead of 312 ms). [Certain, Wanda paper Table 5] The price is accuracy: the pattern forces exactly 50% in every group, even where all four weights matter. On LLaMA-7B, Wanda gives 7.26 perplexity at 50% unstructured but 11.53 at 2:4. [Certain, Wanda Table 3]</p>
+
+<figure class="fig" id="pb-speed"><div class="fig-body">
+<div class="controls"><label class="sl">sparsity \(s\) <input type="range" id="pb-speed-s" min="0" max="95" step="5" value="50"><output id="pb-speed-sv">50%</output></label><span class="seg" id="pb-speed-m"><button type="button" data-m="dec" aria-pressed="true">decode (memory-bound)</button><button type="button" data-m="pre" aria-pressed="false">prefill (compute-bound)</button></span></div>
+<div class="scroll-x"><svg id="pb-speed-svg" viewBox="0 0 640 300" role="img" aria-label="Bytes per weight and ideal speed-up of dense, CSR, bitmask, 2:4 and structured sparse formats"></svg></div>
+<div class="readout" id="pb-speed-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> An ideal model of the speed of one FP16 linear layer, from formula (113.10). Decode: speed-up = 2 bytes ÷ bytes read per original weight. Prefill: speed-up = reduction of the math that the hardware can really skip; unstructured formats are drawn at 1× (compute as dense), 2:4 at its hardware maximum of 2×, structured at \(1/(1-s)\). These are bounds from a simple model, not measurements; the 2:4 bar always assumes 50%.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At 50% in decode mode, CSR gives 1.00× (its index costs as much as the value), the bitmask and 2:4 give 1.78×, and the structured layer (simply a matrix with half the rows) gives 2.00×. Move the slider down to 30%: CSR drops to 0.71×, slower than dense. Move it up to 90%: CSR reaches 5.00× and the bitmask 6.15×; this is why unstructured kernels target high sparsity. Switch to prefill: only 2:4 and structured sparsity save math on tensor cores.</p></details></figure>
+
+<h2>Structured sparsity: channels, heads and layers</h2>
+<h3>What changes</h3>
+<p>Structured pruning removes a whole unit, and the result is a <b>smaller dense model</b>. No index, no special kernel: the normal dense GEMM on a smaller matrix. The speed-up follows the removed work directly, in both memory and compute, on any hardware. [Certain] The common units in a transformer:</p>
+<ul><li><b>FFN neurons (channels).</b> Removing hidden unit \(j\) of the FFN removes row \(j\) of the up (and gate) projection and column \(j\) of the down projection. Both matrices shrink.</li>
+<li><b>Attention heads.</b> Removing a head removes its slices of \(W_Q, W_K, W_V\) and of \(W_O\), and its part of the KV cache. Michel et al. (2019) found that a large percentage of heads can be removed at test time without a significant drop, and some layers can be reduced to one head. [Certain, paper abstract]</li>
+<li><b>Hidden dimension.</b> Removing an embedding channel shrinks every matrix that reads or writes the residual stream. SliceGPT does this after a rotation (<a href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html">session 115</a>).</li>
+<li><b>Layers.</b> ShortGPT measures how much each block changes its input with the <b>Block Influence</b>:
+<div class="eq">\[ \text{BI}_i = 1 - \E_{X,t}\, \frac{\mathbf{x}_{i,t}^{\top}\, \mathbf{x}_{i+1,t}}{\lVert \mathbf{x}_{i,t} \rVert_2\, \lVert \mathbf{x}_{i+1,t} \rVert_2} \tag{113.11} \]</div>
+where \(\mathbf{x}_{i,t}\) is the hidden state of token \(t\) entering block \(i\). A block whose output points the same way as its input (cosine near 1) has a low BI and is removed. [Certain, ShortGPT Eq. 1] For LLaMA-2-7B it removes 9 of 32 layers (layers 27, 26, 25, 28, 24, 29, 23, 21, 22). [Certain, ShortGPT Table 9]</li></ul>
+
+<h3>Second-order scores for whole structures</h3>
+<p>The OBS idea extends to groups. In the layer-wise problem (113.8), removing input channel \(j\) means setting column \(j\) of \(W\) to zero in <b>every</b> row. All rows share the same \(H\), so (113.6) applies to each row with the same \(q = j\), and the costs add up:</p>
+<div class="eq">\[ s_j^{\text{col}} = \frac{\lVert W_{:,j} \rVert^{2}}{2\, [H^{-1}]_{jj}}, \qquad \Delta W = -\frac{W_{:,j}\, \big(H^{-1}\mathbf{e}_j\big)^{\top}}{[H^{-1}]_{jj}} \tag{113.12} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W_{:,j}\)</dt><dd>column \(j\) of \(W\): the weights that read input channel \(j\), one per output</dd>
+<dt>\(\Delta W\)</dt><dd>the update of the whole matrix: an outer product, so every row moves along the same direction \(H^{-1}\mathbf{e}_j\)</dd></dl>
+<p>Removing input channel \(j\) of one layer also removes output channel \(j\) of the layer before it (nobody reads it any more), so the previous layer shrinks too. Removing an <b>output</b> row of a layer is different: that output becomes zero and no change of the other weights of this layer can bring it back; only the next layer can adapt. This is why structured methods look at coupled groups of weights across layers (LLM-Pruner builds a dependency graph for this). [Certain, LLM-Pruner paper]</p>
+
+<h3>Why structured pruning loses more accuracy</h3>
+<p>A unit is chosen as a whole. A column of a 4096 × 4096 matrix has 4096 weights; some of them are important even if the column on average is not. Unstructured pruning can keep those weights and remove unimportant ones from other columns. So, at the same sparsity, the unstructured mask is always at least as good for the layer error: it has more freedom. [Certain, the structured masks are a subset of all masks] The survey puts it in words: structured pruning works directly on regular hardware but “often results in a more pronounced impact on model performance”. [Certain, survey Section 5.2.2] Figure 4 shows the four patterns on the same layer.</p>
+
+<figure class="fig wide" id="pb-gran"><div class="fig-body">
+<div class="controls"><span class="seg" id="pb-gran-g"><button type="button" data-g="un" aria-pressed="true">unstructured</button><button type="button" data-g="nm" aria-pressed="false">2:4</button><button type="button" data-g="col" aria-pressed="false">input channels</button><button type="button" data-g="row" aria-pressed="false">output channels</button></span><span class="seg" id="pb-gran-f"><button type="button" data-f="off" aria-pressed="true">no update</button><button type="button" data-f="on" aria-pressed="false">re-fit kept weights</button></span></div>
+<div class="scroll-x"><svg id="pb-gran-svg" viewBox="0 0 600 220" role="img" aria-label="An 8 by 32 weight matrix with half its weights removed in four different patterns"></svg></div>
+<div class="readout" id="pb-gran-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The layer of Figure 2 (with outlier channels), always at 50% sparsity. Filled cells are kept weights, darker for a larger Wanda score \(|w_{ij}|\lVert\mathbf{x}_j\rVert\); empty frames are removed weights. Unstructured and 2:4 use the Wanda score within each row; input channels use the column score \(\lVert W_{:,j}\rVert \lVert \mathbf{x}_j \rVert\); output channels use \(\lVert \mathbf{w}_i^{\top} X \rVert\). “Re-fit” solves the least-squares problem (113.8) for the kept weights of every row, which is what a complete sequence of OBS updates reaches for a fixed mask.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>With no update, the error grows with the size of the removed unit: unstructured 0.0280, 2:4 0.0316, input channels 0.0725, output channels 0.3300. With re-fit it falls to 0.0072, 0.0097 and 0.0220 for the first three; for output channels it stays at 0.3300, because a removed output cannot be repaired inside the layer. Look at the triangles under the outlier columns: unstructured masks keep most weights on those columns, and the channel score never removes them. The speed-up line moves the other way: irregular zeros give at best 1.78× in memory, a half-size dense matrix gives 2×.</p></details></figure>
+
+<h3>Recovering the accuracy</h3>
+<p>Because structured pruning hurts more, it is almost always followed by training. Three common recipes, each covered later:</p>
+<ul><li><b>Short fine-tuning with LoRA</b> after pruning: LLM-Pruner. [Certain, survey] (<a href="../posttraining/lora-and-other-peft-methods.html">session 57</a>)</li>
+<li><b>Continued pre-training</b> of the pruned model on many tokens: Sheared LLaMA prunes to a chosen target shape and then trains with dynamic batch loading. [Certain, survey]</li>
+<li><b>Knowledge distillation</b> from the dense model: the Minitron work prunes width and depth and retrains with distillation. [Certain, paper title and method] (<a href="../posttraining/knowledge-distillation.html">session 59</a>, <a href="../inference/index.html#row-lab-prune-with-wanda-2-4-recover" title="prune with Wanda (2:4), recover with distillation (planned)">session 122</a>)</li></ul>
+<p>The practical rule that follows: unstructured or 2:4 pruning is a one-shot, cheap compression with a small loss; structured pruning is a way to <b>start</b> training a smaller model from a big one.</p>
+
+<h2>A complete example in PyTorch</h2>
+<p>This script builds a toy layer with correlated and outlier input channels, prunes it with magnitude, OBD (Wanda), OBD with a least-squares re-fit, and greedy OBS, checks the one-weight OBS update against a brute-force fit, and then prunes whole input channels. It is deterministic and runs on a CPU in a few seconds.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+torch.set_default_dtype(torch.float64)
+
+<span class="cm"># 1) a toy linear layer: W is (d_row, d_col); X holds n calibration inputs as columns</span>
+d_row, d_col, n, rho = 32, 128, 1024, 0.8
+Z = torch.randn(d_col, n)
+X = torch.empty(d_col, n); X[0] = Z[0]
+<span class="kw2">for</span> j <span class="kw2">in</span> range(1, d_col):                      <span class="cm"># neighbouring input channels are correlated</span>
+    X[j] = rho * X[j - 1] + (1 - rho**2) ** 0.5 * Z[j]
+X[::16] *= 8.0                                 <span class="cm"># a few "outlier" input channels</span>
+W = torch.randn(d_row, d_col)
+H = 2 * X @ X.T                                <span class="cm"># layer Hessian, formula (113.8)</span>
+H += 0.01 * torch.diag(H).mean() * torch.eye(d_col)   <span class="cm"># small dampening</span>
+
+<span class="kw2">def</span> rel_err(W, Wp):                            <span class="cm"># ||WX - W'X||^2 / ||WX||^2</span>
+    <span class="kw2">return</span> (((W - Wp) @ X) ** 2).sum() / ((W @ X) ** 2).sum()
+
+<span class="kw2">def</span> prune_by_score(W, score, sparsity):        <span class="cm"># zero the lowest scores in every row</span>
+    k = int(sparsity * W.shape[1])
+    idx = torch.argsort(score, dim=1)[:, :k]
+    <span class="kw2">return</span> W.clone().scatter_(1, idx, 0.0)
+
+<span class="kw2">def</span> obs_row(w, Hinv, k):                       <span class="cm"># greedy OBS on one row, formula (113.6)</span>
+    w, Hinv = w.clone(), Hinv.clone()
+    alive = torch.ones_like(w, dtype=torch.bool)
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(k):
+        s = w**2 / torch.diag(Hinv)            <span class="cm"># saliency of every weight</span>
+        s[~alive] = float("inf")
+        q = torch.argmin(s)
+        w -= w[q] / Hinv[q, q] * Hinv[:, q]    <span class="cm"># remove q, move the others</span>
+        w[q] = 0.0; alive[q] = False
+        Hinv -= torch.outer(Hinv[:, q], Hinv[q, :]) / Hinv[q, q]   <span class="cm"># formula (113.7)</span>
+        Hinv[q, :] = 0.0; Hinv[:, q] = 0.0; Hinv[q, q] = 1.0       <span class="cm"># keep it invertible</span>
+    <span class="kw2">return</span> w
+
+<span class="kw2">def</span> refit(W, Wp):                              <span class="cm"># best values for the kept weights (least squares)</span>
+    out = Wp.clone()
+    <span class="kw2">for</span> r <span class="kw2">in</span> range(W.shape[0]):
+        m = Wp[r] != 0
+        out[r, m] = torch.linalg.solve(H[m][:, m], H[m] @ W[r])
+    <span class="kw2">return</span> out
+
+Hinv = torch.linalg.inv(H)
+<span class="kw2">for</span> sp <span class="kw2">in</span> (0.5, 0.7):
+    k = int(sp * d_col)
+    mag = prune_by_score(W, W.abs(), sp)
+    obd = prune_by_score(W, W**2 * torch.diag(H), sp)          <span class="cm"># formula (113.9)</span>
+    obs = torch.stack([obs_row(W[r], Hinv, k) <span class="kw2">for</span> r <span class="kw2">in</span> range(d_row)])
+    print(f"{sp:.0%} unstructured  magnitude {rel_err(W, mag):.4f}  OBD {rel_err(W, obd):.4f}"
+          f"  OBD mask+refit {rel_err(W, refit(W, obd)):.4f}  OBS {rel_err(W, obs):.4f}")
+
+<span class="cm"># 2) check the one-weight OBS update against a brute-force least-squares fit</span>
+q = 5
+dw = -W[0, q] / Hinv[q, q] * Hinv[:, q]
+m = torch.arange(d_col) != q
+best = torch.zeros(d_col); best[m] = torch.linalg.solve(H[m][:, m], H[m] @ W[0])
+print("OBS update equals least squares:", torch.allclose(W[0] + dw, best))
+
+<span class="cm"># 3) structured: remove 50% of the INPUT channels (whole columns of W)</span>
+k = d_col // 2
+col_norm = W.norm(dim=0)                                       <span class="cm"># magnitude score per column</span>
+cut = torch.argsort(col_norm)[:k]
+Wm = W.clone(); Wm[:, cut] = 0.0
+Wo, Hi = W.clone(), Hinv.clone(); alive = torch.ones(d_col, dtype=torch.bool)
+<span class="kw2">for</span> _ <span class="kw2">in</span> range(k):                                             <span class="cm"># OBS for whole columns, formula (113.12)</span>
+    s = (Wo**2).sum(0) / torch.diag(Hi); s[~alive] = float("inf")
+    j = torch.argmin(s)
+    Wo -= torch.outer(Wo[:, j] / Hi[j, j], Hi[:, j])           <span class="cm"># all rows share H</span>
+    Wo[:, j] = 0.0; alive[j] = False
+    Hi -= torch.outer(Hi[:, j], Hi[j, :]) / Hi[j, j]
+    Hi[j, :] = 0.0; Hi[:, j] = 0.0; Hi[j, j] = 1.0
+print(f"50% of input channels  magnitude {rel_err(W, Wm):.4f}  OBS {rel_err(W, Wo):.4f}")
+print("layer after channel pruning is dense:", tuple(Wo[:, alive].shape))</pre>
+<p>Output (PyTorch 2.8, CPU):</p>
+<pre class="code">50% unstructured  magnitude 0.0685  OBD 0.0151  OBD mask+refit 0.0048  OBS 0.0034
+70% unstructured  magnitude 0.1773  OBD 0.0423  OBD mask+refit 0.0193  OBS 0.0114
+OBS update equals least squares: True
+50% of input channels  magnitude 0.4159  OBS 0.0178
+layer after channel pruning is dense: (32, 64)</pre>
+<p>Read the results. (1) At 50%, the input-aware OBD score is 4.5× better than magnitude, re-fitting the kept weights is 3× better again, and greedy OBS, which also chooses the mask with the repair in mind, is best. (2) The closed-form OBS update (113.6) is exactly the least-squares fit of the other weights. (3) Removing half of the input channels by column norm is a disaster (0.4159), while channel OBS keeps the error at 0.0178: still about 5× more than unstructured OBS at the same sparsity (0.0034), but the result is a dense 32 × 64 matrix that any kernel runs at full speed.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Pattern</th><th>Why</th></tr></thead><tbody>
+<tr><td>One-shot compression of a served LLM on Ampere or newer GPUs</td><td>2:4 with SparseGPT or Wanda</td><td>sparse tensor cores give a real gain; no retraining. Accept some perplexity loss, especially for small models [Certain, Wanda Table 3]</td></tr>
+<tr><td>Memory-bound decoding with custom kernels</td><td>unstructured 70–90% (Flash-LLM)</td><td>fewer bytes read per token; needs a kernel and high sparsity [Certain, Flash-LLM]</td></tr>
+<tr><td>Building a family of smaller models from one large one</td><td>width and depth (Minitron, Sheared LLaMA)</td><td>pruning + distillation or continued training is cheaper than training each size from scratch [Likely]</td></tr>
+<tr><td>Quick depth reduction for latency</td><td>layers (ShortGPT)</td><td>fewer blocks = fewer sequential steps in every token; no kernel work</td></tr>
+<tr><td>Encoders (BERT-like) for search and classification</td><td>attention heads, FFN neurons</td><td>many heads are redundant [Certain, Michel et al.]; smaller dense encoders run on CPUs</td></tr>
+<tr><td>MoE models</td><td>whole experts</td><td>the survey lists expert pruning methods (ExpertSparsity, SEER-MoE) [Certain, survey]; see <a href="../transformers/mixture-of-experts-moe.html">session 29</a></td></tr>
+<tr><td>On-device video classification and action recognition</td><td>channel pruning of the vision backbone</td><td>phones and cameras have no sparse kernels; only smaller dense layers help real-time frame rates [Likely]</td></tr>
+<tr><td>Video retrieval and fingerprinting embedders</td><td>structured pruning + distillation</td><td>billions of frames are embedded; a 2× smaller dense encoder halves the cost, and distillation keeps the embedding space close to the teacher [Speculation]</td></tr>
+<tr><td>VLMs for video QA and Video-RAG</td><td>layers or heads of the language model; 2:4 on the vision encoder</td><td>long frame sequences make prefill compute-bound, where only structured or 2:4 sparsity saves math (Figure 3) [Speculation]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Reporting sparsity as speed.</b> “50% sparse” says nothing about latency. In CSR it is exactly as large as the dense matrix (Figure 3). Always state the pattern, the kernel and the measured time.</li>
+<li><b>Using magnitude pruning on an LLM without retraining.</b> It collapses beyond about 30% on OPT-175B and gives 17.29 instead of 5.68 perplexity on LLaMA-7B at 50%. Use an input-aware score.</li>
+<li><b>Comparing scores over the whole layer instead of per output row.</b> Wanda found that comparing per output is crucial for LLMs. [Certain, Wanda paper] Global comparison can empty some rows completely.</li>
+<li><b>Confusing \(1/H_{qq}\) with \([H^{-1}]_{qq}\).</b> OBS needs the diagonal of the inverse; using \(1/H_{qq}\) gives back OBD.</li>
+<li><b>Forgetting dampening.</b> \(XX^{\top}\) is often singular (dead channels, fewer samples than channels). Add \(\lambda I\) before inverting, as GPTQ does.</li>
+<li><b>Pruning output channels and expecting the layer to repair it.</b> A removed output is zero; only the next layer (or training) can compensate (Figure 4).</li>
+<li><b>Removing structures one by one without updating the scores.</b> After one head or layer is removed, the others change their importance. Recompute scores or prune gradually.</li>
+<li><b>Calibrating on the wrong data.</b> \(H = 2XX^{\top}\) depends on the calibration inputs. Pruning a code model with English web text keeps the wrong channels. [Likely]</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is pruning, and what are the three design choices of a pruning method?<span class="lvl">basic</span></summary><div class="ans">Pruning sets a subset of weights to zero with a mask, \(\hat W = M \odot W\) (113.1). A method chooses (1) a score that says which weights are safe to remove (magnitude, OBD, OBS, Wanda), (2) a granularity, from single weights to N:M groups, channels, heads and layers, which decides the speed-up, and (3) what happens to the kept weights: nothing, a closed-form update (OBS), or retraining. It also chooses one-shot or gradual. LLM methods are mostly one-shot with a small calibration set.</div></details>
+<details class="qa"><summary>Magnitude pruning worked for AlexNet and VGG. Why does it fail for LLMs?<span class="lvl">core</span></summary><div class="ans">Two reasons. First, the CNN results used train–prune–retrain loops: retraining repaired the damage (Han et al.: 9× and 13× fewer parameters). One-shot LLM pruning has no retraining. Second, the score ignores the input: the output is \(\sum_j w_j x_j\), and LLMs have a few input features about 100× larger than the others, so small weights on those features matter a lot. Numbers: OPT-175B collapses beyond 30% sparsity with magnitude (perplexity \(4.3 \times 10^4\) at 50% vs 8.35 dense); LLaMA-7B at 50% gives 17.29 vs 7.26 for Wanda, which adds \(\lVert \mathbf{x}_j \rVert\) to the score.</div></details>
+<details class="qa"><summary>Derive the OBD saliency. What are its assumptions?<span class="lvl">core</span></summary><div class="ans">Expand the loss around the trained weights: \(\delta L = \mathbf{g}^{\top}\delta\mathbf{w} + \tfrac12 \delta\mathbf{w}^{\top}H\delta\mathbf{w} + \dots\) (113.3). Assume a minimum (\(\mathbf{g} \approx 0\)), a quadratic loss (drop higher terms), and a diagonal Hessian (removals do not interact). Removing weight \(q\) is \(\delta\mathbf{w} = -w_q\mathbf{e}_q\), so \(\delta L = \tfrac12 H_{qq} w_q^2\) (113.4). With equal \(H_{qq}\) this is magnitude pruning. For a single removal with all else fixed the quadratic term is exact; the diagonal assumption matters when many weights are removed and their saliencies are added.</div></details>
+<details class="qa"><summary>Derive the OBS update and saliency.<span class="lvl">advanced</span></summary><div class="ans">Minimize \(\tfrac12\delta\mathbf{w}^{\top}H\delta\mathbf{w}\) subject to \(\mathbf{e}_q^{\top}\delta\mathbf{w} + w_q = 0\) (113.5). The Lagrangian gives \(H\delta\mathbf{w} = -\lambda\mathbf{e}_q\), so \(\delta\mathbf{w} = -\lambda H^{-1}\mathbf{e}_q\). The constraint gives \(\lambda = w_q/[H^{-1}]_{qq}\). Hence \(\delta\mathbf{w} = -\frac{w_q}{[H^{-1}]_{qq}}H^{-1}\mathbf{e}_q\) and \(\delta L = \tfrac12\lambda^2 [H^{-1}]_{qq} = \frac{w_q^2}{2[H^{-1}]_{qq}}\) (113.6). To remove many weights, repeat greedily and update the inverse with the rank-one formula (113.7) instead of inverting again.</div></details>
+<details class="qa"><summary>When do OBD and OBS give the same answer? How big can the difference be?<span class="lvl">core</span></summary><div class="ans">They agree when weight \(q\) is not coupled to the others (\(H\) diagonal in that row and column), because then \([H^{-1}]_{qq} = 1/H_{qq}\) and the OBS update moves nothing. In general \([H^{-1}]_{qq} \ge 1/H_{qq}\), so OBS saliency ≤ OBD saliency. In two dimensions, \(s^{\text{OBS}} = s^{\text{OBD}}(1-\rho^2)\), where \(\rho\) is the correlation implied by \(H\): with \(\rho = 0.9\) OBS loses 5.3× less (worked example: 0.077 vs 0.405). Strongly correlated inputs, common in LLM layers, make the repair worth a lot.</div></details>
+<details class="qa"><summary>Why can you not run OBS on a 7B model directly? What do LLM methods do instead?<span class="lvl">advanced</span></summary><div class="ans">The full Hessian has \(N^2 = 4.9 \times 10^{19}\) entries (196 EB in FP32), and the loss Hessian is not even available cheaply. LLM methods prune one linear layer at a time and minimize the layer output error \(\lVert WX - \hat W X\rVert_F^2\) on calibration inputs (113.8). Then \(H = 2XX^{\top}\) is exact, small (\(d_{\text{col}}^2\), 67 MB in FP32 for 4096) and shared by all rows. Even so, exact greedy OBS costs about \(1.4 \times 10^{14}\) multiply-adds for one 4096 × 4096 layer at 50%, because each row needs its own sequence of inverses; SparseGPT reorders the work so the rows share one sequence.</div></details>
+<details class="qa"><summary>Show that the Wanda score is OBD for the layer-wise problem.<span class="lvl">advanced</span></summary><div class="ans">With \(H = 2XX^{\top}\), \(H_{jj} = 2\lVert\mathbf{x}_j\rVert^2\), where \(\mathbf{x}_j\) holds the values of input channel \(j\) over the calibration set. The OBD saliency is \(\tfrac12 H_{jj} w_{ij}^2 = (|w_{ij}|\,\lVert\mathbf{x}_j\rVert_2)^2\) (113.9). Its square root is the Wanda score \(|W| \cdot \lVert X \rVert_2\), compared within each output row. Like OBD, Wanda does not update the kept weights. That is why it needs one forward pass and seconds, while SparseGPT (OBS-like) takes minutes to hours.</div></details>
+<details class="qa"><summary>Your 50% unstructured sparse model is not faster. Why?<span class="lvl">core</span></summary><div class="ans">Dense kernels do not skip zeros, so nothing changes unless you store the matrix in a sparse format and use a sparse kernel. In decode (memory-bound) the gain is the ratio of bytes (113.10): CSR with 16-bit indices needs 4 bytes per non-zero, so at 50% it is exactly the dense size (1.0×); a bitmask gives at most 1.78×. Irregular access lowers this further. In prefill (compute-bound) tensor cores multiply dense tiles, so unstructured zeros save no math. Real gains need high sparsity with a kernel like Flash-LLM, or a hardware pattern like 2:4, or structured pruning.</div></details>
+<details class="qa"><summary>What is 2:4 sparsity, and what speed-up does it give in practice?<span class="lvl">core</span></summary><div class="ans">In every group of 4 consecutive weights, at most 2 are non-zero. NVIDIA sparse tensor cores (Ampere and later) store the 2 values plus 2-bit indices (1.125 bytes per weight in FP16) and skip the zeros: twice the dense math throughput. Measured: about 1.6× for LLaMA-65B linear layers and 1.24× end-to-end for LLaMA-7B (Wanda paper). The cost is accuracy, because the pattern is forced in every group: LLaMA-7B Wanda perplexity 7.26 at 50% unstructured but 11.53 at 2:4.</div></details>
+<details class="qa"><summary>Structured or unstructured pruning: what is the trade-off, and how do you recover accuracy?<span class="lvl">core</span></summary><div class="ans">Structured pruning (channels, heads, layers) gives a smaller dense model, so the speed-up is real on any hardware and in both memory and compute. But it removes important weights together with unimportant ones in the same unit, so at the same sparsity it loses more (structured masks are a subset of all masks). In Figure 4 the error at 50% is 0.0280 unstructured vs 0.0725 for input channels without update. Recovery: LoRA fine-tuning (LLM-Pruner), continued pre-training (Sheared LLaMA), or distillation from the dense model (Minitron). Use structured pruning as a starting point for training a smaller model; use unstructured or 2:4 for cheap one-shot compression.</div></details>
+<details class="qa"><summary>Pruning or quantization first, for a memory-bound decode workload?<span class="lvl">advanced</span></summary><div class="ans">Compare bytes. 4-bit weight quantization cuts the bytes 4× (plus small scale overhead) with a mature kernel ecosystem and small loss at 7B and above. 50% unstructured sparsity cuts them at most 1.78× with a bitmask and needs special kernels; 2:4 gives 1.78× in memory with more loss. So for bytes, quantization is usually the first step. [Likely, standard practice] They compose: the zeros can stay zeros after quantization, and SparseGPT showed that joint pruning and quantization runs in one pass. Structured pruning is the one that also cuts compute, which matters for prefill-heavy or batch-heavy workloads.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Two weights \(\mathbf{w} = (0.2, -0.6)\) with a diagonal Hessian \(H = \operatorname{diag}(10, 1)\). Which weight does magnitude pruning remove? Which does OBD remove? What is the loss rise in each case?</li>
+<li>Take \(\mathbf{w} = (1, 1)\) and \(H = \begin{pmatrix} 2 &amp; 1 \\ 1 &amp; 2 \end{pmatrix}\). Compute the OBD and OBS saliencies of \(w_1\), and the new weights after the OBS removal of \(w_1\).</li>
+<li>A 4096 × 4096 FP16 matrix is pruned to 70% unstructured sparsity. How many MB does it take in dense form, in CSR with 16-bit indices, and as bitmask + values? What is the ideal decode speed-up of each sparse format?</li>
+<li>At what sparsity does a bitmask format start to use fewer bytes than dense FP16? And CSR with 16-bit indices?</li>
+<li>Llama-2-7B’s down projection reads \(d_{\text{col}} = 11{,}008\) inputs. How much memory does its layer Hessian \(H = 2XX^{\top}\) take in FP32?</li>
+<li>ShortGPT removes 9 of the 32 blocks of LLaMA-2-7B. Ignoring the embedding and output layers, what is the ideal decode speed-up?</li>
+<li>Prove that in two dimensions \(s_2^{\text{OBS}} = s_2^{\text{OBD}}(1 - \rho^2)\), with \(\rho = H_{12}/\sqrt{H_{11}H_{22}}\).</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Magnitude removes \(w_1\) (\(0.2 \lt 0.6\)): loss rise \(\tfrac12 \cdot 10 \cdot 0.04 = 0.2\). OBD compares 0.2 with \(\tfrac12 \cdot 1 \cdot 0.36 = 0.18\) and removes \(w_2\): loss rise 0.18. With a diagonal \(H\), OBS gives the same as OBD. 2. \(H^{-1} = \tfrac13 \begin{pmatrix} 2 &amp; -1 \\ -1 &amp; 2 \end{pmatrix}\), \([H^{-1}]_{11} = 2/3\). OBD: \(\tfrac12 \cdot 2 \cdot 1 = 1\). OBS: \(1/(2 \cdot 2/3) = 0.75\). Update: \(\delta\mathbf{w} = -\tfrac{1}{2/3} \cdot (2/3, -1/3) = (-1, 0.5)\), new weights \((0, 1.5)\), loss rise 0.75. 3. Dense: \(4096^2 \times 2 = 33.55\) MB. CSR: \(0.3 \times 4 = 1.2\) bytes per weight, 20.13 MB, at best 1.67×. Bitmask: \(0.3 \times 2 + 0.125 = 0.725\) bytes, 12.16 MB, at best 2.76×. 4. Bitmask: \(2(1-s) + 1/8 \lt 2\) when \(s \gt 1/16 = 6.25\%\). CSR: \(4(1-s) \lt 2\) when \(s \gt 50\%\). 5. \(11{,}008^2 \times 4 = 484.7\) MB (242.4 MB in FP16): still small compared with the model, and computed once per layer. 6. \(32/23 = 1.39\times\) at best, since each block reads the same number of weight bytes. 7. In 2D, \([H^{-1}]_{22} = H_{11}/\det H = H_{11}/(H_{11}H_{22} - H_{12}^2)\). So \(s_2^{\text{OBS}} = \frac{w_2^2 (H_{11}H_{22} - H_{12}^2)}{2H_{11}} = \tfrac12 H_{22} w_2^2 \big(1 - \frac{H_{12}^2}{H_{11}H_{22}}\big) = s_2^{\text{OBD}}(1-\rho^2)\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Pruning = a mask \(M \odot W\) (113.1) plus three choices: the score, the granularity, and what happens to the kept weights.</li>
+<li>Magnitude pruning needs retraining. One-shot on LLMs it collapses: OPT-175B beyond about 30%, LLaMA-7B 17.29 vs 5.68 perplexity at 50%, because it ignores outlier input features.</li>
+<li>OBD: loss rise \(\tfrac12 H_{qq} w_q^2\) from a diagonal Hessian (113.4). OBS: remove \(q\) and move all others by \(-\frac{w_q}{[H^{-1}]_{qq}} H^{-1}\mathbf{e}_q\), loss \(\frac{w_q^2}{2[H^{-1}]_{qq}}\) (113.6). OBS is never worse; it helps most when weights are coupled.</li>
+<li>LLMs use the layer-wise problem with \(H = 2XX^{\top}\) (113.8): exact, small, shared by rows. OBD on it is the Wanda score \(|w_{ij}|\,\lVert\mathbf{x}_j\rVert\) (113.9); OBS on it leads to SparseGPT.</li>
+<li>Unstructured zeros save time only through fewer bytes and special kernels: CSR breaks even at 50%, a bitmask gives at most 1.78× at 50% (113.10). Tensor cores do not skip irregular zeros.</li>
+<li>2:4 is the hardware middle way: up to 2× math, about 1.6× measured on linear layers, 1.24× end-to-end for LLaMA-7B, but more accuracy loss than unstructured.</li>
+<li>Structured pruning (channels, heads, layers) gives a smaller dense model and real speed-up everywhere, but loses more accuracy; recover it with LoRA, continued training or distillation.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \hat W = M \odot W, \quad s = 1 - \frac{\lVert M\rVert_0}{N}, \qquad \delta L \approx \tfrac12\, \delta\mathbf{w}^{\top} H\, \delta\mathbf{w} \]</div>
+<div class="eq">\[ s_q^{\text{OBD}} = \tfrac12 H_{qq} w_q^2, \qquad s_q^{\text{OBS}} = \frac{w_q^2}{2[H^{-1}]_{qq}}, \qquad \delta\mathbf{w} = -\frac{w_q}{[H^{-1}]_{qq}} H^{-1}\mathbf{e}_q \]</div>
+<div class="eq">\[ H = 2XX^{\top}, \qquad s_{ij}^{\text{Wanda}} = |w_{ij}|\,\lVert\mathbf{x}_j\rVert_2, \qquad \text{speed-up}_{\text{decode}} \le \frac{b_{\text{dense}}}{(1-s)\,b_{\text{nz}} + b_{\text{meta}}} \]</div>
+<h2 class="plain" id="pruning-basics-magnitude-obd-and-obs-structured-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Hassibi &amp; Stork (1993). <a href="https://scholar.google.com/scholar?q=&amp;quot;Second order derivatives for network pruning: Optimal Brain Surgeon&amp;quot;" target="_blank" rel="noopener">Second order derivatives for network pruning: Optimal Brain Surgeon</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>LeCun, Denker &amp; Solla (1990). <a href="https://scholar.google.com/scholar?q=&amp;quot;Optimal Brain Damage&amp;quot;" target="_blank" rel="noopener">Optimal Brain Damage</a></li><li>Hassibi &amp; Stork (1993). <a href="https://scholar.google.com/scholar?q=&amp;quot;Second order derivatives for network pruning: Optimal Brain Surgeon&amp;quot;" target="_blank" rel="noopener">Second order derivatives for network pruning: Optimal Brain Surgeon</a></li><li>Han, Pool, Tran &amp; Dally (2015). <a href="https://arxiv.org/abs/1506.02626" target="_blank" rel="noopener">Learning both Weights and Connections for Efficient Neural Networks</a></li><li>Zhu &amp; Gupta (2017). <a href="https://arxiv.org/abs/1710.01878" target="_blank" rel="noopener">To prune, or not to prune: exploring the efficacy of pruning for model compression</a></li><li>Frankle &amp; Carbin (2018). <a href="https://arxiv.org/abs/1803.03635" target="_blank" rel="noopener">The Lottery Ticket Hypothesis: Finding Sparse, Trainable Neural Networks</a></li><li>Frantar &amp; Alistarh (2023). <a href="https://arxiv.org/abs/2301.00774" target="_blank" rel="noopener">SparseGPT: Massive Language Models Can Be Accurately Pruned in One-Shot</a></li><li>Sun et al. (2023). <a href="https://arxiv.org/abs/2306.11695" target="_blank" rel="noopener">A Simple and Effective Pruning Approach for Large Language Models (Wanda)</a></li><li>Frantar &amp; Alistarh (2022). <a href="https://arxiv.org/abs/2208.11580" target="_blank" rel="noopener">Optimal Brain Compression: A Framework for Accurate Post-Training Quantization and Pruning</a></li><li>Mishra et al. (2021). <a href="https://arxiv.org/abs/2104.08378" target="_blank" rel="noopener">Accelerating Sparse Deep Neural Networks</a></li><li>Xia, Zheng, Li et al. (2023). <a href="https://arxiv.org/abs/2309.10285" target="_blank" rel="noopener">Flash-LLM: Enabling Cost-Effective and Highly-Efficient Large Generative Model Inference with Unstructured Sparsity</a></li><li>Michel, Levy &amp; Neubig (2019). <a href="https://arxiv.org/abs/1905.10650" target="_blank" rel="noopener">Are Sixteen Heads Really Better than One?</a></li><li>Men, Xu, Zhang et al. (2024). <a href="https://arxiv.org/abs/2403.03853" target="_blank" rel="noopener">ShortGPT: Layers in Large Language Models are More Redundant Than You Expect</a></li><li>Ashkboos et al. (2024). <a href="https://arxiv.org/abs/2401.15024" target="_blank" rel="noopener">SliceGPT: Compress Large Language Models by Deleting Rows and Columns</a></li><li>Ma et al. (2023). <a href="https://arxiv.org/abs/2305.11627" target="_blank" rel="noopener">LLM-Pruner: On the Structural Pruning of Large Language Models</a></li><li>Xia et al. (2023). <a href="https://arxiv.org/abs/2310.06694" target="_blank" rel="noopener">Sheared LLaMA: Accelerating Language Model Pre-training via Structured Pruning</a></li><li>Muralidharan et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Compact Language Models via Pruning and Knowledge Distillation (Minitron)&amp;quot;" target="_blank" rel="noopener">Compact Language Models via Pruning and Knowledge Distillation (Minitron)</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/lab-compare-rtn-gptq-awq-smoothquant-and.html"><small>Previous · session 112</small>compare RTN, GPTQ, AWQ, SmoothQuant and FP8 on one model</a><a class="next" href="../inference/unstructured-and-2-4-pruning-sparsegpt-wanda.html"><small>Next · session 114</small>Unstructured and 2:4 pruning: SparseGPT, Wanda, OWL</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="pruning-basics-magnitude-obd-and-obs-structured"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const T_=(x,y,s,o)=>`<text x="${x}" y="${y}" ${o||""}>${s}</text>`;
+function segInit(seg,attr,cb){seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+const segVal=(seg,attr)=>{const b=seg.querySelector('button[aria-pressed="true"]');return b?b.dataset[attr]:null;};
+const f3=x=>x.toFixed(3),f4=x=>x.toFixed(4);
+
+/* ---------- seeded RNG (mulberry32 + Box-Muller), same as the Python check ---------- */
+function rng(seed){let a=seed>>>0;const u=()=>{a=(a+0x6D2B79F5)>>>0;let t=a;t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296;};
+ return{u,n(){const u1=u(),u2=u();return Math.sqrt(-2*Math.log(u1+1e-12))*Math.cos(2*Math.PI*u2);}};}
+/* toy layer: W is 8 x 32, X holds 256 inputs (columns); neighbouring channels correlated; every 8th channel x6 */
+const NR=8,NC=32,NX=256;
+function makeLayer(outl){const r=rng(113),rho=0.8,c=Math.sqrt(1-rho*rho);
+ const X=[];for(let j=0;j<NC;j++)X.push(new Float64Array(NX));
+ for(let t=0;t<NX;t++){let p=r.n();X[0][t]=p;for(let j=1;j<NC;j++){p=rho*p+c*r.n();X[j][t]=p;}}
+ if(outl)for(let j=0;j<NC;j+=8)for(let t=0;t<NX;t++)X[j][t]*=6;
+ const W=[];for(let i=0;i<NR;i++){const w=new Float64Array(NC);for(let j=0;j<NC;j++)w[j]=r.n();W.push(w);}
+ const G=[];for(let i=0;i<NC;i++){G.push(new Float64Array(NC));}
+ for(let i=0;i<NC;i++)for(let j=i;j<NC;j++){let s=0;const a=X[i],b=X[j];for(let t=0;t<NX;t++)s+=a[t]*b[t];G[i][j]=s;G[j][i]=s;}
+ const xn=G.map((g,j)=>Math.sqrt(g[j]));
+ return{W,G,xn};}
+const quad=(d,G)=>{let s=0;for(let i=0;i<d.length;i++){if(!d[i])continue;let r=0;const g=G[i];for(let j=0;j<d.length;j++)r+=g[j]*d[j];s+=d[i]*r;}return s;};
+function inv(A){const n=A.length;const M=A.map((r,i)=>{const z=new Float64Array(2*n);for(let j=0;j<n;j++)z[j]=r[j];z[n+i]=1;return z;});
+ for(let c=0;c<n;c++){let p=c;for(let r=c+1;r<n;r++)if(Math.abs(M[r][c])>Math.abs(M[p][c]))p=r;[M[c],M[p]]=[M[p],M[c]];const d=M[c][c];for(let j=0;j<2*n;j++)M[c][j]/=d;
+  for(let r=0;r<n;r++){if(r===c)continue;const f=M[r][c];if(!f)continue;for(let j=0;j<2*n;j++)M[r][j]-=f*M[c][j];}}
+ return M.map(r=>Float64Array.from(r.slice(n)));}
+function solve(A,b){const n=b.length;const M=A.map((r,i)=>{const z=Array.from(r);z.push(b[i]);return z;});
+ for(let c=0;c<n;c++){let p=c;for(let r=c+1;r<n;r++)if(Math.abs(M[r][c])>Math.abs(M[p][c]))p=r;[M[c],M[p]]=[M[p],M[c]];
+  for(let r=c+1;r<n;r++){const f=M[r][c]/M[c][c];for(let j=c;j<=n;j++)M[r][j]-=f*M[c][j];}}
+ const x=new Array(n).fill(0);for(let r=n-1;r>=0;r--){let s=M[r][n];for(let j=r+1;j<n;j++)s-=M[r][j]*x[j];x[r]=s/M[r][r];}return x;}
+const argsortAsc=a=>Array.from(a,(v,i)=>i).sort((x,y)=>a[x]-a[y]||x-y);
+const LAY={};const getLayer=o=>LAY[o]||(LAY[o]=makeLayer(o==="on"));
+
+/* ---------- Figure 1: two weights, one quadratic loss ---------- */
+(function(){
+ const svg=$("#pb-2d-svg");if(!svg)return;const info=$("#pb-2d-info");
+ const sr=$("#pb-2d-r"),srv=$("#pb-2d-rv"),sh=$("#pb-2d-h"),shv=$("#pb-2d-hv");
+ const HV=[0.5,1,2,4,8];const w=[0.5,0.9];
+ const lo=-1,hi=2.3,X0=70,Y0=20,S=300/(hi-lo);
+ const px=x=>X0+(x-lo)*S,py=y=>Y0+(hi-y)*S;
+ function draw(){
+  const rho=+sr.value,h1=HV[+sh.value],h2=1;srv.textContent=rho.toFixed(2);shv.textContent=h1;
+  const h12=rho*Math.sqrt(h1*h2),det=h1*h2-h12*h12;const Hi=[[h2/det,-h12/det],[-h12/det,h1/det]];
+  const L=d=>0.5*(h1*d[0]*d[0]+2*h12*d[0]*d[1]+h2*d[1]*d[1]);
+  // four candidates: remove q plain (OBD/magnitude) or remove q with OBS compensation
+  const plain=[[0,w[1]],[w[0],0]];
+  const obsP=[0,1].map(q=>{const f=w[q]/Hi[q][q];return[w[0]-f*Hi[0][q],w[1]-f*Hi[1][q]];});
+  const lossPlain=[0.5*h1*w[0]*w[0],0.5*h2*w[1]*w[1]];
+  const lossObs=[0,1].map(q=>w[q]*w[q]/(2*Hi[q][q]));
+  const qMag=Math.abs(w[0])<=Math.abs(w[1])?0:1,qObd=lossPlain[0]<=lossPlain[1]?0:1,qObs=lossObs[0]<=lossObs[1]?0:1;
+  // contours: ellipses L = c around w*
+  const a=(h1+h2)/2,bq=Math.sqrt(((h1-h2)/2)**2+h12*h12),l1=a+bq,l2=a-bq;const th=Math.abs(h12)<1e-12?(h1>=h2?0:Math.PI/2):Math.atan2(l1-h1,h12);
+  let g=`<defs><clipPath id="pb-2d-clip"><rect x="${px(lo)}" y="${py(hi)}" width="${(hi-lo)*S}" height="${(hi-lo)*S}"/></clipPath></defs>`;
+  g+=`<rect x="${px(lo)}" y="${py(hi)}" width="${(hi-lo)*S}" height="${(hi-lo)*S}" fill="none" stroke="var(--rule)"/>`;
+  g+=`<g clip-path="url(#pb-2d-clip)">`;
+  [0.02,0.08,0.2,0.4,0.8,1.4].forEach(c=>{let d="";for(let k=0;k<=72;k++){const t=k/72*2*Math.PI;const u=Math.sqrt(2*c/l1)*Math.cos(t),v=Math.sqrt(2*c/l2)*Math.sin(t);
+   const x=w[0]+u*Math.cos(th)-v*Math.sin(th),y=w[1]+u*Math.sin(th)+v*Math.cos(th);d+=(k?"L":"M")+px(x).toFixed(1)+" "+py(y).toFixed(1);}
+   g+=`<path d="${d}" fill="none" stroke="var(--muted)" stroke-width="1" opacity="0.55"/>`;});
+  g+=`<line x1="${px(0)}" y1="${py(lo)}" x2="${px(0)}" y2="${py(hi)}" stroke="var(--k)" stroke-width="2.2" opacity="0.8"/>`;
+  g+=`<line x1="${px(lo)}" y1="${py(0)}" x2="${px(hi)}" y2="${py(0)}" stroke="var(--v)" stroke-width="2.2" opacity="0.8"/>`;
+  const dot=(p,col,r,o)=>`<circle cx="${px(p[0]).toFixed(1)}" cy="${py(p[1]).toFixed(1)}" r="${r}" fill="${col}" ${o||""}/>`;
+  for(let q=0;q<2;q++){g+=`<line x1="${px(w[0])}" y1="${py(w[1])}" x2="${px(plain[q][0])}" y2="${py(plain[q][1])}" stroke="var(--ink2)" stroke-dasharray="4 3" stroke-width="1.3"/>`;
+   g+=`<line x1="${px(w[0])}" y1="${py(w[1])}" x2="${px(obsP[q][0]).toFixed(1)}" y2="${py(obsP[q][1]).toFixed(1)}" stroke="var(--q)" stroke-width="1.6"/>`;
+   g+=dot(plain[q],"var(--card)",6,'stroke="var(--ink2)" stroke-width="1.6"')+dot(obsP[q],"var(--q)",6);}
+  g+=dot(w,"var(--ink)",6.5)+`</g>`;
+  g+=T_(px(w[0])+9,py(w[1])-8,"w* (trained)",'font-size="12" class="svgt"');
+  g+=T_(px(0)+6,py(hi)+14,"w₁ = 0 (remove w₁)",'font-size="11.5" fill="var(--k)" font-family="var(--sans)"');
+  g+=T_(px(hi)-4,py(0)-7,"w₂ = 0 (remove w₂)",'font-size="11.5" fill="var(--v)" text-anchor="end" font-family="var(--sans)"');
+  for(const v of [-1,0,1,2]){g+=T_(px(v),py(lo)+16,v,'text-anchor="middle" font-size="11" class="svgs"')+T_(px(lo)-6,py(v)+4,v,'text-anchor="end" font-size="11" class="svgs"');}
+  g+=T_(px((lo+hi)/2),py(lo)+32,"w₁",'text-anchor="middle" font-size="12.5" class="svgt"')+T_(px(lo)-26,py((lo+hi)/2),"w₂",'text-anchor="middle" font-size="12.5" class="svgt"');
+  // side table
+  const tx=398;let y=40;const rows=[["","remove w₁","remove w₂"],["|w_q|",f3(Math.abs(w[0])),f3(Math.abs(w[1]))],["OBD  ½H_qq w_q²",f3(lossPlain[0]),f3(lossPlain[1])],["OBS  w_q²/2[H⁻¹]_qq",f3(lossObs[0]),f3(lossObs[1])]];
+  rows.forEach((r,i)=>{g+=T_(tx,y,r[0],`font-size="12" ${i?'class="svgt"':'class="svgs"'}`)+T_(tx+150,y,r[1],'text-anchor="middle" font-size="12" class="svgm"')+T_(tx+222,y,r[2],'text-anchor="middle" font-size="12" class="svgm"');
+   if(i){const q=i===1?qMag:i===2?qObd:qObs;g+=`<rect x="${tx+150+q*72-30}" y="${y-14}" width="60" height="19" rx="5" fill="none" stroke="var(--accent)" stroke-width="1.8"/>`;}y+=28;});
+  y+=10;g+=T_(tx,y,"Method picks (boxed) and final loss:",'font-size="12" class="svgs"');y+=24;
+  const res=[["magnitude",qMag,lossPlain[qMag]],["OBD",qObd,lossPlain[qObd]],["OBS (+ move)",qObs,lossObs[qObs]]];
+  res.forEach(r=>{g+=T_(tx,y,r[0],'font-size="12.5" class="svgt"')+T_(tx+118,y,"w"+(r[1]?"₂":"₁"),'font-size="12.5" class="svgm"')+T_(tx+150,y,"ΔL = "+f3(r[2]),'font-size="12.5" class="svgm"');y+=24;});
+  y+=8;g+=dot([0,0],"var(--card)",0)+`<circle cx="${tx+6}" cy="${y-4}" r="5.5" fill="var(--card)" stroke="var(--ink2)" stroke-width="1.5"/>`+T_(tx+18,y,"set w_q = 0, others fixed",'font-size="11.5" class="svgs"');
+  y+=20;g+=`<circle cx="${tx+6}" cy="${y-4}" r="5.5" fill="var(--q)"/>`+T_(tx+18,y,"OBS: w_q = 0 and move the other",'font-size="11.5" class="svgs"');
+  svg.innerHTML=g;
+  const m=lossPlain[qMag],o=lossPlain[qObd],s=lossObs[qObs];
+  info.dataset.mag=f4(m);info.dataset.obd=f4(o);info.dataset.obs=f4(s);info.dataset.pick=`${qMag+1}${qObd+1}${qObs+1}`;
+  const np=obsP[qObs];
+  info.innerHTML=`ρ = ${rho.toFixed(2)}, H₁₁ = ${h1}, H₂₂ = 1. Magnitude removes w${qMag?"₂":"₁"} (loss <b>${f3(m)}</b>). OBD removes w${qObd?"₂":"₁"} (loss <b>${f3(o)}</b>). OBS removes w${qObs?"₂":"₁"} and moves the other weight to ${f3(np[1-qObs])}: loss <b>${f3(s)}</b>`+(s>0?`, ${(o/s).toFixed(1)}× less than OBD.`:".")+(qMag!==qObd?" Magnitude and OBD disagree: the smaller weight sits on the steeper direction.":"");}
+ sr.addEventListener("input",draw);sh.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 2: magnitude vs OBD (Wanda) vs OBS on a toy layer ---------- */
+(function(){
+ const svg=$("#pb-layer-svg");if(!svg)return;const info=$("#pb-layer-info");
+ const sk=$("#pb-layer-k"),skv=$("#pb-layer-kv"),so=$("#pb-layer-o");
+ const CUR={};
+ function curves(o){if(CUR[o])return CUR[o];const{W,G,xn}=getLayer(o);
+  let tot=0;for(const w of W)tot+=quad(w,G);
+  const out={mag:new Array(NC).fill(0),obd:new Array(NC).fill(0),obs:new Array(NC).fill(0)};
+  for(const kind of ["mag","obd"])for(const w of W){const sc=Array.from(w,(v,j)=>Math.abs(v)*(kind==="obd"?xn[j]:1));const ord=argsortAsc(sc);
+   const d=new Float64Array(NC);for(let k=1;k<NC;k++){d[ord[k-1]]=-w[ord[k-1]];out[kind][k]+=quad(d,G);}}
+  let md=0;for(let j=0;j<NC;j++)md+=G[j][j];md=0.01*md/NC;
+  const Hd=G.map((r,i)=>{const z=Float64Array.from(r);z[i]+=md;return z;});const Hi0=inv(Hd);
+  for(const w0 of W){const w=Float64Array.from(w0);const Hi=Hi0.map(r=>Float64Array.from(r));const alive=new Array(NC).fill(true);
+   for(let k=1;k<NC;k++){let q=-1,b=Infinity;for(let j=0;j<NC;j++){if(!alive[j])continue;const s=w[j]*w[j]/Hi[j][j];if(s<b){b=s;q=j;}}
+    const f=w[q]/Hi[q][q];for(let j=0;j<NC;j++)w[j]-=f*Hi[j][q];w[q]=0;alive[q]=false;
+    const cq=Array.from(Hi,r=>r[q]),rq=Float64Array.from(Hi[q]),hq=Hi[q][q];
+    for(let i=0;i<NC;i++){const a=cq[i]/hq;if(!a)continue;const r=Hi[i];for(let j=0;j<NC;j++)r[j]-=a*rq[j];}
+    for(let j=0;j<NC;j++){Hi[q][j]=0;Hi[j][q]=0;}Hi[q][q]=1;
+    const d=w.map((v,j)=>v-w0[j]);out.obs[k]+=quad(d,G);}}
+  for(const kk in out)out[kk]=out[kk].map(v=>v/tot);
+  return(CUR[o]=out);}
+ const x0=70,y0=20,W_=520,H_=250,kmax=28;const lmin=-4,lmax=0;
+ const px=k=>x0+k/kmax*W_,py=e=>y0+(lmax-Math.log10(Math.max(e,1e-4)))/(lmax-lmin)*H_;
+ const COL={mag:"var(--k)",obd:"var(--v)",obs:"var(--q)"},NAME={mag:"magnitude |w|",obd:"OBD = Wanda |w|·‖x‖",obs:"OBS (with updates)"};
+ function draw(){const k=+sk.value,o=segVal(so,"o");skv.textContent=`${k}/32 = ${(100*k/32).toFixed(1)}%`;const C=curves(o);
+  let g="";for(let e=lmin;e<=lmax;e++){g+=`<line x1="${x0}" y1="${py(10**e)}" x2="${x0+W_}" y2="${py(10**e)}" stroke="var(--rule)"/>`+T_(x0-8,py(10**e)+4,e===0?"1":"10"+["⁻⁴","⁻³","⁻²","⁻¹"][e+4],'text-anchor="end" font-size="11.5" class="svgs"');}
+  for(let s=0;s<=28;s+=4)g+=T_(px(s),y0+H_+18,Math.round(100*s/32)+"%",'text-anchor="middle" font-size="11" class="svgs"');
+  g+=T_(x0+W_/2,y0+H_+38,"sparsity (fraction of weights removed in every row)",'text-anchor="middle" font-size="12" class="svgs"');
+  g+=T_(16,y0+H_/2,"relative output error",`text-anchor="middle" font-size="12" class="svgs" transform="rotate(-90 16 ${y0+H_/2})"`);
+  g+=`<line x1="${px(k)}" y1="${y0}" x2="${px(k)}" y2="${y0+H_}" stroke="var(--ink2)" stroke-dasharray="4 3"/>`;
+  ["mag","obd","obs"].forEach((m,i)=>{let d="";for(let s=1;s<=kmax;s++){if(C[m][s]<1e-4)continue;d+=(d?"L":"M")+px(s).toFixed(1)+" "+py(C[m][s]).toFixed(1);}
+   g+=`<path d="${d}" fill="none" stroke="${COL[m]}" stroke-width="2.4"/>`;if(k>0&&C[m][k]>=1e-4)g+=`<circle cx="${px(k)}" cy="${py(C[m][k]).toFixed(1)}" r="5" fill="${COL[m]}"/>`;
+   g+=`<rect x="${x0+12}" y="${y0+10+i*20}" width="16" height="4" fill="${COL[m]}"/>`+T_(x0+34,y0+16+i*20,NAME[m],'font-size="12" class="svgt"');});
+  svg.innerHTML=g;const e={mag:C.mag[k],obd:C.obd[k],obs:C.obs[k]};
+  info.dataset.mag=f4(e.mag);info.dataset.obd=f4(e.obd);info.dataset.obs=f4(e.obs);
+  info.innerHTML=k===0?"No weight removed: the error is 0. Move the slider.":`${k} of 32 weights removed per row, input channels ${o==="on"?"with 4 outlier channels (×6)":"all of the same scale"}. Relative error ‖WX − ŴX‖²/‖WX‖²: magnitude <b>${f4(e.mag)}</b>, OBD/Wanda <b>${f4(e.obd)}</b>, OBS <b>${f4(e.obs)}</b>. `+
+   (o==="on"?`Using the input scale cuts the error ${(e.mag/e.obd).toFixed(1)}×; moving the kept weights cuts it ${(e.obd/e.obs).toFixed(1)}× more.`:`With equal input scales the magnitude and OBD scores are almost the same ranking; only OBS, which moves the kept weights, is much better (${(e.obd/e.obs).toFixed(1)}×).`);}
+ sk.addEventListener("input",draw);segInit(so,"o",draw);draw();
+})();
+
+/* ---------- Figure 3: a memory model of sparse formats ---------- */
+(function(){
+ const svg=$("#pb-speed-svg");if(!svg)return;const info=$("#pb-speed-info");
+ const ss=$("#pb-speed-s"),ssv=$("#pb-speed-sv"),sm=$("#pb-speed-m");
+ function draw(){const s=+ss.value/100,mode=segVal(sm,"m");ssv.textContent=Math.round(100*s)+"%";
+  const F=[{n:"dense FP16",b:2,c:1,col:"var(--muted)"},{n:"CSR (16-bit value + 16-bit index)",b:4*(1-s),c:1,col:"var(--k)"},{n:"bitmask + values",b:2*(1-s)+0.125,c:1,col:"var(--k)"},
+   {n:"2:4 (always 50%)",b:1.125,c:2,col:"var(--v)"},{n:"structured (smaller dense matrix)",b:2*(1-s),c:1/Math.max(1-s,0.05),col:"var(--q)"}];
+  F.forEach(f=>{f.sp=mode==="dec"?2/f.b:f.c;});
+  const x0=250,bw=330,y0=50,rh=46;const smax=mode==="dec"?Math.max(4,...F.map(f=>f.sp)):Math.max(4,...F.map(f=>f.sp));
+  let g=T_(320,y0-28,mode==="dec"?"decode: speed-up ≈ 2 bytes ÷ bytes read per weight":"prefill: speed-up ≈ math the hardware can skip",'text-anchor="middle" font-size="12.5" class="svgs"');
+  const sx=v=>x0+Math.min(v,smax)/smax*bw;
+  g+=`<line x1="${sx(1)}" y1="${y0-8}" x2="${sx(1)}" y2="${y0+F.length*rh}" stroke="var(--ink2)" stroke-dasharray="4 3"/>`+T_(sx(1),y0+F.length*rh+16,"1× (no gain)",'text-anchor="middle" font-size="11" class="svgs"');
+  F.forEach((f,i)=>{const y=y0+i*rh;g+=T_(x0-10,y+17,f.n,'text-anchor="end" font-size="12.5" class="svgt"')+T_(x0-10,y+33,f.b.toFixed(3)+" bytes / weight",'text-anchor="end" font-size="11" class="svgs"');
+   g+=`<rect x="${x0}" y="${y+6}" width="${(sx(f.sp)-x0).toFixed(1)}" height="24" rx="5" fill="${f.col}" opacity="${f.sp<1?0.45:0.85}"/>`+T_(sx(f.sp)+8,y+23,f.sp.toFixed(2)+"×",'font-size="13" font-weight="700" class="svgt"');});
+  svg.innerHTML=g;
+  info.dataset.csr=F[1].sp.toFixed(3);info.dataset.bm=F[2].sp.toFixed(3);info.dataset.st=F[4].sp.toFixed(3);info.dataset.nm=F[3].sp.toFixed(3);
+  const be=s<0.5?" CSR is <b>slower</b> than dense here: its index costs as much as the value.":"";
+  info.innerHTML=mode==="dec"?`Sparsity ${Math.round(100*s)}%. Ideal decode speed-up: CSR <b>${F[1].sp.toFixed(2)}×</b>, bitmask <b>${F[2].sp.toFixed(2)}×</b>, 2:4 <b>${F[3].sp.toFixed(2)}×</b>, structured <b>${F[4].sp.toFixed(2)}×</b>.${be} Real kernels reach less than these bounds.`:
+   `Sparsity ${Math.round(100*s)}%. In the compute-bound model, unstructured formats are drawn at 1×: the tensor cores still do dense math on the tile (load as sparse, compute as dense). 2:4 sparse tensor cores give up to 2× math; a structured layer is simply ${F[4].sp.toFixed(2)}× smaller.`;}
+ ss.addEventListener("input",draw);segInit(sm,"m",draw);draw();
+})();
+
+/* ---------- Figure 4: granularity of the mask ---------- */
+(function(){
+ const svg=$("#pb-gran-svg");if(!svg)return;const info=$("#pb-gran-info");
+ const sg=$("#pb-gran-g"),sf=$("#pb-gran-f");
+ const L=getLayer("on");const{W,G,xn}=L;let tot=0;for(const w of W)tot+=quad(w,G);
+ const S=W.map(w=>Array.from(w,(v,j)=>Math.abs(v)*xn[j]));
+ function mask(kind){const M=W.map(()=>new Array(NC).fill(true));
+  if(kind==="un")S.forEach((s,i)=>argsortAsc(s).slice(0,NC/2).forEach(j=>M[i][j]=false));
+  else if(kind==="nm")S.forEach((s,i)=>{for(let g=0;g<NC;g+=4){argsortAsc(s.slice(g,g+4)).slice(0,2).forEach(j=>M[i][g+j]=false);}});
+  else if(kind==="col"){const cs=[];for(let j=0;j<NC;j++){let t=0;for(const w of W)t+=w[j]*w[j];cs.push(Math.sqrt(t)*xn[j]);}argsortAsc(cs).slice(0,NC/2).forEach(j=>M.forEach(r=>r[j]=false));}
+  else{const rs=W.map(w=>Math.sqrt(quad(w,G)));argsortAsc(rs).slice(0,NR/2).forEach(i=>M[i].fill(false));}
+  return M;}
+ function prune(M,fix){return W.map((w,i)=>{const m=M[i];const out=new Float64Array(NC);const idx=[];for(let j=0;j<NC;j++)if(m[j])idx.push(j);
+  if(!idx.length)return out;if(!fix){idx.forEach(j=>out[j]=w[j]);return out;}
+  const A=idx.map(a=>idx.map(b=>G[a][b]));const rhs=idx.map(a=>{let t=0;for(let j=0;j<NC;j++)t+=G[a][j]*w[j];return t;});
+  const x=solve(A,rhs);idx.forEach((j,t)=>out[j]=x[t]);return out;});}
+ const DESC={un:"unstructured: the 16 smallest |w|·‖x‖ in every row",nm:"2:4: the 2 smallest |w|·‖x‖ in every group of 4",col:"input channels: 16 whole columns",row:"output channels: 4 whole rows"};
+ function draw(){const kind=segVal(sg,"g"),fix=segVal(sf,"f")==="on";const M=mask(kind);const Wp=prune(M,fix);
+  let e=0;W.forEach((w,i)=>{e+=quad(w.map((v,j)=>Wp[i][j]-v),G);});e/=tot;
+  const c=17,x0=40,y0=34;let smax=0;S.forEach(r=>r.forEach(v=>smax=Math.max(smax,v)));
+  let g=T_(x0,y0-14,"input channel j → (columns 1, 9, 17, 25 are outlier channels)",'font-size="11.5" class="svgs"');
+  for(let i=0;i<NR;i++){g+=T_(x0-8,y0+i*c+12,i+1,'text-anchor="end" font-size="10.5" class="svgs"');
+   for(let j=0;j<NC;j++){const x=x0+j*c,y=y0+i*c;if(M[i][j]){const op=0.18+0.82*Math.sqrt(S[i][j]/smax);g+=`<rect x="${x+1}" y="${y+1}" width="${c-2}" height="${c-2}" rx="2.5" fill="var(--q)" opacity="${op.toFixed(3)}"/>`;}
+    else g+=`<rect x="${x+1.5}" y="${y+1.5}" width="${c-3}" height="${c-3}" rx="2.5" fill="none" stroke="var(--rule)"/>`;}}
+  for(const j of [0,8,16,24])g+=`<path d="M${x0+j*c+c/2} ${y0+NR*c+4} l-4 7 h8 z" fill="var(--k)"/>`;
+  if(kind==="nm")for(let gg=4;gg<NC;gg+=4)g+=`<line x1="${x0+gg*c}" y1="${y0-3}" x2="${x0+gg*c}" y2="${y0+NR*c+3}" stroke="var(--ink2)" stroke-width="0.8" opacity="0.6"/>`;
+  g+=T_(x0-26,y0+NR*c/2,"row i",`text-anchor="middle" font-size="11" class="svgs" transform="rotate(-90 ${x0-26} ${y0+NR*c/2})"`);
+  const shape=kind==="col"?"8 × 16 dense":kind==="row"?"4 × 32 dense":kind==="nm"?"8 × 32, 2:4 format":"8 × 32, irregular";
+  const sp=kind==="un"?"≈1.78× (bitmask), often less":kind==="nm"?"≈1.78× memory, up to 2× math":"2.00× (half the bytes and the FLOPs)";
+  g+=T_(x0,y0+NR*c+32,`${DESC[kind]}  ·  stored as ${shape}`,'font-size="12" class="svgt"');
+  svg.innerHTML=g;info.dataset.err=f4(e);
+  info.innerHTML=`50% of the weights removed (${DESC[kind]}), ${fix?"kept weights re-fitted by least squares (the OBS update)":"kept weights unchanged"}. Relative output error <b>${f4(e)}</b>. Ideal decode speed-up in the memory model: <b>${sp}</b>.`+(kind==="row"?" Removing an output row zeroes that output: no change of the other weights of this layer can bring it back (only the next layer can).":"");}
+ segInit(sg,"g",draw);segInit(sf,"f",draw);draw();
+})();
+})();
+</script></body></html>

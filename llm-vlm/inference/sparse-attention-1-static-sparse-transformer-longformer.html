@@ -1,0 +1,482 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Sparse attention 1 (static): Sparse Transformer, Longformer, BigBird, StreamingLLM · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 116</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="sparse-attention-1-static-sparse-transformer-longformer">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="sparse-attention-1-static-sparse-transformer-longformer" data-session="sparse-attention-1-static-sparse-transformer-longformer" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">116</span><span>Track 5: LLM inference and serving · session 39 of 65</span></div><h1 class="chap-title">Sparse attention 1 (static): Sparse Transformer, Longformer, BigBird, StreamingLLM</h1><p class="chap-sub">Full attention compares every token with every other token, so its cost grows with the square of the length. Static sparse attention fixes in advance which pairs are computed: a local window, a few global tokens, some random links, a stride. This session builds these patterns one by one (Sparse Transformer, Longformer, BigBird), then shows how StreamingLLM and sliding-window models such as Mistral use the same idea to keep the KV cache at a fixed size during decoding.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 2 hours, exercises 1 to 1.5 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 17 (attention math), 14 (RoPE), 27 (a first look at sliding windows) and 80 (the KV cache)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How to describe any sparse attention as a set of allowed keys per query, and how to count its cost</li><li>The four building blocks: local window, dilated window, global tokens and random links, and what each one adds</li><li>Sparse Transformer: strided and fixed patterns, and why a stride near the square root of n gives O(n√n) cost</li><li>Longformer: sliding and dilated windows, receptive field growth over layers, and global attention on task tokens</li><li>BigBird: why local + global + random keeps the expressive power of full attention, and the blocked implementation</li><li>StreamingLLM: why removing the first tokens breaks a model (attention sinks), and how a sink + window cache streams millions of tokens</li><li>How static patterns cap the KV cache during decoding (Mistral rolling buffer, Gemma 2 local and global layers), with real memory numbers</li></ul></div></header><style>
+.sa-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.sa-grid input[type=range]{width:100%}
+.sa-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.sa-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+#sa-pat-svg text,#sa-cost-svg text,#sa-stream-svg text,#sa-sink-svg text,#sa-kv-svg text{font-family:var(--sans)}
+#sa-pat-svg rect.c{cursor:pointer}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In full attention, every query compares itself with every key. With \(n\) tokens that is \(n^2\) scores per head and per layer. At \(n = 4096\) this is 16.8 million scores; at \(n = 131{,}072\) it is 17.2 billion. The cost of the table grows four times each time the text gets twice as long.</p>
+<p>But a trained model does not use most of that table. Most attention weight goes to nearby tokens, plus a few special tokens that everybody looks at. <b>Sparse attention</b> uses this fact: it computes only some of the query-key pairs and treats the others as if their weight were zero. This session is about <b>static</b> sparse attention: the set of computed pairs is fixed before the model sees the input. (In <a href="../inference/sparse-attention-2-dynamic-reformer-routing-transformer.html">session 117</a> the pairs are chosen from the input itself.)</p>
+<p>The efficient-inference survey of Zhou et al. puts sparse attention under model compression, in its sparsification section (5.2.2). It splits it into static patterns, which "remove activation values independently of specific inputs", and dynamic ones. Its static examples are exactly the four of this session: Sparse Transformer, Longformer, BigBird and StreamingLLM. [Certain]</p>
+<ul>
+<li><b>Sparse Transformer</b> (Child et al., 2019): a local window plus a stride, which gives cost \(O(n\sqrt n)\) instead of \(O(n^2)\).</li>
+<li><b>Longformer</b> (Beltagy et al., 2020): a sliding window, a dilated window, and "global" attention on a few task tokens. Cost \(O(n)\).</li>
+<li><b>BigBird</b> (Zaheer et al., 2020): window + global + random links, with a proof that this keeps the power of full attention.</li>
+<li><b>StreamingLLM</b> (Xiao et al., 2023): a window plus the first four tokens, the "attention sinks". It lets an unchanged pretrained LLM generate millions of tokens with a fixed-size KV cache.</li></ul>
+<p>The last point is why this topic matters so much for serving. During decoding, a static pattern that only looks back a fixed distance means old keys and values can be <b>deleted</b>. Mistral 7B and Gemma 2 use sliding windows partly for this reason. [Certain]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: "Why does sliding-window attention still see far tokens?", "What are attention sinks and why do they exist?", "Why does BigBird need random and global tokens?", "How much KV cache does a 4096 window save at 32K context?". All four are answered with numbers below.</aside>
+
+<h2>Sparse attention as a set of allowed keys</h2>
+<p>We need one language for all patterns. For each query position \(i\), let \(S_i\) be the set of key positions it is allowed to see. Attention is then the usual formula, but the softmax runs only over \(S_i\):</p>
+<div class="eq">\[ \mathbf{o}_i = \sum_{j \in S_i} \alpha_{ij}\, \mathbf{v}_j, \qquad \alpha_{ij} = \frac{\exp\!\big(\mathbf{q}_i^\top \mathbf{k}_j / \sqrt{d}\big)}{\sum_{j' \in S_i} \exp\!\big(\mathbf{q}_i^\top \mathbf{k}_{j'} / \sqrt{d}\big)} \tag{116.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{q}_i, \mathbf{k}_j, \mathbf{v}_j\)</dt><dd>query of token \(i\), key and value of token \(j\), each with \(d\) numbers</dd>
+<dt>\(S_i\)</dt><dd>the allowed keys of query \(i\): the "pattern". Full causal attention uses \(S_i = \{0, 1, \dots, i\}\)</dd>
+<dt>\(\alpha_{ij}\)</dt><dd>attention weight; it sums to 1 over \(S_i\), and is 0 for every \(j\) outside \(S_i\)</dd>
+<dt>\(\mathbf{o}_i\)</dt><dd>the output for query \(i\): a weighted average of the allowed values</dd></dl>
+<p>This is the same as writing a mask with \(-\infty\) for forbidden pairs before the softmax. The cost is the number of scores we compute, which is the size of all the sets together:</p>
+<div class="eq">\[ \text{cost} = \sum_{i=0}^{n-1} |S_i|, \qquad \text{full causal: } \sum_{i=0}^{n-1} (i+1) = \frac{n(n+1)}{2} \tag{116.2} \]</div>
+<p>A good pattern has two properties. First, small sets: \(|S_i|\) should not grow with \(n\) (or only slowly). Second, <b>information must still be able to travel</b>. One layer may only connect \(i\) to its set, but after several layers, token \(j\) can reach token \(i\) through a chain of tokens. If we draw an arrow \(j \to i\) for every \(j \in S_i\), the number of layers needed is the length of the shortest path. Full attention needs 1 layer for every pair. A sparse pattern needs more, and the question is how many.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A large company. In full attention every employee talks to every other employee each day: impossible at 100,000 people. Sparse attention is an org chart: you talk to your team (local), a few managers talk to everyone (global), and a few random coffee chats connect distant teams (random). News still reaches everyone, it just takes a few hops.</aside>
+
+<h2>The four building blocks</h2>
+<p>Almost every static pattern is a union of four simple sets. Let \(r\) be the window radius, \(d_{\text{il}}\) the dilation, \(G\) a small set of global positions and \(R_i\) a few random positions chosen once, before training:</p>
+<div class="eq">\[ \begin{aligned} \text{local: } & W_i = \{ j : |i - j| \le r \} \\ \text{dilated: } & D_i = \{ j : |i - j| \le r\, d_{\text{il}},\ (i - j) \bmod d_{\text{il}} = 0 \} \\ \text{global: } & j \in S_i \text{ for all } i \text{ if } j \in G, \quad S_g = \text{all } j \text{ for } g \in G \\ \text{random: } & R_i = r_{\text{rand}} \text{ positions drawn once per query} \end{aligned} \tag{116.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(r\)</dt><dd>how many neighbors on each side a token sees (Longformer writes the full window as \(w = 2r\))</dd>
+<dt>\(d_{\text{il}}\)</dt><dd>the gap between attended tokens in a dilated window; \(d_{\text{il}} = 1\) is the normal window</dd>
+<dt>\(G\)</dt><dd>global tokens: they see every token, and every token sees them</dd>
+<dt>\(r_{\text{rand}}\)</dt><dd>number of random keys per query (BigBird)</dd></dl>
+<p>For a decoder (causal model), we also remove every \(j \gt i\). Each block adds something different:</p>
+<ul>
+<li><b>Local</b> keeps the strongest signal: neighbors. But information moves only \(r\) positions per layer.</li>
+<li><b>Dilated</b> covers \(d_{\text{il}}\) times more distance for the same cost, but alone it is blind: with \(d_{\text{il}} = 2\), even positions never talk to odd ones.</li>
+<li><b>Global</b> tokens act as hubs: any token reaches any other in 2 steps (token \(\to\) hub \(\to\) token). In a causal model this does not work for a hub at the start of the text: position 0 can only see itself, so it cannot collect information from later tokens.</li>
+<li><b>Random</b> links act like shortcuts in a social network: a few of them make paths short everywhere.</li></ul>
+<p>Build the patterns yourself in Figure 1. The readout counts the cost (116.2) and the number of layers that information needs to travel between the two most distant tokens.</p>
+
+<figure class="fig" id="sa-pat"><div class="fig-body">
+<div class="controls"><span class="seg" id="sa-pat-pre"><button type="button" data-v="win" aria-pressed="true">Window</button><button type="button" data-v="strided" aria-pressed="false">Sparse Transformer</button><button type="button" data-v="lf" aria-pressed="false">Longformer</button><button type="button" data-v="bb" aria-pressed="false">BigBird</button><button type="button" data-v="stream" aria-pressed="false">StreamingLLM</button></span></div>
+<div class="sa-grid" style="margin-top:8px">
+<label for="sa-pat-r">Window radius \(r\)</label><input type="range" id="sa-pat-r" min="0" max="8" step="1" value="3"><output id="sa-pat-rv"></output>
+<label for="sa-pat-d">Dilation \(d_{\text{il}}\)</label><input type="range" id="sa-pat-d" min="1" max="4" step="1" value="1"><output id="sa-pat-dv"></output>
+<label for="sa-pat-s">Stride \(l\) (0 = off)</label><input type="range" id="sa-pat-s" min="0" max="12" step="1" value="0"><output id="sa-pat-sv"></output>
+<label for="sa-pat-g">Global tokens</label><input type="range" id="sa-pat-g" min="0" max="4" step="1" value="0"><output id="sa-pat-gv"></output>
+<label for="sa-pat-x">Random keys per query</label><input type="range" id="sa-pat-x" min="0" max="4" step="1" value="0"><output id="sa-pat-xv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="sa-pat-c"> Causal (decoder: no future keys)</label></div>
+<div class="scroll-x"><svg id="sa-pat-svg" viewBox="0 0 470 446" role="img" aria-label="A 48 by 48 grid of query rows and key columns; colored cells are computed attention pairs"></svg></div>
+<div class="sa-leg"><span style="--c:var(--q)">window or dilated window</span><span style="--c:var(--ink2)">stride</span><span style="--c:var(--k)">global</span><span style="--c:var(--v)">random</span></div>
+<div class="readout" id="sa-pat-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Static attention patterns on \(n = 48\) tokens. Row \(i\) is a query, column \(j\) a key; a colored cell is a computed score. Presets set the sliders to the shape of each method. Random links use a fixed seed, so the same settings always give the same pattern.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with "Window" (radius 3, bidirectional): 324 pairs, 14.1% of the grid, but information needs 16 layers to cross the 48 tokens, because it moves 3 positions per layer. Add 2 global tokens (the Longformer preset): 498 pairs, and the worst path drops to 2 layers. Set the dilation to 2 with no global tokens: the readout says "never", because even and odd positions are never connected. Turn on "Causal" with global tokens: the path length does not improve, because a causal hub at position 0 cannot read later tokens. Click a cell to inspect its query row.</p></details></figure>
+
+<div class="worked"><div class="wt">Worked example: what each block buys (n = 48)</div>
+<p>All numbers are from the pattern rules above, counted exactly (Figure 1 gives the same values).</p>
+<p>Window radius 2, bidirectional: every query sees at most 5 keys, and the longest path is \(\lceil 47/2 \rceil = 24\) layers. Add 2 random keys per query: 320 pairs in total (13.9% of the grid), and the longest path falls to <b>4</b> layers. A few random shortcuts shorten every path.</p>
+<p>Window radius 3 + 2 global tokens: 498 pairs (21.6%), longest path <b>2</b>. Window radius 6 + stride 7, causal (the Sparse Transformer shape): 456 pairs (19.8%) and longest path <b>2</b>, compared with 8 for the same window without the stride.</p></div>
+
+<h2>Sparse Transformer: a window and a stride</h2>
+<p>The Sparse Transformer (Child et al., 2019, OpenAI) was built to generate images, audio and text as very long byte sequences: up to 12,288 bytes for text and 65,536 for audio. [Certain] Its idea is <b>factorized attention</b>: split the work across two heads (or two layers) so that any position can reach any earlier position in 2 steps, while each head looks at only about \(\sqrt n\) keys.</p>
+<p>The <b>strided</b> pattern uses a stride \(l\). Head 1 sees the last \(l\) positions; head 2 sees every \(l\)-th position before \(i\):</p>
+<div class="eq">\[ A^{(1)}_i = \{ j : \max(0, i - l) \le j \le i \}, \qquad A^{(2)}_i = \{ j \le i : (i - j) \bmod l = 0 \} \tag{116.4} \]</div>
+<p>Why 2 steps are enough: take any \(j \le i\). Let \(m\) be the first position at or after \(j\) with \(i - m\) a multiple of \(l\). Then \(0 \le m - j \lt l\), so \(m\) sees \(j\) through its window (head 1), and \(i\) sees \(m\) through the stride (head 2). One hop in each head: this is the "2 layers" you saw in Figure 1.</p>
+<p>The strided pattern works well when the data has a natural period, like the rows of an image. For text, the authors found that the network "can fail to properly route information" with it. [Certain] So for text they use the <b>fixed</b> pattern: tokens attend inside their own block of length \(l\), and every token also attends to the last \(c\) positions of every earlier block, which act as summary cells:</p>
+<div class="eq">\[ A^{(1)}_i = \{ j : \lfloor j / l \rfloor = \lfloor i / l \rfloor \}, \qquad A^{(2)}_i = \{ j : j \bmod l \ge l - c \} \tag{116.5} \]</div>
+<p>(both with \(j \le i\)). The paper used \(c \in \{8, 16, 32\}\) with \(l \in \{128, 256\}\). [Certain]</p>
+<h3>Why the stride should be about \(\sqrt n\)</h3>
+<p>For the strided pattern, a query sees about \(l\) keys from the window and about \(i/l\) keys from the stride. Summed over all queries:</p>
+<div class="eq">\[ \sum_i |S_i| \approx n \left( l + \frac{n}{2l} \right), \qquad \text{smallest at } l^\star = \sqrt{n/2}, \qquad \text{cost}(l^\star) \approx n\sqrt{2n} \tag{116.6} \]</div>
+<p>A larger \(l\) makes the window expensive; a smaller \(l\) makes the stride expensive. The balance point gives cost \(O(n\sqrt n)\). The paper simply says \(l\) is "chosen to be close to \(\sqrt n\)", which is the same order. [Certain] Explore the trade-off in Figure 2.</p>
+
+<figure class="fig" id="sa-cost"><div class="fig-body">
+<div class="sa-grid">
+<label for="sa-cost-n">Sequence length \(n\)</label><input type="range" id="sa-cost-n" min="10" max="20" step="1" value="14"><output id="sa-cost-nv"></output>
+<label for="sa-cost-l">Stride \(l\)</label><input type="range" id="sa-cost-l" min="1" max="11" step="0.25" value="7"><output id="sa-cost-lv"></output></div>
+<svg id="sa-cost-svg" viewBox="0 0 640 270" role="img" aria-label="Number of computed scores of the strided pattern as a function of the stride, on log axes"></svg>
+<div class="sa-leg"><span style="--c:var(--q)">strided pattern (window + stride)</span><span style="--c:var(--muted)">full causal attention</span><span style="--c:var(--k)">your stride</span></div>
+<div class="readout" id="sa-cost-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Exact number of computed scores for the causal strided pattern (116.4), as a function of the stride \(l\) (log scale). The curve has its minimum near \(l = \sqrt{n/2}\).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>The horizontal line is full causal attention, \(n(n+1)/2\). The curve is the strided pattern; the dot is your stride. At \(n = 16{,}384\) and \(l = 128\), the pattern computes 3,129,408 scores instead of 134,225,920: 42.9 times fewer. The best stride is 91 (close to \(\sqrt{8192} = 90.5\)), with 2,953,579 scores. Move \(n\) up: the saving grows like \(\sqrt n\), about 362 times at one million tokens.</p></details></figure>
+
+<div class="worked"><div class="wt">Worked example: the enwik8 setting</div>
+<p>The paper trained on enwik8 with context 12,288, stride 128 and \(c = 32\). [Certain] Full causal attention computes \(12288 \times 12289 / 2 = 75{,}503{,}616\) scores per head per layer. By formula (116.4), the strided pattern needs 2,148,416 (35.1 times fewer). The fixed pattern (116.5) with \(c = 32\) needs 19,470,336 by our count (3.9 times fewer): the summary cells cost more, but they route text better.</p>
+<p>Measured in the paper on enwik8 at 12,288 context (Table 2): dense attention 1.00 bits per byte at 1.31 s per iteration, fixed 0.99 at 0.55 s, strided 1.13 at 0.35 s. [Certain] So the fixed pattern was both faster and not worse on text, while the strided one was fastest but lost quality.</p></div>
+
+<h2>Longformer: sliding windows, dilation and global tokens</h2>
+<p>Longformer (Beltagy, Peters and Cohan, 2020) targets long documents for BERT-style encoders: classification, question answering, and summarization with its encoder-decoder version (LED). Its pretrained models read up to 4,096 tokens, 8 times BERT's 512. [Certain]</p>
+<h3>The sliding window and its receptive field</h3>
+<p>Each token attends to \(\tfrac12 w\) tokens on each side, so the cost is \(O(n \times w)\): linear in \(n\). One layer sees only \(w\) tokens, but layers stack. After \(\ell\) layers, information from \(\ell \times w\) positions away can arrive, like the growing receptive field of a convolutional network. With dilation \(d_{\text{il}}\) in every layer, it grows to \(\ell \times d_{\text{il}} \times w\):</p>
+<div class="eq">\[ \text{receptive field} \approx \ell \times w \quad \text{(window)}, \qquad \approx \ell \times d_{\text{il}} \times w \quad \text{(dilated)} \tag{116.7} \]</div>
+<p>[Certain] (both from the paper). The paper's choices are practical. For character-level language modeling, lower layers use small windows and no dilation, to learn local details. Higher layers use larger windows, and only 2 heads get a small dilation, so the model can look far without losing local context. [Certain] Different heads with different dilation are the fix for the "blind" dilated pattern of Figure 1.</p>
+<div class="worked"><div class="wt">Worked example: Longformer at 4,096 tokens</div>
+<p>The pretrained Longformer uses window \(w = 512\), "the same amount of computation as RoBERTa". [Certain] Each query sees \(256 + 1 + 256 = 513\) keys. Scores per head per layer: \(4096 \times 513 = 2{,}101{,}248\), compared with \(4096^2 = 16{,}777{,}216\) for full attention: <b>7.98 times fewer</b>. With 12 layers, the receptive field (116.7) is \(12 \times 512 = 6{,}144\) tokens: more than the whole 4,096-token input.</p></div>
+<h3>Global attention on task tokens</h3>
+<p>Windows are not flexible enough for tasks such as classification, where one token ([CLS]) must collect the whole document, or question answering, where every document token must compare itself with the question. So Longformer adds <b>global attention</b> on a few chosen positions: [CLS] for classification, all question tokens for QA. [Certain] It is <b>symmetric</b>: a global token attends to every token, and every token attends to it. Since the number of global tokens does not grow with \(n\), the total cost stays \(O(n)\).</p>
+<p>Global attention gets its own projection matrices \(Q_g, K_g, V_g\), separate from the \(Q_s, K_s, V_s\) of the window, initialized as copies of them. The paper reports that these extra projections are "critical for best performance" on downstream tasks. [Certain]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>A sparse pattern is only fast if the kernel skips the work. Writing a dense \(n \times n\) mask and filling it with \(-\infty\) gives the right answer at full cost. Longformer shipped a custom CUDA kernel (generated with TVM) for banded and dilated windows, plus a "chunks" PyTorch version that only supports the non-dilated case; a simple loop version that supports dilation was "unusably slow". [Certain]</aside>
+
+<h2>BigBird: local + global + random</h2>
+<p>BigBird (Zaheer et al., 2020, Google) looks at attention as a <b>graph</b>: tokens are nodes, and every computed pair is an edge. Full attention is a complete graph. Making attention cheap means replacing it with a sparse graph that still behaves like the complete one. Graph theory gives two hints:</p>
+<ul>
+<li><b>Random graphs</b> with only about \(n\) edges already have short paths between all nodes (logarithmic in \(n\)), so information mixes fast.</li>
+<li>Language has strong <b>locality</b>: much of what a token means comes from its neighbors. Random graphs lack this, so a window is added.</li></ul>
+<p>A small experiment in the paper at length 512 shows that random and window alone are not enough. Masked language model accuracy: BERT-base 64.2, random only 60.1, window only 58.3, random + window 62.7. [Certain] The last piece, found from the theory, is a set of <b>global tokens</b>. The final pattern for query \(i\) is the union:</p>
+<div class="eq">\[ S_i = W_i \;\cup\; G \;\cup\; R_i, \qquad |S_i| = w + g + r_{\text{rand}} \ \text{ (independent of } n\text{)} \tag{116.8} \]</div>
+<p>There are two kinds of global tokens. <b>BigBird-ITC</b> (internal transformer construction) makes some existing tokens global. <b>BigBird-ETC</b> (extended transformer construction) adds extra tokens such as [CLS], which gives the model extra memory slots. [Certain]</p>
+<h3>Why the theory matters</h3>
+<p>BigBird proves two things about its pattern. First, a sparse encoder that contains a few global tokens (a "star graph") is a <b>universal approximator</b> of sequence-to-sequence functions, as full attention is. Second, a sparse encoder-decoder is <b>Turing complete</b>, under the same idealized assumptions used for full attention. [Certain] In plain words: with enough layers, nothing is lost in principle.</p>
+<p>The paper is also honest about the cost: "enough layers" can be many. It gives a task (for each vector, find the one furthest from it) that one full-attention layer solves, but that any sparse pattern with about \(n\) edges needs roughly \(n\) layers for, under a standard complexity assumption. [Certain] Sparse patterns save compute per layer, but some tasks need many more layers.</p>
+<h3>The blocked implementation</h3>
+<p>GPUs are bad at gathering scattered single keys. So BigBird works with <b>blocks</b> of \(b\) tokens: a block of 64 queries attends to whole blocks of 64 keys. Each set in (116.8) is made of blocks. The encoder settings used in the paper are \(b = 64\), \(g = 2b\), \(w = 3b\), \(r_{\text{rand}} = 3b\), with sequence length 4,096. [Certain] So a query block computes scores with \((2 + 3 + 3) \times 64 = 512\) keys, one eighth of the 4,096, and the random blocks are drawn once and fixed. With the same hardware, BigBird handles sequences up to 8 times longer than before. [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 1: blocked BigBird-ITC attention (one head, encoder)</div><ol>
+<li><b>input:</b> \(Q, K, V \in \R^{n \times d}\), block size \(b\), global blocks \(g_b\), window blocks \(w_b\) (odd), random blocks \(r_b\), a fixed random table</li>
+<li>split \(Q, K, V\) into \(n_b = n / b\) blocks</li>
+<li><b>for</b> each query block \(u = 0, \dots, n_b - 1\):</li>
+<li>&nbsp;&nbsp;<b>if</b> \(u \lt g_b\): \(\mathcal{B} \leftarrow\) all key blocks <span class="c">// a global block attends to everything</span></li>
+<li>&nbsp;&nbsp;<b>else</b>: \(\mathcal{B} \leftarrow \{0, \dots, g_b - 1\} \cup \{u - \tfrac{w_b - 1}{2}, \dots, u + \tfrac{w_b - 1}{2}\} \cup \text{random}[u]\) <span class="c">// formula (116.8)</span></li>
+<li>&nbsp;&nbsp;gather \(K_{\mathcal{B}}, V_{\mathcal{B}}\) (about \((g_b + w_b + r_b)\,b\) rows)</li>
+<li>&nbsp;&nbsp;\(O_u \leftarrow \softmax(Q_u K_{\mathcal{B}}^\top / \sqrt d)\, V_{\mathcal{B}}\) <span class="c">// formula (116.1), dense inside the gathered set</span></li>
+<li><b>return</b> \(O\) <span class="c">// cost \(O(n\,(g_b + w_b + r_b)\,b\,d)\): linear in \(n\)</span></li></ol></div>
+
+<h2>StreamingLLM: a window plus attention sinks</h2>
+<p>So far the patterns were chosen <b>before training</b>. StreamingLLM (Xiao et al., 2023) asks a different question: can we take a normal LLM, trained with full attention on 4K tokens, and make it generate forever with a fixed-size KV cache, without any training?</p>
+<p>The obvious answer is a sliding window: keep the KV of the last \(R\) tokens and drop older ones. It fails badly. On the first PG19 book (65K tokens), Llama-2-13B with a 1,024-token window reaches perplexity 5,158 once the first tokens are evicted. Keep the first 4 tokens plus the last 1,020, and perplexity is 5.40. [Certain] Even more surprising: replacing those 4 tokens with 4 line-break tokens gives 5.60. [Certain] So the first tokens matter because of their <b>position</b>, not their meaning.</p>
+<h3>Why: attention sinks</h3>
+<p>Softmax weights must sum to 1. When a head has nothing useful to look at, it still has to put its weight somewhere. Models learn to dump this extra weight on the first tokens, which every later token can see during training. Their values are small, so the dumped weight changes the output very little. The paper calls these tokens <b>attention sinks</b>. [Certain] Consider a query that gives the sink a score \(z_s\) and \(m\) other cached tokens a score of 0:</p>
+<div class="eq">\[ \alpha_{\text{sink}} = \frac{e^{z_s}}{e^{z_s} + m}, \qquad \text{after evicting the sink: } \alpha_j \leftarrow \frac{\alpha_j}{1 - \alpha_{\text{sink}}} \tag{116.9} \]</div>
+<p>If the sink took 95% of the weight, removing it multiplies every other weight by about 20. The output of the head, which was a small mix of real values, suddenly becomes 20 times larger. Every later layer receives inputs it never saw in training, and the model breaks. Try it in Figure 3.</p>
+<figure class="fig" id="sa-sink"><div class="fig-body">
+<div class="sa-grid">
+<label for="sa-sink-z">Sink score \(z_s\)</label><input type="range" id="sa-sink-z" min="0" max="8" step="0.1" value="6"><output id="sa-sink-zv"></output>
+<label for="sa-sink-m">Other cached tokens \(m\)</label><input type="range" id="sa-sink-m" min="5" max="40" step="1" value="20"><output id="sa-sink-mv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="sa-sink-ev"> Evict the sink (plain sliding window)</label></div>
+<svg id="sa-sink-svg" viewBox="0 0 640 230" role="img" aria-label="Bar chart of attention weights on the sink token and on the other cached tokens"></svg>
+<div class="readout" id="sa-sink-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> One attention row with a sink. The first bar is the sink (score \(z_s\)); the other \(m\) tokens have score 0. The sink's value vector is taken as zero, so the head output is \((1 - \alpha_{\text{sink}})\) times the average of the other values.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>With \(z_s = 6\) and \(m = 20\), the sink takes 95.3% of the weight and each other token gets 0.0024. Tick "Evict the sink": each other token now gets 0.05, 21.2 times more, and the size of the head output grows by the same factor. With \(z_s = 4\) the factor is only 3.7. A long cache (large \(m\)) also dilutes the sink, which is one reason models learn several sinks rather than one.</p></details></figure>
+<h3>The StreamingLLM cache</h3>
+<p>The fix is simple: never evict the sinks. The cache keeps \(s\) sink tokens (4 is enough for the tested models) and a rolling window of the \(R\) most recent tokens:</p>
+<div class="eq">\[ C_t = \{0, \dots, s - 1\} \;\cup\; \{t - R + 1, \dots, t\}, \qquad |C_t| \le s + R \tag{116.10} \]</div>
+<p>One detail is critical. Positions are given by the place <b>inside the cache</b>, not in the original text. If the cache holds tokens [0, 1, 2, 3, 6, 7, 8] and the model decodes token 9, it uses positions 0 to 7, not [0, 1, 2, 3, 6, 7, 8, 9]. [Certain] With RoPE (<a href="../foundations/position-part-2-rope-in-depth-and.html">session 14</a>), this means keys are cached <b>before</b> the rotation, and rotated again at each step for their current cache slot. So the model never sees a distance larger than it saw in training.</p>
+<figure class="fig wide" id="sa-stream"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="sa-stream-prev">Back</button><button type="button" class="btn primary" id="sa-stream-play">Play</button><button type="button" class="btn" id="sa-stream-next">Next</button><span id="sa-stream-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="sa-grid" style="margin-top:8px">
+<label for="sa-stream-s">Sink tokens \(s\)</label><input type="range" id="sa-stream-s" min="0" max="4" step="1" value="4"><output id="sa-stream-sv"></output>
+<label for="sa-stream-r">Window \(R\)</label><input type="range" id="sa-stream-r" min="2" max="10" step="1" value="6"><output id="sa-stream-rv"></output></div>
+<div class="scroll-x"><svg id="sa-stream-svg" viewBox="0 0 720 210" role="img" aria-label="Tokens of a stream and the KV cache with the positions used for each cached token"></svg></div>
+<div class="sa-leg"><span style="--c:var(--k)">sink (kept forever)</span><span style="--c:var(--q)">recent window</span><span style="--c:var(--rule)">evicted</span></div>
+<div class="readout" id="sa-stream-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> StreamingLLM decoding, one token per step, for 20 tokens. Top row: the stream in original positions. Bottom row: the KV cache, with the position each cached key gets when it is rotated by RoPE at this step.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Press Next or Play. Until the cache is full, it simply grows. After that, every new token evicts the oldest token of the window, never a sink. At the last step with \(s = 4\), \(R = 6\), the cache holds tokens 0 to 3 and 14 to 19, which get positions 0 to 9. Set \(s = 0\) to get a plain sliding window: the first token is evicted at step 7, which is exactly the moment the perplexity of a real model explodes.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 2: one decoding step with a sink + window cache</div><ol>
+<li><b>input:</b> new token \(x_t\), cache of pre-RoPE keys \(K\) and values \(V\) (list), sinks \(s\), window \(R\)</li>
+<li>compute \(\mathbf{q}_t, \mathbf{k}_t, \mathbf{v}_t\) from \(x_t\) <span class="c">// no rotation yet</span></li>
+<li>append \(\mathbf{k}_t\) to \(K\), \(\mathbf{v}_t\) to \(V\)</li>
+<li><b>if</b> \(|K| \gt s + R\): delete entry number \(s\) (the oldest non-sink) from \(K\) and \(V\) <span class="c">// formula (116.10)</span></li>
+<li>\(p \leftarrow (0, 1, \dots, |K| - 1)\) <span class="c">// positions inside the cache</span></li>
+<li>\(\tilde K \leftarrow \text{RoPE}(K, p)\), \(\tilde{\mathbf{q}} \leftarrow \text{RoPE}(\mathbf{q}_t, |K| - 1)\)</li>
+<li>\(\mathbf{o}_t \leftarrow \softmax(\tilde K \tilde{\mathbf{q}} / \sqrt d)^\top V\)</li>
+<li><b>return</b> \(\mathbf{o}_t\) <span class="c">// memory and time per step are constant: \(O(s + R)\)</span></li></ol></div>
+<p>The results reported in the paper: with StreamingLLM, Llama-2 (7B, 13B, 70B), MPT (7B, 30B), Falcon (7B, 40B) and Pythia (2.9B to 12B) model up to 4 million tokens with stable perplexity, and StreamingLLM runs up to 22.2 times faster per token than the only baseline that also works, a sliding window that recomputes the KV of the window from scratch at every step. [Certain] On 400K tokens of PG19, Llama-2-7B with a 4,096-token cache has perplexity 3,359.95 with no sink, 11.88 with 1, 9.59 with 4 and 9.54 with 8. [Certain]</p>
+<p>The paper also pretrains small models with one extra learnable <b>sink token</b> at the start of every sample. Such a model needs only that one token as a sink when streaming. [Certain]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>StreamingLLM does <b>not</b> give the model a longer memory. Tokens outside the window are gone; the model cannot answer a question about text it evicted. It gives stable, endless generation, for example a chat that never needs a reset. Long-context recall needs other tools (<a href="../inference/sparse-attention-2-dynamic-reformer-routing-transformer.html">session 117</a> keeps important tokens; retrieval brings text back).</aside>
+
+<h2>Static patterns shrink the KV cache during decoding</h2>
+<p>During generation, each new token needs the keys and values of every token it may attend to. With full attention, that is all previous tokens, so the KV cache grows without limit (<a href="../inference/the-kv-cache.html">session 80</a>). With a pattern that only looks back \(W\) tokens, older entries are never read again and can be deleted. The cache size per sequence becomes:</p>
+<div class="eq">\[ M_{\text{KV}} = 2 \cdot L \cdot H_{kv} \cdot d_h \cdot b_{\text{el}} \cdot \min(n,\ W) \tag{116.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2\)</dt><dd>one key and one value per token</dd>
+<dt>\(L, H_{kv}, d_h\)</dt><dd>number of layers, key-value heads per layer and dimension per head</dd>
+<dt>\(b_{\text{el}}\)</dt><dd>bytes per number: 2 for BF16</dd>
+<dt>\(\min(n, W)\)</dt><dd>tokens kept: all \(n\) for full attention, at most \(W\) for a window (\(W = s + R\) for StreamingLLM)</dd></dl>
+<p>Mistral 7B stores this as a <b>rolling buffer</b>: the key and value of position \(i\) go to slot</p>
+<div class="eq">\[ \text{slot}(i) = i \bmod W \tag{116.12} \]</div>
+<p>so new tokens overwrite the oldest ones and the cache stops growing at \(W\) entries. [Certain] Mistral 7B has \(L = 32\), \(H_{kv} = 8\), \(d_h = 128\) and \(W = 4096\). [Certain]</p>
+<div class="worked"><div class="wt">Worked example: KV memory for Mistral 7B and Gemma 2 9B</div>
+<p>Mistral 7B, BF16: \(2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes = 128 KiB per token. At 32K tokens with full attention: \(32768 \times 128\) KiB = 4 GiB per sequence. With the 4,096 window: 512 MiB, <b>8 times smaller</b>, which is exactly the number in the Mistral paper. [Certain]</p>
+<p>Information still travels further than the window: one layer moves it up to \(W\) tokens, so after 32 layers the "theoretical attention span" is \(32 \times 4096 = 131{,}072\), about 131K tokens. [Certain] As with Longformer (116.7), this is an upper bound, not a guarantee that the model uses it.</p>
+<p>Gemma 2 9B alternates sliding-window layers (window 4,096) with full-attention layers: 42 layers, 8 KV heads, head size 256 (from its config.json). [Certain] Per token: \(2 \times 42 \times 8 \times 256 \times 2 = 344{,}064\) bytes. At its 8,192-token context, full attention in all layers would need 2.625 GiB; with 21 window layers it needs 1.969 GiB, 25% less. The saving grows with context because only the 21 global layers keep growing.</p></div>
+<p>Not every static pattern helps decoding. A causal stride (116.4) needs every \(l\)-th old token, so it keeps about \(l + n/l\) entries: smaller, but still growing. Random links to any past token and Longformer-style global tokens <b>inside</b> the generated text need the whole history. Only patterns with a bounded look-back (window, window + fixed sinks) give a fixed-size cache. Compare in Figure 5.</p>
+<figure class="fig" id="sa-kv"><div class="fig-body">
+<div class="controls"><span class="seg" id="sa-kv-m"><button type="button" data-v="llama" aria-pressed="false">Llama-2-7B</button><button type="button" data-v="mistral" aria-pressed="true">Mistral 7B</button><button type="button" data-v="gemma" aria-pressed="false">Gemma 2 9B</button></span></div>
+<div class="sa-grid" style="margin-top:8px">
+<label for="sa-kv-n">Context length \(n\)</label><input type="range" id="sa-kv-n" min="0" max="12" step="1" value="5"><output id="sa-kv-nv"></output>
+<label for="sa-kv-w">Window \(W\)</label><input type="range" id="sa-kv-w" min="0" max="4" step="1" value="3"><output id="sa-kv-wv"></output>
+<label for="sa-kv-s">Sink tokens</label><input type="range" id="sa-kv-s" min="0" max="8" step="1" value="0"><output id="sa-kv-sv"></output></div>
+<svg id="sa-kv-svg" viewBox="0 0 640 260" role="img" aria-label="KV cache memory as a function of context length for full attention, a window and a hybrid of window and full layers"></svg>
+<div class="sa-leg"><span style="--c:var(--muted)">full attention, all layers</span><span style="--c:var(--k)">half window, half full layers</span><span style="--c:var(--q)">window (+ sinks) in all layers</span></div>
+<div class="readout" id="sa-kv-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> KV cache memory per sequence (BF16, formula 116.11) against context length, for three real model shapes. The hybrid line puts the window in half of the layers (as Gemma 2 does) and full attention in the rest.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Both axes are logarithmic. The full-attention line grows forever. The window line becomes flat at \(n = W + \text{sinks}\). The hybrid line keeps growing at half the speed. Mistral 7B at 32K with \(W = 4096\): 4 GiB full, 0.5 GiB window. Llama-2-7B has 32 KV heads instead of 8, so it costs 512 KiB per token: at 4,194,304 tokens (the right end), full attention would need 2 TiB, while a window of 2,048 plus 4 sinks needs a constant 1.00 GiB.</p></details></figure>
+
+<h2>PyTorch: masks, gathered attention and a sink cache</h2>
+<p>The code builds the four blocks as boolean masks, checks that masked dense attention equals attention computed only on the gathered keys (what a real sparse kernel does), and runs the StreamingLLM cache of Algorithm 2 with RoPE applied at cache positions. It runs on CPU in about a second.</p>
+<pre class="code">import torch, math
+torch.manual_seed(0)
+
+# ---- 1) static patterns as boolean masks (True = this pair is computed), formula (116.3) ----
+def window(n, radius, causal=False):
+    i = torch.arange(n)[:, None]; j = torch.arange(n)[None, :]
+    m = (i - j).abs() &lt;= radius
+    return m &amp; (j &lt;= i) if causal else m
+
+def dilated(n, radius, d, causal=False):
+    i = torch.arange(n)[:, None]; j = torch.arange(n)[None, :]
+    dist = i - j
+    m = (dist.abs() &lt;= radius * d) &amp; (dist % d == 0)
+    return m &amp; (j &lt;= i) if causal else m
+
+def global_tokens(n, g):                # first g tokens see all and are seen by all
+    m = torch.zeros(n, n, dtype=torch.bool)
+    m[:g, :] = True; m[:, :g] = True
+    return m
+
+def random_blocks(n, b, r, gen):        # BigBird-style: r random key blocks per query block
+    nb = n // b; m = torch.zeros(n, n, dtype=torch.bool)
+    for qb in range(nb):
+        for kb in torch.randperm(nb, generator=gen)[:r].tolist():
+            m[qb*b:(qb+1)*b, kb*b:(kb+1)*b] = True
+    return m
+
+def masked_attention(q, k, v, mask):    # formula (116.1): softmax only over allowed keys
+    s = (q @ k.T) / math.sqrt(q.shape[-1])
+    s = s.masked_fill(~mask, float("-inf"))
+    return torch.softmax(s, dim=-1) @ v
+
+n, d = 64, 16
+q, k, v = torch.randn(n, d), torch.randn(n, d), torch.randn(n, d)
+gen = torch.Generator().manual_seed(116)
+bigbird = window(n, 4) | global_tokens(n, 2) | random_blocks(n, 8, 1, gen)   # formula (116.8)
+print("density of the BigBird-style mask:", round(bigbird.float().mean().item(), 3))   # 0.312
+out = masked_attention(q, k, v, bigbird)
+
+# ---- 2) the same result, computing only the allowed scores (gather per query) ----
+out2 = torch.empty_like(out)
+for i in range(n):
+    idx = bigbird[i].nonzero().squeeze(1)          # the set S_i
+    w = torch.softmax(q[i] @ k[idx].T / math.sqrt(d), dim=-1)
+    out2[i] = w @ v[idx]
+print("max difference, dense-masked vs gathered:", (out - out2).abs().max().item())   # about 4e-7
+
+# ---- 3) StreamingLLM: s sink tokens + a rolling window of R recent tokens (Algorithm 2) ----
+def rope(x, pos):                                  # x: (T, d), pos: (T,)
+    half = x.shape[-1] // 2
+    freq = 10000 ** (-torch.arange(half) / half)
+    ang = pos[:, None].float() * freq[None, :]
+    x1, x2 = x[:, :half], x[:, half:]
+    return torch.cat([x1 * ang.cos() - x2 * ang.sin(), x1 * ang.sin() + x2 * ang.cos()], -1)
+
+class SinkCache:
+    def __init__(self, s, R):
+        self.s, self.R, self.k, self.v = s, R, [], []   # keys stored BEFORE RoPE
+    def append(self, k, v):
+        self.k.append(k); self.v.append(v)
+        if len(self.k) &gt; self.s + self.R:              # evict the oldest non-sink token
+            del self.k[self.s]; del self.v[self.s]
+    def attend(self, q):
+        K, V = torch.stack(self.k), torch.stack(self.v)
+        pos = torch.arange(len(K))                     # positions INSIDE the cache
+        Kr = rope(K, pos); qr = rope(q[None], pos[-1:])[0]
+        w = torch.softmax(Kr @ qr / math.sqrt(q.shape[-1]), -1)
+        return w @ V
+
+T, s, R = 40, 4, 8
+Q, K, V = torch.randn(T, d), torch.randn(T, d), torch.randn(T, d)
+cache = SinkCache(s, R)
+for t in range(T):
+    cache.append(K[t], V[t])
+    o = cache.attend(Q[t])
+keep = list(range(s)) + list(range(T - R, T))          # what the last step should see
+pos = torch.arange(len(keep))
+w = torch.softmax(rope(K[keep], pos) @ rope(Q[T-1][None], pos[-1:])[0] / math.sqrt(d), -1)
+print("cache size:", len(cache.k), " match with direct formula:", (o - w @ V[keep]).abs().max().item())   # 12, 0.0</pre>
+<p>Note what the dense-masked version costs: it still builds the full \(64 \times 64\) score table and throws 69% of it away. Speed only comes from kernels that never compute the masked blocks, such as block-sparse kernels or FlashAttention with a sliding-window option (<a href="../inference/attention-operator-1-flashattention-1-2-and.html">session 124</a>).</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Pattern</th><th>Why</th></tr></thead><tbody>
+<tr><td>Decoder LLMs: Mistral 7B</td><td>Sliding window \(W = 4096\) in every layer, rolling buffer cache [Certain]</td><td>8 times less KV memory at 32K; 2 times faster attention at 16K than a vanilla baseline (paper) [Certain]</td></tr>
+<tr><td>Decoder LLMs: Gemma 2</td><td>Window layers (4,096) alternating with full layers [Certain]</td><td>Keeps full-range recall in half the layers while the other half stay cheap</td></tr>
+<tr><td>Streaming chat and assistants</td><td>StreamingLLM: 4 sinks + recent window, positions inside the cache</td><td>Endless generation with constant memory, no retraining</td></tr>
+<tr><td>Long-document encoders: classification, QA, summarization</td><td>Longformer / LED (window + global on [CLS] or question), BigBird (window + global + random) [Certain]</td><td>4,096-token inputs at a cost close to a 512-token model; summarization of papers and reports</td></tr>
+<tr><td>Genomics</td><td>BigBird on long DNA sequences [Certain]</td><td>The paper reports gains on promoter-region prediction with longer context</td></tr>
+<tr><td>Video classification and action recognition</td><td>Factorized space-time attention: a token attends along time, then within its frame (TimeSformer "divided" attention) [Certain]</td><td>The same idea as the Sparse Transformer: two cheap sparse steps replace one dense step over all frames × patches</td></tr>
+<tr><td>Long-video key-moment detection, Video-RAG indexing</td><td>Local window over frame tokens + a few global query tokens (Longformer shape) [Likely]</td><td>Hours of frames are too many for full attention; local motion needs neighbors, the query needs everything</td></tr>
+<tr><td>Streaming video understanding</td><td>Sink tokens + a rolling window of recent frame tokens [Likely]</td><td>A live camera stream never ends; the cache must stay bounded</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Masking instead of skipping.</b> A dense \(n \times n\) mask with \(-\infty\) is correct but not faster and not smaller. Sparse attention needs a kernel that skips whole blocks.</li>
+<li><b>Thinking the window limits what the model can use.</b> Stacked layers spread information over \(\ell \times W\) tokens (116.7). The reverse mistake is also common: the receptive field is only an upper bound; signals fade over many hops.</li>
+<li><b>Evicting the first tokens.</b> A plain sliding window cache on a model trained with full attention breaks once the first tokens leave (perplexity in the thousands). Keep sinks.</li>
+<li><b>Using original positions after eviction.</b> In StreamingLLM, RoPE positions must be the positions inside the cache, so keys must be cached before rotation. Using text positions gives distances the model never saw.</li>
+<li><b>Expecting StreamingLLM to remember evicted text.</b> It gives stable generation, not long-term memory.</li>
+<li><b>Dilation in every head.</b> A pure dilated pattern never connects some positions (even versus odd). Mix dilated and normal heads, as Longformer does.</li>
+<li><b>Global tokens in a causal model at the wrong place.</b> A "global" token at position 0 can only read itself in a decoder. It works as a sink, not as a summary hub.</li>
+<li><b>Changing the pattern after training without checking.</b> A model trained with full attention can lose quality when you switch it to a window at inference, beyond what perplexity on short text shows. Test long-context tasks.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is the difference between static and dynamic sparse attention?<span class="lvl">basic</span></summary><div class="ans">Static sparse attention fixes the set of computed query-key pairs before seeing the input: windows, strides, global and random positions (Sparse Transformer, Longformer, BigBird, StreamingLLM, sliding-window LLMs). Dynamic sparse attention chooses pairs or tokens from the input at run time, for example by hashing, clustering or attention scores (Reformer, Routing Transformer, H2O). Static patterns are simple and kernel-friendly; dynamic ones adapt to content but cost extra to decide and can make mistakes.</div></details>
+<details class="qa"><summary>Sliding-window attention with \(W = 4096\): can a token use information from 20,000 tokens back?<span class="lvl">core</span></summary><div class="ans">Yes, indirectly. Each layer moves information up to \(W\) positions, so after \(\ell\) layers the receptive field is up to \(\ell \times W\); for Mistral 7B, \(32 \times 4096 \approx 131\)K tokens. But the information must pass through intermediate tokens in each layer, and it gets compressed and diluted, so recall of an exact detail 20,000 tokens back is much weaker than with full attention. That is why models such as Gemma 2 keep some full-attention layers.</div></details>
+<details class="qa"><summary>Why does the Sparse Transformer choose a stride near \(\sqrt n\)?<span class="lvl">core</span></summary><div class="ans">Each query sees about \(l\) window keys and \(i/l\) stride keys, so the total cost is about \(n(l + n/(2l))\). The first term grows with \(l\), the second shrinks; the minimum is at \(l = \sqrt{n/2}\), with cost about \(n\sqrt{2n} = O(n\sqrt n)\). Any \(l\) of order \(\sqrt n\) gives the same order. With this choice, every earlier position is still reachable in 2 hops (window then stride).</div></details>
+<details class="qa"><summary>Why did BigBird need global tokens, when window + random already connects the graph?<span class="lvl">advanced</span></summary><div class="ans">Experimentally, window + random reached 62.7 masked-LM accuracy at length 512 versus 64.2 for BERT, so something was missing. Theoretically, the proof that sparse attention is a universal approximator uses a star graph: a few global tokens that see and are seen by all. They let any pair communicate in 2 hops and serve as a memory where the whole sequence can be summarized. With global tokens added, BigBird is a universal approximator and (with a decoder) Turing complete, under the same assumptions as full attention.</div></details>
+<details class="qa"><summary>What are attention sinks, and why do they appear?<span class="lvl">core</span></summary><div class="ans">Attention sinks are the first few tokens, which receive a large share of attention in most heads regardless of their content. Softmax forces weights to sum to 1; when a head has nothing relevant to attend to, it puts the extra weight on tokens that are visible to every query during training: the initial ones. Their values contribute little, so this is a learned "no-op". Replacing the first 4 tokens with line breaks keeps perplexity close (5.60 versus 5.40 for Llama-2-13B), which shows it is about position, not meaning.</div></details>
+<details class="qa"><summary>Why does a plain sliding-window KV cache fail on Llama 2, and how does StreamingLLM fix it?<span class="lvl">core</span></summary><div class="ans">When the first tokens are evicted, the sink weight (often most of the row) is spread over the remaining tokens: every weight is divided by \(1 - \alpha_{\text{sink}}\), so head outputs change scale and later layers see unseen inputs. Perplexity explodes (Llama-2-7B, 4,096 cache: 3,359.95 with no sink). StreamingLLM keeps 4 sink tokens forever plus a rolling window, and assigns positions inside the cache. Perplexity returns to 9.59 with 4 sinks, and memory stays constant.</div></details>
+<details class="qa"><summary>How do you implement RoPE correctly with a StreamingLLM cache?<span class="lvl">advanced</span></summary><div class="ans">Store keys before applying RoPE. At each decoding step, assign positions \(0, \dots, |C| - 1\) to the cached keys in cache order, rotate them for those positions, and rotate the query with position \(|C| - 1\). This keeps every relative distance within what the model saw in training. Storing rotated keys with original positions would create large jumps between the sinks and the window. The cost is re-rotating the cache each step, which is cheap compared with attention itself. With ALiBi, you simply use a contiguous bias over cache slots.</div></details>
+<details class="qa"><summary>Compute the KV cache of Mistral 7B at 32K tokens, with and without its window.<span class="lvl">core</span></summary><div class="ans">Per token: \(2 \times 32\) layers \(\times 8\) KV heads \(\times 128\) dims \(\times 2\) bytes = 131,072 bytes = 128 KiB. Full attention at 32,768 tokens: 4 GiB per sequence. Window 4,096 with a rolling buffer (slot \(= i \bmod 4096\)): 512 MiB, 8 times smaller. The saving is per sequence, so at batch 16 it is 64 GiB versus 8 GiB.</div></details>
+<details class="qa"><summary>Which static patterns reduce the KV cache during decoding, and which do not?<span class="lvl">advanced</span></summary><div class="ans">Only patterns with a bounded look-back: a sliding window (cache \(W\)), window + fixed sinks (cache \(s + R\)), and hybrids where some layers are windowed (only those layers are capped). A causal stride needs every \(l\)-th past token, so its cache still grows as about \(n/l\). Random links to arbitrary past tokens, and global tokens inside the generated text, need the full history, so they reduce compute but not cache memory.</div></details>
+<details class="qa"><summary>Longformer uses separate projections for global attention. Why?<span class="lvl">basic</span></summary><div class="ans">Global attention does a different job from local attention: a [CLS] or question token must gather information from the whole document, while window attention models local context. Separate \(Q_g, K_g, V_g\) let the two kinds of attention learn different similarity functions. They are initialized as copies of the local projections, and the paper reports they are critical for the best downstream results.</div></details>
+<details class="qa"><summary>Your masked sparse attention is no faster than full attention. Why, and what do you do?<span class="lvl">core</span></summary><div class="ans">Applying a boolean mask to a dense score matrix still computes and stores all \(n^2\) scores; only the softmax ignores some. To gain speed, the kernel must skip work: use block-sparse patterns (BigBird-style blocks of 64), banded kernels (Longformer), or FlashAttention's sliding-window support, which skips whole tiles outside the window. Also check that the sparsity is coarse enough: random single keys are hard to make fast on GPUs.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>For a bidirectional window of radius 2 on 48 tokens (no other blocks), what is the largest number of layers needed for information to go from token 0 to token 47?</li>
+<li>Show that \(f(l) = l + n/(2l)\) is smallest at \(l = \sqrt{n/2}\), and give the value of \(f\) there for \(n = 65{,}536\).</li>
+<li>A Longformer has 12 layers, window \(w = 512\) and dilation 2 in every layer. What is the receptive field by formula (116.7)?</li>
+<li>BigBird-ITC with \(b = 64\), \(g = 2b\), \(w = 3b\), \(r = 3b\) on \(n = 4096\). How many scores does one non-global query block compute, and what fraction of full attention is that?</li>
+<li>In Figure 3, a sink with score \(z_s = 4\) and \(m = 20\) other tokens with score 0. What weight does the sink get, and by what factor do the others grow if it is evicted?</li>
+<li>Llama-2-7B (32 layers, 32 KV heads, head size 128, BF16) with StreamingLLM, 4 sinks and a 1,020-token window. How much KV memory per sequence? How much would full attention need at 4 million tokens?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Information moves 2 positions per layer, so \(\lceil 47/2 \rceil = 24\) layers. 2. \(f'(l) = 1 - n/(2l^2) = 0\) gives \(l^2 = n/2\). For \(n = 65{,}536\): \(l = \sqrt{32768} \approx 181\), \(f = 2\sqrt{n/2} = \sqrt{2n} \approx 362\) keys per query on average, so about \(65536 \times 362 \approx 23.7\) million scores, versus 2.15 billion for full causal attention. 3. \(12 \times 2 \times 512 = 12{,}288\) tokens. 4. A query block of 64 sees \((2 + 3 + 3) \times 64 = 512\) keys: \(64 \times 512 = 32{,}768\) scores, which is \(512/4096 = 1/8\) of a full row block. 5. \(\alpha = e^4/(e^4 + 20) = 54.6/74.6 = 0.732\); the others grow by \(1/(1 - 0.732) = 3.7\). 6. Per token \(2 \times 32 \times 32 \times 128 \times 2 = 524{,}288\) bytes = 512 KiB. 1,024 tokens: 512 MiB, constant. Full attention at 4 million tokens: \(4 \times 10^6 \times 512\) KiB \(\approx 1.9\) TiB.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Any sparse attention is a set of allowed keys \(S_i\) per query (116.1); its cost is \(\sum_i |S_i|\) (116.2), and its reach is the number of hops between distant tokens.</li>
+<li>Four blocks (116.3): local windows, dilated windows, global tokens and random links. Windows give locality, global tokens give 2-hop paths, random links shorten all paths.</li>
+<li>Sparse Transformer: window + stride (116.4) or fixed blocks with summary cells (116.5); a stride near \(\sqrt n\) gives \(O(n\sqrt n)\) (116.6).</li>
+<li>Longformer: sliding and dilated windows with receptive field \(\ell \times d_{\text{il}} \times w\) (116.7), plus symmetric global attention on task tokens with separate projections.</li>
+<li>BigBird: window + global + random (116.8), in blocks of 64; proven as expressive as full attention, but some tasks need many more layers.</li>
+<li>StreamingLLM: models dump extra attention on the first tokens (116.9); keep 4 sinks + a rolling window (116.10) with positions inside the cache, and generation stays stable for millions of tokens.</li>
+<li>Bounded look-back patterns cap the KV cache (116.11, 116.12): Mistral 7B at 32K uses 512 MiB instead of 4 GiB.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \alpha_{ij} = \frac{e^{\mathbf{q}_i^\top \mathbf{k}_j/\sqrt d}}{\sum_{j' \in S_i} e^{\mathbf{q}_i^\top \mathbf{k}_{j'}/\sqrt d}}, \quad \text{cost} = \sum_i |S_i|, \quad l^\star = \sqrt{n/2} \]</div>
+<div class="eq">\[ \text{RF} \approx \ell\, d_{\text{il}}\, w, \quad C_t = \{0..s{-}1\} \cup \{t{-}R{+}1..t\}, \quad M_{\text{KV}} = 2 L H_{kv} d_h b_{\text{el}} \min(n, W) \]</div>
+<h2 class="plain" id="sparse-attention-1-static-sparse-transformer-longformer-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Child et al. (2019). <a href="https://arxiv.org/abs/1904.10509" target="_blank" rel="noopener">Generating Long Sequences with Sparse Transformers</a></li><li>Beltagy et al. (2020). <a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noopener">Longformer: The Long-Document Transformer</a></li><li>Zaheer et al. (2020). <a href="https://arxiv.org/abs/2007.14062" target="_blank" rel="noopener">Big Bird: Transformers for Longer Sequences</a></li><li>Xiao et al. (2023). <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">Efficient Streaming Language Models with Attention Sinks</a></li><li>Child et al. (2019). <a href="https://arxiv.org/abs/1904.10509" target="_blank" rel="noopener">Generating Long Sequences with Sparse Transformers</a></li><li>Beltagy et al. (2020). <a href="https://arxiv.org/abs/2004.05150" target="_blank" rel="noopener">Longformer: The Long-Document Transformer</a></li><li>Zaheer et al. (2020). <a href="https://arxiv.org/abs/2007.14062" target="_blank" rel="noopener">Big Bird: Transformers for Longer Sequences</a></li><li>Xiao et al. (2023). <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">Efficient Streaming Language Models with Attention Sinks</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Jiang et al. (2023). <a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a></li><li>Gemma Team (2024). <a href="https://arxiv.org/abs/2408.00118" target="_blank" rel="noopener">Gemma 2: Improving Open Language Models at a Practical Size</a></li><li>Zhang et al. (2023). <a href="https://arxiv.org/abs/2306.14048" target="_blank" rel="noopener">H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models</a></li><li>Su et al. (2021). <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">RoFormer: Enhanced Transformer with Rotary Position Embedding</a></li><li>Bertasius et al. (2021). <a href="https://arxiv.org/abs/2102.05095" target="_blank" rel="noopener">Is Space-Time Attention All You Need for Video Understanding?</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html"><small>Previous · session 115</small>Structured pruning: LLM-Pruner, Sheared LLaMA, SliceGPT, Minitron</a><a class="next" href="../inference/sparse-attention-2-dynamic-reformer-routing-transformer.html"><small>Next · session 117</small>Sparse attention 2 (dynamic): Reformer, Routing Transformer, SpAtten, H2O</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="sparse-attention-1-static-sparse-transformer-longformer"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmtI=v=>Math.round(v).toLocaleString("en-US");
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function bytes(b){const u=[["TiB",2**40],["GiB",2**30],["MiB",2**20],["KiB",2**10]];for(const [n,v] of u){if(b>=v)return (b/v).toFixed(b/v>=100?0:2)+" "+n;}return b+" B";}
+
+/* ---------- Figure 1: pattern builder ---------- */
+(function(){
+ const svg=$("#sa-pat-svg");if(!svg)return;const N=48,C=8,OX=52,OY=30;
+ const I={r:$("#sa-pat-r"),d:$("#sa-pat-d"),s:$("#sa-pat-s"),g:$("#sa-pat-g"),x:$("#sa-pat-x")},cz=$("#sa-pat-c"),info=$("#sa-pat-info"),seg=$("#sa-pat-pre");
+ const P={win:[3,1,0,0,0,false],strided:[6,1,7,0,0,true],lf:[3,1,0,2,0,false],bb:[3,1,0,2,3,false],stream:[4,1,0,4,0,true]};
+ let sel=24;
+ function build(r,d,st,g,x,causal){const T=[];const rnd=rng(116);
+  for(let i=0;i<N;i++){const row=new Array(N).fill("");
+   for(let j=0;j<N;j++){const dist=i-j;const win=Math.abs(dist)<=r*d&&((dist%d)+d)%d===0;const gl=i<g||j<g;
+    if(causal&&j>i)continue;if(gl)row[j]="g";else if(win)row[j]="w";}
+   const hi=causal?i:N-1;for(let k=0;k<x;k++){const j=Math.floor(rnd()*(hi+1));if(!row[j])row[j]="r";}
+   if(st>0)for(let j=0;j<N;j++){if((causal&&j>i))continue;if((((i-j)%st)+st)%st===0&&!row[j])row[j]="s";}
+   T.push(row);}
+  return T;}
+ function hops(T,causal){let worst=0;for(let src=0;src<N;src++){const dist=new Array(N).fill(-1);dist[src]=0;const q=[src];let h=0;
+   while(h<q.length){const u=q[h++];for(let v=0;v<N;v++){if(T[v][u]&&dist[v]<0){dist[v]=dist[u]+1;q.push(v);}}}
+   for(let t=0;t<N;t++){if(t===src||(causal&&t<src))continue;if(dist[t]<0)return null;if(dist[t]>worst)worst=dist[t];}}
+  return worst;}
+ const col={w:"var(--q)",s:"var(--ink2)",g:"var(--k)",r:"var(--v)"};
+ function draw(){const r=+I.r.value,d=+I.d.value,st=+I.s.value,g=+I.g.value,x=+I.x.value,causal=cz.checked;
+  $("#sa-pat-rv").value=r;$("#sa-pat-dv").value=d;$("#sa-pat-sv").value=st?st:"off";$("#sa-pat-gv").value=g;$("#sa-pat-xv").value=x;
+  const T=build(r,d,st,g,x,causal);let cnt=0;T.forEach(row=>row.forEach(c=>{if(c)cnt++;}));const H=hops(T,causal);
+  let o=`<rect x="${OX}" y="${OY}" width="${N*C}" height="${N*C}" fill="none" stroke="var(--rule)"/>`;
+  for(let i=0;i<N;i++)for(let j=0;j<N;j++){const c=T[i][j];if(c)o+=`<rect class="c" data-i="${i}" x="${OX+j*C+0.5}" y="${OY+i*C+0.5}" width="${C-1}" height="${C-1}" fill="${col[c]}" opacity="${i===sel?1:0.78}"/>`;else o+=`<rect class="c" data-i="${i}" x="${OX+j*C}" y="${OY+i*C}" width="${C}" height="${C}" fill="transparent"/>`;}
+  o+=`<rect x="${OX-2}" y="${OY+sel*C-1}" width="${N*C+4}" height="${C+2}" fill="none" stroke="var(--ink)" stroke-width="1.6" pointer-events="none"/>`;
+  [0,12,24,36,47].forEach(t=>{o+=`<text x="${OX+t*C+C/2}" y="${OY-8}" text-anchor="middle" class="svgs" font-size="11">${t}</text><text x="${OX-6}" y="${OY+t*C+C-1}" text-anchor="end" class="svgs" font-size="11">${t}</text>`;});
+  o+=`<text x="${OX+N*C/2}" y="${OY+N*C+20}" text-anchor="middle" class="svgs" font-size="12.5">key position j</text><text x="16" y="${OY+N*C/2}" text-anchor="middle" class="svgs" font-size="12.5" transform="rotate(-90 16 ${OY+N*C/2})">query position i</text>`;
+  svg.innerHTML=o;
+  const ks=[];T[sel].forEach((c,j)=>{if(c)ks.push(j);});
+  const hs=H===null?`<b>never</b> (some pairs are not connected at any depth)`:`<b>${H}</b> layer${H===1?"":"s"}`;
+  info.innerHTML=`Pairs computed: <b>${fmtI(cnt)}</b> of ${fmtI(N*N)} (<b>${(100*cnt/N/N).toFixed(1)}%</b>), on average <b>${(cnt/N).toFixed(1)}</b> keys per query. Longest path between two tokens${causal?" (earlier to later)":""}: ${hs}.<br>Query ${sel} sees ${ks.length} keys: ${ks.slice(0,24).join(", ")}${ks.length>24?", …":""}.`;
+  info.dataset.pairs=cnt;info.dataset.hops=H===null?"never":H;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;const p=P[b.dataset.v];
+  [I.r.value,I.d.value,I.s.value,I.g.value,I.x.value]=p.slice(0,5).map(String);cz.checked=p[5];
+  seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ Object.values(I).forEach(e=>e.addEventListener("input",()=>{seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed","false"));draw();}));
+ cz.addEventListener("change",draw);
+ svg.addEventListener("click",e=>{const t=e.target.closest("rect.c");if(!t)return;sel=+t.dataset.i;draw();});
+ draw();
+})();
+
+/* ---------- Figure 2: cost of the strided pattern vs stride ---------- */
+(function(){
+ const svg=$("#sa-cost-svg");if(!svg)return;const NI=$("#sa-cost-n"),LI=$("#sa-cost-l"),info=$("#sa-cost-info");
+ function cost(n,l){const S1=n<=l?n*(n-1)/2:l*(l-1)/2+l*(n-l);const q=Math.floor(n/l),rem=n-q*l;const S2=l*q*(q-1)/2+q*rem;return S1+S2+n-Math.max(0,n-l);}
+ const X0=70,X1=620,Y0=225,Y1=20;
+ function draw(){const n=2**(+NI.value);let l=Math.min(n,Math.max(1,Math.round(2**(+LI.value))));
+  $("#sa-cost-nv").value=fmtI(n);$("#sa-cost-lv").value=fmtI(l);
+  const full=n*(n+1)/2;let best=1,bc=Infinity;for(let k=1;k<=n;k++){const c=cost(n,k);if(c<bc){bc=c;best=k;}}
+  const lx=Math.log2(n),ymin=Math.log10(n),ymax=Math.log10(full)+0.2;
+  const X=v=>X0+(Math.log2(v)/lx)*(X1-X0),Y=c=>Y0-(Math.log10(c)-ymin)/(ymax-ymin)*(Y0-Y1);
+  let d="";for(let e=0;e<=lx+1e-9;e+=lx/200){const v=Math.max(1,Math.round(2**e));d+=(d?"L":"M")+X(v).toFixed(1)+" "+Y(cost(n,v)).toFixed(1);}
+  let o=`<path d="M${X0} ${Y1} V${Y0} H${X1}" fill="none" stroke="var(--muted)"/>`;
+  for(let e=0;e<=lx;e+=(lx>14?4:2))o+=`<text x="${X(2**e)}" y="${Y0+16}" text-anchor="middle" class="svgs" font-size="11.5">${fmtI(2**e)}</text>`;
+  for(let p=Math.ceil(ymin);p<=Math.floor(ymax);p++)o+=`<line x1="${X0}" y1="${Y(10**p)}" x2="${X1}" y2="${Y(10**p)}" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="${X0-6}" y="${Y(10**p)+4}" text-anchor="end" class="svgs" font-size="11.5">10^${p}</text>`;
+  o+=`<line x1="${X0}" y1="${Y(full)}" x2="${X1}" y2="${Y(full)}" stroke="var(--muted)" stroke-width="2.5"/><text x="${X1}" y="${Y(full)-6}" text-anchor="end" class="svgs" font-size="12">full causal: ${fmtI(full)}</text>`;
+  o+=`<path d="${d}" fill="none" stroke="var(--q)" stroke-width="3"/>`;
+  o+=`<line x1="${X(best)}" y1="${Y(bc)}" x2="${X(best)}" y2="${Y0}" stroke="var(--q)" stroke-dasharray="4 4"/><text x="${X(best)-6}" y="${Y0-8}" text-anchor="end" class="svgs" font-size="12">best l = ${fmtI(best)}</text>`;
+  const c=cost(n,l);o+=`<circle cx="${X(l)}" cy="${Y(c)}" r="6.5" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;
+  o+=`<text x="${(X0+X1)/2}" y="${Y0+36}" text-anchor="middle" class="svgs" font-size="12.5">stride l (log scale)</text>`;svg.innerHTML=o;
+  info.innerHTML=`n = <b>${fmtI(n)}</b>, stride l = <b>${fmtI(l)}</b>: the strided pattern computes <b>${fmtI(c)}</b> scores, full causal attention <b>${fmtI(full)}</b>, so <b>${(full/c).toFixed(1)}×</b> fewer. Best stride: <b>${fmtI(best)}</b> (√(n/2) = ${Math.sqrt(n/2).toFixed(1)}), with ${fmtI(bc)} scores, <b>${(full/bc).toFixed(1)}×</b> fewer; formula (116.6) estimates n√(2n) = ${fmtI(n*Math.sqrt(2*n))}.`;
+  info.dataset.cost=c;info.dataset.best=best;}
+ [NI,LI].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: attention sink ---------- */
+(function(){
+ const svg=$("#sa-sink-svg");if(!svg)return;const Z=$("#sa-sink-z"),M=$("#sa-sink-m"),EV=$("#sa-sink-ev"),info=$("#sa-sink-info");
+ function draw(){const z=+Z.value,m=+M.value,ev=EV.checked;$("#sa-sink-zv").value=z.toFixed(1);$("#sa-sink-mv").value=m;
+  const keep=B.softmax([z].concat(new Array(m).fill(0)));const ps=keep[0],po=keep[1];const w=ev?[0].concat(new Array(m).fill(1/m)):keep;
+  const X0=50,X1=625,Y0=190,H=160,bw=(X1-X0)/(m+1);let o=`<path d="M${X0} 20 V${Y0} H${X1}" fill="none" stroke="var(--muted)"/>`;
+  [0,0.5,1].forEach(v=>o+=`<text x="${X0-6}" y="${Y0-v*H+4}" text-anchor="end" class="svgs" font-size="11.5">${v}</text><line x1="${X0}" y1="${Y0-v*H}" x2="${X1}" y2="${Y0-v*H}" stroke="var(--rule)" stroke-dasharray="3 4"/>`);
+  w.forEach((v,k)=>{const x=X0+k*bw+bw*0.15,h=v*H;o+=`<rect x="${x.toFixed(1)}" y="${(Y0-h).toFixed(1)}" width="${(bw*0.7).toFixed(1)}" height="${Math.max(h,0).toFixed(1)}" fill="${k===0?"var(--k)":"var(--q)"}"/>`;});
+  o+=(ev?"":`<text x="${X0+bw/2}" y="${Y0-w[0]*H-6}" text-anchor="middle" font-size="12" fill="var(--ink)">${w[0].toFixed(3)}</text>`)+`<text x="${X0+bw+6}" y="${Y0-w[1]*H-8}" font-size="12" fill="var(--ink)">${w[1].toFixed(4)} each</text>`;
+  if(ev)o+=`<text x="${X0+bw/2}" y="${Y0-8}" text-anchor="middle" font-size="16" fill="var(--bad)">✕</text>`;
+  o+=`<text x="${X0+bw/2}" y="${Y0+16}" text-anchor="middle" class="svgs" font-size="11.5">sink</text><text x="${(X0+bw+X1)/2}" y="${Y0+16}" text-anchor="middle" class="svgs" font-size="11.5">${m} other cached tokens (score 0)</text>`;
+  svg.innerHTML=o;const fac=1/(1-ps);
+  info.innerHTML=ev?`Sink evicted: each of the ${m} tokens now gets <b>${(1/m).toFixed(4)}</b> instead of ${po.toFixed(4)}, <b>${fac.toFixed(1)}×</b> more. The head output, which was ${(1-ps).toFixed(3)} × (average value), becomes 1 × (average value): its size grows <b>${fac.toFixed(1)}×</b>.`
+   :`The sink gets <b>${(100*ps).toFixed(1)}%</b> of the weight (formula 116.9); each other token gets <b>${po.toFixed(4)}</b>. The head output is only ${(1-ps).toFixed(3)} × (average of the other values). Evicting the sink would multiply every other weight by <b>${fac.toFixed(1)}</b>.`;
+  info.dataset.psink=ps;info.dataset.factor=fac;}
+ [Z,M].forEach(e=>e.addEventListener("input",draw));EV.addEventListener("change",draw);draw();
+})();
+
+/* ---------- Figure 4: StreamingLLM cache stepper ---------- */
+(function(){
+ const svg=$("#sa-stream-svg");if(!svg)return;const S=$("#sa-stream-s"),RR=$("#sa-stream-r"),info=$("#sa-stream-info");const T=20;
+ function cache(t,s,r){const all=[];for(let k=0;k<=t;k++)all.push(k);if(all.length<=s+r)return all;return all.slice(0,s).concat(all.slice(t-r+1));}
+ function draw(t){const s=+S.value,r=+RR.value;$("#sa-stream-sv").value=s;$("#sa-stream-rv").value=r;const C=cache(t,s,r);const set=new Set(C);
+  const bw=32,gap=4,X0=6;let o=`<text x="${X0}" y="16" class="svgs" font-size="12.5">stream (original positions)</text>`;
+  for(let k=0;k<T;k++){const x=X0+k*(bw+gap);let f="none",st="var(--rule)",tc="var(--muted)";
+   if(k<=t){if(set.has(k)){f=(k<s)?"var(--k)":"var(--q)";st=f;tc="var(--card)";}else{f="var(--rule)";tc="var(--muted)";}}
+   o+=`<rect x="${x}" y="24" width="${bw}" height="30" rx="6" fill="${f}" stroke="${st}" stroke-width="1.4"${k>t?' stroke-dasharray="3 3"':""}/><text x="${x+bw/2}" y="44" text-anchor="middle" font-size="12.5" font-weight="700" fill="${k>t?"var(--muted)":tc}">${k}</text>`;
+   if(k===t)o+=`<text x="${x+bw/2}" y="70" text-anchor="middle" font-size="11.5" fill="var(--ink)">new</text>`;}
+  o+=`<text x="${X0}" y="104" class="svgs" font-size="12.5">KV cache: cached token / position used for RoPE</text>`;
+  C.forEach((k,p)=>{const x=X0+p*(bw+gap+12);const f=k<s?"var(--k)":"var(--q)";o+=`<rect x="${x}" y="112" width="${bw+12}" height="44" rx="6" fill="${f}"/><text x="${x+(bw+12)/2}" y="131" text-anchor="middle" font-size="12.5" font-weight="700" fill="var(--card)">${k}</text><text x="${x+(bw+12)/2}" y="149" text-anchor="middle" font-size="11.5" fill="var(--card)">p=${p}</text>`;});
+  for(let p=C.length;p<s+r;p++){const x=X0+p*(bw+gap+12);o+=`<rect x="${x}" y="112" width="${bw+12}" height="44" rx="6" fill="none" stroke="var(--rule)" stroke-dasharray="3 3"/>`;}
+  o+=`<text x="${X0}" y="186" class="svgs" font-size="12">capacity s + R = ${s+r} slots</text>`;svg.innerHTML=o;
+  const ev=t+1-C.length;const firstGone=s===0&&ev>0;
+  info.innerHTML=`Token <b>${t}</b> arrives. Cache size <b>${C.length}</b> (capacity ${s+r}); ${ev} token${ev===1?"":"s"} evicted so far. Cached tokens: ${C.join(", ")}. Positions used: 0 to ${C.length-1}${C.length<t+1?` (not the original ${C[C.length-1]})`:""}.${firstGone?` <b style="color:var(--bad)">The first token is gone: with no sink, this is where a real model's perplexity explodes.</b>`:""}`;
+  info.dataset.size=C.length;info.dataset.kept=C.join(",");}
+ const st=B.stepper({n:T,prev:$("#sa-stream-prev"),next:$("#sa-stream-next"),play:$("#sa-stream-play"),label:$("#sa-stream-lab"),ms:1100,onStep:draw});
+ [S,RR].forEach(e=>e.addEventListener("input",()=>draw(st.i)));
+ R.sastream=st;
+})();
+
+/* ---------- Figure 5: KV cache memory ---------- */
+(function(){
+ const svg=$("#sa-kv-svg");if(!svg)return;const NI=$("#sa-kv-n"),WI=$("#sa-kv-w"),SI=$("#sa-kv-s"),seg=$("#sa-kv-m"),info=$("#sa-kv-info");
+ const MOD={llama:["Llama-2-7B",32,32,128],mistral:["Mistral 7B",32,8,128],gemma:["Gemma 2 9B",42,8,256]};const WS=[512,1024,2048,4096,8192];let mk="mistral";
+ const X0=70,X1=620,Y0=215,Y1=18,NMIN=1024,NMAX=1024*2**12;
+ function draw(){const [name,L,H,dh]=MOD[mk];const n=1024*2**(+NI.value),W=WS[+WI.value],s=+SI.value;
+  $("#sa-kv-nv").value=fmtI(n);$("#sa-kv-wv").value=fmtI(W);$("#sa-kv-sv").value=s;
+  const per=2*H*dh*2,full=m=>L*per*m,win=m=>L*per*Math.min(m,W+s),Lg=Math.floor(L/2),hyb=m=>Lg*per*m+(L-Lg)*per*Math.min(m,W+s);
+  const ymin=Math.log2(win(NMIN))-0.5,ymax=Math.log2(full(NMAX))+0.3;
+  const X=m=>X0+Math.log2(m/NMIN)/12*(X1-X0),Y=b=>Y0-(Math.log2(b)-ymin)/(ymax-ymin)*(Y0-Y1);
+  const path=f=>{let d="";for(let e=0;e<=12.0001;e+=0.05){const m=NMIN*2**e;d+=(d?"L":"M")+X(m).toFixed(1)+" "+Y(f(m)).toFixed(1);}return d;};
+  let o=`<path d="M${X0} ${Y1} V${Y0} H${X1}" fill="none" stroke="var(--muted)"/>`;
+  [1024,16384,262144,4194304].forEach(m=>o+=`<text x="${X(m)}" y="${Y0+16}" text-anchor="middle" class="svgs" font-size="11.5">${m>=1048576?(m/1048576)+"M":(m/1024)+"K"}</text>`);
+  for(let p=Math.ceil(ymin);p<=ymax;p++){if(p%3)continue;o+=`<line x1="${X0}" y1="${Y(2**p)}" x2="${X1}" y2="${Y(2**p)}" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="${X0-6}" y="${Y(2**p)+4}" text-anchor="end" class="svgs" font-size="11">${bytes(2**p).replace(".00","")}</text>`;}
+  o+=`<path d="${path(full)}" fill="none" stroke="var(--muted)" stroke-width="2.6"/><path d="${path(hyb)}" fill="none" stroke="var(--k)" stroke-width="2.6"/><path d="${path(win)}" fill="none" stroke="var(--q)" stroke-width="3"/>`;
+  o+=`<line x1="${X(n)}" y1="${Y1}" x2="${X(n)}" y2="${Y0}" stroke="var(--muted)" stroke-dasharray="4 4"/>`;
+  [[full,"var(--muted)"],[hyb,"var(--k)"],[win,"var(--q)"]].forEach(([f,c])=>o+=`<circle cx="${X(n)}" cy="${Y(f(n))}" r="5.5" fill="${c}" stroke="var(--card)" stroke-width="1.5"/>`);
+  o+=`<text x="${(X0+X1)/2}" y="${Y0+34}" text-anchor="middle" class="svgs" font-size="12.5">context length n (log scale)</text>`;svg.innerHTML=o;
+  info.innerHTML=`<b>${name}</b>: ${L} layers × ${H} KV heads × ${dh} dims, so ${fmtI(per*L)} bytes (${bytes(per*L)}) per token. At n = <b>${fmtI(n)}</b>: full attention <b>${bytes(full(n))}</b>, window ${fmtI(W)}${s?` + ${s} sinks`:""} in all layers <b>${bytes(win(n))}</b> (${(full(n)/win(n)).toFixed(1)}× smaller), window in ${L-Lg} of ${L} layers <b>${bytes(hyb(n))}</b> (${(full(n)/hyb(n)).toFixed(2)}× smaller).`;
+  info.dataset.full=full(n);info.dataset.win=win(n);info.dataset.hyb=hyb(n);}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;mk=b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ [NI,WI,SI].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

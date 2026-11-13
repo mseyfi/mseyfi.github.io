@@ -1,0 +1,570 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>KV-cache quantization: KIVI and KVQuant · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 110</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="kv-cache-quantization-kivi-and-kvquant">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="kv-cache-quantization-kivi-and-kvquant" data-session="kv-cache-quantization-kivi-and-kvquant" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">110</span><span>Track 5: LLM inference and serving · session 33 of 65</span></div><h1 class="chap-title">KV-cache quantization: KIVI and KVQuant</h1><p class="chap-sub">At long context or big batch, the KV cache can take more GPU memory than the model weights. This session shows how to store keys and values in 2 to 4 bits without breaking the model: keys per channel and values per token (KIVI), and non-uniform levels, pre-RoPE keys and a few kept outliers (KVQuant). It ends with the test that matters: long-context accuracy, not only perplexity.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 2 hours, exercises 1 hour)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 80 (the KV cache), 103 (quantization math) and 14 (RoPE)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>When the KV cache is bigger than the weights, and how many bytes a low-bit cache saves</li><li>Why keys have outlier channels, and why keys must be quantized per channel but values per token</li><li>How KIVI streams a 2-bit cache with a small full-precision window of recent tokens, and what that window costs in bits</li><li>Why KVQuant quantizes keys before RoPE, and how it adds non-uniform levels, sparse outliers and a full-precision first token</li><li>How per-channel and per-token scales fold into the attention matrix products</li><li>How to evaluate a quantized cache: perplexity hides failures that passkey, LongBench and RULER show</li></ul></div></header><style>
+.kq-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px;justify-content:center}
+.kq-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.kq-lab{font:500 14px var(--sans);color:var(--muted)}
+.kq-step{font:500 15px/1.6 var(--sans);background:var(--paper2);border-radius:10px;padding:10px 14px;margin-top:10px}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A model of 8 billion parameters in bfloat16 takes 16 GB. Its KV cache for one user with 128k tokens of context also takes about 16 GB. For 32 users with 4k tokens each it takes 17 GB. At long context or big batch, the cache, not the model, fills the GPU. Storing keys and values in 2 to 4 bits instead of 16 is the most direct way to fit more context and more users.</p>
+<p><a href="../inference/the-kv-cache.html">Session 80</a> gave the size of the cache: \(s = 2 L\, n_{kv}\, d_h\, b\) bytes per token. Only the last factor, the bytes per number, is left after the attention design is fixed. The quantization sessions so far (<a href="../inference/quantization-math-scale-zero-point-granularity-and.html">session 103</a>, <a href="../inference/weight-ptq-2-awq-outliers-and-mixed.html">session 107</a>, <a href="../inference/weight-activation-quantization-llm-int8-smoothquant-zeroquant.html">session 108</a>, <a href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html">session 109</a>) made weights and activations small. The KV cache is a third kind of tensor. It is an activation (it depends on the input), but it is <b>stored</b> for a long time and <b>read</b> at every decode step, like a weight. So it has its own problems and its own methods.</p>
+<p>The efficient-inference survey lists four methods in this area: FlexGen and Atom store the cache in INT4, KVQuant uses non-uniform levels found offline on calibration data, and KIVI uses a tuning-free 2-bit scheme with keys per channel and values per token. [Certain, survey Section 5.2.1] We study the last two in depth:</p>
+<ul><li><b>KIVI</b> (Liu et al., ICML 2024): look at the numbers in the cache, see that keys and values have different shapes of outliers, and quantize them along different axes. Store recent tokens in full precision. No calibration, no training.</li>
+<li><b>KVQuant</b> (Hooper et al., 2024): keys per channel too, but quantized <b>before</b> RoPE; non-uniform levels chosen with a sensitivity weight; the 1% largest values kept apart in full precision; the first token kept in full precision.</li></ul>
+<p>Both papers report big gains. KIVI reports 2.6× less peak memory for Llama-2-7B (weights included), up to 4× larger batches and 2.35× to 3.47× more throughput on one A100. KVQuant reports less than 0.1 perplexity increase at 3 bits, and, from its memory calculation, LLaMA-7B with up to 1 million tokens of context on one A100-80GB. [Certain that the papers report these] The last part of this session shows why such numbers are not enough, and what to measure instead.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A library keeps a short note card for every book that was ever read aloud in a long meeting. The cards fill the room. You can write the cards in shorthand to save space, but shorthand loses detail. The trick is to choose the shorthand for each column of the card separately, and to keep the last few cards in full writing because people look at them most.</aside>
+<p>Interview questions on this topic: “Why are keys quantized per channel and values per token?”, “Why not use GPTQ for the KV cache?”, “Why quantize keys before RoPE?”, “Your 2-bit cache has the same perplexity; can you ship it?”. By the end you can answer each with a formula and a number.</p>
+
+<h2>When the cache is bigger than the weights</h2>
+<p>Take the weight memory \(M_W = N_{\text{params}} \cdot b_W\) and the cache memory from <a href="../inference/the-kv-cache.html">session 80</a>. With a cache of \(\bar b\) bits per number, the cache is</p>
+<div class="eq">\[ M_{\text{KV}} = 2 L\, n_{kv}\, d_h \cdot \frac{\bar b}{8} \cdot \sum_{i=1}^{B} T_i, \qquad M_{\text{KV}} = M_W \ \text{ when } \ B\,T = \frac{M_W}{s} \ \ (\text{equal lengths}) \tag{110.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\bar b\)</dt><dd>the <b>average</b> number of bits per stored key or value number, including the cost of scales, zero points and anything kept in full precision. 16 for bfloat16.</dd>
+<dt>\(s\)</dt><dd>bytes per token at the current precision, \(2 L\, n_{kv}\, d_h \bar b / 8\)</dd>
+<dt>\(B, T_i\)</dt><dd>number of sequences in the batch and the length of sequence \(i\)</dd>
+<dt>\(B\,T\)</dt><dd>the total number of cached tokens on the GPU. The cache equals the weights when this total reaches \(M_W / s\).</dd></dl>
+<div class="worked"><div class="wt">Worked example: the crossover point in bfloat16</div>
+<p><b>Llama 2 7B</b> (MHA, 32 layers, 32 KV heads, \(d_h = 128\)): \(s = 524{,}288\) bytes. Weights: 13.48 GB. The cache passes the weights at \(13.48 \times 10^9 / 524{,}288 \approx 25{,}700\) cached tokens, for example 7 users at 4k tokens.</p>
+<p><b>Llama 3 8B</b> (GQA, 8 KV heads): \(s = 131{,}072\) bytes, weights 16.06 GB. Crossover at about 122,500 tokens: one user at its full 128k context, or 32 users at 4,096 tokens (\(32 \times 4096 \times 131{,}072 = 17.18\) GB).</p>
+<p><b>Llama 3 70B</b>: \(s = 327{,}680\) bytes, weights 141.1 GB. 16 users at 32k tokens need 171.8 GB of cache, more than the weights.</p></div>
+<p>So two settings make the cache the main cost: long context (RAG over long documents, agents, video) and big batches (any busy server). GQA already cut the cache of Llama 3 by 4× compared with MHA. Going from 16 to about 3 bits cuts it by about 5× more, and it needs no retraining.</p>
+<p>Memory is not the only gain. Decoding is memory-bound: each step reads the weights once and every user’s cache once (<a href="../inference/the-kv-cache.html">session 80</a>, formula 80.9). A cache that is 5× smaller is read 5× faster, if the kernel can read the low-bit codes directly. KVQuant reports custom kernels with up to about 1.7× speedup over the fp16 matrix-vector products. [Certain that the paper reports this] With a small cache, the server also fits a bigger batch, which spreads the weight reads over more users.</p>
+<aside class="note side"><span class="nt">Why not GPTQ?</span>GPTQ and AWQ (<a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>) solve a small optimization problem for each weight matrix, once, offline. The cache is written at every decode step, for every user, and must be quantized in microseconds. KIVI uses plain round-to-nearest for this reason: optimization-based methods add too much overhead in a streaming setting. [Certain, KIVI paper] KVQuant also rounds online; its expensive work (choosing the levels) is done offline, once per model.</aside>
+
+<h2>Quantization of a cache in one formula</h2>
+<p><a href="../inference/quantization-math-scale-zero-point-granularity-and.html">Session 103</a> built uniform quantization. KIVI uses the <b>asymmetric</b> (min–max) version, with a zero point equal to the minimum of the group. For a group of numbers \(X\) and \(b\) bits:</p>
+<div class="eq">\[ z = \min X, \quad s = \frac{\max X - \min X}{2^{b} - 1}, \quad c = \operatorname{round}\!\left(\frac{x - z}{s}\right) \in \{0, \dots, 2^{b}-1\}, \quad \hat x = c\, s + z \tag{110.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>group \(X\)</dt><dd>the set of numbers that share one scale and one zero point. Which numbers form a group is the whole design question of this session.</dd>
+<dt>\(z\)</dt><dd>zero point: here the smallest value of the group, stored in 16 bits</dd>
+<dt>\(s\)</dt><dd>scale: the step between two levels, stored in 16 bits</dd>
+<dt>\(c\)</dt><dd>the code, a \(b\)-bit integer. Only the codes are stored per number.</dd>
+<dt>\(\hat x\)</dt><dd>the value the attention kernel will use. The error is at most \(s/2\) per number.</dd></dl>
+<p>Two facts follow at once. First, the error of every number in a group is set by the <b>range</b> of the group: one huge value makes the step \(s\) large for all the others. Second, each group pays 32 extra bits for its scale and zero point. With groups of \(G\) numbers the average cost is</p>
+<div class="eq">\[ \bar b_{\text{group}} = b + \frac{32}{G}, \qquad \text{e.g. } b = 2,\ G = 32: \ \bar b = 3 \text{ bits} \tag{110.3} \]</div>
+<p>So “2-bit KIVI” with \(G = 32\) really stores 3 bits per number, before counting the full-precision part. Keep this in mind whenever you compare methods by their bit width.</p>
+
+<h2>Keys have outlier channels, values do not</h2>
+<h3>What the cache looks like</h3>
+<p>Write the key cache of one head as a matrix \(K \in \R^{T \times d_h}\): one row per token, one column per <b>channel</b> (one of the \(d_h\) numbers of a key). The value cache \(V\) has the same shape. KIVI plotted these matrices for Llama, Falcon and Mistral and found two different patterns. [Certain, KIVI paper]</p>
+<ul><li><b>Keys:</b> a few fixed channels have very large values for almost every token. Inside one channel, the values over tokens are similar. LLM.int8() (<a href="../inference/weight-activation-quantization-llm-int8-smoothquant-zeroquant.html">session 108</a>) found the same kind of fixed outlier dimensions in hidden states.</li>
+<li><b>Values:</b> no clear outlier channels. The size of the values changes more from token to token than from channel to channel.</li></ul>
+<p>Now choose the groups of (110.2). There are two natural choices for a matrix of shape (tokens × channels):</p>
+<div class="eq">\[ \text{per-token: } X_j = \{ K_{j,1}, \dots, K_{j,d_h} \}, \qquad \text{per-channel: } X_i = \{ K_{1,i}, \dots, K_{G,i} \} \tag{110.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(K_{j,i}\)</dt><dd>channel \(i\) of the key of token \(j\)</dd>
+<dt>per-token group</dt><dd>one row: all channels of one token share a scale. This is how activations are usually quantized, and how a new token arrives.</dd>
+<dt>per-channel group</dt><dd>one column, cut into pieces of \(G\) tokens: one channel over \(G\) tokens shares a scale</dd></dl>
+<p>With per-token groups, every row of \(K\) contains the outlier channels, so every row has a huge range and a huge step \(s\). All the normal channels fall onto one or two levels. With per-channel groups, the outlier channel gets its own large scale, and the normal channels keep fine steps. The error stays inside the outlier channel. [Certain, KIVI paper]</p>
+<div class="worked"><div class="wt">Worked example: four keys, 2 bits</div>
+<p>Four tokens, four channels; channel 3 is an outlier channel:</p>
+<div class="eq">\[ K = \begin{bmatrix} 0.2 & -0.4 & 9.0 & 0.1 \\ -0.3 & 0.5 & 10.0 & -0.2 \\ 0.4 & 0.1 & 8.6 & 0.3 \\ -0.1 & -0.3 & 9.4 & 0.0 \end{bmatrix} \]</div>
+<p><b>Per-token</b>, row 1: \(z = -0.4\), \(s = 9.4 / 3 = 3.133\). The codes are \((0, 0, 3, 0)\): the three small channels all become \(-0.4\). Every row looks the same: codes \((0, 0, 3, 0)\), so the small channels lose all their information. The largest error in the small channels is 0.8.</p>
+<p><b>Per-channel</b> over the 4 tokens: the scales are \(0.233, 0.300, 0.467, 0.167\). The largest error in the small channels is 0.1; in the outlier channel it is 0.133.</p>
+<p>Now a query \(\mathbf{q} = (1, 1, 0, 1)\) that reads only the small channels. The true scores \(K\mathbf{q}\) are \((-0.1, 0.0, 0.8, -0.4)\). Per-token gives \((-1.2, -0.9, 0.3, -0.9)\): wrong order, wrong sizes. Per-channel gives \((-0.1, 0.0, 0.9, -0.5)\), almost exact. [Certain, computed in Python]</p></div>
+<p>KIVI measured the same effect on Llama-2-13B, averaged over layers and heads: per-token key quantization gives a relative attention-score error of 47.00, per-channel gives 9.60, about 5× smaller. [Certain, KIVI Table 2]</p>
+
+<h3>Why values are different</h3>
+<p>Values enter attention in a different way. The output of one head is a weighted sum of value <b>rows</b>:</p>
+<div class="eq">\[ \mathbf{o} = \sum_{j=1}^{T} p_j\, \hat{\mathbf{v}}_j = \mathbf{o}_{\text{exact}} + \sum_{j=1}^{T} p_j\, (\hat{\mathbf{v}}_j - \mathbf{v}_j) \tag{110.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(p_j\)</dt><dd>attention probability of token \(j\); most are near zero, a few are large (KIVI reports an average attention sparsity of 84.3%)</dd>
+<dt>\(\hat{\mathbf{v}}_j - \mathbf{v}_j\)</dt><dd>the quantization error of the value row of token \(j\)</dd></dl>
+<p>The output error is a mix of row errors, weighted by \(p_j\). What matters is that the few tokens with large \(p_j\) have accurate value rows. Per-token quantization gives each token its own scale, fitted to that token’s own range, so “the error of one token does not affect the others” (KIVI’s words). Per-channel quantization lets a few large tokens set the scale of a whole column, and an important token with small values then gets a coarse grid. [Likely, our reading of the KIVI argument] KIVI’s measurement: the relative output error is 3.55 for per-token values and 49.89 for per-channel values, about 14× larger. [Certain, KIVI Table 2]</p>
+<p>The task results agree. On Llama-2-7B with 2-bit fake quantization (quantize then dequantize, no real kernel), GSM8K accuracy is 13.50 in 16 bits, 5.76 with keys per channel and values per token, 0.83 with both per token, and 0.00 with both per channel. [Certain, KIVI paper] The only working 2-bit combination is keys per channel, values per token. The full KIVI method (below) brings GSM8K back to 12.74.</p>
+<p>Figure 1 lets you try all four combinations on a small cache with two outlier key channels.</p>
+<figure class="fig" id="kq-gran"><div class="fig-body">
+<div class="controls"><span class="seg" id="kq-gran-b"><button type="button" data-b="2" aria-pressed="true">2 bits</button><button type="button" data-b="3" aria-pressed="false">3 bits</button><button type="button" data-b="4" aria-pressed="false">4 bits</button></span></div>
+<div class="controls"><span class="seg" id="kq-gran-k"><button type="button" data-k="tok" aria-pressed="true">keys per token</button><button type="button" data-k="ch" aria-pressed="false">keys per channel</button></span><span class="seg" id="kq-gran-v"><button type="button" data-v="tok" aria-pressed="true">values per token</button><button type="button" data-v="ch" aria-pressed="false">values per channel</button></span></div>
+<div class="scroll-x"><svg id="kq-gran-svg" viewBox="0 0 640 400" role="img" aria-label="Quantization error maps of a key cache and a value cache, and the attention probabilities before and after quantization"></svg></div>
+<div class="readout" id="kq-gran-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> A toy cache of 12 tokens × 8 channels for one head. Keys have two outlier channels (channel 2 near +5, channel 7 near −4); values have two tokens with large values (tokens 4 and 10). The maps show the absolute error \(|\hat x - x|\) of every number after quantization with formula (110.2); darker means larger error, and the frames show which numbers share a scale. The bars at the bottom compare the attention probabilities with exact keys (outline) and with quantized keys (filled).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start at 2 bits with both per token. The key map is dark everywhere except the outlier channels: each row’s range is about 10, so the normal channels lose their values, and the attention bars move far from their outlines. The readout shows a key error of 0.368 and an attention-score error of 1.419. Switch keys to per channel: the key error falls to 0.070, the score error to 0.299, and the bars almost match. Now switch values to per channel: the value error rises from 0.221 to 0.350, because tokens 4 and 10 set the range of every column. The output error is smallest with keys per channel and values per token (0.331 at 2 bits). At 4 bits all choices are closer together: granularity matters most when bits are few.</p></details></figure>
+
+<h3>The same groups fit the matrix products</h3>
+<p>There is also a reason from the kernel side. A decode step computes scores \(\mathbf{q} \cdot \hat{\mathbf{k}}_j\) (a sum over channels \(i\)) and an output \(\sum_j p_j \hat{\mathbf{v}}_j\) (a sum over tokens \(j\)). Put \(\hat K_{j,i} = s_i c_{j,i} + z_i\) (per-channel keys) and \(\hat{\mathbf{v}}_j = s_j \mathbf{c}_j + z_j \mathbf{1}\) (per-token values, one group per row for simplicity):</p>
+<div class="eq">\[ \mathbf{q} \cdot \hat{\mathbf{k}}_j = \sum_{i} (q_i s_i)\, c_{j,i} + \sum_{i} q_i z_i, \qquad \sum_j p_j \hat{\mathbf{v}}_j = \sum_j (p_j s_j)\, \mathbf{c}_j + \Big(\sum_j p_j z_j\Big) \mathbf{1} \tag{110.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(c_{j,i}, \mathbf{c}_j\)</dt><dd>the stored integer codes</dd>
+<dt>\(q_i s_i\)</dt><dd>the per-channel key scales can be multiplied into the query once per step, and \(\sum_i q_i z_i\) is one number shared by all tokens</dd>
+<dt>\(p_j s_j\)</dt><dd>the per-token value scales can be multiplied into the attention probabilities</dd></dl>
+<p>In both products the scale runs along the axis that is summed. So the scales can be moved out of the inner loop, and the kernel can multiply directly with the integer codes. [Certain, algebra] Grouping keys per token would put the scale on the other axis, which is just as easy for the score product; the problem with per-token keys is accuracy, not speed. Real kernels with groups of \(G\) need one such correction per group. [Likely]</p>
+
+<h2>KIVI: a streaming 2-bit cache</h2>
+<h3>The streaming problem</h3>
+<p>Per-channel keys create a practical problem. A per-channel group covers \(G\) tokens of one channel. During decoding, tokens arrive <b>one at a time</b>: the group of the newest tokens is not complete yet, so its range is unknown. Values have no such problem: a per-token group is complete as soon as the token arrives.</p>
+<p>KIVI’s answer is a small <b>residual</b>: the most recent tokens stay in full precision. [Certain, KIVI paper]</p>
+<ul><li><b>Keys:</b> new keys go into a full-precision buffer. When the buffer holds \(R\) tokens, all of them are quantized per channel (in groups of \(G\) tokens), appended to the quantized key cache, and the buffer is emptied.</li>
+<li><b>Values:</b> new values go into a full-precision queue of length \(R\). When the queue is longer than \(R\), the oldest value leaves it and is quantized per token (in groups of \(G\) channels).</li>
+<li><b>Attention:</b> each step attends to the quantized part and the full-precision part and joins the two results. In prefill, attention uses the exact keys and values; only the stored cache is quantized.</li></ul>
+<p>The paper uses \(G = 32\) and \(R = 128\) in its main experiments. [Certain] The residual has a second benefit: the most recent tokens often get much of the attention, and they are exact. In an ablation on Llama-2-13B GSM8K, \(R = 32, 64, 96, 128\) gave 20.62, 19.86, 20.55 and 20.77 (no clear trend in this range), while \(G = 32, 64, 128\) gave 20.77, 21.00 and 17.29: groups that are too large hurt. [Certain, KIVI ablation tables]</p>
+<div class="algo"><div class="algo-h">Algorithm 1: one decode step with a KIVI cache (one layer, one KV head)</div><ol>
+<li><b>state:</b> quantized keys \(\hat K\) (per channel), full-precision key buffer \(K_r\) (\(\lt R\) rows); quantized values \(\hat V\) (per token), full-precision value queue \(V_r\) (\(\le R\) rows)</li>
+<li><b>input:</b> the new token’s \(\mathbf{q}, \mathbf{k}, \mathbf{v}\)</li>
+<li>append \(\mathbf{k}\) to \(K_r\); append \(\mathbf{v}\) to \(V_r\)</li>
+<li><b>if</b> \(K_r\) has \(R\) rows: \(\hat K \leftarrow [\hat K;\ \text{quant}_{\text{channel}}(K_r, G)]\); \(K_r \leftarrow \varnothing\) <span class="c">// groups of G tokens per channel</span></li>
+<li><b>if</b> \(V_r\) has \(R+1\) rows: pop the oldest row \(\mathbf{v}_{\text{old}}\); \(\hat V \leftarrow [\hat V;\ \text{quant}_{\text{token}}(\mathbf{v}_{\text{old}}, G)]\) <span class="c">// groups of G channels</span></li>
+<li>scores \(\leftarrow [\,\hat K \mathbf{q};\ K_r \mathbf{q}\,] / \sqrt{d_h}\) <span class="c">// low-bit kernel + normal kernel, formula (110.6)</span></li>
+<li>\(\mathbf{p} \leftarrow \softmax(\text{scores})\) over all cached tokens</li>
+<li><b>return</b> \(\mathbf{o} = \mathbf{p}_{\text{old}}^{\top} \hat V + \mathbf{p}_{\text{new}}^{\top} V_r\) <span class="c">// split p by where each value lives</span></li></ol></div>
+<p>Note that the key and value boundaries are not at the same token: keys are quantized in blocks of \(R\), values one by one. The softmax runs over all tokens at once; only the matrix products are split. Figure 2 steps through a toy cache.</p>
+<figure class="fig wide" id="kq-stream"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="kq-stream-prev">Back</button><button type="button" class="btn primary" id="kq-stream-play">Play</button><button type="button" class="btn" id="kq-stream-next">Next</button><span class="kq-lab" id="kq-stream-lab"></span></div>
+<div class="scroll-x"><svg id="kq-stream-svg" viewBox="0 0 760 266" role="img" aria-label="A KIVI cache with residual length 4: which keys and values are quantized and which are in full precision after each step"></svg></div>
+<div class="kq-leg"><span style="--c:var(--k)">key, 2-bit (per channel)</span><span style="--c:var(--v)">value, 2-bit (per token)</span><span style="--c:var(--paper2)">full precision (residual)</span></div>
+<div class="kq-step" id="kq-stream-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> A KIVI cache with a tiny residual \(R = 4\) (the paper uses 128). Each column is a token. The first step is a prefill of 6 tokens; each later step adds one decoded token. Filled cells are quantized; white cells with a frame are in full precision. Brackets above the key row mark the per-channel groups, which are only formed when \(R\) keys have arrived.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>After the prefill of 6 tokens, keys 1–4 form a quantized group and keys 5–6 wait in the buffer; values 1–2 are quantized and values 3–6 sit in the queue of length 4. Press Next: with 8 tokens the key buffer is full and keys 5–8 are quantized together, so the buffer is empty again. The value queue instead moves by one token every step. The number of full-precision keys goes 2, 3, 0, 1, 2, 3, 0, … while the number of full-precision values stays at 4. The readout counts both parts and gives the average bits per number with formula (110.7).</p></details></figure>
+
+<h3>What the residual costs</h3>
+<p>The full-precision tokens cost 16 bits each. Count the worst case, \(R\) residual tokens for both keys and values, at a context of \(T\) tokens:</p>
+<div class="eq">\[ \bar b(T) = \frac{(T - R)\,\big(b + 32/G\big) + 16\,R}{T} \qquad (T \gt R) \tag{110.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(b + 32/G\)</dt><dd>bits per quantized number, codes plus scale and zero point, formula (110.3)</dd>
+<dt>\(16 R\)</dt><dd>the residual in 16 bits</dd>
+<dt>\(T\)</dt><dd>current context length. The residual is fixed, so its share shrinks as \(T\) grows.</dd></dl>
+<div class="worked"><div class="wt">Worked example: bits and bytes of KIVI-2 (\(b = 2, G = 32, R = 128\))</div>
+<p>At \(T = 4096\): \(\bar b = (3968 \times 3 + 2048)/4096 = 3.41\) bits. At \(T = 32{,}768\): 3.05 bits, the exact number KVQuant’s comparison table gives for KIVI at 32k context. At \(T = 131{,}072\): 3.01 bits.</p>
+<p>Llama 3 8B, one sequence of 131,072 tokens: 17.18 GB in bfloat16, 8.59 GB in FP8, 5.38 GB with KIVI-4 (5.01 bits), 3.24 GB with KIVI-2. That is 5.3× smaller than bfloat16, not 8×. [Certain, computed with (110.1) and (110.7)]</p>
+<p>On an 80 GB GPU with \(u = 0.9\) and bfloat16 weights, the room after the weights (55.9 GB) holds about 427,000 tokens in bfloat16 and about 2.28 million tokens with KIVI-2.</p></div>
+<p>KIVI’s own results, with this setting: on LongBench the average for Llama-2-7B is 44.52 in 16 bits, 44.59 for KIVI-4 and 44.27 for KIVI-2; for Mistral-7B 46.58, 46.56 and 45.85. [Certain, KIVI tables] On short tasks the 2-bit method is close to 16 bits. We will see later that a harder long-context test tells a different story.</p>
+
+<h2>KVQuant: four ideas for 3 bits and below</h2>
+<p>KVQuant starts from the same observation (keys per channel, values per token) and asks how to go below 4 bits without losing accuracy. On LLaMA-7B, Wikitext-2 perplexity in fp16 is 5.68. Plain uniform 3-bit with per-token groups gives 10.87; switching keys to per channel gives 7.05. [Certain, KVQuant paper] Then it adds four more ideas.</p>
+
+<h3>1. Quantize keys before RoPE</h3>
+<p>RoPE (<a href="../foundations/position-part-2-rope-in-depth-and.html">session 14</a>) rotates each pair of key channels \((a, b)\) by an angle that grows with the position \(t\). With the pairing \((i, i + d_h/2)\) used in Llama:</p>
+<div class="eq">\[ \begin{bmatrix} a'_t \\ b'_t \end{bmatrix} = \begin{bmatrix} \cos t\theta_i & -\sin t\theta_i \\ \sin t\theta_i & \cos t\theta_i \end{bmatrix} \begin{bmatrix} a_t \\ b_t \end{bmatrix}, \qquad \theta_i = 10000^{-2i/d_h} \tag{110.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(a_t, b_t\)</dt><dd>channels \(i\) and \(i + d_h/2\) of the key of token \(t\) <b>before</b> RoPE (the output of \(W_K\))</dd>
+<dt>\(a'_t, b'_t\)</dt><dd>the same channels <b>after</b> RoPE, which is what most caches store</dd>
+<dt>\(\theta_i\)</dt><dd>the rotation speed of pair \(i\): 1 radian per token for \(i = 0\), about \(10^{-4}\) for the last pair</dd></dl>
+<p>Suppose channel \(a\) is an outlier channel: always near 5, while \(b\) is small. Before RoPE, the column of \(a\) is almost constant: a perfect per-channel group. After RoPE, \(a'_t = a_t \cos t\theta_i - b_t \sin t\theta_i\) swings between about \(-5\) and \(+5\) as the position changes, and the outlier also leaks into \(b'\). Both columns now have a range of about 10, and per-channel quantization loses its advantage. [Certain, from (110.8)]</p>
+<p>KVQuant therefore stores keys <b>before</b> RoPE, \(\hat{\mathbf{k}}_j = \text{quant}(W_K \mathbf{h}_j)\), and applies the rotation after dequantization, inside the attention kernel:</p>
+<div class="eq">\[ \text{score}_{t,j} = \mathbf{q}_t^{\top} R_{\Theta, j}\, \hat{\mathbf{k}}_j, \qquad \hat{\mathbf{k}}_j = \text{dequant}\big(\text{quant}(W_K \mathbf{h}_j)\big) \tag{110.9} \]</div>
+<p>Here \(R_{\Theta, j}\) is the block-diagonal RoPE rotation at position \(j\) and \(\mathbf{q}_t\) is the query, already rotated to its own position. The cost: the kernel must compute \(\cos j\theta_i\) and \(\sin j\theta_i\) for every cached token at every step. KVQuant fuses this into its kernel. [Certain, KVQuant paper] The gain on LLaMA-7B at 3 bits: perplexity 7.05 → 6.23. [Certain] The <a href="../inference/the-kv-cache.html">session 80</a> session noted that StreamingLLM also stores keys before rotation, for a different reason: it re-assigns positions inside the cache.</p>
+<figure class="fig" id="kq-rope"><div class="fig-body">
+<div class="controls"><label class="sl">RoPE pair \(i\) <input type="range" id="kq-rope-i" min="0" max="63" step="1" value="8"><output id="kq-rope-iv">8</output></label><span class="seg" id="kq-rope-b"><button type="button" data-b="2" aria-pressed="false">2 bits</button><button type="button" data-b="3" aria-pressed="true">3 bits</button><button type="button" data-b="4" aria-pressed="false">4 bits</button></span></div>
+<div class="scroll-x"><svg id="kq-rope-svg" viewBox="0 0 640 300" role="img" aria-label="An outlier key channel before and after RoPE over 64 positions, with the quantization levels of each"></svg></div>
+<div class="readout" id="kq-rope-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> One pair of key channels over 64 positions, in a head of size \(d_h = 128\). Channel \(a\) (orange) is an outlier channel near 5; channel \(b\) (green) is small. Left: before RoPE. Right: after RoPE with formula (110.8) for pair \(i\). The thin lines are the \(2^b\) levels of a per-channel quantizer for channel \(a\) over these 64 tokens. The readout compares the relative error of quantizing after RoPE with quantizing before RoPE and rotating afterwards.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At pair 8 (\(\theta = 0.316\), about 3 turns in 64 tokens) the rotated channel \(a'\) swings from −5 to +5, so its quantizer levels spread over a range of 11.7 instead of 2.5. At 3 bits the error after RoPE is 0.126, about 5× the 0.024 of the pre-RoPE path. Move the slider right. Slow pairs (\(i \ge 40\)) barely rotate over 64 tokens, so the two errors become equal. In a real model with thousands of tokens even slow pairs turn a lot: pair 63 turns 0.6 times over 32k tokens. How much pre-RoPE helps depends on which pairs hold the outliers.</p></details></figure>
+
+<h3>2. Non-uniform levels, weighted by sensitivity</h3>
+<p>Uniform levels are equally spaced. But keys and values are not uniformly spread: most numbers are near the center. <a href="../inference/number-formats-int8-int4-fp8-fp4-nf4.html">Session 105</a> showed NF4, whose levels follow a normal distribution. KVQuant goes one step further and <b>learns</b> the levels per layer, offline, from calibration data. Each channel (for keys) or token (for values) is first normalized to \([-1, 1]\); then one set of \(2^b\) levels per layer is chosen by solving</p>
+<div class="eq">\[ Q^{*} = \argmin_{Q} \sum_{i=1}^{N} \mathcal{F}_{ii} \big( A_i - Q(A_i) \big)^2, \qquad \mathcal{F}_{ii} \approx \mathbb{E}\big[\, g_i^2 \,\big] \tag{110.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(A_i\)</dt><dd>one key or value number from the calibration set (after normalization)</dd>
+<dt>\(Q(A_i)\)</dt><dd>the nearest of the \(2^b\) levels</dd>
+<dt>\(g_i\)</dt><dd>the gradient of the loss with respect to \(A_i\)</dd>
+<dt>\(\mathcal{F}_{ii}\)</dt><dd>the diagonal of the Fisher information: how much the loss reacts to an error in \(A_i\). Numbers with a large \(\mathcal{F}_{ii}\) get levels close to them.</dd></dl>
+<p>This is a weighted k-means in one dimension: the levels are the cluster centers. The paper calibrates on 16 samples of 2k tokens from Wikitext-2; at run time the stored levels are only rescaled per channel or per token. These formats are called nuq2, nuq3 and nuq4. [Certain, KVQuant paper] On LLaMA-7B, nuq3 improves on uniform 3-bit by about 0.29 perplexity. [Certain that the paper reports this]</p>
+<div class="algo"><div class="algo-h">Algorithm 2: KVQuant offline calibration and online quantization</div><ol>
+<li><b>offline, once per model:</b> run the fp16 model on calibration text (16 × 2k tokens); keep the pre-RoPE keys and the values of every layer, and the gradients of the loss with respect to them</li>
+<li>&nbsp;&nbsp;for every layer: normalize each key channel and each value token to \([-1, 1]\); ignore the first token <span class="c">// it stays fp16 (idea 4)</span></li>
+<li>&nbsp;&nbsp;choose the \(2^b\) levels by Fisher-weighted k-means, formula (110.10)</li>
+<li>&nbsp;&nbsp;for keys: store per-channel outlier thresholds (the 1% tails) <span class="c">// keys: thresholds known offline</span></li>
+<li><b>online, for each new token:</b> key \(\mathbf{k} \leftarrow W_K \mathbf{h}\), <b>before</b> RoPE</li>
+<li>&nbsp;&nbsp;split into dense + sparse with the per-vector thresholds, formula (110.11); values: compute the token’s thresholds now</li>
+<li>&nbsp;&nbsp;normalize the dense part with the channel (key) or token (value) scale; store the nearest nuq level for each number</li>
+<li>&nbsp;&nbsp;store the sparse outliers in fp16 with their positions (a compressed sparse format)</li>
+<li><b>attention:</b> dequantize, add the sparse part, apply RoPE to keys on the fly, formula (110.9)</li></ol></div>
+
+<h3>3. Dense-and-sparse: keep the 1% largest numbers</h3>
+<p>A few very large numbers still stretch the range of each group. KVQuant removes them: each key channel and each value token is split into a dense part, quantized with nuq, and a sparse part with the largest values, stored exactly:</p>
+<div class="eq">\[ \mathbf{x} = \mathbf{x}_{\text{dense}} + \mathbf{x}_{\text{sparse}}, \qquad (\mathbf{x}_{\text{sparse}})_i = x_i \cdot \mathbb{1}\big[\, x_i \lt \tau_{\text{lo}} \ \text{or}\ x_i \gt \tau_{\text{hi}} \,\big] \tag{110.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\tau_{\text{lo}}, \tau_{\text{hi}}\)</dt><dd>thresholds <b>per vector</b> (per channel for keys, per token for values), set so that about 1% of the numbers fall outside them</dd>
+<dt>\(\mathbf{x}_{\text{sparse}}\)</dt><dd>stored in fp16 in a sparse format; the dense part now has a much smaller range</dd></dl>
+<p>For keys the thresholds come from calibration. For values they must be found online for every new token; KVQuant runs this top-k search on the CPU in parallel with the GPU. [Certain, KVQuant paper] At 3 bits on LLaMA-7B, 1% outliers improve perplexity from 5.94 to 5.75; one threshold per matrix instead of per vector gives only 5.85. [Certain] The sparse part is not free: with 1% outliers the reported average is 4.33 bits for nuq4, 3.33 for nuq3 and 2.33 for nuq2, a third of a bit for outliers and scales. [Certain for the numbers]</p>
+
+<h3>4. Keep the first token in full precision</h3>
+<p>The first token of a sequence often gets a large share of the attention in every head, the <b>attention sink</b> seen in StreamingLLM (<a href="../inference/sparse-attention-1-static-sparse-transformer-longformer.html">session 116</a>). An error in its key or value is multiplied by a large \(p_j\) in (110.5). KVQuant keeps this one token in fp16 and leaves it out of calibration. At 2 bits on LLaMA-7B this alone takes perplexity from 8.47 to 7.23. [Certain, KVQuant paper] It costs nothing measurable: one token out of thousands.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Method (LLaMA-7B, Wikitext-2, fp16 = 5.68)</th><th>4-bit</th><th>3-bit</th><th>2-bit</th></tr></thead><tbody>
+<tr><td>uniform int, per token</td><td>5.98</td><td>10.87</td><td>11,779</td></tr>
+<tr><td>NF (normal float), per token</td><td>5.87</td><td>7.33</td><td>3,210</td></tr>
+<tr><td>Atom</td><td>5.77</td><td>6.17</td><td>37.37</td></tr>
+<tr><td>FlexGen</td><td>5.73</td><td>5.93</td><td>11.09</td></tr>
+<tr><td>KVQuant (nuq)</td><td>5.72</td><td>5.87</td><td>7.23</td></tr>
+<tr><td>KVQuant, 1% outliers</td><td><b>5.69</b></td><td><b>5.75</b></td><td><b>6.01</b></td></tr></tbody></table></div>
+<p>[Certain, KVQuant Table 1; all baselines as run by the KVQuant authors] By perplexity, 3-bit KVQuant with 1% outliers is 0.07 above fp16, and even 2 bits is only 0.33 above. Is a 2-bit cache then ready to ship? The next section says no.</p>
+<aside class="note side"><span class="nt">KIVI or KVQuant?</span>KIVI needs no calibration and no custom data types; it is easy to add to a serving system. KVQuant needs an offline calibration run per model, a sparse format and a fused kernel that dequantizes, adds outliers and applies RoPE. In return it reaches lower bits with less loss. Rotations (<a href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html">session 109</a>) are a third route: QuaRot rotates keys and values with Hadamard matrices to spread the outliers, and quantizes weights, activations and the KV cache to 4 bits. [Certain, QuaRot abstract]</aside>
+
+<h2>Measure long-context accuracy, not only perplexity</h2>
+<p>Perplexity averages the loss over all tokens of a text. Most tokens can be predicted from the last few hundred tokens, and those are exactly the tokens that a KIVI residual keeps in full precision, or that get most of the attention anyway. A cache that ruins the memory of token 3,000 in a 30,000-token context can still have almost the same perplexity. The tasks that use the far context are the ones that break.</p>
+<p>So test with tasks that need the far context:</p>
+<ul><li><b>Passkey retrieval</b>: a random number is hidden in a long filler text; the model must repeat it. The score is the fraction of correct answers.</li>
+<li><b>LongBench</b> (Bai et al., 2023): the 16 English tasks in KVQuant’s table cover long-document QA, multi-document QA, summarization, few-shot learning, code, and synthetic retrieval and counting.</li>
+<li><b>RULER</b> (Hsieh et al., 2024): synthetic tasks at a chosen length: needle-in-a-haystack with one or many keys and values, multi-hop variable tracking, word counting and QA. Many models score far below their claimed context length on it. [Certain, RULER paper]</li></ul>
+<p>KVQuant ran all three on LLaMA-2-7B-32K (a 32k-context version of Llama 2 7B), with KIVI-2 (\(G = 32\), \(R = 128\)) as a baseline. [Certain, KVQuant paper] Figure 4 shows the task scores.</p>
+<figure class="fig wide" id="kq-bench"><div class="fig-body">
+<div class="controls"><span class="seg" id="kq-bench-s"><button type="button" data-s="pk" aria-pressed="false">Passkey</button><button type="button" data-s="lb" aria-pressed="false">LongBench</button><button type="button" data-s="ru" aria-pressed="true">RULER (32k)</button></span><span class="seg" id="kq-bench-d"><button type="button" data-d="0" aria-pressed="true">scores</button><button type="button" data-d="1" aria-pressed="false">change vs fp16</button></span></div>
+<div class="scroll-x"><svg id="kq-bench-svg" viewBox="0 0 760 300" role="img" aria-label="Long-context task scores of fp16, KIVI-2 and KVQuant on LLaMA-2-7B-32K"></svg></div>
+<div class="kq-leg" id="kq-bench-leg"></div>
+<div class="readout" id="kq-bench-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Long-context results on LLaMA-2-7B-32K as reported in the KVQuant paper (Tables 2, 3 and 4). Bars are grouped by task. The average bit widths are the paper’s estimates (for KIVI they include the fp16 residual at the benchmark’s context length). All runs are by the KVQuant authors, so KIVI is a baseline here, not tuned by its own authors.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>RULER is the default. KVQuant at 3.33 bits stays close to fp16 on most tasks (average 53.65 against 56.40). KIVI-2 at 3.05 bits drops on the single-needle tasks (76 against 100 on Niah1) and on multi-key retrieval (MKey2: 11.4 against 68.2); its average is 39.78. KVQuant at 2.33 bits, which had a perplexity only 0.33 above fp16, falls to 36.54. Click “change vs fp16” to see the losses as negative bars. Switch to Passkey: KIVI finds the passkey only 68–76% of the time at every length, KVQuant almost always. On LongBench the gaps are smaller (averages 31.96, 31.21 and 30.04): it mixes many tasks that a short local context can partly solve.</p></details></figure>
+<p>Put the numbers side by side. KVQuant 2-bit with 1% outliers: perplexity +0.33 (6.01 against 5.68), RULER −19.86 points (36.54 against 56.40), a 35% relative loss. KVQuant 3-bit: perplexity +0.07, RULER −2.75 points (−4.9%). KIVI-2: LongBench −1.92 points, RULER −16.62 points (−29.5%). [Certain for the arithmetic on the reported numbers] The perplexity ranking and the RULER ranking agree in direction, but perplexity hides the size of the failure.</p>
+<aside class="note watch"><span class="nt">Read results with care</span>Results depend on the setup. KIVI’s own paper reports LongBench averages almost equal to 16 bits (44.27 against 44.52 for Llama-2-7B), on a different model version and context length than KVQuant’s table. Each paper tunes its own method more than its baselines. Before shipping, run your own long-context tests, on your model, at your real context length, with your real \(R\) and \(G\). [Certain that the setups differ; the advice is standard practice]</aside>
+<p>A good evaluation plan for a quantized cache:</p>
+<ol><li>Perplexity on long documents, as a quick sanity check (catches broken kernels).</li>
+<li>Needle-style retrieval (passkey, RULER needles) at several lengths up to the target context, and several needle depths.</li>
+<li>Multi-key and multi-value retrieval and variable tracking (RULER): these break first.</li>
+<li>Your real long tasks (LongBench-style QA and summarization, or your RAG set), with the same prompt format as production.</li>
+<li>Short reasoning tasks with long outputs (GSM8K): the residual covers the prompt only at the start, and errors in the generated chain add up.</li></ol>
+
+<h2>Plan the memory</h2>
+<p>Figure 5 combines everything: weights + KV cache must fit into \(u \cdot M_{\text{GPU}}\), with the average bits \(\bar b\) of each format. For KIVI it uses formula (110.7) at the chosen context; for KVQuant the reported 4.33, 3.33 and 2.33 bits; for FP8 8 bits (one scale per tensor, as in vLLM’s <code>--kv-cache-dtype fp8</code>).</p>
+<figure class="fig" id="kq-plan"><div class="fig-body">
+<div class="controls"><span class="seg" id="kq-plan-m"><button type="button" data-m="l2" aria-pressed="false">Llama 2 7B</button><button type="button" data-m="l3" aria-pressed="true">Llama 3 8B</button><button type="button" data-m="qw" aria-pressed="false">Qwen2.5 7B</button><button type="button" data-m="l70" aria-pressed="false">Llama 3 70B</button></span><span class="seg" id="kq-plan-g"><button type="button" data-g="80" aria-pressed="true">80 GB</button><button type="button" data-g="160" aria-pressed="false">2 × 80 GB</button></span></div>
+<div class="controls"><span class="seg" id="kq-plan-f"><button type="button" data-f="fp16" aria-pressed="true">BF16</button><button type="button" data-f="fp8" aria-pressed="false">FP8</button><button type="button" data-f="k4" aria-pressed="false">KIVI-4</button><button type="button" data-f="k2" aria-pressed="false">KIVI-2</button><button type="button" data-f="n4" aria-pressed="false">nuq4-1%</button><button type="button" data-f="n3" aria-pressed="false">nuq3-1%</button><button type="button" data-f="n2" aria-pressed="false">nuq2-1%</button></span><span class="seg" id="kq-plan-w"><button type="button" data-w="2" aria-pressed="true">weights 16-bit</button><button type="button" data-w="0.5" aria-pressed="false">4-bit</button></span></div>
+<div class="controls"><label class="sl">Batch \(B\) <input type="range" id="kq-plan-b" min="0" max="6" step="1" value="0"><output id="kq-plan-bv">1</output></label><label class="sl">Context \(T\) <input type="range" id="kq-plan-t" min="0" max="8" step="1" value="5"><output id="kq-plan-tv">131,072</output></label></div>
+<div class="scroll-x"><svg id="kq-plan-svg" viewBox="0 0 640 190" role="img" aria-label="GPU memory split into weights and KV cache for the chosen cache format, against the usable budget"></svg></div>
+<div class="readout" id="kq-plan-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Memory of weights plus KV cache, formula (110.1), against the usable budget \(0.9 \cdot M_{\text{GPU}}\) (dashed line). The light bar behind shows the bfloat16 cache for comparison. Parameter counts come from the model config files; 4-bit weights ignore their small scale overhead. The readout gives the average bits, the cache size, and the longest context that fits at this batch size.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>The default is Llama 3 8B, one user at 128k tokens: weights 16.06 GB plus a 17.18 GB bfloat16 cache. Pick KIVI-2: the cache shrinks to 3.24 GB at 3.01 bits. Now raise the batch to 16: bfloat16 needs 275 GB and does not fit; KIVI-2 needs 52 GB and fits. Move the context down to 4,096: KIVI-2’s average rises to 3.41 bits because the 128-token residual is a bigger share. Pick Llama 3 70B on 2 × 80 GB: with 16-bit weights there is almost no room left for any cache; switch to 4-bit weights and a low-bit cache to serve long contexts.</p></details></figure>
+
+<h2>A complete example in PyTorch</h2>
+<p>The code builds a synthetic cache of one head (512 tokens, \(d_h = 128\)) with the two patterns of this session: three fixed outlier channels in the keys, and a few large tokens in the values. It compares the four granularity choices at 2 and 4 bits, runs a KIVI-style streaming cache, measures pre-RoPE against post-RoPE key quantization, and tests dense-and-sparse values. It uses a fixed seed and only CPU operations, so it is deterministic.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+T, d = 512, 128                                   <span class="cm"># tokens, head size</span>
+
+<span class="cm"># Synthetic cache with the patterns of section 3:</span>
+K = torch.randn(T, d)
+K[:, [5, 70, 100]] += torch.tensor([9.0, -7.0, 6.0])   <span class="cm"># keys: 3 fixed outlier channels</span>
+V = torch.randn(T, d)
+V[torch.randperm(T)[:8]] *= 6                      <span class="cm"># values: a few large tokens, no outlier channels</span>
+q = torch.randn(d)
+
+<span class="kw2">def</span> quant(X, bits, dim, G):
+    <span class="cm">"""Min-max (asymmetric) round-to-nearest, formula (110.2).
+    dim = the axis the statistics run along; groups of G elements on that axis."""</span>
+    Xt = X.movedim(dim, -1)
+    Xg = Xt.reshape(*Xt.shape[:-1], -1, G)          <span class="cm"># (..., n_groups, G)</span>
+    mn = Xg.amin(-1, keepdim=True); mx = Xg.amax(-1, keepdim=True)
+    s = (mx - mn).clamp(min=1e-6) / (2 ** bits - 1)
+    Xq = torch.round((Xg - mn) / s) * s + mn        <span class="cm"># quantize, then dequantize</span>
+    <span class="kw2">return</span> Xq.reshape(Xt.shape).movedim(-1, dim)
+
+<span class="kw2">def</span> attn(q, K, V):
+    p = torch.softmax(K @ q / d ** 0.5, dim=0)
+    <span class="kw2">return</span> p @ V
+rel = <span class="kw2">lambda</span> a, b: ((a - b).norm() / b.norm()).item()
+o = attn(q, K, V)
+
+<span class="cm"># 1) granularity: per-token = stats over channels (dim=1); per-channel = over tokens (dim=0)</span>
+<span class="kw2">for</span> kn, kd <span class="kw2">in</span> [("K per-token  ", 1), ("K per-channel", 0)]:
+    <span class="kw2">for</span> vn, vd <span class="kw2">in</span> [("V per-token  ", 1), ("V per-channel", 0)]:
+        e2 = rel(attn(q, quant(K, 2, kd, 32), quant(V, 2, vd, 32)), o)
+        e4 = rel(attn(q, quant(K, 4, kd, 32), quant(V, 4, vd, 32)), o)
+        print(f"{kn} {vn} output error: 2-bit {e2:.3f}, 4-bit {e4:.3f}")
+
+<span class="cm"># 2) a KIVI-style streaming cache: quantized part + full-precision residual</span>
+<span class="kw2">class</span> KIVICache:
+    <span class="kw2">def</span> __init__(s, bits=2, G=32, R=128):
+        s.bits, s.G, s.R = bits, G, R
+        s.Kq, s.Kr, s.Vq, s.Vr = [], [], [], []
+    <span class="kw2">def</span> append(s, k, v):
+        s.Kr.append(k); s.Vr.append(v)
+        <span class="kw2">if</span> len(s.Kr) == s.R:                        <span class="cm"># keys: wait for R tokens, then</span>
+            s.Kq.append(quant(torch.stack(s.Kr), s.bits, 0, s.G))   <span class="cm"># per-channel</span>
+            s.Kr = []
+        <span class="kw2">if</span> len(s.Vr) &gt; s.R:                         <span class="cm"># values: oldest token leaves the</span>
+            s.Vq.append(quant(s.Vr.pop(0)[None], s.bits, 1, s.G))  <span class="cm"># window, per-token</span>
+    <span class="kw2">def</span> get(s):
+        K_ = torch.cat(s.Kq + ([torch.stack(s.Kr)] <span class="kw2">if</span> s.Kr <span class="kw2">else</span> []))
+        V_ = torch.cat(s.Vq + [torch.stack(s.Vr)])
+        <span class="kw2">return</span> K_, V_
+    <span class="kw2">def</span> avg_bits(s):
+        n = sum(x.shape[0] <span class="kw2">for</span> x <span class="kw2">in</span> s.Kq) + sum(x.shape[0] <span class="kw2">for</span> x <span class="kw2">in</span> s.Vq)
+        r = len(s.Kr) + len(s.Vr)
+        <span class="kw2">return</span> (n * (s.bits + 32 / s.G) + r * 16) / (n + r)
+
+c = KIVICache()
+<span class="kw2">for</span> t <span class="kw2">in</span> range(T - 12):                             <span class="cm"># stream 500 tokens one by one</span>
+    c.append(K[t], V[t])
+Kc, Vc = c.get()
+print("K: quantized", sum(x.shape[0] <span class="kw2">for</span> x <span class="kw2">in</span> c.Kq), "residual", len(c.Kr),
+      "| V: quantized", len(c.Vq), "residual", len(c.Vr))
+print(f"KIVI-2 output error {rel(attn(q, Kc, Vc), attn(q, K[:500], V[:500])):.3f}, "
+      f"average bits {c.avg_bits():.2f}")
+
+<span class="cm"># 3) pre-RoPE vs post-RoPE keys: rotate pairs (i, i + d/2) by angle pos * theta_i</span>
+pos = torch.arange(T, dtype=torch.float32)[:, None]
+theta = 10000 ** (-torch.arange(d // 2, dtype=torch.float32) / (d // 2))
+cos, sin = (pos * theta).cos(), (pos * theta).sin()
+<span class="kw2">def</span> rope(X):
+    a, b = X[:, : d // 2], X[:, d // 2 :]
+    <span class="kw2">return</span> torch.cat([a * cos - b * sin, a * sin + b * cos], dim=1)
+Kr = rope(K)
+post = rel(quant(Kr, 3, 0, 32), Kr)                 <span class="cm"># quantize the rotated keys</span>
+pre = rel(rope(quant(K, 3, 0, 32)), Kr)             <span class="cm"># quantize first, rotate after</span>
+print(f"3-bit per-channel key error: post-RoPE {post:.3f}, pre-RoPE {pre:.3f}")
+
+<span class="cm"># 4) dense-and-sparse: keep the 1% largest |values| in full precision</span>
+<span class="kw2">def</span> dense_sparse(X, bits, dim, G, frac=0.01):
+    thr = X.abs().flatten().kthvalue(int((1 - frac) * X.numel())).values
+    mask = X.abs() &gt; thr                            <span class="cm"># the sparse outliers</span>
+    Xd = quant(torch.where(mask, torch.zeros_like(X), X), bits, dim, G)
+    <span class="kw2">return</span> torch.where(mask, X, Xd), mask.float().mean().item()
+Vds, f = dense_sparse(V, 2, 1, 32)
+print(f"2-bit V per-token error {rel(quant(V, 2, 1, 32), V):.3f}, "
+      f"with {100 * f:.1f}% outliers kept {rel(Vds, V):.3f}")</pre>
+<p>Output (PyTorch 2.8, CPU):</p>
+<pre class="code">K per-token   V per-token   output error: 2-bit 1.205, 4-bit 0.343
+K per-token   V per-channel output error: 2-bit 1.385, 4-bit 0.350
+K per-channel V per-token   output error: 2-bit 0.592, 4-bit 0.115
+K per-channel V per-channel output error: 2-bit 0.758, 4-bit 0.117
+K: quantized 384 residual 116 | V: quantized 372 residual 128
+KIVI-2 output error 0.563, average bits 6.17
+3-bit per-channel key error: post-RoPE 0.138, pre-RoPE 0.111
+2-bit V per-token error 0.394, with 1.0% outliers kept 0.315</pre>
+<p>Read the results. (1) Keys per channel halve the output error at 2 bits and cut it 3× at 4 bits; the value choice matters less here, but per-token is better at 2 bits. (2) The streaming cache holds 384 keys in 3 quantized blocks of 128 and 116 in the buffer, while values have 372 quantized and exactly 128 in the queue: the two boundaries differ, as in Figure 2. At only 500 tokens the residual dominates the cost (6.17 bits); at 32k it would be about 3.05. (3) Pre-RoPE quantization lowers the key error from 0.138 to 0.111. (4) Keeping 1% of values exact lowers their error by 20%. The errors are large because Gaussian toy data at 2 bits is a hard case; real caches have more structure. [Certain for the printed numbers, run twice with identical output]</p>
+<aside class="note side"><span class="nt">In libraries</span>Hugging Face transformers has a <code>QuantizedCache</code>, enabled with <code>cache_implementation="quantized"</code>, with the backends <code>quanto</code> (int2, int4), <code>hqq</code> (int1 to int8) and <code>fp8</code>; its group-wise backends take <code>residual_length</code>, <code>q_group_size</code> and the key and value axes, which are the KIVI parameters. [Certain, from the transformers docs] Its docs warn that a quantized cache can be slower at short context when memory is not the problem.</aside>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Why the cache must shrink</th><th>Typical choice</th></tr></thead><tbody>
+<tr><td>High-throughput chat serving</td><td>Batch size is limited by \(\sum_i T_i \cdot s\), formula (110.1)</td><td>FP8 cache (vLLM, TensorRT-LLM) as a safe first step; 4-bit with care [Likely]</td></tr>
+<tr><td>Long-document QA, RAG over long contexts</td><td>One prompt of 32k–128k tokens can need as much memory as the weights</td><td>KIVI-4 or KVQuant-3/4; test with RULER at the real length</td></tr>
+<tr><td>Agents with long tool traces</td><td>Context grows over many steps and must stay exact enough for retrieval</td><td>4-bit with a residual; check multi-key retrieval</td></tr>
+<tr><td>Single-GPU or edge long context</td><td>No second GPU; weights already 4-bit</td><td>KVQuant nuq2/nuq3 with outliers and kernels</td></tr>
+<tr><td>Offloading to CPU memory (FlexGen)</td><td>The cache moves over PCIe; fewer bytes means faster transfer</td><td>4-bit group-wise cache [Certain, survey]</td></tr>
+<tr><td>Video QA, Video-RAG, key-moment detection</td><td>Thousands of frame tokens per video enter the cache (session 80: 64 frames × 576 tokens)</td><td>Combine token pooling with a low-bit cache; test needle-in-the-video tasks</td></tr>
+<tr><td>Streaming video and live captioning</td><td>Unbounded input; old frames are rarely attended but must not be corrupted</td><td>Sliding window + attention-sink tokens in fp16 + low-bit older frames [Speculation]</td></tr>
+<tr><td>VLM image QA with many images</td><td>Each image adds hundreds of visual tokens</td><td>Same rules; check that visual tokens have outlier channels like text [Likely]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Quantizing keys per token</b> because that is how activations are usually done. The outlier channels then destroy every key (Figure 1).</li>
+<li><b>Quantizing values per channel</b> by symmetry with keys. KIVI’s 2-bit test with both per channel gives 0.00 on GSM8K.</li>
+<li><b>Quantizing keys after RoPE</b> when the kernel can rotate on the fly. RoPE spreads the outlier channel over its pair (Figure 3).</li>
+<li><b>Reporting the code width as the bit width.</b> “2-bit” KIVI with \(G = 32\) is 3 bits plus the residual; KVQuant 2-bit with 1% outliers is 2.33 bits. Compare methods at their average bits (110.7).</li>
+<li><b>Trusting perplexity alone.</b> KVQuant 2-bit-1% is +0.33 perplexity but −19.86 RULER points.</li>
+<li><b>Testing at short context.</b> With a 128-token residual, a 200-token test barely touches the quantized part. Test at the real production length.</li>
+<li><b>Quantizing the first token</b> (the attention sink). It is one token, and keeping it exact took KVQuant 2-bit perplexity from 8.47 to 7.23.</li>
+<li><b>Expecting speed without a kernel.</b> Fake quantization (quantize then dequantize in PyTorch) saves no memory traffic. The gain needs kernels that read the low-bit codes.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>When is the KV cache bigger than the weights? Give a number.<span class="lvl">basic</span></summary><div class="ans">When the total number of cached tokens passes \(M_W / s\) (110.1). Llama 3 8B in bfloat16: \(16.06 \times 10^9 / 131{,}072 \approx 122{,}500\) tokens, so one user at 128k, or 32 users at 4k (17.2 GB of cache against 16.1 GB of weights). Llama 2 7B with MHA already crosses at about 25,700 tokens. Long context and big batches both push the cache past the weights.</div></details>
+<details class="qa"><summary>Why are keys quantized per channel and values per token?<span class="lvl">core</span></summary><div class="ans">Keys have a few fixed outlier channels that are large for almost every token. Per-token groups contain these outliers, so their step size is huge and the normal channels collapse to one or two levels; per-channel groups give the outlier channel its own scale. KIVI measured 47.00 vs 9.60 relative attention-score error on Llama-2-13B. Values have no outlier channels, and they enter the output as a probability-weighted sum of rows (110.5); per-token groups keep each important token accurate on its own scale. KIVI measured 3.55 vs 49.89 output error. At 2 bits, only keys-per-channel with values-per-token keeps GSM8K usable (5.76 vs 0.00–0.83 for the others; 12.74 with the full KIVI method).</div></details>
+<details class="qa"><summary>Why does KIVI keep a full-precision residual of recent tokens?<span class="lvl">core</span></summary><div class="ans">Per-channel key groups span \(G\) tokens, but decoding produces one token at a time, so the newest group is incomplete and its range unknown. KIVI keeps up to \(R\) keys in fp16 and quantizes them together when \(R\) have arrived. Values are kept in a queue of the last \(R\) tokens for symmetry and accuracy: the most recent tokens often get much attention, and keeping them exact helps. The cost is \(16R\) bits per channel, which is small at long context: with \(R = 128\), \(G = 32\) the average is 3.41 bits at 4k and 3.05 bits at 32k.</div></details>
+<details class="qa"><summary>A colleague says “2-bit KV cache = 8× smaller than fp16”. Correct them.<span class="lvl">core</span></summary><div class="ans">Count the overhead. Each group of \(G\) numbers stores a 16-bit scale and a 16-bit zero point: \(b + 32/G\) = 3 bits for \(b = 2\), \(G = 32\) (110.3). KIVI also keeps up to 128 tokens in fp16, so the average is \(((T-R) \cdot 3 + 16R)/T\) (110.7): 3.41 bits at 4k, 3.01 at 128k. The real ratio is about 5.3×, not 8×. KVQuant’s 2-bit with 1% outliers averages 2.33 bits (6.9×).</div></details>
+<details class="qa"><summary>Why quantize keys before RoPE? What does it cost?<span class="lvl">core</span></summary><div class="ans">RoPE rotates each channel pair \((a, b)\) by \(t\theta_i\) (110.8). If \(a\) is an outlier channel, after rotation both channels swing between about \(\pm|a|\) over positions, so each column has a large range and per-channel quantization loses its advantage. Stored before RoPE, the outlier column is nearly constant and quantizes well. The cost: the attention kernel must dequantize and apply RoPE at position \(j\) to every cached key in every step (110.9), which KVQuant fuses into its kernel. On LLaMA-7B at 3 bits, perplexity went from 7.05 to 6.23.</div></details>
+<details class="qa"><summary>What is the Fisher-weighted non-uniform data type in KVQuant?<span class="lvl">advanced</span></summary><div class="ans">A set of \(2^b\) levels per layer, learned offline. On calibration data (16 × 2k tokens), keys (per channel) and values (per token) are normalized to \([-1,1]\), and the levels are found by 1-D k-means that minimizes \(\sum_i \mathcal{F}_{ii} (A_i - Q(A_i))^2\) (110.10), where \(\mathcal{F}_{ii}\) is the squared gradient of the loss with respect to \(A_i\), averaged over data. Numbers the loss is sensitive to pull levels toward them. At run time only the per-channel or per-token scale is computed; the levels are a lookup table. It improved 3-bit LLaMA-7B by about 0.29 perplexity over uniform levels.</div></details>
+<details class="qa"><summary>Why is a 2-bit cache with +0.33 perplexity not ready to ship?<span class="lvl">core</span></summary><div class="ans">Perplexity averages over all tokens, and most tokens depend on nearby context, which stays accurate (residual, recent tokens, attention sink). Tasks that need one fact from far back are what break. On LLaMA-2-7B-32K, KVQuant 2-bit with 1% outliers has perplexity 6.01 vs 5.68, but RULER at 32k drops from 56.40 to 36.54 (−35% relative), with multi-value retrieval falling from 55.95 to 16.65. Ship only after needle, multi-key and real long-task tests at production length.</div></details>
+<details class="qa"><summary>Why not use GPTQ or AWQ to quantize the KV cache?<span class="lvl">basic</span></summary><div class="ans">They are offline methods for fixed weight matrices: they solve a small optimization per matrix using calibration data, which takes seconds to minutes. The KV cache is new data for every request and every token, quantized at decode time inside the serving loop. It needs a cheap online rule such as round-to-nearest with min–max scales (KIVI). KVQuant moves the expensive part offline (levels, key thresholds) and keeps the online part cheap.</div></details>
+<details class="qa"><summary>How can a kernel compute attention on quantized keys and values without dequantizing every number?<span class="lvl">advanced</span></summary><div class="ans">Expand the products (110.6). With per-channel key scales \(s_i\) and zero points \(z_i\): \(\mathbf{q} \cdot \hat{\mathbf{k}}_j = \sum_i (q_i s_i) c_{j,i} + \sum_i q_i z_i\): multiply the scales into the query once, and the second term is one number for all tokens. With per-token value scales: \(\sum_j p_j \hat{\mathbf{v}}_j = \sum_j (p_j s_j) \mathbf{c}_j + (\sum_j p_j z_j)\mathbf{1}\): fold the scales into the probabilities. With groups, one such correction per group. The inner loop then works on integer codes, and the memory traffic is the low-bit codes, which is where the decode speedup comes from.</div></details>
+<details class="qa"><summary>Why does KVQuant keep the first token in fp16, and the 1% outliers per vector?<span class="lvl">advanced</span></summary><div class="ans">The first token is usually an attention sink: many heads put a large probability on it, so any error in its key or value is amplified in (110.5). Keeping one token exact costs almost nothing and improved 2-bit LLaMA-7B perplexity from 8.47 to 7.23. The outliers: a few very large numbers set the range of a group; removing the top 1% per channel (keys) or per token (values) into a sparse fp16 store shrinks the range of the rest (110.11). Per-vector thresholds work better than one per matrix (5.75 vs 5.85 at 3 bits). The price is about 0.33 extra bits and a CPU top-k for values.</div></details>
+<details class="qa"><summary>KIVI or KVQuant or FP8 for a new production service?<span class="lvl">advanced</span></summary><div class="ans">Start from the need. If the cache is only somewhat too big, an FP8 cache is the safe first step: built into vLLM, simple per-tensor scales, 2× smaller. If you need 4–5× and want no calibration, KIVI-style 4-bit (or 2-bit with long-context tests) with \(G = 32\), \(R = 128\) is easy to integrate. If you need 3 bits or below at very long context, KVQuant’s pieces (pre-RoPE keys, nuq levels, 1% outliers, fp16 sink) give the best accuracy per bit but need calibration and custom kernels. In every case, decide with RULER-style tests at production length, and check the real kernel speed, not fake quantization.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Compute the average bits of KIVI-2 with \(G = 64\) and \(R = 128\) at \(T = 8192\). How much smaller than bfloat16 is the cache?</li>
+<li>Llama 3 70B (\(s = 327{,}680\) bytes in bfloat16, 141.1 GB of weights in 16 bits, 35.3 GB in 4 bits) serves 16 users at 32,768 tokens with KIVI-2 (\(G = 32\), \(R = 128\)). How big is the cache? Does it fit on 2 × 80 GB with 16-bit weights, or on one 80 GB GPU with 4-bit weights (\(u = 0.9\))?</li>
+<li>Quantize the key row \((0.3, -0.2, 7.9, 0.1)\) to 2 bits per token with (110.2). Give \(s\), the codes and \(\hat x\).</li>
+<li>Check (110.6) by hand: \(\mathbf{q} = (2, 1)\), per-channel scales \(s = (0.5, 0.1)\), zero points \(z = (-1, 3)\), codes \(c = (3, 2)\).</li>
+<li>With \(d_h = 128\) and \(\theta_i = 10000^{-2i/d_h}\), how many full turns does RoPE pair \(i = 0\) make over 32,768 positions? And pair \(i = 63\)?</li>
+<li>From Figure 4: compute the relative RULER loss (in % of the fp16 average 56.40) for KVQuant-3bit-1%, KIVI-2 and KVQuant-2bit-1%.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(b + 32/G = 2.5\); \(\bar b = (8064 \times 2.5 + 2048)/8192 = 2.71\) bits, so \(16 / 2.71 = 5.9\times\) smaller. 2. \(\bar b = (32{,}640 \times 3 + 2048)/32{,}768 = 3.05\) bits. The bfloat16 cache would be \(327{,}680 \times 32{,}768 \times 16 = 171.8\) GB; KIVI-2 makes it \(171.8 \times 3.05/16 = 32.8\) GB. With 16-bit weights: \(141.1 + 32.8 = 173.9 \gt 144\) GB, does not fit. With 4-bit weights on one GPU: \(35.3 + 32.8 = 68.0 \lt 72\) GB, fits. 3. \(z = -0.2\), \(s = 8.1/3 = 2.7\), codes \((0, 0, 3, 0)\), \(\hat x = (-0.2, -0.2, 7.9, -0.2)\): the small channels lose their values (errors 0.5 and 0.3). 4. \(\hat{\mathbf{k}} = (0.5 \cdot 3 - 1,\ 0.1 \cdot 2 + 3) = (0.5, 3.2)\), \(\mathbf{q} \cdot \hat{\mathbf{k}} = 1 + 3.2 = 4.2\). Folded: \((q \odot s) \cdot c = (1, 0.1) \cdot (3, 2) = 3.2\), plus \(\mathbf{q} \cdot z = -2 + 3 = 1\): 4.2. 5. Pair 0: \(\theta = 1\), \(32{,}768 / 2\pi \approx 5{,}215\) turns. Pair 63: \(\theta = 10000^{-126/128} \approx 1.155 \times 10^{-4}\), \(32{,}768 \times 1.155 \times 10^{-4} / 2\pi \approx 0.60\) turns. 6. KVQuant-3bit-1%: \(2.75 / 56.40 = 4.9\%\). KIVI-2: \(16.62 / 56.40 = 29.5\%\). KVQuant-2bit-1%: \(19.86 / 56.40 = 35.2\%\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>The cache passes the weights when the total cached tokens reach \(M_W / s\): about 122k tokens for Llama 3 8B, 26k for Llama 2 7B (110.1). Then the bits per cached number are the main lever.</li>
+<li>Keys have fixed outlier channels: quantize them per channel. Values have none and enter the output as weighted rows: quantize them per token (KIVI). The other three combinations fail at 2 bits.</li>
+<li>Count real bits: \(b + 32/G\) per group, plus the fp16 residual (110.3, 110.7). “2-bit” KIVI is about 3.05 bits at 32k.</li>
+<li>KIVI streams: keys wait in an fp16 buffer of \(R\) tokens and are quantized in blocks; values leave an fp16 queue one by one. No calibration.</li>
+<li>KVQuant: pre-RoPE keys (rotate after dequantization), Fisher-weighted non-uniform levels, 1% per-vector outliers in fp16, and an fp16 first token. 3.33 bits with +0.07 perplexity on LLaMA-7B.</li>
+<li>Per-channel key scales fold into the query and per-token value scales into the probabilities, so kernels can work on codes (110.6).</li>
+<li>Judge a quantized cache by long-context tasks at production length (passkey, RULER, your own long tasks), not by perplexity: +0.33 perplexity was −35% on RULER.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ z = \min X, \quad s = \frac{\max X - \min X}{2^b - 1}, \quad \hat x = s \cdot \operatorname{round}\!\Big(\frac{x - z}{s}\Big) + z, \qquad \bar b = b + \frac{32}{G} \]</div>
+<div class="eq">\[ \bar b(T) = \frac{(T - R)(b + 32/G) + 16 R}{T}, \qquad M_{\text{KV}} = 2 L\, n_{kv}\, d_h\, \frac{\bar b}{8} \sum_i T_i \]</div>
+<div class="eq">\[ \mathbf{q} \cdot \hat{\mathbf{k}}_j = \sum_i (q_i s_i)\, c_{j,i} + \sum_i q_i z_i, \qquad Q^{*} = \argmin_Q \sum_i \mathcal{F}_{ii} (A_i - Q(A_i))^2 \]</div>
+<h2 class="plain" id="kv-cache-quantization-kivi-and-kvquant-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Liu et al. (2024). <a href="https://arxiv.org/abs/2402.02750" target="_blank" rel="noopener">KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache</a></li><li>Hooper et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization&amp;quot;" target="_blank" rel="noopener">KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Liu et al. (2024). <a href="https://arxiv.org/abs/2402.02750" target="_blank" rel="noopener">KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache</a></li><li>Hooper et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization&amp;quot;" target="_blank" rel="noopener">KVQuant: Towards 10 Million Context Length LLM Inference with KV Cache Quantization</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Sheng et al. (2023). <a href="https://arxiv.org/abs/2303.06865" target="_blank" rel="noopener">FlexGen: High-Throughput Generative Inference of Large Language Models with a Single GPU</a></li><li>Zhao et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Atom: Low-bit Quantization for Efficient and Accurate LLM Serving&amp;quot;" target="_blank" rel="noopener">Atom: Low-bit Quantization for Efficient and Accurate LLM Serving</a></li><li>Ashkboos et al. (2024). <a href="https://arxiv.org/abs/2404.00456" target="_blank" rel="noopener">QuaRot: Outlier-Free 4-Bit Inference in Rotated LLMs</a></li><li>Hsieh et al. (2024). <a href="https://arxiv.org/abs/2404.06654" target="_blank" rel="noopener">RULER: What’s the Real Context Size of Your Long-Context Language Models?</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Dettmers et al. (2022). <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</a></li><li>Frantar et al. (2022). <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</a></li><li>Bai et al. (2023). <a href="https://arxiv.org/abs/2308.14508" target="_blank" rel="noopener">LongBench: A Bilingual, Multitask Benchmark for Long Context Understanding</a></li><li>Hugging Face (2025). <a href="https://huggingface.co/docs/transformers/main/en/kv_cache" target="_blank" rel="noopener">Transformers documentation: cache strategies (QuantizedCache)</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html"><small>Previous · session 109</small>Rotations against outliers: QuIP, QuIP#, QuaRot, SpinQuant</a><a class="next" href="../inference/quantization-aware-training-fake-quant-ste-llm.html"><small>Next · session 111</small>Quantization-aware training: fake quant, STE, LLM-QAT, QLoRA, LoftQ</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="kv-cache-quantization-kivi-and-kvquant"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const comma=n=>Math.round(n).toLocaleString("en-US");
+const T_=(x,y,s,o)=>`<text x="${x}" y="${y}" ${o||""}>${s}</text>`;
+function segInit(seg,attr,cb){seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+const segVal=(seg,attr)=>{const b=seg.querySelector('button[aria-pressed="true"]');return b?b.dataset[attr]:null;};
+const fmt=x=>x>=100?x.toFixed(0):x>=10?x.toFixed(1):x.toFixed(2);
+/* min-max round-to-nearest of one group, formula (110.2) */
+function qgroup(xs,bits){let mn=Infinity,mx=-Infinity;for(const x of xs){if(x<mn)mn=x;if(x>mx)mx=x;}let s=(mx-mn)/(Math.pow(2,bits)-1);if(s===0)s=1;return xs.map(x=>Math.floor((x-mn)/s+0.5)*s+mn);}
+const norm=a=>Math.sqrt(a.reduce((t,x)=>t+x*x,0));
+const relErr=(a,b)=>{let n=0,d=0;for(let i=0;i<a.length;i++){n+=(a[i]-b[i])**2;d+=b[i]**2;}return Math.sqrt(n/d);};
+
+/* ---------- Figure 1: per-token vs per-channel ---------- */
+(function(){
+ const svg=$("#kq-gran-svg");if(!svg)return;const info=$("#kq-gran-info");
+ const K1=[[0,5.2,-0.2,-0.5,-0.3,-0.6,-4,0.8],[-0.3,4.6,0.3,0.2,0.1,-0.6,-4,0.4],[-0.8,4.7,-1.1,-0.8,-1.1,-0.1,-4.8,0.2],[0.1,4.9,-1.5,-0.3,0,0.1,-4.9,-0.3],[-0.6,4.5,0.6,-0.5,0,0.5,-4.4,-0.1],[0.1,5,-0.7,0,0.8,-0.9,-3.5,0.1],[-0.4,6.2,0.5,-0.7,0,0.3,-4.1,0.4],[0,5.4,0.9,-0.4,0.1,-0.3,-3.9,-0.7],[-0.3,4.9,0.5,0.7,-0.8,-0.5,-3.6,-1.2],[-0.3,4.9,0.8,0.4,-0.2,-0.2,-4.2,0.9],[-0.3,4.8,0.2,-0.1,-0.1,-0.7,-4,-0.3],[0.7,5.4,0,0.4,-0.2,0.6,-4,0.4]];
+ const V1=[[-1.3,0.3,-1.7,-2,-0.3,-0.9,0.2,2.2],[-0.8,-0.6,0.2,0.5,-0.2,-0.2,0.7,0.5],[-1,-0.1,0,-1.1,0.3,-0.9,1,0.2],[0.4,-2.4,-0.5,-8,-4.5,1.5,-8.5,3.4],[-1.7,0.8,-0.8,0.8,0.1,-1.5,1.2,1.4],[-0.1,-0.3,-0.2,-1,1.1,-0.5,-0.1,-0.8],[-0.6,-1.3,1.3,-0.2,1,0,-0.7,-0.3],[-0.6,0,-0.4,-0.3,-1.4,-0.8,1.7,-0.7],[-1.1,0.3,1.4,-1.5,-0.2,-0.6,-1.8,0.7],[-0.1,0.2,-2.3,1.4,-1.6,-0.4,-3.3,-3.6],[1.3,-0.5,0.3,0,-0.4,-0.5,0.6,-0.3],[-0.2,0,1.2,0.7,0.4,-0.6,-1.4,0.9]];
+ const Q1=[1,-0.1,0.5,0.8,0.8,0.9,-0.5,1.5];
+ const T=12,D=8,sq=Math.sqrt(D);
+ const sb=$("#kq-gran-b"),sk=$("#kq-gran-k"),sv=$("#kq-gran-v");
+ function quantM(M,bits,mode){const out=M.map(r=>r.slice());
+  if(mode==="tok"){for(let j=0;j<T;j++)out[j]=qgroup(M[j],bits);}
+  else{for(let i=0;i<D;i++){const col=qgroup(M.map(r=>r[i]),bits);for(let j=0;j<T;j++)out[j][i]=col[j];}}
+  return out;}
+ const scores=M=>M.map(r=>r.reduce((t,x,i)=>t+x*Q1[i],0)/sq);
+ const outp=(p,M)=>{const o=new Array(D).fill(0);for(let j=0;j<T;j++)for(let i=0;i<D;i++)o[i]+=p[j]*M[j][i];return o;};
+ const flat=M=>[].concat(...M);
+ const S0=scores(K1),P0=B.softmax(S0),O0=outp(P0,V1);
+ function map(M,Mq,x0,y0,col,mode,title){const c=20;let g=T_(x0+D*c/2,y0-26,title,'text-anchor="middle" font-size="13.5" font-weight="700" class="svgt"');
+  for(let i=0;i<D;i++)g+=T_(x0+i*c+c/2,y0-8,i+1,'text-anchor="middle" font-size="10.5" class="svgs"');
+  for(let j=0;j<T;j++){g+=T_(x0-6,y0+j*c+14,j+1,'text-anchor="end" font-size="10.5" class="svgs"');
+   for(let i=0;i<D;i++){const e=Math.abs(Mq[j][i]-M[j][i]);const op=Math.max(0.04,Math.min(1,e/1.5));
+    g+=`<rect x="${x0+i*c+1}" y="${y0+j*c+1}" width="${c-2}" height="${c-2}" rx="3" fill="${col}" opacity="${op.toFixed(3)}"/>`;}}
+  if(mode==="tok")for(let j=0;j<T;j++)g+=`<rect x="${x0}" y="${y0+j*c}" width="${D*c}" height="${c}" fill="none" stroke="var(--ink2)" stroke-width="0.9" rx="2"/>`;
+  else for(let i=0;i<D;i++)g+=`<rect x="${x0+i*c}" y="${y0}" width="${c}" height="${T*c}" fill="none" stroke="var(--ink2)" stroke-width="0.9" rx="2"/>`;
+  g+=T_(x0+D*c/2,y0+T*c+16,"channel →  (frames = one scale)",'text-anchor="middle" font-size="11" class="svgs"');
+  return g;}
+ function draw(){
+  const bits=+segVal(sb,"b"),km=segVal(sk,"k"),vm=segVal(sv,"v");
+  const Kq=quantM(K1,bits,km),Vq=quantM(V1,bits,vm);
+  const S1=scores(Kq),P1=B.softmax(S1),O1=outp(P1,Vq);
+  const ke=relErr(flat(Kq),flat(K1)),se=relErr(S1,S0),ve=relErr(flat(Vq),flat(V1)),oe=relErr(O1,O0);
+  let g=map(K1,Kq,90,44,"var(--k)",km,`keys K, ${km==="tok"?"per token":"per channel"}: error`)+map(V1,Vq,400,44,"var(--v)",vm,`values V, ${vm==="tok"?"per token":"per channel"}: error`);
+  g+=T_(60,40,"token",'text-anchor="end" font-size="10.5" class="svgs"');
+  // attention bars
+  const bx=90,by=392,bh=62,bw=38;const pm=Math.max(...P0,...P1);
+  g+=T_(bx-8,by-bh+4,"p",'text-anchor="end" font-size="12" font-style="italic" class="svgs"');
+  for(let j=0;j<T;j++){const x=bx+j*bw;const h0=bh*P0[j]/pm,h1=bh*P1[j]/pm;
+   g+=`<rect x="${x+6}" y="${(by-h1).toFixed(1)}" width="${bw-12}" height="${h1.toFixed(1)}" rx="2" fill="var(--q)" opacity="0.8"/><rect x="${x+6}" y="${(by-h0).toFixed(1)}" width="${bw-12}" height="${h0.toFixed(1)}" rx="2" fill="none" stroke="var(--ink)" stroke-width="1.4"/>`;}
+  g+=`<line x1="${bx}" y1="${by}" x2="${bx+T*bw}" y2="${by}" stroke="var(--muted)"/>`;
+  g+=T_(bx+T*bw+8,by-40,"outline: exact keys",'font-size="11" class="svgs"')+T_(bx+T*bw+8,by-24,"filled: quantized",'font-size="11" class="svgs"')+T_(bx+T*bw+8,by-8,"tokens 1–12",'font-size="11" class="svgs"');
+  svg.innerHTML=g;
+  info.dataset.kerr=ke.toFixed(4);info.dataset.serr=se.toFixed(4);info.dataset.verr=ve.toFixed(4);info.dataset.oerr=oe.toFixed(4);
+  info.innerHTML=`${bits}-bit, keys ${km==="tok"?"per token":"per channel"}, values ${vm==="tok"?"per token":"per channel"}. Relative errors: keys <b>${ke.toFixed(3)}</b>, attention scores <b>${se.toFixed(3)}</b>, values <b>${ve.toFixed(3)}</b>, attention output <b>${oe.toFixed(3)}</b>.<br>`+
+   (km==="tok"?"Every key row contains the outlier channels (about −5 to +6), so the normal channels share a step of "+(10/(Math.pow(2,bits)-1)).toFixed(2)+" and are lost.":"Each channel has its own scale: the outlier channels get large steps, the normal channels keep fine steps.")+
+   (vm==="ch"?" Tokens 4 and 10 set the range of every value column, so the other tokens get a coarse grid.":" Each value token has its own scale; only tokens 4 and 10 get coarse steps.");}
+ [[sb,"b"],[sk,"k"],[sv,"v"]].forEach(([s,a])=>segInit(s,a,draw));draw();
+})();
+
+/* ---------- Figure 2: KIVI streaming cache ---------- */
+(function(){
+ const svg=$("#kq-stream-svg");if(!svg)return;const info=$("#kq-stream-info");
+ const Rr=4,P=6,N=14;const x0=86,cw=47,ky=70,vy=150,h=40;
+ function draw(i){
+  const t=P+i;const kq=Math.floor(t/Rr)*Rr,kr=t%Rr,vq=Math.max(0,t-Rr),vr=Math.min(t,Rr);
+  let g=T_(x0-14,ky+25,"K",'text-anchor="end" font-size="15" font-weight="700" class="svgt"')+T_(x0-14,vy+25,"V",'text-anchor="end" font-size="15" font-weight="700" class="svgt"');
+  for(let j=0;j<N;j++){const x=x0+j*cw;const has=j<t;
+   if(!has){g+=`<rect x="${x+2}" y="${ky}" width="${cw-4}" height="${h}" rx="5" fill="none" stroke="var(--rule)" stroke-dasharray="3 3"/><rect x="${x+2}" y="${vy}" width="${cw-4}" height="${h}" rx="5" fill="none" stroke="var(--rule)" stroke-dasharray="3 3"/>`;}
+   else{const kQ=j<kq,vQ=j<vq;const isNew=j===t-1&&i>0;
+    g+=`<rect x="${x+2}" y="${ky}" width="${cw-4}" height="${h}" rx="5" fill="${kQ?"var(--k)":"var(--card)"}" stroke="${kQ?"none":"var(--ink2)"}" stroke-width="1.4"/>`+T_(x+cw/2,ky+25,kQ?"2b":"16",`text-anchor="middle" font-size="12" ${kQ?'fill="var(--card)" font-weight="700"':'class="svgs"'}`);
+    g+=`<rect x="${x+2}" y="${vy}" width="${cw-4}" height="${h}" rx="5" fill="${vQ?"var(--v)":"var(--card)"}" stroke="${vQ?"none":"var(--ink2)"}" stroke-width="1.4"/>`+T_(x+cw/2,vy+25,vQ?"2b":"16",`text-anchor="middle" font-size="12" ${vQ?'fill="var(--card)" font-weight="700"':'class="svgs"'}`);
+    if(isNew)g+=`<rect x="${x}" y="${ky-4}" width="${cw}" height="${vy+h-ky+8}" rx="7" fill="none" stroke="var(--q)" stroke-width="2.2"/>`;}
+   g+=T_(x+cw/2,vy+h+18,j+1,'text-anchor="middle" font-size="11.5" class="svgs"');}
+  for(let k=0;k<kq;k+=Rr){const xa=x0+k*cw+4,xb=x0+(k+Rr)*cw-4;g+=`<path d="M${xa} ${ky-8} V${ky-16} H${xb} V${ky-8}" fill="none" stroke="var(--k)" stroke-width="1.6"/>`+T_((xa+xb)/2,ky-21,"group: 4 tokens × each channel",'text-anchor="middle" font-size="10.5" class="svgs"');}
+  if(vr>0){const xa=x0+vq*cw+2,xb=x0+t*cw-2;g+=`<path d="M${xa} ${vy+h+26} V${vy+h+32} H${xb} V${vy+h+26}" fill="none" stroke="var(--ink2)" stroke-width="1.4"/>`+T_((xa+xb)/2,vy+h+44,"value queue (last R = 4, fp16)",'text-anchor="middle" font-size="10.5" class="svgs"');}
+  g+=T_(x0+N*cw/2,vy+h+62,"token position →",'text-anchor="middle" font-size="11" class="svgs"');
+  svg.innerHTML=g;
+  const bits=((kq+vq)*3+(kr+vr)*16)/(2*t);
+  info.dataset.t=String(t);info.dataset.kq=String(kq);info.dataset.kr=String(kr);info.dataset.vq=String(vq);info.dataset.vr=String(vr);info.dataset.bits=bits.toFixed(3);
+  const msg=i===0?`<b>Prefill of ${P} tokens.</b> Attention uses the exact K and V; then the cache is stored. Keys 1–4 form one full group and are quantized per channel; keys 5–6 wait in the buffer. Values 1–2 are quantized per token; values 3–6 stay in the fp16 queue.`
+   :(kr===0?`<b>Token ${t} arrives.</b> The key buffer now holds R = 4 keys, so keys ${t-3}–${t} are quantized together, per channel, and the buffer is empty again.`:`<b>Token ${t} arrives.</b> Its key joins the buffer (${kr} of 4). Its value enters the queue, and value ${t-Rr} leaves the queue and is quantized on its own, per token.`);
+  info.innerHTML=msg+`<br>Keys: <b>${kq}</b> quantized, <b>${kr}</b> fp16. Values: <b>${vq}</b> quantized, <b>${vr}</b> fp16. If the codes were 2-bit with G = 32 (3 bits with scales), the average would be <b>${bits.toFixed(2)}</b> bits per number (110.7); with R = 128 and 32k tokens it is 3.05.`;}
+ B.stepper({n:N-P+1,prev:$("#kq-stream-prev"),next:$("#kq-stream-next"),play:$("#kq-stream-play"),label:$("#kq-stream-lab"),ms:2200,onStep:draw});
+})();
+
+/* ---------- Figure 3: pre-RoPE vs post-RoPE ---------- */
+(function(){
+ const svg=$("#kq-rope-svg");if(!svg)return;const info=$("#kq-rope-info");
+ const NA=[0.82,-1.02,0.17,-0.23,-0.18,-0.09,-0.81,-0.09,-0.35,1.33,0.09,-0.14,-0.11,-0.27,-0.42,-0.16,0.19,-0.1,0.38,-0.08,0.01,0.62,0.22,-0.2,-0.07,0.22,0.77,-0.11,-0.1,0.4,-0.35,-0.12,0.35,0.23,0.04,0.27,-1.13,0.41,-0.38,-0.67,0.11,0.28,-0.18,-0.43,0.01,-0.02,0.56,0.3,0.08,0.44,-0.08,-0.37,0.23,0.23,-0.09,-0.31,0.09,-1.0,0.28,0.2,-0.66,0.02,-0.39,0.3];
+ const NB=[-0.81,-0.37,0.28,0.46,-0.86,-0.2,0.13,-0.24,0.64,-0.48,0.14,-0.42,0.56,-0.01,-0.15,-0.69,0.67,0.3,0.3,0.46,0.14,-0.26,-0.32,-0.32,0.55,-0.58,-0.24,-0.13,0.09,0.23,-0.5,-0.69,0,0.49,0.3,0.09,-0.13,0.12,-0.1,0.33,-0.32,0.05,-0.04,0.22,0.09,1.02,0.6,0.6,-0.82,-0.14,-0.24,0.21,-0.91,0.47,0.43,-0.52,-0.39,-0.32,0.02,0.26,0.82,-0.08,0.31,0.06];
+ const T=64,A=NA.map(x=>5+x),Bv=NB.slice();
+ const si=$("#kq-rope-i"),iv=$("#kq-rope-iv"),sb=$("#kq-rope-b");
+ function levels(xs,bits){const mn=Math.min(...xs),mx=Math.max(...xs),n=Math.pow(2,bits);const out=[];for(let k=0;k<n;k++)out.push(mn+k*(mx-mn)/(n-1));return out;}
+ function panel(x0,a,b,title,lv){const W=270,y0=34,y1=244;const Y=v=>y0+(y1-y0)*(7-v)/14;const X=t=>x0+W*t/(T-1);
+  let g=T_(x0+W/2,20,title,'text-anchor="middle" font-size="13.5" font-weight="700" class="svgt"');
+  g+=`<rect x="${x0}" y="${y0}" width="${W}" height="${y1-y0}" fill="none" stroke="var(--rule)"/>`;
+  [-5,0,5].forEach(v=>{g+=T_(x0-5,Y(v)+4,v,'text-anchor="end" font-size="10.5" class="svgs"');});
+  g+=`<line x1="${x0}" y1="${Y(0)}" x2="${x0+W}" y2="${Y(0)}" stroke="var(--rule)" stroke-dasharray="2 3"/>`;
+  lv.forEach(v=>{g+=`<line x1="${x0}" y1="${Y(v).toFixed(1)}" x2="${x0+W}" y2="${Y(v).toFixed(1)}" stroke="var(--k)" stroke-width="0.8" opacity="0.55"/>`;});
+  for(let t=0;t<T;t++){g+=`<circle cx="${X(t).toFixed(1)}" cy="${Y(b[t]).toFixed(1)}" r="2.3" fill="var(--v)"/><circle cx="${X(t).toFixed(1)}" cy="${Y(a[t]).toFixed(1)}" r="2.5" fill="var(--k)"/>`;}
+  g+=T_(x0+W/2,y1+16,"position t = 0 … 63",'text-anchor="middle" font-size="11" class="svgs"');
+  return g;}
+ function draw(){
+  const i=+si.value,bits=+segVal(sb,"b");iv.value=String(i);
+  const th=Math.pow(10000,-2*i/128);
+  const ar=[],br=[];for(let t=0;t<T;t++){const c=Math.cos(t*th),s=Math.sin(t*th);ar.push(A[t]*c-Bv[t]*s);br.push(A[t]*s+Bv[t]*c);}
+  const pa=qgroup(ar,bits),pb=qgroup(br,bits);
+  const qa=qgroup(A,bits),qb=qgroup(Bv,bits);const ra=[],rb=[];for(let t=0;t<T;t++){const c=Math.cos(t*th),s=Math.sin(t*th);ra.push(qa[t]*c-qb[t]*s);rb.push(qa[t]*s+qb[t]*c);}
+  const ref=Math.sqrt(ar.reduce((u,x,k)=>u+x*x+br[k]*br[k],0));
+  const post=Math.sqrt(pa.reduce((u,x,k)=>u+(x-ar[k])**2+(pb[k]-br[k])**2,0))/ref;
+  const pre=Math.sqrt(ra.reduce((u,x,k)=>u+(x-ar[k])**2+(rb[k]-br[k])**2,0))/ref;
+  const rgPre=Math.max(...A)-Math.min(...A),rgPost=Math.max(...ar)-Math.min(...ar);const turns=th*(T-1)/(2*Math.PI);
+  svg.innerHTML=panel(40,A,Bv,"before RoPE (stored by KVQuant)",levels(A,bits))+panel(350,ar,br,`after RoPE, pair ${i}`,levels(ar,bits));
+  info.dataset.post=post.toFixed(4);info.dataset.pre=pre.toFixed(4);info.dataset.range=rgPost.toFixed(2);
+  info.innerHTML=`Pair ${i}: θ = ${th<0.01?th.toExponential(2):th.toFixed(4)} rad per token, ${turns.toFixed(turns<0.1?3:2)} turns over these 64 positions. Range of channel a: <b>${rgPre.toFixed(2)}</b> before RoPE, <b>${rgPost.toFixed(2)}</b> after.<br>${bits}-bit per-channel error of the pair: quantize after RoPE <b>${post.toFixed(3)}</b>, quantize before and rotate after <b>${pre.toFixed(3)}</b>`+(post>1.2*pre?` (${(post/pre).toFixed(1)}× larger after RoPE).`:" (about the same: this pair barely rotates in 64 tokens).");}
+ si.addEventListener("input",draw);segInit(sb,"b",draw);draw();
+})();
+
+/* ---------- Figure 4: long-context benchmarks (KVQuant paper, LLaMA-2-7B-32K) ---------- */
+(function(){
+ const svg=$("#kq-bench-svg");if(!svg)return;const info=$("#kq-bench-info"),leg=$("#kq-bench-leg");
+ const ss=$("#kq-bench-s"),sd=$("#kq-bench-d");
+ const COL={fp16:"var(--muted)",kivi:"var(--k)",n4:"var(--q)",n3:"var(--v)",n2:"var(--t6, var(--ink2))"};
+ const NAME={fp16:"fp16",kivi:"KIVI-2 (gs32, r128)",n4:"KVQuant nuq4-1%",n3:"KVQuant 3-bit-1%",n2:"KVQuant 2-bit-1%"};
+ const DATA={
+  pk:{max:1,tasks:["2K","4K","8K","16K","32K"],m:{fp16:[[1,1,1,1,1],16],kivi:[[0.76,0.72,0.72,0.68,0.7],3.05],n4:[[1,1,1,1,1],4.33],n3:[[0.98,1,1,1,1],3.33],n2:[[1,1,0.98,1,1],2.33]}},
+  lb:{max:100,tasks:["NtrvQA","Qasper","MF-en","Hotpot","2Wiki","Musique","GovRep","QMSum","MNews","TREC","TriviQA","SamSum","RBench","LCC","PsgRetr","PsgCnt"],
+   m:{fp16:[[17.96,10.51,33.43,12.55,12.53,6.19,29.65,16.99,22.15,71,87.79,43.97,59.99,62.14,23,1.5],16,31.96],kivi:[[19.25,10.66,24.78,12.48,11.19,6.38,27.05,16.36,23.37,71,80.8,43.93,57.74,60.61,13.58,1.5],3.17,30.04],n3:[[18.87,13.67,30.93,12.07,12.55,6.25,27.1,16.53,16.54,71,87.55,43.95,59.5,61.52,19.5,1.75],3.33,31.21]}},
+  ru:{max:100,tasks:["Niah1","Niah2","Niah3","MKey1","MKey2","MKey3","MValue","MQuery","VT","CWE","FWE","QA1","QA2"],
+   m:{fp16:[[100,99.8,98.6,94,68.2,11,55.95,64.5,37.88,9.64,30.4,31.6,31.6],16,56.40],kivi:[[76,85.6,59.6,72.6,11.4,0,34.7,46.45,39.6,8.26,30.53,24.8,27.6],3.05,39.78],n3:[[99.8,98.8,95.2,92.8,61.6,6.4,47.5,54.45,41.04,8.52,29.33,31,31],3.33,53.65],n2:[[95.4,86.8,49.8,73.6,23.4,0,16.65,22.95,22.52,5.14,24,26.4,28.4],2.33,36.54]}}};
+ function draw(){
+  const key=segVal(ss,"s"),diff=segVal(sd,"d")==="1";const D=DATA[key];const ms=Object.keys(D.m);const nT=D.tasks.length;
+  const avg=m=>D.m[m][2]!=null?D.m[m][2]:D.m[m][0].reduce((a,b)=>a+b,0)/nT;
+  const x0=56,x1=748,y0=34,y1=222;const gw=(x1-x0)/nT;const bwid=Math.min(14,(gw-6)/ms.length);
+  let lo=0,hi=D.max;if(diff){lo=0;hi=0;ms.forEach(m=>D.m[m][0].forEach((v,k)=>{const dv=v-D.m.fp16[0][k];lo=Math.min(lo,dv);hi=Math.max(hi,dv);}));const pad=0.08*(hi-lo||1);lo-=pad;hi+=pad;}
+  const Y=v=>y1-(y1-y0)*(v-lo)/(hi-lo);
+  let g="";
+  const ticks=[];const step=diff?(D.max===1?0.1:10):(D.max===1?0.25:25);for(let v=Math.ceil(lo/step)*step;v<=hi+1e-9;v+=step)ticks.push(+v.toFixed(4));
+  ticks.forEach(v=>{g+=`<line x1="${x0}" y1="${Y(v).toFixed(1)}" x2="${x1}" y2="${Y(v).toFixed(1)}" stroke="var(--rule)" stroke-dasharray="${v===0?"":"2 4"}"/>`+T_(x0-6,(Y(v)+4).toFixed(1),D.max===1?v.toFixed(2):v.toFixed(0),'text-anchor="end" font-size="11" class="svgs"');});
+  D.tasks.forEach((tk,k)=>{const gx=x0+k*gw;const start=gx+(gw-bwid*ms.length)/2;
+   ms.forEach((m,mi)=>{const v=D.m[m][0][k];const val=diff?v-D.m.fp16[0][k]:v;const ya=Y(Math.max(val,0)),yb=Y(Math.min(val,0));
+    if(!(diff&&m==="fp16"))g+=`<rect x="${(start+mi*bwid).toFixed(1)}" y="${ya.toFixed(1)}" width="${(bwid-1.5).toFixed(1)}" height="${Math.max(0.8,yb-ya).toFixed(1)}" fill="${COL[m]}"/>`;});
+   g+=T_((gx+gw/2).toFixed(1),y1+14,tk,`text-anchor="end" font-size="10.5" class="svgs" transform="rotate(-35 ${(gx+gw/2).toFixed(1)} ${y1+14})"`);});
+  g+=`<line x1="${x0}" y1="${Y(0).toFixed(1)}" x2="${x1}" y2="${Y(0).toFixed(1)}" stroke="var(--muted)"/>`;
+  g+=T_(14,(y0+y1)/2,diff?"change vs fp16":(D.max===1?"fraction correct":"score"),`font-size="11.5" class="svgs" transform="rotate(-90 14 ${(y0+y1)/2})" text-anchor="middle"`);
+  svg.innerHTML=g;
+  leg.innerHTML=ms.filter(m=>!(diff&&m==="fp16")).map(m=>`<span style="--c:${COL[m]}">${B.esc(NAME[m])}, ${D.m[m][1]} bits</span>`).join("");
+  const A={};ms.forEach(m=>A[m]=avg(m));
+  info.dataset.avg=ms.map(m=>m+":"+A[m].toFixed(2)).join(",");
+  const nm={pk:"Passkey retrieval",lb:"LongBench",ru:"RULER at 32k"}[key];
+  info.innerHTML=`<b>${nm}</b>, LLaMA-2-7B-32K. Averages: `+ms.map(m=>`${B.esc(NAME[m])} <b>${D.max===1?A[m].toFixed(3):A[m].toFixed(2)}</b>`+(m==="fp16"?"":` (${(A[m]-A.fp16>=0?"+":"")+(D.max===1?(A[m]-A.fp16).toFixed(3):(A[m]-A.fp16).toFixed(2))})`)).join("; ")+"."+
+   (key==="ru"?"<br>Compare perplexity on LLaMA-7B: KVQuant 3-bit-1% is +0.07 and 2-bit-1% is +0.33 above fp16. A small perplexity change can hide a large long-context loss.":key==="pk"?"<br>Passkey is the easiest long-context test: one fact, one place. KIVI-2 misses it about 30% of the time at every length in this run.":"<br>LongBench mixes many tasks; several can be solved from local context, so the averages are close. Look at single tasks such as MF-en and PsgRetr.");}
+ segInit(ss,"s",draw);segInit(sd,"d",draw);draw();
+})();
+
+/* ---------- Figure 5: memory planner ---------- */
+(function(){
+ const svg=$("#kq-plan-svg");if(!svg)return;const info=$("#kq-plan-info");
+ const MOD={l2:{n:"Llama 2 7B",p:6.738e9,L:32,kv:32,dh:128},l3:{n:"Llama 3 8B",p:8.030e9,L:32,kv:8,dh:128},qw:{n:"Qwen2.5 7B",p:7.616e9,L:28,kv:4,dh:128},l70:{n:"Llama 3 70B",p:70.554e9,L:80,kv:8,dh:128}};
+ const FMT={fp16:{n:"BF16",b:16},fp8:{n:"FP8",b:8},k4:{n:"KIVI-4",kb:4},k2:{n:"KIVI-2",kb:2},n4:{n:"KVQuant nuq4-1%",b:4.33},n3:{n:"KVQuant nuq3-1%",b:3.33},n2:{n:"KVQuant nuq2-1%",b:2.33}};
+ const G=32,RR=128,U=0.9;const BV=[1,2,4,8,16,32,64],TV=[4096,8192,16384,32768,65536,131072,262144,524288,1048576];
+ const sm=$("#kq-plan-m"),sg=$("#kq-plan-g"),sf=$("#kq-plan-f"),sw=$("#kq-plan-w"),sb=$("#kq-plan-b"),st=$("#kq-plan-t"),bv=$("#kq-plan-bv"),tv=$("#kq-plan-tv");
+ const bitsAt=(f,T)=>f.kb!=null?(T>RR?((T-RR)*(f.kb+32/G)+16*RR)/T:16):f.b;
+ function draw(){
+  const m=MOD[segVal(sm,"m")],f=FMT[segVal(sf,"f")],gpu=+segVal(sg,"g")*1e9,bw=+segVal(sw,"w"),Bn=BV[+sb.value],T=TV[+st.value];bv.value=String(Bn);tv.value=comma(T);
+  const nPer=2*m.L*m.kv*m.dh;const bb=bitsAt(f,T);const kv=nPer*bb/8*Bn*T,kv16=nPer*2*Bn*T,MW=m.p*bw,budget=U*gpu,room=budget-MW,fits=MW+kv<=budget;
+  let tmax=0;if(room>0){const nums=8*room/(Bn*nPer);tmax=f.kb!=null?Math.max(0,(nums-16*RR)/(f.kb+32/G)+RR):nums/f.b;}
+  const x0=20,Wd=600,y=36,h=44;const top=Math.max(gpu,MW+kv16);const X=v=>x0+Wd*Math.min(v,top)/top;
+  let g=T_(x0,22,`${B.esc(m.n)}, batch ${Bn} × ${comma(T)} tokens, ${B.esc(f.n)} cache`,'font-size="13.5" font-weight="700" class="svgt"');
+  g+=`<rect x="${x0}" y="${y+h+8}" width="${(X(MW+kv16)-x0).toFixed(1)}" height="14" rx="3" fill="var(--rule)"/>`+T_(x0+4,y+h+19,`bfloat16 cache for comparison: ${fmt((MW+kv16)/1e9)} GB total`,'font-size="10.5" class="svgs"');
+  g+=`<rect x="${x0}" y="${y}" width="${(X(MW)-x0).toFixed(1)}" height="${h}" rx="4" fill="var(--muted)"/>`;
+  g+=`<rect x="${X(MW).toFixed(1)}" y="${y}" width="${Math.max(0.8,X(MW+kv)-X(MW)).toFixed(1)}" height="${h}" rx="2" fill="${fits?"var(--v)":"var(--bad)"}"/>`;
+  const xb=X(budget),xg=X(gpu);
+  g+=`<line x1="${xb.toFixed(1)}" y1="${y-8}" x2="${xb.toFixed(1)}" y2="${y+h+26}" stroke="var(--ink)" stroke-width="1.6" stroke-dasharray="5 4"/>`+T_(xb.toFixed(1),y+h+38,`0.9 × GPU = ${fmt(budget/1e9)} GB`,`font-size="11" class="svgt" text-anchor="${xb>x0+Wd-90?"end":"middle"}"`);
+  if(xg<x0+Wd-1)g+=`<line x1="${xg.toFixed(1)}" y1="${y-8}" x2="${xg.toFixed(1)}" y2="${y+h}" stroke="var(--muted)" stroke-width="1"/>`;
+  g+=`<rect x="${x0}" y="150" width="12" height="12" rx="3" fill="var(--muted)"/>`+T_(x0+18,160,`weights ${fmt(MW/1e9)} GB`,'font-size="12" class="svgs"');
+  g+=`<rect x="${x0+150}" y="150" width="12" height="12" rx="3" fill="${fits?"var(--v)":"var(--bad)"}"/>`+T_(x0+168,160,`KV cache ${fmt(kv/1e9)} GB at ${bb.toFixed(2)} bits`,'font-size="12" class="svgs"');
+  g+=T_(x0+400,160,fits?"fits":"does not fit",`font-size="12.5" font-weight="700" fill="${fits?"var(--ok)":"var(--bad)"}"`);
+  svg.innerHTML=g;
+  info.dataset.kv=(kv/1e9).toFixed(3);info.dataset.bits=bb.toFixed(4);info.dataset.fits=String(fits);info.dataset.tmax=String(Math.floor(tmax));
+  info.innerHTML=`Average bits: <b>${bb.toFixed(2)}</b>${f.kb!=null?` (formula 110.7 with G = 32, R = 128)`:f.b===8?" (one scale per tensor)":f.b===16?"":" (reported by KVQuant, outliers and scales included)"}. Cache: 2 × ${m.L} × ${m.kv} × ${m.dh} numbers × ${bb.toFixed(2)}/8 bytes × ${Bn} × ${comma(T)} = <b>${fmt(kv/1e9)} GB</b>, ${(16/bb).toFixed(1)}× smaller than bfloat16 (${fmt(kv16/1e9)} GB).<br>`+
+   (room>0?`Weights + cache = ${fmt((MW+kv)/1e9)} GB of ${fmt(budget/1e9)} GB usable: <b>${fits?"fits":"does not fit"}</b>. Longest context per user at batch ${Bn}: <b>${comma(tmax)}</b> tokens.`:`The weights alone (${fmt(MW/1e9)} GB) exceed the usable ${fmt(budget/1e9)} GB: <b>does not fit</b>. Use more GPUs or 4-bit weights.`);}
+ [[sm,"m"],[sg,"g"],[sf,"f"],[sw,"w"]].forEach(([s,a])=>segInit(s,a,draw));[sb,st].forEach(x=>x.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

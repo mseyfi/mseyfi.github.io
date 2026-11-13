@@ -1,0 +1,486 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Attention operator 1: FlashAttention 1, 2 and 3 · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 124</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="attention-operator-1-flashattention-1-2-and">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="attention-operator-1-flashattention-1-2-and" data-session="attention-operator-1-flashattention-1-2-and" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">124</span><span>Track 5: LLM inference and serving · session 47 of 65</span></div><h1 class="chap-title">Attention operator 1: FlashAttention 1, 2 and 3</h1><p class="chap-sub">Standard attention writes a T×T table of scores to the GPU's main memory and reads it back, and that traffic, not the arithmetic, is what makes it slow. FlashAttention computes attention block by block inside fast on-chip memory, using an online softmax, and recomputes instead of storing in the backward pass. This session builds the algorithm step by step, then shows what FlashAttention-2 (better work split) and FlashAttention-3 (Hopper asynchrony and FP8) changed, and why the results differ slightly from standard attention.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 17 (attention math), 42 (GPU architecture and the roofline) and 123 (runtime profiling)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why standard attention is memory-bound: count its HBM bytes and apply the roofline, with real H100 and A100 numbers</li><li>Online softmax: an exact softmax in one pass over blocks, with a running maximum, a running sum and rescaling</li><li>The FlashAttention forward pass: tiles in SRAM, one fused kernel, O(T) extra memory, and its IO complexity Θ(T²d²/M)</li><li>The backward pass: recompute P from the stored log-sum-exp instead of storing the T×T matrix, and the D = rowsum(dO∘O) trick</li><li>FlashAttention-2: fewer non-matmul FLOPs, parallelism over the sequence, split-Q between warps, causal tile skipping</li><li>FlashAttention-3 on Hopper: warp specialization, ping-pong scheduling, the exponential bottleneck, FP8 with block quantization and incoherent processing</li><li>Numerics: why FlashAttention is exact in math but not bit-identical in floating point, and how to test it</li></ul></div></header><style>
+.fa-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.fa-grid input[type=range]{width:100%}
+.fa-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.fa-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+#fa-io-svg text,#fa-on-svg text,#fa-tile-svg text,#fa-par-svg text,#fa-pp-svg text{font-family:var(--sans)}
+pre.code,code{font-variant-ligatures:none}
+.article p code{overflow-wrap:anywhere}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Attention compares every query with every key. For a sequence of \(T\) tokens, that makes a \(T \times T\) table of scores in every head of every layer. At \(T = 8192\) one such table in BF16 takes 128 MiB; a layer with 32 heads needs 4 GiB of them. Standard attention writes these tables to the GPU’s main memory and reads them back. That traffic, not the arithmetic, is what makes it slow.</p>
+<p>In <a href="../inference/runtime-profiling-where-the-time-goes.html">session 123</a> we saw where the time of a real model goes. The efficient-inference survey of Zhou et al. reports that attention and linear operators together often take more than 75% of inference time, and it names FlashAttention as the fix for the attention part: it “fuses the entire attention operation into a single, memory-efficient operator”. [Certain] This session explains how that single operator works, why it is faster even though it does <b>more</b> arithmetic, and what changed in each version:</p>
+<ul>
+<li><b>FlashAttention</b> (Dao et al., 2022): tiling plus online softmax, so the \(T \times T\) table never goes to main memory; recomputation in the backward pass. Memory becomes linear in \(T\), and the result is <b>exact</b>, not an approximation.</li>
+<li><b>FlashAttention-2</b> (Dao, 2023): the same math, with better work splitting on the GPU. About 2× faster than version 1, up to 73% of the A100’s peak in the forward pass. [Certain]</li>
+<li><b>FlashAttention-3</b> (Shah et al., 2024): rewritten for Hopper GPUs (H100). It overlaps data movement, matrix multiplications and softmax, and adds FP8. Up to 740 TFLOP/s in FP16, about 75% of the H100’s peak. [Certain]</li></ul>
+<p>Every serious training and serving stack uses one of these kernels. PyTorch’s <code>scaled_dot_product_attention</code> dispatches to a FlashAttention kernel when the inputs allow it, and serving engines such as vLLM build their attention on FlashAttention-style kernels. [Likely] Long context for text, many image tokens for VLMs, and thousands of frame tokens for video models all depend on it.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Expect: “Why is FlashAttention faster if it does the same (or more) FLOPs?”, “Explain online softmax”, “What does FlashAttention store for the backward pass?”, “What changed in FlashAttention-2?”, “Why does FlashAttention-3 need Hopper?”, “Is FlashAttention exact?”. Each is answered below, with numbers.</aside>
+
+<h2>Standard attention and its trip to HBM</h2>
+<p>Recall the formula from <a href="../transformers/scaled-dot-product-attention-the-math-and.html">session 17</a>. For one head, with \(Q, K, V \in \R^{T \times d}\):</p>
+<div class="eq">\[ S = \frac{Q K^\top}{\sqrt{d}} \in \R^{T \times T}, \qquad P = \softmax(S) \ \text{(row by row)}, \qquad O = P\, V \in \R^{T \times d} \tag{124.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(T\)</dt><dd>sequence length (number of tokens)</dd>
+<dt>\(d\)</dt><dd>head dimension, usually 64 or 128</dd>
+<dt>\(S\)</dt><dd>the scores: one number per (query, key) pair</dd>
+<dt>\(P\)</dt><dd>the attention probabilities; each row sums to 1</dd>
+<dt>\(O\)</dt><dd>the output: for each query, a weighted average of the value rows</dd></dl>
+<p>A GPU has two kinds of memory that matter here (<a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>). <b>HBM</b> (high-bandwidth memory) is the big main memory: 80 GB on an H100, read at about 3.35 TB/s. <b>SRAM</b> (shared memory, on the chip) is tiny, at most 228 KB per streaming multiprocessor (SM) on an H100, but much faster. [Certain] The FlashAttention paper gives the A100 numbers: 40 to 80 GB of HBM at 1.5 to 2.0 TB/s, and 192 KB of SRAM in each of 108 SMs, with an estimated SRAM bandwidth of about 19 TB/s. [Certain]</p>
+<p>The standard implementation runs three separate GPU programs (<b>kernels</b>), and each kernel reads its input from HBM and writes its output to HBM:</p>
+<div class="algo"><div class="algo-h">Algorithm 1: standard attention (three kernels)</div><ol>
+<li>read \(Q, K\) from HBM; compute \(S = QK^\top/\sqrt d\); <b>write \(S\)</b> (\(T^2\) numbers) to HBM</li>
+<li>read \(S\) from HBM; compute \(P = \softmax(S)\); <b>write \(P\)</b> (\(T^2\) numbers) to HBM</li>
+<li>read \(P\) and \(V\) from HBM; compute \(O = PV\); write \(O\) to HBM</li>
+<li><span class="c">// training also keeps \(P\) (or \(S\)) in HBM for the backward pass: \(O(T^2)\) memory</span></li></ol></div>
+<p>Count the numbers that cross the HBM boundary, with \(b\) bytes per number. \(Q, K, V\) are read once and \(O\) is written once (\(4Td\)), and the two tables are each written once and read once (\(4T^2\)):</p>
+<div class="eq">\[ N_{\text{std}} = b\,\big(4Td + 4T^2\big) \ \text{bytes per head}, \qquad N_{\text{flash}} \approx b \cdot 4Td \tag{124.2} \]</div>
+<p>When \(T\) is much larger than \(d\), the \(4T^2\) term is everything. A fused kernel that keeps \(S\) and \(P\) on the chip only needs the \(4Td\) part (we will refine this later). Real implementations also add masking and dropout kernels, each one another full pass over a \(T^2\) table, so (124.2) is the best case for standard attention.</p>
+<p>To turn bytes into time, use the <b>roofline</b> rule from <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a>: a kernel takes at least as long as its arithmetic and at least as long as its memory traffic.</p>
+<div class="eq">\[ t_{\text{kernel}} \ge \max\!\left( \frac{F}{\pi},\ \frac{N}{\beta} \right) \tag{124.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(F\)</dt><dd>floating-point operations (FLOPs) of the kernel: \(2T^2 d\) for each of the two matrix multiplications</dd>
+<dt>\(\pi\)</dt><dd>peak compute: 989 TFLOP/s on an H100 SXM with BF16 tensor cores, 312 on an A100</dd>
+<dt>\(N\)</dt><dd>bytes moved to and from HBM</dd>
+<dt>\(\beta\)</dt><dd>HBM bandwidth: 3.35 TB/s on an H100 SXM, 2.039 TB/s on an A100 SXM 80 GB</dd></dl>
+<div class="worked"><div class="wt">Worked example: one head at T = 8192 on an H100</div>
+<p>Take \(d = 128\), BF16 (\(b = 2\)). The two matrix multiplications have \(4T^2d = 34.4\) GFLOP, which needs at least \(34.4 \times 10^9 / 989 \times 10^{12} = 34.7\) µs.</p>
+<p>Standard attention moves \(2(4Td + 4T^2) = 545.3\) MB. Kernel by kernel with (124.3): \(QK^\top\) needs 41.3 µs of memory time against 17.4 µs of compute; softmax needs 80.1 µs and almost no compute; \(PV\) again 41.3 µs. All three are <b>memory-bound</b>. Total: <b>162.8 µs</b>.</p>
+<p>A fused kernel moves only \(2 \cdot 4Td = 8.39\) MB (2.5 µs), so it is <b>compute-bound</b> at 34.7 µs. That is 4.68× faster, with the same FLOPs. The real gain is smaller, because no kernel reaches peak compute. Try other lengths and GPUs in Figure 1.</p></div>
+<figure class="fig" id="fa-io"><div class="fig-body">
+<div class="fa-grid">
+<label for="fa-io-t">Sequence length \(T\)</label><input type="range" id="fa-io-t" min="9" max="17" step="1" value="13"><output id="fa-io-tv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="seg" id="fa-io-d"><button type="button" data-v="64" aria-pressed="false">d = 64</button><button type="button" data-v="128" aria-pressed="true">d = 128</button><button type="button" data-v="256" aria-pressed="false">d = 256</button></span>
+<span class="seg" id="fa-io-g"><button type="button" data-v="a100" aria-pressed="false">A100</button><button type="button" data-v="h100" aria-pressed="true">H100</button></span>
+<label class="sl"><input type="checkbox" id="fa-io-rr"> K, V re-reads miss the L2 cache (\(B_r = 128\))</label></div>
+<div class="scroll-x"><svg id="fa-io-svg" viewBox="0 0 640 210" role="img" aria-label="Roofline time of standard attention kernels and of one fused attention kernel"></svg></div>
+<div class="fa-leg"><span style="--c:var(--k)">memory-bound part</span><span style="--c:var(--q)">compute-bound part</span></div>
+<div class="readout" id="fa-io-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Roofline estimate (124.3) for one attention head in BF16: three standard kernels against one fused kernel. Each bar is the lower bound \(\max(F/\pi, N/\beta)\); its color shows which limit wins.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Move \(T\) up: the standard bars grow like \(T^2\) and are always orange (memory-bound), because they read and write \(T^2\) tables. The fused bar is blue (compute-bound) for all but the shortest sequences. Switch to A100: its ridge point is lower (153 FLOP/byte against 295), so the gap is smaller. Tick the checkbox to charge every re-read of \(K\) and \(V\) to HBM (explained in Section 4): the fused kernel then moves about \(2T^2 d / B_r\) numbers, and the speedup drops to 2× when \(B_r = d = 128\). In practice most of those re-reads hit the 50 MB L2 cache. [Likely] This is an ideal model: it ignores launch overhead and the fact that real kernels reach only part of the peak.</p></details></figure>
+<p>The paper measured the same effect on GPT-2 medium (sequence length 1024, forward plus backward): standard attention did 66.6 GFLOP and moved 40.3 GB in 41.7 ms; FlashAttention did <b>more</b> work, 75.2 GFLOP, but moved only 4.4 GB and took 7.3 ms. [Certain] The extra FLOPs come from recomputation in the backward pass (Section 5). Fewer bytes won.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A cook (the tensor cores) works at a small counter (SRAM) next to a big storeroom down the hall (HBM). Standard attention cooks one step, carries the whole tray back to the storeroom, then fetches it again for the next step. FlashAttention brings small portions to the counter and does all the steps there before carrying back only the finished dish.</aside>
+
+<h2>Online softmax: softmax without the whole row</h2>
+<p>Fusing is easy for the matrix multiplications: they can be done block by block. The problem is the softmax in the middle. Each output row needs</p>
+<p>\[ \mathbf{o}_i = \frac{\sum_j e^{s_{ij} - m_i}\, \mathbf{v}_j}{\sum_j e^{s_{ij} - m_i}}, \qquad m_i = \max_j s_{ij}, \]</p>
+<p>and both the maximum \(m_i\) (needed for stability, see <a href="../foundations/math-vectors-matrices-softmax.html">session 2</a>) and the sum in the denominator depend on <b>all</b> keys. If we can only hold a few keys on the chip at a time, we seem to need two passes over the row.</p>
+<p>The <b>online softmax</b> (Milakov and Gimelshein, 2018) removes that need. Keep three running quantities per query row: the maximum so far \(m\), the sum of exponentials so far \(\ell\) (measured against that maximum), and the un-normalized output so far \(\tilde{\mathbf{o}}\). When a new block of scores \(\mathbf{s}^{(j)}\) with values \(V^{(j)}\) arrives:</p>
+<div class="eq">\[ \begin{aligned} m' &= \max\!\big(m,\ \max_k s^{(j)}_k\big), \qquad \alpha = e^{\,m - m'} \\ \ell' &= \alpha\,\ell + \textstyle\sum_k e^{\,s^{(j)}_k - m'} \\ \tilde{\mathbf{o}}' &= \alpha\,\tilde{\mathbf{o}} + \textstyle\sum_k e^{\,s^{(j)}_k - m'}\, \mathbf{v}^{(j)}_k \end{aligned} \tag{124.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(m, \ell, \tilde{\mathbf{o}}\)</dt><dd>running maximum, running sum of exponentials, running weighted sum of values, for one query row; start with \(m = -\infty\), \(\ell = 0\), \(\tilde{\mathbf{o}} = \mathbf{0}\)</dd>
+<dt>\(\mathbf{s}^{(j)}, \mathbf{v}^{(j)}_k\)</dt><dd>the scores of this query against key block \(j\), and the value rows of that block</dd>
+<dt>\(\alpha\)</dt><dd>the correction factor: if the maximum went up, all old terms were measured against a too-small maximum and must shrink by \(e^{m - m'} \le 1\)</dd></dl>
+<p>Why is this exact? Every old term was stored as \(e^{s - m}\). Multiplying by \(e^{m - m'}\) turns it into \(e^{s - m'}\), exactly what it would have been if we had known \(m'\) from the start. After the last block, divide once:</p>
+<div class="eq">\[ \mathbf{o} = \frac{\tilde{\mathbf{o}}}{\ell}, \qquad L = m + \log \ell = \log \textstyle\sum_j e^{s_j} \tag{124.5} \]</div>
+<p>\(L\) is the <b>log-sum-exp</b> of the row, one number. It is all we need to rebuild any probability later: \(p_j = e^{s_j - L}\). FlashAttention stores it for the backward pass.</p>
+<div class="worked"><div class="wt">Worked example: four scores in two blocks</div>
+<p>Scores \(\mathbf{s} = (2, 1, 3, 0)\), scalar values \(v = (10, 20, 30, 40)\), blocks of two.</p>
+<p><b>Block 1</b> \((2, 1)\): \(m = 2\), \(\ell = e^0 + e^{-1} = 1.3679\), \(\tilde o = 10 \cdot 1 + 20 \cdot e^{-1} = 17.3576\).</p>
+<p><b>Block 2</b> \((3, 0)\): the maximum rises to \(m' = 3\), so \(\alpha = e^{2-3} = 0.3679\). Then \(\ell' = 1.3679 \times 0.3679 + e^0 + e^{-3} = 0.5032 + 1 + 0.0498 = 1.5530\) and \(\tilde o' = 17.3576 \times 0.3679 + 30 + 40\,e^{-3} = 6.3855 + 30 + 1.9915 = 38.3770\).</p>
+<p><b>End:</b> \(o = 38.3770 / 1.5530 = 24.7115\) and \(L = 3 + \log 1.5530 = 3.4402\). The ordinary softmax gives probabilities \((0.2369, 0.0871, 0.6439, 0.0321)\) and the same \(o = 24.7115\). Exact, with one pass.</p></div>
+<figure class="fig" id="fa-on"><div class="fig-body">
+<div class="controls"><span class="seg" id="fa-on-bs"><button type="button" data-v="1" aria-pressed="false">block 1</button><button type="button" data-v="2" aria-pressed="false">block 2</button><button type="button" data-v="3" aria-pressed="true">block 3</button><button type="button" data-v="4" aria-pressed="false">block 4</button><button type="button" data-v="6" aria-pressed="false">block 6</button></span></div>
+<div class="controls"><button type="button" class="btn" id="fa-on-prev">Back</button><button type="button" class="btn primary" id="fa-on-play">Play</button><button type="button" class="btn" id="fa-on-next">Next</button><span id="fa-on-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="fa-on-svg" viewBox="0 0 640 250" role="img" aria-label="One row of twelve scores processed block by block with a running maximum and sum"></svg></div>
+<div class="fa-leg"><span style="--c:var(--q)">block in SRAM now</span><span style="--c:var(--k-soft)">already processed</span><span style="--c:var(--v)">weight e<sup>s − m</sup> against the current maximum</span></div>
+<div class="readout" id="fa-on-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Online softmax (124.4) on one query row with 12 keys. Each step brings one block of scores and values into SRAM, updates \(m\), \(\ell\) and \(\tilde o\), and forgets the block. The last step divides by \(\ell\) (124.5).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Watch the green bars. They are the weights \(e^{s - m}\) of all keys seen so far, measured against the <b>current</b> maximum. When a block contains a new maximum, all older bars shrink at once by \(\alpha\): that is the rescaling. Change the block size: the path is different, but the final output always equals the exact softmax result (shown in the last step) up to rounding in the last digits.</p></details></figure>
+
+<h2>FlashAttention: tiling the whole computation</h2>
+<p>Now combine online softmax with tiles. Split \(Q\) into blocks of \(B_r\) rows, and \(K, V\) into blocks of \(B_c\) rows. One block of queries, one block of keys and values, and the small \(B_r \times B_c\) tile of scores all fit in SRAM. The kernel loops over key blocks and keeps \(m\), \(\ell\) and \(\tilde O\) for its query block on the chip. The \(T \times T\) matrices exist only as tiles, one at a time, and never reach HBM. This is <b>kernel fusion</b>: one kernel does what took three.</p>
+<p>FlashAttention-2 uses this loop order (queries outside, keys inside), shown in Algorithm 2. FlashAttention-1 used the opposite order; we compare the two in Figure 3.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: FlashAttention forward (FlashAttention-2 loop order)</div><ol>
+<li><b>input:</b> \(Q, K, V \in \R^{T \times d}\) in HBM; block sizes \(B_r, B_c\)</li>
+<li><b>for</b> each query block \(Q_i\) (\(B_r\) rows) <b>in parallel</b> <span class="c">// one thread block each</span></li>
+<li class="i1">load \(Q_i\) into SRAM; set \(m_i = -\infty\), \(\ell_i = 0\), \(\tilde O_i = 0\) (on chip)</li>
+<li class="i1"><b>for</b> each key block \(j\) (skip blocks above the diagonal if causal)</li>
+<li class="i2">load \(K_j, V_j\) into SRAM</li>
+<li class="i2">\(S_{ij} = Q_i K_j^\top / \sqrt d\) <span class="c">// \(B_r \times B_c\) tile, on chip only</span></li>
+<li class="i2">\(m' = \max(m_i, \text{rowmax}(S_{ij}))\); \(\tilde P = e^{S_{ij} - m'}\); \(\alpha = e^{m_i - m'}\)</li>
+<li class="i2">\(\ell_i \leftarrow \alpha\,\ell_i + \text{rowsum}(\tilde P)\); \(\tilde O_i \leftarrow \text{diag}(\alpha)\,\tilde O_i + \tilde P V_j\); \(m_i \leftarrow m'\) <span class="c">// formula (124.4)</span></li>
+<li class="i1">write \(O_i = \text{diag}(\ell_i)^{-1} \tilde O_i\) and \(L_i = m_i + \log \ell_i\) to HBM <span class="c">// formula (124.5), once</span></li></ol></div>
+<p>Memory: besides \(Q, K, V, O\), the only thing written is \(L\), one FP32 number per row: 32 KiB per head at \(T = 8192\), instead of 128 MiB for \(P\). The FlashAttention paper states it formally: exact attention with \(O(T^2 d)\) FLOPs and \(O(T)\) extra memory. [Certain]</p>
+<h3>How many bytes, really?</h3>
+<p>Formula (124.2) said \(4Td\), but that hides the loops. In Algorithm 2 each query block reads all of \(K\) and \(V\), so \(K\) and \(V\) are read \(\lceil T/B_r \rceil\) times. The paper analyzes its own loop order with an SRAM of \(M\) numbers and proves (its Theorem 2 and Proposition 3):</p>
+<div class="eq">\[ \text{HBM accesses: } \ \Theta\!\left(Td + T^2\right) \ \text{(standard)}, \qquad \Theta\!\left(\frac{T^2 d^2}{M}\right) \ \text{(FlashAttention)}, \qquad d \le M \le Td \tag{124.6} \]</div>
+<p>and no exact attention algorithm can do asymptotically better for all \(M\) in that range. [Certain] Since \(d^2\) is much smaller than \(M\), the factor \(d^2/M\) is small. For example, 192 KB of SRAM holds \(M = 98{,}304\) BF16 numbers; with \(d = 64\), \(d^2/M = 1/24\). The paper sets the block sizes from \(M\): \(B_c = \lceil M/4d \rceil\) and \(B_r = \min(\lceil M/4d \rceil, d)\), which gives \(B_c = 192\) and \(B_r = 128\) for \(M = 98{,}304\), \(d = 128\). [Certain] In practice FlashAttention-2 uses tiles of 64 or 128 in each direction, chosen per head dimension. [Certain]</p>
+<figure class="fig wide" id="fa-tile"><div class="fig-body">
+<div class="controls"><span class="seg" id="fa-tile-ord"><button type="button" data-v="fa1" aria-pressed="false">FlashAttention-1 order</button><button type="button" data-v="fa2" aria-pressed="true">FlashAttention-2 order</button></span><label class="sl"><input type="checkbox" id="fa-tile-causal"> Causal mask</label></div>
+<div class="controls"><button type="button" class="btn" id="fa-tile-prev">Back</button><button type="button" class="btn primary" id="fa-tile-play">Play</button><button type="button" class="btn" id="fa-tile-next">Next</button><span id="fa-tile-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="fa-tile-svg" viewBox="0 0 640 300" role="img" aria-label="A six by six grid of attention tiles processed in FlashAttention-1 or FlashAttention-2 order"></svg></div>
+<div class="fa-leg"><span style="--c:var(--q)">tile being computed</span><span style="--c:var(--k-soft)">done</span><span style="--c:var(--rule)">skipped (above the diagonal)</span></div>
+<div class="readout" id="fa-tile-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> The score matrix split into 6 × 6 tiles (rows: query blocks; columns: key/value blocks). The counters on the right count tile-sized transfers between HBM and SRAM.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>In FlashAttention-1 order, the outer loop runs over key/value blocks: each \(K_j, V_j\) is loaded once, but for every tile the partial output \(O_i\) (and \(m_i, \ell_i\)) must be read from HBM and written back, because the next update of that row comes much later. In FlashAttention-2 order, a query block stays on the chip for its whole row, and \(O_i\) is written once at the end; \(K\) and \(V\) are re-read instead, often from the L2 cache. Turn on the causal mask: tiles fully above the diagonal are skipped, so only 21 of 36 tiles are computed, and only the 6 diagonal tiles need the mask applied element by element.</p></details></figure>
+<p>The causal case deserves a formula. With \(n = T/B\) blocks per side, a causal kernel computes the tiles on or below the diagonal:</p>
+<div class="eq">\[ \frac{\text{tiles computed}}{\text{all tiles}} = \frac{n(n+1)/2}{n^2} = \frac{n+1}{2n} \ \longrightarrow \ \tfrac12 \tag{124.7} \]</div>
+<p>For \(n = 6\) that is 0.583, for \(n = 64\) it is 0.508. Standard attention with a mask computes the full table and then throws half away. FlashAttention-2 reports a 1.7 to 1.8× speedup from skipping these blocks, compared with the same kernel without the causal mask. [Certain]</p>
+
+<h2>The backward pass: recompute instead of store</h2>
+<p>Training needs gradients. With \(dO = \partial \mathcal{L}/\partial O\) coming from above, the gradients of attention are (<a href="../transformers/scaled-dot-product-attention-the-math-and.html">session 17</a> derives them):</p>
+<div class="eq">\[ \begin{aligned} dV &= P^\top dO, \qquad dP = dO\, V^\top, \qquad D_i = \textstyle\sum_c dO_{ic}\, O_{ic} \\ dS &= P \circ \big(dP - D\,\mathbf{1}^\top\big), \qquad dQ = \frac{dS\, K}{\sqrt d}, \qquad dK = \frac{dS^\top Q}{\sqrt d} \end{aligned} \tag{124.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\circ\)</dt><dd>element-wise product</dd>
+<dt>\(D_i\)</dt><dd>one number per query row: the dot product of the output row and its gradient. It replaces the row sum \(\sum_j P_{ij}\, dP_{ij}\) of the softmax gradient, because the two are equal</dd>
+<dt>\(dS\)</dt><dd>gradient with respect to the scores, the softmax backward</dd></dl>
+<p>Every line needs \(P\), a \(T \times T\) matrix. Standard attention keeps it in HBM from the forward pass. FlashAttention does not have it. Instead, it <b>recomputes</b> each tile of \(P\) in the backward pass from \(Q\), \(K\) and the stored \(L\):</p>
+<div class="eq">\[ P_{ij} = \exp\!\big( S_{ij} - L_i \big), \qquad S_{ij} = \frac{\mathbf{q}_i^\top \mathbf{k}_j}{\sqrt d} \tag{124.9} \]</div>
+<p>No running maximum is needed here: \(L_i\) already is the exact normalizer. This costs one extra \(QK^\top\) multiplication per tile, but it avoids reading a \(T^2\) matrix from HBM. It is the same trade as activation checkpointing (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>), applied inside one kernel, and it is why FlashAttention did 75.2 GFLOP against 66.6 and was still 5.7× faster in the GPT-2 measurement above. [Certain] FlashAttention-1 stored both \(m\) and \(\ell\); FlashAttention-2 stores only \(L = m + \log \ell\). [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 3: FlashAttention backward (one key/value block per thread block)</div><ol>
+<li><b>input:</b> \(Q, K, V, O, dO\) and \(L\) in HBM</li>
+<li>\(D = \text{rowsum}(dO \circ O)\) <span class="c">// small pre-pass, \(T\) numbers</span></li>
+<li><b>for</b> each key/value block \(j\) <b>in parallel</b></li>
+<li class="i1">load \(K_j, V_j\); set \(dK_j = 0\), \(dV_j = 0\) on chip</li>
+<li class="i1"><b>for</b> each query block \(i\)</li>
+<li class="i2">load \(Q_i, dO_i, L_i, D_i\); \(S_{ij} = Q_i K_j^\top / \sqrt d\); \(P_{ij} = e^{S_{ij} - L_i}\) <span class="c">// recompute, (124.9)</span></li>
+<li class="i2">\(dV_j \mathrel{+}= P_{ij}^\top dO_i\); \(dP_{ij} = dO_i V_j^\top\); \(dS_{ij} = P_{ij} \circ (dP_{ij} - D_i)\)</li>
+<li class="i2">\(dK_j \mathrel{+}= dS_{ij}^\top Q_i / \sqrt d\); add \(dS_{ij} K_j / \sqrt d\) into \(dQ_i\) in HBM <span class="c">// atomic add</span></li>
+<li class="i1">write \(dK_j, dV_j\) to HBM</li></ol></div>
+<aside class="note watch side"><span class="nt">Watch out</span>The \(dQ\) update in line 8 is added by many thread blocks into the same HBM rows. Floating-point addition in a different order gives slightly different results, so the backward pass may not be bit-for-bit reproducible from run to run. The <code>flash-attn</code> library offers a deterministic mode that is slower. [Likely]</aside>
+
+<h2>FlashAttention-2: the same math, better work split</h2>
+<p>FlashAttention-1 reached only 25 to 40% of the A100’s peak FLOP/s. The FlashAttention-2 paper traces this to how the work is split across thread blocks and warps, and makes three changes. [Certain]</p>
+<h3>1. Fewer non-matmul FLOPs</h3>
+<p>An A100 does 312 TFLOP/s of FP16/BF16 matrix multiplication on tensor cores, but only 19.5 TFLOP/s of other FP32 arithmetic. So each non-matmul FLOP (exp, max, rescaling) costs about 16× more time than a matmul FLOP. [Certain] FlashAttention-2 therefore keeps \(\tilde O\) un-normalized and divides by \(\ell\) only once at the end (Algorithm 2, line 9), instead of rescaling the normalized output at every step, and it stores just \(L\) instead of \(m\) and \(\ell\).</p>
+<h3>2. Parallelism over the sequence</h3>
+<p>FlashAttention-1 used one thread block per (batch, head) pair. A thread block runs on one SM. With batch 1 and 16 heads, only 16 of the A100’s 108 SMs have work. Long sequences usually come with small batches, so this case is common. FlashAttention-2 also splits the sequence: one thread block per query block, so a single head at \(T = 16{,}384\) with \(B_r = 128\) gives 128 thread blocks. This works because query blocks are independent in the forward pass; only key/value blocks interact through the softmax, and that interaction is inside the loop. [Certain]</p>
+<figure class="fig" id="fa-par"><div class="fig-body">
+<div class="fa-grid">
+<label for="fa-par-b">Batch size</label><input type="range" id="fa-par-b" min="1" max="32" step="1" value="1"><output id="fa-par-bv"></output>
+<label for="fa-par-h">Heads</label><input type="range" id="fa-par-h" min="1" max="64" step="1" value="16"><output id="fa-par-hv"></output>
+<label for="fa-par-t">Sequence length</label><input type="range" id="fa-par-t" min="10" max="17" step="1" value="14"><output id="fa-par-tv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="seg" id="fa-par-g"><button type="button" data-v="108" aria-pressed="true">A100 (108 SMs)</button><button type="button" data-v="132" aria-pressed="false">H100 (132 SMs)</button></span></div>
+<div class="scroll-x"><svg id="fa-par-svg" viewBox="0 0 640 230" role="img" aria-label="Streaming multiprocessors that get work in the first wave, for FlashAttention-1 and FlashAttention-2"></svg></div>
+<div class="fa-leg"><span style="--c:var(--q)">SM busy in the first wave</span><span style="--c:var(--rule)">SM idle</span></div>
+<div class="readout" id="fa-par-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> How many SMs get work. FlashAttention-1 launches one thread block per (batch, head); FlashAttention-2 launches one per (batch, head, query block of 128 rows). Toy model: one thread block per SM at a time, all blocks equally long.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>“Waves”: if there are 300 thread blocks and 108 SMs, the GPU runs them in \(\lceil 300/108 \rceil = 3\) waves, and the last wave is partly empty. Utilization in this model is blocks / (waves × SMs). Start with batch 1 and 16 heads: FlashAttention-1 fills 16 of 108 SMs (15%). FlashAttention-2 fills almost all of them. Now raise the batch to 32: both versions are fine, because there are enough (batch, head) pairs. The change matters most for long sequences with small batches, exactly the long-context case. Real GPUs can run more than one thread block per SM, so the real numbers differ; the direction does not.</p></details></figure>
+<h3>3. Splitting work between warps</h3>
+<p>Inside a thread block, 4 or 8 <b>warps</b> (groups of 32 threads) share the work. FlashAttention-1 split \(K\) and \(V\) across warps (“split-K”): each warp got the full query block and part of the keys, so at the end the warps had to write partial results to shared memory, synchronize and add them up. FlashAttention-2 splits \(Q\) across warps (“split-Q”): every warp sees all of \(K\) and \(V\) but owns its own query rows, so each warp finishes its rows alone, with no exchange. [Certain] The backward pass also avoids split-K, though it still needs some synchronization. [Certain]</p>
+<p>The result: 1.7 to 3.0× faster than FlashAttention-1, up to 73% of peak in the forward pass and 63% in the backward pass, and up to 225 TFLOP/s per A100 when training GPT-style models end to end (72% model FLOPs utilization). [Certain] FlashAttention-2 also supports multi-query and grouped-query attention (<a href="../inference/efficient-attention-1-mqa-gqa-and-mla.html">session 97</a>) by indexing into the shared key/value heads instead of copying them. [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model (8× A100, TFLOP/s per GPU)</th><th>Context</th><th>No FlashAttention</th><th>FlashAttention</th><th>FlashAttention-2</th></tr></thead><tbody>
+<tr><td>GPT3-1.3B</td><td>2k</td><td rowspan="4">72 to 149 (by model and context)</td><td>189</td><td>196</td></tr>
+<tr><td>GPT3-1.3B</td><td>8k</td><td>170</td><td>220</td></tr>
+<tr><td>GPT3-2.7B</td><td>2k</td><td>189</td><td>205</td></tr>
+<tr><td>GPT3-2.7B</td><td>8k</td><td>175</td><td>225</td></tr></tbody></table></div>
+<p>Notice the pattern in the table, from the FlashAttention-2 paper: the gain over version 1 is small at 2k and large at 8k, where attention takes a bigger share of the time. [Certain]</p>
+
+<h2>FlashAttention-3: asynchrony and FP8 on Hopper</h2>
+<p>Run on an H100, FlashAttention-2 reaches only about 35% utilization. [Certain] The H100 tensor cores are so fast that everything else becomes the bottleneck. Hopper adds hardware that FlashAttention-3 uses:</p>
+<ul>
+<li><b>TMA</b> (Tensor Memory Accelerator): a unit that copies tiles between HBM and shared memory by itself, so threads do not have to compute addresses and issue loads.</li>
+<li><b>WGMMA</b>: asynchronous matrix multiplication issued by a <b>warpgroup</b> (4 warps, 128 threads). The warpgroup starts it and can do other work while the tensor cores run.</li></ul>
+<h3>The exponential is the new bottleneck</h3>
+<p>Per score, the two matrix multiplications cost \(4d\) FLOPs (\(2d\) for \(QK^\top\), \(2d\) for \(PV\)), while the softmax needs one exponential. But the H100 has 989 TFLOP/s of FP16 matmul and only 3.9 TFLOP/s for special functions such as exp. [Certain] With \(d = 128\):</p>
+<div class="eq">\[ \frac{t_{\exp}}{t_{\text{matmul}}} = \frac{1 / 3.9}{4d / 989} = \frac{989 / 3.9}{512} \approx \frac{254}{512} \approx 0.50 \tag{124.10} \]</div>
+<p>So the exponentials alone can take about half as long as all the matrix multiplications. If they run one after the other, the tensor cores sit idle a third of the time. FlashAttention-3 overlaps them in two ways. [Certain]</p>
+<ul>
+<li><b>Warp specialization.</b> Some warps are <b>producers</b>: they only issue TMA loads of \(K\) and \(V\). The others are <b>consumers</b>: they issue WGMMAs and compute the softmax. Registers are moved from producers to consumers (the <code>setmaxnreg</code> instruction), since consumers need many more.</li>
+<li><b>Ping-pong scheduling.</b> Two consumer warpgroups take turns: while warpgroup 1 computes the softmax of its tile, warpgroup 2 runs its matrix multiplications, and then they swap. Inside one warpgroup, a 2-stage pipeline also overlaps the softmax of one tile with the WGMMA of the next.</li></ul>
+<figure class="fig" id="fa-pp"><div class="fig-body">
+<div class="fa-grid">
+<label for="fa-pp-r">Softmax time / GEMM time</label><input type="range" id="fa-pp-r" min="0.1" max="1.5" step="0.05" value="0.5"><output id="fa-pp-rv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="seg" id="fa-pp-m"><button type="button" data-v="seq" aria-pressed="false">No overlap</button><button type="button" data-v="pp" aria-pressed="true">Ping-pong (2 warpgroups)</button></span></div>
+<div class="scroll-x"><svg id="fa-pp-svg" viewBox="0 0 640 200" role="img" aria-label="Timeline of matrix multiplications and softmax for one or two warpgroups"></svg></div>
+<div class="fa-leg"><span style="--c:var(--q)">GEMM on tensor cores</span><span style="--c:var(--v)">softmax (exp units)</span></div>
+<div class="readout" id="fa-pp-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Toy timeline of the tensor cores. Each tile needs a GEMM (length 1) and then a softmax (length \(r\)). With one warpgroup and no overlap they alternate; with ping-pong two warpgroups interleave so one’s softmax hides behind the other’s GEMM.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>The bottom row is the tensor cores. Without overlap, they are busy \(1/(1+r)\) of the time: 67% at \(r = 0.5\), the ratio from (124.10). With ping-pong, as long as \(r \le 1\) the softmax of one warpgroup fits inside the other’s GEMM and the tensor cores never wait (100% in this toy). Above \(r = 1\) even ping-pong cannot hide it: utilization is \(2/(1+r)\). Real kernels have other costs; the paper measured 570 → 620 to 640 TFLOP/s from ping-pong (FP16, head dimension 128, length 8192). [Certain]</p></details></figure>
+<h3>FP8 attention</h3>
+<p>The H100 doubles its tensor-core throughput in FP8 (see <a href="../inference/number-formats-int8-int4-fp8-fp4-nf4.html">session 105</a>). FP8 attention raises two problems. First, a layout rule: FP8 WGMMA needs its operands in “k-major” order, so FlashAttention-3 transposes the \(V\) tile inside the kernel. Second, accuracy: LLM activations have <b>outliers</b>, a few very large values, and with one scale for a whole tensor they force every other value into the few lowest FP8 levels. FlashAttention-3 uses two fixes. [Certain]</p>
+<ul>
+<li><b>Block quantization:</b> one scale per block of \(Q\), \(K\) or \(V\), not per tensor. The tiles are already there, so this is cheap.</li>
+<li><b>Incoherent processing:</b> multiply \(Q\) and \(K\) by the same random orthogonal matrix \(M\) (random \(\pm 1\) signs times a Hadamard matrix) before quantizing. Because \(M M^\top = I\), the scores do not change, but each outlier is spread over many coordinates:</li></ul>
+<div class="eq">\[ (Q M)(K M)^\top = Q\, M M^\top K^\top = Q K^\top \tag{124.11} \]</div>
+<p>This is the same idea as the rotations of <a href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html">session 109</a> (QuIP, QuaRot). The paper’s test data had about 0.1% outlier entries; the FP8 root-mean-square error was \(9.1 \times 10^{-3}\) for FlashAttention-3 against \(2.4 \times 10^{-2}\) for a baseline FP8 attention, 2.6× lower. [Certain] Overall: 1.5 to 2.0× faster than FlashAttention-2 in FP16, up to 740 TFLOP/s, and close to 1.2 PFLOP/s in FP8. [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th></th><th>FlashAttention-1 (2022)</th><th>FlashAttention-2 (2023)</th><th>FlashAttention-3 (2024)</th></tr></thead><tbody>
+<tr><td>Main idea</td><td>tiling + online softmax + recompute in backward</td><td>fewer non-matmul FLOPs, parallel over sequence, split-Q between warps</td><td>warp specialization, ping-pong, GEMM–softmax overlap, FP8</td></tr>
+<tr><td>Target GPU</td><td>A100 (and older)</td><td>A100; runs on H100 without Hopper features</td><td>H100 / Hopper only</td></tr>
+<tr><td>Kept for backward</td><td>\(O\), \(m\), \(\ell\)</td><td>\(O\), \(L\)</td><td>\(O\), \(L\)</td></tr>
+<tr><td>Reported speed</td><td>25–40% of A100 peak</td><td>50–73% of A100 peak (forward); 335 TFLOP/s on H100</td><td>up to 740 TFLOP/s FP16 (75% of H100), about 1.2 PFLOP/s FP8</td></tr></tbody></table></div>
+
+<h2>Numerics: exact, but not bit-identical</h2>
+<p>FlashAttention is “exact”: in exact arithmetic it gives the same output as (124.1). In floating point the results differ a little, for four reasons:</p>
+<ol>
+<li><b>Different order of additions.</b> The row sums and \(PV\) products are accumulated block by block. Floating-point addition is not associative, so a different order gives different last digits.</li>
+<li><b>Rescaling.</b> Each \(\alpha = e^{m - m'}\) multiplication adds one more rounding.</li>
+<li><b>Rounding of \(P\).</b> The tile of probabilities is rounded to BF16 or FP16 before the \(\tilde P V\) multiplication on the tensor cores. A standard implementation that keeps \(P\) in FP32 avoids this step.</li>
+<li><b>Atomic adds in backward</b> (Algorithm 3): the order changes from run to run.</li></ol>
+<p>How big is this? Golden et al. (2024) measured FlashAttention in BF16 against a baseline attention in an isolated forward pass and found roughly an order of magnitude more numeric deviation; their analysis estimates its effect on model weights during training as 2 to 5 times smaller than the effect of low-precision training itself. [Certain] The efficient-inference survey also warns in a footnote that FlashAttention “might cause the numeric deviation”. [Certain] In FP16 tests, the FlashAttention-3 paper reports the opposite direction: an RMSE of \(1.9 \times 10^{-4}\) for FlashAttention-2 and -3 against \(3.2 \times 10^{-4}\) for a standard FP16 implementation, because the kernels keep the running sums in FP32. [Certain] The practical rule: compare against a high-precision reference with a tolerance, never with <code>==</code>.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>A test that compares a model with and without FlashAttention token by token can fail after many greedy decoding steps even if each layer differs only in the last bits: one different argmax changes the whole continuation. Compare logits with a tolerance, or compare distributions.</aside>
+
+<h2>The algorithm in PyTorch</h2>
+<p>The code below is a reference implementation, not a fast one: Python loops over tiles. It shows exactly what the kernel does. It checks the tiled forward against naive attention, checks the recomputing backward (formulas 124.8 and 124.9, left untiled for clarity) against autograd, and measures low-precision errors. It runs on a CPU in a few seconds.</p>
+<pre class="code">import math, torch
+torch.manual_seed(0)
+
+def naive_attention(q, k, v, causal=False):
+    # q, k, v: (B, h, T, d). Builds the full T x T matrices, like standard attention.
+    S = q @ k.transpose(-2, -1) / math.sqrt(q.shape[-1])
+    if causal:
+        T = q.shape[-2]
+        S = S.masked_fill(torch.ones(T, T, dtype=torch.bool).triu(1), float("-inf"))
+    return torch.softmax(S, dim=-1) @ v
+
+def flash_forward(q, k, v, Br=64, Bc=64, causal=False):
+    # FlashAttention-2 order: outer loop over query blocks, inner loop over key/value blocks.
+    B, h, T, d = q.shape
+    scale = 1.0 / math.sqrt(d)
+    O = torch.empty_like(q)
+    L = torch.empty(B, h, T, dtype=torch.float32)
+    for i in range(0, T, Br):                      # one thread block per query block on a GPU
+        qi = q[:, :, i:i+Br].float()
+        m = torch.full(qi.shape[:-1], float("-inf"))   # running max, per row
+        l = torch.zeros(qi.shape[:-1])                 # running sum of exp, per row
+        acc = torch.zeros_like(qi)                     # un-normalized output
+        for j in range(0, T, Bc):
+            if causal and j &gt; i + Br - 1:
+                break                                  # block is fully above the diagonal: skip it
+            kj, vj = k[:, :, j:j+Bc].float(), v[:, :, j:j+Bc].float()
+            s = qi @ kj.transpose(-2, -1) * scale      # (Br, Bc) tile, lives in SRAM only
+            if causal:
+                rows = torch.arange(i, i + qi.shape[-2])[:, None]
+                cols = torch.arange(j, j + kj.shape[-2])[None, :]
+                s = s.masked_fill(cols &gt; rows, float("-inf"))
+            m_new = torch.maximum(m, s.amax(-1))
+            p = torch.exp(s - m_new[..., None])
+            alpha = torch.exp(m - m_new)               # rescale factor for the old partial results
+            l = alpha * l + p.sum(-1)
+            acc = alpha[..., None] * acc + p.to(q.dtype).float() @ vj   # P is rounded to the input dtype, as on a GPU
+            m = m_new
+        O[:, :, i:i+Br] = (acc / l[..., None]).to(q.dtype)   # divide once, at the end (FA2)
+        L[:, :, i:i+Br] = m + torch.log(l)                    # one number per row is kept for backward
+    return O, L
+
+def flash_backward(q, k, v, O, L, dO, causal=False):
+    # Recompute P from Q, K and the stored log-sum-exp L instead of reading a stored T x T matrix.
+    d = q.shape[-1]
+    S = q.float() @ k.float().transpose(-2, -1) / math.sqrt(d)
+    if causal:
+        T = q.shape[-2]
+        S = S.masked_fill(torch.ones(T, T, dtype=torch.bool).triu(1), float("-inf"))
+    P = torch.exp(S - L[..., None])                    # exact softmax, no max or sum needed
+    D = (dO.float() * O.float()).sum(-1, keepdim=True) # D_i = rowsum(dO * O)
+    dV = P.transpose(-2, -1) @ dO.float()
+    dP = dO.float() @ v.float().transpose(-2, -1)
+    dS = P * (dP - D)
+    dQ = dS @ k.float() / math.sqrt(d)
+    dK = dS.transpose(-2, -1) @ q.float() / math.sqrt(d)
+    return dQ, dK, dV
+
+B, h, T, d = 1, 2, 256, 64
+q, k, v = (torch.randn(B, h, T, d, dtype=torch.float64) for _ in range(3))
+
+# 1) the tiled forward matches naive attention (the tiles compute in fp32, like a GPU kernel)
+for causal in (False, True):
+    O, L = flash_forward(q, k, v, causal=causal)
+    print("forward max error, causal =", causal, (O - naive_attention(q, k, v, causal)).abs().max().item())
+
+# 2) the recomputing backward matches autograd through the naive version
+qr, kr, vr = (t.clone().requires_grad_(True) for t in (q, k, v))
+out = naive_attention(qr, kr, vr, causal=True)
+dO = torch.randn_like(out)
+out.backward(dO)
+O, L = flash_forward(q, k, v, causal=True)
+dQ, dK, dV = flash_backward(q, k, v, O, L, dO, causal=True)
+print("backward max error:", max((a - b).abs().max().item() for a, b in ((dQ, qr.grad), (dK, kr.grad), (dV, vr.grad))))
+
+# 3) numerics in low precision: both methods round, in different places
+ref = naive_attention(q, k, v)                         # float64 reference
+for dt in (torch.float16, torch.bfloat16):
+    qh, kh, vh = q.to(dt), k.to(dt), v.to(dt)
+    std = naive_attention(qh.float(), kh.float(), vh.float()).to(dt)   # standard math in fp32, output rounded
+    fl, _ = flash_forward(qh, kh, vh)
+    e_std = (std.double() - ref).abs().max().item()
+    e_fl = (fl.double() - ref).abs().max().item()
+    e_between = (std.double() - fl.double()).abs().max().item()
+    print(dt, "max error vs fp64: standard %.2e, tiled %.2e, between them %.2e" % (e_std, e_fl, e_between))</pre>
+<p>With PyTorch 2.8 on a CPU this prints forward errors of about \(3 \times 10^{-7}\) (non-causal) and \(6 \times 10^{-7}\) (causal), which is FP32 rounding, and a backward error of about \(3 \times 10^{-6}\). In FP16 both methods have a maximum error of \(4.1 \times 10^{-4}\) against the FP64 reference and differ from each other by \(2.4 \times 10^{-4}\). In BF16, which has fewer mantissa bits, the tiled version is a little worse (\(3.8 \times 10^{-3}\) against \(2.7 \times 10^{-3}\)), mostly because \(\tilde P\) is rounded to BF16 before the \(PV\) product. On a GPU you would call the real kernel: <code>F.scaled_dot_product_attention(q, k, v, is_causal=True)</code> (with <code>F = torch.nn.functional</code>), or <code>flash_attn_func</code> from the <code>flash-attn</code> package.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What FlashAttention gives</th><th>Notes</th></tr></thead><tbody>
+<tr><td>LLM pretraining and fine-tuning</td><td>Attention memory linear in \(T\); no stored \(P\); 2–4× faster attention</td><td>The 8k rows of the FlashAttention-2 table; long-context continued pretraining depends on it</td></tr>
+<tr><td>Prefill in LLM serving</td><td>Fast compute-bound attention over the whole prompt</td><td>Decode has one query row per step, a different problem: <a href="../inference/attention-operator-2-decode-attention-flashdecoding-and.html">session 125</a></td></tr>
+<tr><td>Packed or variable-length batches</td><td>“varlen” kernels take concatenated sequences plus their start offsets, with no padding</td><td>Pairs with sequence packing (<a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a>) [Likely]</td></tr>
+<tr><td>Vision transformers and VLM encoders</td><td>High-resolution images give thousands of patch tokens per image</td><td>Bidirectional attention: no causal skipping, so the full tile grid is computed</td></tr>
+<tr><td>Video models (action recognition, key-moment detection, video retrieval, Video-RAG)</td><td>Frames × patches easily reach tens of thousands of tokens; without fused attention the \(T^2\) table alone would not fit</td><td>Many video LLMs also reduce tokens first; FlashAttention makes the remaining long sequences affordable [Likely]</td></tr>
+<tr><td>Long-document models</td><td>Exact full attention to 16K–64K tokens on one GPU</td><td>FlashAttention made the first transformers better than chance on Path-X (16K tokens, 61.4%) and, with block-sparse FlashAttention, Path-256 (64K, 63.1%) [Certain]</td></tr>
+<tr><td>Sparse and sliding-window attention</td><td>The same tiling with whole tiles skipped</td><td>Block-sparse FlashAttention in the first paper; local windows in later kernels (<a href="../inference/sparse-attention-1-static-sparse-transformer-longformer.html">session 116</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>“FlashAttention reduces the FLOPs.”</b> It does not. Forward FLOPs are the same \(O(T^2 d)\), and training does more because of recomputation. It reduces <b>HBM traffic</b> and <b>memory</b>.</li>
+<li><b>“FlashAttention is an approximation.”</b> It is exact up to floating-point rounding. Linformer, Performer and sparse attention are approximations; FlashAttention is not.</li>
+<li><b>Expecting bit-identical outputs</b> after switching kernels, or comparing with <code>==</code> in tests. Use a tolerance against an FP32 or FP64 reference.</li>
+<li><b>Silently falling back to the slow path.</b> <code>scaled_dot_product_attention</code> picks a backend from dtype, head dimension, mask type and hardware. An arbitrary dense mask tensor, FP32 inputs or an unsupported head size can send you to the math backend with its \(T^2\) memory. Check which backend runs. [Likely]</li>
+<li><b>Building a full \(T \times T\) boolean mask</b> for causal attention and passing it in. That allocates \(T^2\) memory and blocks causal tile skipping; use <code>is_causal=True</code>.</li>
+<li><b>Thinking FlashAttention solves decoding.</b> At decode time there is one query per sequence, so splitting over query blocks gives no parallel work; decode needs a split over keys (<a href="../inference/attention-operator-2-decode-attention-flashdecoding-and.html">session 125</a>).</li>
+<li><b>Using FlashAttention-3 features on the wrong GPU.</b> Its speedups come from Hopper hardware (TMA, WGMMA); on an A100 use FlashAttention-2.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why is FlashAttention faster if it does the same number of FLOPs?<span class="lvl">basic</span></summary><div class="ans">Standard attention is memory-bound: it writes the \(T \times T\) score and probability matrices to HBM and reads them back, \(4T^2\) numbers per head, while the matrix multiplications themselves are cheap on tensor cores. FlashAttention computes attention in tiles inside SRAM and never writes those matrices, so HBM traffic drops to about \(4Td\) numbers (plus re-reads of \(K, V\)). On GPT-2 medium the paper measured 40.3 GB vs 4.4 GB of HBM traffic and 41.7 ms vs 7.3 ms, even though FlashAttention did more FLOPs (75.2 vs 66.6 GFLOP).</div></details>
+<details class="qa"><summary>Explain online softmax. Why is it exact?<span class="lvl">core</span></summary><div class="ans">Keep a running maximum \(m\), running sum \(\ell = \sum e^{s - m}\) and running output \(\tilde o = \sum e^{s - m} v\). When a new block raises the maximum to \(m'\), multiply the old \(\ell\) and \(\tilde o\) by \(\alpha = e^{m - m'}\), then add the new block’s terms measured against \(m'\). Every old term \(e^{s - m}\) becomes exactly \(e^{s - m'}\), so at the end \(\tilde o / \ell\) is the exact softmax-weighted average. Only rounding differs.</div></details>
+<details class="qa"><summary>What does FlashAttention store for the backward pass, and why is recomputation a good trade?<span class="lvl">core</span></summary><div class="ans">It stores the output \(O\) and one number per row: the log-sum-exp \(L = m + \log \ell\) (FlashAttention-1 stored \(m\) and \(\ell\)). In the backward pass it recomputes each tile \(S = QK^\top/\sqrt d\) and \(P = e^{S - L}\) in SRAM. This adds one matrix multiplication per tile, but tensor-core FLOPs are cheap while reading a stored \(T^2\) matrix from HBM is expensive, and the memory saving is \(O(T^2) \to O(T)\). It is activation checkpointing inside one kernel.</div></details>
+<details class="qa"><summary>Write the backward formulas of attention. What is the D term?<span class="lvl">advanced</span></summary><div class="ans">\(dV = P^\top dO\), \(dP = dO V^\top\), \(dS = P \circ (dP - D\mathbf 1^\top)\), \(dQ = dS K/\sqrt d\), \(dK = dS^\top Q/\sqrt d\). The softmax backward needs \(\sum_j P_{ij} dP_{ij}\) per row, which would need a full row of \(P\). But \(\sum_j P_{ij} (dO_i \cdot v_j) = dO_i \cdot \sum_j P_{ij} v_j = dO_i \cdot O_i = D_i\), computable from \(O\) and \(dO\) alone, \(T\) numbers in a cheap pre-pass.</div></details>
+<details class="qa"><summary>What is the IO complexity of FlashAttention, and is it optimal?<span class="lvl">advanced</span></summary><div class="ans">With SRAM of \(M\) numbers and \(d \le M \le Td\), FlashAttention needs \(\Theta(T^2 d^2 / M)\) HBM accesses, against \(\Theta(Td + T^2)\) for standard attention. Since \(d^2\) is much smaller than \(M\) (for example \(64^2\) against about 98K), that is many times fewer. The paper also proves a lower bound: no exact attention algorithm can do \(o(T^2 d^2/M)\) for all \(M\) in that range, so it is asymptotically optimal.</div></details>
+<details class="qa"><summary>What are the three main changes in FlashAttention-2?<span class="lvl">core</span></summary><div class="ans">(1) Fewer non-matmul FLOPs: keep the output un-normalized and divide once at the end; store only the log-sum-exp. Non-matmul FLOPs are about 16× more expensive on an A100 (19.5 vs 312 TFLOP/s). (2) Parallelize over the sequence dimension too (one thread block per query block), so a long sequence with batch 1 still fills the 108 SMs. (3) Split \(Q\) across warps instead of \(K\) (split-Q vs split-K), so warps do not need to exchange and sum partial results through shared memory. Result: about 2× over FlashAttention-1, 50–73% of peak forward.</div></details>
+<details class="qa"><summary>Why does FlashAttention-3 need Hopper, and what does it overlap?<span class="lvl">advanced</span></summary><div class="ans">It uses Hopper-only hardware: TMA for asynchronous tile copies and WGMMA for asynchronous warpgroup matrix multiplications. With these, producer warps load data while consumer warps compute (warp specialization), two consumer warpgroups alternate GEMM and softmax (ping-pong), and inside a warpgroup the softmax of one tile overlaps the GEMM of the next. This matters because exp throughput (3.9 TFLOP/s) is so low next to matmul (989 TFLOP/s) that at \(d = 128\) the exponentials take about half as long as the GEMMs.</div></details>
+<details class="qa"><summary>How does FlashAttention-3 keep FP8 attention accurate?<span class="lvl">advanced</span></summary><div class="ans">Two techniques. Block quantization: one scale per tile of \(Q\), \(K\), \(V\) instead of per tensor, so an outlier only hurts its own block. Incoherent processing: multiply \(Q\) and \(K\) by the same random orthogonal matrix (random signs times a Hadamard matrix); \(QM(KM)^\top = QK^\top\), but outliers are spread over many coordinates, so they quantize better. With 0.1% outliers in the test data, RMSE fell from \(2.4 \times 10^{-2}\) (baseline FP8) to \(9.1 \times 10^{-3}\).</div></details>
+<details class="qa"><summary>Is FlashAttention exact? Why might outputs differ from standard attention?<span class="lvl">basic</span></summary><div class="ans">Mathematically exact. Numerically different: blockwise accumulation changes the order of floating-point additions, rescaling by \(e^{m - m'}\) adds roundings, the probability tile is rounded to BF16/FP16 before the \(PV\) matmul, and atomic adds in the backward pass make the order vary between runs. Golden et al. measured about 10× more deviation than baseline in BF16 forward, but estimate its training effect at 2–5× smaller than that of low-precision training itself. Test with tolerances.</div></details>
+<details class="qa"><summary>How does the causal mask make FlashAttention faster?<span class="lvl">core</span></summary><div class="ans">Tiles completely above the diagonal contribute nothing, so the kernel skips them: with \(n\) blocks per side it computes \(n(n+1)/2\) of \(n^2\) tiles, approaching half. Only the diagonal tiles need element-wise masking. FlashAttention-2 reports 1.7–1.8× speedup over the same kernel without the mask. Standard attention computes the full table and then masks it, so it gets no saving.</div></details>
+<details class="qa"><summary>Your long-context training run with batch size 1 is slow in attention. What do you check?<span class="lvl">core</span></summary><div class="ans">First, that a fused kernel actually runs (profile it: <a href="../inference/runtime-profiling-where-the-time-goes.html">session 123</a>); a dense mask, FP32 inputs or an unsupported head size may cause a fallback. Second, that the kernel parallelizes over the sequence (FlashAttention-2 or later), because with batch 1 and few heads a per-head kernel leaves most SMs idle. Third, use <code>is_causal</code> instead of a mask tensor so masked tiles are skipped, and use variable-length kernels instead of padding. On H100, FlashAttention-3 gives a further 1.5–2×.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>For \(T = 32{,}768\) and 32 heads in BF16, how much memory does one layer’s probability matrix \(P\) need? How much does FlashAttention’s \(L\) need (FP32)?</li>
+<li>Run online softmax by hand on scores \((1, 3)\) then \((2)\), with values \((0, 10)\) then \((5)\). Give \(m\), \(\ell\), \(\tilde o\) after each block and the final output.</li>
+<li>Show that \(\sum_j P_{ij}\, dP_{ij} = dO_i \cdot O_i\) using \(dP = dO\,V^\top\) and \(O = PV\).</li>
+<li>With 8 query blocks per side, what fraction of tiles does a causal kernel compute? How many need element-wise masking?</li>
+<li>Batch 2, 8 heads, \(T = 4096\), \(B_r = 128\), on an A100 with 108 SMs. How many thread blocks do FlashAttention-1 and FlashAttention-2 launch? What is the toy utilization of Figure 4 for each?</li>
+<li>Using (124.10), what is the exp-to-matmul time ratio for \(d = 64\)? Is overlap more or less important than for \(d = 128\)?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(32 \times 32768^2 \times 2\) bytes = 64 GiB per layer. \(L\): \(32 \times 32768 \times 4\) bytes = 4 MiB. 2. Block 1: \(m = 3\), \(\ell = e^{-2} + 1 = 1.1353\), \(\tilde o = 0 + 10 = 10\). Block 2: \(m' = 3\) (no change, \(\alpha = 1\)), \(\ell = 1.1353 + e^{-1} = 1.5032\), \(\tilde o = 10 + 5e^{-1} = 11.8394\). Output \(11.8394/1.5032 = 7.876\). 3. \(\sum_j P_{ij} dP_{ij} = \sum_j P_{ij} \sum_c dO_{ic} V_{jc} = \sum_c dO_{ic} \sum_j P_{ij} V_{jc} = \sum_c dO_{ic} O_{ic}\). 4. \(36/64 = 0.5625\); the 8 diagonal tiles. 5. FlashAttention-1: \(2 \times 8 = 16\) blocks, one partial wave, utilization \(16/108 = 14.8\%\). FlashAttention-2: \(16 \times 32 = 512\) blocks, \(\lceil 512/108 \rceil = 5\) waves, \(512/540 = 94.8\%\). 6. \((989/3.9)/256 \approx 0.99\): the exponentials take about as long as the GEMMs, so overlap matters even more for small heads.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Standard attention is slow because it writes and reads the \(T \times T\) matrices in HBM (124.2); by the roofline (124.3) its kernels are memory-bound.</li>
+<li>Online softmax (124.4, 124.5) computes an exact softmax in one pass over blocks by rescaling old partial sums when the maximum grows.</li>
+<li>FlashAttention tiles \(Q\), \(K\), \(V\) into SRAM, fuses everything into one kernel, uses \(O(T)\) extra memory, and is IO-optimal: \(\Theta(T^2 d^2/M)\) HBM accesses (124.6). Causal tiles above the diagonal are skipped (124.7).</li>
+<li>The backward pass recomputes \(P = e^{S - L}\) from the stored log-sum-exp (124.8, 124.9): more FLOPs, far fewer bytes.</li>
+<li>FlashAttention-2: fewer non-matmul FLOPs, parallel over the sequence, split-Q between warps; about 2× over version 1. FlashAttention-3: Hopper asynchrony (warp specialization, ping-pong) hides the slow exponentials (124.10), and FP8 with block quantization and incoherent processing (124.11).</li>
+<li>Results are exact in math, slightly different in floating point; test with tolerances.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ m' = \max(m, \max_k s_k), \quad \ell' = e^{m - m'}\ell + \textstyle\sum_k e^{s_k - m'}, \quad \tilde{\mathbf{o}}' = e^{m - m'}\tilde{\mathbf{o}} + \textstyle\sum_k e^{s_k - m'}\mathbf{v}_k \]</div>
+<div class="eq">\[ \mathbf{o} = \tilde{\mathbf{o}}/\ell, \quad L = m + \log \ell, \quad P_{ij} = e^{S_{ij} - L_i}, \quad dS = P \circ (dP - D\mathbf{1}^\top), \quad \Theta\!\left(\frac{T^2 d^2}{M}\right) \]</div>
+<h2 class="plain" id="attention-operator-1-flashattention-1-2-and-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>Dao (2023). <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a></li><li>Shah et al. (2024). <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener">FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</a></li><li>Milakov &amp; Gimelshein (2018). <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noopener">Online normalizer calculation for softmax</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>Dao (2023). <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a></li><li>Shah et al. (2024). <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener">FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</a></li><li>Milakov &amp; Gimelshein (2018). <a href="https://arxiv.org/abs/1805.02867" target="_blank" rel="noopener">Online normalizer calculation for softmax</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Golden, Hsia, Sun et al. (2024). <a href="https://arxiv.org/abs/2405.02803" target="_blank" rel="noopener">Is Flash Attention Stable?</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/runtime-profiling-where-the-time-goes.html"><small>Previous · session 123</small>Runtime profiling: where the time goes</a><a class="next" href="../inference/attention-operator-2-decode-attention-flashdecoding-and.html"><small>Next · session 125</small>Attention operator 2: decode attention, FlashDecoding and FlashDecoding++</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="attention-operator-1-flashattention-1-2-and"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function segInit(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+function segVal(el){const b=el.querySelector('button[aria-pressed="true"]');return b?b.dataset.v:null;}
+/* re-create a Book.stepper on fresh buttons (removes old listeners) */
+function freshStepper(ids,n,ms,onStep){const get=id=>{const o=$("#"+id);const c=o.cloneNode(true);o.replaceWith(c);return c;};
+ return B.stepper({n:n,prev:get(ids[0]),next:get(ids[1]),play:get(ids[2]),label:$("#"+ids[3]),ms:ms,onStep:onStep});}
+const fB=x=>x>=1e9?(x/1e9).toFixed(2)+" GB":(x/1e6).toFixed(x>=1e8?1:2)+" MB";
+const fT=s=>s>=1e-3?(s*1e3).toFixed(2)+" ms":(s*1e6).toFixed(1)+" µs";
+const fMi=x=>x>=2**30?(x/2**30).toFixed(x>=2**34?0:2).replace(/\.00$/,"")+" GiB":(x/2**20).toFixed(0)+" MiB";
+
+/* ---------- Figure 1: roofline of standard vs fused attention ---------- */
+(function(){
+ const svg=$("#fa-io-svg");if(!svg)return;const Ti=$("#fa-io-t"),Dg=$("#fa-io-d"),Gg=$("#fa-io-g"),RR=$("#fa-io-rr"),info=$("#fa-io-info");
+ const GPU={a100:{n:"A100",pi:312e12,bw:2.039e12},h100:{n:"H100",pi:989e12,bw:3.35e12}};
+ function draw(){const T=2**(+Ti.value),d=+segVal(Dg),g=GPU[segVal(Gg)],b=2,Br=128,rr=RR.checked;$("#fa-io-tv").value=T.toLocaleString("en-US");
+  const ks=[["QKᵀ",2*T*T*d,b*(2*T*d+T*T)],["softmax",5*T*T,b*2*T*T],["PV",2*T*T*d,b*(T*T+2*T*d)]].map(([n,F,N])=>({n,F,N,tc:F/g.pi,tm:N/g.bw}));
+  ks.forEach(k=>{k.t=Math.max(k.tc,k.tm);k.mem=k.tm>=k.tc;});
+  const ts=ks.reduce((a,k)=>a+k.t,0),Ns=ks.reduce((a,k)=>a+k.N,0);
+  const Ff=4*T*T*d,Nf=rr?b*(2*T*d+2*T*d*Math.ceil(T/Br)):b*4*T*d,tfc=Ff/g.pi,tfm=Nf/g.bw,tf=Math.max(tfc,tfm),fmem=tfm>tfc;
+  const W=480,x0=130,sc=W/ts;let s=`<text x="${x0}" y="22" font-size="13" fill="var(--muted)">time per head (lower bound, formula 124.3)</text>`;
+  s+=`<text x="${x0-10}" y="66" text-anchor="end" font-size="14" font-weight="700" fill="var(--ink)">standard</text><text x="${x0-10}" y="84" text-anchor="end" font-size="12" fill="var(--muted)">3 kernels</text>`;
+  let x=x0;ks.forEach(k=>{const w=Math.max(1,k.t*sc);s+=`<rect x="${x.toFixed(1)}" y="48" width="${w.toFixed(1)}" height="40" rx="4" fill="${k.mem?"var(--k)":"var(--q)"}" stroke="var(--card)" stroke-width="2"/>`;
+   if(w>60)s+=`<text x="${(x+w/2).toFixed(1)}" y="73" text-anchor="middle" font-size="12.5" font-weight="700" fill="#fff">${k.n}</text>`;x+=w;});
+  s+=`<text x="${x0}" y="106" font-size="12.5" fill="var(--ink2)">${fT(ts)}, ${fB(Ns)} moved</text>`;
+  const wf=Math.max(2,tf*sc);
+  s+=`<text x="${x0-10}" y="146" text-anchor="end" font-size="14" font-weight="700" fill="var(--ink)">fused</text><text x="${x0-10}" y="164" text-anchor="end" font-size="12" fill="var(--muted)">1 kernel</text>`;
+  s+=`<rect x="${x0}" y="128" width="${wf.toFixed(1)}" height="40" rx="4" fill="${fmem?"var(--k)":"var(--q)"}"/>`;
+  s+=`<text x="${x0}" y="186" font-size="12.5" fill="var(--ink2)">${fT(tf)}, ${fB(Nf)} moved, ${fmem?"memory-bound":"compute-bound"}</text>`;
+  svg.innerHTML=s;
+  const Sh=b*T*T;
+  info.innerHTML=`T = ${T.toLocaleString("en-US")}, d = ${d}, ${g.n}: one score table S takes <b>${fMi(Sh)}</b> per head (${fMi(32*Sh)} per layer with 32 heads). Standard: <b>${fB(Ns)}</b> of HBM traffic, <b>${fT(ts)}</b> (${ks.filter(k=>k.mem).length} of 3 kernels memory-bound). Fused: <b>${fB(Nf)}</b>, <b>${fT(tf)}</b> (${fmem?"memory-bound":"compute-bound"}). Ideal speedup <b>${(ts/tf).toFixed(2)}×</b>.`;}
+ Ti.addEventListener("input",draw);RR.addEventListener("change",draw);segInit(Dg,draw);segInit(Gg,draw);draw();
+})();
+
+/* ---------- Figure 2: online softmax stepper ---------- */
+(function(){
+ const svg=$("#fa-on-svg");if(!svg)return;const info=$("#fa-on-info"),seg=$("#fa-on-bs");
+ const r=rng(124),n=12;const S=Array.from({length:n},()=>Math.round((r()*6-2.5)*10)/10),V=Array.from({length:n},()=>Math.round((r()*20-10)*10)/10);
+ const M=Math.max(...S),E=S.map(s=>Math.exp(s-M)),Z=E.reduce((a,v)=>a+v,0),exact=E.reduce((a,v,i)=>a+v*V[i],0)/Z;
+ let bs=3,st=null;
+ function states(){const out=[{m:-Infinity,l:0,o:0,k:0,a:null}];let m=-Infinity,l=0,o=0;
+  for(let k=0;k<n;k+=bs){const blk=S.slice(k,k+bs);const mn=Math.max(m,...blk);const a=Math.exp(m-mn);l=a*l;o=a*o;
+   blk.forEach((s,t)=>{const e=Math.exp(s-mn);l+=e;o+=e*V[k+t];});m=mn;out.push({m,l,o,k:Math.min(n,k+bs),a,b0:k});}
+  return out;}
+ function draw(i){const ss=states(),last=ss.length;const fin=i===last,stt=ss[Math.min(i,last-1)];
+  const cw=48,x0=32;let g=`<text x="4" y="40" font-size="12" fill="var(--muted)">s</text><text x="4" y="72" font-size="12" fill="var(--muted)">v</text>`;
+  for(let j=0;j<n;j++){const x=x0+j*cw;const cur=!fin&&i>0&&j>=stt.b0&&j<stt.k,done=j<stt.k;
+   g+=`<rect x="${x}" y="22" width="${cw-4}" height="58" rx="6" fill="${cur?"var(--q-soft)":done?"var(--k-soft)":"var(--card)"}" stroke="${cur?"var(--q)":"var(--rule)"}" stroke-width="${cur?2.4:1.2}"/>`;
+   g+=`<text x="${x+(cw-4)/2}" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">${S[j].toFixed(1)}</text><text x="${x+(cw-4)/2}" y="70" text-anchor="middle" font-size="12" fill="var(--ink2)">${V[j].toFixed(1)}</text>`;
+   if(done){const w=Math.exp(S[j]-stt.m);const h=Math.max(1,w*80);g+=`<rect x="${x+8}" y="${190-h}" width="${cw-20}" height="${h}" rx="3" fill="var(--v)"/><text x="${x+(cw-4)/2}" y="206" text-anchor="middle" font-size="11" fill="var(--muted)">${w.toFixed(2)}</text>`;}}
+  g+=`<line x1="${x0}" y1="190" x2="${x0+n*cw-4}" y2="190" stroke="var(--muted)"/><text x="${x0}" y="104" font-size="12" fill="var(--muted)">weights e^(s − m) of the keys seen so far (height 1 = the current maximum)</text>`;
+  const mt=stt.m===-Infinity?"−∞":stt.m.toFixed(1);
+  [`m = ${mt}`,`ℓ = ${stt.l.toFixed(4)}`,`õ = ${stt.o.toFixed(4)}`].concat(fin?[`o = õ/ℓ = ${(stt.o/stt.l).toFixed(4)}`]:[]).forEach((t,q)=>{g+=`<text x="${x0+q*140}" y="232" font-size="13.5" fill="var(--ink)" font-family="var(--mono)">${t}</text>`;});
+  svg.innerHTML=g;
+  if(i===0)info.innerHTML=`Start: m = −∞, ℓ = 0, õ = 0. The row has ${n} keys; with block size ${bs} the kernel needs ${last-1} steps and never holds more than ${bs} scores at once.`;
+  else if(fin)info.innerHTML=`Final: o = õ / ℓ = ${stt.o.toFixed(4)} / ${stt.l.toFixed(4)} = <b>${(stt.o/stt.l).toFixed(4)}</b>. Exact softmax over the full row: <b>${exact.toFixed(4)}</b> (difference ${Math.abs(stt.o/stt.l-exact).toExponential(1)}). Log-sum-exp L = m + log ℓ = ${(stt.m+Math.log(stt.l)).toFixed(4)}.`;
+  else info.innerHTML=`Block ${i} (keys ${stt.b0+1} to ${stt.k}): new maximum m = ${stt.m.toFixed(1)}, correction α = e<sup>m − m′</sup> = <b>${stt.a===0?"0 (first block)":stt.a.toFixed(4)}</b>${stt.a===1?" (maximum unchanged)":""}. Running sum ℓ = ${stt.l.toFixed(4)}, running output õ = ${stt.o.toFixed(4)}.`;}
+ function setup(){const nst=Math.ceil(n/bs)+2;st=freshStepper(["fa-on-prev","fa-on-next","fa-on-play","fa-on-lab"],nst,1700,draw);}
+ segInit(seg,v=>{bs=+v;setup();});setup();
+})();
+
+/* ---------- Figure 3: tiling order FA1 vs FA2 ---------- */
+(function(){
+ const svg=$("#fa-tile-svg");if(!svg)return;const info=$("#fa-tile-info"),seg=$("#fa-tile-ord"),CA=$("#fa-tile-causal");const n=6;
+ function order(){const o=segVal(seg),c=CA.checked,L=[];
+  if(o==="fa2"){for(let i=0;i<n;i++)for(let j=0;j<n;j++)if(!c||j<=i)L.push([i,j]);}
+  else{for(let j=0;j<n;j++)for(let i=0;i<n;i++)if(!c||j<=i)L.push([i,j]);}return L;}
+ function counts(L,k,o){const C={q:0,kv:0,or:0,ow:0};let pi=-1,pj=-1;
+  for(let t=0;t<k;t++){const [i,j]=L[t];
+   if(o==="fa2"){if(i!==pi){C.q++;}C.kv++;const nx=L[t+1];if(!nx||nx[0]!==i)C.ow++;}
+   else{if(j!==pj)C.kv++;C.q++;C.or++;C.ow++;}pi=i;pj=j;}return C;}
+ function draw(k){const L=order(),o=segVal(seg),c=CA.checked;const cs=36,gx=70,gy=50;const done=new Set(L.slice(0,k).map(([i,j])=>i+","+j));const cur=k>0?L[k-1]:null;
+  let g=`<text x="${gx+n*cs/2}" y="24" text-anchor="middle" font-size="12.5" fill="var(--muted)">key / value block j →</text><text x="20" y="${gy+n*cs/2}" font-size="12.5" fill="var(--muted)" transform="rotate(-90 20 ${gy+n*cs/2})" text-anchor="middle">query block i →</text>`;
+  for(let i=0;i<n;i++){g+=`<text x="${gx-8}" y="${gy+i*cs+cs/2+4}" text-anchor="end" font-size="11" fill="var(--muted)">Q${i+1}</text>`;
+   for(let j=0;j<n;j++){if(i===0)g+=`<text x="${gx+j*cs+cs/2}" y="${gy-6}" text-anchor="middle" font-size="11" fill="var(--muted)">K${j+1}</text>`;
+    const skip=c&&j>i,isc=cur&&cur[0]===i&&cur[1]===j,dn=done.has(i+","+j);
+    g+=`<rect x="${gx+j*cs+1}" y="${gy+i*cs+1}" width="${cs-2}" height="${cs-2}" rx="4" fill="${isc?"var(--q)":dn?"var(--k-soft)":skip?"var(--rule)":"var(--card)"}" stroke="${isc?"var(--q)":"var(--rule)"}" stroke-width="1.2"${skip?' opacity="0.55"':""}/>`;
+    if(c&&i===j)g+=`<path d="M${gx+j*cs+4} ${gy+i*cs+4} L${gx+j*cs+cs-4} ${gy+i*cs+cs-4}" stroke="var(--muted)" stroke-width="1" stroke-dasharray="3 3"/>`;}}
+  const C=counts(L,k,o),px=330;
+  g+=`<rect x="${px}" y="40" width="290" height="104" rx="10" fill="var(--paper2)" stroke="var(--rule)"/><text x="${px+12}" y="60" font-size="13" font-weight="700" fill="var(--ink)">SRAM of one SM now</text>`;
+  if(cur){const [i,j]=cur;const items=o==="fa2"?[[`Q${i+1}`,"var(--q)"],[`K${j+1}, V${j+1}`,"var(--k)"],[`m, ℓ, Õ for Q${i+1}`,"var(--v)"]]:[[`K${j+1}, V${j+1}`,"var(--k)"],[`Q${i+1}`,"var(--q)"],[`O${i+1}, m, ℓ (read from HBM)`,"var(--v)"]];
+   items.forEach(([t,col],q)=>{g+=`<rect x="${px+12}" y="${70+q*24}" width="12" height="12" rx="2" fill="${col}"/><text x="${px+30}" y="${81+q*24}" font-size="12.5" fill="var(--ink2)">${t}</text>`;});}
+  else g+=`<text x="${px+12}" y="84" font-size="12.5" fill="var(--muted)">empty: press Next</text>`;
+  g+=`<text x="${px}" y="172" font-size="13" font-weight="700" fill="var(--ink)">HBM ↔ SRAM transfers so far (in tiles)</text>`;
+  [["Q tiles read",C.q],["K, V tile pairs read",C.kv],["O tiles read",C.or],["O tiles written",C.ow]].forEach(([t,v],q)=>{g+=`<text x="${px}" y="${196+q*20}" font-size="12.5" fill="var(--ink2)">${t}</text><text x="${px+250}" y="${196+q*20}" text-anchor="end" font-size="12.5" font-weight="700" fill="var(--ink)" font-family="var(--mono)">${v}</text>`;});
+  svg.innerHTML=g;
+  const tot=L.length;const fin=k===tot;
+  info.innerHTML=(k===0?`${o==="fa2"?"FlashAttention-2":"FlashAttention-1"} order, ${c?"causal":"no mask"}: ${tot} of ${n*n} tiles will be computed.`:`Tile ${k} of ${tot}: Q block ${cur[0]+1} against K/V block ${cur[1]+1}${c&&cur[0]===cur[1]?" (diagonal tile: element-wise mask)":""}.`)+
+   ` Transfers: Q ${C.q}, K/V ${C.kv}, O read ${C.or}, O written ${C.ow}${fin?` — <b>total ${C.q+C.kv+C.or+C.ow}</b> tile transfers`:""}.`;}
+ function setup(){freshStepper(["fa-tile-prev","fa-tile-next","fa-tile-play","fa-tile-lab"],order().length+1,700,draw);}
+ segInit(seg,setup);CA.addEventListener("change",setup);setup();
+})();
+
+/* ---------- Figure 4: parallelism over SMs ---------- */
+(function(){
+ const svg=$("#fa-par-svg");if(!svg)return;const Bb=$("#fa-par-b"),Hh=$("#fa-par-h"),Tt=$("#fa-par-t"),Gg=$("#fa-par-g"),info=$("#fa-par-info");
+ const util=(nb,S)=>{const w=Math.ceil(nb/S);return{w,u:nb/(w*S)};};
+ function grid(x0,y0,S,busy,title,sub){let s=`<text x="${x0}" y="${y0-26}" font-size="14" font-weight="700" fill="var(--ink)">${title}</text><text x="${x0}" y="${y0-9}" font-size="12" fill="var(--muted)">${sub}</text>`;
+  const cols=12,c=22;for(let k=0;k<S;k++){const x=x0+(k%cols)*c,y=y0+Math.floor(k/cols)*c*0.72;s+=`<rect x="${x}" y="${y}" width="${c-4}" height="${c*0.72-3}" rx="2" fill="${k<busy?"var(--q)":"var(--rule)"}"/>`;}return s;}
+ function draw(){const b=+Bb.value,h=+Hh.value,T=2**(+Tt.value),S=+segVal(Gg);$("#fa-par-bv").value=b;$("#fa-par-hv").value=h;$("#fa-par-tv").value=T.toLocaleString("en-US");
+  const n1=b*h,n2=b*h*Math.ceil(T/128),u1=util(n1,S),u2=util(n2,S);
+  svg.innerHTML=grid(16,52,S,Math.min(S,n1),"FlashAttention-1",`${n1.toLocaleString("en-US")} thread blocks`)+grid(338,52,S,Math.min(S,n2),"FlashAttention-2",`${n2.toLocaleString("en-US")} thread blocks`);
+  info.innerHTML=`Batch ${b} × ${h} heads, T = ${T.toLocaleString("en-US")}, ${S} SMs. FlashAttention-1: ${n1.toLocaleString("en-US")} blocks in ${u1.w} wave${u1.w>1?"s":""}, utilization <b>${(100*u1.u).toFixed(1)}%</b>. FlashAttention-2 (B<sub>r</sub> = 128): ${n2.toLocaleString("en-US")} blocks in ${u2.w} wave${u2.w>1?"s":""}, utilization <b>${(100*u2.u).toFixed(1)}%</b>.`;}
+ [Bb,Hh,Tt].forEach(e=>e.addEventListener("input",draw));segInit(Gg,draw);draw();
+})();
+
+/* ---------- Figure 5: ping-pong toy timeline ---------- */
+(function(){
+ const svg=$("#fa-pp-svg");if(!svg)return;const Rr=$("#fa-pp-r"),Mg=$("#fa-pp-m"),info=$("#fa-pp-info");
+ function draw(){const r=+Rr.value,mode=segVal(Mg);$("#fa-pp-rv").value=r.toFixed(2);const H=8,x0=130,W=490,sc=W/H;const ev=[];
+  if(mode==="seq"){let t=0;while(t<H){ev.push([0,"g",t,t+1]);ev.push([0,"s",t+1,t+1+r]);t+=1+r;}}
+  else{const ready=[0,0];let tc=0,w=0;while(tc<H){const st=Math.max(ready[w],tc);ev.push([w,"g",st,st+1]);tc=st+1;ev.push([w,"s",st+1,st+1+r]);ready[w]=st+1+r;w=1-w;}}
+  const rows=mode==="seq"?["warpgroup 1"]:["warpgroup 1","warpgroup 2"];let s="";const yT=30+rows.length*44;
+  rows.forEach((nm,k)=>{s+=`<text x="${x0-10}" y="${50+k*44}" text-anchor="end" font-size="13" fill="var(--ink2)">${nm}</text>`;});
+  s+=`<text x="${x0-10}" y="${yT+20}" text-anchor="end" font-size="13" font-weight="700" fill="var(--ink)">tensor cores</text><line x1="${x0}" y1="${yT+36}" x2="${x0+W}" y2="${yT+36}" stroke="var(--muted)"/>`;
+  const clip=(a,b)=>[Math.max(0,a),Math.min(H,b)];
+  ev.forEach(([w,k,a,b])=>{const [p,q]=clip(a,b);if(q<=p)return;const y=32+w*44;
+   s+=`<rect x="${(x0+p*sc).toFixed(1)}" y="${y}" width="${((q-p)*sc-1.5).toFixed(1)}" height="26" rx="4" fill="${k==="g"?"var(--q)":"var(--v)"}"/>`;
+   if(k==="g")s+=`<rect x="${(x0+p*sc).toFixed(1)}" y="${yT+4}" width="${((q-p)*sc-1.5).toFixed(1)}" height="26" rx="4" fill="var(--q)"/>`;});
+  for(let t=0;t<=H;t+=2)s+=`<text x="${x0+t*sc}" y="${yT+52}" text-anchor="middle" font-size="11.5" fill="var(--muted)">${t}</text>`;
+  svg.setAttribute("viewBox",`0 0 640 ${yT+60}`);svg.innerHTML=s;
+  const uS=1/(1+r),uP=Math.min(1,2/(1+r)),u=mode==="seq"?uS:uP;
+  info.innerHTML=`r = ${r.toFixed(2)}. Tensor cores busy: <b>${(100*u).toFixed(1)}%</b> with ${mode==="seq"?"no overlap":"ping-pong"} (no overlap ${(100*uS).toFixed(1)}%, ping-pong ${(100*uP).toFixed(1)}%). At d = 128 on an H100, formula (124.10) gives r ≈ 0.50.`;}
+ Rr.addEventListener("input",draw);segInit(Mg,draw);draw();
+})();
+})();
+</script></body></html>

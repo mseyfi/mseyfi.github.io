@@ -1,0 +1,453 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Dynamic inference: early exit and layer skipping · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 121</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="dynamic-inference-early-exit-and-layer-skipping">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="dynamic-inference-early-exit-and-layer-skipping" data-session="dynamic-inference-early-exit-and-layer-skipping" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">121</span><span>Track 5: LLM inference and serving · session 44 of 65</span></div><h1 class="chap-title">Dynamic inference: early exit and layer skipping</h1><p class="chap-sub">Some inputs and some tokens are easy, so a model does not always need all of its layers. Early exit stops after a few layers when the model is already sure, and layer skipping jumps over layers. This session goes from early exit for BERT classifiers (DeeBERT, FastBERT, PABEE) to early exit for LLM generation (CALM, SkipDecode), explains why skipped layers leave holes in the KV cache, and ends with LayerSkip, which uses its own early layers as a draft model for speculative decoding.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> The KV cache (session 80), Why inference is slow (session 82), basic softmax and entropy; Speculative decoding 1 (session 128) helps for the last part</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How early exit works, and how to compute its speed-up from the average depth and the cost of checking an exit</li><li>Sample-level exit for classification: DeeBERT's entropy rule, FastBERT's normalized entropy and self-distillation, PABEE's patience counter</li><li>Token-level exit for generation with CALM: softmax response, hidden-state saturation and a small classifier as confidence, plus the decaying threshold</li><li>The KV-cache problem: why skipped layers leave holes, and four fixes (recompute, state propagation, SkipDecode, verification)</li><li>SkipDecode: batch-wide, position-based, decreasing exit points that skip lower layers instead of top layers</li><li>LayerSkip: layer dropout and a shared-head early-exit loss in training, then self-speculative decoding with one model and one KV cache</li><li>What the papers measured, and a simple model to estimate the speed-up of self-speculation</li></ul></div></header><style>
+.de-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.de-grid input[type=range]{width:100%}
+.de-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.de-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c);border:1.5px solid var(--b,transparent)}
+[data-session="dynamic-inference-early-exit-and-layer-skipping"] pre.code{font-variant-ligatures:none}
+.de-cell{cursor:pointer}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A 32-layer language model spends exactly 32 layers on every token. It spends them on "the" after "on" and on the last digit of a hard sum. Many tokens are easy: a small part of the network already knows the answer. <b>Dynamic inference</b> lets the amount of compute depend on the input. The two main tools are <b>early exit</b> (stop after a few layers when the model is already sure) and <b>layer skipping</b> (jump over some layers).</p>
+<p>All the methods in the last sessions were <b>static</b>: pruning (<a href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html">session 115</a>), quantization and distillation (<a href="../inference/distillation-for-llms-1-white-box-logits.html">session 119</a>) make the model smaller once, and then every input pays the same smaller price. Dynamic methods keep the full model and decide per input, or even per token, how much of it to run. The efficient-inference survey of Zhou et al. puts them under model-level optimization, next to mixture-of-experts (<a href="../inference/efficient-ffn-2-moe-routing-in-depth.html">session 95</a>): MoE chooses which experts to run (width), early exit chooses how many layers to run (depth). [Certain]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: "How does early exit decide when to stop?", "Why is early exit easy for BERT classification but hard for LLM generation?", "What happens to the KV cache when a token skips layers?", "How does LayerSkip use early exit for speculative decoding?". This session answers each one with the numbers from the papers.</aside>
+<p>The story has three steps. First, early exit for <b>classification</b> (DeeBERT, FastBERT, PABEE, 2020): one decision per input, no cache, simple. Second, early exit for <b>generation</b> (CALM, SkipDecode): one decision per token, and a new problem appears. A token that exits at layer 3 never computes the keys and values of layers 4 to 32, but later tokens want to attend to them (<a href="../inference/the-kv-cache.html">session 80</a>). Third, <b>LayerSkip</b> (2024) trains a model so that its early layers are good drafters, and then uses them for <b>self-speculative decoding</b>: draft with the first layers, check with the rest, and get exactly the full model's output.</p>
+
+<h2>The idea: put exits inside the network</h2>
+<p>Take a network with \(L\) layers. After some layers \(l\), add an <b>exit</b>: a small head that turns the hidden state \(\mathbf{h}_l\) into a prediction (class probabilities, or next-token probabilities). At inference, after each layer we look at the exit's prediction and ask a simple question: "is this good enough?" If yes, we stop and return it. If no, we run the next layer.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A doctor at a walk-in clinic. Most patients have a cold: two questions, and they go home. A few patients need tests, a scan, and a specialist. The clinic is fast on average because the expensive path is used only when needed. The hard part is the rule that decides "you can go home now". A bad rule sends sick patients home.</aside>
+<p>If a fraction \(q_l\) of the inputs exits at layer \(l\), the average number of layers is \(\E[\ell] = \sum_l l\, q_l\). Each exit that we check also costs something: a head and a decision. Write that cost as a fraction \(c\) of one layer. Then the speed-up over the full model is</p>
+<div class="eq">\[ \text{speed-up} = \frac{L}{\E[\ell]\,(1 + c)}, \qquad \E[\ell] = \sum_{l=1}^{L} l\, q_l \tag{121.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(L\)</dt><dd>number of layers of the full model</dd>
+<dt>\(q_l\)</dt><dd>fraction of inputs (or tokens) that stop at layer \(l\); the \(q_l\) add up to 1</dd>
+<dt>\(\E[\ell]\)</dt><dd>average number of layers that are run</dd>
+<dt>\(c\)</dt><dd>cost of checking one exit, as a fraction of the cost of one layer (here we assume an exit is checked after every layer)</dd></dl>
+<div class="worked"><div class="wt">Worked example: average depth and speed-up</div>
+<p>A 12-layer classifier. Half of the inputs exit at layer 3, 30% at layer 6, and 20% need all 12 layers. Then \(\E[\ell] = 0.5 \cdot 3 + 0.3 \cdot 6 + 0.2 \cdot 12 = 5.7\) layers, and the speed-up is \(12 / 5.7 = 2.11\times\) if exits are free. If each exit check costs 2% of a layer, the cost is \(5.7 \times 1.02 = 5.81\) layers and the speed-up is \(2.06\times\).</p>
+<p>For a small classifier head, \(c\) is tiny. For an LLM it is not. The exit head of an LLM is the LM head, a \(d \times V\) matrix. In Llama 2 7B (\(d = 4096\), \(V = 32{,}000\)) it has 131M weights, while one layer has 202M: \(c \approx 0.65\). In Llama 3 8B (\(V = 128{,}256\)) the head has 525M weights against 218M per layer: one full softmax at an exit costs <b>2.4 layers</b>. [Certain] (Computed from the config files on Hugging Face.) This is the first reason why LLM early exit needs care.</p></div>
+<p>Two design questions follow, and every method in this session is an answer to them. <b>How do we train</b> the exits, so that early layers give useful predictions? And <b>what rule</b> decides that a prediction is good enough?</p>
+
+<h2>Sample-level early exit for classification</h2>
+<p>In 2020, three papers made BERT-style classifiers faster with early exit. Here one input (a sentence, or a pair of sentences) gets one label. The whole input goes through the layers together, so "exit" means "stop the whole input". There is no generation and no cache, so nothing is missing later. This is the easy case.</p>
+<h3>DeeBERT: stop when the entropy is low</h3>
+<p>DeeBERT (Xin et al.) adds a small classifier, called an <b>off-ramp</b>, after every transformer layer. Each off-ramp outputs class probabilities \(\mathbf{p}_l\). The rule: stop at the first layer where the <b>entropy</b> of \(\mathbf{p}_l\) is below a threshold \(S\). Entropy measures how spread out a distribution is: 0 when one class has all the probability, \(\log N\) when all \(N\) classes are equal.</p>
+<div class="eq">\[ H(\mathbf{p}_l) = -\sum_{i=1}^{N} p_{l,i} \log p_{l,i}, \qquad \text{exit at the first } l \text{ with } H(\mathbf{p}_l) \lt S \tag{121.2} \]</div>
+<p>A larger \(S\) means more inputs exit early: faster, but less accurate. Training has two stages. First, fine-tune the backbone and the last classifier as usual. Then freeze them and train the other off-ramps on the sum of their losses. So the final layer is exactly as good as a normal fine-tuned model. DeeBERT reports up to about 40% less inference time with little loss in quality, on BERT-base and RoBERTa-base and six GLUE tasks. [Certain]</p>
+<h3>FastBERT: self-distillation and normalized entropy</h3>
+<p>FastBERT (Liu et al.) uses the same structure. It calls the exits <b>student classifiers</b> and the last classifier the <b>teacher</b>. Its two changes: the uncertainty is the entropy divided by its maximum \(\log N\), so it is between 0 and 1 for any number of classes, and the students are trained to copy the teacher (self-distillation, as in <a href="../inference/distillation-for-llms-1-white-box-logits.html">session 119</a>) instead of the labels. Because they only need the teacher's outputs, the students can train on unlabeled data.</p>
+<div class="eq">\[ u_l = \frac{H(\mathbf{p}_l)}{\log N} \in [0, 1], \qquad \mathcal{L}_{\text{FastBERT}} = \sum_{l=1}^{L-1} \KL\!\left(\mathbf{p}_L \,\Vert\, \mathbf{p}_l\right) \tag{121.3} \]</div>
+<p>The threshold on \(u_l\) is called the "speed": a higher speed means more early exits. FastBERT reports speed-ups from about 1 to 12 times over BERT on twelve English and Chinese datasets, depending on the threshold. [Certain]</p>
+<h3>PABEE: stop when the layers stop changing their mind</h3>
+<p>A confident wrong answer has low entropy too. Neural networks are often over-confident, so an early layer can be sure and wrong. PABEE (Zhou et al., "BERT Loses Patience") does not trust any single exit. It counts how many layers in a row give the <b>same</b> predicted class, and stops when this count reaches the <b>patience</b> \(t\):</p>
+<div class="eq">\[ \text{cnt}_l = \begin{cases} \text{cnt}_{l-1} + 1 & \text{if } \argmax \mathbf{p}_l = \argmax \mathbf{p}_{l-1} \\ 0 & \text{otherwise} \end{cases}, \qquad \text{exit when } \text{cnt}_l = t \tag{121.4} \]</div>
+<p>For regression, "same" means \(|y_l - y_{l-1}| \lt \tau\). If the count never reaches \(t\), the last layer answers. Patience \(t\) means the earliest possible exit is at layer \(t + 1\). The exits are trained together with a weighted loss that gives deeper layers more weight:</p>
+<div class="eq">\[ \mathcal{L} = \frac{\sum_{j=1}^{L} j \cdot \mathcal{L}_j}{\sum_{j=1}^{L} j} \tag{121.5} \]</div>
+<p>PABEE also argues that early exit can <b>improve</b> accuracy. Deep models can "overthink": a correct prediction at a middle layer turns wrong at a later layer. On ALBERT-base, PABEE reports a 1.57× speed-up together with a higher GLUE score than the full model. [Certain]</p>
+<div class="worked"><div class="wt">Worked example: the three rules on one input</div>
+<p>Two classes. An exit outputs \(\mathbf{p} = (0.9, 0.1)\). Its entropy is \(-(0.9 \ln 0.9 + 0.1 \ln 0.1) = 0.325\) nats. With DeeBERT and \(S = 0.2\), this input does <b>not</b> exit. FastBERT's normalized value is \(0.325 / \ln 2 = 0.469\). A sharper \(\mathbf{p} = (0.97, 0.03)\) has entropy \(0.135\), below \(S = 0.2\), so DeeBERT exits.</p>
+<p>PABEE with \(t = 3\): suppose layers 1 to 6 predict A, B, B, A, A, A. The counts are 0, 0, 1, 0, 1, 2, so no exit yet; if layer 7 also says A, the count is 3 and the input exits at layer 7 with answer A. Note that PABEE never looks at the probabilities, only at the labels.</p></div>
+<p>Figure 1 runs the entropy rule and the patience rule on 400 simulated inputs. Each input has a hidden difficulty. Easy inputs become confident after a few layers; hard inputs stay uncertain, and some are wrong even at layer 12. The data is a toy simulation, not a real model, but it shows the trade-off curve that all these papers report.</p>
+<figure class="fig" id="de-ee"><div class="fig-body">
+<div class="controls"><span class="seg" id="de-ee-mode"><button type="button" data-v="ent" aria-pressed="true">Entropy rule (DeeBERT)</button><button type="button" data-v="pat" aria-pressed="false">Patience rule (PABEE)</button></span></div>
+<div class="de-grid" style="margin-top:8px">
+<label for="de-ee-s">Entropy threshold \(S\)</label><input type="range" id="de-ee-s" min="0.01" max="0.69" step="0.01" value="0.2"><output id="de-ee-sv"></output>
+<label for="de-ee-t">Patience \(t\)</label><input type="range" id="de-ee-t" min="1" max="10" step="1" value="3"><output id="de-ee-tv"></output></div>
+<svg id="de-ee-svg" viewBox="0 0 640 250" role="img" aria-label="Histogram of the exit layer of 400 simulated inputs, and the accuracy against the full model"></svg>
+<div class="de-leg"><span style="--c:var(--q)">inputs that exit at this layer, correct</span><span style="--c:var(--k)">exit here, wrong</span></div>
+<div class="readout" id="de-ee-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Sample-level early exit on 400 simulated inputs and a 12-layer classifier with two classes. Bars show where the inputs exit. The readout gives the average depth, the speed-up from formula (121.1) with free exits, and the accuracy compared to always running all 12 layers.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with the entropy rule at \(S = 0.2\): many inputs exit early, the average depth falls to about 6 layers, and the accuracy drops only a little below the full model's 88.25%. Move \(S\) toward 0.69 (that is \(\ln 2\), the largest possible entropy for two classes): almost everything exits at layer 1, and the accuracy falls hard. Then switch to patience. With \(t = 1\) the rule is too easy to satisfy; at \(t = 7\) or more it matches the full model, because only inputs whose prediction is stable for many layers exit. Every point on these curves is one possible product: you choose the threshold that gives the accuracy you need.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 1: sample-level early exit (inference)</div><ol>
+<li><b>input:</b> input \(x\), layers \(f_1, \dots, f_L\), exit heads \(g_1, \dots, g_L\), rule (entropy threshold \(S\) or patience \(t\))</li>
+<li>\(\mathbf{h} \leftarrow \text{embed}(x)\); \(\text{cnt} \leftarrow 0\); \(\text{prev} \leftarrow \text{none}\)</li>
+<li><b>for</b> \(l = 1\) to \(L\):</li>
+<li>&nbsp;&nbsp;\(\mathbf{h} \leftarrow f_l(\mathbf{h})\); \(\mathbf{p} \leftarrow \softmax(g_l(\mathbf{h}))\)</li>
+<li>&nbsp;&nbsp;<b>if</b> rule is entropy <b>and</b> \(H(\mathbf{p}) \lt S\): <b>return</b> \(\argmax \mathbf{p}\) <span class="c">// formula (121.2)</span></li>
+<li>&nbsp;&nbsp;<b>if</b> rule is patience: \(\text{cnt} \leftarrow \text{cnt} + 1\) if \(\argmax \mathbf{p} = \text{prev}\) else \(0\); \(\text{prev} \leftarrow \argmax \mathbf{p}\)</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;<b>if</b> \(\text{cnt} = t\): <b>return</b> \(\text{prev}\) <span class="c">// formula (121.4)</span></li>
+<li><b>return</b> \(\argmax \mathbf{p}\) <span class="c">// the last layer always answers</span></li></ol></div>
+<aside class="note watch side"><span class="nt">Watch out</span>Sample-level exit and batching do not mix well. If a batch of 32 sentences runs together on a GPU, the batch is done only when its last sentence exits. You either remove finished samples from the batch (and re-pack), or you accept that the batch pays for its hardest member. Most published speed-ups are measured with batch size 1. [Likely]</aside>
+
+<h2>Token-level early exit for generation: CALM</h2>
+<p>For a decoder that generates text, the natural unit is one <b>token</b>. Each token gets its own exit decision. The idea is the same, but three things become harder: the confidence measure is over a vocabulary of tens of thousands of words, one wrong early token can change everything that follows, and the KV cache has holes (next section). CALM, "Confident Adaptive Language Modeling" (Schuster et al., 2022), handles all three.</p>
+<h3>Three confidence measures</h3>
+<p>Let \(\mathbf{d}^i_t\) be the hidden state of token \(t\) after decoder layer \(i\). CALM exits when a confidence \(c^i_t\) is at least a threshold \(\lambda\). It tests three choices of \(c\):</p>
+<div class="eq">\[ c^i_t = \underbrace{p_{(1)} - p_{(2)}}_{\text{softmax response}}, \qquad c^i_t = \underbrace{\cos\!\left(\mathbf{d}^i_t, \mathbf{d}^{i-1}_t\right)}_{\text{hidden-state saturation}}, \qquad c^i_t = \underbrace{\sigma\!\left(\mathbf{w}^\top \mathbf{d}^i_t + b\right)}_{\text{early-exit classifier}} \tag{121.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(p_{(1)}, p_{(2)}\)</dt><dd>the largest and second-largest probabilities of \(\softmax(W \mathbf{d}^i_t)\), the shared LM head applied at layer \(i\)</dd>
+<dt>\(\cos(\cdot,\cdot)\)</dt><dd>cosine similarity of the hidden state with the one from the layer before; near 1 means "this layer changed almost nothing"</dd>
+<dt>\(\mathbf{w}, b\)</dt><dd>a tiny linear classifier (only \(d + 1\) weights), trained after the model is frozen to predict "the exit at this layer gives the same token as the last layer"</dd></dl>
+<p>The softmax response is the most accurate signal, but it needs the full LM head at every layer it checks, which we saw is expensive. (CALM notes that the next layer can start in parallel, so the extra FLOPs do not all add latency.) The saturation measure is free but weak; it was often below the static baseline that uses the same number of layers for every token. The classifier is very cheap and sometimes gives better speed than the softmax. [Certain]</p>
+<p>Training uses a weighted average of the losses of all layers, \(\mathcal{L} = \sum_i \omega_i \mathcal{L}_i\) with \(\omega_i = i / \sum_j j\), the same shape as formula (121.5). [Certain]</p>
+<h3>A threshold that decays over the sequence</h3>
+<p>CALM measured that an error early in a generated sequence hurts the final output more than an error late in the sequence: early mistakes are copied forward. So it makes exiting harder at the start and easier later, with a <b>decaying threshold</b>:</p>
+<div class="eq">\[ \lambda'(\lambda, t) = \operatorname{clip}_{[0,1]}\!\left( \frac{9}{10}\lambda + \frac{1}{10} e^{-\tau t / N} \right) \tag{121.7} \]</div>
+<p>Here \(N\) is the maximum output length and \(\tau\) a temperature. With \(\tau = 0\) the threshold is the constant \(0.9\lambda + 0.1\); a larger \(\tau\) makes it fall faster toward \(0.9\lambda\). The single number \(\lambda\) is then <b>calibrated</b> on held-out data with a statistical method (Learn then Test), so that the early-exit output stays close to the full model's output with a chosen tolerance \(\delta\) and high probability. [Certain]</p>
+<div class="worked"><div class="wt">Worked example: the decaying threshold</div>
+<p>\(\lambda = 0.9\) and \(\tau = 4\). At \(t = 0\): \(0.81 + 0.1 \cdot 1 = 0.91\). At \(t = N/2\): \(0.81 + 0.1\, e^{-2} = 0.824\). At \(t = N\): \(0.81 + 0.1\, e^{-4} = 0.812\). So the first token needs a top-1 minus top-2 gap of 0.91 to exit, the last token only 0.812.</p></div>
+<figure class="fig" id="de-calm"><div class="fig-body">
+<div class="de-grid">
+<label for="de-calm-l">Threshold \(\lambda\)</label><input type="range" id="de-calm-l" min="0.3" max="1" step="0.01" value="0.9"><output id="de-calm-lv"></output>
+<label for="de-calm-t">Temperature \(\tau\)</label><input type="range" id="de-calm-t" min="0" max="10" step="0.5" value="4"><output id="de-calm-tv"></output></div>
+<svg id="de-calm-svg" viewBox="0 0 640 260" role="img" aria-label="Exit layer of 40 generated tokens and the decaying threshold"></svg>
+<div class="de-leg"><span style="--c:var(--q)">exit layer of each token (of 8)</span><span style="--c:var(--k)">threshold λ′(t), right axis</span></div>
+<div class="readout" id="de-calm-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> CALM-style token-level exit on 40 simulated tokens and an 8-layer decoder (the size of the T5 decoder used in the CALM paper). Each token has a confidence that grows with depth; a token exits at the first layer where its softmax response reaches \(\lambda'(t)\) from formula (121.7). The confidences are simulated and fixed; only the rule changes.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Set \(\tau = 0\): the orange line is flat and every position faces the same bar. Raise \(\tau\): the line falls to the right, so later tokens exit earlier and the average depth goes down, while the first tokens are still protected. Lower \(\lambda\) to see more aggressive exiting. In the real paper, the calibration step chooses \(\lambda\) for you from the quality you ask for.</p></details></figure>
+<h3>What CALM measured</h3>
+<p>CALM was tested on an 8-layer T5 1.1 encoder-decoder for summarization (CNN/DM), translation (WMT EN-FR) and question answering (SQuAD). [Certain] With the softmax measure it reports up to about 3× speed-up while provably keeping the output quality within the chosen tolerance. [Certain] An <b>oracle</b> that exits at the first layer whose token equals the last layer's token used only 1.53 decoder layers on average on CNN/DM, with ROUGE-L 38.24 against 38.32 for the full model. [Certain] So the potential is large; the hard part is a confidence measure that is close to the oracle.</p>
+
+<h2>The KV-cache problem</h2>
+<p>Here is the real difficulty of token-level exit. In a decoder, token \(t\) at layer \(i\) attends to the keys and values of all earlier tokens <b>at the same layer \(i\)</b>. With a KV cache, those keys and values were saved when the earlier tokens were processed. But suppose token 2 exited at layer 3. Its keys and values at layers 4 to 8 were <b>never computed</b>. When token 5 reaches layer 6, the cache has a hole where token 2 should be.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A relay of note-takers. At each floor of a building (a layer), a clerk keeps notes on every visitor so that later visitors can read them. A visitor who leaves from the third floor never meets the clerks on floors 4 to 8. When a later visitor goes up to floor 6 and asks "what did the earlier visitors say?", one page is missing.</aside>
+<p>There are four ways to deal with the holes:</p>
+<ol>
+<li><b>Recompute later.</b> When a later token needs layer \(i\) of an earlier token, run the missing layers for that earlier token then. This is exact, but the saved work comes back: each earlier token ends up running as deep as the deepest later token.</li>
+<li><b>Copy the state (CALM's state propagation).</b> When token \(s\) exits at layer \(e_s\), use its last hidden state \(\mathbf{d}^{e_s}_s\) as if it were the hidden state of every skipped layer, and compute keys and values from it with each skipped layer's own projections:
+<div class="eq">\[ \mathbf{k}^{i}_s = W^{i}_K\, \mathbf{d}^{e_s}_s, \qquad \mathbf{v}^{i}_s = W^{i}_V\, \mathbf{d}^{e_s}_s \qquad \text{for all } i \gt e_s \tag{121.8} \]</div>
+This costs only the K and V projections (no attention, no MLP), and all of them can run in parallel because they share one input. CALM tested it with the oracle: ROUGE-L 38.24 against 38.31 for an oracle that never skips, so copying the hidden state barely hurts. Copying the <b>projected</b> keys and values of the exit layer instead dropped ROUGE-L to 23.02. [Certain] So the projections of the skipped layer matter.</li>
+<li><b>Never create holes (SkipDecode).</b> Choose exit points so that a later token never needs a layer that an earlier token skipped (next section).</li>
+<li><b>Fill the holes in a later pass (LayerSkip).</b> Treat the early-exit tokens as drafts, and let a full-depth verification pass compute the missing layers for all of them at once (section after next).</li></ol>
+<div class="worked"><div class="wt">Worked example: counting the holes</div>
+<p>Eight tokens, eight layers, exit layers \(e = (8, 3, 5, 2, 6, 8, 4, 3)\). The tokens compute \(39\) of the \(64\) (token, layer) cells. Now count, for each token \(t\) and each layer \(i \le e_t\), the earlier tokens \(s\) with \(e_s \lt i\): those are attention reads that hit a hole. There are <b>30</b> such missing reads. Recompute fixes them with <b>16</b> extra layer runs: each token must run up to the deepest exit of any later token, \(\sum_s \max(0, \max_{t \gt s} e_t - e_s) = 16\). State copying instead fills all \(64 - 39 = 25\) skipped cells with cheap K/V projections. Figure 3 shows the same grid.</p></div>
+<figure class="fig wide" id="de-kv"><div class="fig-body">
+<div class="controls"><span class="seg" id="de-kv-mode"><button type="button" data-v="full" aria-pressed="false">Full model</button><button type="button" data-v="naive" aria-pressed="true">Early exit, no fix</button><button type="button" data-v="recomp" aria-pressed="false">Recompute</button><button type="button" data-v="copy" aria-pressed="false">Copy state (CALM)</button><button type="button" data-v="skip" aria-pressed="false">SkipDecode</button></span></div>
+<div class="scroll-x"><svg id="de-kv-svg" viewBox="0 0 720 330" role="img" aria-label="Grid of 8 tokens by 8 layers showing which keys and values exist in the cache"></svg></div>
+<div class="de-leg"><span style="--c:var(--q-soft);--b:var(--q)">computed: K and V in cache</span><span style="--c:var(--k-soft);--b:var(--k)">extra compute (recompute)</span><span style="--c:var(--v-soft);--b:var(--v)">K, V projected from copied state</span><span style="--c:transparent;--b:var(--rule)">skipped: no K, V</span><span style="--c:transparent;--b:var(--k)">hole that the selected token needs</span></div>
+<div class="readout" id="de-kv-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> The KV-cache problem on 8 tokens and 8 layers. Columns are tokens in order, rows are layers (layer 1 at the bottom). Click a column to select a token: its attention reads at each of its layers are checked against the earlier tokens. The readout counts computed cells, missing reads and extra work for the chosen strategy.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>"Early exit, no fix" shows the holes: select token 6 (it runs all 8 layers) and see the orange outlines in the columns of earlier tokens that stopped low. "Recompute" removes every hole, but the orange cells are the price: 16 extra layer runs, so the total grows from 39 to 55 of 64. "Copy state" also removes every hole, with green cells that need only two small matrix products each. "SkipDecode" uses a different exit schedule (8, 7, 6, 5, 5, 4, 3, 2) and spends each token's layers at the <b>top</b> of the stack, after one warm-up layer. Every token computes a subset of the layers of every earlier token, so there are no holes and no extra work.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 2: CALM token-level exit with state propagation (one decoding step)</div><ol>
+<li><b>input:</b> token \(y_t\), KV cache for all layers, threshold \(\lambda'(\lambda, t)\) from formula (121.7)</li>
+<li>\(\mathbf{d} \leftarrow \text{embed}(y_t)\)</li>
+<li><b>for</b> \(i = 1\) to \(L\):</li>
+<li>&nbsp;&nbsp;\(\mathbf{d} \leftarrow \text{layer}_i(\mathbf{d}, \text{cache}_i)\); append \(\mathbf{k}^i_t, \mathbf{v}^i_t\) to \(\text{cache}_i\)</li>
+<li>&nbsp;&nbsp;\(c \leftarrow\) confidence of \(\mathbf{d}\) at layer \(i\) <span class="c">// formula (121.6)</span></li>
+<li>&nbsp;&nbsp;<b>if</b> \(c \ge \lambda'\) <b>or</b> \(i = L\): <b>break</b></li>
+<li><b>for</b> every skipped layer \(j = i+1\) to \(L\): append \(W^j_K \mathbf{d},\ W^j_V \mathbf{d}\) to \(\text{cache}_j\) <span class="c">// state propagation, formula (121.8)</span></li>
+<li><b>return</b> \(y_{t+1} = \argmax \softmax(W_{\text{head}}\, \mathbf{d})\)</li></ol></div>
+
+<h2>SkipDecode: early exit that works with batching and caching</h2>
+<p>CALM still has two practical problems. In a <b>batch</b>, tokens of different requests exit at different layers, but the GPU runs one layer for the whole batch at once. So the batch is done only when its deepest token is done:</p>
+<div class="eq">\[ \text{layers run at one step} = \max_{b \in \text{batch}} e_b, \qquad \text{useful fraction} = \frac{\sum_b e_b}{B \cdot \max_b e_b} \tag{121.9} \]</div>
+<p>For a batch of 4 tokens with exits \((2, 3, 8, 4)\), the step runs 8 layers and only \(17 / 32 = 53\%\) of that work is needed. And the state copying of formula (121.8) still adds work for every skipped layer.</p>
+<p>SkipDecode (Del Corro et al., 2023) removes both problems with one decision: the exit point is <b>not</b> chosen per token by a confidence. It is a fixed function of the <b>position</b> in the sequence, the same for every request in the batch, and it never increases:</p>
+<div class="eq">\[ e_i = \begin{cases} L & i \lt P \\ \operatorname{round}\big((1 - t_i)\, e_{\max} + t_i\, e_{\min}\big) & i \ge P \end{cases}, \qquad t_i = \frac{i - P}{N - P} \tag{121.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P\)</dt><dd>prompt length; prompt tokens run all \(L\) layers (they are processed in parallel in the prefill)</dd>
+<dt>\(N\)</dt><dd>maximum sequence length</dd>
+<dt>\(e_{\max}, e_{\min}\)</dt><dd>number of layers for the first and for the last generated token; they fix the compute budget in advance</dd></dl>
+<p>Why decreasing? The paper measured that the loss per position falls along the sequence: later tokens have more context and are easier. [Certain] And because exits never increase, every earlier token has done at least as much work as the current one. The second idea: SkipDecode <b>skips</b> layers instead of stopping early. Each token runs one warm-up layer at the bottom and then the <b>top</b> layers of the stack. So any layer that the current token runs is a layer that all earlier tokens also ran, and their keys and values are in the cache. No holes, no copying, no recompute. With batch-wide exit points, there is no waiting for the slowest request either. [Certain]</p>
+<p>SkipDecode was tested on OPT 1.3B and 6.7B (24 and 32 layers) on E2E, Reddit-TLDR and CNN-DM, with 2× to 5× speed-ups and small loss in quality; one warm-up layer worked best in all settings. [Certain] The price is flexibility: a hard token late in a sequence still gets few layers, because the rule ignores the token's actual difficulty.</p>
+
+<h2>LayerSkip: train for early exit, then self-speculate</h2>
+<p>All methods so far share a weakness: when an early exit is wrong, the error goes into the output. LayerSkip (Elhoushi et al., Meta, 2024) changes the goal. Early exit is used only to make a <b>draft</b>, and the full model <b>checks</b> the draft, as in speculative decoding (<a href="../inference/index.html#row-speculative-decoding-1-the-math" title="Speculative decoding 1: the math (planned)">session 128</a>). The output is then exactly what the full model would produce (with greedy decoding), and the early layers only decide the speed.</p>
+<h3>Training recipe</h3>
+<p>A normal LLM's middle layers are bad at predicting the next token through the final LM head: the head was trained only on the last layer. LayerSkip fixes this with two training changes, and no new heads.</p>
+<p><b>Layer dropout.</b> During training, skip each layer \(l\) for a random part of the batch. Early layers are dropped rarely, late layers often, so the model learns not to depend on its last layers:</p>
+<div class="eq">\[ p_{l,t} = S(t)\, D(l)\, p_{\max}, \qquad D(l) = e^{\frac{l \ln 2}{L - 1}} - 1 \tag{121.11} \]</div>
+<p>\(D(l)\) grows from 0 at layer 0 to 1 at the last layer \(L - 1\). \(S(t)\) scales over training steps: 1 for continued pretraining and fine-tuning, and a similar exponential curriculum when training from scratch. For Llama 2 7B (32 layers) with \(p_{\max} = 0.1\): layer 0 is never dropped, layer 15 with probability 0.040, layer 31 with probability 0.1. [Certain]</p>
+<p><b>Early-exit loss.</b> Apply the <b>shared</b> LM head \(g\) to the output of every layer and add the losses with normalized weights:</p>
+<div class="eq">\[ J = \sum_{l=0}^{L-1} \tilde e(t, l)\; \mathrm{CE}\big(g(\mathbf{x}_{l+1}), Y\big), \qquad \tilde e(t, l) = \frac{C(t, l)\, e(l)}{\sum_{i} C(t, i)\, e(i)} \tag{121.12} \]</div>
+<p>The scale \(e(l)\) grows roughly with \(l^2\) (\(e(l) = e_{\text{scale}} \sum_{i=0}^{l} i\), with a large weight for the last layer), so late layers count most. The binary curriculum \(C(t, l)\) turns on the exit loss for only some layers at each step (for example every \(R\)-th layer, rotating), because computing the loss of all layers at every step slowed training and hurt the last layer. [Certain] For Llama 2 7B continued pretraining, the paper used \(p_{\max} = 0.1\), \(e_{\text{scale}} = 0.2\) and \(R = 8\). [Certain]</p>
+<h3>Self-speculative decoding</h3>
+<p>After this training, the first \(E\) layers plus the shared head form a small, fast <b>draft model</b> that lives inside the big model. Decoding repeats two steps:</p>
+<ol><li><b>Self-drafting.</b> Generate \(d\) tokens autoregressively with only the first \(E\) layers (early exit at a fixed layer \(E\)).</li>
+<li><b>Self-verification.</b> Run the remaining layers \(E+1, \dots, L\) on all \(d\) draft tokens in one parallel pass. Keep the draft tokens up to the first one where the full model disagrees, then add the full model's own token at that point.</li></ol>
+<p>The KV-cache problem disappears. The first \(E\) layers are the same in both steps, so their keys and values from drafting are already the right ones: there is <b>one</b> KV cache. The hidden state at layer \(E\) of each draft token is saved too (the "exit query cache"; together the KVQ cache), so verification starts directly at layer \(E + 1\). And the verification pass computes the missing layers \(E+1\) to \(L\) for all draft tokens, so after each cycle the cache is complete again. Compared with normal speculative decoding there is no second model in memory. [Certain]</p>
+<p>How fast is it? Use the standard model from <a href="../inference/index.html#row-speculative-decoding-1-the-math" title="Speculative decoding 1: the math (planned)">session 128</a>: each draft token is accepted with probability \(\alpha\), independently. One cycle then yields on average \((1 - \alpha^{d+1})/(1 - \alpha)\) tokens. In the memory-bound decode phase (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>), the cost of a pass is roughly the number of layers whose weights are read, whatever the number of tokens in the pass. So the \(d\) drafting steps cost \(d \cdot E / L\) of a full forward pass. The verification pass runs layers \(E+1..L\) for the draft positions and all layers for the last draft token (that gives the extra token), so it reads every layer once and costs about one full pass. This is the formula of <a href="../inference/index.html#row-speculative-decoding-1-the-math" title="Speculative decoding 1: the math (planned)">session 128</a> with draft cost \(c = E/L\):</p>
+<div class="eq">\[ \text{speed-up} \approx \frac{1 - \alpha^{d+1}}{(1 - \alpha)\left(1 + d\,E / L\right)} \tag{121.13} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\alpha\)</dt><dd>probability that one draft token equals the full model's token (assumed independent for each token)</dd>
+<dt>\(d\)</dt><dd>number of draft tokens per cycle</dd>
+<dt>\(E\)</dt><dd>exit layer used for drafting; \(L\) is the total number of layers</dd>
+<dt>\((1 - \alpha^{d+1})/(1 - \alpha)\)</dt><dd>expected tokens per cycle: the accepted drafts plus one token from the verifier</dd>
+<dt>\(1 + dE/L\)</dt><dd>cost of one cycle in units of one full forward pass (the LM head and other overheads are ignored)</dd></dl>
+<div class="worked"><div class="wt">Worked example: self-speculation on a 32-layer model</div>
+<p>\(L = 32\), draft with \(E = 8\) layers, \(d = 4\) draft tokens, \(\alpha = 0.75\). Tokens per cycle: \((1 - 0.75^5)/(1 - 0.75) = 3.05\). Cost: \(1 + 4 \cdot 8/32 = 2.0\) full passes. Speed-up \(\approx 3.05 / 2.0 = 1.53\times\). With \(d = 6\) the tokens rise to 3.47 but the cost to 2.5, so the speed-up falls to \(1.39\times\). The best choice here is \(d = 3\), with \(1.56\times\): more drafts are only worth it if \(\alpha\) is high.</p></div>
+<figure class="fig" id="de-ss"><div class="fig-body">
+<div class="de-grid">
+<label for="de-ss-e">Exit layer \(E\) (of 32)</label><input type="range" id="de-ss-e" min="1" max="31" step="1" value="8"><output id="de-ss-ev"></output>
+<label for="de-ss-d">Draft tokens \(d\)</label><input type="range" id="de-ss-d" min="1" max="12" step="1" value="4"><output id="de-ss-dv"></output>
+<label for="de-ss-a">Acceptance \(\alpha\)</label><input type="range" id="de-ss-a" min="0" max="0.99" step="0.01" value="0.75"><output id="de-ss-av"></output></div>
+<svg id="de-ss-svg" viewBox="0 0 640 250" role="img" aria-label="Speed-up of self-speculative decoding against the number of draft tokens"></svg>
+<div class="de-leg"><span style="--c:var(--q)">speed-up for each d (current E and α)</span><span style="--c:var(--k)">selected d</span><span style="--c:var(--muted)">1× line (no gain)</span></div>
+<div class="readout" id="de-ss-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The speed-up model of formula (121.13) for a 32-layer model, such as Llama 2 7B. Bars show the speed-up for every number of draft tokens \(d\) from 1 to 12, for the chosen exit layer and acceptance rate.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The trade-off is between \(E\) and \(\alpha\). A small \(E\) makes drafts cheap, but in a real model it also lowers \(\alpha\) (shallow layers guess worse). Here \(\alpha\) is a separate slider, so you can ask "how good must my 8-layer draft be?". Try \(E = 8\), \(\alpha = 0.5\): the best \(d\) is 1 and the gain is only 1.2×. Raise \(\alpha\) to 0.9: the best \(d\) grows to 6 and the speed-up reaches about 2.1×. Move \(E\) to 24: drafting is expensive and even with \(\alpha = 0.9\) the best is about 1.09×. Bars below the grey line mean the method is slower than normal decoding.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 3: LayerSkip self-speculative decoding (greedy)</div><ol>
+<li><b>input:</b> prefix \(x\), exit layer \(E\), draft length \(d\), shared KVQ cache</li>
+<li><b>while</b> not finished:</li>
+<li>&nbsp;&nbsp;<b>for</b> \(j = 1\) to \(d\): run layers \(1..E\) on the last token, apply the shared head, append \(\hat y_j = \argmax\) <span class="c">// draft; writes K, V of layers 1..E and the layer-E state</span></li>
+<li>&nbsp;&nbsp;run layers \(E+1..L\) on the draft positions in one pass, starting from the saved layer-E states (the last draft token also runs layers \(1..E\)) <span class="c">// verify; fills K, V of layers E+1..L</span></li>
+<li>&nbsp;&nbsp;\(y_j \leftarrow\) the full model's token at each draft position \(j\)</li>
+<li>&nbsp;&nbsp;\(m \leftarrow\) number of leading positions with \(\hat y_j = y_j\)</li>
+<li>&nbsp;&nbsp;accept \(\hat y_1, \dots, \hat y_m\), then append \(y_{m+1}\) (the full model's correction) <span class="c">// output = full-model greedy output</span></li>
+<li>&nbsp;&nbsp;drop the cache entries of the rejected draft tokens</li></ol></div>
+<h3>What LayerSkip measured</h3>
+<p>The paper trained several Llama models with the recipe (continued pretraining, pretraining from scratch, and fine-tuning) and reports speed-ups of up to 2.16× on CNN/DM summarization, 1.82× on coding and 2.0× on TOPv2 semantic parsing. [Certain] One row in its tables shows why verification matters. For Llama 2 7B after continued pretraining, plain early exit at layer 8 on one-shot CNN/DM gave ROUGE-2 0.012, against 0.079 for the full model; self-speculation from the same layer 8 (12 draft tokens) gave 0.078 at 1.86× speed. [Certain] So the early layers are much too weak to answer alone, but good enough to guess, and the verifier keeps the quality.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>The paper's "token acceptance" is measured on real text, where accepted tokens come in runs. It is not the independent \(\alpha\) of formula (121.13). Do not put the paper's 68.9% into the formula and expect 1.86×; the simple model is for intuition and design, not for exact prediction.</aside>
+
+<h2>Putting it into code</h2>
+<p>The code below trains a tiny 6-layer decoder on a toy language (each token is the sum of the two before it, modulo 16) with a LayerSkip-style recipe: layer dropout (121.11), one shared exit head, and an early-exit loss weighted toward late layers (121.5). Then it measures how often each exit agrees with the last layer, runs CALM-style softmax-response exit, and runs self-speculative decoding with a 1-layer draft, checking that the output equals normal greedy decoding. For clarity it does not use a KV cache; every pass recomputes the prefix. It is deterministic on CPU and runs in under a minute.</p>
+<pre class="code"><span class="kw2">import</span> math, torch, torch.nn as nn, torch.nn.functional as F
+torch.manual_seed(0)
+V, D, L, T = 16, 64, 6, 20          <span class="cm"># vocab, width, layers, sequence length</span>
+
+<span class="kw2">class</span> Block(nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.n1, s.n2 = nn.LayerNorm(D), nn.LayerNorm(D)
+        s.qkv, s.o = nn.Linear(D, 3 * D), nn.Linear(D, D)
+        s.mlp = nn.Sequential(nn.Linear(D, 4 * D), nn.GELU(), nn.Linear(4 * D, D))
+    <span class="kw2">def</span> forward(s, h):
+        q, k, v = s.qkv(s.n1(h)).chunk(3, dim=-1)
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=True)   <span class="cm"># one head, causal</span>
+        h = h + s.o(a)
+        <span class="kw2">return</span> h + s.mlp(s.n2(h))
+
+<span class="kw2">class</span> TinyLM(nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.emb, s.pos = nn.Embedding(V, D), nn.Embedding(T, D)
+        s.blocks = nn.ModuleList(Block() <span class="kw2">for</span> _ <span class="kw2">in</span> <span class="kw2">range</span>(L))
+        s.norm, s.head = nn.LayerNorm(D), nn.Linear(D, V)          <span class="cm"># ONE shared exit head</span>
+    <span class="kw2">def</span> forward(s, x, upto=L, drop=<span class="kw2">None</span>):
+        h = s.emb(x) + s.pos(torch.arange(x.shape[1]))
+        outs = []
+        <span class="kw2">for</span> l <span class="kw2">in</span> <span class="kw2">range</span>(upto):
+            <span class="kw2">if</span> drop <span class="kw2">is</span> <span class="kw2">None</span> <span class="kw2">or</span> <span class="kw2">not</span> drop[l]:                         <span class="cm"># layer dropout skips block l</span>
+                h = s.blocks[l](h)
+            outs.append(s.head(s.norm(h)))                          <span class="cm"># logits of exit l+1</span>
+        <span class="kw2">return</span> outs
+
+<span class="kw2">def</span> batch(n):   <span class="cm"># toy language: x[i+1] = x[i] + x[i-1] (mod V), two random start tokens</span>
+    x = torch.randint(0, V, (n, T))
+    <span class="kw2">for</span> i <span class="kw2">in</span> <span class="kw2">range</span>(2, T):
+        x[:, i] = (x[:, i - 1] + x[:, i - 2]) % V
+    <span class="kw2">return</span> x
+
+model = TinyLM(); opt = torch.optim.AdamW(model.parameters(), lr=3e-3)
+p_max = 0.1
+p_l = [p_max * (math.exp(l * math.log(2) / (L - 1)) - 1) <span class="kw2">for</span> l <span class="kw2">in</span> <span class="kw2">range</span>(L)]   <span class="cm"># formula (121.11)</span>
+w = torch.arange(1, L + 1, dtype=torch.float); w = w / w.sum()                <span class="cm"># later exits weigh more, formula (121.5)</span>
+<span class="kw2">for</span> it <span class="kw2">in</span> <span class="kw2">range</span>(400):
+    x = batch(64)
+    drop = [bool(torch.rand(()) &lt; p) <span class="kw2">for</span> p <span class="kw2">in</span> p_l]
+    outs = model(x[:, :-1], drop=drop)
+    loss = sum(w[l] * F.cross_entropy(o.reshape(-1, V), x[:, 1:].reshape(-1)) <span class="kw2">for</span> l, o <span class="kw2">in</span> enumerate(outs))
+    opt.zero_grad(); loss.backward(); opt.step()
+
+<span class="cm"># 1) how often does exit l agree with the last layer? (CALM's oracle question)</span>
+model.eval(); x = batch(512)
+<span class="kw2">with</span> torch.no_grad():
+    outs = model(x[:, :-1])
+final = outs[-1].argmax(-1)
+print("agree <span class="kw2">with</span> last layer:", [round((o.argmax(-1) == final).float().mean().item(), 3) <span class="kw2">for</span> o <span class="kw2">in</span> outs])
+
+<span class="cm"># 2) token-level exit with the softmax response, formula (121.6): top-1 minus top-2</span>
+lam = 0.9
+probs = torch.stack([o.softmax(-1) <span class="kw2">for</span> o <span class="kw2">in</span> outs])               <span class="cm"># (L, n, T-1, V)</span>
+top2 = probs.topk(2, dim=-1).values; conf = top2[..., 0] - top2[..., 1]
+ok = conf &gt;= lam; ok[-1] = True                                   <span class="cm"># the last layer always exits</span>
+exit_l = ok.float().argmax(0)                                     <span class="cm"># first confident layer (0-based)</span>
+pred = torch.gather(probs.argmax(-1), 0, exit_l[<span class="kw2">None</span>])[0]
+print("avg layers:", round((exit_l + 1).float().mean().item(), 2), "of", L,
+      "| same token as full model:", round((pred == final).float().mean().item(), 3))
+
+<span class="cm"># 3) self-speculative greedy decoding: draft with E layers, verify with all L</span>
+@torch.no_grad()
+<span class="kw2">def</span> greedy(prefix, n, upto=L):
+    x = prefix.clone()
+    <span class="kw2">for</span> _ <span class="kw2">in</span> <span class="kw2">range</span>(n):
+        x = torch.cat([x, model(x, upto)[-1][:, -1].argmax(-1, keepdim=True)], 1)
+    <span class="kw2">return</span> x
+
+@torch.no_grad()
+<span class="kw2">def</span> self_spec(prefix, n, E=2, d=4):
+    x, drafted, accepted, passes = prefix.clone(), 0, 0, 0
+    <span class="kw2">while</span> x.shape[1] &lt; prefix.shape[1] + n:
+        k = min(d, prefix.shape[1] + n - x.shape[1])
+        draft = greedy(x, k, upto=E)                              <span class="cm"># cheap: E layers per token</span>
+        full = model(draft, L)[-1][:, x.shape[1] - 1:].argmax(-1) <span class="cm"># ONE pass of the full model</span>
+        passes += 1; prop = draft[:, x.shape[1]:]
+        m = 0
+        <span class="kw2">while</span> m &lt; k <span class="kw2">and</span> prop[0, m] == full[0, m]:
+            m += 1
+        drafted += k; accepted += m
+        x = torch.cat([x, prop[:, :m], full[:, m:m + 1]], 1)[:, :prefix.shape[1] + n]
+    <span class="kw2">return</span> x, accepted / drafted, passes
+
+prefix = batch(1)[:, :3]
+ref = greedy(prefix, 16)
+out, acc, passes = self_spec(prefix, 16, E=1)
+print("identical to full greedy:", torch.equal(out, ref), "| acceptance:", round(acc, 2), "| full passes:", passes, "<span class="kw2">for</span> 16 tokens")</pre>
+<p>On our run (PyTorch 2.8, CPU) it printed: agreement with the last layer <code>[0.854, 0.945, 0.961, 0.988, 0.996, 1.0]</code> for exits 1 to 6; with \(\lambda = 0.9\), an average of 1.88 layers out of 6 while choosing the same token as the full model 99.9% of the time; and for self-speculation, <code>identical to full greedy: True</code> with 81% of the draft tokens accepted. The exact numbers can change with other PyTorch versions [Likely]; the <code>True</code> must not.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Method that fits</th><th>Why</th></tr></thead><tbody>
+<tr><td>Text classification at high volume (spam, moderation, intent, sentiment)</td><td>DeeBERT / FastBERT / PABEE exits on an encoder</td><td>One decision per input, no cache; most inputs are easy</td></tr>
+<tr><td>Phones and edge devices with a latency budget</td><td>Early exit with a threshold chosen per device</td><td>One trained model serves several speed–accuracy points (FastBERT's "speed" knob)</td></tr>
+<tr><td>Video classification and action recognition</td><td>Exits on the per-frame or per-clip backbone; stop when the label is stable over several exits (patience)</td><td>Many frames or clips are easy (static scene, clear action), so average compute falls [Likely]</td></tr>
+<tr><td>Key-moment detection on live video streams</td><td>A cheap early exit runs on every frame; only uncertain frames go deeper</td><td>Most frames contain nothing interesting; the deep layers are saved for candidates [Likely]</td></tr>
+<tr><td>Video retrieval and fingerprinting</td><td>Early-exit embeddings for a first, coarse search; full-depth embeddings to re-rank the top results</td><td>Same idea as draft-and-verify: cheap guess, exact check [Speculation]</td></tr>
+<tr><td>LLM generation at batch size 1 (local assistants)</td><td>CALM-style exit, or LayerSkip self-speculation</td><td>Decoding is memory-bound; fewer layers per token means fewer weights to read</td></tr>
+<tr><td>LLM serving with large batches</td><td>SkipDecode (batch-wide, position-based exits) or self-speculation</td><td>Per-token exits break batching and the KV cache; these two keep both</td></tr>
+<tr><td>Summarization and long outputs</td><td>LayerSkip self-speculation (CNN/DM: up to 2.16×)</td><td>Long outputs with many predictable tokens give high acceptance</td></tr></tbody></table></div>
+<p>LayerSkip checkpoints for several Llama models were released, and self-speculation with an early-exit draft is available in the Hugging Face <code>transformers</code> generation API. [Likely] Static layer removal (deleting layers that change the hidden state little) is the "same depth for every token" version of these ideas, and belongs with <a href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html">session 115</a>.</p>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Adding exits to a model that was not trained for them.</b> The LM head of a normal LLM gives poor predictions from middle layers. Early exit needs an exit loss (121.5, 121.12) or separately trained exit heads, or the speed-up comes with a large quality loss.</li>
+<li><b>Ignoring the cost of the exit check.</b> For an LLM, one softmax over the vocabulary can cost more than a whole layer (2.4 layers for Llama 3 8B). Check exits only at a few layers, use a cheap classifier, or compute the head only for the top candidates.</li>
+<li><b>Leaving holes in the KV cache.</b> If a token exits and nothing fills its skipped layers, later tokens attend to missing or stale keys and values. Use state propagation (121.8), position-based skipping, or a verification pass.</li>
+<li><b>Copying the exit layer's K and V into the skipped layers.</b> CALM measured that this breaks quality (ROUGE-L 23.02 instead of 38.24). Copy the hidden state and apply each layer's own \(W_K, W_V\).</li>
+<li><b>Measuring speed-up at batch size 1 and deploying with big batches.</b> With per-token exits, a batch waits for its slowest member (121.9); the speed-up can vanish.</li>
+<li><b>Trusting a single confident exit.</b> Over-confident early layers make wrong early exits. Patience (PABEE), calibration (CALM) or verification (LayerSkip) protect against this.</li>
+<li><b>Using one threshold for all positions in generation.</b> Early errors in a sequence propagate; a decaying threshold (121.7) or a decreasing schedule (121.10) spends more compute where it matters.</li>
+<li><b>Too many draft tokens in self-speculation.</b> Each extra draft costs \(E/L\) of a pass; with a low acceptance rate the speed-up falls, and can drop below 1× (Figure 4).</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is early exit, and what two choices define an early-exit method?<span class="lvl">basic</span></summary><div class="ans">Early exit adds prediction heads after intermediate layers and stops the forward pass at the first layer whose prediction is judged good enough. A method is defined by (1) how the exits are trained, for example DeeBERT's two-stage training, FastBERT's self-distillation, or a weighted loss over all layers, and (2) the exit rule, for example entropy below a threshold, a patience counter, or a softmax-response or classifier confidence above a calibrated threshold. The speed-up is \(L / (\E[\ell](1 + c))\), so a cheap check (small \(c\)) matters as much as a small average depth.</div></details>
+<details class="qa"><summary>Compare DeeBERT, FastBERT and PABEE.<span class="lvl">core</span></summary><div class="ans">All three put a classifier after each BERT layer. DeeBERT exits when the entropy of the off-ramp's distribution is below \(S\); it trains the backbone and final classifier first, then freezes them and trains the off-ramps. FastBERT normalizes the entropy by \(\log N\) and trains the student exits by self-distillation (KL to the final classifier), which can use unlabeled data. PABEE ignores confidence and exits when \(t\) consecutive layers predict the same class; it trains all exits jointly with a depth-weighted loss and can even beat the full model by avoiding "overthinking" (1.57× faster with a better score on ALBERT-base).</div></details>
+<details class="qa"><summary>Why is early exit easy for BERT classification but hard for LLM generation?<span class="lvl">core</span></summary><div class="ans">In classification there is one decision per input, the exit head is small, and nothing after the decision depends on the skipped layers. In generation, there is a decision per token; the exit head is the full LM head (expensive for big vocabularies); an early error is copied forward by autoregression; and later tokens attend to the keys and values of earlier tokens at every layer, which do not exist for layers an earlier token skipped. Batching adds another problem: a batch is only as fast as its deepest token.</div></details>
+<details class="qa"><summary>Explain the KV-cache problem of token-level early exit and the ways to solve it.<span class="lvl">core</span></summary><div class="ans">Token \(t\) at layer \(i\) needs \(\mathbf{k}^i_s, \mathbf{v}^i_s\) for all \(s \lt t\). If token \(s\) exited below layer \(i\), those were never computed. Fixes: (1) recompute the missing layers when needed, exact but it gives back most of the saving; (2) CALM's state propagation, which computes \(W^i_K \mathbf{d}^{e_s}_s\) and \(W^i_V \mathbf{d}^{e_s}_s\) from the exit hidden state, cheap and almost lossless in their oracle test; (3) SkipDecode, where exits are monotonically decreasing over positions and run the top layers, so no hole is ever needed; (4) LayerSkip, where a full-depth verification pass fills the missing layers for all draft tokens.</div></details>
+<details class="qa"><summary>What confidence measures does CALM use, and what are their trade-offs?<span class="lvl">core</span></summary><div class="ans">Softmax response: the gap between the top-2 probabilities of the LM head at that layer. The most accurate, but it needs a full vocabulary projection per checked layer. Hidden-state saturation: cosine similarity between consecutive hidden states. Free, no parameters, but weak, often below a static baseline. Early-exit classifier: a linear layer with \(d+1\) weights trained to predict whether the exit matches the last layer. Very cheap, and sometimes faster overall than softmax even though it uses more layers.</div></details>
+<details class="qa"><summary>Why does CALM use a decaying threshold, and how is the threshold chosen?<span class="lvl">advanced</span></summary><div class="ans">CALM found that errors early in the generated sequence hurt the final output more, because later tokens condition on them. The threshold \(\lambda'(\lambda, t) = \text{clip}(0.9\lambda + 0.1e^{-\tau t/N})\) is strict for early positions and looser later. The base \(\lambda\) is calibrated on held-out data with Learn then Test, a multiple-testing procedure that picks the most aggressive \(\lambda\) for which the risk (textual distance to the full model's output, or loss of quality against references) stays below \(\delta\) with high probability.</div></details>
+<details class="qa"><summary>How does SkipDecode stay compatible with batching and the KV cache?<span class="lvl">advanced</span></summary><div class="ans">It sets one exit point per sequence position for the whole batch, so no request waits for another. The exit points decrease linearly from \(e_{\max}\) to \(e_{\min}\) over the positions, so every earlier token has done at least as much work. And it skips the lower-middle layers instead of the top ones (one warm-up layer, then the top layers), so the layers a later token runs are always a subset of what earlier tokens ran: their keys and values are in the cache. The cost: the schedule ignores the actual difficulty of a token.</div></details>
+<details class="qa"><summary>Describe the LayerSkip training recipe.<span class="lvl">core</span></summary><div class="ans">Two parts. Layer dropout: during training, layer \(l\) is skipped with probability \(S(t) D(l) p_{\max}\), where \(D(l) = e^{l\ln2/(L-1)} - 1\) rises from 0 at the first layer to 1 at the last, so late layers are dropped most. Early-exit loss: the one shared LM head is applied to every layer's output and the cross-entropies are summed with normalized weights that grow about quadratically with depth; a curriculum enables only some layers' exit losses per step (rotational or gradual), because all exits at every step slowed training and hurt the last layer. No extra heads are added.</div></details>
+<details class="qa"><summary>How does self-speculative decoding differ from normal speculative decoding?<span class="lvl">core</span></summary><div class="ans">The draft model is the first \(E\) layers of the same model with the shared head, not a separate small model. So there is no second set of weights in memory, the draft and the target share one KV cache for layers \(1..E\), and verification starts from the saved layer-\(E\) states (KVQ cache), running only layers \(E+1..L\). As with normal speculative decoding, greedy verification makes the output identical to the full model's greedy output; the early layers only change the speed.</div></details>
+<details class="qa"><summary>A 32-layer model drafts with 8 layers, 4 tokens per cycle, acceptance 0.75. Estimate the speed-up. What if acceptance is 0.5?<span class="lvl">advanced</span></summary><div class="ans">Tokens per cycle \((1 - 0.75^5)/0.25 = 3.05\); cost \(1 + 4 \cdot 8/32 = 2.0\) passes (four 8-layer draft steps plus one verification pass that reads all layers); speed-up \(\approx 1.53\times\). With \(\alpha = 0.5\): tokens \((1 - 0.5^5)/0.5 = 1.94\), same cost, speed-up \(\approx 0.97\times\), slower than normal decoding. With low acceptance, fewer drafts are better: \(d = 1\) gives \(1.5 / 1.25 = 1.2\times\). This assumes the memory-bound regime and independent acceptances.</div></details>
+<details class="qa"><summary>Can early exit improve accuracy? When?<span class="lvl">advanced</span></summary><div class="ans">Yes, sometimes. PABEE shows "overthinking": an intermediate layer can be right while a later layer is wrong, and requiring agreement across several exits also acts like a small ensemble. On ALBERT-base, PABEE was both faster and more accurate than the full model. For generation with verification (LayerSkip), quality can at best match the full model with greedy decoding; without verification, early exit usually costs some quality, controlled by the threshold.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A 24-layer model has exits after every layer. 40% of inputs exit at layer 4, 40% at layer 12 and 20% at layer 24. Each exit check costs 5% of a layer. Compute the speed-up with formula (121.1).</li>
+<li>Three classes, an exit outputs \(\mathbf{p} = (0.7, 0.2, 0.1)\). Compute the entropy and FastBERT's normalized uncertainty \(u\).</li>
+<li>PABEE with patience \(t = 2\). The layer predictions are A, A, B, B, B, A, ... At which layer does the input exit, and with which label?</li>
+<li>In Figure 3, change the exits to \(e = (4, 4, 4, 4, 4, 4, 4, 4)\) (static depth 4). How many missing reads are there with no fix? Why?</li>
+<li>SkipDecode with \(L = 32\), prompt length \(P = 100\), \(N = 200\), \(e_{\max} = 24\), \(e_{\min} = 8\). How many layers do positions 100, 150 and 200 use?</li>
+<li>For LayerSkip with \(L = 16\) and \(p_{\max} = 0.2\), compute the dropout probability of layers 0, 8 and 15 (with \(S(t) = 1\)).</li>
+<li>Self-speculation with \(L = 32\), \(E = 16\), \(d = 3\), \(\alpha = 0.8\). Compute the speed-up with formula (121.13). Is it better than \(E = 8\), \(d = 3\), \(\alpha = 0.6\)?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(\E[\ell] = 0.4 \cdot 4 + 0.4 \cdot 12 + 0.2 \cdot 24 = 11.2\); cost \(11.2 \times 1.05 = 11.76\); speed-up \(24 / 11.76 = 2.04\times\). 2. \(H = -(0.7\ln0.7 + 0.2\ln0.2 + 0.1\ln0.1) = 0.802\) nats; \(u = 0.802/\ln 3 = 0.730\). 3. Counts: layer 1: 0, layer 2: 1, layer 3: 0, layer 4: 1, layer 5: 2. It exits at layer 5 with label B. 4. Zero. Every token runs layers 1 to 4, and every later token only needs layers 1 to 4 of earlier tokens, which exist. A static depth is just a smaller model; holes come from <b>different</b> depths, and only when a later token goes deeper than an earlier one. 5. \(t = 0, 0.5, 1\): 24, 16 and 8 layers. 6. \(D(l) = e^{l \ln 2/15} - 1\): layer 0: 0; layer 8: \(2^{8/15} - 1 = 0.447\), so \(p = 0.089\); layer 15: \(p = 0.2\). 7. Tokens \((1 - 0.8^4)/0.2 = 2.952\); cost \(1 + 3 \cdot 16/32 = 2.5\); speed-up \(1.18\times\). The other: tokens \((1 - 0.6^4)/0.4 = 2.176\); cost \(1 + 3 \cdot 8/32 = 1.75\); speed-up \(1.24\times\). The shallow draft wins: it guesses worse, but its guesses are half the price.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Dynamic inference spends compute per input: early exit stops after a few layers when the model is sure; the speed-up is \(L / (\E[\ell](1+c))\) (121.1), and the exit cost \(c\) is large for LLM heads.</li>
+<li>For classification, exits are easy: DeeBERT uses entropy (121.2), FastBERT normalized entropy and self-distillation (121.3), PABEE a patience counter (121.4) that is robust to over-confident layers.</li>
+<li>For generation, CALM exits per token with a softmax-response, saturation or classifier confidence (121.6), a decaying threshold (121.7) and calibration; up to about 3× on T5.</li>
+<li>Token-level exit leaves holes in the KV cache. Fix them by recomputing, by copying the hidden state through each layer's own projections (121.8), or avoid them with SkipDecode's batch-wide, decreasing, top-layer schedule (121.10).</li>
+<li>LayerSkip trains with layer dropout (121.11) and a shared-head early-exit loss (121.12), then drafts with the first \(E\) layers and verifies with the rest: one model, one KV cache, the full model's greedy output, up to 2.16× on CNN/DM.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \text{speed-up} = \frac{L}{\E[\ell](1+c)}, \qquad H(\mathbf{p}) \lt S, \qquad \mathbf{k}^i_s = W^i_K \mathbf{d}^{e_s}_s \]</div>
+<div class="eq">\[ \lambda' = 0.9\lambda + 0.1e^{-\tau t/N}, \qquad \text{speed-up}_{\text{self-spec}} \approx \frac{1-\alpha^{d+1}}{(1-\alpha)(1 + dE/L)} \]</div>
+<h2 class="plain" id="dynamic-inference-early-exit-and-layer-skipping-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Xin et al. (2020). <a href="https://arxiv.org/abs/2004.12993" target="_blank" rel="noopener">DeeBERT: Dynamic Early Exiting for Accelerating BERT Inference</a></li><li>Liu et al. (2020). <a href="https://arxiv.org/abs/2004.02178" target="_blank" rel="noopener">FastBERT: a Self-distilling BERT with Adaptive Inference Time</a></li><li>Zhou et al. (2020). <a href="https://scholar.google.com/scholar?q=&amp;quot;BERT Loses Patience: Fast and Robust Inference with Early Exit (PABEE)&amp;quot;" target="_blank" rel="noopener">BERT Loses Patience: Fast and Robust Inference with Early Exit (PABEE)</a></li><li>Schuster et al. (2022). <a href="https://arxiv.org/abs/2207.07061" target="_blank" rel="noopener">Confident Adaptive Language Modeling</a></li><li>Del Corro et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;SkipDecode: Autoregressive Skip Decoding with Batching and Caching for Efficient LLM Inference&amp;quot;" target="_blank" rel="noopener">SkipDecode: Autoregressive Skip Decoding with Batching and Caching for Efficient LLM Inference</a></li><li>Elhoushi et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;LayerSkip: Enabling Early Exit Inference and Self-Speculative Decoding&amp;quot;" target="_blank" rel="noopener">LayerSkip: Enabling Early Exit Inference and Self-Speculative Decoding</a></li><li>Xin et al. (2020). <a href="https://arxiv.org/abs/2004.12993" target="_blank" rel="noopener">DeeBERT: Dynamic Early Exiting for Accelerating BERT Inference</a></li><li>Liu et al. (2020). <a href="https://arxiv.org/abs/2004.02178" target="_blank" rel="noopener">FastBERT: a Self-distilling BERT with Adaptive Inference Time</a></li><li>Zhou et al. (2020). <a href="https://scholar.google.com/scholar?q=&amp;quot;BERT Loses Patience: Fast and Robust Inference with Early Exit (PABEE)&amp;quot;" target="_blank" rel="noopener">BERT Loses Patience: Fast and Robust Inference with Early Exit (PABEE)</a></li><li>Schuster et al. (2022). <a href="https://arxiv.org/abs/2207.07061" target="_blank" rel="noopener">Confident Adaptive Language Modeling</a></li><li>Del Corro et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;SkipDecode: Autoregressive Skip Decoding with Batching and Caching for Efficient LLM Inference&amp;quot;" target="_blank" rel="noopener">SkipDecode: Autoregressive Skip Decoding with Batching and Caching for Efficient LLM Inference</a></li><li>Elhoushi et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;LayerSkip: Enabling Early Exit Inference and Self-Speculative Decoding&amp;quot;" target="_blank" rel="noopener">LayerSkip: Enabling Early Exit Inference and Self-Speculative Decoding</a></li><li>Leviathan et al. (2022). <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">Fast Inference from Transformers via Speculative Decoding</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/distillation-for-llms-2-black-box-outputs.html"><small>Previous · session 120</small>Distillation for LLMs 2: black-box (outputs only)</a><span class="next"><small>Next · session 122, planned</small>prune with Wanda (2:4), recover with distillation</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const R=document.querySelector('[data-session="dynamic-inference-early-exit-and-layer-skipping"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+const sig=z=>1/(1+Math.exp(-z));
+function seg(el,cb){const bs=[...el.querySelectorAll("button")];bs.forEach(b=>b.addEventListener("click",()=>{bs.forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);}));return()=>bs.find(b=>b.getAttribute("aria-pressed")==="true").dataset.v;}
+const pct=v=>(100*v).toFixed(2).replace(/\.?0+$/,"")+"%";
+
+/* ---------- Figure 1: sample-level early exit (toy simulation) ---------- */
+(function(){
+ const svg=$("#de-ee-svg");if(!svg)return;const info=$("#de-ee-info"),S=$("#de-ee-s"),T=$("#de-ee-t"),Sv=$("#de-ee-sv"),Tv=$("#de-ee-tv");
+ const L=12,N=400;const r=rng(121),g=gauss(r);const D=[];
+ for(let i=0;i<N;i++){const d=r();const k=9*(1-d)-1.3;const ms=[];let noise=0;
+  for(let l=1;l<=L;l++){noise=0.5*noise+1.6*g()*(1.1-l/L);ms.push(k*Math.pow(l/L,0.7)+noise);}D.push(ms);}
+ const H2=p=>{let h=0;for(const x of [p,1-p])if(x>0)h-=x*Math.log(x);return h;};
+ let mode="ent";
+ function run(){const s=+S.value,t=+T.value;const cntOK=new Array(L).fill(0),cntBad=new Array(L).fill(0);let sum=0,corr=0,full=0;
+  for(const ms of D){let ex=L;
+   if(mode==="ent"){for(let l=0;l<L;l++){if(H2(sig(ms[l]))<s){ex=l+1;break;}}}
+   else{let c=0;for(let l=0;l<L;l++){if(l>0&&(ms[l]>0)===(ms[l-1]>0))c++;else c=0;if(c===t){ex=l+1;break;}}}
+   sum+=ex;const ok=ms[ex-1]>0;if(ok){corr++;cntOK[ex-1]++;}else cntBad[ex-1]++;if(ms[L-1]>0)full++;}
+  return{avg:sum/N,acc:corr/N,full:full/N,cntOK,cntBad};}
+ function draw(){Sv.textContent=(+S.value).toFixed(2);Tv.textContent=T.value;
+  S.disabled=mode!=="ent";T.disabled=mode!=="pat";
+  const o=run();const x0=50,x1=620,y0=210,y1=20,bw=(x1-x0)/L;const mx=Math.max(...o.cntOK.map((v,i)=>v+o.cntBad[i]),1);
+  let h=`<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y0}" stroke="var(--rule)"/>`;
+  for(let i=0;i<L;i++){const a=o.cntOK[i],b=o.cntBad[i];const ha=(y0-y1)*a/mx,hb=(y0-y1)*b/mx;const x=x0+i*bw+4;
+   h+=`<rect x="${x}" y="${y0-ha}" width="${bw-8}" height="${ha}" fill="var(--q)" opacity=".8"/><rect x="${x}" y="${y0-ha-hb}" width="${bw-8}" height="${hb}" fill="var(--k)" opacity=".85"/>`;
+   if(a+b>0)h+=`<text x="${x+(bw-8)/2}" y="${y0-ha-hb-5}" text-anchor="middle" font-size="12" fill="var(--ink2)" font-family="var(--sans)">${a+b}</text>`;
+   h+=`<text x="${x+(bw-8)/2}" y="${y0+17}" text-anchor="middle" font-size="12" fill="var(--muted)" font-family="var(--sans)">${i+1}</text>`;}
+  h+=`<text x="${(x0+x1)/2}" y="${y0+36}" text-anchor="middle" font-size="13" fill="var(--muted)" font-family="var(--sans)">exit layer</text>`;
+  h+=`<text x="16" y="${(y0+y1)/2}" text-anchor="middle" font-size="13" fill="var(--muted)" font-family="var(--sans)" transform="rotate(-90 16 ${(y0+y1)/2})">inputs</text>`;
+  svg.innerHTML=h;
+  const rule=mode==="ent"?`entropy rule, S = ${(+S.value).toFixed(2)}`:`patience rule, t = ${T.value}`;
+  info.innerHTML=`${rule}: average depth <b>${o.avg.toFixed(3)}</b> of 12 layers, speed-up <b>${(L/o.avg).toFixed(2)}×</b>, accuracy <b>${pct(o.acc)}</b> (all 12 layers: ${pct(o.full)}).`;}
+ seg($("#de-ee-mode"),v=>{mode=v;draw();});S.addEventListener("input",draw);T.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 2: CALM decaying threshold ---------- */
+(function(){
+ const svg=$("#de-calm-svg");if(!svg)return;const info=$("#de-calm-info"),Lm=$("#de-calm-l"),Ta=$("#de-calm-t"),Lv=$("#de-calm-lv"),Tv=$("#de-calm-tv");
+ const NT=40,LL=8;const r=rng(7),g=gauss(r);const A=[],NZ=[];
+ for(let t=0;t<NT;t++){A.push(1.6*g());const row=[];for(let l=1;l<=LL;l++)row.push(0.5*g());NZ.push(row);}
+ const lamp=(lam,tau,t)=>Math.min(1,Math.max(0,0.9*lam+0.1*Math.exp(-tau*t/NT)));
+ function draw(){const lam=+Lm.value,tau=+Ta.value;Lv.textContent=lam.toFixed(2);Tv.textContent=tau.toFixed(1);
+  const ex=[];for(let t=0;t<NT;t++){const th=lamp(lam,tau,t);let e=LL;for(let l=1;l<=LL;l++){const c=sig(A[t]+1.1*l-4.2+NZ[t][l-1]);if(c>=th){e=l;break;}}ex.push(e);}
+  const x0=46,x1=600,y0=215,y1=20,bw=(x1-x0)/NT;const Y=v=>y0-(y0-y1)*v/LL,Yt=v=>y0-(y0-y1)*v;
+  let h="";for(let l=0;l<=LL;l+=2)h+=`<line x1="${x0}" y1="${Y(l)}" x2="${x1}" y2="${Y(l)}" stroke="var(--rule)" stroke-width="${l?0.6:1}"/><text x="${x0-8}" y="${Y(l)+4}" text-anchor="end" font-size="12" fill="var(--muted)" font-family="var(--sans)">${l}</text>`;
+  for(const v of [0,0.5,1])h+=`<text x="${x1+8}" y="${Yt(v)+4}" font-size="12" fill="var(--k)" font-family="var(--sans)">${v.toFixed(1)}</text>`;
+  ex.forEach((e,t)=>{h+=`<rect x="${x0+t*bw+1.5}" y="${Y(e)}" width="${bw-3}" height="${y0-Y(e)}" fill="var(--q)" opacity="${e===LL?0.45:0.85}"/>`;});
+  let pth="";for(let t=0;t<NT;t++)pth+=(t?"L":"M")+(x0+(t+0.5)*bw).toFixed(1)+" "+Yt(lamp(lam,tau,t)).toFixed(1);
+  h+=`<path d="${pth}" fill="none" stroke="var(--k)" stroke-width="2.5"/>`;
+  h+=`<text x="${(x0+x1)/2}" y="${y0+30}" text-anchor="middle" font-size="13" fill="var(--muted)" font-family="var(--sans)">generated token position t (N = 40)</text>`;
+  h+=`<text x="14" y="${(y0+y1)/2}" text-anchor="middle" font-size="13" fill="var(--muted)" font-family="var(--sans)" transform="rotate(-90 14 ${(y0+y1)/2})">exit layer</text>`;
+  svg.innerHTML=h;const avg=ex.reduce((a,b)=>a+b,0)/NT;
+  info.innerHTML=`λ′ falls from <b>${lamp(lam,tau,0).toFixed(3)}</b> at t = 0 to <b>${lamp(lam,tau,NT).toFixed(3)}</b> at t = N. Average depth <b>${avg.toFixed(3)}</b> of 8 decoder layers (speed-up ${(LL/avg).toFixed(2)}× in layers); ${ex.filter(e=>e===LL).length} of 40 tokens use all 8 layers.`;}
+ Lm.addEventListener("input",draw);Ta.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: KV-cache holes ---------- */
+(function(){
+ const svg=$("#de-kv-svg");if(!svg)return;const info=$("#de-kv-info");
+ const L=8,T=8,EX=[8,3,5,2,6,8,4,3];const SD=[];for(let i=0;i<T;i++)SD.push(Math.round((1-i/(T-1))*8+(i/(T-1))*2));
+ let mode="naive",sel=5;
+ function layersOf(m,t){const s=new Set();if(m==="full"){for(let l=1;l<=L;l++)s.add(l);}else if(m==="skip"){s.add(1);for(let l=L-SD[t]+2;l<=L;l++)s.add(l);}else{for(let l=1;l<=EX[t];l++)s.add(l);}return s;}
+ function state(m){const own=[],extra=[],copy=[];
+  for(let t=0;t<T;t++){own.push(layersOf(m,t));extra.push(new Set());copy.push(new Set());}
+  if(m==="recomp"){for(let s=0;s<T;s++){let mx=0;for(let t=s+1;t<T;t++)mx=Math.max(mx,EX[t]);for(let l=EX[s]+1;l<=mx;l++)extra[s].add(l);}}
+  if(m==="copy"){for(let s=0;s<T;s++)for(let l=EX[s]+1;l<=L;l++)copy[s].add(l);}
+  const has=(s,l)=>own[s].has(l)||extra[s].has(l)||copy[s].has(l);
+  let miss=0,cells=0,ex=0,cp=0;for(let t=0;t<T;t++){cells+=own[t].size;ex+=extra[t].size;cp+=copy[t].size;for(const l of own[t])for(let s=0;s<t;s++)if(!has(s,l))miss++;}
+  return{own,extra,copy,has,miss,cells,ex,cp};}
+ function draw(){const st=state(mode);const x0=110,y0=290,cw=70,ch=31;
+  const selHoles=new Set();for(const l of st.own[sel])for(let s=0;s<sel;s++)if(!st.has(s,l))selHoles.add(s+","+l);
+  let h="";
+  for(let l=1;l<=L;l++)h+=`<text x="${x0-10}" y="${y0-(l-0.5)*ch+4}" text-anchor="end" font-size="13" fill="var(--muted)" font-family="var(--sans)">layer ${l}</text>`;
+  for(let t=0;t<T;t++){const x=x0+t*cw;const isS=t===sel;
+   h+=`<g class="de-cell" data-t="${t}"><rect x="${x}" y="${y0-L*ch-6}" width="${cw}" height="${L*ch+44}" fill="${isS?"var(--hl)":"transparent"}" opacity="${isS?0.5:0}"/>`;
+   for(let l=1;l<=L;l++){const y=y0-l*ch;let fill="transparent",stroke="var(--rule)",sw=1,dash="";
+    if(st.own[t].has(l)){fill="var(--q-soft)";stroke="var(--q)";}else if(st.extra[t].has(l)){fill="var(--k-soft)";stroke="var(--k)";}else if(st.copy[t].has(l)){fill="var(--v-soft)";stroke="var(--v)";}else dash=' stroke-dasharray="4 3"';
+    if(selHoles.has(t+","+l)){stroke="var(--k)";sw=3;dash="";}
+    h+=`<rect x="${x+5}" y="${y+3}" width="${cw-10}" height="${ch-6}" rx="5" fill="${fill}" stroke="${stroke}" stroke-width="${sw}"${dash}/>`;}
+   const ne=mode==="skip"?SD[t]:mode==="full"?L:EX[t];
+   h+=`<text x="${x+cw/2}" y="${y0+17}" text-anchor="middle" font-size="13" font-weight="${isS?700:500}" fill="var(--ink)" font-family="var(--sans)">token ${t+1}</text><text x="${x+cw/2}" y="${y0+33}" text-anchor="middle" font-size="12" fill="var(--muted)" font-family="var(--sans)">${ne} layers</text></g>`;}
+  svg.innerHTML=h;
+  svg.querySelectorAll(".de-cell").forEach(g=>g.addEventListener("click",()=>{sel=+g.dataset.t;draw();}));
+  const nm={full:"Full model",naive:"Early exit, no fix",recomp:"Recompute",copy:"Copy state (CALM)",skip:"SkipDecode"}[mode];
+  info.innerHTML=`${nm}: <b>${st.cells}</b> of 64 cells computed by the tokens themselves, <b>${st.miss}</b> missing attention reads, <b>${st.ex}</b> extra layer runs, <b>${st.cp}</b> cells filled by copied state. Token ${sel+1} hits <b>${selHoles.size}</b> holes.`;}
+ seg($("#de-kv-mode"),v=>{mode=v;draw();});draw();
+})();
+
+/* ---------- Figure 4: self-speculative decoding speed-up ---------- */
+(function(){
+ const svg=$("#de-ss-svg");if(!svg)return;const info=$("#de-ss-info"),Ei=$("#de-ss-e"),Di=$("#de-ss-d"),Ai=$("#de-ss-a");
+ const L=32;const tok=(a,d)=>a>=1?d+1:(1-Math.pow(a,d+1))/(1-a);const cost=(E,d)=>1+d*E/L;
+ function draw(){const E=+Ei.value,d=+Di.value,a=+Ai.value;$("#de-ss-ev").textContent=E;$("#de-ss-dv").textContent=d;$("#de-ss-av").textContent=a.toFixed(2);
+  const sp=[];for(let k=1;k<=12;k++)sp.push(tok(a,k)/cost(E,k));let best=0;sp.forEach((v,i)=>{if(v>sp[best])best=i;});
+  const top=Math.max(3,Math.ceil(Math.max(...sp)));const x0=50,x1=620,y0=205,y1=20,bw=(x1-x0)/12;const Y=v=>y0-(y0-y1)*v/top;
+  let h="";for(let v=0;v<=top;v++)h+=`<line x1="${x0}" y1="${Y(v)}" x2="${x1}" y2="${Y(v)}" stroke="var(--rule)" stroke-width="0.6"/><text x="${x0-8}" y="${Y(v)+4}" text-anchor="end" font-size="12" fill="var(--muted)" font-family="var(--sans)">${v}×</text>`;
+  sp.forEach((v,i)=>{const x=x0+i*bw+6;h+=`<rect x="${x}" y="${Y(v)}" width="${bw-12}" height="${y0-Y(v)}" fill="${i+1===d?"var(--k)":"var(--q)"}" opacity="${i+1===d?0.95:0.7}"/><text x="${x+(bw-12)/2}" y="${y0+17}" text-anchor="middle" font-size="12" fill="var(--muted)" font-family="var(--sans)">${i+1}</text>`;});
+  h+=`<line x1="${x0}" y1="${Y(1)}" x2="${x1}" y2="${Y(1)}" stroke="var(--muted)" stroke-width="2" stroke-dasharray="6 4"/>`;
+  h+=`<text x="${(x0+x1)/2}" y="${y0+36}" text-anchor="middle" font-size="13" fill="var(--muted)" font-family="var(--sans)">draft tokens per cycle d</text>`;
+  svg.innerHTML=h;
+  info.innerHTML=`E = ${E}, d = ${d}, α = ${a.toFixed(2)}: <b>${tok(a,d).toFixed(3)}</b> tokens per cycle, cost <b>${cost(E,d).toFixed(3)}</b> full passes, speed-up <b>${(tok(a,d)/cost(E,d)).toFixed(3)}×</b>. Best d for this E and α: <b>${best+1}</b> (${sp[best].toFixed(3)}×).`;}
+ [Ei,Di,Ai].forEach(x=>x.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

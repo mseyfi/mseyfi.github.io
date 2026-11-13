@@ -1,0 +1,490 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Runtime profiling: where the time goes · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 123</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="runtime-profiling-where-the-time-goes">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="runtime-profiling-where-the-time-goes" data-session="runtime-profiling-where-the-time-goes" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">123</span><span>Track 5: LLM inference and serving · session 46 of 65</span></div><h1 class="chap-title">Runtime profiling: where the time goes</h1><p class="chap-sub">Before you optimize an LLM, you must know where its time goes. This session reads the survey’s profiling result (attention and linear operators often take more than 75% of the time), builds a small cost model of every kernel in one decode step, and shows why a GPU can sit idle while a model runs: too many tiny kernels, each waiting for the CPU to launch it. Then you learn to read a PyTorch profiler table and an Nsight Systems trace, and to name the top 3 time sinks of a real model.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 2 hours, exercises 1 to 1.5 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions 81 (inference metrics), 82 (why inference is slow), 85 (CUDA basics) and 50 (CPU and GPU running side by side)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>What the survey’s runtime profiling found, and how to read its claim that attention and linear operators often take more than 75% of the time</li><li>A one-line cost model for any kernel (bytes, FLOPs, a fixed floor), and how to use it to predict a profile before you run one</li><li>Why a decode step of an 8B model launches about 1,300 kernels in eager PyTorch, and why three quarters of them are tiny element-wise kernels</li><li>Launch overhead and CPU gaps: the timeline model that tells you when a faster kernel makes the model no faster at all</li><li>How to read a PyTorch profiler table: self time vs total time, CPU vs CUDA time, calls, and why operator names are not categories</li><li>How to read an Nsight Systems trace: NVTX ranges, the CUDA API row, the kernel row, gaps, and the sync at the end of each step</li><li>A repeatable procedure to find the top 3 time sinks of a real model, rank them with Amdahl’s law, and pick the session that fixes each one</li></ul></div></header><style>
+.rp-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.rp-grid input[type=range]{width:100%}
+.rp-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.rp-leg span::before{content:"";display:inline-block;width:14px;height:10px;border-radius:2px;margin-right:6px;vertical-align:0;background:var(--c)}
+.rp-tbl{width:100%;border-collapse:collapse;font:500 13.5px var(--mono);font-variant-ligatures:none}
+.rp-tbl th{font:650 13px var(--sans);text-align:right;padding:5px 8px;border-bottom:1.5px solid var(--rule);color:var(--ink2);white-space:nowrap}
+.rp-tbl td{text-align:right;padding:4px 8px;border-bottom:1px solid var(--rule2);white-space:nowrap}
+.rp-tbl th:first-child,.rp-tbl td:first-child{text-align:left}
+.rp-tbl tbody tr{cursor:pointer}.rp-tbl tbody tr:hover{background:var(--paper2)}
+.rp-tbl tbody tr.on{background:var(--q-soft)}
+.rp-tbl th button{font:inherit;color:inherit;background:none;border:0;cursor:pointer;padding:0;text-decoration:underline dotted}
+pre.code{font-variant-ligatures:none}
+.article p code,.article li code,.article td code{overflow-wrap:anywhere}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Every optimization in the rest of this track makes one part of the model faster. But a part that takes 5% of the time can never give you more than a 5% gain. So the first job is always the same: <b>measure where the time goes</b>, then attack the biggest piece.</p>
+<p>This sounds obvious, but LLM inference hides the answer well. A GPU kernel is launched by the CPU and runs later, so the time you see in Python is not the time the GPU spends. A decode step of an 8-billion-parameter model in plain PyTorch runs more than a thousand kernels. Most of them are tiny, and the GPU can be idle between them while the CPU prepares the next one. A faster matrix multiplication then changes nothing, because the GPU was not the slow part.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Expect: “Your model is slower than you expected. How do you find out why?”, “What does GPU utilization 100% in nvidia-smi tell you?”, “What is launch overhead and how do you see it in a trace?”, “You made the matmuls 2× faster and the model got 2% faster. Why?”. Each is answered with numbers below.</aside>
+<p>The efficient-inference survey (Zhou et al., Section 6.1.1) starts its system-level part with exactly this step. It profiles LLMs and finds two facts that organize the next sessions: attention and linear operators take most of the time, and many small operators break the timeline into pieces and add CPU launch cost. FlashAttention and FlashDecoding (<a href="../inference/attention-operator-1-flashattention-1-2-and.html">session 124</a>, <a href="../inference/attention-operator-2-decode-attention-flashdecoding-and.html">session 125</a>) attack attention, <a href="../inference/index.html#row-linear-operators-gemm-gemv-and-flat-gemm" title="Linear operators: GEMM, GEMV and flat GEMM (planned)">session 126</a> attacks the matrix multiplications, and <a href="../inference/index.html#row-graph-level-optimization-fusion-cuda-graphs-torch" title="Graph-level optimization: fusion, CUDA graphs, torch.compile (planned)">session 127</a> attacks the small kernels. This session gives you the tools to decide which of these your model needs. In <a href="../inference/index.html#row-lab-prune-with-wanda-2-4-recover" title="prune with Wanda (2:4), recover with distillation (planned)">session 122</a> you measured speed for one model and one method; now you learn to explain the number.</p>
+
+<h2>What a profile measures</h2>
+<p>Three facts about how PyTorch runs on a GPU decide how to read every profile.</p>
+<ol><li><b>Kernels are asynchronous.</b> When Python calls <code>torch.matmul</code> on GPU tensors, the CPU puts a <b>kernel</b> (one GPU program) into a queue called a <b>CUDA stream</b> and returns at once. The GPU takes kernels from the queue in order. So CPU and GPU work at the same time, on different things.</li>
+<li><b>Each launch costs CPU time.</b> Before a kernel is in the queue, Python runs the module code, the PyTorch <b>dispatcher</b> picks the right implementation, and the CUDA driver writes the launch. Together this is the <b>launch overhead</b> \(t_L\). In eager PyTorch it is on the order of a few to about ten microseconds per operator. [Likely]</li>
+<li><b>A sync drains the queue.</b> Some calls make the CPU wait until the GPU has finished everything in the queue: <code>.item()</code>, <code>.cpu()</code>, printing a GPU tensor, <code>torch.cuda.synchronize()</code>. A generation loop has one at every step, because the CPU must know the new token (or at least whether all sequences are finished) before it starts the next step.</li></ol>
+<p>So a profile must answer three different questions, and different tools answer them:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Question</th><th>What you look at</th><th>Tool</th></tr></thead><tbody>
+<tr><td>What does the GPU spend its busy time on?</td><td>Kernel time, grouped by operator</td><td>PyTorch profiler table (<code>self_cuda_time_total</code>), <code>nsys stats</code></td></tr>
+<tr><td>Is the GPU waiting?</td><td>Gaps in the GPU row of a timeline</td><td>Trace viewer (Perfetto), Nsight Systems</td></tr>
+<tr><td>Why is it waiting?</td><td>What the CPU is doing during the gap</td><td>CPU rows and CUDA API row of the same timeline</td></tr></tbody></table></div>
+<aside class="note analogy side"><span class="nt">Analogy</span>A restaurant with one fast cook (the GPU) and one waiter (the CPU) who writes each order on a separate ticket. To know why dinner is slow, you need two things: how long each dish takes to cook, and whether the cook stands idle waiting for the next ticket. A list of cooking times alone never shows the waiting.</aside>
+<aside class="note watch side"><span class="nt">Watch out</span>“GPU utilization” in <code>nvidia-smi</code> is the fraction of time in which <i>at least one</i> kernel was running. A GPU that runs a tiny kernel all the time on one of its 132 SMs shows 100%. It tells you the GPU is not fully idle, nothing more. [Likely]</aside>
+
+<h2>The survey’s profile</h2>
+<p>The survey profiles the inference runtime of several LLMs with the Hugging Face implementation, at different context lengths. Its Figure 15 is titled “Inference runtime breakdown over multiple LLMs”. Three findings: [Certain]</p>
+<ul><li>“Attention operators and linear operators collectively dominate runtime, with their combined duration often exceeding 75% of the inference duration.”</li>
+<li>The share of the attention operator grows as the context gets longer.</li>
+<li>For Mixtral (a mixture-of-experts model), the linear operator dominates, which the survey attributes to the non-optimized FFN code in the Hugging Face implementation.</li></ul>
+<p>And one more sentence, which is the second half of this session: there are many operators that each take a small share of the runtime, which “fragments the operator execution timeline and increases the cost of kernel launch on the CPU side”.</p>
+<p>Note what the survey does not give: it does not state the GPU or split prefill from decode in that section. So treat “more than 75%” as a typical result for Hugging Face code, not as a law. The share depends on the model, the phase, the batch size, the context length and the code. The rest of this session builds a model that shows exactly how it depends on each of them.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>The Mixtral result is a lesson about profiles in general: a profile measures <i>an implementation</i>, not an architecture. The same model in a serving engine with fused MoE kernels can have a very different breakdown. Always write down the code version next to a profile.</aside>
+
+<h2>A cost model for one kernel</h2>
+<p>You can predict most of a profile before you run it. A kernel must move some bytes between HBM (the GPU’s main memory) and the chip, and do some floating-point operations. Whichever takes longer sets its time, as in the roofline of <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>. Real kernels also have a fixed cost: even a kernel that does almost nothing takes a couple of microseconds to start, run and finish. So:</p>
+<div class="eq">\[ d \;=\; t_0 \;+\; \max\!\left( \frac{Q}{\eta_B\, \mathrm{BW}},\ \frac{W}{\eta_F\, F} \right) \tag{123.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(d\)</dt><dd>the GPU time of one kernel</dd>
+<dt>\(Q\)</dt><dd>bytes the kernel reads and writes in HBM</dd>
+<dt>\(W\)</dt><dd>floating-point operations (FLOPs) the kernel does</dd>
+<dt>\(\mathrm{BW}, F\)</dt><dd>peak memory bandwidth and peak compute; for an H100 SXM, 3.35 TB/s and about 989 TFLOP/s in dense BF16 (from <a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>)</dd>
+<dt>\(\eta_B, \eta_F\)</dt><dd>the fraction of peak a good kernel reaches; we use 0.8 for bandwidth and 0.7 for matmul compute (0.5 for attention in prefill)</dd>
+<dt>\(t_0\)</dt><dd>the fixed floor of a kernel; we use 2 µs</dd></dl>
+<p>The values of \(\eta_B\), \(\eta_F\) and \(t_0\) are <b>our assumptions</b>, chosen to be typical, not measured on one machine. [Likely] Every number in this session’s figures comes from formula (123.1) with these values, for Llama 3.1 8B (32 layers, hidden size 4096, 32 query heads, 8 KV heads of size 128, FFN size 14336, vocabulary 128,256, from its config.json [Certain]) on an H100 SXM in BF16. They show the shape of a real profile; your measured numbers will differ.</p>
+<div class="worked"><div class="wt">Worked example: a big kernel and a tiny kernel in one decode step</div>
+<p><b>The query projection</b> at batch 1 multiplies a 4096-vector by a \(4096 \times 4096\) BF16 matrix. It reads \(Q = 2 \cdot 4096 \cdot 4096 = 33.55\) MB of weights (plus 16 KB of activations), and does \(W = 2 \cdot 4096^2 = 33.6\) MFLOP. Memory time: \(33.57\ \text{MB} / (0.8 \times 3.35\ \text{TB/s}) = 12.5\ \mu s\). Compute time: \(0.05\ \mu s\). So \(d = 2 + 12.5 = 14.5\ \mu s\). It is a <b>GEMV</b> (matrix times vector), limited by memory. It reaches \(33.57\ \text{MB} / 14.5\ \mu s = 2.31\) TB/s, 69% of peak.</p>
+<p><b>A multiply</b> of two 4096-vectors in BF16 moves 24 KB. Memory time: \(0.009\ \mu s\). So \(d \approx t_0 = 2.0\ \mu s\). The kernel does almost no work; its time is all fixed cost.</p>
+<p>Now compare with the launch cost. If the CPU needs \(t_L = 8\ \mu s\) to launch each kernel, the tiny multiply is finished 6 µs before the next kernel even arrives. The GPU waits. That is the core of the launch-overhead problem.</p></div>
+
+<h2>Where the GPU time goes in one decode step</h2>
+<p>Let us list the kernels of one decoder layer, written the way the Hugging Face Llama code runs in eager mode. Each PyTorch operator that computes something is one kernel. (Views and transposes are free; they only change the shape bookkeeping.) [Likely]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Part of the layer</th><th>Operators (eager)</th><th>Kernels</th><th>Class</th></tr></thead><tbody>
+<tr><td>RMSNorm before attention</td><td>cast to FP32, <code>pow</code>, <code>mean</code>, <code>+ eps</code>, <code>rsqrt</code>, <code>mul</code>, cast back, <code>mul</code> by weight</td><td>8</td><td>other</td></tr>
+<tr><td>Q, K, V projections</td><td>three <code>mm</code></td><td>3</td><td>linear</td></tr>
+<tr><td>RoPE on Q and on K</td><td><code>q*cos</code>, <code>neg</code>, <code>cat</code> (rotate half), <code>*sin</code>, <code>add</code>; the same for K</td><td>10</td><td>other</td></tr>
+<tr><td>KV-cache update</td><td><code>torch.cat</code> for K and for V (the dynamic cache)</td><td>2</td><td>attention</td></tr>
+<tr><td>Attention</td><td><code>scaled_dot_product_attention</code></td><td>1</td><td>attention</td></tr>
+<tr><td>Output projection, residual</td><td><code>mm</code>, <code>add</code></td><td>2</td><td>linear, other</td></tr>
+<tr><td>RMSNorm before the MLP</td><td>as above</td><td>8</td><td>other</td></tr>
+<tr><td>MLP (SwiGLU)</td><td>gate <code>mm</code>, up <code>mm</code>, <code>silu</code>, <code>mul</code>, down <code>mm</code>, residual <code>add</code></td><td>6</td><td>linear, other</td></tr>
+<tr><td><b>One layer</b></td><td></td><td><b>40</b></td><td>7 linear, 3 attention, 30 other</td></tr></tbody></table></div>
+<p>The RMSNorm, RoPE and MLP lines follow the current <code>modeling_llama.py</code>, and the dynamic cache really appends with <code>torch.cat</code> while the static cache writes in place with <code>index_copy_</code>. [Certain] With 32 layers, plus the embedding, the final norm, the LM head, a cast of the logits to FP32 and an <code>argmax</code>, one decode step launches <b>1,292 kernels</b>: 225 linear, 96 attention and 971 other. Three quarters of the kernels are tiny element-wise kernels.</p>
+<p>The <b>share</b> of a class \(g\) (linear, attention or other) is its part of the total kernel time:</p>
+<div class="eq">\[ p_g = \frac{\sum_{i \in g} d_i}{\sum_i d_i} \tag{123.2} \]</div>
+<p>This is what the survey’s breakdown shows, and what a profiler table sorted by CUDA time gives you. Note that it is a share of <b>GPU busy time</b>, not of wall-clock time. We come back to that difference in the next section.</p>
+<h3>Why the attention share grows with context</h3>
+<p>In decode, both big classes are limited by memory, so compare their bytes per layer. The linear layers read all the layer’s weights once per step, whatever the batch. Attention reads the KV cache of every sequence in the batch:</p>
+<div class="eq">\[ Q_{\text{lin}} \approx 2 P_\ell, \qquad Q_{\text{attn}} \approx B\, c\, s_\ell \qquad \Longrightarrow \qquad c^{*} = \frac{2 P_\ell}{B\, s_\ell} \tag{123.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P_\ell\)</dt><dd>weights in one layer (218.1 million for Llama 3.1 8B); times 2 bytes in BF16</dd>
+<dt>\(s_\ell\)</dt><dd>KV-cache bytes per token in one layer: \(2 \cdot 8 \cdot 128 \cdot 2 = 4{,}096\) bytes (keys and values, 8 KV heads, size 128, BF16)</dd>
+<dt>\(B, c\)</dt><dd>batch size and context length</dd>
+<dt>\(c^{*}\)</dt><dd>the context length at which attention reads as many bytes as the linear layers</dd></dl>
+<div class="worked"><div class="wt">Worked example: the crossover context</div>
+<p>\(2 P_\ell = 436{,}207{,}616\) bytes. So \(c^{*} = 436{,}207{,}616 / (4{,}096\, B) = 106{,}496 / B\). For one sequence, attention reads as much as the weights only at about 106k tokens. For a batch of 32, already at 3,328 tokens. Batching shares the weight reads across sequences but not the KV-cache reads, so at large batch attention becomes the top sink.</p>
+<p>Real eager code reaches the crossover much earlier, for two reasons. The dynamic cache copies the whole cache with <code>torch.cat</code> at every step (read it and write it again, for K and V), so the cache bytes are moved about 3 times instead of once. And a decode attention kernel with one query per head gives work to only \(B \cdot 32\) thread blocks; at \(B = 1\) that is 32 blocks for 132 SMs, so most of the chip is idle. Our model scales attention bandwidth by \(\min(1, 32B/132)\) for this. [Likely] With both effects, the model gives attention 24.9% of GPU time at 8k tokens and 55.6% at 32k, for one sequence. This low parallelism is exactly what FlashDecoding fixes by splitting the sequence across blocks (<a href="../inference/attention-operator-2-decode-attention-flashdecoding-and.html">session 125</a>).</p></div>
+<p>Figure 1 runs this model. Try the default first (decode, batch 1, 1,024 tokens of context), then move the context, then the batch, then switch to prefill.</p>
+<figure class="fig" id="rp-brk"><div class="fig-body">
+<div class="controls"><span class="seg" id="rp-brk-ph"><button type="button" data-v="decode" aria-pressed="true">Decode step</button><button type="button" data-v="prefill" aria-pressed="false">Prefill</button></span>
+<label class="sl"><input type="checkbox" id="rp-brk-fu"> Fused kernels, in-place cache (compiled)</label></div>
+<div class="rp-grid">
+<label for="rp-brk-c">Context length (tokens)</label><input type="range" id="rp-brk-c" min="7" max="17" step="1" value="10"><output id="rp-brk-cv"></output>
+<label for="rp-brk-b">Batch size</label><input type="range" id="rp-brk-b" min="0" max="6" step="1" value="0"><output id="rp-brk-bv"></output></div>
+<div class="scroll-x"><svg id="rp-brk-svg" viewBox="0 0 700 300" role="img" aria-label="Stacked bars of GPU time shares of linear, attention and other kernels at eleven context lengths"></svg></div>
+<div class="rp-leg"><span style="--c:var(--q)">linear (matrix multiplications)</span><span style="--c:var(--k)">attention (SDPA and cache update)</span><span style="--c:var(--muted)">other (norm, RoPE, activation, add, cast)</span></div>
+<div class="readout" id="rp-brk-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Share of GPU kernel time by operator class for Llama 3.1 8B on an H100, from the cost model (123.1). Each bar is one context length (128 to 128k tokens); the outlined bar is the context chosen with the slider. This is a model of a profile, not a measurement.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>At batch 1 and short context, the linear class is about 70% and “other” is about 23% of GPU time: the 971 tiny kernels add up, at 2 µs each. Linear plus attention is 77%, close to the survey’s “often more than 75%”. Move the context up: attention grows and passes linear between 16k and 32k tokens. Move the batch up at a fixed context: the weight reads are shared, the cache reads are not, so attention grows again. Turn on the fused mode: “other” almost disappears (423 kernels instead of 1,292), and attention time drops from 0.50 to 0.40 ms per step because the cache is no longer copied. In prefill, the matmuls do a lot of math per byte and “other” stays large, because the FP32 RMSNorm reads and writes big activations several times.</p></details></figure>
+
+<h2>Many tiny kernels: launch overhead and CPU gaps</h2>
+<p>Figure 1 shows how the GPU spends its <b>busy</b> time. It says nothing about the time the GPU is <b>idle</b>. To see that, follow the CPU and the GPU on one timeline. The CPU launches kernel \(i\) when it has finished launching kernel \(i-1\). The GPU starts kernel \(i\) when the kernel has arrived and the previous kernel is done:</p>
+<div class="eq">\[ c_i = c_{i-1} + t_L, \qquad s_i = \max(c_i,\ e_{i-1}), \qquad e_i = s_i + d_i \tag{123.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(c_i\)</dt><dd>the time at which the CPU has put kernel \(i\) in the queue</dd>
+<dt>\(s_i, e_i\)</dt><dd>start and end of kernel \(i\) on the GPU</dd>
+<dt>\(t_L\)</dt><dd>CPU time per launched operator (Python, dispatcher, driver)</dd></dl>
+<p>When \(c_i \gt e_{i-1}\), the GPU waits: that is a <b>gap</b>. The step ends with the sync, when both are done. Its time, the GPU busy fraction and the idle time are:</p>
+<div class="eq">\[ T_{\text{step}} = \max(c_n,\ e_n), \qquad U = \frac{\sum_i d_i}{T_{\text{step}}}, \qquad T_{\text{idle}} = T_{\text{step}} - \sum_i d_i \tag{123.5} \]</div>
+<p>A simple rule follows. Over a long run of kernels, the GPU falls behind the CPU only if the kernels are longer than the launches. Let \(\bar d\) be the average kernel time over a stretch of the step. Then that stretch is</p>
+<div class="eq">\[ \text{launch-bound if } \ t_L \gt \bar d, \qquad \text{GPU-bound if } \ t_L \lt \bar d \tag{123.6} \]</div>
+<p>In a decode step the stretches alternate: a 46 µs MLP matmul lets the CPU run ahead and fill the queue; then a run of eight 2 µs RMSNorm kernels drains it, and the GPU waits for each new launch. Figure 2 shows this on a real timeline.</p>
+<div class="worked"><div class="wt">Worked example: one decode step, eager, batch 1, 1,024 tokens</div>
+<p>With \(t_L = 8\ \mu s\): the CPU needs \(1{,}292 \times 8 = 10.34\) ms to launch the step. The GPU busy time is 8.50 ms. The timeline (123.4) gives \(T_{\text{step}} = 10.77\) ms, so \(U = 79\%\), and the GPU is idle for 2.26 ms (21% of the step). That is 92.9 tokens per second for this user.</p>
+<p>Of the wall-clock step: linear kernels 56.2%, idle 21.0%, other kernels 18.1%, attention 4.6%. The idle time is the second biggest “operator”, and no profiler table lists it.</p>
+<p>The lower bound for comparison: the step must read 15.0 GB of weights (7.50 billion parameters in the layers and the LM head; the embedding is only looked up). At the full 3.35 TB/s that is 4.48 ms; at 80% of it, 5.60 ms. With fused kernels and a CUDA graph (one launch for the whole step), the model gives 423 kernels and 6.67 ms, 150.0 tokens per second: <b>1.61× faster</b> than eager.</p></div>
+<figure class="fig wide" id="rp-tl"><div class="fig-body">
+<div class="controls"><label class="sl"><input type="checkbox" id="rp-tl-fu"> Fused kernels (fewer, larger kernels)</label><label class="sl"><input type="checkbox" id="rp-tl-gr"> CUDA graph (one launch per step)</label><label class="sl"><input type="checkbox" id="rp-tl-lin"> Make every linear kernel 2× faster</label></div>
+<div class="rp-grid">
+<label for="rp-tl-tl">CPU time per launch \(t_L\) (µs)</label><input type="range" id="rp-tl-tl" min="2" max="30" step="1" value="8"><output id="rp-tl-tlv"></output>
+<label for="rp-tl-b">Batch size</label><input type="range" id="rp-tl-b" min="0" max="6" step="1" value="0"><output id="rp-tl-bv"></output></div>
+<div class="scroll-x"><svg id="rp-tl-svg" viewBox="0 0 760 250" role="img" aria-label="CPU launch lane and GPU kernel lane for the first decoder layer, plus a busy strip for the whole step"></svg></div>
+<div class="rp-leg"><span style="--c:var(--v)">CPU launching an operator</span><span style="--c:var(--q)">linear kernel</span><span style="--c:var(--k)">attention kernel</span><span style="--c:var(--muted)">other kernel</span><span style="--c:repeating-linear-gradient(45deg,var(--bad) 0 2px,var(--card) 2px 4px)">GPU idle (hatched)</span></div>
+<div class="readout" id="rp-tl-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The timeline (123.4) of one decode step of Llama 3.1 8B at 1,024 tokens of context. Top: the first decoder layer, zoomed in, with the CPU lane above the GPU lane. Bottom: the whole step, with idle time hatched in red. Thin lines between the lanes connect each launch to its kernel.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>In eager mode the CPU lane is solid: the CPU is always busy launching. Under the RMSNorm and RoPE kernels the GPU lane is mostly hatched (idle), because each 2 µs kernel waits for an 8 µs launch. Under the long matmuls the GPU catches up and the CPU runs ahead. Now tick “make every linear kernel 2× faster”: in eager mode the step barely changes (10.77 to 10.52 ms), because the CPU still needs 10.34 ms to launch everything. Tick fused and CUDA graph first, then the 2× box: now the step goes from 6.67 to 3.64 ms. The same kernel speedup is worth 2% in one setting and 83% in the other. Raise the batch to 32 or 64: the kernels get longer, \(\bar d\) passes \(t_L\), and the hatched gaps close even in eager mode.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>This is why decode at small batch is the classic launch-bound workload, and prefill almost never is: a prefill of 4,096 tokens has kernels of hundreds of microseconds. Large serving batches hide launch overhead too, which is one reason engines such as vLLM still capture decode steps in CUDA graphs: they serve many small batches. [Likely]</aside>
+
+<h2>Reading a PyTorch profiler table</h2>
+<p>The PyTorch profiler (<code>torch.profiler</code>) records every operator the CPU runs and, with <code>ProfilerActivity.CUDA</code>, every kernel the GPU runs. <code>prof.key_averages().table(sort_by=...)</code> prints one row per operator name. The columns are easy to misread:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Column</th><th>What it means</th></tr></thead><tbody>
+<tr><td><b>Self CPU</b></td><td>CPU time inside this operator, <i>not</i> counting operators it calls. For a kernel launch, this is the launch overhead.</td></tr>
+<tr><td><b>CPU total</b></td><td>CPU time including all children. <code>aten::linear</code> includes <code>aten::t</code> and <code>aten::mm</code>. Sorting by it puts wrapper ops and your <code>record_function</code> ranges on top.</td></tr>
+<tr><td><b>Self CUDA</b></td><td>GPU kernel time launched directly by this operator. This is the column for “what does the GPU spend its busy time on”.</td></tr>
+<tr><td><b># of Calls</b></td><td>How many times the operator ran. Divide every total by it: a big total can be many tiny calls or one slow call.</td></tr>
+<tr><td><b>CPU time avg</b></td><td>CPU total divided by calls. For tiny ops it shows you \(t_L\) directly.</td></tr></tbody></table></div>
+<p>Two traps. First, <b>operator names are not categories</b>. <code>aten::cat</code> appears both in RoPE (rotate half) and in the KV-cache update; <code>aten::mul</code> appears in RMSNorm, RoPE and SwiGLU. To get the survey’s classes you must group by where the op is called: wrap code in <code>record_function("attn")</code> or look at the call stack (<code>group_by_stack_n</code>). Second, the table <b>has no row for idle time</b>. The sum of self CUDA times is the busy time, not the step time. Always compare it with the measured step time.</p>
+<p>When you have found a candidate, ask what fixing it is worth. If a part with share \(p\) of the time becomes \(s\) times faster, the total becomes faster by</p>
+<div class="eq">\[ S = \frac{1}{(1 - p) + p / s} \tag{123.7} \]</div>
+<p>This is Amdahl’s law (also used in <a href="../pretraining/making-training-fast-compile-cuda-graphs-fused.html">session 50</a>). It holds for the time the share was measured on. Apply it to GPU busy time and you get the best case; the real step gains less if the step is launch-bound, as Figure 2 showed. Figure 3 is a profiler table produced by our model of the same decode step. Click a row, then choose a speedup for it.</p>
+<figure class="fig" id="rp-pt"><div class="fig-body">
+<div class="controls"><span class="seg" id="rp-pt-mode"><button type="button" data-v="0" aria-pressed="true">Eager</button><button type="button" data-v="1" aria-pressed="false">Compiled (fused + CUDA graph)</button></span>
+<span class="seg" id="rp-pt-sort"><button type="button" data-v="cuda" aria-pressed="true">Sort by Self CUDA</button><button type="button" data-v="cpu" aria-pressed="false">Sort by Self CPU</button><button type="button" data-v="calls" aria-pressed="false">Sort by calls</button></span></div>
+<div class="scroll-x"><table class="rp-tbl" id="rp-pt-tbl"></table></div>
+<div class="rp-grid" style="margin-top:10px">
+<label for="rp-pt-s">Make the selected row \(s\)× faster</label><input type="range" id="rp-pt-s" min="1" max="10" step="0.5" value="2"><output id="rp-pt-sv"></output></div>
+<div class="readout" id="rp-pt-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> A profiler table for one decode step (batch 1, 1,024 tokens of context, \(t_L = 8\ \mu s\)), in the format of <code>key_averages().table()</code>. The times come from the cost model, not from a real GPU. Self CPU is calls × \(t_L\).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Sorted by Self CUDA, <code>aten::mm</code> is on top with 71% of GPU time from 225 calls. Sort by calls: <code>aten::mul</code> (290 calls) and <code>aten::add</code> (193) lead, with about 2 µs of GPU time per call but 8 µs of CPU time per call. Sort by Self CPU: the tiny ops dominate the CPU side, and that CPU time is what keeps the GPU idle. Select <code>aten::mm</code> with \(s = 2\): Amdahl on GPU time promises 1.55×, the timeline gives only 1.02× in eager. Switch to compiled and do the same: both are close to 1.83×. The readout also shows how much of the step is idle; that line is not in the real table.</p></details></figure>
+
+<h2>Reading an Nsight Systems trace</h2>
+<p>Nsight Systems (<code>nsys</code>) records the whole process with low overhead: CPU threads, CUDA API calls, GPU kernels, memory copies and your own <b>NVTX ranges</b> (named time ranges you mark in code, for example with <code>torch.cuda.nvtx.range_push("layer 3")</code>). You open the report in the Nsight Systems GUI. The PyTorch profiler can also export a timeline (<code>export_chrome_trace</code>) that you open in Perfetto; it has similar rows. A trace has one horizontal row per thread or stream, with time going right. Read it from top to bottom, as Algorithm 1 says, and step through Figure 4.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: reading one decode step in a trace</div><ol>
+<li>Skip the first steps (compilation, memory allocator warmup, cuBLAS heuristics); pick one steady step between two syncs</li>
+<li>Measure the step on the GPU row: \(T_{\text{step}}\) and the busy time \(\sum d_i\), so \(U\) by (123.5) <span class="c">// \(U\) well below 1 means look at gaps before kernels</span></li>
+<li>Use the NVTX row to find the layers; check that all layers look the same <span class="c">// one slow layer means a different code path</span></li>
+<li>Zoom into one layer. If the CPU (CUDA API) row is solid and the GPU row has holes \(\rightarrow\) launch-bound, rule (123.6)</li>
+<li>If the CPU row has holes too, read what the CPU does there: Python work, allocator, a hidden sync (<code>cudaStreamSynchronize</code>, <code>cudaMemcpy</code> device to host)</li>
+<li>Only then look at the long kernels: compute bytes or FLOPs per µs and compare with the peak <span class="c">// formula (123.1)</span></li>
+<li>At the end of the step, check the sync: how long does the CPU wait, and is the GPU idle while the CPU prepares the next step?</li></ol></div>
+<figure class="fig wide" id="rp-ns"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="rp-ns-prev">Back</button><button type="button" class="btn primary" id="rp-ns-play">Play</button><button type="button" class="btn" id="rp-ns-next">Next</button><span id="rp-ns-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="rp-ns-svg" viewBox="0 0 760 260" role="img" aria-label="A drawing of an Nsight Systems timeline with NVTX, CUDA API and GPU kernel rows"></svg></div>
+<div class="rp-leg"><span style="--c:var(--tc)">NVTX range (CPU time)</span><span style="--c:var(--v)">CUDA API call (launch)</span><span style="--c:var(--q)">linear kernel</span><span style="--c:var(--k)">attention kernel</span><span style="--c:var(--muted)">other kernel</span><span style="--c:repeating-linear-gradient(45deg,var(--bad) 0 2px,var(--card) 2px 4px)">idle or waiting (hatched)</span></div>
+<div class="readout" id="rp-ns-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A drawn Nsight Systems timeline of one eager decode step, built from the timeline model (123.4) with \(t_L = 8\ \mu s\). Rows from top: NVTX ranges, the CUDA API calls of the Python thread, and the GPU kernels. Step through it in the order of Algorithm 1.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The first view is the whole step: from far away the kernel row looks almost full, which is why people miss the problem. The zoomed views are one layer. The highlighted parts and the numbers in the text below the drawing are the measurements you would take in the real GUI: the length of a gap, the length of a launch, the bytes per microsecond of a long kernel. The last view shows the same step captured in a CUDA graph: one <code>cudaGraphLaunch</code> and a kernel row with no holes.</p></details></figure>
+<p>The commands, for a script that marks the decode loop with NVTX and starts the capture with <code>torch.cuda.profiler.start()</code>:</p>
+<pre class="code">nsys profile -t cuda,nvtx,osrt --capture-range=cudaProfilerApi --capture-range-end=stop \
+     -o decode python generate.py
+nsys stats -r cuda_gpu_kern_sum,cuda_api_sum,nvtx_sum decode.nsys-rep   <span class="cm"># text summaries</span>
+<span class="cm"># with CUDA graphs, add --cuda-graph-trace=node to see the kernels inside each graph (more overhead)</span></pre>
+<p>The trace, capture-range and graph-trace options are in the Nsight Systems user guide [Certain]; the names of the <code>nsys stats</code> reports have changed between versions, so check <code>nsys stats --help-reports</code> on your install. [Likely]</p>
+
+<h2>Finding the top 3 time sinks of a real model</h2>
+<p>Now put the pieces together into a procedure you can run on any model. A <b>time sink</b> is anything you can name and fix: an operator class, a group of kernels, or the idle time itself. The goal is a ranked list of three, each with its share of the <b>wall-clock</b> step and a candidate fix.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: top 3 time sinks</div><ol>
+<li><b>input:</b> model, real input shapes (batch, prompt length, output length), the real dtype and the real attention backend</li>
+<li>Time prefill and one steady decode step separately with CUDA events after warmup <span class="c">// they have different sinks</span></li>
+<li>For each phase, profile a few steps with <code>torch.profiler</code> (CPU + CUDA), with <code>record_function</code> around attention, MLP, norms, sampling</li>
+<li>\(T_{\text{busy}} \leftarrow \sum\) self CUDA time per step; \(T_{\text{idle}} \leftarrow T_{\text{step}} - T_{\text{busy}}\) <span class="c">// formula (123.5)</span></li>
+<li>Group kernel time into classes (linear, attention, KV-cache update, norms and element-wise, sampling, communication); add “idle” as a class</li>
+<li>Rank the classes by share of \(T_{\text{step}}\); keep the top 3</li>
+<li>For each, compare with its bound from (123.1): a class near its bound needs less work (quantization, fewer bytes); a class far from it needs a better kernel</li>
+<li>Estimate the gain of each fix with Amdahl (123.7) on the right time base; confirm with a trace (Algorithm 1)</li>
+<li><b>output:</b> three sinks, each with share, bound, fix, and expected gain</li></ol></div>
+<p>For the default decode step of this session (eager, batch 1, 1,024 tokens), the model’s answer is:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>#</th><th>Sink</th><th>Share of the step</th><th>Why</th><th>Fix and session</th></tr></thead><tbody>
+<tr><td>1</td><td>Linear GEMVs (225 kernels)</td><td>56.2%</td><td>reading 15 GB of weights per token; already near the bandwidth bound</td><td>fewer bytes: weight-only quantization (<a href="../inference/where-quantization-helps-weight-only-vs-weight.html">session 104</a>), or more tokens per weight read: batching, speculative decoding (<a href="../inference/index.html#row-speculative-decoding-1-the-math" title="Speculative decoding 1: the math (planned)">session 128</a>)</td></tr>
+<tr><td>2</td><td>GPU idle (launch gaps)</td><td>21.0%</td><td>971 kernels of 2 µs launched at 8 µs each</td><td>CUDA graphs, <code>torch.compile</code> (<a href="../inference/index.html#row-graph-level-optimization-fusion-cuda-graphs-torch" title="Graph-level optimization: fusion, CUDA graphs, torch.compile (planned)">session 127</a>)</td></tr>
+<tr><td>3</td><td>Element-wise and norm kernels</td><td>18.1%</td><td>each tiny kernel pays the 2 µs floor; in prefill they also re-read activations</td><td>fusion: RMSNorm + residual, RoPE, SiLU × mul (<a href="../inference/index.html#row-graph-level-optimization-fusion-cuda-graphs-torch" title="Graph-level optimization: fusion, CUDA graphs, torch.compile (planned)">session 127</a>, <a href="../inference/gpu-kernels-2-write-kernels-in-the.html">session 86</a>)</td></tr></tbody></table></div>
+<p>Change the setting and the list changes. At 32k context, attention (with the copied cache) moves to the top. At batch 32 and 8k context, attention is 82% of GPU time in eager mode. In a prefill of 4,096 tokens, idle time is near zero and the list is linear, other, attention. That is why you profile <b>your</b> shapes, not someone else’s.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>When asked “how would you speed up this model?”, do not start with a technique. Say: “I would time prefill and decode separately, profile a steady step, check GPU idle time first, then rank kernel classes by share of the step, and pick the fix for the biggest share.” Then give one number, such as “at batch 1 in eager mode, I expect about a fifth of the step to be launch gaps”.</aside>
+
+<h2>Measuring correctly</h2>
+<p>A wrong measurement leads to the wrong fix. Four rules:</p>
+<ul><li><b>Synchronize before you read a clock.</b> <code>time.time()</code> around GPU code measures how long the CPU took to <i>queue</i> the work. Use CUDA events (<code>torch.cuda.Event(enable_timing=True)</code>) or call <code>torch.cuda.synchronize()</code> before each clock read.</li>
+<li><b>Warm up.</b> The first calls include CUDA context setup, memory allocation, cuBLAS algorithm choice, and for <code>torch.compile</code> the compilation itself. Use a profiler <code>schedule(wait=1, warmup=2, active=3)</code> or run a few steps first.</li>
+<li><b>Know the observer effect.</b> The profiler adds CPU work per operator, so it makes launch-bound code look even more launch-bound. Recording shapes and stacks adds more. Take step times from a run without the profiler, and use the profile for shares.</li>
+<li><b>Profile the real thing.</b> The same model with SDPA or eager attention, BF16 or FP32, static or dynamic cache, batch 1 or 64 is a different program. Write the versions of PyTorch, the CUDA driver and the library next to every profile.</li></ul>
+
+<h2>PyTorch code</h2>
+<p>A small Llama-style decoder written like the Hugging Face code (FP32 RMSNorm, rotate-half RoPE, <code>torch.cat</code> cache, SwiGLU), profiled for one decode step. It runs on CPU or GPU. The operator counts are deterministic; the times are not, and they depend on your machine.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> Fn
+<span class="kw2">from</span> collections <span class="kw2">import</span> Counter
+<span class="kw2">from</span> torch.profiler <span class="kw2">import</span> profile, ProfilerActivity, record_function
+torch.manual_seed(0)
+dev = "cuda" <span class="kw2">if</span> torch.cuda.is_available() <span class="kw2">else</span> "cpu"
+d, nh, nkv, dh, ff, L, V = 256, 8, 2, 32, 512, 4, 1000
+
+<span class="kw2">class</span> RMSNorm(nn.Module):                      <span class="cm"># like LlamaRMSNorm: 8 kernels in eager mode</span>
+    <span class="kw2">def</span> __init__(s, d): super().__init__(); s.w = nn.Parameter(torch.ones(d))
+    <span class="kw2">def</span> forward(s, x):
+        h = x.to(torch.float32)
+        h = h * torch.rsqrt(h.pow(2).mean(-1, keepdim=True) + 1e-6)
+        <span class="kw2">return</span> s.w * h.to(x.dtype)
+
+<span class="kw2">def</span> rot_half(x): x1, x2 = x.chunk(2, -1); <span class="kw2">return</span> torch.cat((-x2, x1), -1)
+
+<span class="kw2">class</span> Layer(nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.n1, s.n2 = RMSNorm(d), RMSNorm(d)
+        s.q, s.k, s.v = (nn.Linear(d, n * dh, bias=False) <span class="kw2">for</span> n <span class="kw2">in</span> (nh, nkv, nkv))
+        s.o = nn.Linear(nh * dh, d, bias=False)
+        s.g, s.u, s.dn = nn.Linear(d, ff, bias=False), nn.Linear(d, ff, bias=False), nn.Linear(ff, d, bias=False)
+    <span class="kw2">def</span> forward(s, x, cos, sin, cache):
+        B, T, _ = x.shape
+        <span class="kw2">with</span> record_function("attn"):            <span class="cm"># a named range: groups ops by where they are called</span>
+            h = s.n1(x)
+            q = s.q(h).view(B, T, nh, dh).transpose(1, 2)
+            k = s.k(h).view(B, T, nkv, dh).transpose(1, 2)
+            v = s.v(h).view(B, T, nkv, dh).transpose(1, 2)
+            q, k = q * cos + rot_half(q) * sin, k * cos + rot_half(k) * sin
+            k, v = torch.cat([cache[0], k], 2), torch.cat([cache[1], v], 2)   <span class="cm"># copies the whole cache</span>
+            a = Fn.scaled_dot_product_attention(q, k, v, enable_gqa=True)
+            x = x + s.o(a.transpose(1, 2).reshape(B, T, nh * dh))
+        <span class="kw2">with</span> record_function("mlp"):
+            h = s.n2(x)
+            x = x + s.dn(Fn.silu(s.g(h)) * s.u(h))
+        <span class="kw2">return</span> x, (k, v)
+
+emb, layers = nn.Embedding(V, d).to(dev), nn.ModuleList(Layer() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)).to(dev)
+norm, head = RMSNorm(d).to(dev), nn.Linear(d, V, bias=False).to(dev)
+
+@torch.no_grad()
+<span class="kw2">def</span> step(tok, pos, caches):                    <span class="cm"># one decode step for one new token</span>
+    x = emb(tok)
+    inv = 1.0 / (10000 ** (torch.arange(0, dh, 2, device=dev) / dh))
+    ang = pos * inv; ang = torch.cat([ang, ang]); cos, sin = ang.cos(), ang.sin()
+    new = []
+    <span class="kw2">for</span> l, lay <span class="kw2">in</span> enumerate(layers):
+        x, c = lay(x, cos, sin, caches[l]); new.append(c)
+    <span class="kw2">return</span> head(norm(x[:, -1])).float().argmax(-1, keepdim=True), new
+
+ctx = 64
+caches = [(torch.randn(1, nkv, ctx, dh, device=dev), torch.randn(1, nkv, ctx, dh, device=dev)) <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)]
+tok = torch.tensor([[1]], device=dev)
+<span class="kw2">for</span> _ <span class="kw2">in</span> range(3): step(tok, ctx, caches)       <span class="cm"># warmup: never profile the first calls</span>
+
+acts = [ProfilerActivity.CPU] + ([ProfilerActivity.CUDA] <span class="kw2">if</span> dev == "cuda" <span class="kw2">else</span> [])
+<span class="kw2">with</span> profile(activities=acts) <span class="kw2">as</span> prof:
+    <span class="kw2">with</span> record_function("decode_step"):
+        nxt, _ = step(tok, ctx, caches)
+        nxt.item()                              <span class="cm"># the sync every generation loop has</span>
+key = "self_cuda_time_total" <span class="kw2">if</span> dev == "cuda" <span class="kw2">else</span> "self_cpu_time_total"
+print(prof.key_averages().table(sort_by=key, row_limit=12))
+
+<span class="cm"># group the top-level operators into the survey's classes</span>
+cls = {"linear": ("aten::linear", "aten::mm", "aten::addmm", "aten::matmul"),
+       "attention": ("aten::scaled_dot_product_attention",)}
+top = [e <span class="kw2">for</span> e <span class="kw2">in</span> prof.events() <span class="kw2">if</span> e.name.startswith("aten::") <span class="kw2">and</span> e.cpu_parent <span class="kw2">is not None</span>
+       <span class="kw2">and not</span> e.cpu_parent.name.startswith("aten::")]
+count = Counter(next((k <span class="kw2">for</span> k, v <span class="kw2">in</span> cls.items() <span class="kw2">if</span> e.name.startswith(v)), "other") <span class="kw2">for</span> e <span class="kw2">in</span> top)
+print(dict(count), "top-level ops:", len(top))   <span class="cm"># linear 29, attention 4, other 191: 224 ops</span>
+print(Counter(e.name <span class="kw2">for</span> e <span class="kw2">in</span> top).most_common(5))   <span class="cm"># aten::mul 40, aten::linear 29, aten::add 25, ...</span>
+
+<span class="cm"># time a GPU step the right way: CUDA events, after warmup</span>
+<span class="kw2">if</span> dev == "cuda":
+    s, e = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    s.record()
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(20): step(tok, ctx, caches)
+    e.record(); torch.cuda.synchronize()
+    print("ms per step:", s.elapsed_time(e) / 20)</pre>
+<p>We ran this on CPU with PyTorch 2.8: 224 top-level operators for 4 layers (29 linear, 4 attention, 191 other), the same every run. Some of the “other” ops are views that launch no kernel; on a GPU, the CUDA rows of the table tell you which ones really ran. To mark the same regions for Nsight Systems, replace <code>record_function</code> with <code>torch.cuda.nvtx.range_push("attn")</code> and <code>range_pop()</code>, or run the profiler with NVTX emission on.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What the profile usually shows</th><th>What people do</th></tr></thead><tbody>
+<tr><td>Chat model at batch 1 on a local GPU (Hugging Face eager)</td><td>GEMVs on top, a large share of GPU idle time from launch gaps, many norm and RoPE kernels</td><td>static cache + <code>torch.compile</code> with CUDA graphs, or a dedicated engine (llama.cpp, vLLM) [Likely]</td></tr>
+<tr><td>Serving engine at large batch (vLLM, SGLang, TensorRT-LLM)</td><td>linear GEMMs and decode attention; attention grows with batch × context</td><td>paged attention kernels, FlashDecoding, CUDA graphs for decode, quantized KV cache (<a href="../inference/index.html#row-vllm-internals" title="vLLM internals (planned)">session 138</a>) [Likely]</td></tr>
+<tr><td>Long-context summarization or RAG (32k+ tokens)</td><td>attention dominates prefill and decode</td><td>FlashAttention for prefill, split-K decode attention, KV-cache compression</td></tr>
+<tr><td>MoE models in reference code</td><td>linear dominates, many small per-expert matmuls and index ops (the survey’s Mixtral case)</td><td>fused or grouped MoE kernels (<a href="../inference/efficient-ffn-2-moe-routing-in-depth.html">session 95</a>)</td></tr>
+<tr><td>VLM answering about an image or a video</td><td>the vision encoder and the long prefill of image tokens appear as their own blocks before the first token</td><td>profile time to first token separately; cache image features; fewer visual tokens [Likely]</td></tr>
+<tr><td>Video retrieval and Video-RAG indexing (embedding many frames)</td><td>the encoder at large batch is GPU-bound; decode and resize on the CPU can leave the GPU idle</td><td>check the CPU rows first: GPU video decoding, more loader workers, pinned memory</td></tr>
+<tr><td>Live key-moment detection or action recognition on a stream</td><td>small batches per frame window: launch gaps and host-to-device copies</td><td>CUDA graphs for the fixed-shape model, batching across streams</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Timing GPU code with a CPU clock and no sync.</b> You measure how fast the CPU queues work. Use CUDA events or synchronize first.</li>
+<li><b>Profiling the first step.</b> It contains allocation, autotuning and compilation. Use a schedule with warmup.</li>
+<li><b>Reading the profiler table as the whole truth.</b> The sum of kernel times is GPU busy time. Idle time is invisible in the table; compare with the measured step time or look at the trace.</li>
+<li><b>Sorting by CPU total.</b> Wrappers and <code>record_function</code> ranges come first because they include their children. Use self time, or the CUDA column, for “who uses the time”.</li>
+<li><b>Treating an operator name as one thing.</b> <code>aten::mul</code> or <code>aten::cat</code> can come from five different places. Group by call site before you draw conclusions.</li>
+<li><b>Mixing prefill and decode in one profile.</b> One long prefill hides the decode pattern, or the other way round. Profile them separately.</li>
+<li><b>Optimizing the biggest kernel in a launch-bound step.</b> Figure 2: a 2× faster matmul gave 1.02×. Remove the gaps first.</li>
+<li><b>Generalizing from one implementation.</b> The survey’s Mixtral result came from unoptimized reference code. A profile describes a code version and a shape, not a model architecture.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What did the survey’s runtime profiling find, and how would you use it?<span class="lvl">basic</span></summary><div class="ans">Profiling Hugging Face implementations of several LLMs, the survey found that attention and linear operators together often take more than 75% of the inference time, that the attention share grows with context length, and that Mixtral was dominated by linear operators because of non-optimized FFN code. It also found many small operators that fragment the timeline and add CPU launch cost. I would use it as a prior, not an answer: it says where to look first (matmuls, attention, small-kernel overhead), but I would profile my own model, phase and shapes before choosing a fix.</div></details>
+<details class="qa"><summary>Why is a GPU often idle during decode at batch 1 in eager PyTorch?<span class="lvl">core</span></summary><div class="ans">Each operator costs CPU time to launch (Python, dispatcher, driver), on the order of several microseconds. A decode step of an 8B model has more than a thousand kernels, and most of them (norm, RoPE, add, cast) take only about 2 µs on the GPU. When the launch takes longer than the kernel, the GPU finishes and waits for the next launch. In our model of Llama 3.1 8B at batch 1, the CPU needs 10.3 ms to launch a step whose kernels take 8.5 ms, and the GPU is idle about 21% of the step.</div></details>
+<details class="qa"><summary>You made all matmuls 2× faster and the model got 2% faster. What happened?<span class="lvl">core</span></summary><div class="ans">The step is launch-bound. The step time is about max(CPU launch time, GPU time). The CPU still has to launch the same number of kernels, so shortening GPU kernels only creates more idle time. Amdahl on GPU time predicted about 1.55×; the timeline gives about 1.02×. Fix the launch problem first (CUDA graphs, torch.compile, fusion), and then the same matmul speedup gives about 1.8× in our model.</div></details>
+<details class="qa"><summary>In a PyTorch profiler table, what is the difference between Self CPU, CPU total and Self CUDA?<span class="lvl">basic</span></summary><div class="ans">Self CPU is CPU time spent in the operator itself, without its children. CPU total includes the children, so wrappers like aten::linear or your record_function ranges look large. Self CUDA is GPU kernel time launched directly by the operator; this is the column for GPU busy time. For tiny ops, the CPU time per call is close to the launch overhead, and comparing it with the CUDA time per call tells you if the op is launch-bound.</div></details>
+<details class="qa"><summary>How do you see launch overhead in an Nsight Systems trace?<span class="lvl">core</span></summary><div class="ans">Zoom into one layer. The CUDA API row of the Python thread is a solid sequence of cudaLaunchKernel calls with Python work between them, and the GPU kernel row has short kernels separated by gaps. The connections from each launch to its kernel show that each kernel starts right after its launch ends, not right after the previous kernel. In contrast, a GPU-bound stretch has a full kernel row and a CPU that runs ahead, so kernels start long after their launch.</div></details>
+<details class="qa"><summary>Why does attention take a bigger share at long context, and even more at large batch?<span class="lvl">core</span></summary><div class="ans">In decode, linear layers read all weights once per step regardless of batch, while attention reads the KV cache of every sequence. Per layer the weights are 2P bytes and the cache is B·c·s bytes, so attention passes linear at c* = 2P/(B·s). For Llama 3.1 8B that is 106,496/B tokens if the cache is read once. Batching divides the weight cost per token but not the cache cost, so attention becomes the top sink at large batch × context. Eager code reaches it earlier because the dynamic cache is copied with torch.cat and decode attention has little parallelism at small batch.</div></details>
+<details class="qa"><summary>How do you time a GPU operation correctly?<span class="lvl">basic</span></summary><div class="ans">Warm up first, then record CUDA events around many iterations and synchronize before reading elapsed_time, or call torch.cuda.synchronize() before each clock read. Never time with time.time() alone, because kernel launches are asynchronous. Report the median of several runs, and measure without the profiler, which adds its own overhead.</div></details>
+<details class="qa"><summary>nvidia-smi shows 100% GPU utilization. Is the GPU well used?<span class="lvl">core</span></summary><div class="ans">Not necessarily. That metric is the fraction of time at least one kernel was running, not how much of the chip was used. A decode attention kernel using 32 of 132 SMs, or a chain of tiny element-wise kernels, can show high utilization while reaching a small fraction of peak bandwidth or compute. Compare achieved bytes/s or FLOP/s per kernel with the peaks, and look for idle gaps in a trace.</div></details>
+<details class="qa"><summary>Walk me through finding the top 3 time sinks of a model you have never seen.<span class="lvl">advanced</span></summary><div class="ans">Fix the real shapes and dtype. Time prefill and a steady decode step separately with CUDA events. Profile a few steps with CPU and CUDA activities and named ranges. Compute busy time from kernel times and idle time as step time minus busy time. Group kernels by call site into classes (linear, attention, cache update, norms and element-wise, sampling, communication) and add idle as a class. Rank by share of wall time and take three. For each, compare with its roofline bound to decide between less work and a better kernel, estimate the gain with Amdahl on the correct time base, and confirm in a trace. For eager batch-1 decode of an 8B model, I would expect linear GEMVs, launch gaps and small element-wise kernels.</div></details>
+<details class="qa"><summary>Why can Amdahl’s law on profiler shares overestimate a speedup?<span class="lvl">advanced</span></summary><div class="ans">Profiler shares are shares of GPU busy time. If the step is limited by CPU launches, the wall time is not the sum of kernel times, so a faster kernel does not shorten the step by its own saving. Also, speeding one kernel can change overlap: the CPU may no longer be able to run ahead, or the next kernel may hit a cold cache. Apply Amdahl to wall-clock shares, including idle time, and confirm with a measurement. The model in this session gives 1.55× predicted versus 1.02× real for 2× faster matmuls in eager decode.</div></details>
+<details class="qa"><summary>Why does prefill have a very different profile from decode?<span class="lvl">core</span></summary><div class="ans">Prefill processes many tokens per weight read, so the matmuls are compute-bound GEMMs and every kernel is long; launch overhead is hidden. Element-wise ops are no longer tiny: they read and write large activations, so FP32 norms and unfused RoPE cost real bandwidth. Attention grows with the square of the prompt length. Decode is one token per sequence: memory-bound GEMVs, tiny element-wise kernels, launch gaps, and attention that grows with the cache size.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>With the cost model (123.1) and our constants, compute the GPU time of the MLP down projection (\(14336 \times 4096\), BF16) in a decode step at batch 1.</li>
+<li>A stretch of 30 kernels of 2 µs each is launched with \(t_L = 8\ \mu s\), starting with an empty queue. How long does the stretch take, and what is \(U\) for it?</li>
+<li>Compute the crossover context \(c^{*}\) of (123.3) for batch 16 if the cache is read once. What if the eager cache moves its bytes 3 times?</li>
+<li>Element-wise kernels take 18.1% of a decode step and fusion makes them 4× faster. What does Amdahl give? Why may the real gain be larger?</li>
+<li>A profiler table shows <code>aten::mul</code> with 290 calls, 2.3 ms self CPU and 0.58 ms self CUDA. What is the CPU time per call and the GPU time per call? What do you conclude?</li>
+<li>A colleague reports “the model runs at 100 tokens/s” measured with <code>time.time()</code> around a loop of 100 calls to <code>model(x)</code>, with no sync. Name two ways this number can be wrong.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(Q = 2 \cdot 14336 \cdot 4096 = 117.4\) MB (plus tiny activations); memory time \(117.48\ \text{MB} / 2.68\ \text{TB/s} = 43.8\ \mu s\); \(d = 45.8\ \mu s\). 2. Each kernel waits for its launch: kernel \(i\) starts at \(8i\) µs and ends at \(8i + 2\), so the stretch takes \(30 \times 8 + 2 = 242\) µs while the GPU is busy 60 µs: \(U = 60/242 \approx 25\%\). 3. \(106{,}496 / 16 = 6{,}656\) tokens; with 3× the bytes, about 2,219 tokens. 4. \(1/(0.819 + 0.181/4) = 1.16\times\). Fusion also removes launches, so it shrinks the idle time (21%) too; the real gain can be larger than Amdahl on the element-wise share alone. 5. 7.9 µs of CPU and 2.0 µs of GPU per call: the op is launch-bound, and the CPU side is the cost. Fuse it or capture it in a graph. 6. Without a sync, the timer can stop before the GPU has finished (too fast), and the loop includes the first calls with warmup costs (too slow); also, a forward call on a fixed input is not a generation step (no cache growth, no sampling sync).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Measure before you optimize. The survey finds attention plus linear often above 75% of the time in Hugging Face code, attention growing with context, and many small operators that add launch cost.</li>
+<li>Each kernel costs about \(t_0 + \max(Q/\text{BW}, W/F)\) (123.1). In decode at batch 1, matmuls are memory-bound GEMVs and most other kernels are only the 2 µs floor.</li>
+<li>Attention passes linear at \(c^{*} = 2P_\ell/(B s_\ell)\) (123.3): about 106k/B tokens for Llama 3.1 8B, much earlier in eager code.</li>
+<li>Launch overhead: when \(t_L \gt \bar d\) the GPU waits (123.4–123.6). In our eager decode model, 21% of the step is idle, and a 2× faster matmul gives only 1.02×.</li>
+<li>A profiler table shows busy time by operator name; a trace shows gaps and why. Rank sinks by share of wall time, including idle, and estimate fixes with Amdahl (123.7).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ d = t_0 + \max\!\Big(\frac{Q}{\eta_B \mathrm{BW}}, \frac{W}{\eta_F F}\Big), \quad s_i = \max(c_i, e_{i-1}), \quad U = \frac{\sum_i d_i}{T_{\text{step}}}, \quad c^{*} = \frac{2P_\ell}{B s_\ell}, \quad S = \frac{1}{(1-p) + p/s} \]</div>
+<h2 class="plain" id="runtime-profiling-where-the-time-goes-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Ansel et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation&amp;quot;" target="_blank" rel="noopener">PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">CUDA C++ Programming Guide</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Ansel et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation&amp;quot;" target="_blank" rel="noopener">PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">CUDA C++ Programming Guide</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/docs/stable/profiler.html" target="_blank" rel="noopener">torch.profiler: PyTorch Profiler API reference</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/tutorials/recipes/recipes/profiler_recipe.html" target="_blank" rel="noopener">PyTorch Profiler recipe (torch.profiler: schedule, key_averages, export_chrome_trace)</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/nsight-systems/UserGuide/index.html" target="_blank" rel="noopener">Nsight Systems User Guide</a></li><li>Nguyen, Carilli, Eryilmaz et al. (NVIDIA and Meta) (2021). <a href="https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/" target="_blank" rel="noopener">Accelerating PyTorch with CUDA Graphs (PyTorch blog)</a></li><li>Hugging Face (code). <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/models/llama/modeling_llama.py" target="_blank" rel="noopener">transformers: modeling_llama.py (LlamaRMSNorm, apply_rotary_pos_emb, LlamaMLP)</a></li><li>Hugging Face (code). <a href="https://github.com/huggingface/transformers/blob/main/src/transformers/cache_utils.py" target="_blank" rel="noopener">transformers: cache_utils.py (DynamicLayer uses torch.cat, StaticLayer uses index_copy_)</a></li><li>Dao (2023). <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a></li><li>Dao et al. (2023). <a href="https://crfm.stanford.edu/2023/10/12/flashdecoding.html" target="_blank" rel="noopener">Flash-Decoding for long-context inference (blog)</a></li><li>Hong et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;FlashDecoding++: Faster Large Language Model Inference on GPUs&amp;quot;" target="_blank" rel="noopener">FlashDecoding++: Faster Large Language Model Inference on GPUs</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li><li>Yuan et al. (2024). <a href="https://arxiv.org/abs/2402.16363" target="_blank" rel="noopener">LLM Inference Unveiled: Survey and Roofline Model Insights</a></li></ol><nav class="pn" aria-label="Previous and next session"><span class="prev"><small>Previous · session 122, planned</small>prune with Wanda (2:4), recover with distillation</span><a class="next" href="../inference/attention-operator-1-flashattention-1-2-and.html"><small>Next · session 124</small>Attention operator 1: FlashAttention 1, 2 and 3</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="runtime-profiling-where-the-time-goes"]');if(!R)return;
+const $=s=>R.querySelector(s);const E=B&&B.esc?B.esc:(x=>String(x));
+/* ---------- the cost model (same as the Python check) ---------- */
+const C={L:32,d:4096,nh:32,nkv:8,dh:128,f:14336,V:128256,BW:3.35e12,F:989e12,NSM:132,EB:0.8,EF:0.7,EFA:0.5,T0:2e-6};
+function kernels(phase,Bt,ctx,fused){
+ const {L,d,nh,nkv,dh,f,V}=C;const P=phase==="prefill"?ctx:1;const T=Bt*P;const qw=nh*dh,kw=nkv*dh;const K=[];let l=-1;
+ const ew=(n,rd,wr,g)=>K.push({n,g:g||"other",q:rd+wr,w:0,l});
+ const gemm=(n,a,b)=>K.push({n:"aten::mm",g:"linear",q:2*a*b+2*T*a+2*T*b,w:2*T*a*b,l,part:n});
+ const norm=()=>{if(fused){ew("fused_add_rmsnorm",2*T*d*2+2*d,2*T*d*2);return;}
+  ew("aten::_to_copy",T*d*2,T*d*4);ew("aten::pow",T*d*4,T*d*4);ew("aten::mean",T*d*4,T*4);ew("aten::add",T*4,T*4);ew("aten::rsqrt",T*4,T*4);
+  ew("aten::mul",T*d*4+T*4,T*d*4);ew("aten::_to_copy",T*d*4,T*d*2);ew("aten::mul",T*d*2+d*2,T*d*2);};
+ const rope=W=>{ew("aten::mul",T*W*2+P*dh*2,T*W*2);ew("aten::neg",T*W,T*W);ew("aten::cat",T*W*2,T*W*2);ew("aten::mul",T*W*2+P*dh*2,T*W*2);ew("aten::add",T*W*4,T*W*2);};
+ K.push({n:"aten::embedding",g:"other",q:T*d*2+T*8,w:T*d*2,l:-1});
+ for(l=0;l<L;l++){
+  if(!fused||l===0)norm();
+  gemm("q_proj",d,qw);gemm("k_proj",d,kw);gemm("v_proj",d,kw);
+  if(fused)ew("fused_rope",T*(qw+kw)*2,T*(qw+kw)*2);else{rope(qw);rope(kw);}
+  const old=phase==="prefill"?0:ctx-1;
+  for(let j=0;j<2;j++){if(fused)K.push({n:"aten::index_copy_",g:"attention",q:2*T*kw*2,w:0,l});else K.push({n:"aten::cat",g:"attention",q:2*Bt*(old*kw*2+P*kw*2),w:0,l});}
+  let fl,by;if(phase==="decode"){fl=4*Bt*nh*dh*ctx;by=T*qw*2*2+2*Bt*ctx*kw*2;}else{fl=4*Bt*nh*dh*P*(P+1)/2;by=T*qw*2*2+2*Bt*P*kw*2;}
+  K.push({n:"aten::scaled_dot_product_attention",g:"attention",q:by,w:fl,l});
+  gemm("o_proj",qw,d);
+  if(fused)norm();else{ew("aten::add",2*T*d*2,T*d*2);norm();}
+  gemm("gate_proj",d,f);gemm("up_proj",d,f);
+  if(fused)ew("fused_silu_mul",2*T*f*2,T*f*2);else{ew("aten::silu",T*f*2,T*f*2);ew("aten::mul",2*T*f*2,T*f*2);}
+  gemm("down_proj",f,d);
+  if(!fused||l===L-1)ew("aten::add",2*T*d*2,T*d*2);}
+ l=-1;norm();
+ K.push({n:"aten::mm",g:"linear",q:2*d*V+2*Bt*d+2*Bt*V,w:2*Bt*d*V,l:-1,part:"lm_head"});
+ ew("aten::_to_copy",Bt*V*2,Bt*V*4);ew("aten::argmax",Bt*V*4,0);
+ return K;}
+function ktime(k,phase,Bt){let eb=C.EB,ef=C.EF;if(k.n==="aten::scaled_dot_product_attention"){ef=C.EFA;if(phase==="decode")eb=C.EB*Math.min(1,Bt*C.nh/C.NSM);}
+ return C.T0+Math.max(k.q/(eb*C.BW),k.w/(ef*C.F));}
+function timeline(ds,tL,graph){const n=ds.length,c=new Float64Array(n),s=new Float64Array(n),e=new Float64Array(n);let cc=graph?10e-6:0,ee=0;
+ for(let i=0;i<n;i++){if(!graph)cc+=tL;c[i]=cc;s[i]=Math.max(cc,ee);ee=s[i]+ds[i];e[i]=ee;}
+ let busy=0;for(let i=0;i<n;i++)busy+=ds[i];const T=Math.max(cc,ee);return{c,s,e,T,busy,cpu:graph?10e-6:n*tL,U:busy/T};}
+function run(phase,Bt,ctx,fused,graph,tL,scale){const K=kernels(phase,Bt,ctx,fused);const ds=K.map(k=>ktime(k,phase,Bt)/(scale?scale(k):1));
+ const tl=timeline(ds,tL,graph);const cat={linear:0,attention:0,other:0};K.forEach((k,i)=>cat[k.g]+=ds[i]);return Object.assign(tl,{K,ds,cat});}
+const BATCH=[1,2,4,8,16,32,64];const COL={linear:"var(--q)",attention:"var(--k)",other:"var(--muted)"};
+const pc=v=>(100*v).toFixed(1)+"%";const ms=v=>(v*1e3).toFixed(2)+" ms";const us=v=>(v*1e6).toFixed(1)+" µs";
+const fmtc=c=>c>=1024?(c/1024)+"k":String(c);
+/* ---------- Figure 1: breakdown ---------- */
+(function(){
+ const svg=$("#rp-brk-svg");if(!svg)return;const seg=$("#rp-brk-ph"),fu=$("#rp-brk-fu"),cs=$("#rp-brk-c"),bs=$("#rp-brk-b"),info=$("#rp-brk-info");let ph="decode";
+ function draw(){const ctx=2**(+cs.value),Bt=BATCH[+bs.value],F=fu.checked;$("#rp-brk-cv").value=ctx.toLocaleString("en-US");$("#rp-brk-bv").value=Bt;
+  let g="";const x0=58,w=46,gap=9,top=20,H=220;
+  [0,25,50,75,100].forEach(v=>{const y=top+H-H*v/100;g+=`<line x1="${x0-4}" x2="${x0+11*(w+gap)}" y1="${y}" y2="${y}" stroke="var(--rule)" stroke-width="1"/><text x="${x0-8}" y="${y+4}" text-anchor="end" class="svgs" font-size="12">${v}%</text>`;});
+  g+=`<line x1="${x0-4}" x2="${x0+11*(w+gap)}" y1="${top+H-H*0.75}" y2="${top+H-H*0.75}" stroke="var(--ink)" stroke-dasharray="5 4" stroke-width="1.2"/><text x="${x0+11*(w+gap)+4}" y="${top+H-H*0.75+4}" class="svgs" font-size="11.5">75%</text>`;
+  let cur=null;
+  for(let k=7;k<=17;k++){const c=2**k;const r=run(ph,Bt,c,F,false,8e-6);const tot=r.busy;const x=x0+(k-7)*(w+gap);let y=top+H;
+   ["linear","attention","other"].forEach(gr=>{const h=H*r.cat[gr]/tot;y-=h;g+=`<rect x="${x}" y="${y.toFixed(2)}" width="${w}" height="${h.toFixed(2)}" fill="${COL[gr]}" opacity="${c===ctx?1:0.55}"/>`;});
+   if(c===ctx){g+=`<rect x="${x-2}" y="${top-2}" width="${w+4}" height="${H+4}" fill="none" stroke="var(--ink)" stroke-width="2.2" rx="3"/>`;cur=r;}
+   g+=`<text x="${x+w/2}" y="${top+H+17}" text-anchor="middle" class="svgs" font-size="12" ${c===ctx?'font-weight="700" style="fill:var(--ink)"':""}>${fmtc(c)}</text>`;}
+  g+=`<text x="${x0+5.5*(w+gap)}" y="${top+H+36}" text-anchor="middle" class="svgs" font-size="12.5">${ph==="decode"?"context length (tokens in the KV cache)":"prompt length (tokens)"}</text>`;
+  svg.innerHTML=g;const r=cur,tot=r.busy;
+  const agg={};r.K.forEach((k,i)=>{const key=k.n+"|"+k.g;agg[key]=(agg[key]||0)+r.ds[i];});
+  const top3=Object.entries(agg).sort((a,b)=>b[1]-a[1]).slice(0,3).map(([k,v])=>`<code>${E(k.split("|")[0])}</code> (${k.split("|")[1]}) ${pc(v/tot)}`).join(", ");
+  const wall=ph==="decode"?` With t<sub>L</sub> = 8 µs the step takes <b>${ms(r.T)}</b> of wall time, so the GPU is idle <b>${pc(1-r.U)}</b> of it.`:` Wall time ≈ GPU time here (GPU busy ${pc(r.U)}).`;
+  info.innerHTML=`${ph==="decode"?"Decode step":"Prefill"}, batch ${Bt}, ${ctx.toLocaleString("en-US")} tokens, ${F?"fused":"eager"}: <b>${r.K.length.toLocaleString("en-US")} kernels</b>, GPU busy time <b>${ms(tot)}</b>. Shares: <b>linear ${pc(r.cat.linear/tot)}</b>, <b>attention ${pc(r.cat.attention/tot)}</b>, <b>other ${pc(r.cat.other/tot)}</b> (linear + attention ${pc((r.cat.linear+r.cat.attention)/tot)}).${wall} Top 3 operator rows: ${top3}.`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;ph=b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ [cs,bs].forEach(e=>e.addEventListener("input",draw));fu.addEventListener("change",draw);draw();
+})();
+/* ---------- Figure 2: timeline ---------- */
+(function(){
+ const svg=$("#rp-tl-svg");if(!svg)return;const fu=$("#rp-tl-fu"),gr=$("#rp-tl-gr"),li=$("#rp-tl-lin"),tls=$("#rp-tl-tl"),bs=$("#rp-tl-b"),info=$("#rp-tl-info");
+ function draw(){const tL=(+tls.value)*1e-6,Bt=BATCH[+bs.value],F=fu.checked,G=gr.checked,LI=li.checked;$("#rp-tl-tlv").value=tls.value;$("#rp-tl-bv").value=Bt;
+  const r=run("decode",Bt,1024,F,G,tL,LI?(k=>k.g==="linear"?2:1):null);const base=run("decode",Bt,1024,F,G,tL,null);
+  const idx=[];r.K.forEach((k,i)=>{if(k.l===0)idx.push(i);});const i0=idx[0],i1=idx[idx.length-1];
+  const t0=G?0:Math.max(0,r.c[i0]-tL),t1=r.e[i1];const X0=70,X1=745,sx=t=>X0+(t-t0)/(t1-t0)*(X1-X0);
+  let g=`<defs><pattern id="rp-h2" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="var(--card)"/><rect width="2.6" height="6" fill="var(--bad)"/></pattern></defs><text x="${X0-8}" y="40" text-anchor="end" class="svgs" font-size="12">CPU</text><text x="${X0-8}" y="100" text-anchor="end" class="svgs" font-size="12">GPU</text>`;
+  g+=`<rect x="${X0}" y="84" width="${X1-X0}" height="26" fill="url(#rp-h2)"/>`;
+  if(G)g+=`<rect x="${sx(0)}" y="26" width="${Math.max(2,sx(10e-6)-sx(0))}" height="24" fill="var(--v)"/><text x="${sx(10e-6)+6}" y="43" class="svgs" font-size="12">cudaGraphLaunch (whole step), then the CPU waits</text>`;
+  else{for(let i=i0;i<=i1;i++){const a=sx(r.c[i]-tL),b=sx(r.c[i]);if(b<X0||a>X1)continue;g+=`<rect x="${Math.max(X0,a).toFixed(2)}" y="26" width="${Math.max(0.6,Math.min(X1,b)-Math.max(X0,a)-0.8).toFixed(2)}" height="24" fill="var(--v)" opacity="${i%2?0.7:1}"/>`;}
+   for(let i=i0;i<=i1;i++){if(r.s[i]-r.c[i]<0.3e-6)g+=`<line x1="${sx(r.c[i]).toFixed(2)}" y1="50" x2="${sx(r.s[i]).toFixed(2)}" y2="84" stroke="var(--muted)" stroke-width="0.8"/>`;}}
+  for(let i=i0;i<=i1;i++){const a=sx(r.s[i]),b=sx(r.e[i]);g+=`<rect x="${a.toFixed(2)}" y="84" width="${Math.max(0.8,b-a-0.4).toFixed(2)}" height="26" fill="${COL[r.K[i].g]}"/>`;}
+  let busy0=0;for(let i=i0;i<=i1;i++)busy0+=r.ds[i];const span0=t1-(G?r.s[i0]:t0);
+  const ticks=5;for(let j=0;j<=ticks;j++){const t=t0+(t1-t0)*j/ticks;g+=`<line x1="${sx(t)}" x2="${sx(t)}" y1="112" y2="117" stroke="var(--muted)"/><text x="${sx(t)}" y="130" text-anchor="${j===ticks?"end":j===0?"start":"middle"}" class="svgs" font-size="11.5">${((t-t0)*1e6).toFixed(0)} µs</text>`;}
+  g+=`<text x="${X0}" y="16" class="svgs" font-size="12">Layer 0, zoomed (${idx.length} kernels)</text>`;
+  const Y2=170,W2=X1-X0,s2=t=>X0+t/r.T*W2;
+  g+=`<text x="${X0}" y="${Y2-8}" class="svgs" font-size="12">Whole step: ${ms(r.T)}</text><text x="${X0-8}" y="${Y2+17}" text-anchor="end" class="svgs" font-size="12">GPU</text><rect x="${X0}" y="${Y2}" width="${W2}" height="26" fill="url(#rp-h2)"/>`;
+  const px=Math.ceil(W2);const occ=[new Float64Array(px),new Float64Array(px),new Float64Array(px)];const gi={linear:0,attention:1,other:2};const dt=r.T/px;
+  for(let i=0;i<r.K.length;i++){let a=r.s[i],b=r.e[i];let p=Math.floor(a/dt);while(a<b&&p<px){const pe=(p+1)*dt;const seg=Math.min(b,pe)-a;occ[gi[r.K[i].g]][p]+=seg;a+=seg;p++;}}
+  for(let p=0;p<px;p++){let y=Y2+26;[0,1,2].forEach(q=>{const h=26*occ[q][p]/dt;if(h>0.05){y-=h;g+=`<rect x="${X0+p}" y="${y.toFixed(2)}" width="1.05" height="${h.toFixed(2)}" fill="${["var(--q)","var(--k)","var(--muted)"][q]}"/>`;}});}
+  [0,0.25,0.5,0.75,1].forEach(f=>{g+=`<text x="${X0+f*W2}" y="${Y2+44}" text-anchor="${f===1?"end":f===0?"start":"middle"}" class="svgs" font-size="11.5">${(f*r.T*1e3).toFixed(1)} ms</text>`;});
+  svg.innerHTML=g;
+  info.innerHTML=`Step <b>${ms(r.T)}</b> (CPU launch time ${ms(r.cpu)}, GPU busy ${ms(r.busy)}): GPU busy <b>U = ${(100*r.U).toFixed(0)}%</b>, idle ${ms(r.T-r.busy)}. ${r.K.length.toLocaleString("en-US")} kernels, ${(Bt/r.T).toFixed(1)} tokens/s in total (${(1/r.T).toFixed(1)} per sequence). Layer 0: busy ${us(busy0)} of ${us(span0)}.`+(LI?` The 2× faster linear kernels change the step from ${ms(base.T)} to ${ms(r.T)}: <b>${(base.T/r.T).toFixed(2)}×</b>.`:"");}
+ [tls,bs].forEach(e=>e.addEventListener("input",draw));[fu,gr,li].forEach(e=>e.addEventListener("change",draw));draw();
+})();
+/* ---------- Figure 3: profiler table ---------- */
+(function(){
+ const tb=$("#rp-pt-tbl");if(!tb)return;const ms_=$("#rp-pt-mode"),so=$("#rp-pt-sort"),ss=$("#rp-pt-s"),info=$("#rp-pt-info");let mode=0,sort="cuda",sel="aten::mm";const tL=8e-6;
+ const DESC={"aten::mm":"All matrix multiplications: Q, K, V, O, gate, up, down in every layer, plus the LM head. In decode at batch 1 they are GEMVs that read the weights.","aten::mul":"Element-wise multiply. It comes from RMSNorm (two per norm), RoPE (four per layer) and SwiGLU. One name, three places in the code.","aten::add":"Element-wise add: residual connections, the + eps inside RMSNorm, and the last step of RoPE.","aten::cat":"Concatenation. Half of the calls are the RoPE rotate-half; the other half copy the whole KV cache (torch.cat in the dynamic cache), which is why its time grows with context.","aten::scaled_dot_product_attention":"The attention kernel. In decode at batch 1 it uses few SMs, so it is slower than its bytes suggest.","aten::_to_copy":"Dtype casts: BF16 to FP32 and back in every RMSNorm, and the logits to FP32.","aten::pow":"x² inside RMSNorm.","aten::mean":"The mean inside RMSNorm.","aten::rsqrt":"1/√ inside RMSNorm; it works on one number per token.","aten::neg":"The minus sign in RoPE’s rotate-half.","aten::silu":"The SiLU activation of SwiGLU.","aten::argmax":"Greedy sampling of the next token.","aten::embedding":"Token embedding lookup.","fused_add_rmsnorm":"One fused kernel for residual add + RMSNorm (what torch.compile or a hand-written kernel produces).","fused_rope":"One fused kernel for RoPE on Q and K.","fused_silu_mul":"One fused kernel for SiLU(gate) × up.","aten::index_copy_":"Writes the new K or V into a preallocated (static) cache, in place: no copy of the old cache.","cudaGraphLaunch":"With a CUDA graph the CPU launches the whole step once; per-operator CPU time disappears from the table."};
+ function rows(){const G=mode===1;const r=run("decode",1,1024,G,G,tL,null);const agg={};r.K.forEach((k,i)=>{const a=agg[k.n]||(agg[k.n]={n:k.n,calls:0,cuda:0});a.calls++;a.cuda+=r.ds[i];});
+  let L=Object.values(agg);L.forEach(a=>a.cpu=G?null:a.calls*tL);if(G)L.push({n:"cudaGraphLaunch",calls:1,cuda:0,cpu:10e-6});return{r,L};}
+ function draw(){const {r,L}=rows();const s=+ss.value;$("#rp-pt-sv").value=s.toFixed(1)+"×";
+  const key={cuda:a=>-a.cuda,cpu:a=>-(a.cpu||0),calls:a=>-a.calls}[sort];L.sort((a,b)=>key(a)-key(b));if(!L.find(a=>a.n===sel))sel="aten::mm";
+  let h=`<thead><tr><th>Name</th><th># of Calls</th><th>Self CPU</th><th>Self CUDA</th><th>Self CUDA %</th><th>CUDA avg</th></tr></thead><tbody>`;
+  L.forEach(a=>{h+=`<tr data-n="${E(a.n)}" class="${a.n===sel?"on":""}"><td>${E(a.n)}</td><td>${a.calls}</td><td>${a.cpu==null?"0.000 ms":(a.cpu*1e3).toFixed(3)+" ms"}</td><td>${(a.cuda*1e3).toFixed(3)} ms</td><td>${(100*a.cuda/r.busy).toFixed(1)}%</td><td>${a.calls?(a.cuda/a.calls*1e6).toFixed(2):"0.00"} µs</td></tr>`;});
+  h+=`</tbody>`;tb.innerHTML=h;
+  const a=L.find(x=>x.n===sel);const p=a.cuda/r.busy;const Sg=1/((1-p)+p/s);const G=mode===1;const r2=run("decode",1,1024,G,G,tL,k=>k.n===sel?s:1);
+  info.innerHTML=`<b><code>${E(sel)}</code></b>: ${E(DESC[sel]||"")} ${a.calls} calls, ${(a.cuda*1e3).toFixed(3)} ms of GPU time = <b>${pc(p)}</b> of GPU busy time and ${pc(a.cuda/r.T)} of the ${ms(r.T)} step. Make it ${s.toFixed(1)}× faster: Amdahl on GPU time predicts <b>${Sg.toFixed(2)}×</b>; the timeline gives <b>${(r.T/r2.T).toFixed(2)}×</b> (${ms(r.T)} → ${ms(r2.T)}). Not in a real table: the GPU is idle ${ms(r.T-r.busy)} (${pc(1-r.U)}) of this step.`;}
+ tb.addEventListener("click",e=>{const t=e.target.closest("tr[data-n]");if(!t)return;sel=t.dataset.n;draw();});
+ const segs=(el,fn)=>el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));fn(b.dataset.v);draw();});
+ segs(ms_,v=>{mode=+v;});segs(so,v=>{sort=v;});ss.addEventListener("input",draw);draw();
+})();
+/* ---------- Figure 4: Nsight Systems trace stepper ---------- */
+(function(){
+ const svg=$("#rp-ns-svg");if(!svg)return;const info=$("#rp-ns-info");const tL=8e-6;
+ const r=run("decode",1,1024,false,false,tL,null);const rg=run("decode",1,1024,true,true,tL,null);const n=r.K.length;
+ const lay=l=>{const id=[];r.K.forEach((k,i)=>{if(k.l===l)id.push(i);});return id;};const L0=lay(0);
+ const X0=110,X1=750,Y={nv:34,api:92,gpu:150};
+ const iGate=L0.find(i=>r.K[i].part==="gate_proj");const iN2=L0.filter(i=>r.K[i].n==="aten::pow")[1];
+ function frame(rr,t0,t1,opt){const sx=t=>X0+(t-t0)/(t1-t0)*(X1-X0);const cl=v=>Math.max(X0,Math.min(X1,v));let g=`<defs><pattern id="rp-h4" width="6" height="6" patternUnits="userSpaceOnUse" patternTransform="rotate(45)"><rect width="6" height="6" fill="var(--card)"/><rect width="2.6" height="6" fill="var(--bad)"/></pattern></defs>`;
+  [["NVTX",Y.nv],["CUDA API",Y.api],["GPU kernels",Y.gpu]].forEach(([t,y])=>{g+=`<text x="${X0-10}" y="${y+16}" text-anchor="end" class="svgs" font-size="12.5">${t}</text><rect x="${X0}" y="${y}" width="${X1-X0}" height="26" fill="var(--paper2)"/>`;});
+  // NVTX
+  if(opt.graph){g+=`<rect x="${sx(0)}" y="${Y.nv}" width="${cl(sx(rr.T))-sx(0)}" height="26" fill="var(--tc)" opacity="0.35"/><text x="${sx(0)+6}" y="${Y.nv+17}" font-size="12" fill="var(--ink)">decode_step (graph replay)</text>`;}
+  else for(let l=0;l<C.L;l++){const id=l===0?L0:lay(l);const a=sx(rr.c[id[0]]-tL),b=sx(rr.c[id[id.length-1]]);if(b<X0||a>X1)continue;
+   g+=`<rect x="${cl(a).toFixed(2)}" y="${Y.nv}" width="${Math.max(0.6,cl(b)-cl(a)-0.6).toFixed(2)}" height="26" fill="var(--tc)" opacity="${l%2?0.3:0.5}"/>`;if(b-a>60)g+=`<text x="${(cl(a)+cl(b))/2}" y="${Y.nv+17}" text-anchor="middle" font-size="12" fill="var(--ink)">layer ${l}</text>`;}
+  // CUDA API
+  if(opt.graph){g+=`<rect x="${sx(0)}" y="${Y.api}" width="${Math.max(2,sx(10e-6)-sx(0))}" height="26" fill="var(--v)"/><text x="${sx(10e-6)+5}" y="${Y.api+17}" font-size="12" fill="var(--ink)">cudaGraphLaunch</text><rect x="${sx(10e-6)+120}" y="${Y.api}" width="${cl(sx(rr.T))-sx(10e-6)-120}" height="26" fill="url(#rp-h4)"/><text x="${sx(10e-6)+126}" y="${Y.api+17}" font-size="12" fill="var(--ink)">cudaStreamSynchronize (CPU waits)</text>`;}
+  else{const wide=(t1-t0)/(X1-X0)>tL/2;if(wide){g+=`<rect x="${cl(sx(0))}" y="${Y.api}" width="${cl(sx(rr.cpu))-cl(sx(0))}" height="26" fill="var(--v)" opacity="0.85"/>`;}
+   else for(let i=0;i<n;i++){const a=sx(rr.c[i]-tL),b=sx(rr.c[i]);if(b<X0||a>X1)continue;g+=`<rect x="${cl(a).toFixed(2)}" y="${Y.api}" width="${Math.max(0.6,cl(b)-cl(a)-0.8).toFixed(2)}" height="26" fill="var(--v)" opacity="${i%2?0.7:1}"/>`;}
+   if(rr.cpu<rr.T){const a=sx(rr.cpu),b=sx(rr.T);if(b>X0&&a<X1)g+=`<rect x="${cl(a)}" y="${Y.api}" width="${Math.max(1,cl(b)-cl(a))}" height="26" fill="url(#rp-h4)"/>`;}}
+  // GPU
+  const pxw=(t1-t0)/(X1-X0);
+  if(pxw>2e-6){const px=Math.ceil(X1-X0);const occ=new Float64Array(px);const cg=new Array(px).fill("other");const best=new Float64Array(px);
+   for(let i=0;i<rr.K.length;i++){let a=rr.s[i],b=rr.e[i];if(b<t0||a>t1)continue;a=Math.max(a,t0);b=Math.min(b,t1);let p=Math.floor((a-t0)/pxw);while(a<b&&p<px){const pe=t0+(p+1)*pxw;const sg=Math.min(b,pe)-a;occ[p]+=sg;if(sg>best[p]){best[p]=sg;cg[p]=rr.K[i].g;}a+=sg;p++;}}
+   g+=`<rect x="${X0}" y="${Y.gpu}" width="${X1-X0}" height="26" fill="url(#rp-h4)"/>`;
+   for(let p=0;p<px;p++){const f=Math.min(1,occ[p]/pxw);if(f>0.01)g+=`<rect x="${X0+p}" y="${Y.gpu+26*(1-f)}" width="1.05" height="${26*f}" fill="${COL[cg[p]]}"/>`;}}
+  else{g+=`<rect x="${X0}" y="${Y.gpu}" width="${X1-X0}" height="26" fill="url(#rp-h4)"/>`;
+   for(let i=0;i<rr.K.length;i++){const a=sx(rr.s[i]),b=sx(rr.e[i]);if(b<X0||a>X1)continue;g+=`<rect x="${cl(a).toFixed(2)}" y="${Y.gpu}" width="${Math.max(0.8,cl(b)-cl(a)-0.4).toFixed(2)}" height="26" fill="${COL[rr.K[i].g]}" stroke="${opt.hi===i?"var(--ink)":"none"}" stroke-width="2"/>`;}
+   if(opt.links)for(let i=0;i<rr.K.length;i++){const a=sx(rr.c[i]),b=sx(rr.s[i]);if(a<X0||a>X1||b>X1)continue;g+=`<line x1="${a.toFixed(2)}" y1="${Y.api+26}" x2="${b.toFixed(2)}" y2="${Y.gpu}" stroke="var(--muted)" stroke-width="0.8"/>`;}}
+  if(opt.box){const [a,b,row]=opt.box;const y=Y[row];g+=`<rect x="${cl(sx(a))-2}" y="${y-4}" width="${cl(sx(b))-cl(sx(a))+4}" height="34" fill="none" stroke="var(--ink)" stroke-width="2.2" stroke-dasharray="5 3" rx="4"/>`;}
+  for(let j=0;j<=4;j++){const t=t0+(t1-t0)*j/4;const lab=(t1-t0)>1e-3?(t*1e3).toFixed(2)+" ms":((t-t0)*1e6).toFixed(0)+" µs";g+=`<line x1="${sx(t)}" x2="${sx(t)}" y1="${Y.gpu+28}" y2="${Y.gpu+33}" stroke="var(--muted)"/><text x="${sx(t)}" y="${Y.gpu+47}" text-anchor="${j===4?"end":j===0?"start":"middle"}" class="svgs" font-size="11.5">${lab}</text>`;}
+  g+=`<text x="${X0}" y="18" class="svgs" font-size="12.5">${opt.title}</text>`;return g;}
+ const la=r.c[L0[0]]-tL,lb=r.e[L0[L0.length-1]];let busyL=0;L0.forEach(i=>busyL+=r.ds[i]);
+ const nrm=L0.filter(i=>i>=iN2-1&&i<iN2+7);const nA=r.c[nrm[0]]-tL,nB=r.e[nrm[nrm.length-1]];let nBusy=0;nrm.forEach(i=>nBusy+=r.ds[i]);
+ const kg=r.K[iGate];let ahead=0;for(let i=iGate+1;i<n;i++){if(r.c[i]<=r.e[iGate])ahead++;else break;}
+ const S=[
+  {f:()=>frame(r,0,r.T,{title:"Whole step"}),t:`The whole eager decode step: <b>${ms(r.T)}</b>. The CPU launches for ${ms(r.cpu)}; the GPU is busy ${ms(r.busy)}, so U = <b>${(100*r.U).toFixed(0)}%</b>. From this far away the kernel row looks almost full: the gaps are thinner than a pixel. That is why you must zoom.`},
+  {f:()=>frame(r,0,r.T,{title:"NVTX ranges: one per layer",box:[r.c[L0[0]]-tL,r.c[L0[L0.length-1]],"nv"]}),t:`The NVTX row shows the ranges you marked in code, one per layer. Note: an NVTX range marks <b>CPU time</b>, from the first launch of the layer to the last (here ${us(r.c[L0[L0.length-1]]-r.c[L0[0]]+tL)} = 40 launches × 8 µs). The layer’s kernels can run later on the GPU. All 32 layers look the same, so one layer is enough to study.`},
+  {f:()=>frame(r,la,lb,{title:"Zoom: layer 0",links:true}),t:`Zoom into layer 0: ${L0.length} kernels between ${us(0)} and ${us(lb-la)}. The GPU is busy ${us(busyL)} of the ${us(lb-la)}: <b>${pc(busyL/(lb-la))}</b>. The long dark kernels are the matmuls; the gray slivers are norm, RoPE and add kernels, each followed by a hatched gap (idle). The thin lines connect each launch to its kernel.`},
+  {f:()=>frame(r,la,lb,{title:"Zoom: layer 0, the RMSNorm before the MLP",links:true,box:[nA,nB,"api"]}),t:`The boxed stretch is the RMSNorm before the MLP: 8 launches of 8 µs on a solid CUDA API row, and 8 kernels of about 2 µs. Each kernel starts the moment its launch ends (vertical lines): it waited for the CPU. GPU busy ${us(nBusy)} out of ${us(nB-nA)}. Solid CPU row + holes in the GPU row = <b>launch-bound</b>, rule (123.6).`},
+  {f:()=>frame(r,la,lb,{title:"Zoom: layer 0, a long kernel",hi:iGate,box:[r.s[iGate],r.e[iGate],"gpu"]}),t:`The boxed kernel is the MLP gate projection: <b>${us(r.ds[iGate])}</b> for ${(kg.q/1e6).toFixed(1)} MB of weights, so ${(kg.q/r.ds[iGate]/1e12).toFixed(2)} TB/s, ${pc(kg.q/r.ds[iGate]/C.BW)} of the 3.35 TB/s peak. This is how you judge a long kernel: bytes (or FLOPs) per microsecond against the peak. While it runs, the CPU queues ${ahead} more launches and gets ahead of the GPU; the next small kernels then start without waiting.`},
+  {f:()=>frame(r,r.T-0.6e-3,r.T,{title:"The end of the step",links:true,box:[r.cpu,r.T,"api"]}),t:`The end of the step. The CPU has launched the last kernel (argmax) at ${ms(r.cpu)} and now waits in <b>cudaStreamSynchronize</b> (the <code>.item()</code> that reads the token) for ${us(r.T-r.cpu)}, until the GPU drains the queue at ${ms(r.T)}. Then the token is copied to the host and the next step starts with an empty queue, so its first kernel waits for its launch too.`},
+  {f:()=>frame(rg,0,rg.T,{title:"The same step in a CUDA graph (fused kernels)",graph:true}),t:`The same step, fused and captured in a CUDA graph: one <b>cudaGraphLaunch</b>, ${rg.K.length} kernels back to back, and the CPU waits in the sync. Step <b>${ms(rg.T)}</b>, U = ${(100*rg.U).toFixed(0)}%, ${(r.T/rg.T).toFixed(2)}× faster than eager. Use <code>--cuda-graph-trace=node</code> to see the kernels inside the graph in a real trace.`}];
+ B.stepper({n:S.length,prev:$("#rp-ns-prev"),next:$("#rp-ns-next"),play:$("#rp-ns-play"),label:$("#rp-ns-lab"),ms:4200,onStep:k=>{svg.innerHTML=S[k].f();info.innerHTML=S[k].t;}});
+})();
+})();
+</script></body></html>
