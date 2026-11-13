@@ -4,6 +4,15 @@
 ## Required page format
 The reader must be able to scroll from beginning to end without switching Overview/Math/Code/Lab tabs. Keep intuitive explanation, concrete figures, math, code, lab and experimental observations **interwoven** where the ideas arise. Essential content stays visible. Add a chapter anchor navigator, accessible controls, mobile layout, and respect prefers-reduced-motion.
 
+## Analogies and visual pedagogy (mandatory)
+
+- **Multiple analogies per session:** normally two to four, strategically spaced through motivation, tensor operations, training dynamics and inference. Each analogy must map its concrete objects to exact mathematical variables and explain where it breaks.
+- **Multiple diagrams per session:** target at least three genuinely different figures — architecture/tensor shapes, state or data flow, and numerical or cost model — with clear axes, units and captions.
+- **Interactive animation with truth conditions:** at least one playable, algorithm-specific animated simulation and one parameter-controlled numerical experiment; never change colors/particles without changing the algorithmic computation. Support Pause, Reset and reduced motion.
+- **A visual-to-math bridge:** directly below each important figure, show a precise formula, its variables and a small example. Add the Python/PyTorch snippet immediately after the mechanism, not in a separate code tab.
+- **Do not label figures research measurements** unless the user actually runs the model and records results. Toy simulations are transparent, unit-tested examples.
+- **Design cues by track:** Transformers = Q/K/V token arrows and RoPE angle geometry; training = memory ledgers, gradient accumulation and all-gather timelines; inference = roofline and cache growth; VLM = ViT patch mosaics and projector dims; video = timestamped sampling, temporal grounding, retrieval; diffusion = denoising trajectories and ODE solvers.
+
 ## Required teaching depth for each session
 1. **Problem and motivation.** Establish prerequisites, what the model is for, what earlier baselines fail to do, and at least one realistic example.
 2. **Precise method variants.** Define every technical term. Compare competing algorithms, architecture families, and crucial tradeoffs. Distinguish a tokenizer library from a tokenization algorithm, or a model checkpoint from a model family.
