@@ -1,0 +1,335 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Optimization: backpropagation, SGD, Adam and AdamW, learning-rate schedules · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../foundations/index.html">Foundations</a><span class="sep">/</span><span>Session 4</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="optimization-backprop-adamw">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="optimization-backprop-adamw" data-session="optimization-backprop-adamw" style="--tc:var(--t1)"><header class="chap-head"><div class="chap-kicker"><span class="num">4</span><span>Track 1: Foundations · session 4 of 15</span></div><h1 class="chap-title">Optimization: backpropagation, SGD, Adam and AdamW, learning-rate schedules</h1><p class="chap-sub">Training means changing billions of numbers so the loss goes down. This session shows how the gradient of every weight is found (backpropagation), how we use it to take a step (SGD, momentum, Adam, AdamW), and how the step size changes during training (warmup, cosine, warmup-stable-decay). These choices decide whether a large training run works or blows up.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 1 to 3</span></div><div class="learn"><h3>What you will learn</h3><ul><li>What a gradient is, and how backpropagation computes all gradients with one backward pass</li><li>Why the backward pass costs about twice the forward pass, and why it needs memory for activations</li><li>Gradient descent, its stability limit, and why badly shaped losses are slow</li><li>SGD with mini-batches, momentum, Adam with bias correction, and why AdamW is different from Adam with L2</li><li>Optimizer memory: 16 bytes per parameter, and what that means for an 8B model</li><li>Learning-rate schedules (warmup, cosine, linear, warmup-stable-decay) and gradient clipping, with the real Llama 2 recipe</li></ul></div></header><style>
+.op-node rect{fill:var(--card);stroke:var(--rule);stroke-width:1.6;transition:stroke .2s,fill .2s}
+.op-node.f rect{stroke:var(--q);fill:var(--q-soft)}.op-node.g rect{stroke:var(--k);fill:var(--k-soft)}
+.op-node text{font-family:var(--sans);text-anchor:middle}
+.op-edge{fill:none;stroke:var(--muted);stroke-width:1.6}
+.op-edge.b{stroke:var(--k);stroke-dasharray:6 5;animation:opdash 1s linear infinite}
+@keyframes opdash{to{stroke-dashoffset:-22}}
+.op-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.op-leg span::before{content:"";display:inline-block;width:18px;height:4px;border-radius:2px;margin-right:6px;vertical-align:3px;background:var(--c)}
+.op-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.op-grid input[type=range]{width:100%}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A model starts with random weights and a loss of about 11.8 nats. Training is the process that brings the loss down, one small step at a time, for hundreds of thousands of steps. The <b>optimizer</b> decides each step.</p>
+<p>Two questions must be answered at every step: <b>which direction</b> should each of the billions of weights move (the gradient, computed by backpropagation), and <b>how far</b> (the learning rate, the optimizer’s rules, and the schedule). Get the first wrong and nothing learns. Get the second wrong and the loss explodes into NaN after a week of GPU time.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Expect: “What is the difference between Adam and AdamW?”, “Why do we need warmup?”, “How much memory does Adam need for an 8B model?”, “Why does backward cost twice the forward?”. All four are answered with numbers below.</aside>
+<p>This session gives you the full toolkit used to train real LLMs. Llama 2, for example, was trained with AdamW (\(\beta_1 = 0.9\), \(\beta_2 = 0.95\), \(\varepsilon = 10^{-5}\)), weight decay 0.1, gradient clipping at 1.0, 2,000 warmup steps, and a cosine schedule down to 10% of the peak learning rate (\(3 \times 10^{-4}\) for the 7B model). [Certain] By the end of this session you will know why each of those numbers is there.</p>
+
+<h2>Gradients: which way is downhill?</h2>
+<p>For a function of one number, the <b>derivative</b> \(f'(w)\) is the slope: how much \(f\) changes when \(w\) moves a tiny bit. For a function of many numbers \(\theta = (\theta_1, \dots, \theta_N)\), each <b>partial derivative</b> \(\partial \mathcal{L} / \partial \theta_i\) is the slope along one weight, with all others held still. The list of all of them is the <b>gradient</b>:</p>
+<div class="eq">\[ \nabla_\theta \mathcal{L} = \left( \frac{\partial \mathcal{L}}{\partial \theta_1},\ \frac{\partial \mathcal{L}}{\partial \theta_2},\ \dots,\ \frac{\partial \mathcal{L}}{\partial \theta_N} \right) \tag{4.1} \]</div>
+<p>The gradient points in the direction where the loss grows fastest. So the steepest way <b>down</b> is \(-\nabla_\theta \mathcal{L}\). For Llama 3 8B, this vector has about 8 billion numbers, one per weight.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>You stand on a foggy mountain and want to reach the valley. You cannot see far, but you can feel the slope under your feet. The gradient is that slope. Each step, you feel it again and walk a little downhill.</aside>
+<h3>The chain rule</h3>
+<p>A network is a chain of simple functions. If \(L\) depends on \(a\), and \(a\) depends on \(z\), then the effect of \(z\) on \(L\) is the product of the two local effects:</p>
+<div class="eq">\[ \frac{\partial L}{\partial z} = \frac{\partial L}{\partial a} \cdot \frac{\partial a}{\partial z} \tag{4.2} \]</div>
+<p>“If moving \(z\) by 1 moves \(a\) by 0.2, and moving \(a\) by 1 moves \(L\) by −0.8, then moving \(z\) by 1 moves \(L\) by −0.16.” Backpropagation is nothing more than this rule, applied from the loss back to every weight.</p>
+
+<h2>Backpropagation</h2>
+<p>We draw the computation as a <b>graph</b>: each node is one simple operation. Then we do two passes:</p>
+<ol><li><b>Forward pass:</b> compute every node’s value from the inputs to the loss, and <b>keep</b> the values we will need later.</li>
+<li><b>Backward pass:</b> start from \(\partial L / \partial L = 1\) and walk back. At each node, multiply the incoming gradient by the node’s local derivative (formula 4.2) and send the result to its inputs. If a value feeds several nodes, add up the gradients that come back from each of them.</li></ol>
+<p>Let us do it by hand on the smallest possible network: one input \(x\), one weight \(w\), one bias \(b\), a sigmoid, and a squared error to the target \(y\):</p>
+<div class="eq">\[ z = w x + b, \qquad a = \sigma(z) = \frac{1}{1 + e^{-z}}, \qquad L = (a - y)^2 \tag{4.3} \]</div>
+<p>With \(x = 2\), \(w = 0.5\), \(b = -0.5\) and \(y = 1\), step through Figure 1.</p>
+<figure class="fig wide" id="op-bp"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="op-bp-prev">Back</button><button type="button" class="btn primary" id="op-bp-play">Play</button><button type="button" class="btn" id="op-bp-next">Next</button><span id="op-bp-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="op-bp-svg" viewBox="0 0 780 260" role="img" aria-label="Computation graph of a tiny network with forward values and backward gradients"></svg></div>
+<div class="op-leg"><span style="--c:var(--q)">forward value</span><span style="--c:var(--k)">gradient ∂L/∂(node), flowing backward</span></div>
+<div class="readout" id="op-bp-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Backpropagation by hand. Forward steps fill in the blue values from left to right. Backward steps fill in the orange gradients from right to left, each one the incoming gradient times a local derivative.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Notice two things. First, the backward pass needs the forward values: \(\sigma'(z) = a(1-a)\) uses \(a\), and \(\partial z/\partial w = x\) uses \(x\). That is why training must store activations, and why memory is the big problem in training (Track 3). Second, the gradient for \(w\) and \(b\) both reuse \(\partial L/\partial z\). Backprop computes each shared piece once; that reuse is what makes it fast.</p></details></figure>
+<div class="worked"><div class="wt">The numbers from Figure 1</div>
+<p>Forward: \(z = 0.5 \cdot 2 - 0.5 = 0.5\), \(a = \sigma(0.5) = 0.622\), \(L = (0.622 - 1)^2 = 0.143\).</p>
+<p>Backward: \(\partial L/\partial a = 2(a - y) = -0.755\). Then \(\partial a/\partial z = a(1 - a) = 0.235\), so \(\partial L/\partial z = -0.755 \times 0.235 = -0.177\). Finally \(\partial L/\partial w = \partial L/\partial z \cdot x = -0.355\) and \(\partial L/\partial b = -0.177\).</p>
+<p>One step with learning rate 1: \(w \leftarrow 0.5 + 0.355 = 0.855\), \(b \leftarrow -0.5 + 0.177 = -0.323\). The new loss is \(0.040\), down from \(0.143\).</p></div>
+<h3>Backprop through a linear layer</h3>
+<p>The same rule, written for matrices, gives the two formulas you need for every linear layer \(Y = XW\) with \(X \in \R^{B \times n}\) and \(W \in \R^{n \times m}\). Let \(G = \partial L / \partial Y\) (same shape as \(Y\)) be the gradient that arrives from above:</p>
+<div class="eq">\[ \frac{\partial L}{\partial W} = X^\top G \in \R^{n \times m}, \qquad \frac{\partial L}{\partial X} = G\, W^\top \in \R^{B \times n} \tag{4.4} \]</div>
+<p>Check the shapes: \((n \times B)(B \times m) = n \times m\), the shape of \(W\). Good. Each formula is one matrix multiplication with the same cost as the forward \(XW\). So the backward pass costs about <b>twice</b> the forward pass: one multiplication for the weight gradient, one for the input gradient. Forward \(2N\) plus backward \(4N\) gives the \(6N\) FLOPs per token from Session 1.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Backprop stores the input \(X\) of every linear layer until the backward pass reaches it. For long sequences this activation memory is often larger than the weights. Activation checkpointing trades it for extra compute (<a href="../pretraining/index.html#row-gradient-accumulation-and-gradient-checkpointing" title="Gradient accumulation and gradient checkpointing (planned)">session 39</a>).</aside>
+
+<h2>Gradient descent, and why it can be slow or unstable</h2>
+<p>The simplest optimizer takes a step against the gradient, scaled by the <b>learning rate</b> \(\eta\):</p>
+<div class="eq">\[ \theta_{t+1} = \theta_t - \eta \, \nabla_\theta \mathcal{L}(\theta_t) \tag{4.5} \]</div>
+<p>Too small an \(\eta\), and training crawls. Too large, and each step jumps over the valley and lands higher than before. For a bowl-shaped loss we can say exactly where “too large” starts. Near a minimum, the loss looks like \(\tfrac12 \sum_i \lambda_i u_i^2\), where the \(\lambda_i\) are the curvatures along its main directions (the eigenvalues of the Hessian). Gradient descent is stable only if</p>
+<div class="eq">\[ \eta \lt \frac{2}{\lambda_{\max}} \tag{4.6} \]</div>
+<p>But progress along the <b>flattest</b> direction is proportional to \(\eta \lambda_{\min}\). So when \(\lambda_{\max} / \lambda_{\min}\) (the <b>condition number</b>) is large, the steep direction forces a small \(\eta\), and the flat direction then takes forever. The loss looks like a long, narrow ravine. Deep networks have such ravines everywhere, and this is the main reason we need better optimizers than plain gradient descent. Figure 2 shows a ravine with \(\lambda = 1\) and \(\lambda = 50\).</p>
+<figure class="fig" id="op-race"><div class="fig-body">
+<div class="op-grid">
+<label for="op-race-lr">\(\eta\) for gradient descent and momentum</label><input type="range" id="op-race-lr" min="0.005" max="0.06" step="0.001" value="0.02"><output id="op-race-lrv"></output>
+<label for="op-race-alr">\(\eta\) for Adam</label><input type="range" id="op-race-alr" min="0.01" max="0.5" step="0.01" value="0.15"><output id="op-race-alrv"></output>
+<label for="op-race-n">Steps</label><input type="range" id="op-race-n" min="5" max="150" step="1" value="60"><output id="op-race-nv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="op-race-noise"> Noisy gradients (like small mini-batches)</label></div>
+<svg id="op-race-svg" viewBox="0 0 640 300" role="img" aria-label="Contour plot of a narrow bowl with the paths of three optimizers"></svg>
+<div class="op-leg"><span style="--c:var(--muted)">gradient descent</span><span style="--c:var(--q)">momentum (β = 0.9)</span><span style="--c:var(--k)">Adam (β₁ = 0.9, β₂ = 0.999)</span></div>
+<div class="readout" id="op-race-info"></div>
+</div><figcaption><b>Figure 2.</b> Three optimizers on the loss \(f(x, y) = \tfrac12 (x^2 + 50 y^2)\), starting from the same point. The minimum is at the center. Gradient descent and momentum share one learning rate. Adam has its own, because Adam’s learning rate is a step size in weight units, not a multiplier on the gradient.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Plain gradient descent zig-zags across the narrow direction and creeps along the long one. Push its \(\eta\) above 0.04 and it diverges, exactly as formula (4.6) says (\(\lambda_{\max} = 50\)): it can never go fast along the flat direction. Momentum cancels the zig-zag and builds speed along the ravine; it stays stable up to about \(\eta = 0.076\). Adam scales each coordinate separately, so the steep and flat directions move at similar speed. Turn on noisy gradients: every method wanders, which is what small batches do in real training.</p></details></figure>
+
+<h2>Stochastic gradient descent and mini-batches</h2>
+<p>The true loss is an average over the whole dataset (trillions of tokens). We cannot compute its gradient for every step. Instead we take a random <b>mini-batch</b> of \(B\) examples and use their average gradient as an estimate:</p>
+<div class="eq">\[ \mathbf{g}_B = \frac{1}{B} \sum_{i=1}^{B} \nabla_\theta \ell_i(\theta), \qquad \E[\mathbf{g}_B] = \nabla_\theta \mathcal{L}, \qquad \operatorname{Var}(\mathbf{g}_B) = \frac{\sigma^2}{B} \tag{4.7} \]</div>
+<p>The estimate is right on average (unbiased) but noisy, and the noise shrinks as \(1/B\). This is <b>stochastic gradient descent (SGD)</b>. Bigger batches give cleaner gradients but cost more per step; beyond a certain “critical batch size”, doubling the batch no longer halves the number of steps. A common rule for SGD is the <b>linear scaling rule</b>: multiply the batch by \(k\), multiply the learning rate by \(k\) (with warmup). For Adam, the best learning rate grows more slowly with batch size. [Likely] LLMs count batches in tokens: Llama 2 used about 4 million tokens per step.</p>
+
+<h2>Momentum</h2>
+<p>Momentum keeps a running average of past gradients and steps along it:</p>
+<div class="eq">\[ \mathbf{v}_{t} = \beta\, \mathbf{v}_{t-1} + \mathbf{g}_t, \qquad \theta_{t+1} = \theta_t - \eta\, \mathbf{v}_t \tag{4.8} \]</div>
+<p>Components that keep the same sign add up; components that flip sign (the zig-zag) cancel. With \(\beta = 0.9\), a steady gradient eventually produces steps \(1/(1 - \beta) = 10\) times larger, so the effective learning rate along a consistent direction is \(10\eta\).</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A heavy ball rolling down the ravine. Small bumps (noise) and side-to-side slopes barely change its path, but a long gentle slope keeps speeding it up.</aside>
+
+<h2>Adam</h2>
+<p>Adam keeps <b>two</b> running averages for every weight: the mean of the gradient \(\mathbf{m}\), and the mean of the <b>squared</b> gradient \(\mathbf{v}\). Then it divides one by the square root of the other:</p>
+<div class="eq">\[ \begin{aligned} \mathbf{m}_t &= \beta_1 \mathbf{m}_{t-1} + (1 - \beta_1)\, \mathbf{g}_t \\ \mathbf{v}_t &= \beta_2 \mathbf{v}_{t-1} + (1 - \beta_2)\, \mathbf{g}_t^2 \\ \hat{\mathbf{m}}_t &= \frac{\mathbf{m}_t}{1 - \beta_1^t}, \qquad \hat{\mathbf{v}}_t = \frac{\mathbf{v}_t}{1 - \beta_2^t} \\ \theta_{t+1} &= \theta_t - \eta\, \frac{\hat{\mathbf{m}}_t}{\sqrt{\hat{\mathbf{v}}_t} + \varepsilon} \end{aligned} \tag{4.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{g}_t^2\)</dt><dd>the gradient squared, each component separately</dd>
+<dt>\(\beta_1, \beta_2\)</dt><dd>how long each average remembers: 0.9 is about the last 10 steps; 0.95 about 20; 0.999 about 1,000</dd>
+<dt>\(\hat{\mathbf{m}}_t, \hat{\mathbf{v}}_t\)</dt><dd>bias-corrected averages (explained below)</dd>
+<dt>\(\varepsilon\)</dt><dd>a tiny number (\(10^{-8}\) or \(10^{-5}\)) that prevents division by zero</dd></dl>
+<p>What does this achieve? The ratio \(\hat m / \sqrt{\hat v}\) is roughly “average gradient divided by its typical size”. If a weight’s gradient is consistently positive, the ratio is near 1 and the weight moves about \(\eta\) per step. If the gradient is mostly noise that flips sign, \(\hat m\) is near 0 and the weight barely moves. And a weight with tiny gradients moves as fast as one with huge gradients. Each weight gets its own step size. This fixes the ravine problem of Figure 2.</p>
+<h3>Why bias correction?</h3>
+<p>Both averages start at 0. After the first step, \(m_1 = (1 - \beta_1) g_1 = 0.1\, g_1\): ten times too small. In general, \(\E[m_t] = (1 - \beta_1^t)\, \E[g]\), so dividing by \(1 - \beta_1^t\) removes the bias exactly. The same holds for \(v\).</p>
+<div class="worked"><div class="wt">Worked example: the very first Adam step</div>
+<p>With bias correction, \(\hat m_1 = g_1\) and \(\hat v_1 = g_1^2\), so the first update is \(\eta\, g_1 / |g_1| = \pm\eta\), whatever the gradient’s size. Without correction and with \(\beta_1 = 0.9\), \(\beta_2 = 0.999\): the update would be \(\eta \cdot 0.1 g_1 / \sqrt{0.001\, g_1^2} = 3.16\,\eta\). The first steps would be more than 3 times too large, at the moment the model is most fragile. With \(\beta_2 = 0.95\) the factor would be 0.45 instead. Explore it in Figure 3.</p></div>
+<figure class="fig" id="op-adam"><div class="fig-body">
+<div class="op-grid">
+<label for="op-adam-b1">\(\beta_1\)</label><input type="range" id="op-adam-b1" min="0.5" max="0.99" step="0.01" value="0.9"><output id="op-adam-b1v"></output>
+<label for="op-adam-b2">\(\beta_2\)</label><input type="range" id="op-adam-b2" min="0.9" max="0.999" step="0.001" value="0.999"><output id="op-adam-b2v"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="op-adam-bc" checked> Use bias correction</label></div>
+<svg id="op-adam-svg" viewBox="0 0 640 260" role="img" aria-label="Gradients, Adam averages and update sizes over 60 steps"></svg>
+<div class="op-leg"><span style="--c:var(--rule)">gradient g (dots)</span><span style="--c:var(--muted)">raw average m</span><span style="--c:var(--tc)">corrected average m̂</span><span style="--c:var(--k)">update size ÷ η</span></div>
+<div class="readout" id="op-adam-info"></div>
+</div><figcaption><b>Figure 3.</b> Adam on a single weight whose gradient is about 1 plus noise. The orange line is the size of each update in units of \(\eta\). Ideally it should be close to 1 from the first step.</figcaption></figure>
+
+<h2>AdamW: weight decay done right</h2>
+<p><b>Weight decay</b> shrinks every weight a little each step, which keeps weights small and acts as regularization. With plain SGD, adding an L2 penalty \(\tfrac{\lambda}{2}\lVert\theta\rVert^2\) to the loss gives exactly the same thing. With Adam it does <b>not</b>. In “Adam with L2”, the penalty’s gradient \(\lambda\theta\) is added to \(\mathbf{g}\) before the division by \(\sqrt{\hat{\mathbf{v}}}\). Weights with large gradients then get almost no decay, and weights with small gradients get a lot. AdamW (Loshchilov and Hutter) <b>decouples</b> the decay from the adaptive part:</p>
+<div class="eq">\[ \theta_{t+1} = \theta_t - \eta \left( \frac{\hat{\mathbf{m}}_t}{\sqrt{\hat{\mathbf{v}}_t} + \varepsilon} + \lambda\, \theta_t \right) \tag{4.10} \]</div>
+<p>Here \(\mathbf{m}\) and \(\mathbf{v}\) are computed from the loss gradient only, and every weight shrinks by the same fraction \(\eta\lambda\) per step. With \(\eta = 3 \times 10^{-4}\) and \(\lambda = 0.1\), that is \(0.003\%\) per step. AdamW is the standard optimizer for transformers. Weight decay is usually <b>not</b> applied to biases and normalization weights, and often not to embeddings. [Likely]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Adam vs AdamW”: in Adam with L2, the decay term passes through the per-weight scaling \(1/\sqrt{\hat v}\), so it is not real weight decay. AdamW applies decay directly to the weights, separate from the gradient statistics. This makes the best \(\lambda\) and the best \(\eta\) much less tied together.</aside>
+<h3>The memory cost of Adam</h3>
+<p>Adam stores \(\mathbf{m}\) and \(\mathbf{v}\) for every weight, usually in FP32. With mixed-precision training, the full bill per parameter is:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>What</th><th>Bytes per parameter</th></tr></thead><tbody>
+<tr><td>BF16 weights (used in forward and backward)</td><td>2</td></tr><tr><td>BF16 gradients</td><td>2</td></tr><tr><td>FP32 master copy of the weights</td><td>4</td></tr><tr><td>Adam \(\mathbf{m}\) (FP32)</td><td>4</td></tr><tr><td>Adam \(\mathbf{v}\) (FP32)</td><td>4</td></tr><tr><td><b>Total</b>, before activations</td><td><b>16</b></td></tr></tbody></table></div>
+<p>For an 8B model: \(8 \times 10^9 \times 16 = 128\) GB, before a single activation is stored. That is why full fine-tuning of an 8B model does not fit on one 80 GB GPU, and why sharding (FSDP, ZeRO), 8-bit optimizers, Adafactor and LoRA exist (<a href="../pretraining/index.html#row-memory-math-for-training" title="Memory math for training (planned)">session 38</a>, <a href="../posttraining/index.html#row-lora-and-other-peft-methods" title="LoRA and other PEFT methods (planned)">session 57</a>). Newer optimizers such as Lion (one state instead of two) and Muon (for the matrices of hidden layers) are being used too; Adam(W) is still the default. [Likely]</p>
+
+<h2>Learning-rate schedules</h2>
+<p>Almost no LLM is trained with a constant learning rate. The learning rate follows a <b>schedule</b> \(\eta(t)\) with two phases.</p>
+<h3>Warmup</h3>
+<p>For the first \(W\) steps, the learning rate rises linearly from near 0 to its peak:</p>
+<div class="eq">\[ \eta(t) = \eta_{\max} \cdot \frac{t}{W}, \qquad t \lt W \tag{4.11} \]</div>
+<p>Why? At the start, the weights are random, the gradients are large and change fast, and Adam’s \(\mathbf{v}\) has seen only a few gradients, so its scaling is unreliable. Big steps at that moment can push the model into a bad region it never leaves, or cause a loss spike. Warmup lets the statistics settle first. Llama 2 used 2,000 warmup steps out of about 500,000 (2 trillion tokens at 4 million tokens per step).</p>
+<h3>Decay</h3>
+<p>After warmup, the learning rate goes down. Early on, big steps make fast progress; at the end, small steps let the model settle into the bottom of the valley instead of bouncing around it. The most common shape is <b>cosine decay</b> to a minimum \(\eta_{\min}\):</p>
+<div class="eq">\[ \eta(t) = \eta_{\min} + \tfrac12 (\eta_{\max} - \eta_{\min}) \left( 1 + \cos\!\left( \pi \, \frac{t - W}{T - W} \right) \right), \qquad W \le t \le T \tag{4.12} \]</div>
+<p>At the start of decay the cosine is 1 and \(\eta = \eta_{\max}\); at the end it is \(-1\) and \(\eta = \eta_{\min}\). Halfway, \(\eta\) is the average of the two: with \(\eta_{\max} = 3\times10^{-4}\) and \(\eta_{\min} = 3\times10^{-5}\), that is \(1.65\times10^{-4}\).</p>
+<p>The weakness of cosine: you must choose the total length \(T\) in advance. <b>Warmup-stable-decay (WSD)</b> keeps the learning rate constant for most of training, then decays it quickly (for example linearly) over the last 10–20% of steps. You can continue training from any point in the stable phase and only run a short decay when you need a finished model. Several recent LLMs use it. [Likely]</p>
+<figure class="fig" id="op-sch"><div class="fig-body">
+<div class="controls"><span class="seg" id="op-sch-type"><button type="button" data-v="cos" aria-pressed="true">Cosine</button><button type="button" data-v="lin" aria-pressed="false">Linear</button><button type="button" data-v="wsd" aria-pressed="false">Warmup-stable-decay</button><button type="button" data-v="const" aria-pressed="false">Constant</button></span></div>
+<div class="op-grid">
+<label for="op-sch-w">Warmup (% of steps)</label><input type="range" id="op-sch-w" min="0" max="20" step="0.5" value="2"><output id="op-sch-wv"></output>
+<label for="op-sch-m">Minimum (% of peak)</label><input type="range" id="op-sch-m" min="0" max="50" step="1" value="10"><output id="op-sch-mv"></output>
+<label for="op-sch-d">WSD decay length (% of steps)</label><input type="range" id="op-sch-d" min="5" max="50" step="1" value="15"><output id="op-sch-dv"></output>
+<label for="op-sch-t">Read the value at step</label><input type="range" id="op-sch-t" min="0" max="10000" step="50" value="5000"><output id="op-sch-tv"></output></div>
+<svg id="op-sch-svg" viewBox="0 0 640 240" role="img" aria-label="The learning rate over 10,000 steps for the chosen schedule"></svg>
+<div class="readout" id="op-sch-info"></div>
+</div><figcaption><b>Figure 4.</b> Learning-rate schedules over 10,000 steps with peak \(\eta_{\max} = 3 \times 10^{-4}\). The dot shows the value at the chosen step.</figcaption></figure>
+
+<h2>Gradient clipping</h2>
+<p>Sometimes one batch produces a huge gradient (an odd example, or a sharp cliff in the loss). One such step can undo days of training. <b>Global-norm clipping</b> rescales the whole gradient when its length is above a threshold \(c\):</p>
+<div class="eq">\[ \mathbf{g} \leftarrow \mathbf{g} \cdot \min\!\left( 1,\ \frac{c}{\lVert \mathbf{g} \rVert_2} \right), \qquad \lVert \mathbf{g} \rVert_2 = \sqrt{\textstyle\sum_i g_i^2} \ \text{ over all weights} \tag{4.13} \]</div>
+<p>The direction is kept; only the length is capped. Example: \(\mathbf{g} = (3, 4)\) has norm 5; with \(c = 1\) it becomes \((0.6, 0.8)\). LLMs typically use \(c = 1.0\). Watching the gradient norm over training is one of the best early warnings of instability: rising norms often come before a loss spike (<a href="../pretraining/index.html#row-training-recipe-and-stability" title="Training recipe and stability (planned)">session 36</a>).</p>
+
+<h2>Putting it together: one optimizer step</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: one training step with AdamW, clipping and a schedule</div><ol>
+<li><b>input:</b> weights \(\theta\), states \(\mathbf{m}, \mathbf{v}\), step \(t\), batch, hyper-parameters \(\beta_1, \beta_2, \varepsilon, \lambda, c\)</li>
+<li>\(L \leftarrow\) forward pass on the batch, storing activations</li>
+<li>\(\mathbf{g} \leftarrow \nabla_\theta L\) <span class="c">// backward pass, formula (4.4) per layer</span></li>
+<li>\(\mathbf{g} \leftarrow \mathbf{g} \cdot \min(1, c / \lVert \mathbf{g} \rVert)\) <span class="c">// clip, formula (4.13)</span></li>
+<li>\(\eta \leftarrow \text{schedule}(t)\) <span class="c">// warmup then cosine, formulas (4.11), (4.12)</span></li>
+<li>\(t \leftarrow t + 1\)</li>
+<li>\(\mathbf{m} \leftarrow \beta_1 \mathbf{m} + (1 - \beta_1)\mathbf{g}\), \(\;\mathbf{v} \leftarrow \beta_2 \mathbf{v} + (1 - \beta_2)\mathbf{g}^2\)</li>
+<li>\(\hat{\mathbf{m}} \leftarrow \mathbf{m}/(1 - \beta_1^t)\), \(\;\hat{\mathbf{v}} \leftarrow \mathbf{v}/(1 - \beta_2^t)\) <span class="c">// bias correction</span></li>
+<li>\(\theta \leftarrow \theta - \eta\,\big(\hat{\mathbf{m}}/(\sqrt{\hat{\mathbf{v}}} + \varepsilon) + \lambda\,\theta \cdot \text{decay\_mask}\big)\) <span class="c">// formula (4.10); no decay on norms and biases</span></li>
+<li>set all gradients to zero for the next step</li></ol></div>
+<p>The PyTorch version, with a check that a hand-written AdamW matches the built-in one:</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+torch.manual_seed(0)
+
+model = torch.nn.Sequential(torch.nn.Linear(16, 32), torch.nn.LayerNorm(32), torch.nn.Linear(32, 4))
+
+<span class="cm"># 1) no weight decay on biases and normalization weights (all 1-D parameters)</span>
+decay   = [p <span class="kw2">for</span> n, p <span class="kw2">in</span> model.named_parameters() <span class="kw2">if</span> p.ndim >= 2]
+nodecay = [p <span class="kw2">for</span> n, p <span class="kw2">in</span> model.named_parameters() <span class="kw2">if</span> p.ndim <  2]
+opt = torch.optim.AdamW([{"params": decay, "weight_decay": 0.1},
+                         {"params": nodecay, "weight_decay": 0.0}],
+                        lr=3e-4, betas=(0.9, 0.95), eps=1e-8)
+
+<span class="cm"># 2) warmup + cosine schedule, formulas (4.11) and (4.12), as a multiplier of the peak lr</span>
+W, T, min_ratio = 100, 1000, 0.1
+<span class="kw2">def</span> lr_mult(step):
+    <span class="kw2">if</span> step &lt; W:
+        <span class="kw2">return</span> (step + 1) / W
+    p = (step - W) / max(1, T - W)
+    <span class="kw2">return</span> min_ratio + 0.5 * (1 - min_ratio) * (1 + math.cos(math.pi * min(1.0, p)))
+sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_mult)
+
+<span class="cm"># 3) one training step: forward, backward, clip, step, schedule</span>
+x, y = torch.randn(64, 16), torch.randint(0, 4, (64,))
+loss = torch.nn.functional.cross_entropy(model(x), y)
+opt.zero_grad(set_to_none=True)
+loss.backward()
+gnorm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)   <span class="cm"># formula (4.13); returns the norm before clipping</span>
+opt.step()
+sched.step()                                    <span class="cm"># once per optimizer step, not per epoch</span>
+print(loss.item(), gnorm.item(), sched.get_last_lr())
+
+<span class="cm"># 4) a hand-written AdamW update, formula (4.10), matches torch.optim.AdamW</span>
+w = torch.randn(5, requires_grad=True); w2 = w.detach().clone().requires_grad_(True)
+ref = torch.optim.AdamW([w2], lr=1e-2, betas=(0.9, 0.95), eps=1e-8, weight_decay=0.1)
+m = torch.zeros(5); v = torch.zeros(5)
+<span class="kw2">for</span> t <span class="kw2">in</span> range(1, 6):
+    g = torch.sin(w.detach() * t)                  <span class="cm"># any gradient sequence</span>
+    w2.grad = g.clone(); ref.step()
+    <span class="kw2">with</span> torch.no_grad():
+        w.mul_(1 - 1e-2 * 0.1)                     <span class="cm"># decoupled decay (PyTorch applies it first)</span>
+        m = 0.9 * m + 0.1 * g; v = 0.95 * v + 0.05 * g * g
+        mh, vh = m / (1 - 0.9 ** t), v / (1 - 0.95 ** t)
+        w -= 1e-2 * mh / (vh.sqrt() + 1e-8)
+print((w - w2).abs().max().item())                 <span class="cm"># about 1e-8: the same update</span></pre>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical choices</th><th>Why</th></tr></thead><tbody>
+<tr><td>LLM pretraining (Llama 2 7B)</td><td>AdamW, \(\beta = (0.9, 0.95)\), \(\varepsilon = 10^{-5}\), wd 0.1, clip 1.0, warmup 2,000 steps, cosine to 10%, peak \(3\times10^{-4}\)</td><td>\(\beta_2 = 0.95\) reacts faster to sudden gradient changes than 0.999, which helps stability at scale [Likely]</td></tr>
+<tr><td>Supervised fine-tuning of an LLM</td><td>AdamW, peak lr around 10–100× lower than pretraining, short warmup, cosine or linear decay, 1–3 epochs [Likely]</td><td>The model is already good; big steps cause forgetting (<a href="../posttraining/index.html#row-sft-in-detail" title="SFT in detail (planned)">session 54</a>)</td></tr>
+<tr><td>LoRA fine-tuning</td><td>AdamW on the small adapter matrices only, often lr around \(10^{-4}\) to \(2\times10^{-4}\) [Likely]</td><td>Few trainable weights, so optimizer memory is tiny</td></tr>
+<tr><td>Heads on a frozen vision backbone (action recognition, shot classification)</td><td>AdamW on the heads only; if you unfreeze the backbone, a much smaller lr for it than for the heads</td><td>Protects good pretrained features while the new head learns fast</td></tr>
+<tr><td>RL fine-tuning (PPO, GRPO)</td><td>AdamW with a very small lr (around \(10^{-6}\)), clipping, KL penalty [Likely]</td><td>The policy must change slowly or it collapses (<a href="../posttraining/index.html#row-policy-gradient-and-reinforce" title="Policy gradient and REINFORCE (planned)">session 64</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Forgetting to zero the gradients.</b> PyTorch adds new gradients to old ones. Without <code>zero_grad()</code> every step uses the sum of all past gradients. (Gradient accumulation does this on purpose, then divides the loss by the number of micro-batches.)</li>
+<li><b>Calling the scheduler once per epoch</b> when it was designed for steps, or the other way round. Plot your schedule before training.</li>
+<li><b>Weight decay on norms and biases.</b> Decaying LayerNorm or RMSNorm gains toward 0 hurts. Use parameter groups as in the code.</li>
+<li><b>Adam + L2 when you meant AdamW.</b> <code>torch.optim.Adam(weight_decay=...)</code> is the L2 version. Use <code>AdamW</code>.</li>
+<li><b>Clipping before unscaling in FP16 training.</b> With a gradient scaler, call <code>scaler.unscale_(opt)</code> before <code>clip_grad_norm_</code>, or you clip the scaled (huge) gradients.</li>
+<li><b>Too small \(\varepsilon\) in low precision.</b> In FP16, \(10^{-8}\) rounds to 0 and \(\sqrt{\hat v} + \varepsilon\) can be 0. Keep optimizer math in FP32 (the standard), or use a larger \(\varepsilon\).</li>
+<li><b>No warmup with a large peak learning rate.</b> Classic cause of an early loss spike or NaN.</li>
+<li><b>Changing the batch size without changing the learning rate.</b> They are linked (formula 4.7); re-tune or scale.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Explain backpropagation in two sentences. Why is it efficient?<span class="lvl">basic</span></summary><div class="ans">Backprop applies the chain rule from the loss back through the computation graph, multiplying each incoming gradient by a local derivative and summing over paths. It is efficient because it computes the gradient for all weights in one backward pass that costs about twice the forward pass, reusing shared intermediate gradients instead of differentiating each weight separately.</div></details>
+<details class="qa"><summary>Why does the backward pass cost about 2× the forward pass?<span class="lvl">core</span></summary><div class="ans">For each linear layer \(Y = XW\), the backward pass needs two matrix multiplications of the same size as the forward one: \(\partial L/\partial W = X^\top G\) and \(\partial L/\partial X = GW^\top\). So forward ≈ \(2N\) FLOPs per token and backward ≈ \(4N\), giving the \(6N\) per token training rule. (The first layer does not need the input gradient, a small saving.)</div></details>
+<details class="qa"><summary>What is the difference between Adam and AdamW?<span class="lvl">core</span></summary><div class="ans">Adam with weight decay adds \(\lambda\theta\) to the gradient, so the decay is divided by \(\sqrt{\hat v}\) and becomes uneven: weights with large gradient variance are barely decayed. AdamW applies \(\theta \leftarrow \theta - \eta\lambda\theta\) directly, decoupled from the adaptive scaling. This gives true weight decay and makes \(\lambda\) and \(\eta\) easier to tune separately. AdamW is the standard for transformers.</div></details>
+<details class="qa"><summary>Why does Adam need bias correction?<span class="lvl">core</span></summary><div class="ans">\(\mathbf{m}\) and \(\mathbf{v}\) start at zero, so early averages are shrunk: \(\E[m_t] = (1-\beta_1^t)\E[g]\). Dividing by \(1-\beta_1^t\) and \(1-\beta_2^t\) removes the bias. Without it, with \(\beta_1 = 0.9\), \(\beta_2 = 0.999\), the first update is about \(3.16\eta\) instead of \(\eta\), exactly when the model is most fragile.</div></details>
+<details class="qa"><summary>How much memory does AdamW training of an 8B model need, before activations?<span class="lvl">core</span></summary><div class="ans">With mixed precision: 2 bytes (BF16 weights) + 2 (gradients) + 4 (FP32 master weights) + 4 + 4 (Adam m and v) = 16 bytes per parameter, so 128 GB. Plus activations, which depend on batch size and sequence length. Ways to reduce: shard across GPUs (ZeRO or FSDP), 8-bit optimizer states, Adafactor (factored second moment), or LoRA (train few parameters).</div></details>
+<details class="qa"><summary>Why do we use learning-rate warmup?<span class="lvl">core</span></summary><div class="ans">At initialization gradients are large and change quickly, and Adam’s second-moment estimate is based on very few steps, so adaptive step sizes are unreliable. Large early steps can cause loss spikes or move the model into a poor region. Ramping the learning rate up over the first steps lets the statistics stabilize; it also matters more with large batches and with Post-LN transformers.</div></details>
+<details class="qa"><summary>What is the stability limit of gradient descent on a quadratic, and what does it tell you about deep networks?<span class="lvl">advanced</span></summary><div class="ans">On \(\tfrac12\sum\lambda_i u_i^2\), gradient descent is stable only for \(\eta \lt 2/\lambda_{\max}\), while convergence along the flattest direction scales with \(\eta\lambda_{\min}\). A large condition number therefore forces slow training. Deep nets have very uneven curvature, which motivates momentum and per-parameter adaptive methods. Empirically, training often runs near this “edge of stability”, where the largest curvature hovers around \(2/\eta\). [Likely]</div></details>
+<details class="qa"><summary>Cosine vs warmup-stable-decay schedules?<span class="lvl">core</span></summary><div class="ans">Cosine decays smoothly from the peak to a minimum over a fixed total length, so you must know the total steps in advance; stopping early leaves the model at a high learning rate. WSD holds the peak learning rate for most of training and decays quickly at the end, so you can keep training from any stable-phase checkpoint and produce a finished model with a short decay. Both work well; WSD is more flexible for continued pretraining.</div></details>
+<details class="qa"><summary>What does gradient clipping do, and how would you use it to detect problems?<span class="lvl">basic</span></summary><div class="ans">Global-norm clipping rescales the full gradient to length \(c\) (often 1.0) whenever its norm is larger, keeping the direction. It prevents one bad batch from causing a huge update. Log the pre-clip norm: a steady rise or sudden jumps usually come before loss spikes, and frequent clipping means the learning rate may be too high.</div></details>
+<details class="qa"><summary>Batch size doubles. What do you do with the learning rate?<span class="lvl">advanced</span></summary><div class="ans">Gradient noise variance halves (formula 4.7). For SGD, the linear scaling rule suggests doubling the learning rate, with warmup. For Adam, the best learning rate typically grows more slowly (often closer to \(\sqrt{2}\)), and beyond the critical batch size, larger batches stop reducing the number of steps needed. In practice, re-tune on a small sweep, and keep tokens-per-step in mind for LLMs.</div></details>
+<details class="qa"><summary>Why is \(\beta_2 = 0.95\) common for LLMs instead of the default 0.999?<span class="lvl">advanced</span></summary><div class="ans">\(\beta_2 = 0.999\) averages squared gradients over about 1,000 steps. If gradients suddenly grow, \(\hat v\) lags behind, the denominator is too small, and updates become too large, which can trigger loss spikes. \(\beta_2 = 0.95\) (about 20 steps) adapts faster. Large-scale recipes such as Llama 2 use 0.95. [Likely]</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>In Figure 1, change the target to \(y = 0\) (by hand). Compute \(\partial L/\partial w\) and \(\partial L/\partial b\). Which way do \(w\) and \(b\) move?</li>
+<li>For \(f(x, y) = \tfrac12(x^2 + 50y^2)\), what is the largest stable learning rate for gradient descent? Check it in Figure 2.</li>
+<li>Write the first Adam update for a weight with \(g_1 = 0.002\), \(\eta = 10^{-3}\), with bias correction.</li>
+<li>Compute the learning rate at step 7,500 of a 10,000-step cosine schedule with no warmup, \(\eta_{\max} = 3\times10^{-4}\) and \(\eta_{\min} = 0\).</li>
+<li>How much memory do Adam states (\(\mathbf{m}\) and \(\mathbf{v}\) only) need for a 70B model in FP32? In 8-bit?</li>
+<li>Clip \(\mathbf{g} = (6, 8, 0)\) to norm 2.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(\partial L/\partial a = 2(0.622 - 0) = 1.245\); \(\partial L/\partial z = 1.245 \times 0.235 = 0.293\); \(\partial L/\partial w = 0.585\), \(\partial L/\partial b = 0.293\). Both are positive, so both decrease, which lowers \(a\) toward 0. 2. \(\eta \lt 2/50 = 0.04\). 3. \(\hat m = g\), \(\hat v = g^2\), so the update is \(10^{-3} \times 0.002/0.002 = 10^{-3}\) (minus a tiny \(\varepsilon\) effect): the size of the gradient does not matter. 4. Progress \(p = 0.75\): \(\eta = 0.5 \times 3\times10^{-4} \times (1 + \cos 0.75\pi) = 1.5\times10^{-4} \times (1 - 0.707) = 4.39\times10^{-5}\). 5. \(70\times10^9 \times 8\) bytes = 560 GB; in 8-bit, \(70\times10^9 \times 2\) = 140 GB (plus small block scales). 6. Norm 10, factor 0.2: \((1.2, 1.6, 0)\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>The gradient (4.1) gives the downhill direction for every weight; backpropagation computes all of it with the chain rule (4.2) in one backward pass, at about twice the forward cost (4.4).</li>
+<li>Gradient descent (4.5) is stable only for \(\eta \lt 2/\lambda_{\max}\) (4.6); badly conditioned losses are slow. Mini-batches give unbiased but noisy gradients (4.7).</li>
+<li>Momentum (4.8) smooths the path; Adam (4.9) gives each weight its own step size, with bias correction for the first steps; AdamW (4.10) applies weight decay correctly.</li>
+<li>AdamW with mixed precision costs 16 bytes per parameter: 128 GB for an 8B model before activations.</li>
+<li>Warmup (4.11) then decay (4.12, or WSD), plus global-norm clipping at 1.0 (4.13): the standard recipe, as in Llama 2.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \theta \leftarrow \theta - \eta\left(\frac{\hat{\mathbf{m}}}{\sqrt{\hat{\mathbf{v}}}+\varepsilon} + \lambda\theta\right), \quad \frac{\partial L}{\partial W} = X^\top G, \quad \eta \lt \frac{2}{\lambda_{\max}}, \quad \mathbf{g} \leftarrow \mathbf{g}\min\!\left(1, \frac{c}{\lVert\mathbf{g}\rVert}\right) \]</div>
+<h2 class="plain" id="optimization-backprop-adamw-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Kingma &amp; Ba (2014). <a href="https://arxiv.org/abs/1412.6980" target="_blank" rel="noopener">Adam: A Method for Stochastic Optimization</a></li><li>Loshchilov &amp; Hutter (2017). <a href="https://arxiv.org/abs/1711.05101" target="_blank" rel="noopener">Decoupled Weight Decay Regularization</a></li><li>Karpathy (2023). <a href="https://karpathy.ai/zero-to-hero.html" target="_blank" rel="noopener">Neural Networks: Zero to Hero (video course)</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">Llama 2: Open Foundation and Fine-Tuned Chat Models</a></li><li>Goyal et al. (2017). <a href="https://arxiv.org/abs/1706.02677" target="_blank" rel="noopener">Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour</a></li><li>Hu et al. (2024). <a href="https://arxiv.org/abs/2404.06395" target="_blank" rel="noopener">MiniCPM: Unveiling the Potential of Small Language Models with Scalable Training Strategies</a></li><li>Shazeer &amp; Stern (2018). <a href="https://arxiv.org/abs/1804.04235" target="_blank" rel="noopener">Adafactor: Adaptive Learning Rates with Sublinear Memory Cost</a></li><li>Dettmers et al. (2021). <a href="https://arxiv.org/abs/2110.02861" target="_blank" rel="noopener">8-bit Optimizers via Block-wise Quantization</a></li><li>Chen et al. (2023). <a href="https://arxiv.org/abs/2302.06675" target="_blank" rel="noopener">Symbolic Discovery of Optimization Algorithms (Lion)</a></li><li>Jordan et al. (2024). <a href="https://kellerjordan.github.io/posts/muon/" target="_blank" rel="noopener">Muon: An optimizer for hidden layers in neural networks (blog)</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../foundations/math-probability-cross-entropy.html"><small>Previous · session 3</small>Math you need, part 2: probability, cross-entropy, KL divergence and perplexity</a><a class="next" href="../foundations/lab-pytorch-bigram.html"><small>Next · session 5</small>PyTorch mental model and a tiny bigram language model</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="optimization-backprop-adamw"]');if(!R)return;
+const $=s=>R.querySelector(s);const f3=v=>(Math.abs(v)<5e-4?0:v).toFixed(3).replace("-","−");
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+/* ---------- Figure 1: backprop graph ---------- */
+(function(){
+ const svg=$("#op-bp-svg");if(!svg)return;const info=$("#op-bp-info");const sg=z=>1/(1+Math.exp(-z));
+ const x=2,w=0.5,b=-0.5,y=1,z=w*x+b,a=sg(z),L=(a-y)**2,dLa=2*(a-y),daz=a*(1-a),dLz=dLa*daz,dLw=dLz*x,dLb=dLz,w2=w-dLw,b2=b-dLb,L2=(sg(w2*x+b2)-y)**2;
+ const N={x:[70,55,"x","input"],w:[70,130,"w","weight"],b:[70,205,"b","bias"],z:[300,130,"z = wx + b",""],a:[490,130,"a = σ(z)",""],L:[680,130,"L = (a − y)²","y = 1"]};
+ const E=[["x","z"],["w","z"],["b","z"],["z","a"],["a","L"]];
+ const S=[{f:{x:x,w:w,b:b},g:{},t:"The graph. Inputs and parameters on the left, the loss on the right. Press Next to run the forward pass."},
+  {f:{x,w,b,z},g:{},t:`Forward: z = w·x + b = ${w}×${x} + (${b}) = <b>${f3(z)}</b>.`},
+  {f:{x,w,b,z,a},g:{},t:`Forward: a = σ(z) = 1 / (1 + e<sup>−${f3(z)}</sup>) = <b>${f3(a)}</b>.`},
+  {f:{x,w,b,z,a,L},g:{},t:`Forward: L = (a − y)² = (${f3(a)} − 1)² = <b>${f3(L)}</b>. The forward values are kept in memory for the backward pass.`},
+  {f:{x,w,b,z,a,L},g:{L:1,a:dLa},bk:["a","L"],t:`Backward starts with ∂L/∂L = 1. Local derivative of (a − y)² is 2(a − y), so ∂L/∂a = 1 × 2(${f3(a)} − 1) = <b>${f3(dLa)}</b>.`},
+  {f:{x,w,b,z,a,L},g:{L:1,a:dLa,z:dLz},bk:["z","a"],t:`Local derivative of σ is σ'(z) = a(1 − a) = ${f3(daz)} (it uses the stored a). So ∂L/∂z = ${f3(dLa)} × ${f3(daz)} = <b>${f3(dLz)}</b>.`},
+  {f:{x,w,b,z,a,L},g:{L:1,a:dLa,z:dLz,w:dLw,b:dLb,x:dLz*w},bk:["x","z","w","z","b","z"],t:`z = wx + b, so ∂z/∂w = x, ∂z/∂b = 1, ∂z/∂x = w. Therefore ∂L/∂w = ${f3(dLz)} × ${x} = <b>${f3(dLw)}</b>, ∂L/∂b = <b>${f3(dLb)}</b> (and ∂L/∂x = ${f3(dLz*w)}, not needed for training).`},
+  {f:{x,w:w2,b:b2,z:w2*x+b2,a:sg(w2*x+b2),L:L2},g:{},t:`Update with η = 1: w ← ${w} − (${f3(dLw)}) = <b>${f3(w2)}</b>, b ← ${b} − (${f3(dLb)}) = <b>${f3(b2)}</b>. Run forward again: the loss falls from ${f3(L)} to <b>${f3(L2)}</b>.`}];
+ function draw(k){const st=S[k];let g=`<defs><marker id="op-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+  const bk=new Set();(st.bk||[]).forEach((n,i,arr)=>{if(i%2===0)bk.add(arr[i]+">"+arr[i+1]);});
+  E.forEach(([u,v])=>{const [x1,y1]=N[u],[x2,y2]=N[v];const isb=bk.has(u+">"+v)||(st.bk&&st.bk[0]===u&&st.bk[1]===v);g+=`<path class="op-edge${isb?" b":""}" d="M${x1+58} ${y1} C ${(x1+x2)/2} ${y1}, ${(x1+x2)/2} ${y2}, ${x2-74} ${y2}" marker-end="url(#op-ah)"/>`;});
+  Object.entries(N).forEach(([id,[cx,cy,lab,sub]])=>{const hasF=id in st.f,hasG=id in st.g;const wd=id.length===1&&"xwb".includes(id)?116:148;
+   g+=`<g class="op-node${hasG?" g":hasF?" f":""}"><rect x="${cx-wd/2}" y="${cy-30}" width="${wd}" height="60" rx="12"/><text x="${cx}" y="${cy-8}" font-size="14" font-weight="700" fill="var(--ink)">${lab}</text>`+
+   (hasF?`<text x="${cx}" y="${cy+14}" font-size="13" fill="var(--q)" font-family="var(--mono)">= ${f3(st.f[id])}</text>`:`<text x="${cx}" y="${cy+14}" font-size="12" fill="var(--muted)">${sub}</text>`)+
+   (hasG?`<text x="${cx}" y="${cy-38}" font-size="13" fill="var(--k)" font-family="var(--mono)" font-weight="700">∂L/∂${id} = ${f3(st.g[id])}</text>`:"")+`</g>`;});
+  svg.innerHTML=g;info.innerHTML=st.t;}
+ B.stepper({n:S.length,prev:$("#op-bp-prev"),next:$("#op-bp-next"),play:$("#op-bp-play"),label:$("#op-bp-lab"),ms:2600,onStep:draw});
+})();
+/* ---------- Figure 2: optimizer race ---------- */
+(function(){
+ const svg=$("#op-race-svg");if(!svg)return;const ALR=$("#op-race-alr"),LR=$("#op-race-lr"),NS=$("#op-race-n"),NZ=$("#op-race-noise"),info=$("#op-race-info");
+ const S=60,X=x=>320+x*S,Y=y=>150-y*S;const f=(x,y)=>0.5*(x*x+50*y*y);const start=[-4.5,1.2];
+ function run(kind,lr,n,noisy){const r=gauss(rng(77));let x=start[0],y=start[1],vx=0,vy=0,mx=0,my=0,sx=0,sy=0;const pts=[[x,y]];
+  for(let t=1;t<=n;t++){let gx=x,gy=50*y;if(noisy){gx+=1.5*r();gy+=1.5*r();}
+   if(kind==="gd"){x-=lr*gx;y-=lr*gy;}else if(kind==="mom"){vx=0.9*vx+gx;vy=0.9*vy+gy;x-=lr*vx;y-=lr*vy;}
+   else{mx=0.9*mx+0.1*gx;my=0.9*my+0.1*gy;sx=0.999*sx+0.001*gx*gx;sy=0.999*sy+0.001*gy*gy;const c1=1-0.9**t,c2=1-0.999**t;x-=lr*(mx/c1)/(Math.sqrt(sx/c2)+1e-8);y-=lr*(my/c1)/(Math.sqrt(sy/c2)+1e-8);}
+   if(!Number.isFinite(x)||!Number.isFinite(y)||Math.abs(x)>1e6||Math.abs(y)>1e6){pts.push([NaN,NaN]);break;}pts.push([x,y]);}
+  return pts;}
+ function draw(){const lr=+LR.value,alr=+ALR.value,n=+NS.value,noisy=NZ.checked;$("#op-race-lrv").value=lr.toFixed(3);$("#op-race-alrv").value=alr.toFixed(2);$("#op-race-nv").value=n;
+  let g=`<defs><clipPath id="op-rc"><rect width="640" height="300"/></clipPath></defs><g clip-path="url(#op-rc)">`;
+  [0.5,2,4.5,8,12.5,18,24.5].forEach(c=>{const ax=Math.sqrt(2*c),ay=Math.sqrt(2*c/50);g+=`<ellipse cx="${X(0)}" cy="${Y(0)}" rx="${ax*S}" ry="${ay*S}" fill="none" stroke="var(--rule)" stroke-width="1.2"/>`;});
+  g+=`<circle cx="${X(0)}" cy="${Y(0)}" r="4" fill="var(--ink)"/>`;const res={};
+  [["gd","var(--muted)"],["mom","var(--q)"],["adam","var(--k)"]].forEach(([k,c])=>{const p=run(k,k==="adam"?alr:lr,n,noisy);const ok=p.filter(q=>Number.isFinite(q[0]));
+   g+=`<polyline points="${ok.map(q=>X(q[0]).toFixed(1)+","+Y(q[1]).toFixed(1)).join(" ")}" fill="none" stroke="${c}" stroke-width="2.2" stroke-linejoin="round"/>`+ok.map(q=>`<circle cx="${X(q[0]).toFixed(1)}" cy="${Y(q[1]).toFixed(1)}" r="2.2" fill="${c}"/>`).join("");
+   const last=p[p.length-1];res[k]=Number.isFinite(last[0])?f(last[0],last[1]):Infinity;});
+  g+=`<circle cx="${X(start[0])}" cy="${Y(start[1])}" r="6" fill="none" stroke="var(--ink)" stroke-width="2"/></g>`;svg.innerHTML=g;
+  const fmt=v=>Number.isFinite(v)&&v<1e6?(v<1e-4?v.toExponential(1):v.toFixed(4)):"<b style='color:var(--bad)'>diverged</b>";
+  info.innerHTML=`Loss after ${n} steps (start: ${f(...start).toFixed(2)}): gradient descent ${fmt(res.gd)}, momentum ${fmt(res.mom)}, Adam ${fmt(res.adam)}. Stability limit for gradient descent here: η &lt; 2/λ<sub>max</sub> = 2/50 = 0.04${lr>=0.04?" — <b>you are above it</b>":""}; for momentum about 0.076.`;}
+ [LR,ALR,NS].forEach(e=>e.addEventListener("input",draw));NZ.addEventListener("change",draw);draw();
+})();
+/* ---------- Figure 3: Adam bias correction ---------- */
+(function(){
+ const svg=$("#op-adam-svg");if(!svg)return;const b1=$("#op-adam-b1"),b2=$("#op-adam-b2"),bc=$("#op-adam-bc"),info=$("#op-adam-info");
+ const r=gauss(rng(5));const G=Array.from({length:60},()=>1+0.8*r());const X=t=>50+(t-1)*(570/59),Y=v=>200-v*70;
+ function draw(){const B1=+b1.value,B2=+b2.value,cor=bc.checked;$("#op-adam-b1v").value=B1.toFixed(2);$("#op-adam-b2v").value=B2.toFixed(3);
+  let m=0,v=0;const M=[],MH=[],U=[];G.forEach((g,i)=>{const t=i+1;m=B1*m+(1-B1)*g;v=B2*v+(1-B2)*g*g;const mh=m/(1-B1**t),vh=v/(1-B2**t);M.push(m);MH.push(mh);U.push(cor?mh/(Math.sqrt(vh)+1e-8):m/(Math.sqrt(v)+1e-8));});
+  const top=Math.max(2.6,Math.min(6,Math.max(...U)+0.3)),sc=210/(top+0.4),Y=v=>212-(v+0.4)*sc+0.4*sc-0.4*sc;const cl=v=>Math.max(-0.4,Math.min(top,v));
+  const line=(a,c,w)=>`<polyline points="${a.map((v,i)=>X(i+1).toFixed(1)+","+Y(cl(v)).toFixed(1)).join(" ")}" fill="none" stroke="${c}" stroke-width="${w}"/>`;
+  let g=`<line x1="50" y1="${Y(0)}" x2="620" y2="${Y(0)}" stroke="var(--muted)"/><line x1="50" y1="${Y(1)}" x2="620" y2="${Y(1)}" stroke="var(--rule)" stroke-dasharray="4 4"/>`;
+  Array.from({length:Math.floor(top)+1},(_,k)=>k).forEach(v=>g+=`<text x="42" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="12">${v}</text>`);[1,20,40,60].forEach(t=>g+=`<text x="${X(t)}" y="${Y(-0.4)+16}" text-anchor="middle" class="svgs" font-size="12">${t}</text>`);
+  g+=G.map((v,i)=>`<circle cx="${X(i+1).toFixed(1)}" cy="${Y(cl(v)).toFixed(1)}" r="2.6" fill="var(--rule)" stroke="var(--muted)" stroke-width=".6"/>`).join("")+line(M,"var(--muted)",2)+line(MH,"var(--tc)",2.5)+line(U,"var(--k)",2.5);
+  g+=`<text x="335" y="${Y(-0.4)+32}" text-anchor="middle" class="svgs" font-size="12.5">step t</text>`;svg.innerHTML=g;
+  info.innerHTML=`Step 1: m<sub>1</sub> = ${(1-B1).toFixed(2)}×g<sub>1</sub> = ${M[0].toFixed(3)}, corrected m̂<sub>1</sub> = ${MH[0].toFixed(3)} (equal to g<sub>1</sub> = ${G[0].toFixed(3)}). First update: <b>${U[0].toFixed(2)} η</b>${cor?" (with correction it is always 1.00 η)":` (without correction: (1−β₁)/√(1−β₂) = ${((1-B1)/Math.sqrt(1-B2)).toFixed(2)} η)`}. Average update over steps 30–60: <b>${(U.slice(29).reduce((a,v)=>a+v,0)/31).toFixed(2)} η</b>.`;}
+ [b1,b2].forEach(e=>e.addEventListener("input",draw));bc.addEventListener("change",draw);draw();
+})();
+/* ---------- Figure 4: schedules ---------- */
+(function(){
+ const svg=$("#op-sch-svg");if(!svg)return;const W=$("#op-sch-w"),Mn=$("#op-sch-m"),Dd=$("#op-sch-d"),Tt=$("#op-sch-t"),info=$("#op-sch-info"),seg=$("#op-sch-type");let type="cos";const T=10000,P=3e-4;
+ function lr(t){const w=T*(+W.value)/100,mn=P*(+Mn.value)/100;if(t<w)return P*(t+1)/Math.max(1,w);if(type==="const")return P;const p=(t-w)/Math.max(1,T-w);
+  if(type==="cos")return mn+0.5*(P-mn)*(1+Math.cos(Math.PI*p));if(type==="lin")return P-(P-mn)*p;const d=T*(+Dd.value)/100;if(t<T-d)return P;return P-(P-mn)*(t-(T-d))/d;}
+ const X=t=>50+t/T*570,Y=v=>200-v/P*170;
+ function draw(){$("#op-sch-wv").value=(+W.value).toFixed(1)+"%";$("#op-sch-mv").value=Mn.value+"%";$("#op-sch-dv").value=Dd.value+"%";$("#op-sch-tv").value=Tt.value;
+  let d="";for(let t=0;t<=T;t+=25)d+=(t?"L":"M")+X(t).toFixed(1)+" "+Y(lr(t)).toFixed(1);const t0=+Tt.value,v0=lr(t0);
+  let g=`<path d="M50 20 V200 H625" fill="none" stroke="var(--muted)"/>`;[0,2500,5000,7500,10000].forEach(t=>g+=`<text x="${X(t)}" y="218" text-anchor="middle" class="svgs" font-size="12">${t}</text>`);
+  [[P,"3e-4"],[P/2,"1.5e-4"],[0,"0"]].forEach(([v,l])=>g+=`<text x="44" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${l}</text>`);
+  g+=`<path d="${d}" fill="none" stroke="var(--tc)" stroke-width="3"/><line x1="${X(t0)}" y1="20" x2="${X(t0)}" y2="200" stroke="var(--muted)" stroke-dasharray="4 4"/><circle cx="${X(t0)}" cy="${Y(v0)}" r="6" fill="var(--k)"/><text x="335" y="234" text-anchor="middle" class="svgs" font-size="12.5">training step</text>`;svg.innerHTML=g;
+  info.innerHTML=`At step <b>${t0}</b>, η = <b>${v0.toExponential(2)}</b> (${(100*v0/P).toFixed(1)}% of the peak). ${type==="wsd"?`The stable phase ends at step ${Math.round(T*(1-(+Dd.value)/100))}; a checkpoint from anywhere before that can be decayed into a finished model.`:type==="cos"?"Halfway through the decay, cosine is exactly the average of the peak and the minimum.":type==="lin"?"Linear decay drops faster at the start of decay than cosine.":"A constant rate never lets the model settle; it is mostly used for short experiments."}`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;type=b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ [W,Mn,Dd,Tt].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>
