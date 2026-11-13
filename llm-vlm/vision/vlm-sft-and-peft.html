@@ -1,0 +1,510 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>VLM SFT and PEFT · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 189</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="vlm-sft-and-peft">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="vlm-sft-and-peft" data-session="vlm-sft-and-peft" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">189</span><span>Track 7: Vision and VLMs · session 27 of 38</span></div><h1 class="chap-title">VLM SFT and PEFT</h1><p class="chap-sub">Supervised fine-tuning (SFT) turns a pretrained vision-language model into an assistant, or into a specialist for your own images. For each of its three parts (vision encoder, connector, LLM) you decide: freeze it, train a small LoRA adapter, or train it fully, and with which learning rate. This session shows how to make those choices with real parameter counts and memory numbers, how QLoRA fits a 7B VLM on one small GPU, and how to keep the text skills the model already had.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> LoRA and QLoRA (sessions 57 and 58), forgetting and data mixing (61), and VLM training stages (186); batching and masking for multimodal sequences (188) helps</span></div><div class="learn"><h3>What you will learn</h3><ul><li>What VLM SFT optimizes: next-token loss on the answer tokens only, with image tokens and prompts masked out</li><li>The freeze map: frozen, LoRA or full for the vision tower, the connector and the LLM, and what each choice costs in memory and compute</li><li>Different learning rates per part with AdamW parameter groups, with the real LLaVA-1.5, LLaVA-OneVision and Molmo values</li><li>Where to put LoRA (LLM, connector, vision tower), how many weights each target adds, and what LLaVA-1.5 LoRA scored against full fine-tuning</li><li>QLoRA for VLMs: NF4 at 4.127 bits per weight, what to keep in 16 bits (vision tower, connector, embeddings, lm_head), and a 7B VLM in under 10 GB before activations</li><li>How to keep text-only skills: measure them, mix text data in, prefer LoRA or a smaller learning rate, stop earlier, or interpolate back toward the base</li><li>A runnable PyTorch freeze map with LoRA, per-part learning rates, answer-only loss and a merge check</li></ul></div></header><style>
+.vsp-rows{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center;font:500 14px var(--sans);margin:6px 0}
+.vsp-rows .seg{flex-wrap:wrap}
+.vsp-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.vsp-grid input[type=range]{width:100%;min-width:0}
+.vsp-grid output{font-family:var(--mono);font-size:14px;min-width:3em;text-align:right}
+.vsp-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.vsp-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:2px;margin-right:6px;vertical-align:0;background:var(--c);border:1.5px solid var(--b,transparent)}
+.vsp-svg text{font-family:var(--sans)}
+.vsp-rec{display:flex;flex-wrap:wrap;gap:6px;margin:4px 0 8px}
+.article pre.code,.article code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">After pretraining, a vision-language model (VLM) can describe images, but it does not yet follow instructions well, and it knows nothing about <b>your</b> images: your product photos, your medical scans, your video frames. <b>Supervised fine-tuning (SFT)</b> fixes both. You show the model many examples of “image + question → good answer” and train it to produce the answer.</p>
+<p>In <a href="../vision/vlm-training-stages.html">session 186</a> you saw that SFT is the third stage of building a VLM. In <a href="../vision/batching-and-masking-for-multimodal-sequences.html">session 188</a> you saw how to pack samples and put the loss only on the answer. This session is about the decisions you make when <b>you</b> run SFT, either as the last stage of building a VLM or as a fine-tune of an open model such as LLaVA-1.5 or Qwen2-VL:</p>
+<ol>
+<li><b>What to train.</b> A VLM has three parts: the <b>vision tower</b> (the vision encoder, for example a ViT), the <b>connector</b> (a small network that maps image features into the LLM’s input space) and the <b>LLM</b>. Each one can be frozen, adapted with a small add-on (PEFT, parameter-efficient fine-tuning, such as LoRA), or trained fully.</li>
+<li><b>How fast each part moves.</b> The parts were trained on very different data, so they need different learning rates.</li>
+<li><b>How to fit it on your GPU.</b> Full fine-tuning of a 7B VLM needs more than 100 GB before activations. LoRA and QLoRA bring this below 20 GB and 10 GB.</li>
+<li><b>How not to break what already works.</b> A VLM is also a chat model. If SFT sees only images, the model can forget text skills (and even some visual skills it had).</li>
+</ol>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “Do you freeze the vision encoder when fine-tuning a VLM?”, “Where do you put LoRA in a VLM?”, “Can you QLoRA a VLM? What do you not quantize?”, “Your fine-tuned VLM got worse at plain chat. What happened and how do you fix it?”. Each one has a numeric answer below.</aside>
+<p>The real recipes we will use: LLaVA-1.5 (CLIP ViT-L/14-336, a 2-layer MLP connector, Vicuna-7B or 13B), which ships both a full fine-tuning script and a LoRA script with published scores; Qwen2-VL, which freezes its vision encoder during SFT; and Idefics2, which trains its pretrained parts with LoRA and DoRA. [Certain]</p>
+
+<h2>What SFT optimizes in a VLM</h2>
+<p>One SFT sample is a short conversation with one or more images. The chat template turns it into one token sequence: image tokens (the connector outputs), then the user’s text, then the assistant’s answer. The model is trained with the usual next-token loss, but <b>only on the answer tokens</b>. The image tokens and the user’s words are context, not targets:</p>
+<div class="eq">\[ \mathcal{L}_{\text{SFT}}(\theta) = -\frac{1}{\sum_t m_t} \sum_{t=1}^{T} m_t \log p_\theta\!\left(x_t \mid I,\ x_{\lt t}\right) \tag{189.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\theta\)</dt><dd>all weights of the VLM: vision tower, connector and LLM</dd>
+<dt>\(I\)</dt><dd>the image (or images, or video frames) of the sample</dd>
+<dt>\(x_1, \dots, x_T\)</dt><dd>the text tokens of the conversation after the chat template</dd>
+<dt>\(m_t\)</dt><dd>the loss mask: 1 if token \(x_t\) belongs to an assistant answer, 0 for prompts, image placeholders, padding and template tokens</dd>
+<dt>\(p_\theta(x_t \mid I, x_{\lt t})\)</dt><dd>the probability the model gives to the correct next token</dd></dl>
+<p>In code, the mask is the label value <code>-100</code>, which PyTorch’s cross-entropy ignores. Idefics2 states the same rule: “we only compute the loss on the tokens of the answers in the Q/A pairs”. [Certain] Formula (189.1) is the same loss as text SFT (<a href="../posttraining/sft-in-detail.html">session 54</a>). What is new in a VLM is the question <b>which part of \(\theta\) the gradient is allowed to change</b>.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A VLM is like a team: a photographer (vision tower), an interpreter who turns photos into words the writer understands (connector), and an experienced writer (LLM). For a new job you can retrain the whole team, give each one a short course (LoRA), or only train the interpreter. Retraining the experienced writer is the most expensive choice and the one most likely to make them forget how to write other things.</aside>
+
+<h2>The freeze map: three parts, three choices</h2>
+<p>For each part you choose one of three modes. We call the result the <b>freeze map</b>.</p>
+<ul>
+<li><b>Frozen:</b> the weights never change. The part needs memory only for its weights (2 bytes each in BF16), and no weight gradients are computed for it.</li>
+<li><b>LoRA:</b> the original weights stay frozen, and small low-rank matrices are added to some of its linear layers and trained (<a href="../posttraining/lora-and-other-peft-methods.html">session 57</a>).</li>
+<li><b>Full:</b> every weight is trained. With mixed-precision AdamW this costs 16 bytes per weight: BF16 weight 2, BF16 gradient 2, FP32 master copy 4, Adam moments \(m\) and \(v\) 4 + 4 (<a href="../foundations/optimization-backprop-adamw.html">session 4</a>).</li>
+</ul>
+<p>What do real recipes do in SFT? LLaVA-1.5 freezes the vision tower and trains the connector and the LLM fully (or the LLM with LoRA) [Certain, from the training code]. Qwen2-VL: “we lock the ViT parameters and perform exclusive fine-tuning of the LLM” [Certain]. LLaVA-OneVision trains everything, with a smaller learning rate for the vision tower [Certain]. Idefics2 trains the new parts fully and the pretrained vision encoder and LLM with LoRA (DoRA in its instruction tuning) [Certain].</p>
+<h3>Compute: where the backward pass must go</h3>
+<p>Freezing saves more than memory. In a VLM the order is fixed: vision tower, then connector, then LLM, then the loss. The backward pass starts at the loss and must travel back to the <b>lowest trainable part</b>. Parts below it need only a forward pass. Parts above it need the gradient with respect to their <b>inputs</b> (to pass it down), and only trained weights need gradients with respect to the <b>weights</b>. For a part with \(N_p\) weights, each pass costs about \(2N_p\) FLOPs per token (one multiply and one add per weight):</p>
+<div class="eq">\[ C_p \approx \underbrace{2N_p}_{\text{forward}} + \underbrace{2N_p \cdot [\text{backward passes through } p]}_{\text{input gradients}} + \underbrace{2N_p \cdot [p \text{ is fully trained}]}_{\text{weight gradients}} \ \text{ FLOPs per token} \tag{189.2} \]</div>
+<p>The brackets are 1 if the condition is true and 0 otherwise. A LoRA part has a frozen base, so it pays \(4N_p\) (plus a tiny amount for the adapters); a fully trained LLM pays \(6N_p\), the familiar training rule. A frozen vision tower below a trainable connector pays only \(2N_p\) per image token and stores no activations for the backward pass. That is why LLaVA runs the vision tower under <code>torch.no_grad()</code> [Certain, from the code].</p>
+<aside class="note watch side"><span class="nt">Watch out</span>“Frozen” does not mean “free”. If the LLM is frozen but the connector below it is trained, the backward pass still goes through every LLM layer, and their activations must be stored. Freezing the LLM saves its weight gradients and optimizer states, not its activation memory.</aside>
+<p>Figure 1 puts the three choices together for two real models. The parameter counts are computed from the models’ <code>config.json</code> files on Hugging Face and match the size of the released weights exactly: LLaVA-1.5-7B has 7,063,427,072 weights (vision tower 303.5M, connector 21.0M, LLM 6,738.9M) and Qwen2-VL-7B has 8,291,375,616 (vision tower 631.2M, merger 44.6M, LLM 7,615.6M). [Certain]</p>
+<figure class="fig wide" id="vsp-mem"><div class="fig-body">
+<div class="vsp-rec" id="vsp-mem-rec"><button type="button" class="btn" data-v="full">LLaVA-1.5 full SFT</button><button type="button" class="btn" data-v="lora">LLaVA-1.5 LoRA</button><button type="button" class="btn" data-v="qlora">LLaVA-1.5 QLoRA</button><button type="button" class="btn" data-v="idef">LoRA on vision tower and LLM</button><button type="button" class="btn" data-v="qwen">Qwen2-VL QLoRA, LLM only</button></div>
+<div class="vsp-rows">
+<span>Model</span><span class="seg" id="vsp-mem-model"><button type="button" data-v="llava" aria-pressed="true">LLaVA-1.5-7B</button><button type="button" data-v="qwen" aria-pressed="false">Qwen2-VL-7B</button></span>
+<span>Vision tower</span><span class="seg" id="vsp-mem-vit"><button type="button" data-v="F" aria-pressed="true">Frozen</button><button type="button" data-v="L" aria-pressed="false">LoRA</button><button type="button" data-v="T" aria-pressed="false">Full</button></span>
+<span>Connector</span><span class="seg" id="vsp-mem-con"><button type="button" data-v="F" aria-pressed="false">Frozen</button><button type="button" data-v="L" aria-pressed="false">LoRA</button><button type="button" data-v="T" aria-pressed="true">Full</button></span>
+<span>LLM</span><span class="seg" id="vsp-mem-llm"><button type="button" data-v="F" aria-pressed="false">Frozen</button><button type="button" data-v="L" aria-pressed="true">LoRA</button><button type="button" data-v="T" aria-pressed="false">Full</button></span>
+<span>LoRA in the LLM</span><span class="seg" id="vsp-mem-tg"><button type="button" data-v="qv" aria-pressed="false">q and v only</button><button type="button" data-v="all" aria-pressed="true">all 7 linear layers</button></span></div>
+<div class="vsp-grid"><label for="vsp-mem-r">LoRA rank \(r\)</label><input type="range" id="vsp-mem-r" min="0" max="6" step="1" value="5"><output id="vsp-mem-rv"></output></div>
+<div class="controls" style="margin-top:6px"><label class="sl"><input type="checkbox" id="vsp-mem-q4"> LLM base weights in 4-bit NF4 (QLoRA)</label></div>
+<div class="scroll-x"><svg id="vsp-mem-svg" class="vsp-svg" viewBox="0 0 760 226" role="img" aria-label="The three parts of a VLM with their training mode, the backward path, and a bar of training memory in GB"></svg></div>
+<div class="vsp-leg"><span style="--c:var(--paper2);--b:var(--rule)">frozen</span><span style="--c:var(--v-soft);--b:var(--v)">LoRA</span><span style="--c:var(--k-soft);--b:var(--k)">full training</span><span style="--c:var(--q)">memory: frozen weights</span><span style="--c:var(--k)">memory: trainable weights, gradients, FP32 copy, Adam m and v (16 bytes each)</span></div>
+<div class="readout" id="vsp-mem-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> A freeze map and its memory cost before activations, from formula (189.6). Parameter counts are computed from the Hugging Face configs of LLaVA-1.5-7B and Qwen2-VL-7B. LoRA on the vision tower and connector covers all their linear layers. A dashed border means the LLM’s linear layers are stored in NF4 (4.127 bits per weight); embeddings and the output layer stay in BF16. The dashed orange arrow shows how far the backward pass must travel.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with “LLaVA-1.5 full SFT”: 6.76B trainable weights and 108.77 GB, more than one 80 GB GPU, which is why the official script uses DeepSpeed ZeRO-3 to shard the states over 8 GPUs. Click “LLaVA-1.5 LoRA” (the official LoRA recipe: rank 128 on all linear layers of the LLM, full connector): 340.8M trainable weights (4.82%), 19.54 GB. Turn on 4-bit: 9.93 GB, because the 6.48B linear weights of the LLM drop from 2 bytes to 0.516 bytes. Now change the rank: memory grows slowly, from 14.74 GB at rank 8 to 19.54 GB at rank 128, because the frozen base dominates. Finally unfreeze the vision tower fully: the backward pass now reaches the image, and 303.5M more weights cost 16 bytes each.</p></details></figure>
+
+<h2>Different learning rates for different parts</h2>
+<p>When several parts train together, they rarely share one learning rate. The rule of thumb: <b>the more a part already knows, and the broader the data it learned from, the more gently it should move</b>. New or small parts can move fast. In AdamW this is done with <b>parameter groups</b>: each group has its own learning rate \(\eta_g\) and its own weight decay \(\lambda_g\), and the same update rule:</p>
+<div class="eq">\[ \theta_g \leftarrow \theta_g - \eta_g(t)\left( \frac{\hat{\mathbf{m}}_g}{\sqrt{\hat{\mathbf{v}}_g} + \varepsilon} + \lambda_g\, \theta_g \right), \qquad \eta_g(t) = \eta_g \cdot s(t), \qquad g \in \{\text{vision}, \text{connector}, \text{LLM}, \text{LoRA}\} \tag{189.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\theta_g\)</dt><dd>the trainable weights of group \(g\)</dd>
+<dt>\(\eta_g\)</dt><dd>the peak learning rate of the group</dd>
+<dt>\(s(t)\)</dt><dd>the shared schedule, a number between 0 and 1 (warmup, then cosine decay)</dd>
+<dt>\(\hat{\mathbf{m}}_g, \hat{\mathbf{v}}_g\)</dt><dd>Adam’s bias-corrected moment estimates for those weights</dd>
+<dt>\(\lambda_g\)</dt><dd>the weight decay of the group (often 0 for LoRA, norms and biases)</dd></dl>
+<p>Real values, all with a cosine schedule:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Recipe</th><th>Vision tower</th><th>Connector</th><th>LLM</th></tr></thead><tbody>
+<tr><td>LLaVA-1.5 full SFT</td><td>frozen</td><td>\(2\times10^{-5}\)</td><td>\(2\times10^{-5}\) (full)</td></tr>
+<tr><td>LLaVA-1.5 LoRA SFT (r = 128, \(\alpha\) = 256)</td><td>frozen</td><td>\(2\times10^{-5}\) (full)</td><td>\(2\times10^{-4}\) (LoRA factors)</td></tr>
+<tr><td>LLaVA-OneVision (later stages)</td><td>\(2\times10^{-6}\)</td><td>\(1\times10^{-5}\)</td><td>\(1\times10^{-5}\)</td></tr>
+<tr><td>Molmo (pretraining)</td><td>\(6\times10^{-6}\)</td><td>\(2\times10^{-4}\)</td><td>\(2\times10^{-5}\)</td></tr></tbody></table></div>
+<p>The LLaVA-1.5 rows come from its <code>finetune.sh</code> and <code>finetune_lora.sh</code> scripts (1 epoch, warmup 3%, weight decay 0) [Certain]. Molmo also uses a 200-step warmup for the connector against 2,000 for the ViT and the LLM, and clips gradients separately for each part [Certain]. The OneVision values are from its paper [Certain, as reported in <a href="../vision/vlm-training-stages.html">session 186</a>].</p>
+<p>Notice the LLaVA LoRA row. The LoRA factors get a learning rate 10 times larger than the full-training rate, while the connector keeps the small one. This is typical: a LoRA update starts at zero (\(B = 0\)) and lives in a small subspace, so it needs bigger steps to move as far; the connector is a full weight matrix and keeps the full-training rate. The script sets it with a separate flag, <code>--mm_projector_lr 2e-5</code>, which creates a separate parameter group in the optimizer [Certain, from the code].</p>
+<p>A softer version of the same idea, inside the vision tower, is <b>layer-wise learning-rate decay</b>: block \(l\) of \(L\) gets \(\eta \cdot \gamma^{L - l}\) with \(\gamma\) around 0.8 to 0.9, so the early blocks (general edges and textures) move least. It comes from fine-tuning ViTs for classification (BEiT, MAE) and is used in some VLM recipes. [Likely]</p>
+<div class="algo"><div class="algo-h">Algorithm 1: build the freeze map and the optimizer</div><ol>
+<li><b>input:</b> VLM with parts vision, connector, LLM; a mode per part (frozen, LoRA, full); learning rates \(\eta_g\)</li>
+<li>set <code>requires_grad = False</code> for every weight <span class="c">// start from "all frozen"</span></li>
+<li><b>for</b> each part \(p\) <b>with</b> mode full: set <code>requires_grad = True</code> for its weights; put them in group \(p\)</li>
+<li><b>for</b> each part \(p\) <b>with</b> mode LoRA: wrap the chosen linear layers, \(W_0 x \to W_0 x + \tfrac{\alpha}{r} B A x\); put \(A, B\) in group "LoRA of \(p\)"</li>
+<li>split every group into weights that get decay (matrices) and weights that do not (biases, norms)</li>
+<li>build AdamW with one entry per group: \(\{\text{params}, \eta_g, \lambda_g\}\) <span class="c">// formula (189.3)</span></li>
+<li>if the lowest trainable part is above the vision tower: run the vision tower under <code>no_grad</code> <span class="c">// formula (189.2)</span></li>
+<li>print the trainable count per part, and check it against your plan before you start a run</li></ol></div>
+
+<h2>LoRA in a VLM: on the LLM, the connector or the vision tower</h2>
+<p>LoRA replaces the output of a frozen linear layer \(W_0 \in \R^{d_{\text{out}} \times d_{\text{in}}}\) by</p>
+<div class="eq">\[ \mathbf{h} = W_0 \mathbf{x} + \frac{\alpha}{r}\, B A \mathbf{x}, \qquad A \in \R^{r \times d_{\text{in}}},\ \ B \in \R^{d_{\text{out}} \times r},\ \ B_{\text{init}} = 0 \tag{189.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(r\)</dt><dd>the rank, much smaller than \(d_{\text{in}}\) and \(d_{\text{out}}\) (common values 8 to 128)</dd>
+<dt>\(\alpha\)</dt><dd>a scale; the update is multiplied by \(\alpha / r\) (rsLoRA uses \(\alpha / \sqrt{r}\))</dd>
+<dt>\(A, B\)</dt><dd>the trainable factors; \(A\) starts random, \(B\) starts at zero, so at step 0 the model is unchanged</dd></dl>
+<p>Each adapted layer adds \(r(d_{\text{in}} + d_{\text{out}})\) trainable weights. For a whole part, sum over the adapted layers:</p>
+<div class="eq">\[ N_{\text{LoRA}} = r \sum_{\ell \in \text{targets}} \left( d_{\text{in}}^{(\ell)} + d_{\text{out}}^{(\ell)} \right) \tag{189.5} \]</div>
+<p>Where should the adapters go? Each of the three parts gives a different answer.</p>
+<h3>LoRA on the LLM (the default)</h3>
+<p>Most of the weights are here, and most of the new behavior (answer format, task skill, domain words) is language behavior. LLaVA-1.5 adds LoRA to every linear layer of the LLM except <code>lm_head</code>, and its code explicitly skips any module whose name contains <code>mm_projector</code> or <code>vision_tower</code> [Certain, from the code]. The QLoRA paper found that adapting all linear layers of each transformer block is needed to match full fine-tuning; adapting only the query and value projections is not enough [Certain]. Figure 1 shows the price: for LLaVA-1.5-7B at rank 8, “q and v only” adds 4.2M weights and “all 7 linear layers” adds 20.0M. Both are tiny next to the 14 GB of frozen weights.</p>
+<h3>Full training (not LoRA) for the connector</h3>
+<p>The connector is small (21.0M weights in LLaVA-1.5, 0.30% of the model; 44.6M in Qwen2-VL) and it is the part that most needs to change when the image distribution changes. LoRA on it would save almost nothing. So recipes train it fully: LLaVA-1.5 LoRA trains the projector fully at \(2\times10^{-5}\) [Certain], and Idefics2 uses “standard full fine-tuning” for its newly initialized parts [Certain]. With Hugging Face PEFT you list it in <code>modules_to_save</code>, which makes it trainable and saves it with the adapter. Freeze the connector only if you want the visual features to reach the LLM exactly as before (for example, a text-only style fine-tune).</p>
+<h3>LoRA on the vision tower (when the images are new)</h3>
+<p>Freeze the vision tower when your images look like web photos: CLIP and SigLIP have seen billions of them. Adapt it when the <b>pixels</b> are unusual: X-rays, satellite images, thermal video, dense documents at a new resolution, or a new position-embedding size. Idefics2 does exactly this: it interpolates the encoder’s position embeddings to a higher resolution and trains “the vision encoder with LoRA parameters to adapt to these modifications” [Certain]. LoRA is a safer way to change the vision tower than full training, because the change is small and can be scaled down or removed. In Figure 1, LoRA rank 8 on all linear layers of the LLaVA vision tower adds only 3.5M weights, but it makes the backward pass go all the way down to the pixels, so activation memory and compute for the image tokens go up.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A camera with a good lens (vision tower), a cable (connector) and a skilled editor (LLM). For a new kind of photo you first change the cable and give the editor some notes (LoRA). You only adjust the lens when the scene itself is new to it, like an infrared scene.</aside>
+<h3>Does LoRA lose quality for VLM SFT?</h3>
+<p>LLaVA-1.5 released both versions trained on the same 665K-sample mix for one epoch, so we can compare them directly. Figure 2 shows the differences. For the 7B model, LoRA was higher on 8 of 11 benchmarks, lower on 2 and equal on 1, with a mean difference of +0.6 points [Certain, from the published table]. Each number comes from a single run, and differences of about 1 point may be noise. [Likely] The text-only skills were not measured in that table.</p>
+<figure class="fig" id="vsp-zoo"><div class="fig-body">
+<div class="controls"><span class="seg" id="vsp-zoo-size"><button type="button" data-v="7b" aria-pressed="true">LLaVA-1.5-7B</button><button type="button" data-v="13b" aria-pressed="false">LLaVA-1.5-13B</button></span></div>
+<div class="scroll-x"><svg id="vsp-zoo-svg" class="vsp-svg" viewBox="0 0 760 320" role="img" aria-label="Bar chart of LoRA minus full fine-tuning scores for 11 benchmarks"></svg></div>
+<div class="vsp-leg"><span style="--c:var(--v)">LoRA higher</span><span style="--c:var(--k)">full fine-tuning higher</span></div>
+<div class="readout" id="vsp-zoo-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> LLaVA-1.5 with full fine-tuning of the LLM (learning rate \(2\times10^{-5}\)) and with LoRA (rank 128, \(\alpha\) = 256, learning rate \(2\times10^{-4}\)), both with a frozen vision tower and a fully trained connector. Scores are copied from the LLaVA Model Zoo. Bars show LoRA minus full, in points; the labels give both scores.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Green bars are benchmarks where the LoRA model scored higher, orange where full fine-tuning did. For 7B, most bars are green and small (under 2.5 points); VizWiz is the largest loss (−2.2). Switch to 13B: the picture is mixed (4 higher, 5 lower, 2 equal) and the biggest bars go in both directions (VizWiz +5.3, LLaVA-Bench −3.0). The lesson is not “LoRA is better” but “on this data, LoRA and full fine-tuning are about equal, at about one fifth of the memory”.</p></details></figure>
+<p>This matches what is known for text LLMs: on instruction-following data, which mostly teaches format and style, LoRA usually matches full fine-tuning; on data that must teach a lot of new knowledge (for example a large amount of code or math), full fine-tuning learns more. That is the finding of “LoRA Learns Less and Forgets Less” [Certain]. For a VLM, the second case is learning a new visual domain or a new language from scratch; there, more trainable capacity (higher rank, more targets, or full training) helps. [Likely]</p>
+<p><b>DoRA</b> (weight-decomposed LoRA) splits each weight into a length and a direction and trains the length separately (<a href="../posttraining/lora-and-other-peft-methods.html">session 57</a>). Idefics2 used it for instruction tuning [Certain]. In PEFT it is one flag, <code>use_dora=True</code>; it is slower per step than LoRA, so merge it before serving.</p>
+
+<h2>QLoRA for VLMs</h2>
+<p>QLoRA (<a href="../posttraining/qlora-and-training-with-quantized-weights.html">session 58</a>) stores the frozen base weights in 4 bits and trains LoRA adapters in 16 bits on top. In each forward pass a block of 4-bit weights is turned back into BF16 (dequantized), multiplied, and thrown away. Gradients flow through the frozen 4-bit weights into the adapters. The QLoRA paper fine-tuned a 65B model on one 48 GB GPU this way [Certain]. Its storage cost per weight, with blocks of 64 weights, 8-bit block scales, and one FP32 scale for every 256 blocks (“double quantization”), is</p>
+<div class="eq">\[ b_{\text{NF4}} = 4 + \frac{8}{64} + \frac{32}{64 \cdot 256} = 4.127 \text{ bits} = 0.516 \text{ bytes per weight} \tag{189.6} \]</div>
+<p>So the memory of a VLM training run, before activations, is</p>
+<div class="eq">\[ M \approx \sum_{p\ \text{frozen part}} b_p\, N_p + 16\, N_{\text{train}} \ \text{ bytes}, \qquad b_p = 2 \ (\text{BF16}) \ \text{or}\ 0.516 \ (\text{NF4}) \tag{189.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N_p\)</dt><dd>the number of frozen base weights in part \(p\) (also the frozen base of a LoRA part)</dd>
+<dt>\(b_p\)</dt><dd>bytes per frozen weight: 2 in BF16, 0.516 in NF4 with double quantization</dd>
+<dt>\(N_{\text{train}}\)</dt><dd>all trainable weights: LoRA factors plus fully trained parts, 16 bytes each with mixed-precision AdamW</dd></dl>
+<h3>What to quantize in a VLM, and what not</h3>
+<ul>
+<li><b>The LLM’s linear layers: yes.</b> They hold 96.1% of LLaVA-1.5’s LLM weights and 85.7% of Qwen2-VL’s (Qwen2-VL has a large vocabulary: its input and output embeddings are 1.09B weights). This is where the savings are.</li>
+<li><b>Embeddings and <code>lm_head</code>: no.</b> They are not nn.Linear layers inside blocks, the output layer is sensitive, and in Hugging Face it is skipped by default. [Likely]</li>
+<li><b>The connector: no.</b> It is small and you usually train it fully, and a fully trained part cannot be stored in 4 bits. LLaVA’s QLoRA path passes <code>llm_int8_skip_modules=["mm_projector"]</code> to the quantization config for exactly this reason [Certain, from the code].</li>
+<li><b>The vision tower: usually no.</b> Quantizing it saves little: \(303.5\text{M} \times (2 - 0.516) = 0.45\) GB for LLaVA-1.5, 0.94 GB for Qwen2-VL. And errors in the image features reach every visual token the LLM reads. Most QLoRA VLM recipes keep it in BF16. [Likely]</li></ul>
+<div class="worked"><div class="wt">Worked example: LLaVA-1.5-7B, three ways</div>
+<p><b>Full SFT</b> (vision frozen, connector and LLM full): frozen \(2 \times 303.5\text{M} = 0.61\) GB, trainable \(16 \times 6{,}759.9\text{M} = 108.16\) GB. Total <b>108.77 GB</b>.</p>
+<p><b>LoRA</b> (rank 128 on all 7 linear layers of 32 blocks, connector full): LoRA adds \(128 \times 32 \times (4 \cdot 8{,}192 + 3 \cdot 15{,}104) = 319.8\)M weights; with the connector, \(N_{\text{train}} = 340.8\)M (4.82% of 7.06B). Memory: \(2 \times 7{,}042.4\text{M} = 14.08\) GB frozen + \(16 \times 340.8\text{M} = 5.45\) GB. Total <b>19.54 GB</b>.</p>
+<p><b>QLoRA</b> (the same, with the LLM’s 6,476.0M linear weights in NF4): those weights drop from 12.95 GB to 3.34 GB, saving 9.61 GB. Total <b>9.93 GB</b>. With a smaller rank (8) and the connector frozen as well, Qwen2-VL-7B needs <b>7.22 GB</b>.</p>
+<p>Activations come on top, and in a VLM they grow with the number of image tokens: 576 per image for LLaVA-1.5 at 336 px, and many more for high-resolution or video inputs. Gradient checkpointing (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>) is almost always on.</p></div>
+<p>Two practical warnings. First, <b>merging</b>: after QLoRA training, do not add \(\frac{\alpha}{r}BA\) into the 4-bit weights; the sum would be rounded back to the 4-bit grid and much of the update lost. Load the base model in BF16, merge there, and quantize again for serving if you need to. [Likely] Second, <b>speed</b>: dequantizing on every forward pass makes QLoRA steps slower than BF16 LoRA steps. Use it when memory, not time, is the limit. [Likely]</p>
+
+<h2>Keeping text-only skills while learning vision tasks</h2>
+<p>A VLM is used as a chat model too: users ask it plain questions, ask for code, or keep talking after the image is forgotten. If SFT trains only on image data, the LLM’s weights drift toward that data and its text skills drop. This is <b>catastrophic forgetting</b> (<a href="../posttraining/forgetting-data-mixing-and-model-merging.html">session 61</a>). It also happens inside vision: Zhai et al. treated several fine-tuned VLMs as image classifiers and found that “almost all evaluated MLLMs fail to retain the same performance levels as their vision encoders” [Certain]. Fine-tuning LLaVA further on one image dataset helped other image datasets at first, then the model began to hallucinate and generalize worse, even with the image encoder frozen [Certain].</p>
+<p>First, <b>measure</b> it. Before training, score the base model on a small text suite that matches your users (for example MMLU for knowledge, GSM8K for math, IFEval for instruction following, plus your own prompts). After training, the forgetting on that suite is</p>
+<div class="eq">\[ F = \text{score}_{\text{text}}(\theta_0) - \text{score}_{\text{text}}(\theta_{\text{SFT}}) \tag{189.8} \]</div>
+<p>where \(\theta_0\) are the weights before SFT. Track \(F\) during training, not only at the end; it often grows with the number of steps.</p>
+<p>Then use one or more of five remedies.</p>
+<ol>
+<li><b>Mix text-only data into SFT.</b> With a share \(\lambda\) of text samples, the loss becomes
+<div class="eq">\[ \mathcal{L} = (1 - \lambda)\, \mathcal{L}_{\text{SFT}}^{\text{image}} + \lambda\, \mathcal{L}_{\text{SFT}}^{\text{text}} \tag{189.9} \]</div>
+LLaVA-1.5 includes about 40K ShareGPT text conversations in its 665K mix (\(\lambda \approx 6.0\%\)), and the authors report that the model learned from them to answer in the user’s language, a behavior that “is transferred to visual conversations” [Certain]. Qwen2-VL’s SFT data “encompasses not only pure text-based dialogue data but also multimodal conversational data”, and Idefics2 adds text-only instruction datasets [Certain]. Good text samples are ones close to what the base model was tuned on.</li>
+<li><b>Change fewer weights.</b> Freeze the LLM or use LoRA on it. LoRA constrains the update to rank \(r\), and “LoRA Learns Less and Forgets Less” found it keeps more of the base model’s skills outside the target domain than full fine-tuning [Certain]. Figure 3 shows the same trade-off in a toy.</li>
+<li><b>Move gently.</b> A smaller learning rate, one epoch instead of three, and early stopping on the text suite.</li>
+<li><b>Interpolate back.</b> Mix the fine-tuned weights with the original ones, as in WiSE-FT:
+<div class="eq">\[ \theta(\beta) = (1 - \beta)\, \theta_0 + \beta\, \theta_{\text{SFT}}, \qquad \text{for LoRA: } W(\beta) = W_0 + \beta\, \frac{\alpha}{r} B A, \qquad 0 \le \beta \le 1 \tag{189.10} \]</div>
+Sweep \(\beta\) and pick the value with the best combined score. For LoRA this is free: scale the adapter at merge time.</li>
+<li><b>Keep the chat format.</b> Use the base model’s own chat template and system prompt. Many “forgetting” reports are really a format mismatch: the model was trained on short benchmark answers (“Answer with a single word”) and now answers chat questions in one word. LLaVA-1.5 attaches an explicit format prompt to each short-answer dataset for this reason [Certain], and Idefics2 adds a short “chatty” stage on long dialogues because its answers had become too short [Certain].</li></ol>
+<figure class="fig" id="vsp-fg"><div class="fig-body">
+<div class="controls"><span class="seg" id="vsp-fg-m"><button type="button" data-v="full" aria-pressed="true">Full fine-tuning</button><button type="button" data-v="r1" aria-pressed="false">LoRA r = 1</button><button type="button" data-v="r2" aria-pressed="false">LoRA r = 2</button><button type="button" data-v="r4" aria-pressed="false">LoRA r = 4</button></span></div>
+<div class="vsp-grid">
+<label for="vsp-fg-mix">Text share \(\lambda\) in the data</label><input type="range" id="vsp-fg-mix" min="0" max="0.5" step="0.05" value="0"><output id="vsp-fg-mixv"></output>
+<label for="vsp-fg-t">Read at step</label><input type="range" id="vsp-fg-t" min="0" max="300" step="5" value="300"><output id="vsp-fg-tv"></output></div>
+<div class="scroll-x"><svg id="vsp-fg-svg" class="vsp-svg" viewBox="0 0 740 240" role="img" aria-label="Left: image-task loss and text loss over training steps. Right: text loss against image-task loss for four methods"></svg></div>
+<div class="vsp-leg"><span style="--c:var(--q)">image-task loss</span><span style="--c:var(--k)">text loss (forgetting)</span><span style="--c:var(--v)">one method, at the chosen step</span></div>
+<div class="readout" id="vsp-fg-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> A toy of forgetting, trained live in your browser. The “LLM” is one 8 × 8 linear layer that starts at the pretrained weights and is perfect on text. Training changes it by \(E\). Text inputs and image-question inputs use partly the same directions, so the text loss is \(\sum_{ij} E_{ij}^2 a_j\) and the image-task loss is \(\sum_{ij} (E_{ij} - \Delta_{ij})^2 b_j\), where \(\Delta\) is the seeded change the image task needs (a strong rank-1 part, a weaker rank-1 part and a small full-rank part). 300 steps of gradient descent with learning rate 0.05 on formula (189.9); LoRA uses \(\alpha = 2\) and the same seeded \(A\).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>With full fine-tuning and no text data, the image-task loss falls to almost 0 (0.001 at step 300), and the text loss climbs to 2.390: the model learned the new task and paid with its old one. Move the text share to 10%: the text loss falls to 1.494 (37% less forgetting), while the image-task loss is still only 0.041. Now try LoRA r = 1: it can only learn the strongest direction of the change, so the image loss stays at 1.478 (29% of the start) but the text loss is only 0.537. Higher ranks move toward full fine-tuning: they learn more and forget more. Drag the step slider back to 30: full fine-tuning already reached 0.083 on the image task with half the forgetting (1.254), so early stopping is also a remedy. The early bump of the LoRA text loss comes from the random start of \(A\).</p></details></figure>
+<p>The toy is linear, so do not read its numbers as predictions for a real VLM. It shows the shape of the trade-off: every remedy moves you along a curve between “learned the new task” and “kept the old one”, and mixing text data moves the whole curve down. [Likely]</p>
+
+<h2>Putting it together: an SFT step with a freeze map</h2>
+<div class="algo"><div class="algo-h">Algorithm 2: one VLM SFT training step</div><ol>
+<li><b>input:</b> batch of (images, conversations); model with freeze map; optimizer from Algorithm 1; schedule \(s(t)\)</li>
+<li>build token ids with the model’s chat template; insert image placeholders</li>
+<li>labels \(\leftarrow\) ids; set labels to \(-100\) on image tokens, user turns, system prompt and padding <span class="c">// \(m_t\) of formula (189.1)</span></li>
+<li>visual tokens \(\leftarrow\) connector(vision tower(images)) <span class="c">// vision tower under no_grad if frozen</span></li>
+<li>logits \(\leftarrow\) LLM([visual tokens ; text embeddings])</li>
+<li>loss \(\leftarrow\) cross-entropy(logits shifted by one, labels) <span class="c">// formula (189.1)</span></li>
+<li>loss.backward(); clip the gradient norm (per part, if you follow Molmo)</li>
+<li>set each group’s rate to \(\eta_g \cdot s(t)\); optimizer step; zero gradients <span class="c">// formula (189.3)</span></li>
+<li>every few hundred steps: evaluate the image task <b>and</b> the text suite <span class="c">// forgetting \(F\), formula (189.8)</span></li></ol></div>
+<p>The PyTorch version below builds a tiny VLM (a 2-block vision tower, an MLP connector, a 2-block LLM), freezes the vision tower, trains the connector fully, puts LoRA on all linear layers of the LLM blocks, gives the two groups different learning rates, masks the loss to the answer, and checks that merging the adapters does not change the outputs. It runs on a CPU in a few seconds and prints the same numbers every time (PyTorch 2.x).</p>
+<pre class="code"><span class="kw2">import</span> math, re, torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="kw2">class</span> LoRALinear(nn.Module):
+    <span class="cm">"""h = W0 x + (alpha/r) B A x, with W0 frozen (formula 189.4)."""</span>
+    <span class="kw2">def</span> __init__(self, base: nn.Linear, r=4, alpha=8):
+        super().__init__()
+        self.base, self.s = base, alpha / r
+        base.weight.requires_grad_(False)
+        <span class="kw2">if</span> base.bias <span class="kw2">is not</span> None: base.bias.requires_grad_(False)
+        self.A = nn.Parameter(torch.randn(r, base.in_features) / math.sqrt(base.in_features))
+        self.B = nn.Parameter(torch.zeros(base.out_features, r))     <span class="cm"># B = 0: the model starts unchanged</span>
+    <span class="kw2">def</span> forward(self, x):
+        <span class="kw2">return</span> self.base(x) + self.s * (x @ self.A.T) @ self.B.T
+    <span class="kw2">def</span> merge(self):                                                 <span class="cm"># fold the adapter into W0 for serving</span>
+        self.base.weight.data += self.s * self.B @ self.A
+        <span class="kw2">return</span> self.base
+
+<span class="kw2">class</span> Block(nn.Module):                                              <span class="cm"># a tiny pre-norm transformer block</span>
+    <span class="kw2">def</span> __init__(self, d):
+        super().__init__()
+        self.n1, self.n2 = nn.LayerNorm(d), nn.LayerNorm(d)
+        self.q_proj, self.k_proj, self.v_proj, self.o_proj = (nn.Linear(d, d) <span class="kw2">for</span> _ <span class="kw2">in</span> range(4))
+        self.up_proj, self.down_proj = nn.Linear(d, 4 * d), nn.Linear(4 * d, d)
+    <span class="kw2">def</span> forward(self, x, causal):
+        h = self.n1(x); B_, T, d = h.shape
+        q, k, v = self.q_proj(h), self.k_proj(h), self.v_proj(h)
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=causal)
+        x = x + self.o_proj(a)
+        <span class="kw2">return</span> x + self.down_proj(F.gelu(self.up_proj(self.n2(x))))
+
+<span class="kw2">class</span> TinyVLM(nn.Module):
+    <span class="kw2">def</span> __init__(self, dv=32, dl=64, vocab=100, nv=2, nl=2):
+        super().__init__()
+        self.vision_tower = nn.ModuleList(Block(dv) <span class="kw2">for</span> _ <span class="kw2">in</span> range(nv))
+        self.patch = nn.Linear(48, dv)                                    <span class="cm"># 4x4x3 pixel patches</span>
+        self.connector = nn.Sequential(nn.Linear(dv, dl), nn.GELU(), nn.Linear(dl, dl))
+        self.embed = nn.Embedding(vocab, dl)
+        self.llm = nn.ModuleList(Block(dl) <span class="kw2">for</span> _ <span class="kw2">in</span> range(nl))
+        self.lm_head = nn.Linear(dl, vocab, bias=False)
+    <span class="kw2">def</span> forward(self, patches, ids):
+        v = self.patch(patches)
+        <span class="kw2">for</span> blk <span class="kw2">in</span> self.vision_tower: v = blk(v, causal=False)
+        x = torch.cat([self.connector(v), self.embed(ids)], dim=1)       <span class="cm"># [image tokens | text tokens]</span>
+        <span class="kw2">for</span> blk <span class="kw2">in</span> self.llm: x = blk(x, causal=True)
+        <span class="kw2">return</span> self.lm_head(x)
+
+model = TinyVLM()
+n_all = sum(p.numel() <span class="kw2">for</span> p <span class="kw2">in</span> model.parameters())
+
+<span class="cm"># 1) freeze everything, then choose per part (the "freeze map")</span>
+model.requires_grad_(False)
+<span class="kw2">for</span> p <span class="kw2">in</span> model.connector.parameters(): p.requires_grad_(True)       <span class="cm"># connector: full training</span>
+targets = re.compile(r"llm\.\d+\.(q_proj|k_proj|v_proj|o_proj|up_proj|down_proj)")
+<span class="kw2">for</span> name, mod <span class="kw2">in</span> list(model.named_modules()):                       <span class="cm"># LLM: LoRA on all linear layers</span>
+    <span class="kw2">if</span> targets.fullmatch(name):
+        parent, child = name.rsplit(".", 1)
+        setattr(model.get_submodule(parent), child, LoRALinear(mod, r=4, alpha=8))
+n_train = sum(p.numel() <span class="kw2">for</span> p <span class="kw2">in</span> model.parameters() <span class="kw2">if</span> p.requires_grad)
+print(f"trainable {n_train} of {n_all} ({100 * n_train / n_all:.2f}%)")
+
+<span class="cm"># 2) one learning rate per part (formula 189.3): LoRA factors high, the full connector lower</span>
+lora = [p <span class="kw2">for</span> n, p <span class="kw2">in</span> model.named_parameters() <span class="kw2">if</span> p.requires_grad <span class="kw2">and</span> n.endswith((".A", ".B"))]
+conn = list(model.connector.parameters())
+opt = torch.optim.AdamW([{"params": lora, "lr": 2e-3}, {"params": conn, "lr": 2e-4}], weight_decay=0.0)
+
+<span class="cm"># 3) SFT batch: 16 image tokens, a prompt, then the answer; loss only on the answer (formula 189.1)</span>
+patches = torch.randn(8, 16, 48)
+ids = torch.randint(0, 100, (8, 12))
+labels = torch.full((8, 16 + 12), -100)                            <span class="cm"># -100 = ignored by cross_entropy</span>
+labels[:, 16 + 6:] = ids[:, 6:]                                     <span class="cm"># the last 6 text tokens are the answer</span>
+model.eval()                                                       <span class="cm"># no dropout here; keeps the check exact</span>
+<span class="kw2">for</span> step <span class="kw2">in</span> range(30):
+    logits = model(patches, ids)
+    loss = F.cross_entropy(logits[:, :-1].reshape(-1, 100), labels[:, 1:].reshape(-1))  <span class="cm"># shift by one</span>
+    opt.zero_grad(set_to_none=True); loss.backward(); opt.step()
+    <span class="kw2">if</span> step <span class="kw2">in</span> (0, 29): print(f"step {step:2d}  answer loss {loss.item():.3f}")
+
+<span class="cm"># 4) no gradient ever reached the frozen vision tower</span>
+print("vision grads:", all(p.grad <span class="kw2">is</span> None <span class="kw2">for</span> p <span class="kw2">in</span> model.vision_tower.parameters()))
+
+<span class="cm"># 5) merge the adapters and check the outputs do not change</span>
+<span class="kw2">with</span> torch.no_grad():
+    before = model(patches, ids)
+    <span class="kw2">for</span> name, mod <span class="kw2">in</span> list(model.named_modules()):
+        <span class="kw2">if</span> isinstance(mod, LoRALinear):
+            parent, child = name.rsplit(".", 1)
+            setattr(model.get_submodule(parent), child, mod.merge())
+    after = model(patches, ids)
+print("max change after merge:", f"{(before - after).abs().max().item():.1e}")</pre>
+<p>Output: <code>trainable 15488 of 146016 (10.61%)</code>, the answer loss goes from 4.885 at step 0 to 2.890 at step 29, <code>vision grads: True</code>, and the merge changes the outputs by about \(10^{-6}\) (float rounding). Check the count by hand: the connector has \(32 \cdot 64 + 64 + 64 \cdot 64 + 64 = 6{,}272\) weights; LoRA with \(r = 4\) adds \(4 \cdot (4 \cdot 128 + 2 \cdot 320) = 4{,}608\) per block, 9,216 for two blocks; the total is 15,488.</p>
+<p>With Hugging Face libraries the same freeze map is a configuration. The sketch below is <b>not run here</b> (it needs a CUDA GPU, <code>bitsandbytes</code>, <code>peft</code> and the model download); the module names are those of the Hugging Face LLaVA implementation and differ between models, so print <code>model.named_modules()</code> first.</p>
+<pre class="code"><span class="kw2">from</span> transformers <span class="kw2">import</span> LlavaForConditionalGeneration, BitsAndBytesConfig
+<span class="kw2">from</span> peft <span class="kw2">import</span> LoraConfig, get_peft_model, prepare_model_for_kbit_training
+<span class="kw2">import</span> torch
+
+bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4",
+                         bnb_4bit_use_double_quant=True, bnb_4bit_compute_dtype=torch.bfloat16,
+                         llm_int8_skip_modules=["vision_tower", "multi_modal_projector", "lm_head"])
+model = LlavaForConditionalGeneration.from_pretrained("llava-hf/llava-1.5-7b-hf", quantization_config=bnb)
+model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+
+cfg = LoraConfig(r=128, lora_alpha=256, lora_dropout=0.05,
+                 <span class="cm"># a regex: LoRA only inside the language model, on all 7 projections</span>
+                 target_modules=r".*language_model.*\.(q_proj|k_proj|v_proj|o_proj|gate_proj|up_proj|down_proj)",
+                 modules_to_save=["multi_modal_projector"])       <span class="cm"># connector: full training, saved with the adapter</span>
+model = get_peft_model(model, cfg)
+model.print_trainable_parameters()</pre>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>Typical freeze map</th><th>Why</th></tr></thead><tbody>
+<tr><td>General visual assistant (stage 3 of building a VLM)</td><td>Vision frozen or slow; connector and LLM full; text-only data in the mix</td><td>Large, varied data justifies full training; text data protects chat skills (LLaVA-1.5, Qwen2-VL)</td></tr>
+<tr><td>Domain specialist: documents, charts, receipts</td><td>LoRA on the LLM, connector full; vision LoRA if resolution changes</td><td>Mostly new answer formats and words; fine text needs higher resolution, which the encoder must adapt to</td></tr>
+<tr><td>Medical, satellite, thermal or industrial images</td><td>LoRA on the vision tower and the LLM, connector full</td><td>The pixels are unlike web photos, so the encoder itself must change, but gently</td></tr>
+<tr><td>Video classification, action recognition and key-moment detection with a video LLM</td><td>Vision frozen (features can be cached per frame), connector full, LoRA on the LLM</td><td>Many frames per sample make the vision backward pass very expensive; a frozen encoder lets you precompute features once</td></tr>
+<tr><td>Video-RAG and video retrieval answers</td><td>LoRA on the LLM only</td><td>The model must learn to read retrieved frames and cite timestamps; the visual features are already good</td></tr>
+<tr><td>Fine-tuning on one consumer GPU</td><td>QLoRA on the LLM, everything else frozen or full in BF16</td><td>A 7B VLM fits in about 7 to 10 GB before activations (Figure 1)</td></tr>
+<tr><td>Many customers or tasks on one server</td><td>One frozen base model, one LoRA adapter per task</td><td>Adapters are a few hundred MB and can be swapped or batched together (<a href="../posttraining/lora-and-other-peft-methods.html">session 57</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Training on the prompt and the image tokens.</b> Forgetting the loss mask (labels \(-100\)) makes the model learn to predict user questions and spends gradient on placeholders. Print one sample with its labels before every new run.</li>
+<li><b>LoRA landing in the wrong part.</b> A target list like <code>["q_proj", "v_proj"]</code> matches by name suffix, so it may also hit the vision tower’s attention layers if they use the same names. Use a regex or <code>exclude_modules</code>, and print the trainable count per part.</li>
+<li><b>The connector is silently frozen.</b> With PEFT, everything not adapted is frozen, including the connector you meant to train. Put it in <code>modules_to_save</code> and check <code>requires_grad</code>.</li>
+<li><b>One learning rate for everything.</b> \(2\times10^{-4}\) is fine for LoRA factors and harmful for full weights of the LLM or the vision tower. Use parameter groups.</li>
+<li><b>Quantizing the connector or the vision tower in QLoRA.</b> The savings are small (under 1 GB for 7B models) and the quality cost lands on every image token. Skip them in the quantization config.</li>
+<li><b>Measuring only the image benchmark.</b> Without a text suite you will not see forgetting until users report it. Evaluate both, from step 0.</li>
+<li><b>Changing the chat template.</b> Fine-tuning with a different template than the base model used turns a good chat model into a confused one. Use the processor’s own template.</li>
+<li><b>Merging a QLoRA adapter into 4-bit weights.</b> Merge into a BF16 copy of the base, then quantize again if needed.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Which parts of a VLM do you train in SFT, and why?<span class="lvl">basic</span></summary><div class="ans">It depends on data size and how new the images are. The common default is: vision tower frozen (it was trained on billions of images, and next-token loss on a few hundred thousand samples can only make it less general), connector fully trained (small and closest to the change), LLM fully trained or with LoRA. Qwen2-VL locks the ViT in SFT; LLaVA-1.5 freezes it and trains the connector and LLM. Unfreeze the vision tower (preferably with LoRA or a 5 to 10 times smaller learning rate) when the pixels are unusual or the resolution changes, as Idefics2 does.</div></details>
+<details class="qa"><summary>Why use different learning rates for different parts? Give real numbers.<span class="lvl">core</span></summary><div class="ans">Parts differ in how much they already know and how many weights they have. A well-trained vision tower should move slowly to keep general features; a new or small connector can move fast; LoRA factors start at zero and live in a small subspace, so they need larger steps. Examples: LLaVA-1.5 LoRA uses \(2\times10^{-4}\) for LoRA and \(2\times10^{-5}\) for the connector; LLaVA-OneVision uses \(2\times10^{-6}\) for the vision tower and \(1\times10^{-5}\) for the rest; Molmo pretraining uses \(6\times10^{-6}\) (ViT), \(2\times10^{-4}\) (connector), \(2\times10^{-5}\) (LLM). In PyTorch these are AdamW parameter groups.</div></details>
+<details class="qa"><summary>How much memory does SFT of LLaVA-1.5-7B need with full fine-tuning, LoRA and QLoRA?<span class="lvl">core</span></summary><div class="ans">Use frozen weights × bytes + 16 bytes per trainable weight. Full (vision frozen): \(2 \times 0.30\text{B} + 16 \times 6.76\text{B} = 108.8\) GB, so it must be sharded. LoRA rank 128 on all LLM linear layers with a full connector: 340.8M trainable, 19.5 GB. QLoRA (LLM linears in NF4 at 0.516 bytes): 9.9 GB. All before activations, which grow with the image tokens (576 per image for LLaVA-1.5) and are reduced with gradient checkpointing.</div></details>
+<details class="qa"><summary>Where would you put LoRA in a VLM?<span class="lvl">core</span></summary><div class="ans">On all linear layers of the LLM blocks (attention and MLP, not lm_head); the QLoRA paper found that adapting all linear layers is needed to match full fine-tuning. The connector is small, so train it fully instead (modules_to_save). Add LoRA to the vision tower only when the image domain or resolution is new, accepting that the backward pass then runs through the encoder, which costs activation memory and compute for every image token.</div></details>
+<details class="qa"><summary>If the LLM is frozen and only the connector is trained, is the LLM's backward pass free?<span class="lvl">advanced</span></summary><div class="ans">No. The gradient must flow from the loss through all LLM layers down to the connector, so the LLM still computes input gradients (about \(2N\) FLOPs per token extra) and must keep its activations. You save only the weight gradients (another \(2N\)) and all optimizer state. Per token the LLM costs about \(4N\) instead of \(6N\). Parts below the lowest trainable part, such as a frozen vision tower under a trainable connector, need only the forward pass and can run under no_grad.</div></details>
+<details class="qa"><summary>What do you quantize and what do you keep in 16 bits when you QLoRA a VLM?<span class="lvl">core</span></summary><div class="ans">Quantize the LLM’s linear layers to NF4: they hold most of the weights (96% of LLaVA-1.5’s LLM). Keep in BF16: the connector (small and usually fully trained, LLaVA passes it in llm_int8_skip_modules), the vision tower (small savings, about 0.45 GB for CLIP ViT-L, and errors would reach every visual token), the embeddings and lm_head, and the LoRA adapters. Compute runs in BF16 after dequantizing each block.</div></details>
+<details class="qa"><summary>Your fine-tuned VLM is great on your image task but worse at plain chat. What happened, and what do you do?<span class="lvl">core</span></summary><div class="ans">Catastrophic forgetting, or a format shift. First check the format: short-answer training data (“answer in one word”) teaches short answers everywhere; add format prompts and long dialogue data, as LLaVA-1.5 and Idefics2 did. Then measure a text suite against the base model and reduce forgetting: mix text-only SFT data in (LLaVA-1.5 used about 6%), use LoRA or freeze the LLM, lower the learning rate and train fewer steps, or interpolate the weights back toward the base (WiSE-FT, or scale the LoRA adapter by \(\beta \lt 1\)) and pick the best combined score.</div></details>
+<details class="qa"><summary>Does LoRA lose quality compared with full fine-tuning for VLM instruction tuning?<span class="lvl">core</span></summary><div class="ans">Often not. LLaVA-1.5-7B with LoRA (rank 128, lr \(2\times10^{-4}\)) scored higher than full fine-tuning on 8 of 11 benchmarks in the released model zoo, mean +0.6 points; for 13B the mean was +0.2 points. Instruction data mostly teaches format and style, which fits in a low-rank update. When the data must teach a lot of new knowledge, full fine-tuning learns more (“LoRA Learns Less and Forgets Less”), so raise the rank or train fully in that case.</div></details>
+<details class="qa"><summary>Why does QLoRA not lose the 4-bit rounding of the update, and why must you be careful when merging?<span class="lvl">advanced</span></summary><div class="ans">During training, the update lives in separate BF16 adapter matrices \(A, B\); only the frozen base is 4-bit, and it is dequantized for each matmul. The update is never rounded. At merge time, adding \(\frac{\alpha}{r}BA\) into the 4-bit weights would round the sum to the NF4 grid, and the small update could mostly vanish. Merge into a BF16 copy of the base instead, then quantize the merged model again (for example with GPTQ or AWQ) if you serve in 4 bits.</div></details>
+<details class="qa"><summary>You fine-tune a video LLM for action recognition with 32 frames per clip. How do you set the freeze map?<span class="lvl">advanced</span></summary><div class="ans">Freeze the vision tower: with 32 frames, a trainable encoder would need a backward pass and stored activations for every frame’s patches, which dominates cost. A frozen encoder also lets you precompute and cache the frame features once and reuse them every epoch. Train the connector fully (it decides how frames are pooled into tokens) and put LoRA on the LLM so it learns the label vocabulary and answer format. Unfreeze the encoder with LoRA only if the frames are far from its training data, such as thermal or surgical video.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>LLaVA-1.5-13B has an LLM with 40 blocks, hidden size 5,120 and MLP size 13,824. How many weights does LoRA rank 128 on all 7 linear layers add?</li>
+<li>Using formula (189.2), compare the LLM compute per token for (a) connector-only training, (b) LoRA on the LLM, (c) full LLM training.</li>
+<li>A 7B VLM’s LLM has 6.5B linear weights. How much memory does NF4 with double quantization save over BF16 for these weights?</li>
+<li>In Figure 3, set full fine-tuning and find the text share \(\lambda\) where the text loss at step 300 first drops below 1.0. What is the image-task loss there?</li>
+<li>Your SFT mix has 500K image samples. How many text-only samples do you add for a text share of 6%?</li>
+<li>Write the PyTorch parameter groups for: vision tower LoRA at \(5\times10^{-5}\), connector full at \(1\times10^{-5}\), LLM LoRA at \(2\times10^{-4}\), no weight decay on biases and norms.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Per block: \(128 \times (4 \times (5{,}120 + 5{,}120) + 3 \times (5{,}120 + 13{,}824)) = 128 \times 97{,}792 = 12{,}517{,}376\); times 40 blocks: 500,695,040, about 500.7M. 2. (a) The backward pass goes through the LLM for input gradients only: about \(4N\). (b) The same \(4N\), plus a small LoRA cost. (c) \(6N\). Freezing saves weight gradients and optimizer states, not the backward pass. 3. \(6.5\text{B} \times (2 - 0.516) = 9.65\) GB (from 13.0 GB to 3.35 GB). 4. At \(\lambda = 20\%\) the text loss is 1.108 (still above 1). At \(\lambda = 25\%\) it is 0.978, with an image-task loss of 0.145 (2.8% of the start). Compare \(\lambda = 0\): 2.390 and 0.001. 5. \(0.06 = T / (500{,}000 + T)\), so \(T = 30{,}000 / 0.94 \approx 31{,}915\), about 32K. 6. Collect parameters by name (for example names containing <code>vision_tower</code> and <code>lora_</code>), and for each part split into <code>p.ndim >= 2</code> (decay) and <code>p.ndim &lt; 2</code> (no decay), giving up to six groups, each with its own <code>lr</code> and <code>weight_decay</code>; then pass the list to <code>torch.optim.AdamW</code>.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>VLM SFT is next-token loss on the answer tokens only (189.1). The new decision is the freeze map: frozen, LoRA or full for the vision tower, the connector and the LLM.</li>
+<li>The backward pass must reach the lowest trainable part (189.2). Frozen parts above it still pay for input gradients and activations; frozen parts below it pay only the forward pass.</li>
+<li>Use parameter groups (189.3): slow for the vision tower, faster for the connector, about 10 times faster for LoRA factors than for full weights (LLaVA-1.5: \(2\times10^{-4}\) vs \(2\times10^{-5}\)).</li>
+<li>Put LoRA (189.4, 189.5) on all linear layers of the LLM, train the connector fully, and adapt the vision tower only when the images are new. LLaVA-1.5 LoRA matched full fine-tuning on its benchmarks.</li>
+<li>QLoRA stores the LLM’s linear layers at 4.127 bits (189.6); with (189.7), LLaVA-1.5-7B goes from 108.8 GB (full) to 19.5 GB (LoRA) to 9.9 GB (QLoRA). Keep the vision tower, connector, embeddings and lm_head in BF16.</li>
+<li>Measure forgetting on a text suite (189.8). Fix it with text data in the mix (189.9), fewer changed weights, gentler training, weight interpolation (189.10), and the base model’s chat format.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \mathcal{L}_{\text{SFT}} = -\frac{\sum_t m_t \log p_\theta(x_t \mid I, x_{\lt t})}{\sum_t m_t}, \qquad \mathbf{h} = W_0\mathbf{x} + \frac{\alpha}{r} B A \mathbf{x}, \qquad N_{\text{LoRA}} = r\sum_\ell \big(d_{\text{in}}^{(\ell)} + d_{\text{out}}^{(\ell)}\big) \]</div>
+<div class="eq">\[ M \approx \sum_{p} b_p N_p + 16\, N_{\text{train}}, \quad b_{\text{NF4}} = 4 + \tfrac{8}{64} + \tfrac{32}{64\cdot 256} = 4.127 \text{ bits}, \quad \mathcal{L} = (1-\lambda)\mathcal{L}^{\text{image}} + \lambda \mathcal{L}^{\text{text}}, \quad \theta(\beta) = (1-\beta)\theta_0 + \beta\theta_{\text{SFT}} \]</div>
+<h2 class="plain" id="vlm-sft-and-peft-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 5: Post-Training Vision Language Models</li><li>Dettmers et al. (2023). <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">QLoRA: Efficient Finetuning of Quantized LLMs</a></li><li>Hugging Face (code). <a href="https://github.com/huggingface/peft" target="_blank" rel="noopener">PEFT library</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 5: Post-Training Vision Language Models</li><li>Dettmers et al. (2023). <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">QLoRA: Efficient Finetuning of Quantized LLMs</a></li><li>Hugging Face (code). <a href="https://github.com/huggingface/peft" target="_blank" rel="noopener">PEFT library</a></li><li>Hu et al. (2021). <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">LoRA: Low-Rank Adaptation of Large Language Models</a></li><li>Liu et al. (2024). <a href="https://arxiv.org/abs/2402.09353" target="_blank" rel="noopener">DoRA: Weight-Decomposed Low-Rank Adaptation</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.03744" target="_blank" rel="noopener">Improved Baselines with Visual Instruction Tuning</a></li><li>Laurençon et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;What matters when building vision-language models?&amp;quot;" target="_blank" rel="noopener">What matters when building vision-language models?</a></li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Deitke et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Molmo and PixMo: Open Weights and Open Data for State-of-the-Art Multimodal Models&amp;quot;" target="_blank" rel="noopener">Molmo and PixMo: Open Weights and Open Data for State-of-the-Art Multimodal Models</a></li><li>Li et al. (2024). <a href="https://arxiv.org/abs/2408.03326" target="_blank" rel="noopener">LLaVA-OneVision: Easy Visual Task Transfer</a></li><li>Biderman et al. (2024). <a href="https://arxiv.org/abs/2405.09673" target="_blank" rel="noopener">LoRA Learns Less and Forgets Less</a></li><li>Zhai, Tong, Li, Cai, Qu, Lee &amp; Ma (2023). <a href="https://arxiv.org/abs/2309.10313" target="_blank" rel="noopener">Investigating the Catastrophic Forgetting in Multimodal Large Language Models</a></li><li>Wortsman et al. (2022). <a href="https://arxiv.org/abs/2109.01903" target="_blank" rel="noopener">Robust fine-tuning of zero-shot models</a></li><li>Liu et al. (2023). <a href="https://github.com/haotian-liu/LLaVA/blob/main/docs/MODEL_ZOO.md" target="_blank" rel="noopener">LLaVA code base: v1.5 fine-tuning scripts (finetune.sh, finetune_lora.sh) and Model Zoo</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/batching-and-masking-for-multimodal-sequences.html"><small>Previous · session 188</small>Batching and masking for multimodal sequences</a><a class="next" href="../vision/vlm-preference-optimization-and-rl.html"><small>Next · session 190</small>VLM preference optimization and RL</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const R=document.querySelector('[data-session="vlm-sft-and-peft"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const segVal=el=>{const b=el.querySelector('button[aria-pressed="true"]');return b?b.dataset.v:null;};
+const segSet=(el,v)=>el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.v===v?"true":"false"));
+const segOn=(el,f)=>el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b||!el.contains(b))return;segSet(el,b.dataset.v);f();});
+const fmtM=n=>n>=1e9?(n/1e9).toFixed(2)+"B":(n/1e6).toFixed(1)+"M";
+const sgn=v=>(v>0?"+":v<0?"−":"")+Math.abs(v).toFixed(1);
+
+/* ---------- Figure 1: freeze map and memory calculator ---------- */
+(function(){
+ const svg=$("#vsp-mem-svg");if(!svg)return;
+ const mdl=$("#vsp-mem-model"),sv=$("#vsp-mem-vit"),sc=$("#vsp-mem-con"),sl=$("#vsp-mem-llm"),st=$("#vsp-mem-tg"),rk=$("#vsp-mem-r"),q4=$("#vsp-mem-q4"),info=$("#vsp-mem-info"),rec=$("#vsp-mem-rec");
+ const NF4=(4+8/64+32/(64*256))/8;            /* bytes per weight, formula (189.7) */
+ const RANKS=[4,8,16,32,64,128,256];
+ /* parameter counts computed from the Hugging Face config.json files; they match the safetensors sizes exactly */
+ const M={
+  llava:{name:"LLaVA-1.5-7B",vit:303507456,con:20979712,llm:6738939904,lin:32*(4*4096*4096+3*4096*11008),vt:"CLIP ViT-L/14-336",ct:"2-layer MLP",lt:"Vicuna-7B",
+   lora_llm:(r,all)=>32*r*(all?(4*(4096+4096)+3*(4096+11008)):2*(4096+4096)),
+   lora_vit:r=>24*r*(4*(1024+1024)+(1024+4096)+(4096+1024)),
+   lora_con:r=>r*((1024+4096)+(4096+4096))},
+  qwen:{name:"Qwen2-VL-7B",vit:631183360,con:44575744,llm:7615616512,lin:28*(3584*3584*2+2*3584*512+3*3584*18944),vt:"ViT 675M-class (32 blocks)",ct:"patch merger MLP",lt:"Qwen2-7B",
+   lora_llm:(r,all)=>28*r*(all?((3584+3584)*2+2*(3584+512)+3*(3584+18944)):(3584+3584)+(3584+512)),
+   lora_vit:r=>32*r*((1280+3840)+(1280+1280)+(1280+5120)+(5120+1280)),
+   lora_con:r=>r*((5120+5120)+(5120+3584))}};
+ function calc(){
+  const P=M[segVal(mdl)],r=RANKS[+rk.value],all=segVal(st)==="all",quant=q4.checked;
+  const modes={vit:segVal(sv),con:segVal(sc),llm:segVal(sl)};
+  let tr=0,fz=0,lora=0;const per={};
+  ["vit","con","llm"].forEach(p=>{const n=P[p],m=modes[p];let t=0,f=0;
+   if(m==="T"){t=n;}else{f=(p==="llm"&&quant)?2*(n-P.lin)+NF4*P.lin:2*n;if(m==="L"){t=p==="llm"?P.lora_llm(r,all):P["lora_"+p](r);lora+=t;}}
+   per[p]={t,f};tr+=t;fz+=f;});
+  const base=P.vit+P.con+P.llm;
+  /* backward must reach the lowest (earliest) trainable part */
+  const order=["vit","con","llm"];const low=order.findIndex(p=>modes[p]!=="F");
+  return {P,r,all,quant,modes,tr,fz,lora,base,per,low,gb:(fz+16*tr)/1e9,fzgb:fz/1e9,trgb:16*tr/1e9};}
+ function draw(){
+  const c=calc();$("#vsp-mem-rv").value=c.r;
+  q4.disabled=c.modes.llm==="T";
+  const col={F:"var(--paper2)",L:"var(--v-soft)",T:"var(--k-soft)"},stc={F:"var(--rule)",L:"var(--v)",T:"var(--k)"},lab={F:"frozen",L:"LoRA r = "+c.r,T:"full training"};
+  const bx=[[20,"vit","Vision tower",c.P.vt],[270,"con","Connector",c.P.ct],[520,"llm","LLM",c.P.lt]];
+  let g=`<defs><marker id="vsp-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker><marker id="vsp-ahk" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--k)"/></marker></defs>`;
+  bx.forEach(([x,p,t,sub])=>{const m=c.modes[p];const q=(p==="llm"&&c.quant&&m!=="T");
+   g+=`<rect x="${x}" y="20" width="220" height="86" rx="12" fill="${col[m]}" stroke="${stc[m]}" stroke-width="${m==="F"?1.4:2.4}"${q?' stroke-dasharray="7 4"':""}/>`+
+   `<text x="${x+110}" y="44" text-anchor="middle" font-size="15" font-weight="700" fill="var(--ink)">${t}</text>`+
+   `<text x="${x+110}" y="63" text-anchor="middle" font-size="12" class="svgs">${sub}</text>`+
+   `<text x="${x+110}" y="84" text-anchor="middle" font-size="13" fill="var(--ink2)">${fmtM(c.P[p])} · ${lab[m]}${q?" · NF4":""}</text>`+
+   `<text x="${x+110}" y="100" text-anchor="middle" font-size="12" fill="var(--ink2)">${c.per[p].t?"trainable "+fmtM(c.per[p].t):"no gradients"}</text>`;});
+  g+=`<path d="M240 52 H268" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vsp-ah)"/><path d="M490 52 H518" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vsp-ah)"/>`;
+  if(c.low>=0){const xs=[130,380,630][c.low];g+=`<path d="M690 126 H${xs}" stroke="var(--k)" stroke-width="2" stroke-dasharray="6 5" marker-end="url(#vsp-ahk)"/><text x="${(690+xs)/2}" y="142" text-anchor="middle" font-size="12" fill="var(--k)">backward pass stops at the ${["vision tower","connector","LLM"][c.low]}</text>`;}
+  else g+=`<text x="380" y="138" text-anchor="middle" font-size="12" class="svgs">nothing is trainable: no backward pass</text>`;
+  /* memory bar */
+  const X0=20,W=720,MAX=140,sx=v=>X0+W*Math.min(v,MAX)/MAX,y0=168;
+  g+=`<rect x="${X0}" y="${y0}" width="${W}" height="30" rx="4" fill="none" stroke="var(--rule)"/>`;
+  g+=`<rect x="${X0}" y="${y0}" width="${(sx(c.fzgb)-X0).toFixed(1)}" height="30" fill="var(--q)" opacity=".75"/>`;
+  g+=`<rect x="${sx(c.fzgb).toFixed(1)}" y="${y0}" width="${Math.max(0,sx(c.gb)-sx(c.fzgb)).toFixed(1)}" height="30" fill="var(--k)" opacity=".85"/>`;
+  [24,48,80].forEach(v=>{g+=`<line x1="${sx(v)}" y1="${y0-6}" x2="${sx(v)}" y2="${y0+36}" stroke="var(--ink2)" stroke-dasharray="3 3"/><text x="${sx(v)}" y="${y0+50}" text-anchor="middle" font-size="12" class="svgs">${v} GB</text>`;});
+  [0,100,140].forEach(v=>g+=`<text x="${sx(v)}" y="${y0+50}" text-anchor="middle" font-size="12" class="svgs">${v===0?"0 GB":v+" GB"}</text>`);
+  if(c.gb>MAX)g+=`<text x="${X0+W-4}" y="${y0+20}" text-anchor="end" font-size="12" fill="var(--on-accent)">→ ${c.gb.toFixed(0)} GB</text>`;
+  svg.innerHTML=g;
+  const fit=c.gb<=24?"fits a 24 GB GPU":c.gb<=48?"fits a 48 GB GPU":c.gb<=80?"fits one 80 GB GPU":"needs more than one 80 GB GPU (shard with ZeRO-3 or FSDP)";
+  const llmCost=c.modes.llm==="T"?6:(c.low>=0&&c.low<=2)?4:2;
+  info.innerHTML=`<b>${c.P.name}</b>: trainable <b>${c.tr.toLocaleString("en-US")}</b> weights (<b>${(100*c.tr/c.base).toFixed(2)}%</b> of the ${(c.base/1e9).toFixed(2)}B base weights${c.lora?`; LoRA adds ${fmtM(c.lora)} new ones`:""}). Memory before activations: frozen ${c.fzgb.toFixed(2)} GB + trainable ${c.trgb.toFixed(2)} GB = <b>${c.gb.toFixed(2)} GB</b>, ${fit}. LLM compute per token: about <b>${llmCost}N</b> FLOPs${llmCost===4?" (forward plus input gradients, no weight gradients for the frozen base)":llmCost===6?" (full training)":" (forward only)"}.${c.modes.llm==="T"&&q4.checked?" The 4-bit option is off: a fully trained LLM cannot keep 4-bit weights.":""}`;}
+ const RECS={
+  full:{model:"llava",vit:"F",con:"T",llm:"T",r:5,tg:"all",q:false},
+  lora:{model:"llava",vit:"F",con:"T",llm:"L",r:5,tg:"all",q:false},
+  qlora:{model:"llava",vit:"F",con:"T",llm:"L",r:5,tg:"all",q:true},
+  idef:{model:"llava",vit:"L",con:"T",llm:"L",r:1,tg:"all",q:false},
+  qwen:{model:"qwen",vit:"F",con:"F",llm:"L",r:1,tg:"all",q:true}};
+ function load(k){const s=RECS[k];segSet(mdl,s.model);segSet(sv,s.vit);segSet(sc,s.con);segSet(sl,s.llm);rk.value=s.r;segSet(st,s.tg);q4.checked=s.q;draw();}
+ rec.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;load(b.dataset.v);});
+ [mdl,sv,sc,sl,st].forEach(el=>segOn(el,draw));rk.addEventListener("input",draw);q4.addEventListener("change",draw);
+ load("lora");
+})();
+
+/* ---------- Figure 2: forgetting toy, trained live ---------- */
+(function(){
+ const svg=$("#vsp-fg-svg");if(!svg)return;
+ const meth=$("#vsp-fg-m"),mix=$("#vsp-fg-mix"),stp=$("#vsp-fg-t"),info=$("#vsp-fg-info");
+ function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+ function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+ const D=8,STEPS=300,LR=0.05;
+ const a=[1,1,1,1,0.5,0.25,0.1,0.05];      /* how much text inputs use each input direction */
+ const b=[0.05,0.1,0.25,0.5,1,1,1,1];      /* how much image-question inputs use each direction */
+ const unit=v=>{const n=Math.sqrt(v.reduce((s,x)=>s+x*x,0));return v.map(x=>x/n);};
+ const g=gauss(rng(189));
+ const u1=unit(Array.from({length:D},()=>g())),u2=unit(Array.from({length:D},()=>g()));
+ const v1=unit([0,0,0,0,0.3,0.6,1,0.8]),v2=unit([0,0.2,0.5,0.8,0.6,0,0,0]);
+ const N=Array.from({length:D},()=>Array.from({length:D},()=>g()/Math.sqrt(D)));
+ const DL=Array.from({length:D},(_,i)=>Array.from({length:D},(_,j)=>2*u1[i]*v1[j]+0.8*u2[i]*v2[j]+0.5*N[i][j]));
+ const A0=Array.from({length:8},()=>Array.from({length:D},()=>g()));
+ function losses(E){let LA=0,LB=0;for(let i=0;i<D;i++)for(let j=0;j<D;j++){LA+=E[i][j]*E[i][j]*a[j];const d=E[i][j]-DL[i][j];LB+=d*d*b[j];}return [LA,LB];}
+ const zero=()=>Array.from({length:D},()=>new Array(D).fill(0));
+ function grad(E,m){const G=zero();for(let i=0;i<D;i++)for(let j=0;j<D;j++)G[i][j]=2*(1-m)*(E[i][j]-DL[i][j])*b[j]+2*m*E[i][j]*a[j];return G;}
+ function run(method,m){
+  let E=zero();const H=[losses(E)];
+  if(method==="full"){for(let t=0;t<STEPS;t++){const G=grad(E,m);const E2=zero();for(let i=0;i<D;i++)for(let j=0;j<D;j++)E2[i][j]=E[i][j]-LR*G[i][j];E=E2;H.push(losses(E));}return H;}
+  const r=+method.slice(1),s=2/r;
+  let A=Array.from({length:r},(_,k)=>A0[k].map(x=>x/Math.sqrt(D))),B=Array.from({length:D},()=>new Array(r).fill(0));
+  const prod=()=>{const E2=zero();for(let i=0;i<D;i++)for(let j=0;j<D;j++){let v=0;for(let k=0;k<r;k++)v+=B[i][k]*A[k][j];E2[i][j]=s*v;}return E2;};
+  for(let t=0;t<STEPS;t++){E=prod();const G=grad(E,m);
+   const dB=Array.from({length:D},(_,i)=>Array.from({length:r},(_,k)=>{let v=0;for(let j=0;j<D;j++)v+=G[i][j]*A[k][j];return s*v;}));
+   const dA=Array.from({length:r},(_,k)=>Array.from({length:D},(_,j)=>{let v=0;for(let i=0;i<D;i++)v+=B[i][k]*G[i][j];return s*v;}));
+   B=B.map((row,i)=>row.map((x,k)=>x-LR*dB[i][k]));A=A.map((row,k)=>row.map((x,j)=>x-LR*dA[k][j]));
+   E=prod();H.push(losses(E));}
+  return H;}
+ const METHODS=[["full","full fine-tuning"],["r1","LoRA r = 1"],["r2","LoRA r = 2"],["r4","LoRA r = 4"]];
+ let cache={},cacheMix=null;
+ function all(m){if(cacheMix!==m){cache={};METHODS.forEach(([k])=>cache[k]=run(k,m));cacheMix=m;}return cache;}
+ const L0=losses(zero());
+ function draw(){
+  const m=+mix.value,t=+stp.value,k=segVal(meth);$("#vsp-fg-mixv").value=Math.round(100*m)+"%";$("#vsp-fg-tv").value=t;
+  const C=all(m),H=C[k];
+  /* left: curves */
+  const X=s=>50+s/STEPS*300,Y=v=>200-v/5.2*175;
+  let s=`<path d="M50 20 V200 H352" fill="none" stroke="var(--muted)"/>`;
+  [0,100,200,300].forEach(v=>s+=`<text x="${X(v)}" y="216" text-anchor="middle" font-size="11.5" class="svgs">${v}</text>`);
+  [0,1,2,3,4,5].forEach(v=>s+=`<text x="44" y="${Y(v)+4}" text-anchor="end" font-size="11.5" class="svgs">${v}</text>`);
+  const line=(idx,c)=>`<polyline points="${H.map((h,i)=>X(i).toFixed(1)+","+Y(h[idx]).toFixed(1)).join(" ")}" fill="none" stroke="${c}" stroke-width="2.6"/>`;
+  s+=line(1,"var(--q)")+line(0,"var(--k)");
+  s+=`<line x1="${X(t)}" y1="20" x2="${X(t)}" y2="200" stroke="var(--ink2)" stroke-dasharray="4 4"/><circle cx="${X(t)}" cy="${Y(H[t][1])}" r="5" fill="var(--q)"/><circle cx="${X(t)}" cy="${Y(H[t][0])}" r="5" fill="var(--k)"/>`;
+  s+=`<text x="200" y="234" text-anchor="middle" font-size="12.5" class="svgs">training step</text><text x="200" y="14" text-anchor="middle" font-size="12.5" fill="var(--ink2)">losses of “${METHODS.find(x=>x[0]===k)[1]}”</text>`;
+  /* right: trade-off at step t for every method */
+  const X2=v=>420+v/5.2*300,Y2=v=>200-v/3*175;
+  s+=`<path d="M420 20 V200 H722" fill="none" stroke="var(--muted)"/>`;
+  [0,1,2,3,4,5].forEach(v=>s+=`<text x="${X2(v)}" y="216" text-anchor="middle" font-size="11.5" class="svgs">${v}</text>`);
+  [0,1,2,3].forEach(v=>s+=`<text x="414" y="${Y2(v)+4}" text-anchor="end" font-size="11.5" class="svgs">${v}</text>`);
+  s+=`<text x="571" y="234" text-anchor="middle" font-size="12.5" class="svgs">image-task loss (lower = learned more)</text><text x="571" y="14" text-anchor="middle" font-size="12.5" fill="var(--ink2)">text loss (lower = forgot less), at step ${t}</text>`;
+  s+=`<circle cx="${X2(L0[1])}" cy="${Y2(L0[0])}" r="5" fill="none" stroke="var(--ink)" stroke-width="1.6"/><text x="${X2(L0[1])-8}" y="${Y2(L0[0])-8}" text-anchor="end" font-size="11.5" fill="var(--ink2)">start</text>`;
+  const OFF={full:[8,-10,"start"],r1:[10,-8,"start"],r2:[10,-8,"start"],r4:[10,16,"start"]};
+  METHODS.forEach(([kk,nm])=>{const h=C[kk][t];const on=kk===k;const cx=X2(Math.min(5.2,h[1])),cy=Y2(Math.min(3,h[0]));const o=OFF[kk];
+   s+=`<circle cx="${cx.toFixed(1)}" cy="${cy.toFixed(1)}" r="${on?7:5}" fill="${on?"var(--v)":"var(--card)"}" stroke="var(--v)" stroke-width="2"/><text x="${(cx+o[0]).toFixed(1)}" y="${(cy+o[1]).toFixed(1)}" text-anchor="${o[2]}" font-size="11.5" fill="var(--ink2)">${nm.replace("full fine-tuning","full")}</text>`;});
+  svg.innerHTML=s;
+  const h=H[t];
+  info.innerHTML=`Step <b>${t}</b>, text share <b>${Math.round(100*m)}%</b>, ${METHODS.find(x=>x[0]===k)[1]}: image-task loss <b>${h[1].toFixed(3)}</b> (${(100*h[1]/L0[1]).toFixed(1)}% of the start value ${L0[1].toFixed(3)}), text loss <b>${h[0].toFixed(3)}</b> (it starts at 0, so every bit of it is forgetting).`;}
+ segOn(meth,draw);mix.addEventListener("input",draw);stp.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: LLaVA-1.5 full fine-tuning vs LoRA (model zoo numbers) ---------- */
+(function(){
+ const svg=$("#vsp-zoo-svg");if(!svg)return;const sz=$("#vsp-zoo-size"),info=$("#vsp-zoo-info");
+ const BEN=["VQAv2","GQA","VizWiz","ScienceQA","TextVQA","POPE","MMBench","MMBench-CN","SEED","LLaVA-Bench","MM-Vet"];
+ const D={"7b":{full:[78.5,62.0,50.0,66.8,58.2,85.9,64.3,58.3,58.6,65.4,31.1],lora:[79.1,63.0,47.8,68.4,58.2,86.4,66.1,58.9,60.1,67.9,30.2],mme:[1510.7,1476.9]},
+  "13b":{full:[80.0,63.3,53.6,71.6,61.3,85.9,67.7,63.6,61.6,72.5,36.1],lora:[80.0,63.3,58.9,71.2,60.2,86.7,68.5,61.5,61.3,69.5,38.3],mme:[1531.3,1541.7]}};
+ function draw(){const d=D[segVal(sz)];const dl=d.lora.map((v,i)=>Math.round((v-d.full[i])*10)/10);
+  const Xc=400,S=45,y=i=>18+i*24;
+  let g=`<line x1="${Xc}" y1="10" x2="${Xc}" y2="${y(BEN.length)}" stroke="var(--muted)"/>`;
+  [-5,-4,-3,-2,-1,1,2,3,4,5].forEach(v=>g+=`<line x1="${Xc+v*S}" y1="10" x2="${Xc+v*S}" y2="${y(BEN.length)}" stroke="var(--rule)" stroke-dasharray="2 4"/>`);
+  [-5,-3,-1,0,1,3,5].forEach(v=>g+=`<text x="${Xc+v*S}" y="${y(BEN.length)+14}" text-anchor="middle" font-size="11.5" class="svgs">${v>0?"+"+v:v<0?"−"+(-v):"0"}</text>`);
+  BEN.forEach((n,i)=>{const v=dl[i],w=Math.abs(v)*S,x=v>=0?Xc:Xc-w;
+   g+=`<text x="10" y="${y(i)+14}" font-size="12.5" fill="var(--ink)">${n}</text>`;
+   g+=`<rect x="${x.toFixed(1)}" y="${y(i)+3}" width="${Math.max(1.5,w).toFixed(1)}" height="16" rx="3" fill="${v>=0?"var(--v)":"var(--k)"}"/>`;
+   g+=`<text x="${(v>=0?Xc+w+6:Xc-w-6).toFixed(1)}" y="${y(i)+15}" text-anchor="${v>=0?"start":"end"}" font-size="12" fill="var(--ink2)">${sgn(v)} (${d.full[i].toFixed(1)} → ${d.lora[i].toFixed(1)})</text>`;});
+  g+=`<text x="${Xc}" y="${y(BEN.length)+32}" text-anchor="middle" font-size="12.5" class="svgs">LoRA score minus full fine-tuning score (points)</text>`;
+  svg.innerHTML=g;
+  const up=dl.filter(v=>v>0).length,dn=dl.filter(v=>v<0).length,eq=dl.length-up-dn,mean=dl.reduce((s,v)=>s+v,0)/dl.length;
+  info.innerHTML=`LLaVA-1.5-${segVal(sz).toUpperCase()}: LoRA is higher on <b>${up}</b>, lower on <b>${dn}</b> and equal on <b>${eq}</b> of ${dl.length} benchmarks; mean difference <b>${sgn(mean)}</b> points. MME (a different scale, not drawn): full ${d.mme[0]} vs LoRA ${d.mme[1]}.`;}
+ segOn(sz,draw);draw();
+})();
+})();
+</script></body></html>

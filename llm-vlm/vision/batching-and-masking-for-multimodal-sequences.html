@@ -1,0 +1,474 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Batching and masking for multimodal sequences · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 188</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="batching-and-masking-for-multimodal-sequences">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="batching-and-masking-for-multimodal-sequences" data-session="batching-and-masking-for-multimodal-sequences" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">188</span><span>Track 7: Vision and VLMs · session 26 of 38</span></div><h1 class="chap-title">Batching and masking for multimodal sequences</h1><p class="chap-sub">A VLM batch mixes text-only chats, single images, tiled documents and videos, so one sample may have 0 visual tokens and the next 3,000. This session shows how such samples become tensors that train fast and correctly: padding and length grouping, packing with document masks and restarted positions (in the language model and, as in NaViT, in the vision encoder), a loss only on the text answer with the right averaging, and balancing tokens and images across GPUs.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 1.5 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 18 (masks), 54 (SFT in detail) and 177 (anatomy of a VLM); session 44 (data parallelism) helps</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why the number of image tokens per sample varies so much (fixed 576, AnyRes tiles, native resolution, video), and how placeholders and masked_scatter put image features into the sequence</li><li>Padding efficiency, and how length grouping and LLaVA’s modality-grouped sampler remove most padding</li><li>Packing with a block-diagonal document mask, restarted position ids and cu_seqlens, and how much attention work it saves</li><li>NaViT: packing images of different sizes into one vision-encoder sequence with masked attention and masked pooling</li><li>Loss only on answer tokens (labels −100 elsewhere), the shift inside each sample, and token, sample and square averaging (InternVL 2.5)</li><li>The global-count rule for gradient accumulation and data parallelism</li><li>Balancing tokens and vision-encoder work across GPUs with a simple cost model</li></ul></div></header><style>
+.bm-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.bm-grid input[type=range]{width:100%;min-width:0}
+.bm-grid output{font-family:var(--mono);font-size:14px;min-width:4.5em;text-align:right}
+.bm-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.bm-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:2px;margin-right:6px;vertical-align:0;background:var(--c);border:1.5px solid var(--b,transparent)}
+.bm-seg{flex-wrap:wrap}
+.bm-svg text{font-family:var(--sans)}
+.bm-svg .bm-cell{cursor:pointer}
+.article pre.code,.article code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Take four training samples for a vision-language model: a text-only chat of 300 tokens, a LLaVA-1.5 image with a short question (696 tokens), a 1080p screenshot in Qwen2-VL (2,751 tokens) and a document cut into LLaVA-NeXT tiles (2,960 tokens). Put them in one batch the simple way, by padding every row to the longest one, and 43% of the tensor is padding. The GPU does that work and throws it away.</p>
+<p>In a text model, sample lengths already vary. In a VLM they vary much more, because the number of <b>visual tokens</b> (the vectors that stand for the image inside the language model) depends on the model design, the image size, the number of images and the number of video frames. One sample can have 0 visual tokens and the next 3,000. This session is about the engineering that turns such a mixed set of samples into tensors that train fast and train <b>correctly</b>:</p>
+<ul>
+<li>how a multimodal sample becomes one sequence, with a different number of image tokens per sample;</li>
+<li>how to <b>pack</b> several samples into one row, with attention masks so that samples do not see each other, and the same idea inside the vision encoder (NaViT);</li>
+<li>how to put the loss only on the text answer, never on image tokens or prompts, and how to average it so that short and long answers get the weight you want;</li>
+<li>how to get high throughput: sort by length, and balance tokens (and images) per GPU.</li></ul>
+<p>We built the masks themselves in <a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a> and the text-only version of packing and loss averaging in <a href="../posttraining/sft-in-detail.html">session 54</a>. Here we add what images change. The book covers batching and the real batch size in VLM training (Noyan et al., chapter 3).</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “Your VLM batches are 50% padding. What do you do?”, “You packed samples and the loss went down too fast. What is wrong?”, “Why are image tokens excluded from the loss?”, “Token mean or sample mean?”, “Why is one GPU always the slowest?”. Strong answers give a formula and a number: padding efficiency, attention pairs, the share of the gradient each sample gets.</aside>
+<p>These are not toy problems. NaViT packs images of different sizes into one sequence of the vision encoder [Certain]. Qwen2-VL’s vision encoder runs all images of a batch as one packed sequence with segment boundaries (the <code>cu_seqlens</code> in the Hugging Face code) [Certain, from the transformers code]. InternVL 2.5 packs samples under a limit on both the context length and the number of image tiles, and lets tokens attend only within their own sample [Certain, from the paper]. LLaVA-1.5 trains with <code>--group_by_modality_length True</code>, a sampler that groups samples by modality and length [Certain, from its training script].</p>
+
+<h2>One sample, one sequence: a different number of image tokens</h2>
+<p>A VLM in the unified-sequence style (<a href="../vision/anatomy-of-a-vision-language-model.html">session 177</a>, <a href="../vision/fusion-early-late-unified-sequence-and-cross.html">session 179</a>) reads one sequence of embeddings. The text goes through the token embedding table. Each image goes through the vision encoder and the connector, which return a matrix of \(v\) vectors. These vectors are placed into the sequence where the image belongs.</p>
+<p>The usual way to do this is with a <b>placeholder token</b>. The chat template writes a special token such as <code>&lt;image&gt;</code> where the image goes. Before the model runs, the processor repeats it: one placeholder per visual token, so the input ids already have the final length. Inside the model, the embedding layer produces a vector for every id, and then the rows at the placeholder positions are overwritten with the image features (in PyTorch, <code>masked_scatter</code>). Qwen2-VL does exactly this, and checks first that the number of placeholders equals the number of feature vectors [Certain, from the transformers code]. LLaVA’s original code uses a negative id, <code>IMAGE_TOKEN_INDEX = -200</code>, as the placeholder [Certain, from its <code>constants.py</code>].</p>
+<p>For sample \(i\) with images \(j = 1, \dots, J_i\), the length of the sequence is</p>
+<div class="eq">\[ n_i = V_i + T_i, \qquad V_i = \sum_{j=1}^{J_i} v_{ij} \tag{188.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n_i\)</dt><dd>the number of positions sample \(i\) takes in the language model</dd>
+<dt>\(T_i\)</dt><dd>the number of text tokens: system prompt, user turns, assistant answers and special tokens</dd>
+<dt>\(v_{ij}\)</dt><dd>the visual tokens of image (or frame) \(j\): 576 for every LLaVA-1.5 image; \((H'/28)(W'/28)\) for Qwen2-VL, which depends on the image size; up to \(5 \times 576 = 2{,}880\) for LLaVA-NeXT tiles</dd>
+<dt>\(J_i\)</dt><dd>the number of images in the sample: 0 for text-only data, several for multi-image or video samples</dd></dl>
+<p>So \(V_i\) is a random variable with a wide range, and in a typical sample it is far larger than \(T_i\). In the four samples above, 91.7% of the real tokens are visual. This is why VLM batching is harder than text batching: the length is decided mostly by the image, and the image size is decided by the data, not by you.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A train where every passenger needs a row of seats. Text passengers are single people; image passengers travel with a group of 576, or 2,880, or any number. If every carriage must be as long as the longest group in it, most seats ride empty.</aside>
+<p>Two practical rules follow from (188.1). First, you must know \(n_i\) <b>before</b> you batch, so the processor (resize, tile, count tokens) runs in the data loader, not in the model. Second, a limit on the sequence length must be checked on \(n_i\), not on the text length: cutting a sample in the middle of its image tokens breaks the placeholder count and crashes the scatter, and cutting the answer trains on a fragment.</p>
+<figure class="fig" id="bm-pipe"><div class="fig-body">
+<div class="scroll-x"><svg class="bm-svg" id="bm-pipe-svg" viewBox="0 0 640 250" role="img" aria-label="Two packed sequences: images of different sizes go through the vision encoder as one sequence with per-image attention; their output vectors are scattered into the placeholder positions of the language model sequence, which holds three samples with a document mask; labels are minus 100 everywhere except on the answers" style="min-width:560px"></svg></div>
+</div><figcaption><b>Figure 1.</b> The life of a packed multimodal batch. Top: the images of all samples run through the vision encoder as one sequence; patches attend only within their own image (brackets). Middle: the connector output is scattered into the placeholder positions of one language-model row that holds three samples; a document mask keeps the samples apart. Bottom: the labels; only answer tokens (green) carry a loss, everything else is −100.</figcaption></figure>
+
+<h2>Padding, and why sorting helps</h2>
+<p>The simple way to make a batch is to <b>pad</b>: give each sample its own row and fill the short rows with a pad token up to the longest row in the batch. The padding mask from <a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a> makes the pad positions invisible, and the loss ignores them. The result is correct, but the GPU still computes every pad position. The <b>padding efficiency</b> of a batch is the share of real tokens:</p>
+<div class="eq">\[ \eta = \frac{\sum_{i=1}^{B} n_i}{B \cdot \max_i n_i} \tag{188.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(B\)</dt><dd>the number of samples (rows) in the batch</dd>
+<dt>\(\max_i n_i\)</dt><dd>the longest sample, which sets the width of the tensor</dd>
+<dt>\(\eta\)</dt><dd>1 means no waste; \(1 - \eta\) is the share of compute spent on padding (for the linear layers; for attention the waste is larger, because the cost grows with the square of the width)</dd></dl>
+<div class="worked"><div class="wt">Worked example: four mixed samples</div>
+<p>Lengths 300 (text only), 696 (576 + 120), 2,751 (2,691 + 60) and 2,960 (2,880 + 80): 6,707 real tokens. Padded to 2,960, the tensor has \(4 \times 2{,}960 = 11{,}840\) positions, so \(\eta = 6{,}707 / 11{,}840 = 56.6\%\): 5,133 positions are padding.</p>
+<p>Attention is worse. Each padded row computes a \(2{,}960 \times 2{,}960\) score matrix, \(4 \times 2{,}960^2 = 35.0\) million pairs. The real samples need only \(\sum_i n_i^2 = 16.9\) million, 48.2% of that.</p>
+<p>Now pack them instead (next section) into rows of 4,096 with <b>first-fit decreasing</b> (sort long to short, put each sample into the first row with room): row 1 holds 2,960 + 696 + 300 = 3,956 tokens, row 2 holds 2,751. Efficiency \(6{,}707 / 8{,}192 = 81.9\%\), and with a document mask the attention work is exactly the 16.9 million pairs the samples need.</p></div>
+<p>The cheapest fix is to put samples of similar length in the same batch. <b>Length grouping</b> sorts samples by \(n_i\) (usually inside a large random chunk, so that the order of the data stays random) and cuts the sorted list into batches. LLaVA’s sampler does this: it shuffles, cuts the data into “megabatches” of (number of GPUs × batch size) samples, sorts each megabatch from long to short, and splits it over the GPUs [Certain, from <code>llava_trainer.py</code>]. With <code>group_by_modality_length</code> it also keeps image-text samples and text-only samples in separate megabatches, so text-only batches are not padded to image lengths [Certain, from the same file].</p>
+<p>Sorting has a cost. Batches of similar length are less random: all the long document samples arrive together, and the gradient of that step sees only one kind of data. Grouping inside megabatches keeps most of the randomness and most of the gain.</p>
+<figure class="fig" id="bm-pad"><div class="fig-body">
+<div class="controls"><span class="seg bm-seg" id="bm-pad-mode"><button type="button" data-v="rand" aria-pressed="true">Pad, random order</button><button type="button" data-v="sort" aria-pressed="false">Pad, sorted by length</button><button type="button" data-v="pack" aria-pressed="false">Pack with document mask</button></span></div>
+<div class="bm-grid" style="margin-top:8px">
+<label for="bm-pad-b">Batch size \(B\)</label><input type="range" id="bm-pad-b" min="2" max="12" step="1" value="4"><output id="bm-pad-bv"></output>
+<label for="bm-pad-l">Packed row length</label><input type="range" id="bm-pad-l" min="0" max="1" step="1" value="1"><output id="bm-pad-lv"></output></div>
+<div class="scroll-x"><svg class="bm-svg" id="bm-pad-svg" viewBox="0 0 640 330" role="img" aria-label="Rows of a batch: visual tokens, text tokens and padding for 24 multimodal samples" style="min-width:560px"></svg></div>
+<div class="bm-leg"><span style="--c:var(--q-soft);--b:var(--q)">visual tokens</span><span style="--c:var(--k-soft);--b:var(--k)">text tokens</span><span style="--c:var(--paper2);--b:var(--rule)">padding</span></div>
+<div class="readout" id="bm-pad-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The same 24 samples (a fixed mix of text-only chats, LLaVA-1.5 images, AnyRes tiles, Qwen2-VL native-resolution images and short videos; 28,333 real tokens) batched three ways. “Attention work” counts score pairs \(n^2\) per row segment and divides by the minimum \(\sum_i n_i^2\).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Each bar is one row of the tensor that goes to the GPU; gaps separate batches. With random order and \(B = 4\), 46.2% of the positions are padding and attention does 2.59× the necessary work. Sort by length: padding falls to 16.1% and attention to 1.38×. Raise \(B\) to 8: padding grows again in both modes, because a larger batch is more likely to contain one very long sample. Packing does not depend on \(B\): the only waste is the empty end of each row (13.5% here), and with a document mask attention does exactly the necessary work. The row-length slider switches between rows of 4,096 and 8,192 tokens.</p></details></figure>
+
+<h2>Packing, with masks so samples do not see each other</h2>
+<p><b>Packing</b> puts several whole samples one after the other into one row. A row of 8,192 positions might hold one video sample, two images and a text chat. There is almost no padding left. But now there is a new danger: in one row, the causal mask lets a token of sample 3 attend to all of sample 1 and sample 2. The model would learn to use context that does not exist at test time, and the loss of later samples would look better than it should.</p>
+<h3>The document mask</h3>
+<p>The fix is a <b>block-diagonal</b> (document) mask: a query may only see keys of its own sample. Give each position \(t\) a sample id \(s(t)\) and an image flag. The mask is</p>
+<div class="eq">\[ M_{tu} = \begin{cases} 0 & s(t) = s(u) \ \text{ and } \ \big(u \le t \ \text{ or } \ t, u \in \text{same image}\big) \\ -\infty & \text{otherwise} \end{cases} \tag{188.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t, u\)</dt><dd>the query position and the key position in the packed row</dd>
+<dt>\(s(t)\)</dt><dd>which sample position \(t\) belongs to</dd>
+<dt>\(u \le t\)</dt><dd>the usual causal rule inside a sample</dd>
+<dt>same image</dt><dd>an optional exception: visual tokens of one image see each other in both directions. PaliGemma goes further and lets the image and the text prefix attend fully (a prefix-LM, <a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a>) [Certain]; the Hugging Face Gemma 3 code makes image tokens bidirectional [Likely]. Most LLaVA-style models keep the plain causal rule for image tokens too.</dd></dl>
+<p>With the mask, a packed row computes the same outputs as separate rows, only faster. The code at the end of this session checks this: the difference is about \(7 \times 10^{-7}\), float rounding.</p>
+<h3>Positions restart in every sample</h3>
+<p>The mask is not enough. Position ids must also restart at 0 for every sample, because the model was trained to see the image near position 0, not at position 5,000. If \(c_k\) is the start of sample \(k\) in the row,</p>
+<div class="eq">\[ c_0 = 0, \quad c_k = \sum_{i=1}^{k} n_i, \qquad p_t = t - c_{s(t)} \tag{188.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(c_k\)</dt><dd>the cumulative lengths; the vector \((c_0, c_1, \dots, c_K)\) is called <code>cu_seqlens</code> in FlashAttention and Hugging Face code</dd>
+<dt>\(p_t\)</dt><dd>the position id of token \(t\) inside its own sample, used by RoPE or by a position table</dd></dl>
+<p>For lengths 13, 4 and 13, <code>cu_seqlens</code> is \((0, 13, 17, 30)\). In Qwen2-VL, positions are three numbers per token (time, height, width, called M-RoPE), and the text after an image continues from the largest image position plus one (<a href="../vision/high-resolution-and-native-aspect-ratio.html">session 180</a>). The rule is the same: compute these ids per sample, then concatenate. In the code below, a packed row without restarted positions differs from the separate rows by 3.37 in the logits: a different model.</p>
+<h3>Kernels: you rarely build the mask</h3>
+<p>A dense \(N \times N\) boolean mask costs memory, and most of it is \(-\infty\). Fast kernels take <code>cu_seqlens</code> instead. FlashAttention’s variable-length function (<code>flash_attn_varlen_func</code>) runs attention on each segment separately inside one launch (<a href="../inference/attention-operator-1-flashattention-1-2-and.html">session 124</a>). Hugging Face’s <code>DataCollatorWithFlattening</code> concatenates samples into one row and passes <code>position_ids</code> so FlashAttention-2 can find the boundaries; its authors report up to 2× training throughput on FLAN and 1.4× on OrcaMath, with up to 20% lower peak memory [Certain, from the Hugging Face blog, August 2024]. PyTorch FlexAttention can build the block-diagonal rule from a small Python function of the sample ids. The cost of attention with a document mask is</p>
+<div class="eq">\[ \frac{\text{pairs with a document mask}}{\text{pairs without}} = \frac{\sum_{k} n_k^2}{\big(\sum_{k} n_k\big)^2} \tag{188.5} \]</div>
+<p>For the four samples of the worked example in one row of 6,707, this ratio is 37.6%: a kernel that skips the masked blocks does less than half the attention work of a plain causal row of the same length. A dense kernel with a mask computes everything and then throws most of it away.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A shared taxi with a privacy wall between passengers. They share the ride (one row, one kernel launch), but nobody hears another passenger’s conversation (the mask), and each passenger’s trip meter starts at zero (the restarted positions).</aside>
+<div class="algo"><div class="algo-h">Algorithm 1: multimodal collate with packing</div><ol>
+<li><b>input:</b> samples with images and chat turns; row length \(L_{\max}\); tile or image limit</li>
+<li>for each sample: run the image processor, count \(v_{ij}\), write \(v_{ij}\) placeholders, compute \(n_i\) (188.1) <span class="c">// in the data loader</span></li>
+<li>build labels: answer tokens keep their ids, all else \(-100\); shift by one inside the sample</li>
+<li>drop or split samples with \(n_i \gt L_{\max}\) at a turn boundary, never inside an image</li>
+<li>first-fit decreasing: sort by \(n_i\), put each sample into the first row with room (also checking the image limit)</li>
+<li>for each row: concatenate ids and labels, compute <code>cu_seqlens</code> and restarted positions (188.4), sample ids, image flags</li>
+<li>concatenate the pixel tensors of all images in the row, with their own <code>cu_seqlens</code> for the vision encoder</li>
+<li><b>return</b> ids, labels, positions, <code>cu_seqlens</code>, pixels, image grid sizes</li></ol></div>
+<h3>The same idea inside the vision encoder: NaViT</h3>
+<p>The vision encoder has its own batching problem. A standard ViT resizes every image to one size, say 224 × 224, so that every image gives the same number of patches. <b>NaViT</b> (“Patch n’ Pack”, Dehghani et al., 2023) keeps each image at its own resolution and aspect ratio, and packs the patch sequences of several images into one sequence. Three changes make this work [Certain, from the paper]:</p>
+<ul>
+<li><b>masked self-attention</b>, so that patches of one image do not attend to another image (the vision version of (188.3), without the causal part);</li>
+<li><b>masked pooling</b>, so that each image gets its own pooled vector at the end;</li>
+<li><b>factorized position embeddings</b> (separate x and y embeddings, added), so that any grid size works.</li></ul>
+<p>NaViT packs greedily, adding each image to the first sequence with enough space, and reports that typically less than 2% of the tokens are padding [Certain]. Packing also makes <b>token dropping</b> easy (randomly removing a share of the patches of each image during training), and NaViT reports processing about five times more images in training at the same compute, which it names as the main source of its gains [Certain]. In VLMs, the Qwen2-VL family uses the same approach in its vision encoder: one long sequence of patches for all images in the batch, with attention only inside each segment.</p>
+<p>So a multimodal batch usually has <b>two</b> packed sequences: one for the vision encoder (patches, segmented by image) and one for the language model (tokens, segmented by sample). They have different lengths and different segment boundaries, and both must be balanced (last section).</p>
+<figure class="fig" id="bm-mask"><div class="fig-body">
+<div class="controls"><span class="seg bm-seg" id="bm-mask-mode"><button type="button" data-v="causal" aria-pressed="false">Causal only (leaks)</button><button type="button" data-v="doc" aria-pressed="true">Document mask</button><button type="button" data-v="bidi" aria-pressed="false">Document mask + bidirectional image</button></span></div>
+<div class="scroll-x"><svg class="bm-svg" id="bm-mask-svg" viewBox="0 0 640 480" role="img" aria-label="A 22 by 22 attention mask for a packed row of three samples, with the label row below" style="min-width:560px"></svg></div>
+<div class="bm-leg"><span style="--c:var(--q-soft);--b:var(--q)">image token</span><span style="--c:var(--k-soft);--b:var(--k)">prompt token</span><span style="--c:var(--v-soft);--b:var(--v)">answer token (has a loss)</span><span style="--c:var(--ink2);--b:var(--ink2)">allowed, same sample</span><span style="--c:var(--bad-soft);--b:var(--bad)">allowed, but from another sample</span></div>
+<div class="readout" id="bm-mask-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> One packed row of 22 tokens: sample A (4 image, 2 prompt, 3 answer tokens), sample B (text only: 2 prompt, 2 answer) and sample C (6 image, 1 prompt, 2 answer). Row \(t\) of the grid shows the keys that query \(t\) may attend to. Below the grid: the target of each position after the shift by one; “×” means −100 (no loss).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Click any cell or token to choose a query row; its visible keys are outlined. With “causal only”, the 22 tokens have 253 allowed pairs and 153 of them cross a sample boundary (red): sample C’s answer can read sample A’s image. The document mask leaves 100 pairs, all inside a sample. Adding bidirectional attention inside each image adds 21 pairs (6 for A’s 4-token image, 15 for C’s 6-token image). Look at the label row: only 7 positions carry a loss, one per answer token, and the last token of each sample has no target, so no sample learns to predict the start of the next one.</p></details></figure>
+
+<h2>Loss only on the text answer</h2>
+<p>A VLM is trained with next-token prediction, but only on the tokens it should produce at test time (<a href="../vision/vlm-training-stages.html">session 186</a>). Image tokens are not predicted at all: they are continuous vectors from the encoder, there is no vocabulary entry to predict, and the output head would be asked for a placeholder id that means nothing. The system prompt and the user question are also inputs, not outputs. So the labels are \(-100\) (the <code>ignore_index</code> of PyTorch’s cross-entropy; LLaVA calls it <code>IGNORE_INDEX</code> [Certain]) on every image, prompt and pad position, and the loss is</p>
+<div class="eq">\[ \mathcal{L} = \frac{\sum_{t} m_t\, \ell_t}{\sum_{t} m_t}, \qquad \ell_t = -\log p_\theta\big(y_{t+1} \mid y_{\le t}, \text{image}\big), \quad m_t = \mathbb{1}\big[y_{t+1} \in \text{answer}\big] \tag{188.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\ell_t\)</dt><dd>the cross-entropy at position \(t\): the negative log probability of the next token</dd>
+<dt>\(m_t\)</dt><dd>1 when the <b>next</b> token is part of an assistant answer (including its end-of-turn token), 0 otherwise</dd>
+<dt>\(\sum_t m_t\)</dt><dd>the number of answer tokens that count; the denominator decides how examples are weighted (below)</dd></dl>
+<p>Three details cause most bugs. (1) The shift: position \(t\) predicts token \(t+1\). In a packed row, shift <b>inside</b> each sample, so the last token of sample A does not get the first token of sample B as its target. (2) Multi-turn chats have several assistant turns; each gets \(m = 1\), and each user turn between them gets \(m = 0\). (3) The end-of-turn token must be inside the answer, or the model never learns to stop. Print one sample with its labels before training; this is the single cheapest check.</p>
+<h3>How to average: token mean, sample mean, square mean</h3>
+<p>Formula (188.6) is a <b>token mean</b>: every answer token in the batch has the same weight. A sample with a 400-token document transcription then has 100 times the weight of a sample whose answer is “Yes.”. The <b>sample mean</b> averages inside each sample first, so every sample has the same weight. InternVL 2.5 writes both as one family [Certain, from the paper]:</p>
+<div class="eq">\[ \mathcal{L} = \frac{\sum_{s} w_s \sum_{t \in s} \ell_t}{\sum_{s} w_s\, x_s}, \qquad w_s = \frac{1}{x_s^{\,q}} \tag{188.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(x_s\)</dt><dd>the number of answer tokens in sample \(s\)</dd>
+<dt>\(q\)</dt><dd>\(q = 0\): token mean; \(q = 1\): sample mean; \(q = 0.5\): the “square averaging” that InternVL 2.5 proposes</dd>
+<dt>\(w_s x_s\)</dt><dd>the total weight of sample \(s\), proportional to \(x_s^{1-q}\)</dd></dl>
+<p>The paper explains the choice: token averaging biases the gradient toward responses with more tokens, and sample averaging makes every sample count equally but can make the model favor shorter responses [Certain]. VLM data mixes one-word VQA answers with long captions and OCR outputs, so the range of \(x_s\) is huge and this choice matters more than in text SFT.</p>
+<div class="worked"><div class="wt">Worked example: “Yes.” against a document</div>
+<p>Two samples: a VQA answer of \(x = 4\) tokens and a transcription of \(x = 400\). Total weight is proportional to \(x^{1-q}\):</p>
+<ul><li>token mean (\(q = 0\)): \(4 : 400\), so 1.0% and 99.0%;</li>
+<li>square mean (\(q = 0.5\)): \(2 : 20\), so 9.1% and 90.9%;</li>
+<li>sample mean (\(q = 1\)): 50% and 50%.</li></ul>
+<p>Per token, the short answer’s tokens weigh 1×, 10× and 100× as much as the long answer’s tokens.</p></div>
+<h3>The denominator across micro-batches and GPUs</h3>
+<p>With gradient accumulation or data parallelism, the batch is split into micro-batches \(k = 1, \dots, K\) (on one GPU over time, or over many GPUs). If each micro-batch divides by its <b>own</b> token count and the results are averaged, the tokens of a micro-batch with few answer tokens get more weight. The correct token mean divides by the <b>global</b> count:</p>
+<div class="eq">\[ \mathcal{L} = \frac{\sum_{k=1}^{K} S_k}{\sum_{k=1}^{K} N_k} \ \ne\ \frac{1}{K} \sum_{k=1}^{K} \frac{S_k}{N_k} \tag{188.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(S_k\)</dt><dd>the sum of the (weighted) token losses in micro-batch \(k\)</dd>
+<dt>\(N_k\)</dt><dd>the number of loss tokens in micro-batch \(k\) (the weighted count \(\sum_s w_s x_s\) for 188.7)</dd></dl>
+<p>Example: micro-batch 1 has 10 answer tokens with mean loss 2.0, micro-batch 2 has 190 with mean loss 1.0. The right loss is \((20 + 190)/200 = 1.05\); the mean of means is \((2.0 + 1.0)/2 = 1.5\), and every token of micro-batch 1 got 10 times its fair weight. Hugging Face transformers fixed exactly this bug in gradient accumulation in October 2024: the loss is now summed and divided by the total number of items [Certain, from the Hugging Face blog]. With data parallelism, you get the global count with one all-reduce of \(N_k\) before the backward pass, and scale each GPU’s loss by \(K / \sum_k N_k\) (DDP averages gradients over the \(K\) GPUs, <a href="../pretraining/data-parallelism-ddp.html">session 44</a>). Packing makes this more important, not less: the number of samples and answer tokens per row now varies a lot.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Grading a class exam with several graders. If each grader reports the average of their own pile and you average the graders, a student in a small pile counts more than a student in a big pile. Add all the points and divide by all the students.</aside>
+<figure class="fig" id="bm-loss"><div class="fig-body">
+<div class="bm-grid">
+<label for="bm-loss-q">Exponent \(q\)</label><input type="range" id="bm-loss-q" min="0" max="1" step="0.05" value="0"><output id="bm-loss-qv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="seg bm-seg" id="bm-loss-red"><button type="button" data-v="global" aria-pressed="true">Divide by the global count</button><button type="button" data-v="local" aria-pressed="false">Average per-micro-batch means (bug)</button></span></div>
+<div class="scroll-x"><svg class="bm-svg" id="bm-loss-svg" viewBox="0 0 640 250" role="img" aria-label="Share of the total gradient weight for five samples with answers of 1 to 400 tokens" style="min-width:540px"></svg></div>
+<div class="readout" id="bm-loss-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Five samples of one global batch, with answers of 1, 8, 30, 120 and 400 tokens (a yes/no answer, a short phrase, a caption, a detailed description, a document transcription). Bars: the share of the total loss weight each sample gets under formula (188.7). The first three samples are in micro-batch 1 and the last two in micro-batch 2.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At \(q = 0\) (token mean) the transcription takes 71.6% of the weight and the yes/no answer 0.18%. Move \(q\) to 0.5: the shares become 2.5% to 49.7%. At \(q = 1\) every sample gets 20%. Now switch to the bug at \(q = 0\): each micro-batch gets half of the weight whatever its size, so the caption jumps from 5.4% to 38.5%, the same as the transcription. The bug is an accidental and unstable re-weighting: it changes with how the data falls into micro-batches.</p></details></figure>
+
+<h2>Throughput: sort by length, balance tokens per GPU</h2>
+<p>In data-parallel training, every GPU must finish its micro-batch before the gradients are all-reduced. The step time is set by the <b>slowest</b> GPU. If one GPU gets two video samples and another gets four short chats, the second GPU waits. The cost of a sample is not just its length. A useful model is</p>
+<div class="eq">\[ c_i = \underbrace{n_i}_{\text{linear layers}} + \underbrace{\frac{n_i^2}{n_\star}}_{\text{attention}} + \underbrace{r\, V_i}_{\text{vision encoder}}, \qquad \text{step} = \max_g \sum_{i \in g} c_i, \qquad U = \frac{\frac{1}{G}\sum_g \sum_{i \in g} c_i}{\text{step}} \tag{188.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(c_i\)</dt><dd>the cost of sample \(i\), in units of “one token through the language model’s linear layers”</dd>
+<dt>\(n_\star\)</dt><dd>the length at which attention costs as much as the linear layers. With the layer cost of <a href="../vision/visual-token-efficiency.html">session 183</a>, \(2n(4d^2 + 3dm) + 4n^2 d\), it is \(n_\star = (4d^2 + 3dm)/(2d) = 24{,}704\) for a 7B Llama shape (\(d = 4096\), \(m = 11008\))</dd>
+<dt>\(r\)</dt><dd>the vision-encoder cost per visual token, relative to one language-model token. It depends on the encoder size and on the merge ratio (a 2 × 2 merge means 4 patches per visual token). Measure it on your system</dd>
+<dt>\(g\), \(G\)</dt><dd>a GPU and the number of GPUs</dd>
+<dt>\(U\)</dt><dd>the utilization: the average GPU’s work divided by the slowest GPU’s work; \(1 - U\) is the share of time GPUs sit idle waiting</dd></dl>
+<p>Three strategies, in order of effort:</p>
+<ol>
+<li><b>Equal count, random:</b> every GPU gets the same number of random samples. Simple, and with heavy-tailed lengths, slow.</li>
+<li><b>Sort and balance tokens</b> (LLaVA): sort a megabatch from long to short and give each sample to the GPU with the fewest tokens so far, keeping the count per GPU equal. This is the greedy <b>longest-processing-time-first</b> rule from scheduling.</li>
+<li><b>Balance the full cost:</b> the same greedy rule on \(c_i\) instead of \(n_i\), and without the equal-count rule. GPUs may then get different numbers of samples, which is fine only if the loss uses the global token count (188.8).</li></ol>
+<div class="algo"><div class="algo-h">Algorithm 2: cost-balanced assignment of one global batch</div><ol>
+<li><b>input:</b> samples with \(n_i\), \(V_i\); \(G\) GPUs; cost model (188.9)</li>
+<li>compute \(c_i\) for every sample <span class="c">// lengths are known from the data loader</span></li>
+<li>sort samples by \(c_i\), largest first</li>
+<li>\(\text{load}_g \leftarrow 0\) for all \(g\)</li>
+<li>for each sample \(i\): \(g^* \leftarrow \argmin_g \text{load}_g\); give \(i\) to \(g^*\); \(\text{load}_{g^*} \leftarrow \text{load}_{g^*} + c_i\)</li>
+<li>on each GPU, pack its samples into rows (Algorithm 1)</li>
+<li>all-reduce the number of loss tokens; scale each local loss by \(G / \sum_k N_k\) <span class="c">// formula 188.8</span></li></ol></div>
+<div class="worked"><div class="wt">Worked example: two GPUs, eight samples</div>
+<p>Lengths 3,000, 2,900, 700, 650, 600, 500, 400 and 300 tokens. Split in order, four per GPU: 7,250 and 1,800 tokens. The step waits for 7,250, while the average is 4,525: \(U = 62.4\%\). Sort and fill the lightest GPU: GPU 1 gets 3,000, 650, 500 and 400 (4,550); GPU 2 gets 2,900, 700, 600 and 300 (4,500). \(U = 99.5\%\), and the step is 1.59× faster.</p></div>
+<p>The vision encoder adds a second axis. Balancing tokens does not balance images: a GPU with one 3,000-token video and a GPU with three 1,000-token text chats have the same token count, but only the first runs the vision encoder. When the encoder is large (InternVL uses a 6B-parameter InternViT in some versions, <a href="../vision/case-studies-2-qwen2-5-vl-internvl.html">session 182</a>) or runs at high resolution, \(r\) is large and the cost-aware rule wins. InternVL 2.5’s packing limits both the context length and the number of image tiles of each packed sample for this reason [Certain, from the paper, which does not give the numeric limits]. Another common fix is to run the vision encoder on a balanced split of all images of the step, then send the features to the GPUs that own the samples [Likely].</p>
+<figure class="fig" id="bm-gpu"><div class="fig-body">
+<div class="controls"><span class="seg bm-seg" id="bm-gpu-mode"><button type="button" data-v="rand" aria-pressed="true">Equal count, random</button><button type="button" data-v="llava" aria-pressed="false">Sort, balance tokens (LLaVA)</button><button type="button" data-v="cost" aria-pressed="false">Balance full cost</button></span></div>
+<div class="controls" style="margin-top:8px"><span class="seg bm-seg" id="bm-gpu-g"><button type="button" data-v="2" aria-pressed="false">2 GPUs</button><button type="button" data-v="4" aria-pressed="false">4 GPUs</button><button type="button" data-v="8" aria-pressed="true">8 GPUs</button><button type="button" data-v="16" aria-pressed="false">16 GPUs</button></span></div>
+<div class="bm-grid" style="margin-top:8px">
+<label for="bm-gpu-r">Encoder cost \(r\)</label><input type="range" id="bm-gpu-r" min="0" max="2" step="0.1" value="0.3"><output id="bm-gpu-rv"></output></div>
+<div class="scroll-x"><svg class="bm-svg" id="bm-gpu-svg" viewBox="0 0 640 300" role="img" aria-label="Stacked bars of work per GPU for one global batch of 64 multimodal samples" style="min-width:540px"></svg></div>
+<div class="bm-leg"><span style="--c:var(--k-soft);--b:var(--k)">language model, linear</span><span style="--c:var(--q-soft);--b:var(--q)">language model, attention</span><span style="--c:var(--v-soft);--b:var(--v)">vision encoder</span></div>
+<div class="readout" id="bm-gpu-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> One global batch of 64 fixed samples (text-only, single images, tiles, native-resolution images and videos; 80,923 tokens) spread over \(G\) GPUs with formula (188.9), \(n_\star = 24{,}704\). The dashed line is the slowest GPU, which sets the step time. The cost units are “one token through the linear layers”.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>With 8 GPUs and random equal counts, utilization is 73.4%: about a quarter of the GPU time is waiting. Sorting and balancing tokens brings it to 98.5% and makes the step 1.34× faster. Raise \(r\) to 1.0 (a large vision encoder): the token-balanced split falls to 95.7%, because it ignores where the images are, while balancing the full cost keeps 99.3% (some GPUs now get 7 samples and others 9). Choose 16 GPUs: with only 4 samples per GPU, random assignment drops to 47.2% utilization, and balancing makes the step about 2× faster.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>Balancing is computed on one global batch, so it needs all lengths of the step before the step starts. That is easy when lengths are stored in the dataset index (count tokens once in preprocessing), and slow if every worker must decode the image to learn its size.</aside>
+
+<h2>Code: packing, masks and the loss in PyTorch</h2>
+<p>This file builds three samples with 6, 0 and 9 image tokens, packs them into one row with restarted positions and a document mask, scatters fake image features into the placeholders, and checks that the packed row gives the same logits as three separate rows. Then it checks the masked loss, the global-count rule (188.8), and the greedy GPU balance. It runs on a CPU in under a second and is deterministic.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+IMG, IGNORE, VOCAB, D = 0, -100, 100, 32       <span class="cm"># id 0 is the image placeholder</span>
+
+<span class="cm"># ---------- 1) three samples with different numbers of image tokens ----------</span>
+samples = [dict(n_img=6, prompt=[5, 6, 7], answer=[20, 21, 22, 2]),   <span class="cm"># 2 = end of turn</span>
+           dict(n_img=0, prompt=[8, 9],    answer=[23, 2]),           <span class="cm"># a text-only sample</span>
+           dict(n_img=9, prompt=[10],      answer=[24, 25, 2])]
+<span class="kw2">for</span> s <span class="kw2">in</span> samples:
+    s[<span class="st">"feats"</span>] = torch.randn(s[<span class="st">"n_img"</span>], D)                           <span class="cm"># output of the vision encoder + connector</span>
+
+<span class="kw2">def</span> build(s):
+    <span class="st">"""input ids with one placeholder per visual token; targets already shifted by one."""</span>
+    ids = [IMG] * s[<span class="st">"n_img"</span>] + s[<span class="st">"prompt"</span>] + s[<span class="st">"answer"</span>]
+    lab = [IGNORE] * (s[<span class="st">"n_img"</span>] + len(s[<span class="st">"prompt"</span>])) + s[<span class="st">"answer"</span>]   <span class="cm"># loss only on the answer</span>
+    tgt = lab[1:] + [IGNORE]                                           <span class="cm"># position t predicts token t+1</span>
+    <span class="kw2">return</span> torch.tensor(ids), torch.tensor(tgt)
+
+<span class="cm"># ---------- 2) pack: concatenate, cu_seqlens, restarted positions, sample ids ----------</span>
+parts = [build(s) <span class="kw2">for</span> s <span class="kw2">in</span> samples]
+ids = torch.cat([p[0] <span class="kw2">for</span> p <span class="kw2">in</span> parts]); tgt = torch.cat([p[1] <span class="kw2">for</span> p <span class="kw2">in</span> parts])
+lens = torch.tensor([len(p[0]) <span class="kw2">for</span> p <span class="kw2">in</span> parts])
+cu_seqlens = F.pad(lens.cumsum(0), (1, 0))
+seq_id = torch.repeat_interleave(torch.arange(len(lens)), lens)
+pos = torch.arange(len(ids)) - cu_seqlens[seq_id]                      <span class="cm"># 0,1,2,... inside each sample</span>
+print(lens.tolist(), cu_seqlens.tolist(), int((tgt != IGNORE).sum()))  <span class="cm"># [13, 4, 13] [0, 13, 17, 30] 9</span>
+
+<span class="cm"># ---------- 3) a tiny model: embeddings, image scatter, one masked attention layer ----------</span>
+<span class="kw2">class</span> Tiny(nn.Module):
+    <span class="kw2">def</span> __init__(self):
+        super().__init__()
+        self.tok, self.pos = nn.Embedding(VOCAB, D), nn.Embedding(64, D)
+        self.qkv, self.out = nn.Linear(D, 3 * D), nn.Linear(D, VOCAB)
+    <span class="kw2">def</span> forward(self, ids, feats, pos, mask):
+        h = self.tok(ids)
+        img = (ids == IMG).unsqueeze(-1)
+        <span class="kw2">assert</span> int(img.sum()) == feats.shape[0]                        <span class="cm"># one feature per placeholder</span>
+        h = h.masked_scatter(img, feats) + self.pos(pos)               <span class="cm"># put visual tokens in place</span>
+        q, k, v = self.qkv(h).chunk(3, -1)
+        a = F.scaled_dot_product_attention(q[None], k[None], v[None], attn_mask=mask[None])[0]
+        <span class="kw2">return</span> self.out(h + a)
+
+<span class="kw2">def</span> packed_mask(seq_id, is_img):
+    same = seq_id[:, None] == seq_id[None, :]                          <span class="cm"># block diagonal: no cross-sample attention</span>
+    n = len(seq_id); causal = torch.ones(n, n, dtype=torch.bool).tril()
+    both_img = is_img[:, None] &amp; is_img[None, :]                       <span class="cm"># optional: bidirectional inside the image</span>
+    <span class="kw2">return</span> same &amp; (causal | both_img)
+
+model = Tiny().eval()
+feats = torch.cat([s[<span class="st">"feats"</span>] <span class="kw2">for</span> s <span class="kw2">in</span> samples])
+<span class="kw2">with</span> torch.no_grad():
+    packed = model(ids, feats, pos, packed_mask(seq_id, ids == IMG))
+    alone = torch.cat([model(p[0], s[<span class="st">"feats"</span>], torch.arange(len(p[0])),
+                             packed_mask(torch.zeros(len(p[0]), dtype=torch.long), p[0] == IMG))
+                       <span class="kw2">for</span> p, s <span class="kw2">in</span> zip(parts, samples)])
+    no_restart = model(ids, feats, torch.arange(len(ids)), packed_mask(seq_id, ids == IMG))
+    leaky = model(ids, feats, pos, torch.ones(len(ids), len(ids), dtype=torch.bool).tril())
+print(f<span class="st">"{(packed - alone).abs().max():.1e}"</span>)                           <span class="cm"># 7.2e-07: packing changes nothing</span>
+print(f<span class="st">"{(no_restart - alone).abs().max():.2f}"</span>, f<span class="st">"{(leaky - alone).abs().max():.2f}"</span>)  <span class="cm"># 3.37 1.28: both wrong</span>
+
+<span class="cm"># ---------- 4) the loss: sum over answer tokens, divided by the GLOBAL count ----------</span>
+loss_tok = F.cross_entropy(packed, tgt, ignore_index=IGNORE, reduction=<span class="st">"none"</span>)
+print(f<span class="st">"{loss_tok[tgt != IGNORE].mean():.4f}"</span>, f<span class="st">"{F.cross_entropy(packed, tgt, ignore_index=IGNORE):.4f}"</span>)  <span class="cm"># 4.8876 4.8876</span>
+
+<span class="kw2">def</span> global_mean(micro):                       <span class="cm"># micro: list of (sum of token losses, number of loss tokens)</span>
+    <span class="kw2">return</span> sum(s <span class="kw2">for</span> s, _ <span class="kw2">in</span> micro) / sum(n <span class="kw2">for</span> _, n <span class="kw2">in</span> micro)
+micro = [(20.0, 10), (190.0, 190)]           <span class="cm"># micro-batch 1: 10 tokens at loss 2.0; micro-batch 2: 190 at 1.0</span>
+print(global_mean(micro), sum(s / n <span class="kw2">for</span> s, n <span class="kw2">in</span> micro) / len(micro))   <span class="cm"># 1.05 (right) versus 1.5 (wrong)</span>
+
+<span class="cm"># ---------- 5) balance samples over GPUs (sort, then fill the lightest GPU) ----------</span>
+<span class="kw2">def</span> balance(lengths, n_gpu, cost=<span class="kw2">lambda</span> n: n):
+    order = sorted(range(len(lengths)), key=<span class="kw2">lambda</span> i: -cost(lengths[i]))
+    load, groups = [0.0] * n_gpu, [[] <span class="kw2">for</span> _ <span class="kw2">in</span> range(n_gpu)]
+    <span class="kw2">for</span> i <span class="kw2">in</span> order:
+        g = min(range(n_gpu), key=<span class="kw2">lambda</span> g: load[g])
+        groups[g].append(i); load[g] += cost(lengths[i])
+    <span class="kw2">return</span> groups, load
+L = [3000, 2900, 700, 650, 600, 500, 400, 300]
+print([sum(L[:4]), sum(L[4:])], balance(L, 2)[1])                     <span class="cm"># [7250, 1800] [4550.0, 4500.0]</span></pre>
+<p>The dense boolean mask here is for clarity. In real training you pass <code>cu_seqlens</code> (or <code>position_ids</code>) to a variable-length FlashAttention kernel, or a mask function to FlexAttention, and never build the \(N \times N\) matrix. The 3.37 and 1.28 are the two classic bugs: positions that do not restart, and a causal mask that lets samples read each other. Both run without any error message; only a test like this one finds them.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical choice</th><th>Why</th></tr></thead><tbody>
+<tr><td>LLaVA-style SFT (one image per sample, 576 tokens)</td><td>Padding plus modality and length grouping</td><td>Image lengths are fixed, so grouping removes most padding with no kernel changes</td></tr>
+<tr><td>Native-resolution VLMs (Qwen2-VL, Qwen2.5-VL)</td><td>Packed vision-encoder sequence with <code>cu_seqlens</code>; per-sample M-RoPE ids</td><td>Image token counts vary from a few to thousands per image</td></tr>
+<tr><td>Tiled high-resolution models (InternVL, LLaVA-NeXT)</td><td>Packing under a token limit and a tile limit</td><td>Both the LLM and the large vision encoder must stay balanced</td></tr>
+<tr><td>Vision-encoder pretraining (NaViT, SigLIP-style)</td><td>Pack images of mixed resolution; masked attention and pooling; token dropping</td><td>Less than 2% padding and about 5× more images at the same compute (NaViT)</td></tr>
+<tr><td>Video captioning and video QA training</td><td>Few samples per row, cost-aware balancing, frame caps per sample</td><td>One video can be tens of thousands of tokens; it dominates any GPU it lands on (<a href="../video/index.html#row-long-video" title="Long video (planned)">session 206</a>)</td></tr>
+<tr><td>Action recognition and video classification</td><td>Packed clips of different lengths and frame rates in the video encoder, masked pooling per clip</td><td>Same idea as NaViT in time: no resizing of every clip to the same frame count</td></tr>
+<tr><td>Key-moment detection and temporal grounding</td><td>Loss only on the timestamp answer; long clips packed alone or with short ones</td><td>The answer is a few tokens after many visual tokens; token mean would drown it among long captions</td></tr>
+<tr><td>Video retrieval and fingerprinting (embedding training)</td><td>Packed clips, one pooled vector per clip with masked pooling</td><td>The pooled vector must not mix two clips; contrastive batches need many clips per step</td></tr>
+<tr><td>Multimodal serving (prefill)</td><td>Variable-length kernels with <code>cu_seqlens</code>, continuous batching</td><td>The same packing idea, without labels (<a href="../vision/index.html#row-the-vlm-inference-path" title="The VLM inference path (planned)">session 196</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Packing with a plain causal mask.</b> Samples read each other, the loss looks too good, and the model learns to depend on context that is absent at test time. Use a document mask or <code>cu_seqlens</code>.</li>
+<li><b>Not restarting position ids.</b> The image of the third sample sits at position 5,000; with RoPE or M-RoPE the model sees a different geometry than at test time.</li>
+<li><b>Truncating inside an image.</b> The number of placeholders no longer matches the number of feature vectors; the scatter fails, or worse, silently shifts features. Truncate only at turn boundaries, or drop the sample.</li>
+<li><b>Loss on image or prompt tokens.</b> Predicting placeholder ids is meaningless, and training on the prompt teaches the model to write questions. Labels must be −100 there.</li>
+<li><b>Shifting the labels across the packed row.</b> The last token of one sample then learns to predict the first token of the next. Shift inside each sample.</li>
+<li><b>Averaging per-micro-batch means.</b> It re-weights tokens by the size of their micro-batch (formula 188.8). Divide the summed loss by the global count of loss tokens.</li>
+<li><b>Balancing only tokens when the vision encoder is heavy.</b> A GPU with all the images is the straggler even if its token count is average.</li>
+<li><b>Sorting the whole dataset by length.</b> Every step then sees one kind of sample, and the loss curve has a pattern that is about length, not learning. Sort inside random megabatches.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why does a VLM batch have more padding than a text batch with the same samples’ text?<span class="lvl">basic</span></summary><div class="ans">Because the sequence length is \(n_i = V_i + T_i\) (formula 188.1), and the visual part \(V_i\) varies from 0 (text-only samples) to thousands (tiles, native resolution, video). It is usually much larger than the text part, so the length spread is mostly the image spread. With four samples of 300, 696, 2,751 and 2,960 tokens, padding to the longest gives 56.6% efficiency: 43% of the tensor is padding.</div></details>
+<details class="qa"><summary>You pack samples into rows of 8,192 tokens. What else must change for training to stay correct?<span class="lvl">core</span></summary><div class="ans">(1) The attention mask must be block-diagonal: a token attends only to its own sample (pass <code>cu_seqlens</code> to a variable-length kernel). (2) Position ids must restart at 0 in every sample (or M-RoPE ids must be computed per sample). (3) Labels must be shifted inside each sample, so no sample predicts the start of the next. (4) The loss normalization must use the global count of loss tokens, because rows now hold different numbers of samples. (5) In the vision encoder, the images of a row also need their own segments. Without (1) and (2) the packed row is a different model; the test is to compare packed logits against separate rows.</div></details>
+<details class="qa"><summary>Why are image tokens excluded from the loss?<span class="lvl">basic</span></summary><div class="ans">The positions hold continuous vectors from the vision encoder, not vocabulary tokens. Their “target” would be the placeholder id, which carries no information; predicting it wastes capacity and adds a large, easy loss that hides the real signal. The model should learn to produce text answers given the image, so only answer tokens (including the end-of-turn token) get labels; image, system and user tokens get −100.</div></details>
+<details class="qa"><summary>Token mean, sample mean or square mean: what is the difference and how do you choose?<span class="lvl">core</span></summary><div class="ans">With weight \(w_s = x_s^{-q}\) per token of a sample with \(x_s\) answer tokens (formula 188.7), the total weight of a sample is proportional to \(x_s^{1-q}\). Token mean (\(q = 0\)) gives long answers most of the gradient: a 400-token transcription gets 99% against a 4-token answer. Sample mean (\(q = 1\)) gives every sample equal weight, which over-weights tokens of short answers and, per InternVL 2.5, can push the model toward short responses. InternVL 2.5 uses the middle, \(q = 0.5\) (9.1% / 90.9% in the same example). Choose by looking at the answer-length distribution of your mixture and at the outputs: too short answers suggest lowering \(q\), ignored short-answer tasks suggest raising it.</div></details>
+<details class="qa"><summary>Your loss with gradient accumulation of 8 does not match the loss with a batch 8 times larger. Why?<span class="lvl">core</span></summary><div class="ans">Each micro-batch divided its summed loss by its own token count, and the 8 results were averaged. That is a mean of means (formula 188.8), which gives tokens in small micro-batches more weight. With 10 tokens at loss 2.0 and 190 at 1.0, the mean of means is 1.5 while the true token mean is 1.05. Fix: sum token losses, divide by the total number of loss tokens of the whole accumulated batch (count them first, all-reduce across GPUs). Hugging Face fixed exactly this in October 2024.</div></details>
+<details class="qa"><summary>How does NaViT handle images of different sizes in one batch?<span class="lvl">core</span></summary><div class="ans">It keeps each image at its own resolution and aspect ratio, turns it into a variable number of patches, and packs the patch sequences of several images into one sequence. Masked self-attention stops patches from attending across images, masked pooling gives one vector per image, and factorized x/y position embeddings handle any grid. Packing is greedy (first sequence with room), and typically less than 2% of tokens are padding. It also enables per-image token dropping; the paper reports about five times more images processed at the same compute.</div></details>
+<details class="qa"><summary>One GPU is always the slowest in your VLM training. How do you find and fix it?<span class="lvl">advanced</span></summary><div class="ans">Log per-rank step time, token count, visual-token count and number of images. If the slow rank has more tokens, sort and balance tokens per GPU (LLaVA-style greedy: sort long to short, give each sample to the least-loaded GPU). If its token count is normal but it has more images, the vision encoder is the bottleneck: balance a cost \(c_i = n_i + n_i^2/n_\star + r V_i\) (formula 188.9) with \(r\) measured, or cap tiles per packed row as InternVL 2.5 does, or run the encoder on a balanced split of all images. If counts per GPU become unequal, keep the loss normalized by the global token count.</div></details>
+<details class="qa"><summary>How much attention work does a document mask save in a packed row?<span class="lvl">core</span></summary><div class="ans">The ratio of computed pairs is \(\sum_k n_k^2 / (\sum_k n_k)^2\) (formula 188.5), if the kernel skips fully masked blocks (variable-length FlashAttention, FlexAttention block masks). For samples of 300, 696, 2,751 and 2,960 tokens in one row of 6,707, that is 37.6%. A dense kernel with a boolean mask computes all pairs and gets no saving. With a causal mask both sides are halved, so the ratio is about the same.</div></details>
+<details class="qa"><summary>Should image tokens attend to each other bidirectionally?<span class="lvl">advanced</span></summary><div class="ans">It is a design choice. Inside one image there is no natural order, so causal attention forces the top-left patches to ignore the rest of the image in the language model. Bidirectional attention inside the image block (or a full prefix, as in PaliGemma) lets every visual token use the whole image and costs nothing at inference, because the image is known in full before generation. The cost is a more complex mask (it is no longer pure causal, so some fast causal kernels need a block mask), and the model must be trained with the same mask it is served with. Most LLaVA-style models keep plain causal attention and still work well.</div></details>
+<details class="qa"><summary>Why does sorting by length hurt training if you do it over the whole dataset?<span class="lvl">basic</span></summary><div class="ans">Batches become homogeneous: all long document samples come in one part of the epoch, all short VQA samples in another. The gradient of each step is then biased toward one task and one length, and the loss curve shows the order of the data instead of learning. Grouping inside random megabatches (LLaVA) keeps the batches mixed across steps while still removing most padding.</div></details>
+<details class="qa"><summary>A sample is longer than the maximum sequence length. What do you do?<span class="lvl">core</span></summary><div class="ans">Never cut inside an image: the placeholder count would not match the features. Options: reduce the visual tokens (lower the max pixels, fewer tiles, fewer frames, as InternVL 2.5 does by sharing a tile budget across images), split a multi-turn chat at a turn boundary into two samples with the image repeated, or drop the sample and log it. Check \(n_i\) in the data loader, before batching.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A batch has four samples of 700, 700, 700 and 3,000 tokens. What is the padding efficiency (188.2)?</li>
+<li>Pack the same four samples into rows of 4,096 with first-fit decreasing. How many rows, and what is the efficiency?</li>
+<li>Three samples of 13, 4 and 13 tokens are packed into one row. Write <code>cu_seqlens</code> and the position id of the first token of the third sample.</li>
+<li>Two samples have answers of 4 and 400 tokens. What share of the loss weight does the short one get with token, square and sample averaging?</li>
+<li>Micro-batch 1 has 50 answer tokens with mean loss 3.0, micro-batch 2 has 150 with mean loss 1.0. What is the correct token-mean loss, and what does the mean of means give?</li>
+<li>In Figure 3, how many attention pairs does a causal mask allow over the 22 tokens, and how many does the document mask allow? Why is the second number so much smaller?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(5{,}100 / (4 \times 3{,}000) = 42.5\%\). 2. Sorted: 3,000 goes to row 1; 700 fits (3,700); the next 700 does not (4,400 \(\gt\) 4,096), so row 2 gets 700 + 700. Two rows: \(5{,}100 / 8{,}192 = 62.3\%\). 3. <code>cu_seqlens</code> \(= (0, 13, 17, 30)\); the first token of the third sample is at row position 17 and has position id \(17 - 17 = 0\). 4. Weights \(\propto x^{1-q}\): token mean \(4/404 = 1.0\%\); square mean \(2/(2 + 20) = 9.1\%\); sample mean 50%. 5. Correct: \((50 \cdot 3 + 150 \cdot 1)/200 = 1.5\). Mean of means: \((3 + 1)/2 = 2.0\). 6. Causal over 22 tokens: \(22 \cdot 23/2 = 253\). Document mask: \(9 \cdot 10/2 + 4 \cdot 5/2 + 9 \cdot 10/2 = 45 + 10 + 45 = 100\). Pairs grow with the square of the length, so cutting one row into three short blocks removes most of them (formula 188.5).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A multimodal sample has \(n_i = V_i + T_i\) positions (188.1); the visual part varies from 0 to thousands and decides the length. Count it in the data loader.</li>
+<li>Padding wastes \(1 - \eta\) of the work (188.2), and more for attention; sorting inside megabatches and grouping by modality remove most of it.</li>
+<li>Packing needs a document mask (188.3), restarted positions (188.4) and per-sample label shifts; with <code>cu_seqlens</code> kernels, attention work falls to \(\sum n_k^2 / (\sum n_k)^2\) (188.5). The vision encoder packs images the same way (NaViT).</li>
+<li>The loss is only on answer tokens (188.6); image, prompt and pad positions get −100.</li>
+<li>The averaging rule (188.7) decides how much long and short answers count; divide by the global count across micro-batches and GPUs (188.8).</li>
+<li>Step time is the slowest GPU (188.9): sort and balance tokens per GPU, and balance the vision-encoder load too when it is heavy.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ n_i = V_i + T_i, \qquad \eta = \frac{\sum_i n_i}{B \max_i n_i}, \qquad p_t = t - c_{s(t)} \]</div>
+<div class="eq">\[ \mathcal{L} = \frac{\sum_s w_s \sum_{t \in s} \ell_t}{\sum_s w_s x_s}, \quad w_s = x_s^{-q}, \qquad \mathcal{L}_{\text{global}} = \frac{\sum_k S_k}{\sum_k N_k} \]</div>
+<div class="eq">\[ c_i = n_i + \frac{n_i^2}{n_\star} + r V_i, \qquad \text{step} = \max_g \sum_{i \in g} c_i \]</div>
+<p>Next, <a href="../vision/vlm-sft-and-peft.html">session 189</a> uses these batches to fine-tune a VLM: which parts to train, LoRA on the language model and the connector, and how the data mixture is set.</p>
+<h2 class="plain" id="batching-and-masking-for-multimodal-sequences-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 3: Vision Language Model Training</li><li>Dehghani et al. (2023). <a href="https://arxiv.org/abs/2307.06304" target="_blank" rel="noopener">Patch n’ Pack: NaViT, a Vision Transformer for any Aspect Ratio and Resolution</a></li><li>Dehghani et al. (2023). <a href="https://arxiv.org/abs/2307.06304" target="_blank" rel="noopener">Patch n’ Pack: NaViT, a Vision Transformer for any Aspect Ratio and Resolution</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.03744" target="_blank" rel="noopener">Improved Baselines with Visual Instruction Tuning</a></li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Chen et al. (2024). <a href="https://arxiv.org/abs/2412.05271" target="_blank" rel="noopener">Expanding Performance Boundaries of Open-Source Multimodal Models with Model, Data, and Test-Time Scaling (InternVL 2.5)</a></li><li>Beyer et al. (2024). <a href="https://arxiv.org/abs/2407.07726" target="_blank" rel="noopener">PaliGemma: A versatile 3B VLM for transfer</a></li><li>Dao (2023). <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a></li><li>Dong, Feng, Guessous, Liang, He (2024). <a href="https://arxiv.org/abs/2412.05496" target="_blank" rel="noopener">Flex Attention: A Programming Model for Generating Optimized Attention Kernels</a></li><li>Lee, Zucker, Kundu, Wynter, Ganti and Mishra (2024). <a href="https://huggingface.co/blog/packing-with-FA2" target="_blank" rel="noopener">Improving Hugging Face Training Efficiency Through Packing with Flash Attention 2 (blog)</a></li><li>The Hugging Face Transformers team (2024). <a href="https://huggingface.co/blog/gradient_accumulation" target="_blank" rel="noopener">Fixing Gradient Accumulation (blog)</a></li><li>Liu et al. (2023). <a href="https://github.com/haotian-liu/LLaVA" target="_blank" rel="noopener">LLaVA code: constants.py, llava_trainer.py (modality and length grouped sampler) and scripts/v1_5/finetune.sh</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/multimodal-data-at-scale.html"><small>Previous · session 187</small>Multimodal data at scale</a><a class="next" href="../vision/vlm-sft-and-peft.html"><small>Next · session 189</small>VLM SFT and PEFT</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const R=document.querySelector('[data-session="batching-and-masking-for-multimodal-sequences"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmt=n=>Math.round(n).toLocaleString("en-US");
+function seg(el,cb){const bs=[...el.querySelectorAll("button")];bs.forEach(b=>b.addEventListener("click",()=>{bs.forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);}));}
+const T=(x,y,s,o)=>{o=o||{};return `<text x="${x}" y="${y}" font-size="${o.fs||13}" font-weight="${o.fw||500}" text-anchor="${o.a||"middle"}" fill="${o.c||"var(--ink)"}">${s}</text>`;};
+const RC=(x,y,w,h,f,s,sw)=>`<rect x="${(+x).toFixed(1)}" y="${(+y).toFixed(1)}" width="${Math.max(0,w).toFixed(1)}" height="${Math.max(0,h).toFixed(1)}" fill="${f}" stroke="${s||"none"}" stroke-width="${sw||1}"/>`;
+const COL={i:["var(--q-soft)","var(--q)"],p:["var(--k-soft)","var(--k)"],a:["var(--v-soft)","var(--v)"]};
+
+/* ---------- Figure 1: the life of a packed batch (static) ---------- */
+(function(){
+ const svg=$("#bm-pipe-svg");if(!svg)return;let g="";
+ const S=[{n:"A",img:[4],p:2,a:3},{n:"B",img:[],p:2,a:2},{n:"C",img:[6],p:1,a:2}];
+ // vision encoder row: patches (4 per visual token after a 2x2 merge would be too many; draw 2 per token)
+ g+=T(14,24,"Vision encoder: one packed sequence of patches, attention only inside each image",{a:"start",fs:12.5,fw:700});
+ let x=20;const pw=11;
+ S.forEach(s=>s.img.forEach(v=>{const np=2*v;g+=RC(x,34,np*pw,20,"var(--q-soft)","var(--q)",1.2);for(let k=1;k<np;k++)g+=`<line x1="${x+k*pw}" y1="34" x2="${x+k*pw}" y2="54" stroke="var(--q)" stroke-width=".5"/>`;
+  g+=`<path d="M${x} 60 v5 h${np*pw} v-5" fill="none" stroke="var(--ink2)" stroke-width="1.2"/>`+T(x+np*pw/2,78,`${s.n}: ${np} patches`,{fs:11.5,c:"var(--ink2)"});s.vx=x+np*pw/2;x+=np*pw+16;}));
+ g+=T(x+6,48,"cu_seqlens = (0, 8, 20)",{a:"start",fs:12,c:"var(--muted)"});
+ // LLM row
+ g+=T(14,112,"Language model: one packed row of three samples, document mask, positions restart",{a:"start",fs:12.5,fw:700});
+ x=20;const cw=24,y=122;const lab=[];
+ S.forEach((s,si)=>{const x0=x;const toks=[];s.img.forEach(v=>{for(let k=0;k<v;k++)toks.push("i");});for(let k=0;k<s.p;k++)toks.push("p");for(let k=0;k<s.a;k++)toks.push("a");
+  toks.forEach((tp,k)=>{const [f,st]=COL[tp];g+=RC(x,y,cw-2,22,f,st,1.3)+T(x+cw/2-1,y+15,k,{fs:10.5,c:"var(--ink2)"});lab.push([x,tp,k===toks.length-1?null:toks[k+1]]);x+=cw;});
+  if(s.img.length){g+=`<path d="M${s.vx} 84 L${x0+s.img[0]*cw/2} ${y-2}" stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="3 3" fill="none"/>`;}
+  g+=T((x0+x)/2,y+40,`sample ${s.n} (${toks.length} tokens)`,{fs:11.5,c:"var(--ink2)"});
+  if(si<S.length-1){g+=`<line x1="${x+3}" y1="${y-6}" x2="${x+3}" y2="${y+48}" stroke="var(--bad)" stroke-width="2.2"/>`;x+=8;}});
+ g+=T(20,y+64,"numbers in the boxes are position ids; red walls are the sample boundaries of the document mask",{a:"start",fs:11.5,c:"var(--muted)"});
+ // labels row
+ const yl=y+84;g+=T(14,yl-6,"Labels (target of each position after the shift by one)",{a:"start",fs:12.5,fw:700});
+ lab.forEach(([lx,tp,nx])=>{const on=nx==="a";g+=RC(lx,yl,cw-2,20,on?"var(--v-soft)":"var(--paper2)",on?"var(--v)":"var(--rule)",1.1)+T(lx+cw/2-1,yl+14,on?"✓":"×",{fs:12,fw:700,c:on?"var(--v)":"var(--muted)"});});
+ g+=T(20,yl+38,"✓ = answer token predicted here (loss);  × = −100 (image, prompt, last token of a sample)",{a:"start",fs:11.5,c:"var(--muted)"});
+ svg.innerHTML=g;
+})();
+
+/* ---------- Figure 2: padding versus sorting versus packing ---------- */
+(function(){
+ const svg=$("#bm-pad-svg");if(!svg)return;const Bs=$("#bm-pad-b"),Ls=$("#bm-pad-l"),info=$("#bm-pad-info");let mode="rand";
+ const D=[["q",384,488],["t",0,204],["a",2304,165],["v",2352,49],["t",0,1101],["q",960,77],["t",0,141],["l",576,135],["a",2880,67],["t",0,422],["q",756,194],["l",576,162],["l",576,87],["a",1728,300],["q",418,446],["l",576,288],["q",2295,102],["t",0,1310],["t",0,1011],["l",576,118],["l",576,46],["q",1881,347],["l",576,348],["l",576,159]];
+ const n=D.map(d=>d[1]+d[2]),real=n.reduce((a,b)=>a+b,0),ideal=n.reduce((a,b)=>a+b*b,0);
+ function plan(md,B,Lr){const rows=[];let slots=0,attn=0;
+  if(md==="pack"){const idx=[...n.keys()].sort((a,b)=>n[b]-n[a]||a-b);const bins=[];
+   idx.forEach(i=>{let r=bins.find(b=>b.t+n[i]<=Lr);if(!r){r={t:0,it:[]};bins.push(r);}r.it.push(i);r.t+=n[i];});
+   bins.forEach((b,k)=>rows.push({it:b.it,w:Lr,batch:k}));slots=bins.length*Lr;attn=ideal;}
+  else{const idx=[...n.keys()];if(md==="sort")idx.sort((a,b)=>n[b]-n[a]||a-b);
+   for(let b=0;b<idx.length;b+=B){const bb=idx.slice(b,b+B);const mx=Math.max(...bb.map(i=>n[i]));bb.forEach(i=>rows.push({it:[i],w:mx,batch:b/B}));slots+=bb.length*mx;attn+=bb.length*mx*mx;}}
+  return{rows,slots,attn};}
+ function draw(){const B=+Bs.value,Lr=+Ls.value?8192:4096;$("#bm-pad-bv").value=B;$("#bm-pad-lv").value=fmt(Lr);
+  Bs.disabled=mode==="pack";Ls.disabled=mode!=="pack";
+  const P=plan(mode,B,Lr);const nb=P.rows.length?P.rows[P.rows.length-1].batch+1:0;
+  const x0=64,W=540,Wmax=mode==="pack"?Lr:3000;const sc=W/Math.max(Wmax,...P.rows.map(r=>r.w));
+  const gap=mode==="pack"?14:4,avail=300-gap*(nb-1);const rh=Math.min(mode==="pack"?40:14,avail/P.rows.length);let g="",y=8,lastB=0;
+  P.rows.forEach((r,k)=>{if(r.batch!==lastB){y+=gap;lastB=r.batch;}let x=x0;
+   if(k===0||P.rows[k-1].batch!==r.batch)g+=T(x0-8,y+Math.min(rh,12)-1,mode==="pack"?`row ${r.batch+1}`:`batch ${r.batch+1}`,{a:"end",fs:10.5,c:"var(--ink2)"});
+   r.it.forEach(i=>{const v=D[i][1],t=D[i][2];g+=RC(x,y,v*sc,rh-1.5,"var(--q-soft)","var(--q)",.8);x+=v*sc;g+=RC(x,y,t*sc,rh-1.5,"var(--k-soft)","var(--k)",.8);x+=t*sc;if(r.it.length>1)g+=`<line x1="${x.toFixed(1)}" y1="${y-2}" x2="${x.toFixed(1)}" y2="${(y+rh).toFixed(1)}" stroke="var(--bad)" stroke-width="1.6"/>`;});
+   const used=r.it.reduce((a,i)=>a+n[i],0);if(r.w>used)g+=RC(x,y,(r.w-used)*sc,rh-1.5,"var(--paper2)","var(--rule)",.8);y+=rh;});
+  svg.innerHTML=g;
+  const pad=100*(1-real/P.slots);
+  info.innerHTML=`${mode==="pack"?`<b>${P.rows.length}</b> rows of ${fmt(Lr)}`:`<b>${P.rows.length}</b> rows in ${nb} batches of up to ${B}`}: <b>${fmt(P.slots)}</b> positions for ${fmt(real)} real tokens. Padding <b>${pad.toFixed(1)}%</b> (efficiency ${(100-pad).toFixed(1)}%). Attention work <b>${(P.attn/ideal).toFixed(2)}×</b> the minimum.`;
+  info.dataset.pad=pad.toFixed(1);info.dataset.attn=(P.attn/ideal).toFixed(2);info.dataset.rows=P.rows.length;}
+ seg($("#bm-pad-mode"),v=>{mode=v;draw();});[Bs,Ls].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: the packed mask and the labels ---------- */
+(function(){
+ const svg=$("#bm-mask-svg");if(!svg)return;const info=$("#bm-mask-info");let mode="doc",sel=21;
+ const S=[["A",4,2,3],["B",0,2,2],["C",6,1,2]];const tk=[];
+ S.forEach(([nm,vi,p,a],si)=>{let k=0;for(let j=0;j<vi;j++)tk.push({s:si,t:"i",k:k++,nm});for(let j=0;j<p;j++)tk.push({s:si,t:"p",k:k++,nm});for(let j=0;j<a;j++)tk.push({s:si,t:"a",k:k++,nm});});
+ const N=tk.length;
+ const ok=(q,k,md)=>{const a=tk[q],b=tk[k];if(md==="causal")return k<=q;if(a.s!==b.s)return false;if(k<=q)return true;return md==="bidi"&&a.t==="i"&&b.t==="i";};
+ const tgt=tk.map((a,t)=>t+1<N&&tk[t+1].s===a.s&&tk[t+1].t==="a");
+ function counts(md){let all=0,cross=0;for(let q=0;q<N;q++)for(let k=0;k<N;k++)if(ok(q,k,md)){all++;if(tk[q].s!==tk[k].s)cross++;}return{all,cross};}
+ function draw(){const cs=17,gx=62,gy=44;let g="";
+  for(let j=0;j<N;j++){const [f,st]=COL[tk[j].t];g+=`<g class="bm-cell" data-q="${j}">`+RC(gx+j*cs,gy-22,cs-1.5,16,f,st,1)+`</g>`;g+=`<g class="bm-cell" data-q="${j}">`+RC(gx-22,gy+j*cs,16,cs-1.5,f,st,j===sel?2.4:1)+`</g>`;}
+  g+=T(gx+N*cs/2,14,"keys (what is looked at)",{fs:12,c:"var(--ink2)"});
+  g+=`<text x="16" y="${gy+N*cs/2}" font-size="12" fill="var(--ink2)" text-anchor="middle" transform="rotate(-90 16 ${gy+N*cs/2})">queries</text>`;
+  for(let q=0;q<N;q++)for(let k=0;k<N;k++){const a=ok(q,k,mode);const cross=a&&tk[q].s!==tk[k].s;
+   const f=a?(cross?"var(--bad-soft)":"var(--ink2)"):"var(--paper2)";const op=a&&!cross?(q===sel?0.85:0.4):1;
+   g+=`<rect class="bm-cell" data-q="${q}" x="${gx+k*cs}" y="${gy+q*cs}" width="${cs-1.5}" height="${cs-1.5}" fill="${f}" fill-opacity="${op}" stroke="${q===sel&&a?(cross?"var(--bad)":"var(--ink)"):"var(--rule)"}" stroke-width="${q===sel&&a?1.6:.5}"/>`;}
+  let c0=0;S.forEach(([,vi,p,a])=>{const L=vi+p+a;g+=`<rect x="${gx+c0*cs-1}" y="${gy+c0*cs-1}" width="${L*cs}" height="${L*cs}" fill="none" stroke="var(--ink2)" stroke-width="1.4" stroke-dasharray="4 3"/>`;c0+=L;});
+  const ly=gy+N*cs+14;g+=T(gx-26,ly+12,"label",{a:"end",fs:11.5,c:"var(--ink2)"});
+  for(let t=0;t<N;t++){g+=RC(gx+t*cs,ly,cs-1.5,16,tgt[t]?"var(--v-soft)":"var(--paper2)",tgt[t]?"var(--v)":"var(--rule)",1)+T(gx+t*cs+cs/2-1,ly+12,tgt[t]?"✓":"×",{fs:11,fw:700,c:tgt[t]?"var(--v)":"var(--muted)"});}
+  // side panel
+  const C=counts(mode),q=tk[sel];let vis=0,own=0;for(let k=0;k<N;k++)if(ok(sel,k,mode)){vis++;if(tk[k].s===q.s)own++;}
+  const px=gx+N*cs+18;const TY={i:"image",p:"prompt",a:"answer"};
+  g+=T(px,gy+4,"Selected query",{a:"start",fw:700})+T(px,gy+24,`token ${sel} = sample ${q.nm}, ${TY[q.t]}`,{a:"start",fs:12.5})+T(px,gy+42,`position id ${q.k}`,{a:"start",fs:12.5,c:"var(--ink2)"});
+  g+=T(px,gy+66,`sees ${vis} keys`,{a:"start",fs:12.5})+T(px,gy+84,`${own} own, ${vis-own} from other samples`,{a:"start",fs:12.5,c:vis-own?"var(--bad)":"var(--ink2)"});
+  g+=T(px,gy+120,"Whole row",{a:"start",fw:700})+T(px,gy+140,`${C.all} allowed pairs`,{a:"start",fs:12.5})+T(px,gy+158,`${C.cross} cross-sample pairs`,{a:"start",fs:12.5,c:C.cross?"var(--bad)":"var(--ink2)"})+T(px,gy+176,`${tgt.filter(Boolean).length} loss positions of ${N}`,{a:"start",fs:12.5,c:"var(--ink2)"});
+  g+=T(px,gy+212,"Click a cell or a token",{a:"start",fs:11.5,c:"var(--muted)"})+T(px,gy+228,"to choose a query row.",{a:"start",fs:11.5,c:"var(--muted)"});
+  svg.innerHTML=g;
+  info.innerHTML=`${mode==="causal"?"Causal mask over the packed row":mode==="doc"?"Document (block-diagonal) causal mask":"Document mask with bidirectional attention inside each image"}: <b>${C.all}</b> allowed pairs, <b>${C.cross}</b> of them across samples. Query ${sel} (sample ${q.nm}, ${TY[q.t]}) sees <b>${vis}</b> keys, ${vis-own} from other samples. Loss positions: <b>${tgt.filter(Boolean).length}</b>.`;
+  info.dataset.all=C.all;info.dataset.cross=C.cross;info.dataset.vis=vis;}
+ svg.addEventListener("click",e=>{const c=e.target.closest("[data-q]");if(!c)return;sel=+c.dataset.q;draw();});
+ seg($("#bm-mask-mode"),v=>{mode=v;draw();});draw();
+})();
+
+/* ---------- Figure 4: loss weighting ---------- */
+(function(){
+ const svg=$("#bm-loss-svg");if(!svg)return;const Q=$("#bm-loss-q"),info=$("#bm-loss-info");let red="global";
+ const X=[1,8,30,120,400],MB=[0,0,0,1,1],NM=["yes/no","phrase","caption","description","transcription"];
+ function shares(q,md){const c=X.map(x=>x**(1-q));if(md==="global"){const s=c.reduce((a,b)=>a+b,0);return c.map(v=>100*v/s);}
+  const tot=[0,0];c.forEach((v,i)=>tot[MB[i]]+=v);return c.map((v,i)=>100*v/tot[MB[i]]/2);}
+ function draw(){const q=+Q.value;$("#bm-loss-qv").value=q.toFixed(2)+(q===0?" token":q===0.5?" square":q===1?" sample":"");
+  const sh=shares(q,red),ref=shares(q,"global");const x0=70,bw=80,gap=34,y1=190,H=160;let g=`<line x1="${x0-10}" y1="${y1}" x2="${x0+5*(bw+gap)}" y2="${y1}" stroke="var(--muted)"/>`;
+  [0,25,50,75].forEach(v=>{const y=y1-H*v/80;g+=`<line x1="${x0-10}" y1="${y}" x2="${x0+5*(bw+gap)}" y2="${y}" stroke="var(--rule)" stroke-dasharray="3 4"/>`+T(x0-14,y+4,v+"%",{a:"end",fs:11,c:"var(--ink2)"});});
+  sh.forEach((v,i)=>{const x=x0+i*(bw+gap),h=H*Math.min(v,80)/80;g+=RC(x,y1-h,bw,h,MB[i]?"var(--k-soft)":"var(--q-soft)",MB[i]?"var(--k)":"var(--q)",1.5)+T(x+bw/2,y1-h-6,v.toFixed(v<1?2:1)+"%",{fw:700,fs:12.5});
+   if(red==="local"){const hr=H*Math.min(ref[i],80)/80;g+=`<line x1="${x}" y1="${(y1-hr).toFixed(1)}" x2="${x+bw}" y2="${(y1-hr).toFixed(1)}" stroke="var(--ink)" stroke-width="2" stroke-dasharray="5 3"/>`;}
+   g+=T(x+bw/2,y1+18,NM[i],{fs:12})+T(x+bw/2,y1+34,`x = ${X[i]}`,{fs:11.5,c:"var(--ink2)"});});
+  g+=T(x0+1.5*bw+gap,y1+52,"micro-batch 1",{fs:11.5,c:"var(--q)",fw:700})+T(x0+3.5*bw+3.5*gap,y1+52,"micro-batch 2",{fs:11.5,c:"var(--k)",fw:700});
+  svg.innerHTML=g;const pt=(sh[0]/X[0])/(sh[4]/X[4]);
+  info.innerHTML=`q = ${q.toFixed(2)}${red==="local"?" with the per-micro-batch bug (dashed lines: the correct shares)":""}. Shares: ${sh.map((v,i)=>NM[i]+" <b>"+v.toFixed(2)+"%</b>").join(", ")}. One token of the 1-token answer weighs <b>${pt.toFixed(1)}×</b> one token of the 400-token answer.`;
+  info.dataset.s=sh.map(v=>v.toFixed(2)).join(",");}
+ seg($("#bm-loss-red"),v=>{red=v;draw();});Q.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 5: balancing GPUs ---------- */
+(function(){
+ const svg=$("#bm-gpu-svg");if(!svg)return;const Rr=$("#bm-gpu-r"),info=$("#bm-gpu-info");let mode="rand",G=8;
+ const D=[["t",0,75],["v",2304,44],["q",168,66],["l",576,342],["a",2304,144],["l",576,271],["q",600,96],["l",576,301],["q",1920,290],["q",1652,209],["a",1728,209],["q",812,244],["t",0,313],["l",576,189],["a",1728,36],["v",3136,120],["v",1152,26],["q",112,36],["q",316,407],["t",0,162],["l",576,262],["a",2880,175],["a",1728,94],["t",0,820],["a",1728,216],["v",3136,147],["l",576,176],["l",576,116],["t",0,829],["l",576,239],["t",0,576],["l",576,359],["l",576,39],["l",576,226],["t",0,1332],["a",2304,171],["a",1728,165],["t",0,987],["q",192,464],["t",0,771],["a",1728,297],["t",0,939],["l",576,305],["q",510,445],["l",576,179],["l",576,333],["q",777,112],["q",192,348],["q",1533,287],["l",576,30],["q",246,178],["q",190,182],["v",2304,112],["a",2304,223],["q",328,112],["v",1152,50],["v",3136,31],["a",2880,47],["a",2880,132],["l",576,319],["l",576,102],["q",540,153],["t",0,1070],["t",0,1073]];
+ const NS=24704,Nn=D.length,n=D.map(d=>d[1]+d[2]);
+ function assign(md,G,r){const c=D.map((d,i)=>n[i]+n[i]*n[i]/NS+r*d[1]);const per=Nn/G;const A=[...Array(G)].map(()=>[]);
+  const argmin=t=>{let b=0;for(let g=1;g<G;g++)if(t[g]<t[b])b=g;return b;};
+  if(md==="rand"){for(let g=0;g<G;g++)for(let i=g*per;i<(g+1)*per;i++)A[g].push(i);}
+  else if(md==="llava"){const idx=[...n.keys()].sort((a,b)=>n[b]-n[a]||a-b);const t=Array(G).fill(0);idx.forEach(i=>{const g=argmin(t);A[g].push(i);t[g]+=n[i];if(A[g].length===per)t[g]=Infinity;});}
+  else{const idx=[...n.keys()].sort((a,b)=>c[b]-c[a]||a-b);const t=Array(G).fill(0);idx.forEach(i=>{const g=argmin(t);A[g].push(i);t[g]+=c[i];});}
+  const parts=A.map(a=>{let l=0,at=0,v=0;a.forEach(i=>{l+=n[i];at+=n[i]*n[i]/NS;v+=r*D[i][1];});return{l,at,v,tot:l+at+v,cnt:a.length,vt:a.reduce((s,i)=>s+D[i][1],0)};});
+  const mx=Math.max(...parts.map(p=>p.tot)),mean=parts.reduce((s,p)=>s+p.tot,0)/G;return{parts,mx,mean};}
+ function draw(){const r=+Rr.value;$("#bm-gpu-rv").value=r.toFixed(1);
+  const res=assign(mode,G,r),base=assign("rand",G,r);const scale=Math.max(res.mx,base.mx);
+  const x0=70,W=470,y0=10,H=250,rh=H/G;let g="";
+  res.parts.forEach((p,k)=>{const y=y0+k*rh,h=Math.max(2,rh-3);let x=x0;
+   [[p.l,"var(--k-soft)","var(--k)"],[p.at,"var(--q-soft)","var(--q)"],[p.v,"var(--v-soft)","var(--v)"]].forEach(([v,f,s])=>{const w=W*v/scale;g+=RC(x,y,w,h,f,s,1);x+=w;});
+   g+=T(x0-8,y+h/2+4,"GPU "+(k+1),{a:"end",fs:G>8?9.5:11.5,c:"var(--ink2)"});if(G<=8)g+=T(x+6,y+h/2+4,`${p.cnt} samples, ${fmt(p.vt)} vis.`,{a:"start",fs:11,c:"var(--ink2)"});});
+  const xm=x0+W*res.mx/scale,xa=x0+W*res.mean/scale;
+  g+=`<line x1="${xm.toFixed(1)}" y1="${y0-4}" x2="${xm.toFixed(1)}" y2="${y0+H}" stroke="var(--bad)" stroke-width="2" stroke-dasharray="5 3"/>`+`<line x1="${xa.toFixed(1)}" y1="${y0-4}" x2="${xa.toFixed(1)}" y2="${y0+H}" stroke="var(--muted)" stroke-width="1.4" stroke-dasharray="2 3"/>`;
+  g+=T(xm,y0+H+18,"slowest GPU = step time",{fs:11.5,c:"var(--bad)",fw:700,a:xm>x0+W-60?"end":"middle"})+T(xa,y0+H+34,"average",{fs:11,c:"var(--muted)"});
+  svg.innerHTML=g;const U=100*res.mean/res.mx,sp=base.mx/res.mx;
+  info.innerHTML=`${G} GPUs, r = ${r.toFixed(1)}. Step time <b>${fmt(res.mx)}</b> units, average GPU ${fmt(res.mean)}: utilization <b>${U.toFixed(1)}%</b>. Speed-up over equal-count random: <b>${sp.toFixed(2)}×</b>. Samples per GPU: ${Math.min(...res.parts.map(p=>p.cnt))} to ${Math.max(...res.parts.map(p=>p.cnt))}.`;
+  info.dataset.u=U.toFixed(1);info.dataset.sp=sp.toFixed(2);}
+ seg($("#bm-gpu-mode"),v=>{mode=v;draw();});seg($("#bm-gpu-g"),v=>{G=+v;draw();});Rr.addEventListener("input",draw);draw();
+})();
+})();
+</script></body></html>

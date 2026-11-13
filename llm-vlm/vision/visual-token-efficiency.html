@@ -1,0 +1,469 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Visual token efficiency · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 183</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="visual-token-efficiency">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="visual-token-efficiency" data-session="visual-token-efficiency" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">183</span><span>Track 7: Vision and VLMs · session 21 of 38</span></div><h1 class="chap-title">Visual token efficiency</h1><p class="chap-sub">One image can become hundreds or thousands of tokens, and a short video can become tens of thousands. These visual tokens usually far outnumber the text tokens, so they decide most of the prefill time and the KV-cache memory of a VLM. This session counts that cost, then builds the main ways to cut it: token merging (ToMe), pruning by attention inside the language model (FastV), fixed-budget resamplers and dynamic token counts. It ends with how to measure the accuracy versus cost trade-off without fooling yourself.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Beginner to interview level</span><span><b>Before this:</b> Sessions 164 (ViT), 177 (anatomy of a VLM), 178 (connectors) and 180 (high resolution); session 80 (the KV cache) helps</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why visual tokens dominate the cost of a VLM: token counts, prefill FLOPs and KV-cache memory for real models (LLaVA-1.5, LLaVA-NeXT, Qwen2-VL), and what video does to them</li><li>The three places to remove tokens: inside the vision encoder, in the connector, and inside the language model</li><li>Token merging (ToMe): bipartite soft matching on keys, size-weighted averages and proportional attention, with the token schedule and its FLOPs</li><li>Pruning by attention (FastV): rank image tokens by the attention they receive at layer K, drop R% of them, and the theoretical FLOPs ratio</li><li>Fixed-budget resamplers (Q-Former, Perceiver) versus dynamic token counts (AnyRes tiling, Qwen2-VL native resolution, Matryoshka tokens)</li><li>How to measure the trade-off honestly: wall-clock latency with FlashAttention, end-to-end time, random and pooling baselines at the same budget, and vision-centric benchmarks</li></ul></div></header><style>
+.vt-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.vt-grid input[type=range]{width:100%;min-width:0}
+.vt-grid output{font-family:var(--mono);font-size:14px;min-width:4.5em;text-align:right}
+.vt-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.vt-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:2px;margin-right:6px;vertical-align:0;background:var(--c);border:1.5px solid var(--b,transparent)}
+.vt-seg{flex-wrap:wrap}
+.vt-svg text{font-family:var(--sans)}
+.article pre.code,.article code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Ask LLaVA-1.5 “What is in this picture?”. The question is about 10 text tokens. The picture is 576 tokens. The language model spends more than 90% of its prefill work on the image, and the image also fills more than 90% of the KV cache. For a video it is worse: 32 frames at 576 tokens each are 18,432 tokens, before the user has typed a word.</p>
+<p>A <b>visual token</b> is one vector that the language model reads in place of a piece of the image (one patch, or a merged group of patches). In <a href="../vision/anatomy-of-a-vision-language-model.html">session 177</a> we counted them with \(V = (H/P)(W/P)/r^2\). In <a href="../vision/high-resolution-and-native-aspect-ratio.html">session 180</a> we saw that reading documents and charts needs <b>more</b> of them: tiling and native resolution push one image to thousands of tokens. This session is the other side of the same coin. Visual tokens are expensive, many of them carry little information (sky, wall, white paper), and there are good ways to remove them.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “Why is a VLM slower than the same LLM on text?”, “How would you serve a video-LLM at 10× lower cost?”, “How does ToMe work?”, “What does FastV prune, and where?”, “Q-Former or MLP projector, and why?”. Strong answers start with a token count and a FLOPs or memory number, then name where in the model the tokens are removed.</aside>
+<p>The ideas here are used in real systems. Fixed-budget resamplers (BLIP-2’s 32 queries, Flamingo’s and Idefics2’s 64 latents) were designed to cap the token count. Pixel shuffle (a 2 × 2 merge) is used in Qwen2-VL, InternVL, Idefics3 and SmolVLM (<a href="../vision/connectors-projector-q-former-perceiver-resampler-pixel.html">session 178</a>). Training-free methods such as ToMe and FastV can be added to a model that is already trained. Long-video systems (<a href="../video/index.html#row-long-video" title="Long video (planned)">session 206</a>) depend on token compression to fit hours of video into a context window.</p>
+<p>The plan: first we count the cost (Figure 1); then we see the three places where tokens can be removed; then token merging (Figure 2) and pruning by attention (Figure 3); then fixed versus dynamic budgets (Figure 4); and finally how to measure the gain without fooling yourself (Figure 5). The main survey of this area is Jin et al. (2024), and the book chapter on video-language models (Noyan et al., chapter 9) shows the same problem for video.</p>
+
+<h2>Where the cost goes</h2>
+<p>Let a request have \(V\) visual tokens and \(T\) text tokens, so the language model reads \(n = V + T\) tokens in prefill. The <b>visual share</b> of the input is</p>
+<div class="eq">\[ f_{\text{vis}} = \frac{V}{V + T} \tag{183.1} \]</div>
+<p>With 576 visual tokens and 40 text tokens, \(f_{\text{vis}} = 93.5\%\). Two costs grow with \(n\).</p>
+<h3>Prefill compute</h3>
+<p>In <b>prefill</b> (the first forward pass over the whole prompt, <a href="../inference/the-generation-loop-prefill-and-decode.html">session 78</a>), every token passes through every layer. For one Llama-style layer with hidden width \(d\), MLP width \(m\) and a SwiGLU MLP (three weight matrices), the FLOPs are about</p>
+<div class="eq">\[ C(n) = \underbrace{2n\,(4d^2 + 3dm)}_{\text{weight matrices}} + \underbrace{4n^2 d}_{\text{attention scores and mixing}} \tag{183.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n\)</dt><dd>the number of tokens in the prompt (visual plus text)</dd>
+<dt>\(d\)</dt><dd>the hidden width of the language model (4,096 for a 7B Llama)</dd>
+<dt>\(m\)</dt><dd>the inner width of the MLP (11,008 for Llama 2 7B and Vicuna-7B)</dd>
+<dt>\(4d^2\)</dt><dd>the four attention projections \(W_Q, W_K, W_V, W_O\), each \(d \times d\), one multiply-add each (2 FLOPs)</dd>
+<dt>\(3dm\)</dt><dd>the three MLP matrices (gate, up, down)</dd>
+<dt>\(4n^2 d\)</dt><dd>the score matrix \(QK^\top\) and the weighted sum with \(V\), each \(n^2 d\) multiply-adds (we ignore the causal mask, which halves this)</dd></dl>
+<p>The first term is <b>linear</b> in \(n\): every token costs the same. The second term is <b>quadratic</b> and only matters when \(n\) is large. Multiply by the number of layers \(L\) for the whole model. Each visual token costs exactly as much as a text token, so removing visual tokens is the most direct way to cut prefill.</p>
+<h3>KV-cache memory</h3>
+<p>After prefill, the model keeps the keys and values of every token in every layer (<a href="../inference/the-kv-cache.html">session 80</a>). The memory is</p>
+<div class="eq">\[ M_{\text{KV}} = 2 \cdot L \cdot n_{\text{kv}} \cdot d_h \cdot b \cdot n \tag{183.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2\)</dt><dd>one key and one value per token per layer</dd>
+<dt>\(L\)</dt><dd>the number of layers (32 for a 7B Llama)</dd>
+<dt>\(n_{\text{kv}}, d_h\)</dt><dd>the number of key-value heads and their width; Vicuna-7B uses full multi-head attention, so \(n_{\text{kv}} d_h = 32 \times 128 = 4{,}096\)</dd>
+<dt>\(b\)</dt><dd>bytes per number (2 for FP16 or BF16)</dd></dl>
+<p>Every decode step reads this whole cache from memory, so a larger cache also makes each generated token slower and leaves less room for other users in the batch.</p>
+<div class="worked"><div class="wt">Worked example: LLaVA-1.5-7B, one image</div>
+<p><b>Tokens.</b> 576 visual + 40 text = 616 tokens. Visual share: \(576/616 = 93.5\%\).</p>
+<p><b>Prefill.</b> With \(d = 4096\), \(m = 11008\), \(L = 32\): \(32 \cdot C(616) = 8.18 \times 10^{12}\) FLOPs. The 40 text tokens alone would cost \(32 \cdot C(40) = 0.52 \times 10^{12}\). So the image adds \(93.7\%\) of the prefill work. At this length the quadratic attention term is only about 2.4% of \(C(n)\); the cost is almost all in the weight matrices, and so almost exactly proportional to the number of tokens.</p>
+<p><b>KV cache.</b> \(2 \cdot 32 \cdot 4096 \cdot 2 = 524{,}288\) bytes = 0.5 MiB per token. The image costs \(576 \times 0.5 = 288\) MiB per request.</p>
+<p><b>Video.</b> 32 frames at 576 tokens: 18,432 visual tokens, \(4.18 \times 10^{14}\) prefill FLOPs, and 9 GiB of KV cache for one request. Now the attention term is 43% of \(C(n)\): long inputs make the quadratic part matter.</p></div>
+<p>Use Figure 1 to try other models. All of them run through the same 7B language model shape here, so that only the token count changes.</p>
+<figure class="fig" id="vt-bud"><div class="fig-body">
+<div class="controls"><span class="seg vt-seg" id="vt-bud-enc"><button type="button" data-v="llava" aria-pressed="true">LLaVA-1.5 (576)</button><button type="button" data-v="next" aria-pressed="false">LLaVA-NeXT 672² (2,880)</button><button type="button" data-v="qwen" aria-pressed="false">Qwen2-VL 1080p (2,691)</button><button type="button" data-v="idef" aria-pressed="false">Idefics2 (64)</button><button type="button" data-v="qf" aria-pressed="false">Q-Former (32)</button></span></div>
+<div class="vt-grid" style="margin-top:8px">
+<label for="vt-bud-f">Images or frames</label><input type="range" id="vt-bud-f" min="1" max="64" step="1" value="1"><output id="vt-bud-fv"></output>
+<label for="vt-bud-t">Text tokens</label><input type="range" id="vt-bud-t" min="10" max="2000" step="10" value="40"><output id="vt-bud-tv"></output></div>
+<div class="scroll-x"><svg class="vt-svg" id="vt-bud-svg" viewBox="0 0 640 200" role="img" aria-label="Bars showing the share of tokens, prefill FLOPs and KV cache taken by visual tokens" style="min-width:520px"></svg></div>
+<div class="vt-leg"><span style="--c:var(--q-soft);--b:var(--q)">visual tokens</span><span style="--c:var(--k-soft);--b:var(--k)">text tokens</span></div>
+<div class="readout" id="vt-bud-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The token budget of one request through a 7B Llama-shaped language model (\(d = 4096\), \(m = 11008\), \(L = 32\), FP16 KV cache with no grouped-query attention). Token counts per image are the real counts of each design (LLaVA-NeXT before removing padding, Qwen2-VL for a 1920 × 1080 image with its default pixel limits).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>The first bar is the share of tokens, the second is the share of prefill FLOPs that the images add (formula 183.2 with and without them), and the third is the KV-cache memory. Start with LLaVA-1.5 and one image, then move the frames slider to 32: the visual part fills almost everything and the KV cache passes 9 GiB. Then pick Q-Former: 32 tokens per image makes even 64 frames cheap. That is why fixed-budget resamplers were popular for video. Raise the text tokens to 2,000 (a long document question) and see that a single LLaVA-1.5 image becomes a minority.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>Grouped-query attention changes the KV numbers. Qwen2-VL-7B, for example, has 4 KV heads of width 128 and 28 layers, so it stores far less per token than Vicuna-7B. Always read \(n_{\text{kv}}\) from the model’s config.json before you compute memory.</aside>
+
+<h2>Three places to remove tokens</h2>
+<p>A visual token passes through three parts of the model: the vision encoder, the connector, and the language model (<a href="../vision/anatomy-of-a-vision-language-model.html">session 177</a>). You can remove tokens in any of them, and the choice decides what you save and what you risk.</p>
+<ol>
+<li><b>Inside the vision encoder.</b> Merge or drop patch tokens between ViT layers. This saves encoder compute and, if the reduced set is passed on, also the language model’s work. Example: ToMe. The language model never sees the dropped tokens, and the reduction does not know the user’s question.</li>
+<li><b>In the connector.</b> Map the \(N\) patch vectors to fewer tokens: pool or merge neighbors (pixel shuffle, 2 × 2 average pooling), or pull out a fixed number \(Q\) with learned queries (Q-Former, Perceiver resampler). This is usually part of the design and trained with the model. It also does not know the question (except InstructBLIP-style Q-Formers that also read the instruction).</li>
+<li><b>Inside the language model.</b> Run the first few layers on all tokens, then drop visual tokens that the model is not using. Example: FastV. This can use the question, because by layer \(K\) the text tokens have already looked at the image. But the first \(K\) layers still pay full price, and the encoder is not made cheaper.</li></ol>
+<aside class="note analogy side"><span class="nt">Analogy</span>Packing for a trip. You can pack less at home (encoder), use a compression bag with a fixed size (resampler), or carry everything to the hotel and throw away what you did not use after the first day (pruning in the LLM). The last option knows best what you need, but you already paid to carry it on day one.</aside>
+<p>There is a second axis: <b>merge</b> or <b>prune</b>. Pruning deletes a token and its information. Merging replaces several tokens by one average, so the information is blurred but not lost. Most methods are a mix: LLaVA-PruMerge, for example, keeps the tokens that the encoder’s class token attends to most, and merges the information of the pruned tokens into the kept ones, reaching about 14× fewer visual tokens on LLaVA-1.5 [Certain, from the paper’s abstract].</p>
+
+<h2>Token merging (ToMe)</h2>
+<p><b>Token merging</b> (ToMe, Bolya et al., 2022) speeds up a trained ViT without retraining. In every block, between the attention and the MLP, it merges the \(r\) most similar pairs of tokens. After \(L\) layers, \(rL\) tokens are gone. The trick is to find similar pairs quickly: comparing all pairs, or clustering, would be too slow to do in every layer.</p>
+<h3>Bipartite soft matching</h3>
+<p>ToMe splits the current tokens into two sets by position: \(\mathcal{A}\) holds tokens 0, 2, 4, …; \(\mathcal{B}\) holds tokens 1, 3, 5, …. Then:</p>
+<div class="eq">\[ s_{ij} = \frac{\mathbf{k}_i^\top \mathbf{k}_j}{\lVert \mathbf{k}_i \rVert\,\lVert \mathbf{k}_j \rVert}, \quad i \in \mathcal{A},\ j \in \mathcal{B}; \qquad j^*(i) = \argmax_{j \in \mathcal{B}} s_{ij} \tag{183.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{k}_i\)</dt><dd>the key vector of token \(i\) in this layer’s attention, averaged over heads; keys already summarize “what this token contains”, so no extra computation is needed</dd>
+<dt>\(s_{ij}\)</dt><dd>cosine similarity between token \(i\) in \(\mathcal{A}\) and token \(j\) in \(\mathcal{B}\)</dd>
+<dt>\(j^*(i)\)</dt><dd>the best partner in \(\mathcal{B}\) for token \(i\)</dd></dl>
+<p>Each \(\mathcal{A}\) token keeps only one edge, to its best partner. ToMe sorts these edges by similarity and merges the top \(r\) of them; the other \(\mathcal{A}\) tokens stay. Because every edge goes from \(\mathcal{A}\) to \(\mathcal{B}\), no chains form, and the whole step is a matrix product plus a sort. At most \(|\mathcal{A}|\), about half the tokens, can be merged in one layer. The class token is protected (it is never merged).</p>
+<h3>Size-weighted merging and proportional attention</h3>
+<p>When token \(a\) merges into token \(b\), the result is the average weighted by <b>size</b>, where the size \(s\) counts how many original patches a token stands for:</p>
+<div class="eq">\[ \mathbf{x}_{b} \leftarrow \frac{s_a \mathbf{x}_a + s_b \mathbf{x}_b}{s_a + s_b}, \qquad s_b \leftarrow s_a + s_b \tag{183.5} \]</div>
+<p>A merged token is now one vector in place of several. In attention it would get the weight of one token, which is less than the original group had. ToMe fixes this with <b>proportional attention</b>: add \(\log s\) to the attention logits of each key,</p>
+<div class="eq">\[ \text{Attn}(Q, K, V) = \softmax\!\left( \frac{Q K^\top}{\sqrt{d_h}} + \log \mathbf{s} \right) V \tag{183.6} \]</div>
+<p>Why \(\log s\)? Because \(e^{z + \log s} = s\, e^{z}\): a key that stands for \(s\) identical tokens gets exactly \(s\) times the weight, as if the copies were still there. The code below checks this: merging two identical tokens with proportional attention gives the same output as not merging, to about \(10^{-7}\).</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A town meeting where neighbors who agree send one speaker. The speaker says what they all think (the average), and when there is a vote, the speaker holds up as many hands as the people sent (proportional attention).</aside>
+<div class="algo"><div class="algo-h">Algorithm 1: one ToMe step inside a ViT block</div><ol>
+<li><b>input:</b> tokens \(\mathbf{x}_1..\mathbf{x}_N\), sizes \(s_1..s_N\), merge count \(r\)</li>
+<li>run attention with the \(\log \mathbf{s}\) bias (183.6); keep the keys \(\mathbf{k}\), averaged over heads</li>
+<li>\(\mathcal{A} \leftarrow\) even positions, \(\mathcal{B} \leftarrow\) odd positions; protect the class token</li>
+<li>for each \(i \in \mathcal{A}\): \(j^*(i) \leftarrow \argmax_j s_{ij}\), \(\;e_i \leftarrow \max_j s_{ij}\) <span class="c">// formula 183.4</span></li>
+<li>\(r \leftarrow \min(r, |\mathcal{A}|)\); merge the \(r\) tokens of \(\mathcal{A}\) with the largest \(e_i\) into their \(j^*(i)\) <span class="c">// formula 183.5</span></li>
+<li>concatenate the unmerged \(\mathcal{A}\) tokens and all \(\mathcal{B}\) tokens: \(N - r\) tokens</li>
+<li>run the MLP on the \(N - r\) tokens</li></ol></div>
+<h3>The token schedule</h3>
+<p>With a constant \(r\), layer \(\ell\) ends with \(N_\ell = N_0 - \ell r\) tokens (until half of the tokens can no longer be merged). The total cost is the sum of the per-layer costs:</p>
+<div class="eq">\[ N_\ell = N_0 - \ell\, r, \qquad \text{cost} \approx \sum_{\ell=1}^{L} C_{\text{ViT}}(N_{\ell-1}, N_\ell) \tag{183.7} \]</div>
+<p>Here \(C_{\text{ViT}}\) is a ViT layer’s cost with attention on \(N_{\ell-1}\) tokens and the MLP on \(N_\ell\) tokens (merging happens in between).</p>
+<div class="worked"><div class="wt">Worked example: ToMe in the CLIP encoder of LLaVA-1.5</div>
+<p>CLIP ViT-L/14 at 336 px has \(N_0 = 577\) tokens (576 patches and a class token), 24 layers, width 1,024 and MLP width 4,096. With \(r = 16\) per layer, the last layer ends with \(577 - 24 \times 16 = 193\) tokens. Counting each layer as \(2N_{\ell-1} \cdot 4d^2 + 4N_{\ell-1}^2 d\) for attention and \(2N_\ell \cdot 2dm\) for the MLP, the encoder needs <b>64.9%</b> of its original FLOPs (about 1.54× fewer). With \(r = 8\): 385 tokens and 82.1%.</p>
+<p>The bigger saving is downstream: if the 192 merged patch tokens are passed to the language model in place of 576, its prefill work falls to about one third. But the language model was trained on a regular 24 × 24 grid, and merged tokens no longer sit on a grid, so without fine-tuning accuracy can drop more than in the encoder alone [Likely].</p></div>
+<p>ToMe reported about 2× the throughput of ViT-L at 512 px and ViT-H at 518 px off the shelf with a 0.2–0.3% accuracy drop on ImageNet, and 2.2× for ViT-L on video, where it merges similar tokens across frames too [Certain, from the paper]. Video is where merging shines: a static background repeated over 16 frames is exactly the kind of redundancy it removes.</p>
+<figure class="fig" id="vt-tome"><div class="fig-body">
+<div class="vt-grid">
+<label for="vt-tome-r">\(r\) per layer</label><input type="range" id="vt-tome-r" min="0" max="40" step="1" value="12"><output id="vt-tome-rv"></output>
+<label for="vt-tome-l">Layers</label><input type="range" id="vt-tome-l" min="0" max="10" step="1" value="6"><output id="vt-tome-lv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="seg" id="vt-tome-mode"><button type="button" data-v="sim" aria-pressed="true">Bipartite matching (ToMe)</button><button type="button" data-v="rand" aria-pressed="false">Random pairs</button></span></div>
+<div class="scroll-x"><svg class="vt-svg" id="vt-tome-svg" viewBox="0 0 640 300" role="img" aria-label="A 12 by 12 grid of image patches before and after token merging" style="min-width:520px"></svg></div>
+<div class="readout" id="vt-tome-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Token merging on a toy 12 × 12 image (144 tokens). Each token’s feature is its color; the similarity is the cosine of centered colors. Right: every patch is painted with the average color of the token it now belongs to, and dark lines separate different tokens. The error is the mean squared difference between each patch and its token.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With ToMe matching, sky merges with sky and grass with grass, and the small red object and the sun keep their own tokens for a long time: the error stays small while the count falls. Switch to random pairs with the same count: patches of different regions are averaged together and the error jumps. Push \(r\) above half the tokens: the count stops at what one bipartite step can merge (at most half per layer). In a real ViT the features change from layer to layer; here they do not, so the picture shows only the merging rule.</p></details></figure>
+
+<h2>Pruning by attention inside the language model (FastV)</h2>
+<p>FastV (Chen et al., 2024) looked at the attention maps of LLaVA-1.5 and found something surprising. In the first two layers, image tokens receive a fair share of attention. After layer 2, an average image token receives only about 0.21% of the attention that an average system-prompt token receives, even though image tokens were about 64% of the input tokens in their tests [Certain, from the paper]. In deep layers the model mostly ignores most image tokens. So why keep computing them?</p>
+<h3>The rule</h3>
+<p>Run the language model normally up to layer \(K\). At layer \(K\), compute how much attention each image token receives, averaged over heads and over all query tokens:</p>
+<div class="eq">\[ a_j = \frac{1}{H\, n} \sum_{h=1}^{H} \sum_{i=1}^{n} A^{(K)}_{h,i,j}, \qquad j \in \text{image tokens} \tag{183.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(A^{(K)}_{h,i,j}\)</dt><dd>the attention probability from query token \(i\) to key token \(j\) in head \(h\) of layer \(K\)</dd>
+<dt>\(H\), \(n\)</dt><dd>the number of heads and the number of tokens</dd>
+<dt>\(a_j\)</dt><dd>the importance score of image token \(j\): how much the rest of the sequence looks at it</dd></dl>
+<p>Keep the top \((1 - R)\) fraction of image tokens by \(a_j\), drop the rest, and run layers \(K+1\) to \(L\) on the shorter sequence. Text tokens are never dropped. The dropped tokens also leave the KV cache of those layers, so decoding gets cheaper too. No training is needed.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: FastV prefill</div><ol>
+<li><b>input:</b> sequence of \(n = n_{\text{sys}} + V + T\) tokens, filter layer \(K\), drop ratio \(R\)</li>
+<li>run layers \(1..K\) on all \(n\) tokens; at layer \(K\), also return the attention probabilities</li>
+<li>\(a_j \leftarrow\) mean over heads and queries of the attention to image token \(j\) <span class="c">// formula 183.8</span></li>
+<li>keep \(\lceil (1-R)\,V \rceil\) image tokens with the largest \(a_j\), in their original order, with their original position ids</li>
+<li>run layers \(K+1..L\) on \(\hat n = n_{\text{sys}} + (1-R)V + T\) tokens</li>
+<li>decode as usual; layers after \(K\) keep only \(\hat n\) entries in the KV cache</li></ol></div>
+<h3>What it saves, in theory</h3>
+<div class="eq">\[ \rho = \frac{K\, C(n) + (L - K)\, C(\hat n)}{L\, C(n)}, \qquad \hat n = n - R\,V \tag{183.9} \]</div>
+<p>\(\rho\) is the fraction of prefill FLOPs that remains, with \(C\) from formula (183.2). The KV cache shrinks by the same kind of ratio, with \(n\) in place of \(C(n)\).</p>
+<div class="worked"><div class="wt">Worked example: FastV with K = 2, R = 50%</div>
+<p>LLaVA-1.5-7B, 576 image tokens and 40 other tokens, so \(n = 616\) and \(\hat n = 40 + 288 = 328\). With \(L = 32\): \(\rho = (2\,C(616) + 30\,C(328)) / (32\,C(616)) = 0.556\). Prefill FLOPs fall by about 44%. The KV cache falls to \((2 \cdot 616 + 30 \cdot 328)/(32 \cdot 616) = 56.2\%\).</p>
+<p>For LLaVA-1.5-13B (\(d = 5120\), \(m = 13824\), \(L = 40\)) the same setting gives \(\rho = 0.551\). The paper reports about 45% fewer FLOPs for this model with no loss on its benchmark average (73.6 before and after on captioning, A-OKVQA and MMMU) [Certain, from the paper]. Its own FLOPs formula is slightly different, so do not expect every digit to match.</p>
+<p>With \(R = 75\%\): \(\hat n = 184\) and \(\rho = 0.338\). Moving the filter to \(K = 16\) with \(R = 50\%\) keeps \(\rho = 0.763\): late pruning saves little, because half the layers already paid full price.</p></div>
+<figure class="fig" id="vt-fv"><div class="fig-body">
+<div class="controls"><span class="seg" id="vt-fv-model"><button type="button" data-v="7" aria-pressed="true">LLaVA-1.5-7B</button><button type="button" data-v="13" aria-pressed="false">LLaVA-1.5-13B</button></span></div>
+<div class="vt-grid" style="margin-top:8px">
+<label for="vt-fv-k">Filter layer \(K\)</label><input type="range" id="vt-fv-k" min="0" max="31" step="1" value="2"><output id="vt-fv-kv"></output>
+<label for="vt-fv-r">Drop ratio \(R\)</label><input type="range" id="vt-fv-r" min="0" max="95" step="5" value="50"><output id="vt-fv-rv"></output>
+<label for="vt-fv-b">Position bias of the score</label><input type="range" id="vt-fv-b" min="0" max="1" step="0.05" value="0"><output id="vt-fv-bv"></output></div>
+<div class="scroll-x"><svg class="vt-svg" id="vt-fv-svg" viewBox="0 0 640 260" role="img" aria-label="Tokens per layer with FastV pruning, and a 24 by 24 map of the image tokens that are kept" style="min-width:560px"></svg></div>
+<div class="vt-leg"><span style="--c:var(--q-soft);--b:var(--q)">image tokens kept</span><span style="--c:var(--k-soft);--b:var(--k)">text and system tokens</span><span style="--c:var(--paper2);--b:var(--rule)">pruned</span></div>
+<div class="readout" id="vt-fv-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> FastV in numbers. Left: tokens in each of the \(L\) layers (40 text and system tokens, 576 image tokens). Right: which of the 24 × 24 image tokens survive. The scores on the right are synthetic: two “objects” plus noise, and an optional bias toward tokens late in the sequence (the bottom of the image).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The FLOPs ratio comes from formula (183.9) with the real layer shapes of each model. Move \(K\) to the right and the savings shrink quickly. Raise \(R\) and the savings grow, but the map on the right gets thin. Now raise the position bias: the kept tokens slide to the bottom rows. Real attention scores in a RoPE language model have this bias, because RoPE makes attention decay with distance and the bottom rows of the image sit closest to the text that follows. Then a question about the top of the image loses its evidence.</p></details></figure>
+<h3>The practical catches</h3>
+<ul>
+<li><b>It needs the attention matrix.</b> Fast kernels such as FlashAttention never write the \(n \times n\) attention probabilities to memory (<a href="../inference/attention-operator-1-flashattention-1-2-and.html">session 124</a>). FastV needs them at layer \(K\), so that layer must run a slower path or recompute the scores. Wen et al. (2025) report that FastV, SparseVLM and MustDrop do not support FlashAttention, and that SparseVLM had only 2.8% more FLOPs than FastV but 26.8% more latency [Certain, from the paper].</li>
+<li><b>Position bias.</b> Endo et al. (2024) found that pruning after a shallow layer keeps tokens concentrated at the bottom of the image, and traced it to the long-distance decay of RoPE [Certain, from the paper]. They also found that early-layer pruning keeps good scores on many benchmarks but fails on localization tasks.</li>
+<li><b>The first \(K\) layers and the encoder still pay in full.</b> With small \(K\) this is a small part of prefill, but the vision encoder cost is untouched.</li>
+<li><b>It interacts with batching.</b> Different requests keep different tokens, which is fine for a serving engine with paged KV memory, but harder for code that assumes fixed shapes.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Where would you prune visual tokens?” A good answer compares three places: before the LLM (cheap, compatible with every kernel, blind to the question), at a shallow LLM layer (question-aware, needs attention scores, has position bias), and in the connector with training (best accuracy per token, but needs a training run).</aside>
+
+<h2>Fixed budgets and dynamic token counts</h2>
+<p>Pruning and merging change a model after the fact. The connector decides the token count by design (<a href="../vision/connectors-projector-q-former-perceiver-resampler-pixel.html">session 178</a>). There are two families.</p>
+<p>A <b>fixed-budget resampler</b> uses \(Q\) learned query vectors that cross-attend to all patch features and return exactly \(Q\) tokens, whatever the image size. BLIP-2’s Q-Former uses 32 queries; Flamingo’s Perceiver resampler and Idefics2 use 64 latents [Certain]. The cost is constant and easy to plan for, and a video of 64 frames at 32 tokens each is only 2,048 tokens. The risk is the other side of the same fact: a dense page of text needs more than 32 or 64 vectors, so fine detail is lost.</p>
+<p>A <b>dynamic token count</b> grows with the image. LLaVA-NeXT picks the best grid of 336 px tiles for the image’s aspect ratio and adds a low-resolution overview, so a 672 × 672 grid costs \(5 \times 576 = 2{,}880\) tokens before padding is removed [Certain, from the config and the tiling rule]. Qwen2-VL resizes the image to multiples of 28 pixels inside a pixel budget and makes one token per 28 × 28 area (14 px patches, then a 2 × 2 merge):</p>
+<div class="eq">\[ V_{\text{fixed}} = Q, \qquad V_{\text{Qwen2-VL}} = \frac{H'}{28} \cdot \frac{W'}{28}, \quad H' W' \in [\,3{,}136,\ 12{,}845{,}056\,] \text{ pixels} \tag{183.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(Q\)</dt><dd>the number of learned queries of a resampler (32 or 64 in the models above)</dd>
+<dt>\(H', W'\)</dt><dd>the image size after Qwen2-VL rounds each side to a multiple of 28 and scales it into the pixel budget</dd>
+<dt>\([3{,}136,\ 12{,}845{,}056]\)</dt><dd>the default <code>min_pixels</code> and <code>max_pixels</code> in Qwen2-VL’s preprocessor config, which give between 4 and 16,384 tokens per image [Certain]</dd></dl>
+<p>A 1920 × 1080 frame becomes 1932 × 1092 and costs \(69 \times 39 = 2{,}691\) tokens. A 4K frame costs 10,549. The user can lower <code>max_pixels</code> to cap the cost: with \(1280 \times 28 \times 28\) pixels, the same 4K frame costs 1,222 tokens. A dynamic count spends tokens where there are pixels, which is right for documents. But the cost of a request is no longer known before you see the image, which matters for serving and for batching (<a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>).</p>
+<p>A middle path is <b>nested</b> tokens. Matryoshka Multimodal Models (M3, Cai et al., 2024) train one model to work with several pooled versions of LLaVA’s 24 × 24 grid, from coarse to fine, so the user can choose the number of tokens per request. They report that COCO-style benchmarks need only about 9 tokens to reach accuracy close to using all 576 [Certain, from the paper], which says as much about those benchmarks as about the method.</p>
+<figure class="fig" id="vt-res"><div class="fig-body">
+<div class="controls"><span class="seg vt-seg" id="vt-res-ar"><button type="button" data-v="1" aria-pressed="false">1:1</button><button type="button" data-v="1.3333" aria-pressed="false">4:3</button><button type="button" data-v="1.7778" aria-pressed="true">16:9</button><button type="button" data-v="0.5625" aria-pressed="false">9:16 (phone)</button><button type="button" data-v="3" aria-pressed="false">3:1 (panorama)</button></span></div>
+<div class="vt-grid" style="margin-top:8px">
+<label for="vt-res-s">Long side (pixels)</label><input type="range" id="vt-res-s" min="224" max="4096" step="16" value="1920"><output id="vt-res-sv"></output></div>
+<div class="scroll-x"><svg class="vt-svg" id="vt-res-svg" viewBox="0 0 640 280" role="img" aria-label="Visual tokens per image as a function of image size for five connector designs" style="min-width:540px"></svg></div>
+<div class="readout" id="vt-res-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Visual tokens per image versus image size (log scale), for one aspect ratio. Fixed budgets are flat lines; LLaVA-1.5 is flat because it resizes everything to 336 px; LLaVA-NeXT (dashed) jumps between tile grids; Qwen2-VL grows with the pixel count until its pixel limit.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At 1920 × 1080, Qwen2-VL spends 2,691 tokens and LLaVA-NeXT 2,880, while the Q-Former spends 32. Choose 3:1 and LLaVA-NeXT’s best grid becomes 1008 × 336 (three tiles plus the overview, 2,304 tokens). Slide the long side down to 448: Qwen2-VL now spends fewer tokens than LLaVA-1.5, because a small image has few pixels. Dynamic counts are cheap for small images and expensive for large ones; fixed budgets are the same price for both.</p></details></figure>
+
+<h2>Measuring the trade-off honestly</h2>
+<p>A token-reduction paper usually shows one number: “we keep 25% of the tokens and lose only 1 point”. That number can be true and still misleading. The pitfalls are the same as in any efficiency work (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>), plus some special to vision.</p>
+<h3>Measure time, not only FLOPs</h3>
+<p>FLOPs are a proxy. The real goal is <b>latency</b> (time to first token, time per output token) and <b>throughput</b> (requests per second on a fixed GPU budget). Only the prefill part shrinks with visual tokens; the vision encoder, the decode steps and any overhead of the method do not shrink, or shrink less. This is Amdahl’s law:</p>
+<div class="eq">\[ \text{speedup} = \frac{1}{\,e + p\,\rho + (1 - e - p)\,\delta + o\,} \tag{183.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(e, p\)</dt><dd>the fractions of the original end-to-end time spent in the vision encoder and in the LLM prefill; the rest, \(1 - e - p\), is decoding</dd>
+<dt>\(\rho\)</dt><dd>the fraction of prefill time that remains after reduction (formula 183.9, if prefill is compute-bound)</dd>
+<dt>\(\delta\)</dt><dd>the fraction of decode time that remains (a smaller KV cache helps a little)</dd>
+<dt>\(o\)</dt><dd>the extra time the method adds (scoring, sorting, a non-flash attention layer), as a fraction of the original time</dd></dl>
+<figure class="fig" id="vt-amd"><div class="fig-body">
+<div class="vt-grid">
+<label for="vt-amd-e">Encoder share \(e\)</label><input type="range" id="vt-amd-e" min="0" max="50" step="1" value="10"><output id="vt-amd-ev"></output>
+<label for="vt-amd-p">Prefill share \(p\)</label><input type="range" id="vt-amd-p" min="0" max="90" step="1" value="40"><output id="vt-amd-pv"></output>
+<label for="vt-amd-rho">Prefill left \(\rho\)</label><input type="range" id="vt-amd-rho" min="10" max="100" step="0.5" value="55.5"><output id="vt-amd-rhov"></output>
+<label for="vt-amd-d">Decode left \(\delta\)</label><input type="range" id="vt-amd-d" min="50" max="100" step="1" value="90"><output id="vt-amd-dv"></output>
+<label for="vt-amd-o">Overhead \(o\)</label><input type="range" id="vt-amd-o" min="0" max="20" step="1" value="3"><output id="vt-amd-ov"></output></div>
+<div class="scroll-x"><svg class="vt-svg" id="vt-amd-svg" viewBox="0 0 640 170" role="img" aria-label="Stacked bars of end-to-end time before and after token reduction" style="min-width:520px"></svg></div>
+<div class="vt-leg"><span style="--c:var(--v-soft);--b:var(--v)">vision encoder</span><span style="--c:var(--q-soft);--b:var(--q)">LLM prefill</span><span style="--c:var(--k-soft);--b:var(--k)">decode</span><span style="--c:var(--bad-soft);--b:var(--bad)">method overhead</span></div>
+<div class="readout" id="vt-amd-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> From a FLOPs ratio to an end-to-end speedup, formula (183.11). The default \(\rho = 55.5\%\) is close to FastV with \(K = 2\), \(R = 50\%\) on LLaVA-1.5-7B. The time shares are inputs you must measure on your own system; the defaults are only an example.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>With the defaults, the method removes 44.5% of the prefill FLOPs, a “1.80× faster prefill”, but the whole request is only about 1.25× faster, because the encoder and the decoding of the answer do not shrink much. Move \(p\) up to 80% (a long video with a one-word answer): now the same \(\rho\) gives a much larger speedup. Move \(o\) up to 15% (a method that breaks FlashAttention in a layer, or sorts on the CPU): the speedup can fall below 1.</p></details></figure>
+<h3>Compare at equal budgets, against simple baselines</h3>
+<p>The most important control is boring: at the same number of kept tokens, compare against <b>random</b> dropping and plain <b>average pooling</b>. Wen et al. (2025) did this on LLaVA-1.5-7B across several benchmarks. As a percentage of the full 576-token model’s average score [Certain, Table 1 of the paper]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Method</th><th>Keep 144 tokens (−75%)</th><th>Keep 64 tokens (−88.9%)</th></tr></thead><tbody>
+<tr><td>Random dropping</td><td>95.0%</td><td>89.1%</td></tr>
+<tr><td>2D average pooling</td><td>96.4%</td><td>87.6%</td></tr>
+<tr><td>FastV</td><td>89.8%</td><td>78.2%</td></tr>
+<tr><td>SparseVLM</td><td>93.5%</td><td>87.3%</td></tr></tbody></table></div>
+<p>At these aggressive budgets, the attention-based methods were not better than the two simple baselines. This does not mean attention scores are useless; FastV was designed for \(R = 50\%\), where it loses little. It means a method must beat random and pooling at the same budget before its scoring rule gets credit. Random dropping and pooling also have a hidden advantage: they cover the whole image evenly, which a position-biased score does not.</p>
+<h3>Choose benchmarks that need the pixels</h3>
+<p>Many benchmark questions can be answered from a blurry thumbnail, or even without the image. Token reduction looks free on those. Test where detail matters: text reading (TextVQA, DocVQA, ChartQA), counting, and localization (referring expressions, grounding boxes), and for video, questions about short events and exact timestamps (<a href="../vision/evaluating-vlms.html">session 192</a>). Endo et al. found exactly this split: early pruning kept good scores on many benchmarks but failed on localization [Certain, from the paper].</p>
+<h3>A checklist</h3>
+<div class="algo"><div class="algo-h">Algorithm 3: an honest token-reduction evaluation</div><ol>
+<li>fix the model, the prompt template, the decoding settings and the hardware; use the fastest attention kernel for the baseline too</li>
+<li>for each budget \(V' \in \{V, V/2, V/4, V/9\}\): run your method, random dropping and average pooling <span class="c">// equal tokens</span></li>
+<li>score on a detail-heavy set (text reading, counting, grounding, short video events) and a general set</li>
+<li>measure time to first token, time per output token, peak memory and throughput at your real batch size</li>
+<li>plot accuracy against measured time (a Pareto curve), not against kept tokens alone</li>
+<li>report the encoder time and the method’s overhead separately <span class="c">// formula 183.11</span></li></ol></div>
+
+<h2>Code: ToMe, proportional attention and FastV in PyTorch</h2>
+<p>This file implements bipartite soft matching with sizes, checks proportional attention, runs the FastV selection rule on a causal attention map, computes the FLOPs ratio of formula (183.9), and builds the random and pooling baselines at equal budget. It runs on a CPU in under a second and is deterministic.</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+<span class="kw2">import</span> torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="cm"># ---------- 1) ToMe: bipartite soft matching with sizes (formulas 183.4, 183.5) ----------</span>
+<span class="kw2">def</span> tome_merge(x, k, size, r):
+    <span class="st">"""x: (N, D) tokens, k: (N, Dk) keys (mean over heads), size: (N, 1). Remove r tokens."""</span>
+    N = x.shape[0]
+    r = min(r, N // 2)                                   <span class="cm"># at most half can be merged</span>
+    kn = k / k.norm(dim=-1, keepdim=True)
+    a, b = kn[0::2], kn[1::2]                            <span class="cm"># alternate split into sets A and B</span>
+    scores = a @ b.T                                     <span class="cm"># cosine similarity, (|A|, |B|)</span>
+    best, dst = scores.max(dim=-1)                       <span class="cm"># best partner in B for each A token</span>
+    order = best.argsort(descending=True)
+    src, keep_a = order[:r], order[r:]                   <span class="cm"># the r most similar edges are merged</span>
+    xa, xb = x[0::2] * size[0::2], x[1::2] * size[1::2]  <span class="cm"># weight by size before summing</span>
+    sa, sb = size[0::2], size[1::2]
+    xb = xb.index_add(0, dst[src], xa[src]); sb = sb.index_add(0, dst[src], sa[src])
+    kb = k[1::2]                                         <span class="cm"># (keys are recomputed by the next layer)</span>
+    x_new = torch.cat([xa[keep_a], xb]) / torch.cat([sa[keep_a], sb])
+    <span class="kw2">return</span> x_new, torch.cat([k[0::2][keep_a], kb]), torch.cat([sa[keep_a], sb])
+
+N, D = 576, 64                                           <span class="cm"># a 24 x 24 grid of visual tokens</span>
+x = torch.randn(N, D); size = torch.ones(N, 1)
+<span class="kw2">for</span> layer <span class="kw2">in</span> range(4):                                   <span class="cm"># 4 layers, r = 64 each</span>
+    x, k, size = tome_merge(x, x, size, r=64)
+    print(layer, x.shape[0], int(size.sum().item()))     <span class="cm"># 512, 448, 384, 320 tokens; sizes always sum to 576</span>
+
+<span class="cm"># ---------- 2) proportional attention (formula 183.6): a merged pair counts twice ----------</span>
+dh = 16
+q = torch.randn(1, dh); keys = torch.randn(3, dh); vals = torch.randn(3, dh)
+keys_dup = torch.cat([keys, keys[2:3]]); vals_dup = torch.cat([vals, vals[2:3]])   <span class="cm"># token 2 appears twice</span>
+full = F.softmax(q @ keys_dup.T / math.sqrt(dh), -1) @ vals_dup
+s = torch.tensor([1.0, 1.0, 2.0])                                                   <span class="cm"># after merging: size 2</span>
+prop = F.softmax(q @ keys.T / math.sqrt(dh) + s.log(), -1) @ vals
+print((full - prop).abs().max().item())                  <span class="cm"># about 1e-7: identical output</span>
+
+<span class="cm"># ---------- 3) FastV: rank image tokens by attention received at layer K (formula 183.8) ----------</span>
+<span class="kw2">def</span> fastv_keep(attn, img_slice, R):
+    <span class="st">"""attn: (H, n, n) attention probabilities of layer K. Returns indices of image tokens to keep."""</span>
+    score = attn.mean(dim=0).mean(dim=0)[img_slice]      <span class="cm"># average over heads and over all queries</span>
+    n_keep = round((1 - R) * score.numel())
+    idx = score.topk(n_keep).indices.sort().values       <span class="cm"># keep the original order</span>
+    <span class="kw2">return</span> idx + img_slice.start
+
+H, n_sys, V, T = 8, 35, 576, 40
+n = n_sys + V + T
+logits = torch.randn(H, n, n)
+mask = torch.ones(n, n).tril().bool()
+attn = logits.masked_fill(~mask, float(<span class="st">"-inf"</span>)).softmax(-1)  <span class="cm"># a causal attention map</span>
+keep = fastv_keep(attn, slice(n_sys, n_sys + V), R=0.5)
+print(keep.numel())                                       <span class="cm"># 288 image tokens survive after layer K</span>
+
+<span class="cm"># ---------- 4) the theoretical FLOPs ratio (formula 183.9) for LLaVA-1.5-7B ----------</span>
+<span class="kw2">def</span> layer_flops(n, d=4096, m=11008):                     <span class="cm"># Llama layer with a SwiGLU FFN, formula 183.2</span>
+    <span class="kw2">return</span> 2 * n * (4 * d * d + 3 * d * m) + 4 * n * n * d
+<span class="kw2">def</span> fastv_ratio(V, T, K, R, L=32):
+    n, nh = V + T, T + round((1 - R) * V)
+    <span class="kw2">return</span> (K * layer_flops(n) + (L - K) * layer_flops(nh)) / (L * layer_flops(n))
+print(round(fastv_ratio(576, 40, K=2, R=0.5), 3))         <span class="cm"># 0.556: about 44% fewer prefill FLOPs</span>
+
+<span class="cm"># ---------- 5) honest baselines at the same budget: random and 2x2 average pooling ----------</span>
+grid = torch.randn(24, 24, D)
+g = torch.Generator().manual_seed(0)
+rand_keep = torch.randperm(V, generator=g)[:144].sort().values
+pooled = F.avg_pool2d(grid.permute(2, 0, 1), 2).permute(1, 2, 0).reshape(-1, D)
+print(rand_keep.numel(), pooled.shape[0])                 <span class="cm"># 144 and 144: compare methods at equal tokens</span></pre>
+<p>In a real model, <code>tome_merge</code> runs inside every ViT block between attention and MLP, with the attention keys as the metric and the sizes passed to the next block’s attention as the \(\log \mathbf{s}\) bias. <code>fastv_keep</code> runs once, at layer \(K\) of the language model, and the kept indices are used to slice the hidden states, the position ids and the KV cache of the following layers. Keep the original position ids of the kept tokens: renumbering them would tell the model the image is smaller than it is.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical choice</th><th>Why</th></tr></thead><tbody>
+<tr><td>General image chat (LLaVA-1.5 style)</td><td>MLP projector, all 576 tokens; optional FastV with \(R = 50\%\) at serving time</td><td>Few images per request; the cost is acceptable, and training-free pruning is a cheap extra</td></tr>
+<tr><td>Documents, charts, screenshots</td><td>Dynamic counts (AnyRes tiles, native resolution) with a pixel cap; little or no pruning</td><td>Small text needs many tokens; pruning hurts text reading first (<a href="../vision/high-resolution-and-native-aspect-ratio.html">session 180</a>)</td></tr>
+<tr><td>Small and edge models (SmolVLM, phones)</td><td>Aggressive pixel shuffle or resamplers, trained in</td><td>Context and memory are tiny; a fixed small budget is predictable (<a href="../vision/case-studies-2-qwen2-5-vl-internvl.html">session 182</a>)</td></tr>
+<tr><td>Long video QA and Video-RAG</td><td>Few tokens per frame (pooling, resamplers), merging across frames, keyframe selection</td><td>Thousands of frames must fit in one context (<a href="../video/index.html#row-long-video" title="Long video (planned)">session 206</a>, <a href="../video/index.html#row-video-question-answering-and-video-rag" title="Video question answering and Video-RAG (planned)">session 210</a>)</td></tr>
+<tr><td>Action recognition and video classification</td><td>ToMe in the video ViT</td><td>Static backgrounds repeat across frames; ToMe reported 2.2× throughput for ViT-L on video</td></tr>
+<tr><td>Key-moment detection, temporal grounding</td><td>Keep frames dense in time, reduce tokens per frame</td><td>Merging across time blurs the exact boundary of an event; spatial reduction is safer</td></tr>
+<tr><td>Video retrieval and fingerprinting</td><td>One pooled embedding per frame or clip, not many tokens</td><td>Index size scales with tokens; retrieval needs a compact vector (<a href="../video/index.html#row-text-to-video-retrieval" title="Text-to-video retrieval (planned)">session 208</a>, <a href="../video/index.html#row-video-fingerprinting-and-near-duplicate-detection" title="Video fingerprinting and near-duplicate detection (planned)">session 209</a>)</td></tr>
+<tr><td>Serving at scale</td><td>Token caps per request, prefix caching of repeated images, measured TTFT</td><td>Visual tokens decide KV-cache memory and so the batch size (<a href="../vision/index.html#row-the-vlm-inference-path" title="The VLM inference path (planned)">session 196</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Reporting only FLOPs or kept tokens.</b> A method that breaks FlashAttention or sorts on the CPU can save FLOPs and lose time. Report time to first token and throughput on real hardware.</li>
+<li><b>No random or pooling baseline.</b> Without them you cannot tell whether your scoring rule helps or whether any reduction to that budget would do as well.</li>
+<li><b>Testing only on easy benchmarks.</b> If the questions can be answered from a thumbnail, every method looks lossless. Include text reading, counting and grounding.</li>
+<li><b>Renumbering positions after pruning.</b> Kept tokens must keep their original position ids (or M-RoPE coordinates); otherwise the model’s sense of where things are is wrong.</li>
+<li><b>Merging without proportional attention.</b> A merged token that stands for 10 patches then gets the attention weight of one, and the image is under-weighted.</li>
+<li><b>Forgetting the KV cache.</b> Pruning only the prefill hidden states but storing the full KV cache saves compute but not memory, and memory is what limits the batch size.</li>
+<li><b>Ignoring GQA when estimating memory.</b> Models with few KV heads store several times less per token; use the real config, formula (183.3).</li>
+<li><b>Merging across time for tasks that need exact time.</b> Temporal merging is great for classification and bad for “when did the goal happen?”.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why is a VLM request often much more expensive than a text request of similar length in words?<span class="lvl">basic</span></summary><div class="ans">Because the image becomes many tokens: 576 for LLaVA-1.5, up to about 2,880 for LLaVA-NeXT tiling, and about 2,700 for a 1080p image in Qwen2-VL. Each visual token costs the same as a text token in every layer (formula 183.2) and in the KV cache (183.3). With a 40-token question, the image is over 90% of the prefill work and memory. Video multiplies this by the number of frames.</div></details>
+<details class="qa"><summary>Explain ToMe’s bipartite soft matching. Why not cluster the tokens?<span class="lvl">core</span></summary><div class="ans">Split the tokens into alternating sets A and B. For each A token, find its most similar B token by cosine similarity of the attention keys (averaged over heads). Sort these edges by similarity and merge the top r A tokens into their partners with a size-weighted average. It is one matrix product and one sort per layer, with no iterations, so it is almost as cheap as pruning. Clustering (k-means) or full pairwise matching would need iterations or sequential steps in every layer, which would eat the savings. The cost of the simplicity: at most half the tokens can merge per layer, and the match is greedy.</div></details>
+<details class="qa"><summary>What is proportional attention and why is it needed?<span class="lvl">core</span></summary><div class="ans">After merging, one token stands for \(s\) patches. Without a correction, softmax gives it the weight of one key. Adding \(\log s\) to its logits multiplies its unnormalized weight by \(s\), because \(e^{z+\log s} = s e^z\). If the merged patches were identical, the output is exactly the same as before merging. It keeps the attention distribution close to the original one, which matters when the model is used off the shelf.</div></details>
+<details class="qa"><summary>How does FastV choose tokens, and what does it save with K = 2, R = 50% on LLaVA-1.5-7B?<span class="lvl">core</span></summary><div class="ans">At layer K it averages, over heads and all query positions, the attention each image token receives, keeps the top half of the image tokens, and runs the remaining layers on the shorter sequence. With 576 image and 40 other tokens, the later 30 layers see 328 tokens instead of 616. By formula (183.9) the prefill FLOPs fall to 55.6% (about 44% saved), and the KV cache of those layers shrinks too. The paper reports about 45% fewer FLOPs on LLaVA-1.5-13B with no loss on its average score.</div></details>
+<details class="qa"><summary>Why do attention-based pruning scores tend to keep the bottom of the image?<span class="lvl">advanced</span></summary><div class="ans">Image tokens are placed in raster order (top-left first), and the text comes after them. RoPE makes attention scores decay with relative distance on average, so query tokens in the text attend more to the nearby, later image tokens, which are the bottom rows. In shallow layers, which focus on short distances, this effect is strong. A score that averages attention over queries therefore prefers the bottom of the image for reasons that have nothing to do with content. Fixes: compute the score without RoPE, mix in uniform spatial sampling, or prune later. Endo et al. (2024) documented this effect.</div></details>
+<details class="qa"><summary>Q-Former with 32 queries or an MLP projector with 576 tokens: how do you choose?<span class="lvl">core</span></summary><div class="ans">The resampler gives a fixed, small cost, which is great for many images, video and small models, and its cost is known before you see the input. But it compresses every image to 32 vectors, so dense text and small objects suffer, and it has its own training cost. The MLP keeps every patch: better detail and simpler training, but 18× more tokens. For documents choose many tokens (often with tiling); for long video or edge devices choose a small budget, or a middle path such as a 2 × 2 pixel-shuffle merge (144 tokens from 576).</div></details>
+<details class="qa"><summary>A paper shows its pruning method keeps 98% accuracy at 25% of the tokens. What do you check?<span class="lvl">advanced</span></summary><div class="ans">(1) Random dropping and average pooling at the same budget: Wen et al. found these reach 95.0% and 96.4% at 144 tokens on LLaVA-1.5-7B, above FastV’s 89.8%. (2) Whether the benchmarks need detail: add text reading, counting, grounding. (3) Measured latency and throughput with FlashAttention in the baseline, not only FLOPs. (4) End-to-end time including the vision encoder and decoding (formula 183.11). (5) Whether the KV cache really shrinks. (6) Whether the baseline is the same model with the same prompts and decoding.</div></details>
+<details class="qa"><summary>Halving the prefill FLOPs gave only a 1.2× faster request. Why?<span class="lvl">core</span></summary><div class="ans">Amdahl’s law (formula 183.11). Prefill is only part of the request time; the vision encoder and the decoding of the answer are not halved. With 10% encoder, 40% prefill and 50% decode, halving prefill gives \(1/(0.1 + 0.2 + 0.5) = 1.25\times\) at best, less with overhead. Also, at small batch sizes prefill may not be compute-bound, so fewer FLOPs do not mean proportionally less time.</div></details>
+<details class="qa"><summary>How would you cut the token cost of a 1-hour video QA system?<span class="lvl">advanced</span></summary><div class="ans">Combine several levels. Sample frames sparsely (for example 1 fps or less), and skip near-duplicate frames using cheap embeddings. Reduce tokens per frame: pooling or a resampler to tens of tokens. Merge across time where the scene is static (ToMe-style). Retrieve only the relevant segments for the question (Video-RAG) and give those segments more tokens. Keep timestamps for every kept token. Then measure on questions about short events, because those break first.</div></details>
+<details class="qa"><summary>Why can FastV not simply run with FlashAttention, and what can you do?<span class="lvl">advanced</span></summary><div class="ans">FlashAttention computes the softmax in tiles and never writes the full attention probability matrix to memory, so the per-key attention sums are not available. Options: run layer K with a standard attention implementation (slower for that layer), compute scores only from a few query rows (for example the last text tokens) in a cheap separate pass, or use a score that does not need attention (key norms, similarity to the text, uniform sampling). Report the real latency whichever you choose.</div></details>
+<details class="qa"><summary>Merge or prune: which is safer, and why?<span class="lvl">basic</span></summary><div class="ans">Merging is usually safer at the same token count, because the information of the removed tokens is averaged into a kept token instead of being deleted. Pruning is simpler and keeps kept tokens unchanged, which is good when the dropped tokens are truly background. Many methods do both: choose important tokens to keep, then merge the rest into them (LLaVA-PruMerge).</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>LLaVA-1.5-7B reads 8 video frames (576 tokens each) and a 60-token question. What is the visual share of the input, and how much KV cache do the visual tokens use (FP16, formula 183.3)?</li>
+<li>ToMe with \(r = 16\) on CLIP ViT-L/14-336 (577 tokens, 24 layers). How many tokens leave the encoder? Could you use \(r = 300\) in the first layer?</li>
+<li>FastV on LLaVA-1.5-7B with \(K = 2\), \(R = 75\%\), 576 image and 40 other tokens. How many tokens do layers 3 to 32 see, and what is \(\rho\)? Check with Figure 3.</li>
+<li>Qwen2-VL with the default pixel limits reads a 3840 × 2160 frame. How many tokens? What if you set <code>max_pixels</code> to \(1280 \times 28 \times 28\)? Check with Figure 4.</li>
+<li>Prefill is 30% of your request time, with no encoder cost and no overhead, and decode does not change. A method halves prefill time. What is the end-to-end speedup?</li>
+<li>Show that proportional attention with \(\log s\) gives the same output as \(s\) identical copies of a token.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Visual tokens \(8 \times 576 = 4{,}608\); share \(4{,}608/4{,}668 = 98.7\%\). KV: \(4{,}608 \times 0.5\) MiB \(= 2{,}304\) MiB \(= 2.25\) GiB. 2. \(577 - 24 \times 16 = 193\) tokens (192 patch tokens and the class token). No: one bipartite step can merge at most \(|\mathcal{A}|\) tokens, about half of the 576 non-class tokens, so at most 288. 3. \(\hat n = 40 + 144 = 184\) tokens; \(\rho = (2\,C(616) + 30\,C(184))/(32\,C(616)) = 0.338\), about 66% fewer prefill FLOPs. 4. Default: the frame becomes 3836 × 2156, so \(137 \times 77 = 10{,}549\) tokens. With the lower cap it is scaled to 1316 × 728: \(47 \times 26 = 1{,}222\) tokens. 5. \(1/(0.7 + 0.15) = 1.18\times\). 6. Let token \(t\) with logit \(z_t\) and value \(\mathbf{v}_t\) appear \(s\) times. Its total weight in the softmax is \(s e^{z_t}/Z\), where \(Z = \sum_{j \ne t} e^{z_j} + s e^{z_t}\). With one copy and logit \(z_t + \log s\), the weight is \(e^{z_t + \log s}/Z' = s e^{z_t}/Z'\), with \(Z' = \sum_{j \ne t} e^{z_j} + s e^{z_t} = Z\). The weights of all tokens are the same, so the output \(\sum_j w_j \mathbf{v}_j\) is the same.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Visual tokens usually far outnumber text tokens (183.1); each costs as much as a text token in prefill (183.2) and in the KV cache (183.3). One LLaVA-1.5 image is 576 tokens and 288 MiB of KV cache; 32 frames are 9 GiB.</li>
+<li>Tokens can be removed in the encoder, in the connector, or inside the LLM. Earlier is cheaper and simpler; later can use the question.</li>
+<li>ToMe merges the \(r\) most similar pairs per layer with bipartite matching on keys (183.4), size-weighted averages (183.5) and proportional attention (183.6).</li>
+<li>FastV ranks image tokens by the attention they receive at layer \(K\) (183.8) and drops \(R\%\); \(K = 2\), \(R = 50\%\) keeps about 55% of prefill FLOPs (183.9). It needs attention probabilities and has a position bias.</li>
+<li>Resamplers fix the budget (32 or 64 tokens); AnyRes and native resolution make it grow with the image (183.10); nested tokens let the user choose.</li>
+<li>Measure honestly: real latency (183.11), random and pooling baselines at equal budget, and benchmarks that need the pixels.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ C(n) = 2n(4d^2 + 3dm) + 4n^2 d, \qquad M_{\text{KV}} = 2 L\, n_{\text{kv}} d_h\, b\, n \]</div>
+<div class="eq">\[ \text{Attn} = \softmax\!\left(\frac{QK^\top}{\sqrt{d_h}} + \log \mathbf{s}\right) V, \qquad \rho = \frac{K C(n) + (L-K)\, C(n - RV)}{L\, C(n)} \]</div>
+<div class="eq">\[ \text{speedup} = \frac{1}{e + p\rho + (1 - e - p)\delta + o} \]</div>
+<p>Next, <a href="../vision/audio-and-omni-models.html">session 184</a> adds another modality with the same problem: an audio encoder turns one second of sound into many tokens, and the same tools (pooling, fixed budgets, merging over time) decide its cost.</p>
+<h2 class="plain" id="visual-token-efficiency-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Bolya et al. (2022). <a href="https://arxiv.org/abs/2210.09461" target="_blank" rel="noopener">Token Merging: Your ViT But Faster</a></li><li>Chen et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;An Image is Worth 1/2 Tokens After Layer 2: Plug-and-Play Inference Acceleration for Large Vision-Language Models&amp;quot;" target="_blank" rel="noopener">An Image is Worth 1/2 Tokens After Layer 2: Plug-and-Play Inference Acceleration for Large Vision-Language Models</a></li><li>Jin et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Efficient Multimodal Large Language Models: A Survey&amp;quot;" target="_blank" rel="noopener">Efficient Multimodal Large Language Models: A Survey</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 9: Video-Language Models</li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.03744" target="_blank" rel="noopener">Improved Baselines with Visual Instruction Tuning</a></li><li>Liu et al. (2024). <a href="https://llava-vl.github.io/blog/2024-01-30-llava-next/" target="_blank" rel="noopener">LLaVA-NeXT: Improved reasoning, OCR, and world knowledge (blog)</a></li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Li et al. (2023). <a href="https://arxiv.org/abs/2301.12597" target="_blank" rel="noopener">BLIP-2: Bootstrapping Language-Image Pre-training with Frozen Image Encoders and Large Language Models</a></li><li>Alayrac et al. (2022). <a href="https://arxiv.org/abs/2204.14198" target="_blank" rel="noopener">Flamingo: a Visual Language Model for Few-Shot Learning</a></li><li>Laurençon et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;What matters when building vision-language models?&amp;quot;" target="_blank" rel="noopener">What matters when building vision-language models?</a></li><li>Cai, Yang, Gao and Lee (2024). <a href="https://arxiv.org/abs/2405.17430" target="_blank" rel="noopener">Matryoshka Multimodal Models</a></li><li>Shang et al. (2024). <a href="https://arxiv.org/abs/2403.15388" target="_blank" rel="noopener">LLaVA-PruMerge: Adaptive Token Reduction for Efficient Large Multimodal Models</a></li><li>Endo, Wang and Yeung-Levy (2024). <a href="https://arxiv.org/abs/2412.13180" target="_blank" rel="noopener">Feather the Throttle: Revisiting Visual Token Pruning for Vision-Language Model Acceleration</a></li><li>Wen et al. (2025). <a href="https://arxiv.org/abs/2502.11501" target="_blank" rel="noopener">Token Pruning in Multimodal Large Language Models: Are We Solving the Right Problem?</a></li><li>Dao (2023). <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/case-studies-2-qwen2-5-vl-internvl.html"><small>Previous · session 182</small>Case studies 2: Qwen2.5-VL, InternVL, PaliGemma and Gemma, SmolVLM</a><a class="next" href="../vision/audio-and-omni-models.html"><small>Next · session 184</small>Audio and omni models</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="visual-token-efficiency"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmt=n=>Math.round(n).toLocaleString("en-US");
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function seg(el,cb){const bs=[...el.querySelectorAll("button")];bs.forEach(b=>b.addEventListener("click",()=>{bs.forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);}));}
+const T=(x,y,s,o)=>{o=o||{};return `<text x="${x}" y="${y}" font-size="${o.fs||13}" font-weight="${o.fw||500}" text-anchor="${o.a||"middle"}" fill="${o.c||"var(--ink)"}">${s}</text>`;};
+/* layer FLOPs of a Llama layer with SwiGLU, formula 183.2 */
+const C=(n,d,m)=>2*n*(4*d*d+3*d*m)+4*n*n*d;
+const M7={d:4096,m:11008,L:32},M13={d:5120,m:13824,L:40};
+
+/* ---------- Figure 1: token budget ---------- */
+(function(){
+ const svg=$("#vt-bud-svg");if(!svg)return;const F=$("#vt-bud-f"),Tt=$("#vt-bud-t"),info=$("#vt-bud-info");
+ const PER={llava:576,next:2880,qwen:2691,idef:64,qf:32},NAME={llava:"LLaVA-1.5",next:"LLaVA-NeXT (672 × 672 grid)",qwen:"Qwen2-VL (1920 × 1080)",idef:"Idefics2 (no splitting)",qf:"BLIP-2 Q-Former"};let enc="llava";
+ function draw(){const f=+F.value,t=+Tt.value;$("#vt-bud-fv").value=f;$("#vt-bud-tv").value=t;
+  const V=PER[enc]*f,n=V+t,{d,m,L}=M7;const tot=L*C(n,d,m),txt=L*C(t,d,m),flShare=1-txt/tot,tokShare=V/n;
+  const kvTok=2*L*4096*2,kvV=V*kvTok,kvAll=n*kvTok;const mem=b=>b>=2**30?(b/2**30).toFixed(2)+" GiB":(b/2**20).toFixed(0)+" MiB";
+  const X0=150,W=440;let g="";
+  const bar=(y,lab,share,sub)=>{const w1=W*share;return T(X0-10,y+19,lab,{a:"end",fw:700})+`<rect x="${X0}" y="${y}" width="${w1.toFixed(1)}" height="28" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1.5"/><rect x="${(X0+w1).toFixed(1)}" y="${y}" width="${(W-w1).toFixed(1)}" height="28" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1.5"/>`+T(X0+W+8,y+19,(100*share).toFixed(1)+"%",{a:"start",fw:700,c:"var(--q)"})+T(X0,y+44,sub,{a:"start",fs:12,c:"var(--ink2)"});};
+  g+=bar(10,"Tokens",tokShare,`${fmt(V)} visual + ${fmt(t)} text = ${fmt(n)} tokens`);
+  g+=bar(72,"Prefill FLOPs",flShare,`${(tot/1e12).toFixed(2)} TFLOPs total; text alone ${(txt/1e12).toFixed(2)} TFLOPs`);
+  g+=bar(134,"KV cache",tokShare,`${mem(kvAll)} total, ${mem(kvV)} for the visual tokens (0.5 MiB per token)`);
+  svg.innerHTML=g;
+  info.innerHTML=`${NAME[enc]}, ${f} image${f>1?"s or frames":""}: <b>${fmt(V)}</b> visual tokens, visual share <b>${(100*tokShare).toFixed(1)}%</b>. Prefill <b>${(tot/1e12).toFixed(2)} TFLOPs</b>, of which the images add <b>${(100*flShare).toFixed(1)}%</b>. KV cache <b>${mem(kvAll)}</b>. Attention is ${(100*4*n*n*d/C(n,d,m)).toFixed(1)}% of each layer’s FLOPs at this length.`;}
+ seg($("#vt-bud-enc"),v=>{enc=v;draw();});[F,Tt].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: ToMe on a toy image ---------- */
+(function(){
+ const svg=$("#vt-tome-svg");if(!svg)return;const Rr=$("#vt-tome-r"),Ll=$("#vt-tome-l"),info=$("#vt-tome-info");let mode="sim";
+ const G=12,NP=G*G;const r0=rng(11);const col=[];
+ for(let i=0;i<G;i++)for(let j=0;j<G;j++){let c;
+  if(i<6){const t=i/5;c=[0.55-0.25*t,0.78-0.22*t,0.97-0.1*t];}else{c=[0.32,0.62-0.03*(i-6),0.25];}
+  if((i-2)**2+(j-9)**2<=2.6)c=[0.98,0.85,0.2];
+  if(i>=7&&i<=9&&j>=2&&j<=5)c=[0.85,0.18,0.15];
+  if(i>=10&&j>=7)c=[0.55,0.55,0.58];
+  col.push(c.map(v=>Math.max(0,Math.min(1,v+0.05*(r0()-0.5)))));}
+ const cen=c=>c.map(v=>v-0.5),cos=(a,b)=>{const x=cen(a),y=cen(b);const d=x[0]*y[0]+x[1]*y[1]+x[2]*y[2],na=Math.hypot(...x),nb=Math.hypot(...y);return d/(na*nb+1e-9);};
+ function run(r,L,md){let toks=col.map((c,i)=>({f:c.slice(),s:1,mem:[i],first:i}));const rr=rng(7);
+  for(let l=0;l<L;l++){toks.sort((a,b)=>a.first-b.first);const A=toks.filter((_,i)=>i%2===0),Bs=toks.filter((_,i)=>i%2===1);const rk=Math.min(r,A.length);if(rk===0)break;
+   const edges=A.map(a=>{let bj=0,bv=-2;if(md==="sim"){Bs.forEach((b,j)=>{const v=cos(a.f,b.f);if(v>bv){bv=v;bj=j;}});}else{bj=Math.floor(rr()*Bs.length);bv=rr();}return{a,bj,bv};});
+   edges.sort((x,y)=>y.bv-x.bv);const merged=new Set();
+   edges.slice(0,rk).forEach(e=>{const b=Bs[e.bj],a=e.a;const s=a.s+b.s;b.f=b.f.map((v,k)=>(a.s*a.f[k]+b.s*v)/s);b.s=s;b.mem=b.mem.concat(a.mem);b.first=Math.min(b.first,a.first);merged.add(a);});
+   toks=A.filter(a=>!merged.has(a)).concat(Bs);}
+  const own=new Array(NP);toks.forEach((t,ti)=>t.mem.forEach(p=>own[p]=ti));let err=0;for(let p=0;p<NP;p++){const f=toks[own[p]].f;err+=(col[p][0]-f[0])**2+(col[p][1]-f[1])**2+(col[p][2]-f[2])**2;}
+  return{toks,own,err:err/NP};}
+ const rgb=c=>`rgb(${c.map(v=>Math.round(255*v)).join(",")})`;
+ function draw(){const r=+Rr.value,L=+Ll.value;$("#vt-tome-rv").value=r;$("#vt-tome-lv").value=L;
+  const res=run(r,L,mode),alt=run(r,L,mode==="sim"?"rand":"sim");const cs=20,ox1=20,ox2=340,oy=36;let g="";
+  g+=T(ox1+120,24,"Input: 144 patch tokens",{fw:700})+T(ox2+120,24,`After ${L} layer${L===1?"":"s"}: ${res.toks.length} tokens`,{fw:700});
+  for(let p=0;p<NP;p++){const i=Math.floor(p/G),j=p%G;g+=`<rect x="${ox1+j*cs}" y="${oy+i*cs}" width="${cs}" height="${cs}" fill="${rgb(col[p])}"/>`;
+   g+=`<rect x="${ox2+j*cs}" y="${oy+i*cs}" width="${cs}" height="${cs}" fill="${rgb(res.toks[res.own[p]].f)}"/>`;}
+  let ln="";for(let i=0;i<G;i++)for(let j=0;j<G;j++){const p=i*G+j;if(j<G-1&&res.own[p]!==res.own[p+1])ln+=`M${ox2+(j+1)*cs} ${oy+i*cs}v${cs}`;if(i<G-1&&res.own[p]!==res.own[p+G])ln+=`M${ox2+j*cs} ${oy+(i+1)*cs}h${cs}`;}
+  g+=`<path d="${ln}" stroke="#111" stroke-width="1.6" fill="none"/><rect x="${ox1}" y="${oy}" width="${G*cs}" height="${G*cs}" fill="none" stroke="var(--muted)"/><rect x="${ox2}" y="${oy}" width="${G*cs}" height="${G*cs}" fill="none" stroke="var(--muted)"/>`;
+  g+=T(300,oy+G*cs/2+5,"→",{c:"var(--muted)",fs:26,fw:700});
+  svg.innerHTML=g;const big=Math.max(...res.toks.map(t=>t.s));const eS=mode==="sim"?res.err:alt.err,eR=mode==="sim"?alt.err:res.err;
+  info.innerHTML=`Tokens: <b>${res.toks.length}</b> of 144 (${(100*res.toks.length/144).toFixed(0)}%). Largest token stands for <b>${big}</b> patches. Error with bipartite matching: <b>${eS.toFixed(4)}</b>; with random pairs: <b>${eR.toFixed(4)}</b>.`;}
+ seg($("#vt-tome-mode"),v=>{mode=v;draw();});[Rr,Ll].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: FastV ---------- */
+(function(){
+ const svg=$("#vt-fv-svg");if(!svg)return;const K=$("#vt-fv-k"),Rr=$("#vt-fv-r"),Bb=$("#vt-fv-b"),info=$("#vt-fv-info");let M=M7;
+ const V=576,Tt=40,G=24;const r0=rng(3);const sal=[];
+ for(let i=0;i<G;i++)for(let j=0;j<G;j++){const o1=Math.exp(-(((i-6)**2+(j-7)**2)/18)),o2=0.8*Math.exp(-(((i-15)**2+(j-17)**2)/12));sal.push(0.55*Math.max(o1,o2)+0.45*r0());}
+ function draw(){const k=+K.value,R0=+Rr.value/100,bias=+Bb.value;K.max=M.L-1;if(k>M.L-1)K.value=M.L-1;const kk=+K.value;
+  $("#vt-fv-kv").value=kk;$("#vt-fv-rv").value=Math.round(R0*100)+"%";$("#vt-fv-bv").value=bias.toFixed(2);
+  const keepN=Math.round((1-R0)*V),n=V+Tt,nh=Tt+keepN,{d,m,L}=M;
+  const rho=(kk*C(n,d,m)+(L-kk)*C(nh,d,m))/(L*C(n,d,m)),kv=(kk*n+(L-kk)*nh)/(L*n);
+  const sc=sal.map((s,p)=>s+bias*1.2*(p/(V-1)));const idx=sc.map((s,p)=>[s,p]).sort((a,b)=>b[0]-a[0]).slice(0,keepN).map(x=>x[1]);const kept=new Set(idx);
+  let bottom=0;idx.forEach(p=>{if(Math.floor(p/G)>=G/2)bottom++;});
+  let g="";const x0=40,y0=20,h=200,bw=300/L;
+  g+=`<path d="M${x0} ${y0} V${y0+h} H${x0+305}" fill="none" stroke="var(--muted)"/>`;
+  for(let l=0;l<L;l++){const nn=l<kk?n:nh;const hi=h*(nn-Tt)/n,ht=h*Tt/n;const x=x0+2+l*bw;
+   g+=`<rect x="${x.toFixed(1)}" y="${(y0+h-ht).toFixed(1)}" width="${(bw-1).toFixed(1)}" height="${ht.toFixed(1)}" fill="var(--k-soft)" stroke="var(--k)" stroke-width=".8"/>`;
+   g+=`<rect x="${x.toFixed(1)}" y="${(y0+h-ht-hi).toFixed(1)}" width="${(bw-1).toFixed(1)}" height="${hi.toFixed(1)}" fill="var(--q-soft)" stroke="var(--q)" stroke-width=".8"/>`;
+   if(l>=kk&&R0>0)g+=`<rect x="${x.toFixed(1)}" y="${y0}" width="${(bw-1).toFixed(1)}" height="${(h-ht-hi).toFixed(1)}" fill="var(--paper2)" stroke="var(--rule)" stroke-width=".6"/>`;}
+  g+=T(x0-6,y0+8,fmt(n),{a:"end",fs:11,c:"var(--ink2)"})+T(x0-6,y0+h,"0",{a:"end",fs:11,c:"var(--ink2)"})+T(x0+152,y0+h+18,`layer 1 … ${L}`,{fs:12,c:"var(--ink2)"});
+  if(kk>0)g+=`<line x1="${(x0+2+kk*bw-0.5).toFixed(1)}" y1="${y0-6}" x2="${(x0+2+kk*bw-0.5).toFixed(1)}" y2="${y0+h}" stroke="var(--warn)" stroke-width="2" stroke-dasharray="4 3"/>`+T(x0+2+kk*bw,y0+h+34,"filter at K = "+kk,{fs:12,c:"var(--warn)",fw:700});
+  const gx=395,gy=20,cs=8.4;g+=T(gx+G*cs/2,gy-6,"image tokens kept",{fs:12,fw:700});
+  for(let p=0;p<V;p++){const i=Math.floor(p/G),j=p%G;g+=`<rect x="${(gx+j*cs).toFixed(1)}" y="${(gy+i*cs).toFixed(1)}" width="${(cs-0.6).toFixed(1)}" height="${(cs-0.6).toFixed(1)}" fill="${kept.has(p)?"var(--q)":"var(--paper2)"}" ${kept.has(p)?"":'stroke="var(--rule)" stroke-width=".5"'}/>`;}
+  svg.innerHTML=g;
+  info.innerHTML=`Layers ${kk+1}–${L} see <b>${fmt(nh)}</b> tokens instead of ${fmt(n)} (${keepN} image tokens kept). Prefill FLOPs left: <b>ρ = ${rho.toFixed(3)}</b> (${(100*(1-rho)).toFixed(1)}% saved). KV cache left: <b>${(100*kv).toFixed(1)}%</b>. Kept tokens in the bottom half of the image: <b>${keepN?(100*bottom/keepN).toFixed(0):0}%</b>.`;}
+ seg($("#vt-fv-model"),v=>{M=v==="13"?M13:M7;draw();});[K,Rr,Bb].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: tokens versus resolution ---------- */
+(function(){
+ const svg=$("#vt-res-svg");if(!svg)return;const S=$("#vt-res-s"),info=$("#vt-res-info");let ar=1.7778;
+ const PIN=[[336,672],[672,336],[672,672],[1008,336],[336,1008]];
+ function next(h,w){let best=null,be=-1,bw=Infinity;PIN.forEach(([ph,pw])=>{const s=Math.min(pw/w,ph/h);const dw=Math.floor(w*s),dh=Math.floor(h*s);const eff=Math.min(dw*dh,w*h),waste=pw*ph-eff;if(eff>be||(eff===be&&waste<bw)){be=eff;bw=waste;best=[ph,pw];}});return{grid:best,tok:(best[0]/336*best[1]/336+1)*576};}
+ function qwen(h,w){const f=28,mn=3136,mx=12845056;let hb=Math.max(f,Math.round(h/f)*f),wb=Math.max(f,Math.round(w/f)*f);
+  if(hb*wb>mx){const be=Math.sqrt(h*w/mx);hb=Math.floor(h/be/f)*f;wb=Math.floor(w/be/f)*f;}else if(hb*wb<mn){const be=Math.sqrt(mn/(h*w));hb=Math.ceil(h*be/f)*f;wb=Math.ceil(w*be/f)*f;}return{h:hb,w:wb,tok:hb*wb/784};}
+ const dims=s=>ar>=1?[Math.round(s/ar),s]:[s,Math.round(s*ar)];
+ const SER=[["Q-Former",()=>32,"var(--muted)"],["Idefics2",()=>64,"var(--v)"],["LLaVA-1.5",()=>576,"var(--k)"],["LLaVA-NeXT",(h,w)=>next(h,w).tok,"var(--warn)","7 4"],["Qwen2-VL",(h,w)=>qwen(h,w).tok,"var(--q)"]];
+ const x0=60,x1=500,y0=20,y1=240,lmin=Math.log10(16),lmax=Math.log10(20000);const X=s=>x0+(s-224)/(4096-224)*(x1-x0),Y=v=>y1-(Math.log10(v)-lmin)/(lmax-lmin)*(y1-y0);
+ function draw(){const s=+S.value;$("#vt-res-sv").value=s;const [h,w]=dims(s);let g=`<path d="M${x0} ${y0} V${y1} H${x1}" fill="none" stroke="var(--muted)"/>`;
+  [16,100,1000,10000].forEach(v=>g+=`<line x1="${x0}" y1="${Y(v)}" x2="${x1}" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/>`+T(x0-6,Y(v)+4,fmt(v),{a:"end",fs:11,c:"var(--ink2)"}));
+  [224,1024,2048,3072,4096].forEach(v=>g+=T(X(v),y1+16,v,{fs:11,c:"var(--ink2)"}));g+=T((x0+x1)/2,y1+34,"long side of the image (pixels)",{fs:12,c:"var(--ink2)"});
+  const vals={};SER.forEach(([nm,fn,c,da])=>{let d="";for(let t=224;t<=4096;t+=16){const [hh,ww]=dims(t);d+=(t===224?"M":"L")+X(t).toFixed(1)+" "+Y(Math.max(16,fn(hh,ww))).toFixed(1);}
+   const v=fn(h,w);vals[nm]=v;g+=`<path d="${d}" fill="none" stroke="${c}" stroke-width="2.4"${da?` stroke-dasharray="${da}"`:""}/><circle cx="${X(s).toFixed(1)}" cy="${Y(v).toFixed(1)}" r="5" fill="${c}"/>`;});
+  const order=SER.map(([nm,,c])=>[nm,c,vals[nm]]).sort((a,b)=>b[2]-a[2]);order.forEach(([nm,c,v],i)=>{g+=`<rect x="512" y="${30+i*40}" width="12" height="12" fill="${c}"/>`+T(530,41+i*40,nm,{a:"start",fs:12.5,fw:700})+T(530,57+i*40,fmt(v)+" tokens",{a:"start",fs:12,c:"var(--ink2)"});});
+  g+=`<line x1="${X(s)}" y1="${y0}" x2="${X(s)}" y2="${y1}" stroke="var(--muted)" stroke-dasharray="4 4"/>`;svg.innerHTML=g;
+  const nx=next(h,w),qw=qwen(h,w);
+  info.innerHTML=`Image <b>${w} × ${h}</b>. Q-Former <b>32</b>, Idefics2 <b>64</b>, LLaVA-1.5 <b>576</b>, LLaVA-NeXT <b>${fmt(nx.tok)}</b> (grid ${nx.grid[1]} × ${nx.grid[0]}, ${nx.tok/576-1} tiles + overview, before unpadding), Qwen2-VL <b>${fmt(qw.tok)}</b> (resized to ${qw.w} × ${qw.h}).`;}
+ seg($("#vt-res-ar"),v=>{ar=+v;draw();});S.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 5: Amdahl ---------- */
+(function(){
+ const svg=$("#vt-amd-svg");if(!svg)return;const E=$("#vt-amd-e"),P=$("#vt-amd-p"),Rh=$("#vt-amd-rho"),D=$("#vt-amd-d"),O=$("#vt-amd-o"),info=$("#vt-amd-info");
+ function draw(){let e=+E.value/100,p=+P.value/100;if(e+p>1){p=1-e;P.value=Math.round(p*100);}const rho=+Rh.value/100,dl=+D.value/100,o=+O.value/100,dec=1-e-p;
+  $("#vt-amd-ev").value=Math.round(e*100)+"%";$("#vt-amd-pv").value=Math.round(p*100)+"%";$("#vt-amd-rhov").value=(rho*100).toFixed(1)+"%";$("#vt-amd-dv").value=Math.round(dl*100)+"%";$("#vt-amd-ov").value=Math.round(o*100)+"%";
+  const after=e+p*rho+dec*dl+o,sp=1/after;const x0=90,W=460;let g="";
+  const row=(y,lab,parts)=>{let x=x0,s=T(x0-10,y+20,lab,{a:"end",fw:700});parts.forEach(([v,c,cs])=>{if(v>0){s+=`<rect x="${x.toFixed(1)}" y="${y}" width="${(W*v).toFixed(1)}" height="30" fill="${cs}" stroke="${c}" stroke-width="1.5"/>`;x+=W*v;}});return s+T(x+8,y+20,(100*parts.reduce((a,q)=>a+q[0],0)).toFixed(1)+"%",{a:"start",fw:700});};
+  g+=row(20,"Before",[[e,"var(--v)","var(--v-soft)"],[p,"var(--q)","var(--q-soft)"],[dec,"var(--k)","var(--k-soft)"]]);
+  g+=row(80,"After",[[e,"var(--v)","var(--v-soft)"],[p*rho,"var(--q)","var(--q-soft)"],[dec*dl,"var(--k)","var(--k-soft)"],[o,"var(--bad)","var(--bad-soft)"]]);
+  g+=T(x0,140,"end-to-end time, as a % of the original",{a:"start",fs:12,c:"var(--ink2)"});svg.innerHTML=g;
+  info.innerHTML=`Prefill alone: <b>${(1/rho).toFixed(2)}×</b> faster. Whole request: time ${(100*after).toFixed(1)}% of before, so <b>${sp.toFixed(2)}×</b> ${sp<1?"(slower!)":"faster"}. Upper limit if prefill cost were zero and nothing else changed: ${(1/(e+dec)).toFixed(2)}×.`;}
+ [E,P,Rh,D,O].forEach(x=>x.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

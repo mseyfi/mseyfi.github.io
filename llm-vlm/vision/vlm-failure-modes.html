@@ -1,0 +1,558 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>VLM failure modes · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 193</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="vlm-failure-modes">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="vlm-failure-modes" data-session="vlm-failure-modes" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">193</span><span>Track 7: Vision and VLMs · session 31 of 38</span></div><h1 class="chap-title">VLM failure modes</h1><p class="chap-sub">A vision-language model can describe a photo well and still say there is a fork that is not there, count seven apples as six, miss the total on a receipt, or mix up what happened first in a video. This session takes the four big failure families one by one: object hallucination, counting and spatial relations, small text lost by resizing, and temporal confusion in video. For each one we find the cause, measure it with a simple test, and fix it.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions on the anatomy of a VLM (177), high resolution (180), VLM preference optimization (190) and evaluating VLMs (192)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why the language prior can beat the image: the Bayes view of a VLM answer, and how co-occurrence drives object hallucination</li><li>How to measure hallucination with CHAIR and POPE, and why a model that always says “yes” gets F1 = 66.7 on POPE</li><li>Visual contrastive decoding (VCD): subtract the answer given a noised image, and why this amplifies only the visual evidence</li><li>Why counting and spatial relations fail: bag-of-words contrastive encoders, CLIP-blind pairs (MMVP), coarse token grids, and the p to the power n effect</li><li>How resizing destroys small text: the effective text height after resizing, and how tiling, native resolution and zoom-in search fix it</li><li>Why video models confuse time: sparse frame sampling, the hit probability d N / T, bag-of-frames encoders, and absolute-time position ids</li><li>A diagnosis protocol: blind, noised-image, crop, resize and frame-shuffle tests that tell you which failure you have</li></ul></div></header><style>
+.vfm-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.vfm-grid input[type=range]{width:100%}
+.vfm-grid output{min-width:3.2em;text-align:right;font:500 14px var(--mono)}
+.vfm-canvas{display:block;width:100%;max-width:640px;height:auto;border:1px solid var(--rule);border-radius:8px;background:#fff;image-rendering:pixelated;image-rendering:crisp-edges}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A vision-language model (VLM) can write a fluent paragraph about a photo and still be wrong in ways a child would not be. It says there is a fork next to the plate when there is none. It counts seven apples as six. It cannot read the total on a receipt. In a video, it says the man sat down and then stood up when he did the opposite. This session is about these failures: what causes each one, how to measure it, and how to fix it.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “Your VLM hallucinates objects. How do you measure it and fix it?”, “Why are VLMs bad at counting?”, “Our document model cannot read invoices. What do you check first?”, “Why does a video model miss events?”. A strong answer always has three parts: the cause, a test that confirms the cause, and a fix that targets it.</aside>
+<p>In <a href="../vision/evaluating-vlms.html">session 192</a> we saw how to score a model on benchmarks. A single score hides <b>why</b> a model fails. In practice, almost all VLM errors fall into four families, and each has a different root cause in the pipeline you met in <a href="../vision/anatomy-of-a-vision-language-model.html">session 177</a>:</p>
+<ol>
+<li><b>Object hallucination.</b> The model names things that are not in the image. Cause: the <b>language prior</b>, which is what the language model expects from text alone, is stronger than the visual evidence.</li>
+<li><b>Counting and spatial relations.</b> “How many?” and “Is the cup left of the laptop?” fail. Cause: vision encoders trained with image–text matching learn <b>what</b> is in the image much better than <b>how many</b> or <b>where</b>.</li>
+<li><b>Small text and fine details.</b> The model cannot read small print or see a small object. Cause: the image is <b>resized</b> to a few hundred pixels before the encoder sees it.</li>
+<li><b>Temporal confusion in video.</b> The model mixes up order, misses short events, or answers from one frame. Cause: only a few <b>frames are sampled</b>, and the model often treats them as an unordered bag.</li>
+</ol>
+<p>These failures matter in real products. A retail shelf audit needs counts. An invoice or form pipeline needs small digits. A content moderation system must not invent objects. A video search system must find a 3-second moment in a 10-minute clip. The good news: each failure has a clear cause, and the cause tells you the fix. Figure 1 shows where each one enters the pipeline.</p>
+
+<figure class="fig wide" id="vfm-map"><div class="fig-body">
+<div class="scroll-x"><svg viewBox="0 0 800 330" role="img" aria-label="The VLM pipeline with the place where each of the four failure families enters">
+<defs><marker id="vfm-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+<g font-family="var(--sans)">
+<rect x="10" y="40" width="120" height="70" rx="10" fill="var(--paper2)" stroke="var(--rule)"/>
+<text x="70" y="70" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)">image</text>
+<text x="70" y="90" text-anchor="middle" font-size="12" fill="var(--muted)">e.g. 3024 × 4032</text>
+<rect x="10" y="150" width="120" height="70" rx="10" fill="var(--paper2)" stroke="var(--rule)"/>
+<text x="70" y="180" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)">video</text>
+<text x="70" y="200" text-anchor="middle" font-size="12" fill="var(--muted)">e.g. 600 s at 30 fps</text>
+<path d="M132 75 H170" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vfm-ah)"/>
+<path d="M132 185 H150 V120 H170" fill="none" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vfm-ah)"/>
+<rect x="172" y="40" width="130" height="110" rx="10" fill="var(--card)" stroke="var(--k)" stroke-width="1.6"/>
+<text x="237" y="66" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)">resize /</text>
+<text x="237" y="84" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)">sample frames</text>
+<text x="237" y="106" text-anchor="middle" font-size="12" fill="var(--muted)">336 × 336,</text>
+<text x="237" y="122" text-anchor="middle" font-size="12" fill="var(--muted)">32 frames</text>
+<path d="M304 95 H340" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vfm-ah)"/>
+<rect x="342" y="40" width="130" height="110" rx="10" fill="var(--card)" stroke="var(--q)" stroke-width="1.6"/>
+<text x="407" y="72" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)">vision encoder</text>
+<text x="407" y="94" text-anchor="middle" font-size="12" fill="var(--muted)">CLIP / SigLIP ViT</text>
+<text x="407" y="112" text-anchor="middle" font-size="12" fill="var(--muted)">+ connector</text>
+<text x="407" y="130" text-anchor="middle" font-size="12" fill="var(--muted)">576 tokens</text>
+<path d="M474 95 H510" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vfm-ah)"/>
+<rect x="512" y="40" width="150" height="110" rx="10" fill="var(--card)" stroke="var(--v)" stroke-width="1.6"/>
+<text x="587" y="72" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)">language model</text>
+<text x="587" y="94" text-anchor="middle" font-size="12" fill="var(--muted)">visual tokens +</text>
+<text x="587" y="112" text-anchor="middle" font-size="12" fill="var(--muted)">question → answer</text>
+<path d="M664 95 H700" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vfm-ah)"/>
+<rect x="702" y="62" width="88" height="66" rx="10" fill="var(--paper2)" stroke="var(--rule)"/>
+<text x="746" y="92" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">“There is</text>
+<text x="746" y="110" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">a fork.”</text>
+<g font-size="12.5">
+<path d="M237 152 V200" stroke="var(--k)" stroke-dasharray="4 3"/>
+<rect x="172" y="200" width="160" height="58" rx="8" fill="var(--k-soft)" stroke="var(--k)"/>
+<text x="252" y="222" text-anchor="middle" font-weight="700" fill="var(--ink)">3. small text lost</text>
+<text x="252" y="242" text-anchor="middle" fill="var(--ink2)">40 px text → 3.3 px</text>
+<rect x="172" y="264" width="160" height="58" rx="8" fill="var(--k-soft)" stroke="var(--k)"/>
+<text x="252" y="286" text-anchor="middle" font-weight="700" fill="var(--ink)">4. temporal confusion</text>
+<text x="252" y="306" text-anchor="middle" fill="var(--ink2)">a 3 s event between frames</text>
+<path d="M407 152 V200" stroke="var(--q)" stroke-dasharray="4 3"/>
+<rect x="342" y="200" width="160" height="58" rx="8" fill="var(--q-soft)" stroke="var(--q)"/>
+<text x="422" y="222" text-anchor="middle" font-weight="700" fill="var(--ink)">2. counting, spatial</text>
+<text x="422" y="242" text-anchor="middle" fill="var(--ink2)">“what”, not “how many”</text>
+<path d="M587 152 V200" stroke="var(--v)" stroke-dasharray="4 3"/>
+<rect x="512" y="200" width="170" height="58" rx="8" fill="var(--v-soft)" stroke="var(--v)"/>
+<text x="597" y="222" text-anchor="middle" font-weight="700" fill="var(--ink)">1. object hallucination</text>
+<text x="597" y="242" text-anchor="middle" fill="var(--ink2)">text prior beats the image</text>
+</g>
+<text x="400" y="22" text-anchor="middle" font-size="13" fill="var(--muted)">Each failure enters at a different stage, so each needs a different test and a different fix</text>
+</g></svg></div>
+</div><figcaption><b>Figure 1.</b> Where the four failure families enter a VLM. Resizing and frame sampling throw information away before the model sees anything. The vision encoder keeps “what” better than “how many” and “where”. The language model can override weak visual evidence with what text usually says.</figcaption></figure>
+
+<h2>Object hallucination: the language prior beats the image</h2>
+<p><b>Object hallucination</b> means the model mentions an object that is not in the image. It is the most common VLM failure and the most studied one. To see why it happens, write the answer probability with Bayes’ rule. Let \(I\) be the image, \(x\) the question and \(y\) an answer (for example the word “fork”):</p>
+<div class="eq">\[ \log p(y \mid I, x) = \underbrace{\log p(y \mid x)}_{\text{language prior}} + \underbrace{\log \frac{p(I \mid y, x)}{p(I \mid x)}}_{\text{visual evidence}} \tag{193.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(p(y \mid I, x)\)</dt><dd>what the VLM outputs: the probability of the answer given the image and the question</dd>
+<dt>\(p(y \mid x)\)</dt><dd>the <b>language prior</b>: how likely the answer is from the text alone, with no image</dd>
+<dt>\(\log \frac{p(I \mid y, x)}{p(I \mid x)}\)</dt><dd>the <b>visual evidence</b>: how much the image supports this answer more than an average answer; positive if the image supports \(y\), negative if it argues against it</dd></dl>
+<p>This is an exact identity, not a model. Its message is simple: the answer is the sum of a text term and an image term. A VLM is built on a language model that has read trillions of words. Its prior is <b>strong and sharp</b>: after “a kitchen table with a plate and a knife”, the word “fork” is very likely. The visual term comes from a few hundred visual tokens that the model learned to read on far less data. When the image is clear, the visual term wins. When the image is unclear, small or busy, the visual term is weak, and the prior decides. That is hallucination.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A witness who has seen a thousand kitchens is asked about a blurry photo of one kitchen. If he is not sure, he describes a typical kitchen, fork included. He is not lying. He is filling the gaps with what is usually true.</aside>
+<p>For a yes/no question such as “Is there a fork in the image?” it helps to write the same idea as log-odds (the log of “yes” probability over “no” probability):</p>
+<div class="eq">\[ z = \log \frac{p(\text{yes} \mid I, x)}{p(\text{no} \mid I, x)} = a + w\,e, \qquad p(\text{yes}) = \sigma(z) = \frac{1}{1 + e^{-z}} \tag{193.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(a\)</dt><dd>the prior log-odds of “yes” from the text and scene type: large for objects that often co-occur with what is in the image (fork near a plate)</dd>
+<dt>\(e\)</dt><dd>the visual evidence: positive if the encoder sees the object, negative if it sees that it is absent</dd>
+<dt>\(w\)</dt><dd>how much the model actually uses the image; small when the model has learned to rely on text</dd>
+<dt>\(\sigma\)</dt><dd>the logistic (sigmoid) function that turns log-odds into a probability</dd></dl>
+<p>This is a simplified model for thinking, not a formula from a paper. But it explains the three main causes that the literature reports:</p>
+<ul>
+<li><b>Co-occurrence.</b> POPE (Li et al.) found that LVLMs (large VLMs) tend to hallucinate objects that appear often in the instruction data, or that often appear <b>together with</b> the objects that are really in the image [Certain]. In (193.2), this is a large \(a\).</li>
+<li><b>Weak or missing visual evidence.</b> If the encoder cannot see the object (too small, hidden, low resolution), \(e\) is near 0 and the prior wins. This links hallucination to the resizing problem below.</li>
+<li><b>Training data that teaches the model to talk beyond the image.</b> Many early instruction datasets were written by text-only LLMs from captions and boxes. Long, detailed answers reward plausible extra details. The POPE authors suggest this as one reason why some models hallucinated more [Likely]. Longer answers also hallucinate more: in POPE’s CHAIR test, captions from the longer “brief description” prompt had much higher hallucination rates than short captions for most models (Table 1 of the paper) [Certain].</li>
+</ul>
+
+<div class="worked"><div class="wt">Worked example: a hallucinated fork, and how much the prior must lose</div>
+<p>An image shows a dinner table with a plate and a knife. There is no fork. The question is “Is there a fork in the image?”. The prior is strong: \(a = 2.0\), so the text alone says “yes” with \(\sigma(2.0) = 0.881\). The encoder weakly sees that there is no fork: \(w e = -1.5\).</p>
+<p>Then \(z = 2.0 - 1.5 = 0.5\) and \(p(\text{yes}) = \sigma(0.5) = 0.622\). The model says “yes”. It hallucinated, even though its visual evidence pointed the right way. To answer “no”, the visual term must be stronger than the prior: \(w e \lt -2.0\). Below we will see a decoding trick that, with \(\alpha = 1\), doubles the visual term to \(-3.0\), giving \(z = -1.0\) and \(p(\text{yes}) = 0.269\).</p></div>
+
+<figure class="fig" id="vfm-prior"><div class="fig-body">
+<div class="vfm-grid">
+<label for="vfm-pr-a">prior \(a\)</label><input type="range" id="vfm-pr-a" min="-3" max="4" step="0.1" value="2"><output id="vfm-pr-av"></output>
+<label for="vfm-pr-e">visual term \(w e\)</label><input type="range" id="vfm-pr-e" min="-4" max="4" step="0.1" value="-1.5"><output id="vfm-pr-ev"></output>
+<label for="vfm-pr-s">evidence left in noised image \(s\)</label><input type="range" id="vfm-pr-s" min="0" max="1" step="0.05" value="0"><output id="vfm-pr-sv"></output>
+<label for="vfm-pr-al">VCD strength \(\alpha\)</label><input type="range" id="vfm-pr-al" min="0" max="3" step="0.1" value="1"><output id="vfm-pr-alv"></output></div>
+<svg id="vfm-pr-svg" viewBox="0 0 640 272" role="img" aria-label="Log-odds of yes as the sum of a prior arrow and a visual arrow, for normal decoding and for visual contrastive decoding"></svg>
+<div class="readout" id="vfm-pr-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The answer to “Is there a fork?” as a sum of two arrows on the log-odds axis: the language prior \(a\) and the visual term \(we\). The top row is normal decoding (193.2). The bottom row is visual contrastive decoding (193.5), which makes the visual arrow longer and leaves the prior alone.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Each row starts at 0. The first arrow is the prior, the second is the visual evidence; the dot is where the sum \(z\) lands. Right of the dashed line the model says “yes”. At the defaults, the top row lands at \(z = 0.5\) (“yes”, a hallucination) and the bottom row at \(z = -1.0\) (“no”). Move the prior \(a\) up to 4: even VCD with \(\alpha = 1\) now says “yes”; raise \(\alpha\) to 2 to win again. Move \(s\) toward 1: the noised image keeps the evidence, so the contrast removes nothing and VCD falls back to normal decoding. Finally set \(we\) to a positive value (the fork is really there): VCD makes the correct “yes” even more confident.</p></details></figure>
+
+<h3>Measuring it: CHAIR and POPE</h3>
+<p>The first standard metric is <b>CHAIR</b> (Caption Hallucination Assessment with Image Relevance, Rohrbach et al., 2018). Generate captions, find the object words in them, and compare them with the ground-truth objects of the image (for example the COCO labels):</p>
+<div class="eq">\[ \text{CHAIR}_i = \frac{|\{\text{hallucinated objects}\}|}{|\{\text{all mentioned objects}\}|}, \qquad \text{CHAIR}_s = \frac{|\{\text{captions with a hallucinated object}\}|}{|\{\text{all captions}\}|} \tag{193.3} \]</div>
+<p>\(\text{CHAIR}_i\) counts at the object level, \(\text{CHAIR}_s\) at the caption (sentence) level. CHAIR has two problems. It needs a parser and synonym lists to find objects in free text. And it depends on the prompt and the caption length. In POPE’s tests, LLaVA had \(\text{CHAIR}_s = 32.7\) with “Generate a short caption of the image” and 62.7 with “Provide a brief description of the given image”, with average caption lengths of 64.3 and 90.7 [Certain].</p>
+<p><b>POPE</b> (Polling-based Object Probing Evaluation, Li et al., 2023) turns the problem into yes/no questions: “Is there a &lt;object&gt; in the image?”. Half of the questions ask about objects that are really there (answer “yes”) and half about objects that are not (answer “no”). The trick is how the absent objects are chosen. There are three settings [Certain]:</p>
+<ul>
+<li><b>Random:</b> any object that is not in the image.</li>
+<li><b>Popular:</b> the most frequent objects in the whole dataset that are not in this image.</li>
+<li><b>Adversarial:</b> the objects that co-occur most often with the objects that are in the image (a fork for a table with a plate). This attacks the prior \(a\) directly.</li>
+</ul>
+<p>On COCO, POPE used 500 images with more than 3 labeled objects and 6 questions per image (3 “yes”, 3 “no”), so 3,000 questions per setting [Certain]. It reports accuracy, precision, recall, F1 and the <b>yes ratio</b>, the share of questions answered “yes”:</p>
+<div class="eq">\[ \text{Prec} = \frac{TP}{TP + FP}, \quad \text{Rec} = \frac{TP}{TP + FN}, \quad F_1 = \frac{2\,\text{Prec}\,\text{Rec}}{\text{Prec} + \text{Rec}}, \quad \text{yes ratio} = \frac{TP + FP}{N} \tag{193.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(TP\)</dt><dd>true positives: the object is there and the model says “yes”</dd>
+<dt>\(FP\)</dt><dd>false positives: the object is <b>not</b> there and the model says “yes”; each one is a hallucination</dd>
+<dt>\(FN\)</dt><dd>false negatives: the object is there and the model says “no”</dd>
+<dt>\(N\)</dt><dd>the number of questions (3,000 per setting); a balanced test has a correct yes ratio of 50%</dd></dl>
+<p>The yes ratio is the key diagnostic. In the POPE paper, LLaVA (the first version), mPLUG-Owl and MultiModal-GPT answered “yes” to 95–100% of the questions: they had almost stopped looking at the image [Certain]. A model that always says “yes” has precision 0.5 and recall 1, so its F1 is \(2 \cdot 0.5 \cdot 1 / 1.5 = 0.667\). Several of those models scored F1 between 66.7 and 68.7, which is no better than “always yes”. InstructBLIP was the best model in the paper, but even its F1 fell from 89.29 (random) to 78.45 (adversarial) [Certain]. The fall from random to adversarial is the prior at work. Explore the real rows in Figure 3.</p>
+
+<figure class="fig" id="vfm-pope"><div class="fig-body">
+<div class="controls"><span class="seg" id="vfm-po-preset"><button type="button" data-p="yes" aria-pressed="false">Always “yes”</button><button type="button" data-p="llr" aria-pressed="true">LLaVA, random</button><button type="button" data-p="ibr" aria-pressed="false">InstructBLIP, random</button><button type="button" data-p="iba" aria-pressed="false">InstructBLIP, adversarial</button></span></div>
+<div class="vfm-grid">
+<label for="vfm-po-tp">“yes” on real objects (of 1500)</label><input type="range" id="vfm-po-tp" min="0" max="1500" step="1" value="1497"><output id="vfm-po-tpv"></output>
+<label for="vfm-po-fp">“yes” on absent objects (of 1500)</label><input type="range" id="vfm-po-fp" min="0" max="1500" step="1" value="1364"><output id="vfm-po-fpv"></output></div>
+<div class="scroll-x"><svg id="vfm-po-svg" viewBox="0 0 640 220" role="img" aria-label="POPE confusion matrix and metric bars"></svg></div>
+<div class="readout" id="vfm-po-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> POPE metrics from a confusion matrix of 3,000 questions (1,500 with a real object, 1,500 with an absent one). The presets rebuild real rows of Table 3 of the POPE paper (MSCOCO) from their recall and yes ratio.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The left square is the confusion matrix; the red cell counts hallucinations (FP). The bars on the right are the metrics of (193.4). Start with “Always yes”: F1 is 0.667 and accuracy 0.5. Now pick “LLaVA, random”: the numbers are almost the same as “always yes”, and the yes ratio is 95.4%. Compare “InstructBLIP, random” and “InstructBLIP, adversarial”: recall barely moves (93.9% vs 93.3%), but the number of hallucinations nearly triples (247 vs 669). That is co-occurrence: adversarial questions ask about objects the prior expects. Always look at the yes ratio and FP next to F1.</p></details></figure>
+
+<h3>Fixing hallucination</h3>
+<p>The fixes follow from (193.1): make the visual term stronger, make the prior weaker, or teach the model that the prior is not enough.</p>
+<p><b>Visual contrastive decoding (VCD)</b> (Leng et al., 2023) is a training-free fix at decoding time. Run the model twice at each step: once with the real image \(v\) and once with a distorted image \(v'\) (the paper adds Gaussian noise in steps, like the forward process of a diffusion model). The distorted run keeps the prior but loses most of the visual evidence. Then subtract [Certain]:</p>
+<div class="eq">\[ p_{\text{vcd}}(y \mid v, v', x) = \softmax\Big[ (1 + \alpha)\, \ell_\theta(y \mid v, x) - \alpha\, \ell_\theta(y \mid v', x) \Big] \tag{193.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\ell_\theta(y \mid v, x)\)</dt><dd>the logits (scores before softmax) of the next token with the real image</dd>
+<dt>\(\ell_\theta(y \mid v', x)\)</dt><dd>the logits with the noised image: mostly the language prior</dd>
+<dt>\(\alpha\)</dt><dd>contrast strength; \(\alpha = 0\) is normal decoding; the paper’s default is \(\alpha = 1\)</dd></dl>
+<p>Subtracting can also give a high score to junk tokens that are unlikely in both runs. So VCD keeps only tokens that are already plausible with the real image, an <b>adaptive plausibility constraint</b> [Certain]:</p>
+<div class="eq">\[ \mathcal{V}_{\text{head}} = \big\{\, y : p_\theta(y \mid v, x) \ge \beta \max_{w} p_\theta(w \mid v, x) \,\big\}, \qquad p_{\text{vcd}}(y) = 0 \text{ for } y \notin \mathcal{V}_{\text{head}} \tag{193.6} \]</div>
+<p>with default \(\beta = 0.1\). Why does this work? Put the yes/no model (193.2) into (193.5). With the real image the log-odds are \(a + we\). With the noised image a share \(s\) of the evidence survives: \(a + s\,we\). Then:</p>
+<div class="eq">\[ z_{\text{vcd}} = (1 + \alpha)(a + we) - \alpha(a + s\,we) = a + (1 + \alpha - \alpha s)\, w e \tag{193.7} \]</div>
+<p>The prior \(a\) cancels out of the contrast and stays as it is, while the visual term is multiplied by \(1 + \alpha(1 - s)\). With full noise (\(s = 0\)) and \(\alpha = 1\), the visual evidence counts twice. If the noise does not remove the evidence (\(s = 1\)), VCD does nothing. This is what Figure 2 shows. On POPE (MSCOCO) with LLaVA-1.5, the paper reports F1 going from 81.33 to 87.16 (random) and from 77.57 to 81.33 (adversarial) [Certain]. The cost: two forward passes per token, so decoding is about twice as slow [Likely].</p>
+<p>Other fixes, from cheap to expensive:</p>
+<ul>
+<li><b>Ask shorter, closed questions.</b> Long free descriptions drift away from the image; ask “Is there X?” or “List only objects you can see” when you can [Likely].</li>
+<li><b>Better visual evidence.</b> Higher resolution and a stronger encoder raise \(e\) (sections below).</li>
+<li><b>Preference tuning.</b> Train on pairs where the rejected answer has a hallucinated object, so the model learns to push down its own prior-driven words: see <a href="../vision/vlm-preference-optimization-and-rl.html">session 190</a> (mDPO, RLHF-V) and the lab <a href="../vision/index.html#row-lab-preference-tuning-a-vlm-against-hallucination" title="preference tuning a VLM against hallucination (planned)">session 195</a>.</li>
+<li><b>Better instruction data.</b> Include questions whose correct answer is “no”, and avoid answers that mention things not in the image.</li>
+</ul>
+<aside class="note watch side"><span class="nt">Watch out</span>A model can raise its POPE score just by saying “no” more often. Check that recall did not fall. A good fix lowers FP while keeping TP.</aside>
+
+<h2>Counting and spatial relations</h2>
+<p>“How many people are in the photo?” and “Is the mug to the left of the laptop?” look easy. VLMs are often bad at both. There are three causes, and they stack.</p>
+<p><b>Cause 1: the encoder was trained to know “what”, not “how many” or “where”.</b> Most VLMs use a CLIP- or SigLIP-style encoder (see <a href="../vision/clip-learning-images-and-text-together.html">session 166</a>). Contrastive training only asks: does this image match this caption better than the other captions in the batch? Captions rarely depend on exact counts or on left versus right, so the encoder gets little reward for keeping them. Yuksekgonul et al. showed that such models often behave like a <b>bag of words</b>: they are poor at relations and at matching attributes to the right object, and barely notice word order [Certain]. They built the ARO benchmark (Attribution, Relation, Order) with more than 50,000 test cases [Certain]. Kamath et al. built What’sUp, photos that differ only in the spatial relation between two objects; all 18 models they tested performed poorly, far below humans [Certain].</p>
+<p><b>Cause 2: the language model cannot recover what the encoder dropped.</b> Tong et al. (“Eyes Wide Shut”) searched for <b>CLIP-blind pairs</b>: two images that CLIP sees as almost the same (cosine similarity above 0.95) but a self-supervised model, DINOv2, sees as different (below 0.6) [Certain]. From these pairs they built MMVP: 150 image pairs, 300 questions, scored per pair (both answers must be right, so random guessing gets \(0.5 \times 0.5 = 25\%\)). Humans scored 95.7%, GPT-4V 38.7% and LLaVA-1.5 24.7% [Certain]. “Quantity and count” and “positional and relational context” are two of their nine failure patterns [Certain]. Their fix, Mixture of Features, adds DINOv2 features next to CLIP features [Certain].</p>
+<p><b>Cause 3: a coarse token grid, and many objects.</b> A 336-pixel image with 14-pixel patches becomes a 24 × 24 grid of 576 tokens. Connectors often pool or merge these further (see <a href="../vision/connectors-projector-q-former-perceiver-resampler-pixel.html">session 178</a>). Small objects that fall into the same token become one blob. And even if each object is seen with high probability, the chance to get the <b>whole</b> count right falls fast with the number of objects. If each of \(n\) objects is found independently with probability \(p\) and nothing is counted twice:</p>
+<div class="eq">\[ P(\text{exact count}) = p^{\,n} \tag{193.8} \]</div>
+<p>With \(p = 0.97\), the count is exactly right with probability 0.859 for 5 objects, 0.737 for 10 and 0.544 for 20. This is why counting errors grow with crowd size even for good models.</p>
+<p>The token grid adds a second effect. Suppose, as a toy model, that the model can tell whether a cell of the grid contains the object, but not how many copies are inside one cell. With \(M\) cells and \(n\) objects placed at random, the expected number of occupied cells (the classic occupancy formula) is:</p>
+<div class="eq">\[ \E[\text{occupied cells}] = M \Big( 1 - \big(1 - \tfrac{1}{M}\big)^{n} \Big) \tag{193.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(M\)</dt><dd>the number of cells that the model can tell apart, for example 6 × 6 = 36 after strong pooling, or 24 × 24 = 576 patch tokens</dd>
+<dt>\(n\)</dt><dd>the true number of objects</dd>
+<dt>\(\big(1 - \tfrac{1}{M}\big)^{n}\)</dt><dd>the chance that one given cell gets none of the \(n\) objects</dd></dl>
+<p>With 36 cells and 12 objects, the expected count is 10.33: the toy model undercounts by almost 2. With 576 cells and the same 12 objects it is 11.89. Real models are not this simple, but the direction is right: coarse grids and crowded scenes lead to undercounting. Try it in Figure 4.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Count sheep from a plane through a window with a coarse grid painted on it. You can say which squares have sheep. When two sheep stand in the same square, you count one.</aside>
+
+<figure class="fig" id="vfm-count"><div class="fig-body">
+<div class="vfm-grid">
+<label for="vfm-ct-n">objects \(n\)</label><input type="range" id="vfm-ct-n" min="1" max="40" step="1" value="12"><output id="vfm-ct-nv"></output>
+<label for="vfm-ct-g">grid cells per side</label><input type="range" id="vfm-ct-g" min="3" max="24" step="1" value="6"><output id="vfm-ct-gv"></output></div>
+<div class="controls" style="margin-top:8px"><button type="button" class="btn" id="vfm-ct-new">New layout</button><span id="vfm-ct-seed" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="vfm-ct-svg" viewBox="0 0 640 300" role="img" aria-label="Objects on a token grid; cells with two or more objects are merged"></svg></div>
+<div class="readout" id="vfm-ct-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A toy model of counting on a token grid. Each dot is an object; the model sees only which cells are occupied. Orange cells hold two or more objects and are counted once. The right panel compares the true count, this layout’s count and the expectation (193.9).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At the defaults (12 objects, 6 × 6 cells) the expected toy count is 10.33. Press “New layout” a few times: the count of this layout moves around that value. Now raise the grid to 24 cells per side (the 576-token grid of a 336-pixel image): merges become rare and the count is nearly exact. Then push \(n\) to 40 with a 6 × 6 grid: the toy count saturates near the number of cells. This is why high resolution, less pooling and point-then-count prompts help counting.</p></details></figure>
+
+<h3>Fixing counting and spatial errors</h3>
+<ul>
+<li><b>Count by pointing or detecting.</b> Ask the model to output one point or box per object first, then count the list. Molmo was trained with a large 2D pointing dataset (PixMo) [Certain] and counts by pointing [Likely]. Qwen2.5-VL reports 93.6 on CountBench (72B model) with a “detect then count” style prompt [Certain]. Each object then gets its own output, so errors no longer hide inside one blob.</li>
+<li><b>Use a detector as a tool.</b> For production counting (shelves, parking lots), an open-vocabulary detector (<a href="../vision/grounded-pretraining-glip-and-yolo-world.html">session 174</a>) plus code is usually more reliable than asking the VLM for a number [Likely].</li>
+<li><b>Better features.</b> Add self-supervised features (DINOv2, see <a href="../vision/self-supervised-vision-mae-dino-dinov2-dinov3.html">session 165</a>) next to CLIP (MMVP’s Mixture of Features), or use a less pooled, higher-resolution feature map.</li>
+<li><b>Hard negatives and spatial data.</b> ARO showed that contrastive training with composition-aware hard negatives (for example, captions with swapped words) improves order and composition tasks [Certain]. For the VLM itself, add instruction data with counts, left/right and boxes.</li>
+<li><b>Absolute coordinates.</b> Train and ask for boxes in pixel coordinates of the real image; Qwen2.5-VL represents boxes and points in the actual image size, not normalized values [Certain].</li>
+</ul>
+<p>Cambrian-1 (Tong et al., 2024) made these skills measurable. It introduced CV-Bench, a vision-centric benchmark of 2,638 manually checked examples, with 2D tasks (spatial relationship: 650, object count: 788, from ADE20K and COCO) and 3D tasks (depth order and relative distance: 600 each, from Omni3D) [Certain]. It also warned that several popular benchmarks (for example MMMU, MathVista and AI2D) show less than 5% difference between vision enabled and disabled: a model can do well on them mostly with its language prior [Certain]. Always include a vision-centric test when you study these failures.</p>
+
+<h2>Small text and fine details lost by resizing</h2>
+<p>Many VLMs resize every image to a fixed square: 224 or 336 pixels for classic CLIP encoders (LLaVA-1.5 uses 336 × 336, so 576 tokens) [Certain]. A phone photo is 3024 × 4032 pixels. If we keep the aspect ratio and fit the long side to the model input of size \(S\), every length in the image shrinks by the same factor:</p>
+<div class="eq">\[ h' = h \cdot \min\Big( \frac{S_W}{W}, \frac{S_H}{H} \Big), \qquad \text{text height in patches} = \frac{h'}{P} \tag{193.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W, H\)</dt><dd>the original width and height of the image in pixels</dd>
+<dt>\(S_W, S_H\)</dt><dd>the width and height the encoder receives (336 and 336 for LLaVA-1.5)</dd>
+<dt>\(h\)</dt><dd>the height of a line of text (or of a small object) in the original image</dd>
+<dt>\(h'\)</dt><dd>its height after resizing</dd>
+<dt>\(P\)</dt><dd>the patch size of the ViT, usually 14 pixels; one token sees one \(P \times P\) patch</dd></dl>
+<div class="worked"><div class="wt">Worked example: a receipt photo</div>
+<p>A receipt is photographed at 3024 × 4032. The line with the total is 40 pixels tall. Fit to 336: the factor is \(336 / 4032 = 0.0833\), so the text becomes \(40 \times 0.0833 = 3.33\) pixels tall, about a quarter of one 14-pixel patch (0.24). No model can read digits that are 3 pixels tall. At 224 it is 2.22 pixels, and with a 672-pixel canvas (2 × 2 tiles of 336) it is 6.67 pixels.</p>
+<p>Now use native resolution as in Qwen2-VL and Qwen2.5-VL, where each visual token covers 28 × 28 pixels after a 2 × 2 merge of 14-pixel patches. The default processor limit is <code>max_pixels = 12845056</code> \(= 16384 \times 28 \times 28\) [Certain], and \(3024 \times 4032 = 12{,}192{,}768\) is below it. So the photo is kept as it is: the text stays 40 pixels tall, at the cost of \(108 \times 144 = 15{,}552\) visual tokens. With a cap of 1280 tokens (<code>max_pixels = 1280 × 28 × 28</code>, a common setting [Likely]), the processor resizes the photo to 840 × 1148, which is 1,230 tokens, and the text becomes 11.39 pixels tall.</p></div>
+<p>This is the core trade-off of <a href="../vision/high-resolution-and-native-aspect-ratio.html">session 180</a>: legibility costs tokens, and tokens cost latency and memory (<a href="../vision/visual-token-efficiency.html">session 183</a>). Squashing to a square without keeping the aspect ratio is even worse for text: it also distorts the letter shapes. Figure 5 lets you see the effect.</p>
+
+<figure class="fig" id="vfm-text"><div class="fig-body">
+<div class="controls"><span class="seg" id="vfm-tx-src"><button type="button" data-s="r" aria-pressed="true">Receipt photo 3024 × 4032</button><button type="button" data-s="s" aria-pressed="false">Screenshot 1920 × 1080</button><button type="button" data-s="a" aria-pressed="false">A4 scan 2480 × 3508</button></span></div>
+<div class="controls"><span class="seg" id="vfm-tx-mode"><button type="button" data-m="224" aria-pressed="false">224</button><button type="button" data-m="336" aria-pressed="true">336</button><button type="button" data-m="672" aria-pressed="false">2 × 2 tiles (672)</button><button type="button" data-m="n1280" aria-pressed="false">native, ≤ 1280 tokens</button><button type="button" data-m="nfull" aria-pressed="false">native, default limit</button></span></div>
+<div class="vfm-grid">
+<label for="vfm-tx-h">text height in the original (px)</label><input type="range" id="vfm-tx-h" min="6" max="60" step="1" value="40"><output id="vfm-tx-hv"></output></div>
+<canvas id="vfm-tx-cv" class="vfm-canvas" width="640" height="150" aria-label="The text TOTAL $1,284.50 as the encoder would see it after resizing"></canvas>
+<div class="readout" id="vfm-tx-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> What resizing does to a line of text. The string is drawn at its size <b>after</b> resizing (193.10) and then blown up with no smoothing, so each square is one pixel the encoder actually gets. Token counts: 256 at 224, 576 at 336, 5 × 576 = 2,880 for 2 × 2 tiles plus a thumbnail, and Qwen2-VL’s rule for native resolution.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Start at the receipt and 336: the total is 3.33 pixels tall and unreadable. Click “2 × 2 tiles”: it doubles to 6.67 pixels and starts to be readable, for 5 times the tokens. Click “native, ≤ 1280 tokens”: 11.39 pixels with 1,230 tokens, a better trade than tiles here. Switch to the screenshot with 12-pixel text: at 336 it shrinks to 2.10 pixels, while native resolution with the default limit keeps it at about 12 pixels (2,691 tokens). The “readable?” label uses a rough rule for this demo (below 6 pixels: unreadable; 6 to 10: risky), not a measured threshold.</p></details></figure>
+
+<h3>Fixing small text and small objects</h3>
+<ul>
+<li><b>Tiling.</b> Split the image into tiles at the encoder’s size, plus a low-resolution thumbnail for the global view (LLaVA-NeXT, InternVL). Cambrian-1 lists 2,880 visual tokens for LLaVA-NeXT [Certain].</li>
+<li><b>Native resolution.</b> Patchify the image at (almost) its real size, with 2-D positions (Qwen2-VL, Qwen2.5-VL). Set <code>max_pixels</code> from the smallest text you must read, using (193.10) backwards.</li>
+<li><b>Better connectors for high resolution.</b> Cambrian-1 found that high-resolution encoders greatly improve chart and vision-centric tasks, and that ConvNet encoders handle high resolution well [Certain]. Its Spatial Vision Aggregator (SVA) uses a grid of learnable queries, where each query attends only to its own sub-region of the encoder features; the final models use 576 visual tokens [Certain].</li>
+<li><b>Zoom in on demand.</b> V* (Wu and Xie) lets the LLM search the image for the region it needs and look again at high resolution, for crowded high-resolution images [Certain]. A simple version is a crop tool: the model names a box, the system crops it at full resolution and feeds it back (see <a href="../applications/agents-and-tool-use.html">session 154</a>).</li>
+<li><b>OCR as a tool.</b> For documents, run a dedicated OCR model and give its text (with positions) to the VLM. This is often cheaper than very high resolution [Likely].</li>
+</ul>
+<aside class="note watch side"><span class="nt">Watch out</span>The resize often hides in the data loader or the serving code, not in the model. A model fine-tuned at 1,280 tokens and then served with a smaller <code>max_pixels</code> “forgets” how to read. Log the actual image size the encoder receives.</aside>
+
+<h2>Temporal confusion in video</h2>
+<p>A Video-LLM (see <a href="../video/index.html#row-video-llms" title="Video-LLMs (planned)">session 205</a>) usually samples a fixed number of frames \(N\), encodes each frame like an image, and puts all the visual tokens into the language model. A 10-minute video at 30 frames per second has 18,000 frames; the model may see 32. Three things go wrong.</p>
+<p><b>Short events fall between frames.</b> With uniform sampling the gap between frames is \(T/N\). An event of length \(d\) is seen in at least one frame with probability (assuming a random start of the sampling grid):</p>
+<div class="eq">\[ P(\text{event seen}) = \min\Big( 1, \frac{d\,N}{T} \Big) \tag{193.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(T\)</dt><dd>video length in seconds</dd>
+<dt>\(N\)</dt><dd>number of sampled frames; \(T/N\) is the stride, the time between two frames</dd>
+<dt>\(d\)</dt><dd>duration of the event, for example a 3-second goal or a fall</dd></dl>
+<p>For a 600-second video with 32 frames, the stride is 18.75 seconds and a 3-second event is seen with probability \(3 \times 32 / 600 = 0.16\). With 64 frames it is 0.32. A model that “misses” the event never had a chance. Worse, the language prior fills the gap: it answers with what usually happens in such a video.</p>
+<p><b>Order is lost.</b> Many encoders process each frame on its own. If the frame tokens carry weak or no time positions, the model sees a <b>bag of frames</b> and cannot tell “sat down, then stood up” from the reverse. TempCompass (Liu et al., 2024) tested this with “conflicting videos” that share the same static content but differ in one temporal aspect such as direction or speed, so that single-frame cues and language priors do not help; the 8 Video LLMs and 3 image LLMs they tested showed notably poor temporal perception [Certain].</p>
+<p><b>Time is in frames, not seconds.</b> If position ids count frames, “frame 10” means 5 seconds at 2 fps and 50 seconds at 0.2 fps. The model cannot answer “when?” or compare speeds across videos sampled differently. Qwen2.5-VL aligns the temporal part of its M-RoPE positions with absolute time, so the gaps between temporal ids reflect real time, and it samples the frame rate dynamically during training [Certain]. It also groups two consecutive frames into one temporal step to save tokens [Certain], which means one temporal token already spans two frames.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>You get 32 photos of a 10-minute football match, shuffled, with no clock on them. You can say it was football. You cannot say who scored first, and you probably missed the goal.</aside>
+
+<figure class="fig" id="vfm-frames"><div class="fig-body">
+<div class="vfm-grid">
+<label for="vfm-fr-t">video length \(T\) (s)</label><input type="range" id="vfm-fr-t" min="10" max="1200" step="10" value="600"><output id="vfm-fr-tv"></output>
+<label for="vfm-fr-n">frames \(N\)</label><input type="range" id="vfm-fr-n" min="4" max="128" step="1" value="32"><output id="vfm-fr-nv"></output>
+<label for="vfm-fr-d">event length \(d\) (s)</label><input type="range" id="vfm-fr-d" min="0.5" max="30" step="0.5" value="3"><output id="vfm-fr-dv"></output></div>
+<div class="scroll-x"><svg id="vfm-fr-svg" viewBox="0 0 640 190" role="img" aria-label="Video timeline with sampled frames and short events; events hit by a frame are filled"></svg></div>
+<div class="readout" id="vfm-fr-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 6.</b> Uniform frame sampling on a video timeline. Ticks are sampled frames; the boxes A to E are events of length \(d\) at fixed places in the video. A filled box was hit by at least one frame; an empty box is invisible to the model.</figcaption>
+<details class="howto"><summary>How to read Figure 6</summary><p>At the defaults (600 s, 32 frames, 3 s events) the stride is 18.75 s and each event is seen with probability 0.16 by (193.11); here all five events are missed. Raise \(N\) to 128: the stride is 4.69 s and the chance is 0.64. Now raise \(d\) to 20 s: every event is caught even with 32 frames. The lesson: the frame budget must be chosen from the shortest event you care about, \(N \ge T/d\), or you must pick frames smartly (key frames, scene cuts, or retrieval).</p></details></figure>
+
+<h3>Fixing temporal confusion</h3>
+<ul>
+<li><b>More frames, fewer tokens per frame.</b> Raise \(N\) and compress each frame (pooling, token merging; see <a href="../vision/visual-token-efficiency.html">session 183</a>). Qwen2.5-VL was evaluated with up to 768 frames and at most 24,576 video tokens [Certain].</li>
+<li><b>Smart frame selection.</b> Sample at scene cuts, at motion peaks, or retrieve frames that match the question with a CLIP-style score (see <a href="../video/index.html#row-long-video" title="Long video (planned)">session 206</a>).</li>
+<li><b>Time in the input.</b> Use absolute-time position ids (Qwen2.5-VL) or write timestamps as text next to each frame, so “when” questions have an anchor [Likely].</li>
+<li><b>Temporal training data.</b> Include questions that need order, direction and speed, and conflicting videos (reversed or reordered clips with flipped answers) so single-frame shortcuts stop working.</li>
+<li><b>Test the shortcut.</b> Ask the same question with the frames shuffled or reversed. If the answer does not change on an order question, the model is using a bag of frames.</li>
+</ul>
+
+<h2>A diagnosis protocol</h2>
+<p>When a VLM fails, first find <b>which</b> failure you have. Each test removes or changes one input and watches the answer. The table maps symptoms to tests and fixes.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Failure</th><th>Typical symptom</th><th>Test that confirms the cause</th><th>Fix that targets it</th></tr></thead><tbody>
+<tr><td>Object hallucination</td><td>Names typical but absent objects; yes ratio far above 50%</td><td>Blind test (no image or a blank image): the same answer means the prior decides. POPE adversarial vs random</td><td>VCD, preference tuning with hallucinated negatives, “no” questions in data</td></tr>
+<tr><td>Counting</td><td>Undercounts crowds; right for 2–3 objects, wrong for 10+</td><td>Accuracy vs true count; same image at higher resolution; ask for points first</td><td>Point/detect then count, detector tool, less pooling</td></tr>
+<tr><td>Spatial relations</td><td>Left/right and above/below at chance</td><td>Mirror the image horizontally: the answer should flip; CV-Bench, What’sUp</td><td>Spatial instruction data, absolute boxes, SSL features</td></tr>
+<tr><td>Small text / details</td><td>Wrong digits, “I cannot read it”, guesses typical values</td><td>Crop the region and ask again at full resolution; log the encoder input size</td><td>Tiling, native resolution, zoom-in tool, OCR tool</td></tr>
+<tr><td>Temporal confusion</td><td>Misses short events; wrong order; answers from one frame</td><td>Shuffle or reverse frames; double \(N\); compare with a single middle frame</td><td>More frames with compression, smart sampling, absolute time ids</td></tr></tbody></table></div>
+
+<div class="algo"><div class="algo-h">Algorithm 1: find the failure family of one wrong answer</div><ol>
+<li><b>input:</b> model \(f\), image or video \(I\), question \(x\), wrong answer \(\hat y = f(I, x)\)</li>
+<li>\(y_0 \leftarrow f(\varnothing, x)\) <span class="c">// blind test: no image, or a blank gray image</span></li>
+<li><b>if</b> \(y_0 = \hat y\) <b>then</b> report “language prior” and stop <span class="c">// the image did not change the answer</span></li>
+<li>\(y_c \leftarrow f(\text{crop}(I, \text{region}), x)\) at full resolution <span class="c">// zoom on the relevant region</span></li>
+<li><b>if</b> \(y_c\) is correct <b>then</b> report “resolution” and stop</li>
+<li><b>if</b> \(x\) asks for a count <b>then</b> ask for one point per object, count the points <span class="c">// pointing splits the blob</span></li>
+<li class="i1"><b>if</b> the point count is correct <b>then</b> report “counting by direct read-out” and stop</li>
+<li><b>if</b> \(x\) asks about left/right <b>then</b> \(y_m \leftarrow f(\text{mirror}(I), x)\); <b>if</b> \(y_m = \hat y\) <b>then</b> report “spatial relation ignored”</li>
+<li><b>if</b> \(I\) is a video <b>then</b></li>
+<li class="i1">\(y_s \leftarrow f(\text{shuffle}(I), x)\); <b>if</b> \(x\) needs order and \(y_s = \hat y\) <b>then</b> report “bag of frames”</li>
+<li class="i1">\(y_{2N} \leftarrow f(I \text{ with } 2N \text{ frames}, x)\); <b>if</b> \(y_{2N}\) is correct <b>then</b> report “sparse sampling”</li>
+<li><b>else</b> report “encoder cannot see it” <span class="c">// try a stronger encoder or SSL features</span></li></ol></div>
+<p>Run this on a few hundred failures, not one. The share of each family tells you where to spend effort. The second algorithm is the decoding fix for the first family.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: one decoding step of visual contrastive decoding (VCD)</div><ol>
+<li><b>input:</b> image \(v\), prompt and answer so far \(x, y_{\lt t}\), strength \(\alpha\), plausibility \(\beta\), noise steps</li>
+<li>\(v' \leftarrow \operatorname{noise}(v)\) <span class="c">// once per image, reused for every step</span></li>
+<li>\(\mathbf{u} \leftarrow \text{model}(v, x, y_{\lt t})\), \(\;\mathbf{u}' \leftarrow \text{model}(v', x, y_{\lt t})\) <span class="c">// two passes, two KV caches</span></li>
+<li>\(\mathbf{p} \leftarrow \softmax(\mathbf{u})\)</li>
+<li>\(\mathcal{V}_{\text{head}} \leftarrow \{y : p_y \ge \beta \max_w p_w\}\) <span class="c">// (193.6)</span></li>
+<li>\(\mathbf{c} \leftarrow (1 + \alpha)\mathbf{u} - \alpha \mathbf{u}'\); set \(c_y = -\infty\) for \(y \notin \mathcal{V}_{\text{head}}\) <span class="c">// (193.5)</span></li>
+<li>\(y_t \leftarrow\) sample from \(\softmax(\mathbf{c})\) (or take the argmax)</li>
+<li><b>return</b> \(y_t\)</li></ol></div>
+<p>Here \(\mathbf{u}\) and \(\mathbf{u}'\) are the two logit vectors \(\ell_\theta(\cdot \mid v, x)\) and \(\ell_\theta(\cdot \mid v', x)\) of (193.5). Each failure family also has a standard benchmark: POPE and CHAIR for hallucination, CV-Bench and MMVP for counting and spatial skills, text-heavy sets such as TextVQA and DocVQA for small text, and Video-MME or TempCompass for time (see <a href="../vision/evaluating-vlms.html">session 192</a>).</p>
+
+<h2>The code: POPE metrics, VCD, resizing and frame sampling</h2>
+<p>The code below implements the four measurements of this session in plain PyTorch, with no model download. It computes POPE metrics (193.4), one VCD step (193.5–193.6), the effective text height under fixed and native resizing (193.10), and checks the frame hit formula (193.11) by simulation. It is deterministic.</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+
+torch.manual_seed(0)
+
+<span class="cm"># 1) POPE metrics from yes/no answers (1 = "yes")</span>
+<span class="kw2">def</span> pope_metrics(pred, gold):
+    tp = ((pred == 1) &amp; (gold == 1)).sum().item()
+    fp = ((pred == 1) &amp; (gold == 0)).sum().item()
+    fn = ((pred == 0) &amp; (gold == 1)).sum().item()
+    acc = (pred == gold).float().mean().item()
+    prec = tp / max(tp + fp, 1)
+    rec = tp / max(tp + fn, 1)
+    f1 = 2 * prec * rec / max(prec + rec, 1e-9)
+    <span class="kw2">return</span> dict(acc=round(acc, 4), prec=round(prec, 4), rec=round(rec, 4),
+                f1=round(f1, 4), yes=round(pred.float().mean().item(), 4))
+
+gold = torch.tensor([1, 1, 1, 0, 0, 0] * 500)          <span class="cm"># 500 images x 6 questions</span>
+always_yes = torch.ones_like(gold)
+print("always yes:", pope_metrics(always_yes, gold))
+<span class="cm"># a model that sees real objects 90% of the time and says "yes" to 30% of absent ones</span>
+g = torch.Generator().manual_seed(0)
+u = torch.rand(gold.shape, generator=g)
+pred = torch.where(gold == 1, (u &lt; 0.9).long(), (u &lt; 0.3).long())
+print("biased model:", pope_metrics(pred, gold))
+
+<span class="cm"># 2) Visual contrastive decoding (VCD) for one next-token step</span>
+<span class="kw2">def</span> vcd_logits(logit_img, logit_noisy, alpha=1.0, beta=0.1):
+    """(1+alpha)*l(y|v,x) - alpha*l(y|v',x), restricted to plausible tokens."""
+    p = logit_img.softmax(-1)
+    keep = p &gt;= beta * p.max(-1, keepdim=True).values      <span class="cm"># head set V_head</span>
+    out = (1 + alpha) * logit_img - alpha * logit_noisy
+    <span class="kw2">return</span> out.masked_fill(~keep, float("-inf"))
+
+vocab = ["yes", "no", "maybe", "a"]
+l_img   = torch.tensor([0.5, 0.0, -1.5, -3.0])   <span class="cm"># with the real image</span>
+l_noisy = torch.tensor([2.0, 0.0, -1.5, -3.0])   <span class="cm"># with a noised image: prior only</span>
+<span class="kw2">for</span> name, l <span class="kw2">in</span> [("regular", l_img), ("vcd", vcd_logits(l_img, l_noisy))]:
+    pr = l.softmax(-1)
+    print(name, {w: round(pr[i].item(), 3) <span class="kw2">for</span> i, w <span class="kw2">in</span> enumerate(vocab)})
+
+<span class="cm"># 3) Effective text height after resizing (aspect ratio kept)</span>
+<span class="kw2">def</span> smart_resize(h, w, factor=28, min_pixels=56 * 56, max_pixels=1280 * 28 * 28):
+    hb, wb = round(h / factor) * factor, round(w / factor) * factor
+    <span class="kw2">if</span> hb * wb &gt; max_pixels:
+        b = math.sqrt(h * w / max_pixels)
+        hb, wb = math.floor(h / b / factor) * factor, math.floor(w / b / factor) * factor
+    <span class="kw2">elif</span> hb * wb &lt; min_pixels:
+        b = math.sqrt(min_pixels / (h * w))
+        hb, wb = math.ceil(h * b / factor) * factor, math.ceil(w * b / factor) * factor
+    <span class="kw2">return</span> hb, wb
+
+H, W, text_h = 4032, 3024, 40                     <span class="cm"># phone photo of a receipt</span>
+<span class="kw2">for</span> side <span class="kw2">in</span> (224, 336, 672):
+    s = min(side / H, side / W)
+    print(f"fixed {side}: text {text_h * s:.2f} px")
+hb, wb = smart_resize(H, W)
+print("native 1280-token cap:", (hb, wb), "tokens", (hb // 28) * (wb // 28),
+      f"text {text_h * hb / H:.2f} px")
+
+<span class="cm"># 4) Uniform frame sampling: chance to see a short event</span>
+<span class="kw2">def</span> hit_rate(T, N, d, trials=20000):
+    g = torch.Generator().manual_seed(1)
+    stride = T / N
+    offset = torch.rand(trials, generator=g) * stride           <span class="cm"># random phase</span>
+    start = torch.rand(trials, generator=g) * (T - d)           <span class="cm"># event start</span>
+    t = offset[:, None] + stride * torch.arange(N)[None, :]     <span class="cm"># frame times</span>
+    seen = ((t &gt;= start[:, None]) &amp; (t &lt;= start[:, None] + d)).any(1)
+    <span class="kw2">return</span> seen.float().mean().item()
+
+<span class="kw2">for</span> N <span class="kw2">in</span> (8, 32, 64):
+    print(f"T=600 s, N={N}: simulated {hit_rate(600, N, 3):.3f}, formula {min(1, 3 * N / 600):.3f}")</pre>
+<p>Output (the same on every run):</p>
+<pre class="code">always yes: {'acc': 0.5, 'prec': 0.5, 'rec': 1.0, 'f1': 0.6667, 'yes': 1.0}
+biased model: {'acc': 0.7953, 'prec': 0.7445, 'rec': 0.8993, 'f1': 0.8146, 'yes': 0.604}
+regular {'yes': 0.564, 'no': 0.342, 'maybe': 0.076, 'a': 0.017}
+vcd {'yes': 0.231, 'no': 0.629, 'maybe': 0.14, 'a': 0.0}
+fixed 224: text 2.22 px
+fixed 336: text 3.33 px
+fixed 672: text 6.67 px
+native 1280-token cap: (1148, 840) tokens 1230 text 11.39 px
+T=600 s, N=8: simulated 0.038, formula 0.040
+T=600 s, N=32: simulated 0.160, formula 0.160
+T=600 s, N=64: simulated 0.322, formula 0.320</pre>
+<p>Read the output. “Always yes” gets F1 0.667, as computed above. In the VCD step, “yes” was the top token (0.564) and becomes 0.231, while “no” rises to 0.629; the ratio of “yes” to “no” is \(e^{-1}\), the same log-odds of \(-1.0\) as in the worked example. The token “a” had probability 0.017, below \(\beta \times 0.564 = 0.056\), so the plausibility constraint removes it. The resize lines repeat the receipt example. The simulated hit rates match (193.11) up to sampling noise. To use VCD with a real model, compute the two logit vectors with two forward passes (one per image) and call <code>vcd_logits</code> at each step.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>Main failure risk</th><th>What teams do</th></tr></thead><tbody>
+<tr><td>Image captioning and alt text</td><td>Object hallucination, especially in long captions</td><td>Short captions, CHAIR / POPE in evaluation, preference tuning, VCD-style decoding [Likely]</td></tr>
+<tr><td>Retail shelf audit, crowd and inventory counting</td><td>Undercounting crowded scenes</td><td>Detector or point-then-count, high resolution, count by tiles [Likely]</td></tr>
+<tr><td>Invoices, receipts, forms, screenshots (Document AI)</td><td>Small text lost by resizing</td><td>Native resolution with a chosen <code>max_pixels</code>, tiling, OCR as a tool</td></tr>
+<tr><td>Robotics and UI agents</td><td>Spatial relations, exact positions</td><td>Absolute coordinates, pointing, crop-and-zoom loops</td></tr>
+<tr><td>Video key-moment detection and temporal grounding</td><td>Short events between frames</td><td>Dense sampling with token compression, shot-cut sampling, absolute time ids</td></tr>
+<tr><td>Video action recognition and video QA</td><td>Bag-of-frames answers, single-frame shortcuts</td><td>Reverse/shuffle tests, temporal training data (TempCompass-style)</td></tr>
+<tr><td>Video-RAG and text-to-video retrieval</td><td>The retrieved clip misses the moment; the answer is filled in by the prior</td><td>Retrieve frames by question, cite timestamps, check answers against frames [Speculation]</td></tr>
+<tr><td>Content moderation</td><td>Hallucinated objects lead to false flags</td><td>Ask closed questions per policy item, check yes ratio on clean data</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Reporting only F1 or accuracy on POPE.</b> A model can win by changing its yes ratio. Always report the yes ratio and FP, and test the adversarial setting.</li>
+<li><b>Evaluating on benchmarks that do not need the image.</b> Cambrian-1 found less than 5% gap with and without vision on several popular sets. Run a blind baseline on every benchmark you use.</li>
+<li><b>Blaming the language model for what the resize destroyed.</b> Before you fine-tune, check the real encoder input size. Many “OCR failures” are 3-pixel text.</li>
+<li><b>Tiling without a thumbnail.</b> Tiles cut objects and text lines at tile borders; the global view is needed to put them back together.</li>
+<li><b>Asking for a number when you can ask for a list.</b> “How many?” forces one read-out. “Point to each X” gives one output per object and can be checked.</li>
+<li><b>Choosing the frame count from the token budget only.</b> Choose it from the shortest event you must catch, \(N \ge T/d\), then compress tokens to fit the budget.</li>
+<li><b>Forgetting the time unit.</b> Training at 2 fps and serving at 0.5 fps changes what “frame 10” means if positions count frames.</li>
+<li><b>Using VCD without the plausibility constraint.</b> The contrast alone can push up rare junk tokens; keep \(\beta\) around 0.1.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why do VLMs hallucinate objects?<span class="lvl">basic</span></summary><div class="ans">By Bayes’ rule (193.1), \(\log p(y \mid I, x)\) is the language prior \(\log p(y \mid x)\) plus a visual-evidence term. The language model’s prior is strong, learned from trillions of tokens; the visual term comes from a few hundred visual tokens learned on much less data. When the evidence is weak (small, hidden or blurry object, low resolution, long answer far from the image), the prior wins and the model names objects that usually co-occur with the scene. Instruction data written by text-only LLMs and long detailed answers make it worse.</div></details>
+<details class="qa"><summary>Explain POPE and why the adversarial setting matters.<span class="lvl">core</span></summary><div class="ans">POPE asks “Is there a &lt;object&gt; in the image?” with half real and half absent objects (COCO: 500 images, 6 questions each, 3,000 per setting). Absent objects are sampled at random, from the most popular objects, or from the objects that co-occur most with the ones present (adversarial). Adversarial questions attack the language prior directly: InstructBLIP’s F1 fell from 89.29 (random) to 78.45 (adversarial) while recall stayed near 93%, so the drop is almost all extra false “yes” answers. Report accuracy, precision, recall, F1 and the yes ratio.</div></details>
+<details class="qa"><summary>A model scores F1 = 67 on POPE. Is that good?<span class="lvl">core</span></summary><div class="ans">No. A model that always says “yes” has precision 0.5, recall 1 and F1 \(= 2 \cdot 0.5 / 1.5 = 0.667\). Check the yes ratio: early LLaVA, mPLUG-Owl and MultiModal-GPT answered “yes” 95–100% of the time and scored F1 66.7–68.7, so they were barely using the image. A good model has a yes ratio near 50% on balanced POPE and high precision.</div></details>
+<details class="qa"><summary>How does visual contrastive decoding work, and why does it reduce hallucination?<span class="lvl">advanced</span></summary><div class="ans">At each step compute logits with the real image and with a noised image, and decode from \(\softmax[(1+\alpha)\ell(y \mid v, x) - \alpha\ell(y \mid v', x)]\), restricted to tokens with probability at least \(\beta\) times the top token (default \(\alpha = 1, \beta = 0.1\)). The noised image keeps the language prior but loses visual evidence. In the log-odds model the result is \(a + (1 + \alpha - \alpha s)we\) (193.7): the prior is unchanged and the visual term is amplified. It needs no training but doubles the decoding compute. On LLaVA-1.5, POPE F1 (random) went from 81.33 to 87.16.</div></details>
+<details class="qa"><summary>Why are VLMs bad at counting?<span class="lvl">core</span></summary><div class="ans">(1) Contrastive encoders are trained to match captions, which rarely depend on exact counts, so count information is weak in the features (bag-of-words behaviour, MMVP “quantity” pattern). (2) The token grid is coarse, and connectors pool it further, so nearby small objects merge (toy occupancy model 193.9: 12 objects on 36 cells give 10.33 expected cells). (3) Exact counts need every object to be found: \(p^n\) falls fast (0.97 per object gives 0.544 for 20 objects). Fixes: point or detect each object then count, a detector tool, higher resolution and less pooling.</div></details>
+<details class="qa"><summary>What are CLIP-blind pairs and what do they tell us about VLMs?<span class="lvl">advanced</span></summary><div class="ans">Pairs of images that CLIP embeds almost identically (cosine above 0.95) while DINOv2 sees them as different (below 0.6). Tong et al. built MMVP from 150 such pairs (300 questions, scored per pair, random = 25%): humans got 95.7%, GPT-4V 38.7%, LLaVA-1.5 24.7%. Errors cluster in patterns such as orientation, counts, position and text. Since the language model only sees what the encoder gives, these failures cannot be fixed by the LLM; the fix is better visual features, such as adding self-supervised DINOv2 features (Mixture of Features).</div></details>
+<details class="qa"><summary>Our invoice model gets digits wrong. What do you check first?<span class="lvl">basic</span></summary><div class="ans">The size of the image the encoder actually receives. By (193.10), a 40-pixel line on a 3024 × 4032 photo becomes 3.33 pixels at 336. Crop the total and ask again at full resolution: if that is right, it is a resolution problem. Fixes: native resolution with a larger <code>max_pixels</code> (1280 tokens gives 11.39 px here), tiling with a thumbnail, a zoom/crop tool, or OCR as a tool. Also check that serving uses the same resolution settings as fine-tuning.</div></details>
+<details class="qa"><summary>How do you pick the number of frames for a video task?<span class="lvl">core</span></summary><div class="ans">From the shortest event you must catch. With uniform sampling the hit probability is \(\min(1, dN/T)\); a 3-second event in a 600-second video is seen with probability 0.16 at 32 frames. To be sure, \(N \ge T/d\) (200 frames here). If that is too many tokens, compress each frame (pooling, merging) or select frames smartly (shot cuts, motion, question-based retrieval). Add absolute timestamps so the model can answer “when”.</div></details>
+<details class="qa"><summary>How can you tell if a Video-LLM uses temporal order at all?<span class="lvl">advanced</span></summary><div class="ans">Ask order questions (“what happened first?”, “is the door opening or closing?”) on the original clip and on the reversed or shuffled clip; the correct answer should flip or change. If the model’s answer stays the same, it uses a bag of frames or single-frame cues. Also compare with a single middle frame: if accuracy is the same, the benchmark or the model does not need time. TempCompass builds conflicting videos for exactly this purpose. Fixes: time-aware positions (Qwen2.5-VL aligns M-RoPE temporal ids with absolute time), temporal training data with reversed clips.</div></details>
+<details class="qa"><summary>Design an evaluation suite that separates the four failure families.<span class="lvl">advanced</span></summary><div class="ans">Hallucination: POPE (all three settings, with yes ratio) plus CHAIR on free captions, and a blind baseline. Counting and spatial: CV-Bench (count, relation, depth, distance), MMVP, and a mirror test for left/right. Small text: a text-heavy set (TextVQA, DocVQA, charts) evaluated at two resolutions, so the gain from resolution is visible. Video: Video-MME plus TempCompass-style reversed or conflicting clips, and accuracy vs number of frames. For each, report the result with and without the image to see how much the prior explains (Cambrian-1 found less than 5% gap on some popular benchmarks).</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>In the log-odds model (193.2), the prior is \(a = 1.0\) and the visual term is \(we = -2.0\). What is \(p(\text{yes})\)? Now apply VCD with \(\alpha = 0.5\) and \(s = 0\). What is \(p(\text{yes})\) now?</li>
+<li>On balanced POPE (1,500 real, 1,500 absent), a model says “yes” to 1,350 real and 450 absent objects. Compute precision, recall, accuracy, F1 and the yes ratio.</li>
+<li>A model finds each object with probability 0.98. What is the chance of an exact count for 15 objects? For 30?</li>
+<li>A 1920 × 1080 screenshot has 12-pixel text. How tall is the text after fitting to 336 (aspect ratio kept)? To 448? How large must the long side be for the text to stay at least 8 pixels tall?</li>
+<li>A 90-second clip is sampled at 16 frames. What is the chance to see a 1.5-second event? How many frames do you need to be sure to see it?</li>
+<li>On MMVP, a model answers each question right with probability 0.7, independently. What MMVP score do you expect? Why is random guessing 25%?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(z = 1.0 - 2.0 = -1.0\), \(p = \sigma(-1) = 0.269\): the model correctly says “no”. With VCD: \(z = 1.0 + (1 + 0.5) \times (-2.0) = -2.0\), \(p = \sigma(-2) = 0.119\): more confident “no”. 2. TP = 1350, FP = 450, FN = 150. Precision \(1350/1800 = 0.75\), recall \(1350/1500 = 0.9\), accuracy \((1350 + 1050)/3000 = 0.8\), F1 \(= 2 \times 0.75 \times 0.9 / 1.65 = 0.818\), yes ratio \(1800/3000 = 0.6\). 3. \(0.98^{15} = 0.739\); \(0.98^{30} = 0.545\). 4. Factor \(336/1920 = 0.175\): text 2.10 px. Factor \(448/1920 = 0.233\): text 2.80 px. Need factor \(8/12 = 0.667\), so the long side must be at least \(0.667 \times 1920 = 1280\) px. 5. Stride \(90/16 = 5.625\) s; \(P = 1.5/5.625 = 0.267\). To be sure: \(N \ge 90/1.5 = 60\) frames. 6. \(0.7^2 = 0.49\), so 49%. A pair counts only if both questions are right; random guessing gets each yes/no-style question right half the time, so \(0.5^2 = 0.25\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Most VLM errors fall into four families with four different causes: the language prior (hallucination), the encoder (counting and spatial), resizing (small text), and frame sampling (video time).</li>
+<li>Bayes’ rule (193.1) splits an answer into prior plus visual evidence; when evidence is weak, co-occurring objects get hallucinated. POPE’s adversarial setting and the yes ratio expose this; “always yes” gets F1 0.667.</li>
+<li>VCD (193.5) subtracts the logits of a noised image; in the log-odds view the prior stays and the visual term is multiplied by \(1 + \alpha(1 - s)\) (193.7). LLaVA-1.5 POPE F1 (random) rose from 81.33 to 87.16.</li>
+<li>Counting fails because contrastive encoders keep “what” not “how many”, grids are coarse (193.9), and exact counts need every object (\(p^n\)). Point or detect, then count.</li>
+<li>Resizing shrinks text by \(\min(S_W/W, S_H/H)\) (193.10): 40 px becomes 3.33 px at 336. Tiling, native resolution with a chosen <code>max_pixels</code>, and zoom-in tools fix it at a token cost.</li>
+<li>Video models miss events with probability \(1 - \min(1, dN/T)\) (193.11) and lose order when frames are a bag. Choose \(N\) from the shortest event, add absolute time, and test with reversed clips.</li>
+<li>Diagnose before fixing: blind, crop, mirror, shuffle and more-frames tests (Algorithm 1) tell you which family you have.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \log p(y \mid I, x) = \log p(y \mid x) + \log \frac{p(I \mid y, x)}{p(I \mid x)}, \qquad z_{\text{vcd}} = a + (1 + \alpha - \alpha s)\, w e \]</div>
+<div class="eq">\[ p_{\text{vcd}} = \softmax\big[(1+\alpha)\ell(y \mid v, x) - \alpha\,\ell(y \mid v', x)\big], \qquad F_1 = \frac{2\,\text{Prec}\,\text{Rec}}{\text{Prec} + \text{Rec}} \]</div>
+<div class="eq">\[ P(\text{exact}) = p^n, \quad \E[\text{cells}] = M\big(1 - (1 - \tfrac1M)^n\big), \quad h' = h \min\Big(\frac{S_W}{W}, \frac{S_H}{H}\Big), \quad P(\text{seen}) = \min\Big(1, \frac{dN}{T}\Big) \]</div>
+<h2 class="plain" id="vlm-failure-modes-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Li et al. (2023). <a href="https://arxiv.org/abs/2305.10355" target="_blank" rel="noopener">Evaluating Object Hallucination in Large Vision-Language Models</a></li><li>Tong et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Cambrian-1: A Fully Open, Vision-Centric Exploration of Multimodal LLMs&amp;quot;" target="_blank" rel="noopener">Cambrian-1: A Fully Open, Vision-Centric Exploration of Multimodal LLMs</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 2: Vision Language Model Applications</li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 2: Vision Language Model Applications</li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 9: Video-Language Models</li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 11: Advanced Topics and Cutting-Edge Research</li><li>Li et al. (2023). <a href="https://arxiv.org/abs/2305.10355" target="_blank" rel="noopener">Evaluating Object Hallucination in Large Vision-Language Models</a></li><li>Tong et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Cambrian-1: A Fully Open, Vision-Centric Exploration of Multimodal LLMs&amp;quot;" target="_blank" rel="noopener">Cambrian-1: A Fully Open, Vision-Centric Exploration of Multimodal LLMs</a></li><li>Rohrbach, Hendricks, Burns, Darrell &amp; Saenko (2018). <a href="https://arxiv.org/abs/1809.02156" target="_blank" rel="noopener">Object Hallucination in Image Captioning</a></li><li>Leng, Zhang, Chen, Li, Lu, Miao &amp; Bing (2023). <a href="https://arxiv.org/abs/2311.16922" target="_blank" rel="noopener">Mitigating Object Hallucinations in Large Vision-Language Models through Visual Contrastive Decoding</a></li><li>Tong, Liu, Zhai, Ma, LeCun &amp; Xie (2024). <a href="https://arxiv.org/abs/2401.06209" target="_blank" rel="noopener">Eyes Wide Shut? Exploring the Visual Shortcomings of Multimodal LLMs</a></li><li>Yuksekgonul, Bianchi, Kalluri, Jurafsky &amp; Zou (2022). <a href="https://arxiv.org/abs/2210.01936" target="_blank" rel="noopener">When and why vision-language models behave like bags-of-words, and what to do about it?</a></li><li>Kamath, Hessel &amp; Chang (2023). <a href="https://arxiv.org/abs/2310.19785" target="_blank" rel="noopener">What&#x27;s &quot;up&quot; with vision-language models? Investigating their struggle with spatial reasoning</a></li><li>Wu &amp; Xie (2023). <a href="https://arxiv.org/abs/2312.14135" target="_blank" rel="noopener">V*: Guided Visual Search as a Core Mechanism in Multimodal LLMs</a></li><li>Deitke, Clark et al. (2024). <a href="https://arxiv.org/abs/2409.17146" target="_blank" rel="noopener">Molmo and PixMo: Open Weights and Open Data for State-of-the-Art Vision-Language Models</a></li><li>Liu, Li, Liu, Wang, Ren, Li, Chen, Sun &amp; Hou (2024). <a href="https://arxiv.org/abs/2403.00476" target="_blank" rel="noopener">TempCompass: Do Video LLMs Really Understand Videos?</a></li><li>Bai et al. (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;Qwen2.5-VL Technical Report&amp;quot;" target="_blank" rel="noopener">Qwen2.5-VL Technical Report</a></li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.03744" target="_blank" rel="noopener">Improved Baselines with Visual Instruction Tuning</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/evaluating-vlms.html"><small>Previous · session 192</small>Evaluating VLMs</a><span class="next"><small>Next · session 194, planned</small>LoRA fine-tune a small VLM</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="vlm-failure-modes"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const sig=z=>1/(1+Math.exp(-z));
+const mn=s=>String(s).replace(/^-/,"−");
+const f2=v=>mn((Math.abs(v)<5e-3?0:v).toFixed(2));
+const f3=v=>mn((Math.abs(v)<5e-4?0:v).toFixed(3));
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function seg(el,attr,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+
+/* ---------- Figure 2: prior vs visual evidence, and VCD ---------- */
+(function(){
+ const svg=$("#vfm-pr-svg");if(!svg)return;
+ const A=$("#vfm-pr-a"),E=$("#vfm-pr-e"),S=$("#vfm-pr-s"),AL=$("#vfm-pr-al"),info=$("#vfm-pr-info");
+ const LO=-8,HI=8,X=z=>40+(Math.max(LO,Math.min(HI,z))-LO)/(HI-LO)*580;
+ function arrow(x1,x2,y,col,lab){if(Math.abs(x2-x1)<1)return `<circle cx="${x1}" cy="${y}" r="3" fill="${col}"/>`;const d=x2>x1?1:-1;
+  return `<line x1="${x1}" y1="${y}" x2="${x2-d*7}" y2="${y}" stroke="${col}" stroke-width="5"/><path d="M${x2} ${y}L${x2-d*10} ${y-7}L${x2-d*10} ${y+7}z" fill="${col}"/><text x="${(x1+x2)/2}" y="${y-10}" text-anchor="middle" class="svgs" font-size="12">${lab}</text>`;}
+ function row(y,title,a,v,z){let g=`<text x="40" y="${y-30}" class="svgt" font-size="13.5" font-weight="700">${title}</text>`;
+  g+=arrow(X(0),X(a),y,"var(--k)","prior a = "+f2(a));g+=arrow(X(a),X(a+v),y+22,"var(--q)","visual "+f2(v));
+  const p=sig(z);const xr=X(z)<420;g+=`<circle cx="${X(z)}" cy="${y+48}" r="7" fill="${z>0?"var(--bad)":"var(--v)"}"/><text x="${X(z)+(xr?14:-14)}" y="${y+53}" text-anchor="${xr?"start":"end"}" class="svgm" font-size="12.5">z = ${f2(z)}, p(yes) = ${f3(p)}</text>`;return g;}
+ function draw(){const a=+A.value,we=+E.value,s=+S.value,al=+AL.value;
+  $("#vfm-pr-av").value=f2(a);$("#vfm-pr-ev").value=f2(we);$("#vfm-pr-sv").value=s.toFixed(2);$("#vfm-pr-alv").value=al.toFixed(1);
+  const z=a+we,k=1+al-al*s,zv=a+k*we;
+  let g=`<line x1="40" y1="246" x2="620" y2="246" stroke="var(--muted)"/>`;
+  for(let t=LO;t<=HI;t+=2)g+=`<line x1="${X(t)}" y1="242" x2="${X(t)}" y2="250" stroke="var(--muted)"/><text x="${X(t)}" y="264" text-anchor="middle" class="svgs" font-size="11">${mn(t)}</text>`;
+  g+=`<line x1="${X(0)}" y1="14" x2="${X(0)}" y2="246" stroke="var(--muted)" stroke-dasharray="4 4"/><text x="${X(0)+6}" y="24" class="svgs" font-size="12">says “yes” →</text><text x="${X(0)-6}" y="24" text-anchor="end" class="svgs" font-size="12">← says “no”</text>`;
+  g+=row(56,"Normal decoding",a,we,z)+row(172,"VCD (×"+k.toFixed(2)+" on the visual term)",a,k*we,zv);
+  svg.innerHTML=g;
+  const truth=we<0?"absent":we>0?"present":"unclear";
+  const verdict=(zz)=>truth==="absent"?(zz>0?"<b>yes: a hallucination</b>":"no: correct"):truth==="present"?(zz>0?"yes: correct":"<b>no: a miss</b>"):(zz>0?"yes":"no");
+  info.innerHTML=`Normal: z = ${f2(a)} + (${f2(we)}) = <b>${f2(z)}</b>, p(yes) = <b>${f3(sig(z))}</b> → ${verdict(z)}. VCD: z = ${f2(a)} + ${k.toFixed(2)} × (${f2(we)}) = <b>${f2(zv)}</b>, p(yes) = <b>${f3(sig(zv))}</b> → ${verdict(zv)}. The evidence says the object is ${truth}.${s>=0.999?" With s = 1 the noised image keeps all evidence, so VCD changes nothing.":""}`;}
+ [A,E,S,AL].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: POPE confusion matrix and metrics ---------- */
+(function(){
+ const svg=$("#vfm-po-svg");if(!svg)return;const TP=$("#vfm-po-tp"),FP=$("#vfm-po-fp"),info=$("#vfm-po-info");
+ const PRE={yes:[1500,1500],llr:[1497,1364],ibr:[1409,247],iba:[1400,669]};
+ seg($("#vfm-po-preset"),"p",k=>{TP.value=PRE[k][0];FP.value=PRE[k][1];draw();});
+ function draw(){const tp=+TP.value,fp=+FP.value,fn=1500-tp,tn=1500-fp;$("#vfm-po-tpv").value=tp;$("#vfm-po-fpv").value=fp;
+  const prec=tp+fp?tp/(tp+fp):0,rec=tp/1500,acc=(tp+tn)/3000,f1=prec+rec?2*prec*rec/(prec+rec):0,yes=(tp+fp)/3000;
+  const cell=(x,y,v,lab,col)=>`<rect x="${x}" y="${y}" width="96" height="70" rx="6" fill="${col}" stroke="var(--rule)"/><text x="${x+48}" y="${y+32}" text-anchor="middle" class="svgm" font-size="17" font-weight="700">${v}</text><text x="${x+48}" y="${y+54}" text-anchor="middle" class="svgs" font-size="12">${lab}</text>`;
+  let g=`<text x="128" y="16" text-anchor="middle" class="svgs" font-size="12">says “yes”</text><text x="224" y="16" text-anchor="middle" class="svgs" font-size="12">says “no”</text>`;
+  g+=`<text x="74" y="62" text-anchor="end" class="svgs" font-size="12">real</text><text x="74" y="136" text-anchor="end" class="svgs" font-size="12">absent</text>`;
+  g+=cell(80,26,tp,"TP","var(--v-soft)")+cell(176,26,fn,"FN","var(--paper2)")+cell(80,100,fp,"FP: hallucinated","var(--bad-soft)")+cell(176,100,tn,"TN","var(--paper2)");
+  const bars=[["accuracy",acc],["precision",prec],["recall",rec],["F1",f1],["yes ratio",yes]];
+  bars.forEach(([n,v],i)=>{const y=24+i*36;g+=`<text x="380" y="${y+16}" text-anchor="end" class="svgt" font-size="13">${n}</text><rect x="388" y="${y}" width="200" height="22" rx="4" fill="var(--paper2)" stroke="var(--rule)"/><rect x="388" y="${y}" width="${(200*v).toFixed(1)}" height="22" rx="4" fill="${n==="yes ratio"?"var(--k)":"var(--q)"}" opacity=".85"/><text x="596" y="${y+16}" class="svgm" font-size="12.5">${(100*v).toFixed(2)}</text>`;});
+    svg.innerHTML=g;
+  const ay=Math.abs(f1-2/3)<0.02?" This F1 is close to the 66.67 of a model that always says “yes”.":"";
+  info.innerHTML=`Accuracy <b>${(100*acc).toFixed(2)}</b>, precision <b>${(100*prec).toFixed(2)}</b>, recall <b>${(100*rec).toFixed(2)}</b>, F1 <b>${(100*f1).toFixed(2)}</b>, yes ratio <b>${(100*yes).toFixed(2)}%</b>. Hallucinations (FP): <b>${fp}</b> of 1500 absent objects.${ay}`;}
+ [TP,FP].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: counting on a token grid ---------- */
+(function(){
+ const svg=$("#vfm-ct-svg");if(!svg)return;const N=$("#vfm-ct-n"),G=$("#vfm-ct-g"),info=$("#vfm-ct-info"),sl=$("#vfm-ct-seed");let seed=1;
+ $("#vfm-ct-new").addEventListener("click",()=>{seed++;draw();});
+ function draw(){const n=+N.value,gs=+G.value,M=gs*gs;$("#vfm-ct-nv").value=n;$("#vfm-ct-gv").value=gs+" × "+gs;sl.textContent="layout "+seed;
+  const r=rng(500+seed*104729);const pts=[];for(let i=0;i<40;i++)pts.push([r(),r()]);const P=pts.slice(0,n);
+  const cnt=new Map();P.forEach(([x,y])=>{const k=Math.floor(x*gs)+","+Math.floor(y*gs);cnt.set(k,(cnt.get(k)||0)+1);});
+  const occ=cnt.size,merged=[...cnt.values()].filter(v=>v>1).length,exp=M*(1-Math.pow(1-1/M,n));
+  const S=280,O=10,c=S/gs;let g=`<rect x="${O}" y="${O}" width="${S}" height="${S}" fill="var(--paper2)" stroke="var(--muted)"/>`;
+  cnt.forEach((v,k)=>{const [i,j]=k.split(",").map(Number);g+=`<rect x="${(O+i*c).toFixed(1)}" y="${(O+j*c).toFixed(1)}" width="${c.toFixed(1)}" height="${c.toFixed(1)}" fill="${v>1?"var(--warn-soft)":"var(--q-soft)"}" stroke="${v>1?"var(--warn)":"none"}"/>`;});
+  for(let i=1;i<gs;i++)g+=`<line x1="${(O+i*c).toFixed(1)}" y1="${O}" x2="${(O+i*c).toFixed(1)}" y2="${O+S}" stroke="var(--rule)" stroke-width=".8"/><line x1="${O}" y1="${(O+i*c).toFixed(1)}" x2="${O+S}" y2="${(O+i*c).toFixed(1)}" stroke="var(--rule)" stroke-width=".8"/>`;
+  P.forEach(([x,y])=>g+=`<circle cx="${(O+x*S).toFixed(1)}" cy="${(O+y*S).toFixed(1)}" r="${Math.max(2.5,Math.min(6,c/5)).toFixed(1)}" fill="var(--ink)"/>`);
+  const bar=(y,lab,v,col)=>`<text x="330" y="${y-6}" class="svgt" font-size="13">${lab}</text><rect x="330" y="${y}" width="${(260*v/40).toFixed(1)}" height="22" rx="4" fill="${col}"/><text x="${336+260*v/40}" y="${y+16}" class="svgm" font-size="13" font-weight="700">${typeof v==="number"&&v%1?v.toFixed(2):v}</text>`;
+  g+=bar(50,"true count n",n,"var(--v)")+bar(120,"toy count: occupied cells (this layout)",occ,"var(--q)")+bar(190,"expected toy count, formula (193.9)",exp,"var(--k)");
+  g+=`<text x="330" y="262" class="svgs" font-size="12">${M} cells; ${merged} cell${merged===1?" holds":"s hold"} 2+ objects</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`True count <b>${n}</b>. This layout occupies <b>${occ}</b> of ${M} cells (${merged} merged cell${merged===1?"":"s"}), so the toy model answers ${occ}. Expected toy count M(1 − (1 − 1/M)<sup>n</sup>) = <b>${exp.toFixed(2)}</b>, an undercount of ${(n-exp).toFixed(2)} on average.`;}
+ [N,G].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 5: small text after resizing ---------- */
+(function(){
+ const cv=$("#vfm-tx-cv");if(!cv)return;const H=$("#vfm-tx-h"),info=$("#vfm-tx-info");
+ const SRC={r:[3024,4032,"receipt photo"],s:[1920,1080,"screenshot"],a:[2480,3508,"A4 scan"]};let src="r",mode="336";
+ seg($("#vfm-tx-src"),"s",k=>{src=k;if(k==="s")H.value=12;else if(k==="a")H.value=25;else H.value=40;draw();});
+ seg($("#vfm-tx-mode"),"m",k=>{mode=k;draw();});
+ function smart(h,w,mx){const f=28;let hb=Math.round(h/f)*f,wb=Math.round(w/f)*f;if(hb*wb>mx){const b=Math.sqrt(h*w/mx);hb=Math.floor(h/b/f)*f;wb=Math.floor(w/b/f)*f;}else if(hb*wb<3136){const b=Math.sqrt(3136/(h*w));hb=Math.ceil(h*b/f)*f;wb=Math.ceil(w*b/f)*f;}return [hb,wb];}
+ const STR="TOTAL $1,284.50";
+ function draw(){const [W,Hh,name]=SRC[src],h=+H.value;$("#vfm-tx-hv").value=h;
+  let s,tok,desc;
+  if(mode==="224"||mode==="336"||mode==="672"){const S=+mode;s=Math.min(S/W,S/Hh);tok=mode==="224"?256:mode==="336"?576:2880;desc=mode==="672"?`fit into 672 × 672 (2 × 2 tiles of 336 + thumbnail)`:`fit into ${S} × ${S}`;}
+  else{const mx=mode==="n1280"?1280*784:12845056;const [hb,wb]=smart(Hh,W,mx);s=hb/Hh;tok=(hb/28)*(wb/28);desc=`native: resized to ${wb} × ${hb}`;}
+  const he=h*s,pat=he/14;
+  // draw text at its effective pixel size, then blow it up without smoothing
+  const fpx=Math.max(1,he/0.72);const sm=document.createElement("canvas");const cx=sm.getContext("2d");cx.font=`700 ${fpx}px Arial, Helvetica, sans-serif`;
+  const tw=Math.ceil(cx.measureText(STR).width)+4,th=Math.ceil(fpx*1.3)+2;sm.width=tw;sm.height=th;
+  cx.fillStyle="#fff";cx.fillRect(0,0,tw,th);cx.fillStyle="#111";cx.font=`700 ${fpx}px Arial, Helvetica, sans-serif`;cx.textBaseline="middle";cx.fillText(STR,2,th/2);
+  const ctx=cv.getContext("2d");ctx.imageSmoothingEnabled=false;ctx.fillStyle="#fff";ctx.fillRect(0,0,cv.width,cv.height);
+  const k=Math.min((cv.width-20)/tw,(cv.height-20)/th);const dw=tw*k,dh=th*k;ctx.drawImage(sm,0,0,tw,th,(cv.width-dw)/2,(cv.height-dh)/2,dw,dh);
+  const ok=he<6?"<b>unreadable</b>":he<10?"<b>risky</b>":"<b>readable</b>";
+  info.innerHTML=`${name} ${W} × ${Hh}, ${desc}. Scale factor <b>${s.toFixed(4)}</b>. Text height ${h} px → <b>${he.toFixed(2)} px</b> (${pat.toFixed(2)} of a 14-pixel patch). Visual tokens: <b>${tok.toLocaleString("en-US")}</b>. Readable? ${ok} (demo rule).`;}
+ H.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 6: frame sampling on a timeline ---------- */
+(function(){
+ const svg=$("#vfm-fr-svg");if(!svg)return;const T=$("#vfm-fr-t"),N=$("#vfm-fr-n"),D=$("#vfm-fr-d"),info=$("#vfm-fr-info");
+ const EV=[0.07,0.29,0.48,0.66,0.88],NM="ABCDE";
+ function draw(){const t=+T.value,n=+N.value,d=Math.min(+D.value,t/6);$("#vfm-fr-tv").value=t;$("#vfm-fr-nv").value=n;$("#vfm-fr-dv").value=d.toFixed(1);
+  const st=t/n,fr=[];for(let i=0;i<n;i++)fr.push((i+0.5)*st);const X=v=>20+v/t*600;
+  let g=`<line x1="20" y1="120" x2="620" y2="120" stroke="var(--muted)" stroke-width="1.5"/>`;
+  [0,0.25,0.5,0.75,1].forEach(f=>g+=`<line x1="${X(f*t)}" y1="120" x2="${X(f*t)}" y2="126" stroke="var(--muted)"/><text x="${X(f*t)}" y="142" text-anchor="middle" class="svgs" font-size="11.5">${Math.round(f*t)} s</text>`);
+  fr.forEach(v=>g+=`<line x1="${X(v).toFixed(1)}" y1="40" x2="${X(v).toFixed(1)}" y2="118" stroke="var(--muted)" stroke-width="${n>64?1:1.6}" opacity=".8"/>`);
+  let hit=0;const seen=[];
+  EV.forEach((f,i)=>{const s0=f*(t-d),hitI=fr.some(v=>v>=s0&&v<=s0+d);if(hitI){hit++;seen.push(NM[i]);}const x=X(s0),w=Math.max(3,X(s0+d)-x);
+   g+=`<rect x="${x.toFixed(1)}" y="70" width="${w.toFixed(1)}" height="30" rx="3" fill="${hitI?"var(--v)":"none"}" fill-opacity="${hitI?0.75:0}" stroke="${hitI?"var(--v)":"var(--bad)"}" stroke-width="2"/><text x="${(x+w/2).toFixed(1)}" y="62" text-anchor="middle" class="svgt" font-size="13" font-weight="700">${NM[i]}</text>`;});
+  g+=`<text x="20" y="24" class="svgs" font-size="12">${n} sampled frames (grey ticks), stride ${st.toFixed(2)} s</text><text x="20" y="170" class="svgs" font-size="12">filled = seen by at least one frame, empty = missed</text>`;
+  svg.innerHTML=g;const P=Math.min(1,d*n/t),need=Math.ceil(t/d);
+  info.innerHTML=`Stride T/N = <b>${st.toFixed(2)} s</b>. Chance to see one ${d.toFixed(1)} s event (193.11): min(1, ${d.toFixed(1)} × ${n} / ${t}) = <b>${P.toFixed(3)}</b>. In this video <b>${hit} of 5</b> events are seen${seen.length?" ("+seen.join(", ")+")":""}. To be sure to see every event you need N ≥ T/d = <b>${need}</b> frames.`;}
+ [T,N,D].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>
