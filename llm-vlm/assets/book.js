@@ -10,10 +10,10 @@ B.softmax=(z,T)=>{T=T||1;const m=Math.max(...z.map(v=>v/T));const e=z.map(v=>Mat
 B.svg=(tag,attrs,parent)=>{const e=document.createElementNS("http://www.w3.org/2000/svg",tag);for(const k in attrs||{})e.setAttribute(k,attrs[k]);if(parent)parent.appendChild(e);return e;};
 B.fmt=(x,d)=>Number(x).toFixed(d==null?2:d);
 /* theme */
-const root=document.documentElement;const th=B.store.get("llmvlm.theme",null);if(th)root.setAttribute("data-theme",th);
+const root=document.documentElement;const th=B.store.get("llmvlm.theme2",null);if(th)root.setAttribute("data-theme",th);
 document.addEventListener("click",e=>{const t=e.target.closest("[data-theme-toggle]");if(!t)return;
  const dark=root.getAttribute("data-theme")!=="light";
- const n=dark?"light":"dark";root.setAttribute("data-theme",n);B.store.set("llmvlm.theme",n);});
+ const n=dark?"light":"dark";root.setAttribute("data-theme",n);B.store.set("llmvlm.theme2",n);});
 /* math */
 B.mathReady=new Promise(res=>{B._mres=res;});
 window.MathJax={tex:{inlineMath:[["\\(","\\)"]],displayMath:[["\\[","\\]"]],tags:"ams",macros:{R:"\\mathbb{R}",E:"\\mathbb{E}",softmax:"\\operatorname{softmax}",argmax:"\\operatorname*{arg\\,max}",argmin:"\\operatorname*{arg\\,min}",KL:"\\operatorname{KL}"}},
