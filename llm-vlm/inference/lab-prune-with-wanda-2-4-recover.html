@@ -1,0 +1,588 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>prune with Wanda (2:4), recover with distillation · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 122</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="lab-prune-with-wanda-2-4-recover">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="lab-prune-with-wanda-2-4-recover" data-session="lab-prune-with-wanda-2-4-recover" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">122</span><span>Track 5: LLM inference and serving · session 45 of 65</span></div><h1 class="chap-title">prune with Wanda (2:4), recover with distillation</h1><p class="chap-sub">In this lab you prune a real small LLM, SmolLM2-135M, with Wanda to 50% sparsity, once unstructured and once in NVIDIA’s 2:4 pattern, and measure what it costs in perplexity. You count the bytes and time sparse kernels to see which zeros give real speed. Then you win back most of the lost quality with a short distillation run from the dense model, compare it with plain fine-tuning, and draw the trade-off curve.</p><div class="meta-row"><span><b>Time:</b> 4 to 6 hours (reading 1.5 hours, runs and analysis the rest)</span><span><b>Level:</b> Intermediate to interview level, hands-on</span><span><b>Before this:</b> Sessions 114 and 119, Python and PyTorch; a laptop CPU is enough for all steps except the GPU speed test, which needs an NVIDIA GPU of the Ampere generation or newer</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How to implement Wanda block by block: input norms from forward hooks, the score |W_ij|·‖X_j‖₂, a per-row comparison, and the N:M masks 2:4 and 4:8</li><li>How much quality a small model loses at each sparsity, measured: perplexity from 10% to 70%, magnitude against Wanda, unstructured against 4:8 and 2:4</li><li>Why unstructured 50% sparsity gives no speed or memory gain on a GPU, how the 2:4 format stores b/2 + 1 bits per weight, and what speed-up to expect for decode and prefill</li><li>How to time dense and sparse kernels honestly, and how to run PyTorch’s 2:4 semi-structured kernels on a GPU</li><li>How to recover a pruned model with logit distillation from the dense teacher while keeping the mask fixed, and how it compares with plain fine-tuning on the same tokens</li><li>How to measure recovery as the share of the log-perplexity gap that is closed, and what the recovery run costs in FLOPs and memory</li><li>How to report the trade-off: perplexity, bytes, measured speed, recovery budget, and simple alternatives such as quantization</li></ul></div></header><style>
+[data-session="lab-prune-with-wanda-2-4-recover"] code,[data-session="lab-prune-with-wanda-2-4-recover"] pre,[data-session="lab-prune-with-wanda-2-4-recover"] .fig,[data-session="lab-prune-with-wanda-2-4-recover"] .fig *{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.pw-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.pw-grid input[type=range]{width:100%}
+.pw-grid output{font:600 14px var(--mono);min-width:52px;text-align:right}
+.pw-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.pw-leg span::before{content:"";display:inline-block;width:14px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+.pw-svg text{font-family:var(--sans)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead"><a href="../inference/unstructured-and-2-4-pruning-sparsegpt-wanda.html">Session 114</a> showed how Wanda chooses which weights to remove: it multiplies each weight by the size of the input it sees, and removes the smallest products. In this lab you do it to a real model and measure what you get. You prune a small LLM to 50% sparsity in two ways (unstructured and 2:4), measure its perplexity, find out how much faster it really runs, and then win back most of the lost quality with a short <b>distillation</b> run: the dense model teaches the pruned one. At the end you draw the trade-off curve and write down which model you would ship.</p>
+<p><a href="../inference/dynamic-inference-early-exit-and-layer-skipping.html">Session 121</a> kept the full model and decided per token how much of it to run. This lab goes back to the static tools, which make the model smaller once for every input, and measures two of them end to end: pruning and distillation. The lab answers three questions that come up in real projects and in interviews. Does pruning keep enough quality? Does it give real speed, or only zeros? And how much training does it take to repair the damage? The answers are often surprising. Unstructured 50% sparsity gives no speed at all on a GPU. 2:4 sparsity gives speed, but it hurts quality much more. And small models break much faster than the big models in the papers.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “You pruned 50% of the weights. Why is the model not faster?”, “Why does Wanda compare weights inside each output row?”, “What is the 2:4 format and what speed-up can you expect?”, “Why distill instead of fine-tuning on the data?”, “How do you keep the zeros at zero during training?”. Each one has a measured answer on this page.</aside>
+<p>This is how pruning is used in practice. NVIDIA’s Minitron models were made by pruning a 15B model to 8B and 4B and then retraining them with distillation from the 15B teacher; the paper reports up to 40 times fewer training tokens per model than training from scratch [Certain]. The Wanda paper itself recovers 2:4 LLaMA-7B with LoRA or full fine-tuning on C4 [Certain]. NVIDIA GPUs since the Ampere generation have sparse tensor cores that run 2:4 matrices at twice the peak math rate [Certain].</p>
+<p>You will:</p>
+<ol>
+<li>Measure the dense model: perplexity on WikiText-2 (Step 1).</li>
+<li>Prune it with Wanda and with magnitude pruning, unstructured and 2:4, and see why the input norm matters (Figure 1, Step 2).</li>
+<li>Sweep the sparsity from 10% to 70% and plot perplexity (Figure 2, Step 3).</li>
+<li>Count the bytes and measure the speed: what sparse formats store, and what a sparse kernel gains (Figure 3, Step 4).</li>
+<li>Recover with distillation from the dense model, against plain fine-tuning on the same data (Figure 4, Step 5).</li>
+<li>Draw the trade-off and decide (Figure 5, Step 6).</li></ol>
+
+<h2>Setup</h2>
+<p><b>What we ran.</b> We ran every step except the GPU speed test on an Apple M5 Pro laptop with PyTorch 2.8 and transformers 4.57, in FP32. The Wanda sweep ran partly on the laptop GPU (MPS) and partly on the CPU. The two 2:4 distillation runs ran on the CPU and the 50% run on the laptop GPU; after 50 steps, the GPU run and an earlier CPU run of the same job agreed to within 0.01 in perplexity. All numbers on this page come from these runs, except where we quote a paper. The GPU code for 2:4 kernels in Step 4 follows the PyTorch documentation, but we could <b>not</b> run it: it needs an NVIDIA GPU of the Ampere generation or newer. You will measure that part.</p>
+<pre class="code">pip install torch "transformers&gt;=4.45" pyarrow</pre>
+<p><b>Model.</b> <code>HuggingFaceTB/SmolLM2-135M</code>, the base model (not the instruct one). From its <code>config.json</code>: a Llama-style decoder with 30 layers, hidden size 576, MLP size 1536, 9 query heads and 3 key-value heads, a vocabulary of 49,152 tokens and tied input and output embeddings [Certain]. It was pretrained on 2 trillion tokens [Certain]. We counted 134,515,008 parameters. The seven linear layers of each block (q, k, v, o, gate, up, down) hold 3,538,944 weights, so the 30 blocks hold 106,168,320 weights: 78.9% of the model. These are the weights we prune. The embedding matrix (28,311,552 weights) is not pruned, as in the Wanda paper.</p>
+<p><b>Data.</b> Three disjoint pieces of text:</p>
+<ul>
+<li><b>Calibration</b>: 128 windows of 2048 tokens from C4 (the first 4,000 documents of the English validation shard 0). This is the same amount as in the Wanda paper, which used 128 sequences from the C4 training set [Certain].</li>
+<li><b>Recovery training</b>: C4 documents 4,000 to 40,000 of the same shard, about 10 million tokens. We use only 819,200 of them.</li>
+<li><b>Evaluation</b>: the WikiText-2 test set (304,978 tokens with this tokenizer), cut into 148 windows of 2048 tokens, and the last 1,576 C4 documents of the shard as a held-out C4 set. WikiText is never used for training, so the WikiText perplexity also tests whether the repair is general.</li></ul>
+<p><b>The table you will fill.</b> Copy it now. The last section shows our numbers.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model</th><th>Linear sparsity</th><th>WikiText-2 ppl</th><th>Held-out C4 ppl</th><th>Bytes of linear weights (FP16)</th><th>Measured speed-up (GPU)</th></tr></thead><tbody>
+<tr><td>A: dense</td><td>0%</td><td></td><td></td><td>212 MB</td><td>1.0×</td></tr>
+<tr><td>B: Wanda 50% unstructured</td><td>50%</td><td></td><td></td><td>212 MB (dense storage)</td><td></td></tr>
+<tr><td>C: Wanda 2:4</td><td>50%</td><td></td><td></td><td>119 MB</td><td></td></tr>
+<tr><td>D: C + distillation</td><td>50% (2:4)</td><td></td><td></td><td>119 MB</td><td>same as C</td></tr>
+<tr><td>E: C + fine-tuning on data (CE)</td><td>50% (2:4)</td><td></td><td></td><td>119 MB</td><td>same as C</td></tr>
+<tr><td>F: B + distillation</td><td>50%</td><td></td><td></td><td>212 MB</td><td>same as B</td></tr></tbody></table></div>
+
+<h2>Step 1: the dense baseline</h2>
+<p>We measure quality with <b>perplexity</b> (ppl): the exponential of the average next-token loss on a text the model did not train on. A perplexity of 15 means the model is, on average, as unsure as if it had to choose among 15 equally likely tokens. Lower is better.</p>
+<div class="eq">\[ \text{ppl} = \exp\!\Big(-\frac{1}{N} \sum_{t=1}^{N} \log p_\theta\big(x_t \mid x_{\lt t}\big)\Big) \tag{122.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(x_t\)</dt><dd>the token at position \(t\) of the test text</dd>
+<dt>\(p_\theta(x_t \mid x_{\lt t})\)</dt><dd>the probability the model gives to the true next token, after reading the tokens before it</dd>
+<dt>\(N\)</dt><dd>the number of predicted tokens: here 148 windows of 2048 tokens, each predicting 2047 tokens</dd></dl>
+<p>We use the same protocol as the Wanda code: non-overlapping windows of 2048 tokens, so the first tokens of each window have little context. Other protocols (a sliding window, a different length) give different numbers, so compare only numbers measured the same way [Certain].</p>
+<pre class="code"><span class="cm"># common.py, part 1: model, data, perplexity (formula 122.1)</span>
+import gzip, json, math, torch, torch.nn as nn
+import pyarrow.parquet as pq
+from transformers import AutoModelForCausalLM, AutoTokenizer
+torch.manual_seed(0)
+MID, dev = "HuggingFaceTB/SmolLM2-135M", "cpu"
+tok = AutoTokenizer.from_pretrained(MID)
+LIN = ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.o_proj",
+       "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"]
+
+def load():
+    return AutoModelForCausalLM.from_pretrained(MID, dtype=torch.float32).to(dev).eval()
+
+def get(mod, name):                         <span class="cm"># get(layer, "mlp.up_proj")</span>
+    for p in name.split("."): mod = getattr(mod, p)
+    return mod
+
+docs = [json.loads(l)["text"] for l in gzip.open("c4-validation.00000-of-00008.json.gz", "rt")]
+def c4_ids(lo, hi):                         <span class="cm"># documents lo..hi as one token stream</span>
+    ids = []
+    for t in docs[lo:hi]: ids += tok(t).input_ids + [tok.eos_token_id]
+    return torch.tensor(ids)
+
+def calib(n=128, L=2048, seed=0):           <span class="cm"># 128 random windows, as in the Wanda paper</span>
+    s = c4_ids(0, 4000); g = torch.Generator().manual_seed(seed)
+    st = torch.randint(0, s.numel() - L - 1, (n,), generator=g)
+    return torch.stack([s[i:i + L] for i in st])
+
+def wiki_test():                            <span class="cm"># the WikiText-2 (raw) test split as a parquet file</span>
+    t = "\n\n".join(pq.read_table("wikitext2_test.parquet").column("text").to_pylist())
+    return tok(t, return_tensors="pt").input_ids[0]
+
+@torch.no_grad()
+def ppl(model, ids, L=2048, bs=4):          <span class="cm"># non-overlapping windows</span>
+    n = ids.numel() // L; x = ids[:n * L].view(n, L); nll = 0.0
+    for i in range(0, n, bs):
+        b = x[i:i + bs].to(dev); lg = model(b).logits[:, :-1].float()
+        nll += nn.functional.cross_entropy(lg.reshape(-1, lg.size(-1)), b[:, 1:].reshape(-1),
+                                           reduction="sum").item()
+    return math.exp(nll / (n * (L - 1)))</pre>
+<p><b>Our result:</b> the dense SmolLM2-135M has a WikiText-2 perplexity of <b>15.43</b>. One evaluation pass took about 50 seconds on the laptop GPU and about 4 minutes on the CPU while other jobs were running. For comparison, the Wanda paper reports 5.68 for LLaMA-7B with the same protocol [Certain]: a 50 times larger model is much more certain about the next token.</p>
+
+<h2>Step 2: prune with Wanda</h2>
+<p>Pruning one linear layer is a small optimization problem. The layer computes \(Y = WX\). We want a 0/1 mask \(M\) that removes a fixed share of the weights and changes the output as little as possible on real inputs:</p>
+<div class="eq">\[ \min_{M}\ \big\lVert WX - (M \odot W) X \big\rVert_F^2 \quad \text{such that a share } s \text{ of the entries of } M \text{ is } 0 \tag{122.2} \]</div>
+<p>Here \(\odot\) is the element-wise product and \(X\) holds the calibration inputs of the layer, one column per token. SparseGPT solves this problem with second-order information and also updates the remaining weights (<a href="../inference/unstructured-and-2-4-pruning-sparsegpt-wanda.html">session 114</a>). Wanda uses a cheaper answer. If we keep only the diagonal of \(XX^\top\), removing weight \(W_{ij}\) adds about \(W_{ij}^2 \lVert X_j \rVert_2^2\) to the error. So the weights with the smallest <b>Wanda score</b> are the cheapest to remove:</p>
+<div class="eq">\[ S_{ij} = |W_{ij}| \cdot \lVert X_j \rVert_2, \qquad \lVert X_j \rVert_2 = \Big(\sum_{t} X_{jt}^2\Big)^{1/2} \tag{122.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W_{ij}\)</dt><dd>the weight from input feature \(j\) to output feature \(i\) (row \(i\), column \(j\))</dd>
+<dt>\(X_{jt}\)</dt><dd>the value of input feature \(j\) at calibration token \(t\)</dd>
+<dt>\(\lVert X_j \rVert_2\)</dt><dd>the size of input feature \(j\) over all calibration tokens; LLMs have a few features that are much larger than the rest (outlier features)</dd>
+<dt>\(S_{ij}\)</dt><dd>the Wanda score; magnitude pruning uses only \(|W_{ij}|\)</dd></dl>
+<p>Two details matter. First, Wanda compares scores <b>inside each output row</b>: every row of \(W\) loses the same share of its weights. The Wanda paper found this per-output comparison works better for LLMs than comparing across the whole layer, but not for image classifiers [Certain]. Second, the mask is computed one transformer block at a time, and each block receives the outputs of the blocks that are already pruned. So later blocks see the inputs they will really get.</p>
+<p>The <b>2:4</b> pattern adds a constraint: in every group of 4 consecutive weights of a row, exactly 2 stay. Wanda then removes the 2 smallest scores in each group:</p>
+<div class="eq">\[ \sum_{k=0}^{3} M_{i,\,4g+k} = 2 \quad \text{for every row } i \text{ and every group } g \tag{122.4} \]</div>
+<p>This is still 50% sparsity, but the zeros cannot go where they hurt least; they must be spread evenly. 4:8 (4 of every 8 stay) is a looser version of the same idea. Figure 1 shows the difference on a toy layer.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>You must cut half the staff of a company. Magnitude pruning keeps the people with the highest salary. Wanda keeps the people whose salary times workload is highest: a cheap person who handles the most customers stays. The 2:4 rule adds: in every team of four, exactly two must go, even if one team is full of stars.</aside>
+<figure class="fig" id="pw-toy"><div class="fig-body">
+<div class="controls"><span class="seg" id="pw-toy-m"><button type="button" data-v="wanda" aria-pressed="true">Wanda |W|·‖X‖</button><button type="button" data-v="magnitude" aria-pressed="false">Magnitude |W|</button></span></div>
+<div class="controls"><span class="seg" id="pw-toy-p"><button type="button" data-v="u" aria-pressed="true">50% per row</button><button type="button" data-v="24" aria-pressed="false">2:4</button></span></div>
+<div class="pw-grid"><label for="pw-toy-s">Outlier size ‖X<sub>4</sub>‖</label><input type="range" id="pw-toy-s" min="0" max="3" step="1" value="2"><output id="pw-toy-sv"></output></div>
+<div class="scroll-x"><svg id="pw-toy-svg" class="pw-svg" viewBox="0 0 600 290" role="img" aria-label="A 4 by 8 weight matrix with input norms above each column; pruned weights are struck out"></svg></div>
+<div class="pw-leg"><span style="--c:var(--k)">input norm ‖X<sub>j</sub>‖ of each column</span><span style="--c:var(--q)">kept weight (darker = larger |W|)</span><span style="--c:var(--paper2)">pruned weight</span></div>
+<div class="readout" id="pw-toy-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> One toy linear layer with 4 output rows and 8 inputs. Input 4 is an outlier feature whose size you set. The error is the share of the output energy that is lost, computed with the diagonal approximation behind formula (122.3) (exact when the input features are uncorrelated).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with Wanda, 50% per row and an outlier of 8. Wanda keeps all 4 weights of the outlier column, although they are among the smallest weights (0.15, 0.25, 0.3, 0.1), and loses 7.5% of the output. Switch to magnitude: it removes all 4 of them and loses 61.0%, eight times more. Set the outlier to 1 (no outlier): both methods choose the same mask and lose 10.5%. With an outlier of 16, magnitude loses 85.7% and Wanda 2.8%. Now pick 2:4 (the dashed line splits each row into two groups of 4): with an outlier of 8, Wanda loses 8.3% instead of 7.5%. The constraint costs a little here, because some rows must give up a weight they would have kept. In a real model the cost is much larger, as Step 3 shows.</p></details></figure>
+<p>Here is the pruning code we ran, slightly shortened (our version kept the hidden states on the CPU between blocks). It adds the masks to <code>common.py</code>. It never calls <code>model(...)</code> on the full model during pruning: it keeps the hidden states of the 128 calibration windows in memory and runs one block at a time, so each block runs twice (once to collect the input norms with forward hooks, once more after pruning to produce the inputs of the next block).</p>
+<div class="algo"><div class="algo-h">Algorithm 1: sequential Wanda pruning</div><ol>
+<li><b>input:</b> model with blocks \(1..L\), calibration tokens (128 × 2048), pattern: share \(s\) or N:M</li>
+<li>\(H \leftarrow\) embeddings of the calibration tokens <span class="c">// hidden states, 128 × 2048 × 576</span></li>
+<li><b>for</b> block \(l = 1..L\):</li>
+<li>&nbsp;&nbsp;run block \(l\) on \(H\); for every linear layer, accumulate \(\sum_t X_{jt}^2\) per input feature \(j\)</li>
+<li>&nbsp;&nbsp;<b>for</b> each linear layer: \(S \leftarrow |W| \cdot \sqrt{\sum_t X_{jt}^2}\) (formula 122.3)</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;share \(s\): in each row, zero the \(\lfloor s \cdot d_{in} \rfloor\) smallest \(S_{ij}\); N:M: in each group, zero the smallest (formula 122.4)</li>
+<li>&nbsp;&nbsp;\(H \leftarrow\) block \(l\) run again on \(H\), now pruned <span class="c">// the next block sees pruned outputs</span></li>
+<li>return the pruned model and the masks (kept for Step 5)</li></ol></div>
+<pre class="code"><span class="cm"># common.py, part 2: masks, magnitude and Wanda pruning</span>
+def mask_rows(score, s):                   <span class="cm"># Wanda: the same share s in every output row</span>
+    k = int(score.shape[1] * s)
+    idx = score.argsort(dim=1)[:, :k]
+    m = torch.ones_like(score, dtype=torch.bool); m.scatter_(1, idx, False); return m
+
+def mask_layer(score, s):                  <span class="cm"># magnitude baseline: compare across the whole matrix</span>
+    k = int(score.numel() * s)
+    thr = score.flatten().kthvalue(k).values.item() if k &gt; 0 else -1
+    return score &gt; thr
+
+def mask_nm(score, n, m):                  <span class="cm"># "2:4": prune 2 of every 4 inputs, per row</span>
+    o, i = score.shape; s = score.reshape(o, i // m, m)
+    idx = s.topk(m - n, dim=-1).indices    <span class="cm"># keep the m - n largest</span>
+    return torch.zeros_like(s, dtype=torch.bool).scatter_(-1, idx, True).reshape(o, i)
+
+def make_mask(score, pattern, per_row):
+    if isinstance(pattern, str):
+        n, m = map(int, pattern.split(":")); return mask_nm(score, n, m)
+    return (mask_rows if per_row else mask_layer)(score, pattern)
+
+@torch.no_grad()
+def prune_magnitude(model, pattern):
+    masks = {}
+    for li, layer in enumerate(model.model.layers):
+        for nm in LIN:
+            lin = get(layer, nm); mk = make_mask(lin.weight.abs(), pattern, per_row=False)
+            lin.weight.mul_(mk); masks[f"{li}.{nm}"] = mk
+    return masks
+
+@torch.no_grad()
+def prune_wanda(model, pattern, cal, bs=8):    <span class="cm"># Algorithm 1</span>
+    m = model.model
+    h = m.embed_tokens(cal.to(dev))            <span class="cm"># (128, 2048, 576) hidden states</span>
+    pos = torch.arange(cal.shape[1], device=dev)[None]
+    masks = {}
+    for li, layer in enumerate(m.layers):
+        sq = {nm: torch.zeros(get(layer, nm).in_features, device=dev) for nm in LIN}
+        def hook(nm):
+            def f(mod, inp, out):
+                x = inp[0].reshape(-1, inp[0].shape[-1]).float()
+                sq[nm] += (x * x).sum(0)       <span class="cm"># sum over tokens of X_jt^2</span>
+            return f
+        hooks = [get(layer, nm).register_forward_hook(hook(nm)) for nm in LIN]
+        for i in range(0, h.shape[0], bs):     <span class="cm"># pass 1: collect input norms</span>
+            x = h[i:i + bs]; layer(x, position_ids=pos, position_embeddings=m.rotary_emb(x, pos))
+        for k in hooks: k.remove()
+        for nm in LIN:
+            lin = get(layer, nm)
+            score = lin.weight.abs() * sq[nm].sqrt()[None, :]     <span class="cm"># formula (122.3)</span>
+            mk = make_mask(score, pattern, per_row=True)
+            lin.weight.mul_(mk); masks[f"{li}.{nm}"] = mk
+        for i in range(0, h.shape[0], bs):     <span class="cm"># pass 2: outputs of the pruned block</span>
+            x = h[i:i + bs]; out = layer(x, position_ids=pos, position_embeddings=m.rotary_emb(x, pos))
+            h[i:i + bs] = out[0] if isinstance(out, tuple) else out
+    return masks
+
+<span class="cm"># usage</span>
+model = load(); te = wiki_test()
+print("dense", ppl(model, te))
+masks = prune_wanda(model, "2:4", calib())     <span class="cm"># or 0.5 for unstructured 50%</span>
+print("wanda 2:4", ppl(model, te))</pre>
+<p>Calling a decoder layer directly needs the rotary position embeddings (<code>position_embeddings</code>); with no attention mask, the default SDPA attention applies a causal mask. We checked this: for the dense model in transformers 4.57, running the 30 blocks one by one and then the final norm gives exactly the same hidden states as <code>model(...)</code> (largest difference 0.0). Do the same check with your version before you trust the block-by-block path. Two practical notes from our runs. The hidden states of 128 × 2048 tokens take 604 MB in FP32. And <code>kthvalue</code> is not implemented on Apple’s MPS backend in PyTorch 2.8, so move the scores to the CPU for the magnitude baseline.</p>
+<p><b>Our results at 50%</b> (WikiText-2): Wanda unstructured <b>34.95</b>, Wanda 4:8 <b>63.66</b>, Wanda 2:4 <b>125.67</b>. Magnitude pruning at 50% gives 1,622.7, and magnitude 2:4 gives 2,547.5: the model is broken. Wanda’s calibration took 81 seconds per run on the laptop GPU (two block passes over 262,144 tokens; the score itself is almost free) and 22 minutes on a busy CPU. The Wanda paper reports 0.54 seconds to compute the scores for LLaMA-7B on a GPU, without the forward passes [Certain].</p>
+<aside class="note watch side"><span class="nt">Watch out</span>The same 2:4 run gave 123.83 when the calibration ran on the laptop GPU and 125.67 when it ran on the CPU. The two backends round floating-point sums differently; a few scores near the cut-off change order, and with them a few mask entries. So a difference of 1 to 2% in perplexity between two pruning runs can be pure noise. Fix the device and the seed when you compare methods.</aside>
+
+<h2>Step 3: the sparsity sweep</h2>
+<p>One number at 50% hides the shape of the damage. Prune at 10%, 20%, …, 70% with both methods, plus 4:8 and 2:4, and plot perplexity on a log scale. Each Wanda point is a full new pruning run from the dense model.</p>
+<pre class="code"><span class="cm"># sweep.py: perplexity vs sparsity (one JSON line per run)</span>
+import json
+te, cal = wiki_test(), calib()
+for p in [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, "4:8", "2:4"]:
+    for meth in ["magnitude", "wanda"]:
+        model = load()
+        masks = prune_magnitude(model, p) if meth == "magnitude" else prune_wanda(model, p, cal)
+        print(json.dumps({"method": meth, "pattern": p, "wiki_ppl": ppl(model, te)}))
+        if meth == "wanda" and p in (0.5, "2:4"):          <span class="cm"># the starting points of Step 5</span>
+            torch.save(model.state_dict(), f"wanda_{p}.pt".replace(":", "of"))
+            torch.save(masks, f"mask_{p}.pt".replace(":", "of"))</pre>
+<figure class="fig wide" id="pw-curve"><div class="fig-body">
+<div class="pw-grid"><label for="pw-curve-s">Sparsity</label><input type="range" id="pw-curve-s" min="0" max="7" step="1" value="5"><output id="pw-curve-sv"></output></div>
+<div class="scroll-x"><svg id="pw-curve-svg" class="pw-svg" viewBox="0 0 640 270" role="img" aria-label="WikiText-2 perplexity against sparsity for magnitude and Wanda pruning of SmolLM2-135M"></svg></div>
+<div class="pw-leg"><span style="--c:var(--q)">Wanda</span><span style="--c:var(--k)">magnitude</span><span style="--c:var(--muted)">dense model</span></div>
+<div class="readout" id="pw-curve-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Real measurements: WikiText-2 perplexity of SmolLM2-135M after one-shot pruning of all linear layers, no retraining. Dots: unstructured sparsity. At 50%, a diamond marks 4:8 and a square marks 2:4 (shifted left and right a little so they do not overlap). The y axis is logarithmic and stops at 100,000.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Move the slider from left to right. At 10% and 20%, Wanda is almost free: 15.49 and 15.93 against 15.43 dense. Magnitude is already worse at 20% (19.24). At 40%, Wanda gives 21.60 and magnitude 70.49. At 50% (the default), Wanda gives 34.95, 2.3 times the dense value; magnitude gives 1,622.7. Above 50%, both methods break down: at 60% Wanda gives 116.37 (7.5 times dense) and magnitude 21,332; at 70% Wanda gives 2,318.7 and magnitude 934,886, which is off the chart. Now look at the squares and diamonds at 50%: the N:M patterns cost much more than unstructured sparsity at the same 50%. Wanda 4:8 gives 63.66 and Wanda 2:4 gives 125.67, 8.1 times the dense value.</p></details></figure>
+<p>Compare this with the paper. For LLaMA-7B at 50%, Wanda goes from 5.68 to 7.26 (1.28 times), 4:8 to 8.57 and 2:4 to 11.53 (2.03 times) [Certain]. Our 135M model loses far more: 2.3 times at 50% unstructured and 8.1 times at 2:4. Small models have less redundancy, so each weight carries more of the function. The SparseGPT paper made the same observation: larger models are easier to prune [Certain]. So do not take the paper’s numbers as a forecast for your small model. Measure.</p>
+<p>Note one more comparison in Figure 2: Wanda 2:4 at 50% (125.67) is worse than Wanda unstructured at 60% (116.37). For this model, the 2:4 rule costs more than removing another 10% of the weights freely. All magnitude results at 50% are broken (1,622.7 unstructured, 3,408.1 at 4:8 and 2,547.5 at 2:4); at that level the order among them means little.</p>
+<p>The gap between unstructured and 2:4 also has a clear reason. Unstructured 50% can remove 3 or 4 weights from a group of 4 when they are unimportant and keep all 4 elsewhere. 2:4 forces exactly 2 out of every group. In Figure 1, this cost was small; in the real model, the scores inside many groups are very uneven, and the rule removes weights that matter.</p>
+
+<h2>Step 4: bytes and speed</h2>
+<p>Zeros only help if the hardware or the kernel can skip them. Two things can get faster. In <b>decode</b> (one new token per request), the time is mostly spent reading the weights from memory, so fewer bytes means more speed (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>). In <b>prefill</b> and large batches, the time is spent on multiplications, so fewer multiplications means more speed.</p>
+<p><b>Unstructured 50% on a GPU.</b> The zeros are stored as zeros in a dense matrix, so the bytes and the math are the same as before: no speed-up. A sparse format such as CSR stores only the non-zero values plus a column index for each one. With FP16 values and 16-bit indices, that is \(2 \times 16 \times 0.5 = 16\) bits per original weight: no memory saving at 50%. With 32-bit indices it is 24 bits: more memory than dense. Sparse kernels for unstructured patterns are also much less efficient than dense tensor-core kernels at this sparsity [Likely].</p>
+<p><b>2:4 on a GPU.</b> Each group of 4 stores its 2 kept values and two 2-bit positions (the <b>metadata</b>). For values with \(b\) bits:</p>
+<div class="eq">\[ \text{bits per weight}_{2:4} = \frac{2b + 2 \cdot 2}{4} = \frac{b}{2} + 1 \qquad (b = 16:\ 9 \text{ bits};\ b = 4:\ 3 \text{ bits}) \tag{122.5} \]</div>
+<p>PyTorch documents the same numbers: a 2:4 FP16 or BF16 tensor takes 9/16 = 56.25% of the dense size, and INT8 takes 62.5% [Certain]. If decode were purely limited by weight reads, the best possible speed-up of the linear layers would be the ratio of bytes:</p>
+<div class="eq">\[ \text{speed-up}_\text{decode} \le \frac{\text{bits}_\text{dense}}{\text{bits}_\text{sparse}} = \frac{16}{9} \approx 1.78, \qquad \text{speed-up}_\text{prefill} \le 2 \tag{122.6} \]</div>
+<p>The 2 is the peak math rate of the sparse tensor cores against the dense ones [Certain]. Real numbers are lower, because attention, norms, the KV cache and the other operators do not get faster. The Wanda paper measured 2:4 matrix multiplications of LLaMA-65B at 1.54 to 1.63 times the dense speed (for example 3.49 ms to 2.14 ms for the q/k/v/o projections) with the CUTLASS kernels on an A6000 GPU, and an end-to-end latency of 251 ms instead of 312 ms for LLaMA-7B: <b>1.24 times</b> [Certain].</p>
+<div class="worked"><div class="wt">Worked example: bytes of the linear layers</div>
+<p>SmolLM2-135M has 106,168,320 linear weights. Dense FP16: \(106{,}168{,}320 \times 2 = 212.3\) MB. 2:4 FP16: \(\times 9/16 = 119.4\) MB, a saving of 92.9 MB. The embedding matrix and the norms (56.7 MB in FP16) stay dense, so the whole model goes from 269.0 MB to 176.1 MB: 1.53 times smaller, not 1.78 times.</p>
+<p>LLaMA-7B has 32 blocks of \(4 \times 4096^2 + 3 \times 4096 \times 11008 = 202{,}375{,}168\) linear weights: 6,476,005,376 in total. Dense FP16: 12.95 GB. 2:4 FP16: 7.29 GB. 2:4 with 4-bit values (3 bits per weight): 2.43 GB, against 3.24 GB for dense INT4. Combined with quantization, 2:4 saves a smaller share (4/3 = 1.33 times), because the 2-bit metadata is a larger part of each weight.</p></div>
+<p><b>On the GPU you will measure.</b> The code below converts each linear weight of the pruned model to PyTorch’s 2:4 format and times the decode of a few tokens. We could not run it (no NVIDIA GPU). PyTorch calls this feature a prototype, supports it only on CUDA, and needs 2D FP16/BF16 matrices whose sizes are multiples of 64 [Certain]. SmolLM2’s matrices (576, 192 and 1536 wide) meet this.</p>
+<pre class="code"><span class="cm"># speed_24.py: 2:4 kernels on an NVIDIA GPU (Ampere or newer). NOT run by us.</span>
+import time, torch
+from torch.sparse import to_sparse_semi_structured
+model = load().half().cuda()               <span class="cm"># with dev = "cuda" in common.py</span>
+model.load_state_dict(torch.load("wanda_2of4.pt"))   <span class="cm"># the Wanda 2:4 model from Step 3</span>
+model.half()
+x = torch.randint(0, 49152, (1, 1), device="cuda")
+
+def bench(m, reps=200):                     <span class="cm"># decode-like: one token, batch 1, no KV cache</span>
+    with torch.no_grad():
+        for _ in range(20): m(x)
+        torch.cuda.synchronize(); t = time.perf_counter()
+        for _ in range(reps): m(x)
+        torch.cuda.synchronize(); return (time.perf_counter() - t) / reps * 1e3
+
+t_dense = bench(model)                       <span class="cm"># the zeros are still stored densely here</span>
+for layer in model.model.layers:
+    for nm in LIN:
+        lin = get(layer, nm)
+        lin.weight = torch.nn.Parameter(to_sparse_semi_structured(lin.weight))
+t_24 = bench(model)
+print(f"dense storage {t_dense:.3f} ms   2:4 kernels {t_24:.3f} ms   speed-up {t_dense / t_24:.2f}x")
+<span class="cm"># also time a prefill: x = torch.randint(0, 49152, (8, 512), device="cuda")</span></pre>
+<p>A 135M model is a hard case for this test. Its matrices are small, so kernel launch time and the other operators dominate, and the speed-up will be smaller than for a 7B model [Likely]. Time a large batch too (prefill, 8 × 512 tokens): that is where the math speed of the sparse tensor cores shows.</p>
+<p><b>What we could measure: CPU sparse kernels.</b> On the CPU we timed one matrix multiplication with a dense FP32 matrix against the same matrix in PyTorch’s CSR format at 50% sparsity, once with random (unstructured) zeros and once with a 2:4 mask. Figure 3 shows the result next to the byte counts.</p>
+<pre class="code"><span class="cm"># bench.py: dense vs CSR at 50% on the CPU (FP32, 8 threads, best of 5)</span>
+import time, torch
+torch.manual_seed(0); torch.set_num_threads(8)
+def nm_mask(w):
+    s = w.abs().reshape(w.shape[0], -1, 4); idx = s.topk(2, -1).indices
+    return torch.zeros_like(s, dtype=torch.bool).scatter_(-1, idx, True).reshape(w.shape)
+def tm(f, reps):
+    for _ in range(3): f()
+    best = 1e9
+    for _ in range(5):
+        t = time.perf_counter()
+        for _ in range(reps): f()
+        best = min(best, (time.perf_counter() - t) / reps)
+    return best * 1e3
+for name, (o, i) in {"SmolLM2 up_proj": (1536, 576), "LLaMA-7B up_proj": (11008, 4096)}.items():
+    W = torch.randn(o, i); Wu = W * (torch.rand(o, i) &gt; 0.5); W24 = W * nm_mask(W)
+    cu, c24 = Wu.to_sparse_csr(), W24.to_sparse_csr()
+    for T in [1, 16, 512]:
+        X = torch.randn(i, T); reps = 50 if o * i * T &lt; 1e9 else 5
+        print(name, T, "dense %.4f ms" % tm(lambda: W @ X, reps),
+              "csr50 %.4f ms" % tm(lambda: cu @ X, reps), "csr24 %.4f ms" % tm(lambda: c24 @ X, reps))</pre>
+<figure class="fig" id="pw-mem"><div class="fig-body">
+<div class="controls"><span class="seg" id="pw-mem-sh"><button type="button" data-v="smol" aria-pressed="true">SmolLM2-135M</button><button type="button" data-v="llama" aria-pressed="false">LLaMA-7B</button></span></div>
+<div class="controls"><span class="seg" id="pw-mem-t"><button type="button" data-v="1" aria-pressed="true">1 token</button><button type="button" data-v="16" aria-pressed="false">16 tokens</button><button type="button" data-v="512" aria-pressed="false">512 tokens</button></span></div>
+<div class="scroll-x"><svg id="pw-mem-svg" class="pw-svg" viewBox="0 0 640 330" role="img" aria-label="Bits per weight of sparse formats and measured CPU time of dense and CSR matrix multiplication"></svg></div>
+<div class="pw-leg"><span style="--c:var(--v)">dense storage</span><span style="--c:var(--k)">CSR (values + column indices)</span><span style="--c:var(--q)">2:4 (values + 2-bit metadata)</span></div>
+<div class="readout" id="pw-mem-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Top: bits per linear weight and total size for each format, from formula (122.5); “≤” is the best decode speed-up from bytes alone (122.6). Bottom: our measured CPU time of one up-projection matrix multiplication (SmolLM2: 1536 × 576; LLaMA-7B: 11008 × 4096) for a batch of 1, 16 or 512 tokens. The CPU numbers come from a busy laptop and can vary by tens of percent between runs.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The top part does not change with the token buttons: memory is memory. Only 2:4 saves bytes at 50%; CSR with 16-bit indices is as big as dense, and with 32-bit indices it is bigger. Now look at the measured times. For SmolLM2 with 1 token, the dense matmul takes 0.0064 ms and CSR at 50% takes 2.85 ms: <b>445 times slower</b>. With 512 tokens the gap shrinks to 31 times, and for the LLaMA-7B shape it is 24 to 155 times. The 2:4 mask makes no difference to CSR (2.86 ms): a general sparse format does not know about the pattern, so it cannot use it. This is why “50% sparse” alone says nothing about speed: it depends on the pattern, the format and the kernel.</p></details></figure>
+<p><b>What our CPU numbers show.</b> On this laptop, CSR at 50% was 24 to 445 times slower than dense in all six cases. Two reasons. First, the dense matmul is very well tuned: it reached about 1.7 trillion FP32 operations per second at 512 tokens (Apple’s matrix unit through the Accelerate library [Likely]), and the small SmolLM2 matrix (3.5 MB) stays in the CPU cache. Second, PyTorch on this ARM laptop has no MKL, and its CSR kernel ran on one core: its time did not change when we went from 1 to 8 threads. On an x86 server with MKL the gap would be smaller, but published results agree that general sparse kernels need much more than 50% sparsity to beat dense ones [Likely]. So the lesson holds: zeros give speed only with a format and a kernel built for them. On a GPU that means 2:4 with sparse tensor cores, which you measure with <code>speed_24.py</code>.</p>
+
+<h2>Step 5: recover with distillation</h2>
+<p>The pruned model has lost quality, but most of its knowledge is still there. A short training run on the remaining weights can repair much of the damage. Two choices matter: what loss to use, and how to keep the pruned weights at zero.</p>
+<p><b>The loss.</b> Plain fine-tuning uses the next-token cross-entropy (CE) on text. <b>Knowledge distillation</b> (KD) uses the dense model as a <b>teacher</b>: at every position, the pruned <b>student</b> is trained to match the teacher’s full probability distribution over the next token (<a href="../posttraining/knowledge-distillation.html">session 59</a>, <a href="../inference/distillation-for-llms-1-white-box-logits.html">session 119</a>). The teacher is the model before pruning, so its distribution is exactly the behavior we want back.</p>
+<div class="eq">\[ \mathcal{L}_\text{KD} = \frac{1}{N} \sum_{t=1}^{N} \KL\big(p_T(\cdot \mid x_{\lt t}) \,\big\|\, p_S(\cdot \mid x_{\lt t})\big) = \frac{1}{N} \sum_{t=1}^{N} \sum_{v=1}^{V} p_T(v \mid x_{\lt t}) \log \frac{p_T(v \mid x_{\lt t})}{p_S(v \mid x_{\lt t})} \tag{122.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(p_T, p_S\)</dt><dd>the next-token distributions of the dense teacher and the pruned student (softmax at temperature 1)</dd>
+<dt>\(V\)</dt><dd>the vocabulary size, 49,152</dd>
+<dt>\(N\)</dt><dd>the number of token positions in the batch</dd>
+<dt>\(\KL\)</dt><dd>the Kullback–Leibler divergence; it is 0 only when the student matches the teacher exactly</dd></dl>
+<p>Why should this beat CE? A CE target is one token; a teacher target is 49,152 probabilities, so each position carries much more signal. And CE pulls the student toward the data, which is a different target from the teacher it was cut from. Minitron found that retraining a pruned model with the logit KL loss alone, at temperature 1, worked better than conventional training at the same compute [Certain]. We test it on our model.</p>
+<p><b>Keeping the zeros.</b> After every optimizer step, multiply each pruned weight matrix by its mask again:</p>
+<div class="eq">\[ W \leftarrow M \odot \big(W - \eta\, u(W)\big) \tag{122.8} \]</div>
+<p>Here \(u(W)\) is the AdamW update and \(\eta\) the learning rate. Without this line, the gradients would make the pruned weights non-zero again, and the sparsity (and with it any 2:4 speed) would be gone. The mask stays fixed: we only train the weights that survived, as in the Wanda paper [Certain]. The embedding matrix and the norms are trained too; they are dense anyway.</p>
+<p><b>Measuring recovery.</b> To compare runs that start from different points, we report the share of the damage that was repaired, in log-perplexity (which is the average loss):</p>
+<div class="eq">\[ \text{gap closed} = \frac{\log \text{ppl}_\text{pruned} - \log \text{ppl}_\text{recovered}}{\log \text{ppl}_\text{pruned} - \log \text{ppl}_\text{dense}} \tag{122.9} \]</div>
+<p>1 means the student is as good as the teacher; 0 means no repair.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: recovery with distillation and a fixed mask</div><ol>
+<li><b>input:</b> pruned student \(S\) with masks \(M\), dense teacher \(T\) (frozen), training text, steps \(K\), learning rate \(\eta\)</li>
+<li><b>for</b> step \(k = 1..K\):</li>
+<li>&nbsp;&nbsp;sample 8 windows of 512 tokens <span class="c">// 4,096 tokens per step</span></li>
+<li>&nbsp;&nbsp;student logits \(z_S\) (with gradient); teacher logits \(z_T\) (no gradient)</li>
+<li>&nbsp;&nbsp;loss \(\leftarrow\) mean over positions of \(\KL(\softmax(z_T) \,\|\, \softmax(z_S))\) <span class="c">// (122.7); CE baseline: cross-entropy on the next token</span></li>
+<li>&nbsp;&nbsp;backward; clip the gradient norm to 1; AdamW step with warm-up and cosine decay</li>
+<li>&nbsp;&nbsp;<b>for</b> each pruned matrix: \(W \leftarrow M \odot W\) <span class="c">// (122.8)</span></li>
+<li>&nbsp;&nbsp;every 50 steps: perplexity on WikiText-2 and held-out C4</li></ol></div>
+<pre class="code"><span class="cm"># distill.py: recover a pruned model.  Usage: python distill.py 2of4 kd   (or: ce)</span>
+import sys, math, json, torch, torch.nn.functional as F
+from common import *
+P, MODE = sys.argv[1], sys.argv[2]
+STEPS, LR, BS, L, WARM = 200, 1e-4, 8, 512, 20
+torch.manual_seed(0)
+te = wiki_test()[:2048 * 40]; c4v = c4_ids(44000, 45576)[:2048 * 20]   <span class="cm"># eval subsets</span>
+train = c4_ids(4000, 40000)
+student = load(); student.load_state_dict(torch.load(f"wanda_{P}.pt"))
+masks = torch.load(f"mask_{P}.pt")
+mk = [(get(student.model.layers[int(k.split(".")[0])], k.split(".", 1)[1]).weight, v)
+      for k, v in masks.items()]
+teacher = load().requires_grad_(False) if MODE == "kd" else None
+student.train()
+opt = torch.optim.AdamW(student.parameters(), lr=LR, weight_decay=0.0, betas=(0.9, 0.95))
+lr_at = lambda s: LR * min(1, (s + 1) / WARM) * 0.5 * (1 + math.cos(math.pi * s / STEPS))
+g = torch.Generator().manual_seed(1)
+for step in range(1, STEPS + 1):
+    st = torch.randint(0, train.numel() - L - 1, (BS,), generator=g)
+    x = torch.stack([train[i:i + L] for i in st]).to(dev)
+    lg = student(x).logits[:, :-1].float()
+    if MODE == "kd":                                    <span class="cm"># formula (122.7)</span>
+        with torch.no_grad(): tl = teacher(x).logits[:, :-1].float()
+        V = lg.size(-1)
+        loss = F.kl_div(F.log_softmax(lg, -1).reshape(-1, V), F.log_softmax(tl, -1).reshape(-1, V),
+                        log_target=True, reduction="batchmean")
+    else:                                               <span class="cm"># the CE baseline</span>
+        loss = F.cross_entropy(lg.reshape(-1, lg.size(-1)), x[:, 1:].reshape(-1))
+    for gp in opt.param_groups: gp["lr"] = lr_at(step - 1)
+    opt.zero_grad(); loss.backward()
+    torch.nn.utils.clip_grad_norm_(student.parameters(), 1.0); opt.step()
+    with torch.no_grad():
+        for w, m in mk: w.mul_(m)                       <span class="cm"># formula (122.8): zeros stay zero</span>
+    if step % 50 == 0:
+        student.eval()
+        print(json.dumps({"step": step, "loss": round(loss.item(), 4),
+                          "wiki": ppl(student, te), "c4": ppl(student, c4v)}))
+        student.train()
+torch.save(student.state_dict(), f"student_{P}_{MODE}.pt")</pre>
+<p>Our script also logged the CE loss in the KD runs, the KL divergence, and the time per step; this shortened version prints less. <code>F.kl_div</code> with <code>reduction="batchmean"</code> divides by the first dimension, which here is the number of token positions, so the loss is the average KL per token, as in (122.7). We ran three runs of 200 steps (819,200 training tokens each): 2:4 with KD, 2:4 with CE, and 50% unstructured with KD.</p>
+<div class="worked"><div class="wt">Worked example: what the recovery run costs</div>
+<p>One KD step on 4,096 tokens costs about \(6N\) FLOPs per token for the student (forward and backward) plus \(2N\) for the teacher’s forward, with \(N = 134{,}515{,}008\): \(8 \times 134{,}515{,}008 \times 4{,}096 = 4.41 \times 10^{12}\) FLOPs. 200 steps: \(8.8 \times 10^{14}\) FLOPs. Pretraining on 2 trillion tokens cost about \(6N \times 2 \times 10^{12} = 1.6 \times 10^{21}\) FLOPs. So the recovery costs about \(5.5 \times 10^{-7}\) of the pretraining: one part in 1.8 million. A CE step skips the teacher and costs \(6N\) per token, 25% less.</p>
+<p>Memory: the teacher adds one more copy of the weights (538 MB in FP32 here, 269 MB in BF16). The logits are the hidden cost: \(8 \times 511 \times 49{,}152\) FP32 values are 804 MB for the student, the same again for the teacher, plus the softmax outputs and gradients. For a large vocabulary, compute the KL in chunks of positions, or keep only the teacher’s top-k probabilities [Likely].</p></div>
+<figure class="fig wide" id="pw-rec"><div class="fig-body">
+<div class="controls"><span class="seg" id="pw-rec-run"><button type="button" data-v="24kd" aria-pressed="true">2:4 + KD</button><button type="button" data-v="24ce" aria-pressed="false">2:4 + CE</button><button type="button" data-v="50kd" aria-pressed="false">50% + KD</button></span></div>
+<div class="controls"><span class="seg" id="pw-rec-ds"><button type="button" data-v="wiki" aria-pressed="true">WikiText-2</button><button type="button" data-v="c4" aria-pressed="false">Held-out C4</button></span></div>
+<div class="scroll-x"><svg id="pw-rec-svg" class="pw-svg" viewBox="0 0 640 260" role="img" aria-label="Perplexity during recovery training for three runs"></svg></div>
+<div class="pw-leg"><span style="--c:var(--q)">2:4 + KD</span><span style="--c:var(--k)">2:4 + CE (dashed)</span><span style="--c:var(--v)">50% unstructured + KD</span></div>
+<div class="readout" id="pw-rec-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Real logs of <code>distill.py</code> on the laptop: perplexity every 50 steps, on the first 40 windows of WikiText-2 (81,920 tokens) and on 20 windows of held-out C4 (40,960 tokens). These subsets are smaller than the full test set, so the values differ a little from the full-set numbers in the last section. The y axis is logarithmic.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Start with 2:4 + KD on WikiText-2. Perplexity falls from 118.02 to 42.93 in the first 50 steps: most of the repair happens at once. Then it falls slowly to 38.76 at step 200, which closes 53% of the log gap to the dense model on this subset (14.49). Switch to 2:4 + CE: the same tokens and steps end at 41.93 (49%). KD after only 100 steps (39.93) is already better than CE after 200. Switch to held-out C4: both runs close more of the gap there (62% for KD, 60% for CE), because the training text is also C4. Last, 50% + KD starts much lower (32.59) and ends at 23.82, 39% of its gap.</p></details></figure>
+<p><b>Our recovery results</b> on the full WikiText-2 test set. The 2:4 model went from 125.67 to <b>41.24</b> with KD, which closes 53% of the log gap, and to 44.78 with CE (49%). With the same 819,200 tokens, KD is better by 9% in perplexity. It is also better at the same compute: 100 KD steps cost \(100 \times 8N\) FLOPs for each token position of a batch, less than 200 CE steps (\(200 \times 6N\)), and it was already better on the subset (39.93 against 41.93). The 50% unstructured model went from 34.95 to <b>25.24</b> with KD (40%). But read the numbers against each other. The repaired 2:4 model (41.24) is still worse than the unstructured model <i>before</i> any repair (34.95), and 2.7 times the dense perplexity. 200 steps are a short first look; the Wanda paper used up to 3 days on 4 GPUs for full fine-tuning [Certain].</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Check the sparsity after training. Our script counts the zeros of every pruned matrix at the end; it must still be exactly 50%, and every group of 4 must still have 2 non-zeros. A forgotten mask line, or an optimizer that adds weight decay to a weight that was re-masked only at the start, leaks the zeros back. With AdamW and the mask applied after every step, as above, they stay zero.</aside>
+
+<h2>Step 6: the trade-off, and the decision</h2>
+<p>Put everything in one place: quality against the cost of serving. Figure 5 plots perplexity against bits per linear weight, the quantity that sets decode speed (formula 122.6). Unstructured 50% sits at 16 bits, like the dense model, because on a GPU it is stored densely. 2:4 sits at 9 bits.</p>
+<figure class="fig" id="pw-trade"><div class="fig-body">
+<div class="controls"><span class="seg" id="pw-trade-src"><button type="button" data-v="ours" aria-pressed="true">Our run: SmolLM2-135M</button><button type="button" data-v="paper" aria-pressed="false">Wanda paper: LLaMA-7B</button></span></div>
+<div class="scroll-x"><svg id="pw-trade-svg" class="pw-svg" viewBox="0 0 640 260" role="img" aria-label="Perplexity against bits per weight for pruned and recovered models"></svg></div>
+<div class="readout" id="pw-trade-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Full WikiText-2 perplexity (log scale) against bits per linear weight in FP16 on a GPU. Dashed lines join a pruned model to its recovered version. “Our run” uses our measurements; “Wanda paper” uses Table 6 of Sun et al. (2023), where LLaMA-7B was pruned with Wanda and then fine-tuned on C4 with LoRA (a budget of 12 hours on one GPU) or with full fine-tuning (a budget of 3 days on 4 GPUs) [Certain].</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>In “Our run”, the dense model sits at 16 bits and 15.43. The 50% unstructured model sits at the same 16 bits, because a GPU stores it densely, with a worse perplexity (34.95, 25.24 after KD): on a GPU without sparse kernels it costs the same as dense and is only worse. The 2:4 models sit at 9 bits: 125.67 after pruning, 41.24 after KD and 44.78 after CE. Now switch to “Wanda paper”. The picture is the same in shape but very different in size: for LLaMA-7B, 2:4 goes from 11.53 to 8.24 with LoRA and 7.02 with full fine-tuning, only 1.24 times the dense 5.68. A large model with a long recovery run ends close to dense; our small model with 200 steps ends 2.7 times worse.</p></details></figure>
+<p><b>Our filled table</b> (full WikiText-2 test set; held-out C4 on the 40,960-token subset):</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model</th><th>Linear sparsity</th><th>WikiText-2 ppl</th><th>Held-out C4 ppl</th><th>Bytes of linear weights (FP16)</th><th>Measured speed-up (GPU)</th></tr></thead><tbody>
+<tr><td>A: dense</td><td>0%</td><td>15.43</td><td>22.49</td><td>212 MB</td><td>1.0×</td></tr>
+<tr><td>B: Wanda 50% unstructured</td><td>50%</td><td>34.95</td><td>46.11</td><td>212 MB (dense storage)</td><td>1.0× (dense kernels)</td></tr>
+<tr><td>C: Wanda 2:4</td><td>50%</td><td>125.67</td><td>160.75</td><td>119 MB</td><td>not measured (no NVIDIA GPU)</td></tr>
+<tr><td>D: C + distillation</td><td>50% (2:4)</td><td>41.24</td><td>47.25</td><td>119 MB</td><td>same as C</td></tr>
+<tr><td>E: C + fine-tuning on data (CE)</td><td>50% (2:4)</td><td>44.78</td><td>49.81</td><td>119 MB</td><td>same as C</td></tr>
+<tr><td>F: B + distillation</td><td>50%</td><td>25.24</td><td>32.05</td><td>212 MB</td><td>same as B</td></tr></tbody></table></div>
+<p><b>Our decision for SmolLM2-135M.</b> We would not ship any of the pruned models. The best 2:4 model (41.24) is 2.7 times worse than dense, for at most 1.78 times faster decode of the linear layers. Model F (25.24) is the best pruned model, but it gives no speed and no memory gain on a GPU. For a model this small, a longer recovery run is the first thing to try; if the gap stays large, a 4-bit quantized dense model is a simpler way to cut memory [Likely]. For a 7B model the paper’s numbers point the other way: 2:4 plus a few GPU-days of recovery comes within 24% of dense, and then the 2:4 speed-up can be worth it.</p>
+<p>A decision memo, half a page, makes the result reviewable:</p>
+<ol>
+<li><b>Goal.</b> Example: “a model with less than 120 MB of linear weights and at most 20% higher perplexity than dense.”</li>
+<li><b>Results.</b> The table, plus the measured GPU speed-up of Step 4 for decode and for prefill.</li>
+<li><b>Decision.</b> Which model, with its recovery budget. If the 2:4 speed-up on your GPU is below about 1.2 times end to end, compare with simply using a smaller dense model or with 4-bit quantization (<a href="../inference/lab-compare-rtn-gptq-awq-smoothquant-and.html">session 112</a>), which may give more speed for less quality loss [Likely].</li>
+<li><b>Checks.</b> Perplexity is not everything: run a few zero-shot tasks (<a href="../pretraining/evaluating-base-models.html">session 40</a>) and read some generated text. Pruned models can keep a good perplexity and still lose specific skills [Likely].</li></ol>
+<aside class="note analogy side"><span class="nt">Analogy</span>Pruning is like removing half the books from a library to make it fit into a smaller building. Distillation is the old librarian walking through the new building and rewriting the notes so that readers still find the answers. The librarian is fast because they already know every answer; a new librarian (CE training on the raw texts) must work it out again.</aside>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>How pruning and recovery are used</th><th>What to watch</th></tr></thead><tbody>
+<tr><td>Model families from one big model (Minitron, Llama 3.2 1B and 3B)</td><td>Prune a trained model (mostly structured: heads, neurons, layers), then retrain with logit distillation from the big model</td><td>Structured pruning gives speed on any hardware; see <a href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html">session 115</a></td></tr>
+<tr><td>2:4 sparse checkpoints for GPU serving</td><td>Prune to 2:4 with Wanda or SparseGPT, recover, and serve with sparse kernels; often combined with INT8 or FP8 [Likely]</td><td>Real speed-up is 1.2 to 1.6 times, not 2; check your engine supports the format</td></tr>
+<tr><td>Memory-limited edge devices</td><td>Unstructured sparsity plus compression; useful only with a sparse-aware runtime [Likely]</td><td>No gain without a kernel that skips zeros; often 4-bit quantization is simpler</td></tr>
+<tr><td>Video understanding with a VLM (video retrieval, action recognition, key-moment detection)</td><td>Prune the language model of the VLM to 2:4 to speed up the prefill of many frame tokens, where the math speed of sparse tensor cores helps most [Speculation]</td><td>Calibrate on real video prompts: frame tokens have different outlier features than text [Likely]</td></tr>
+<tr><td>Video-RAG and video captioning at scale</td><td>A pruned and distilled captioner runs over millions of clips; the dense model is the teacher</td><td>Measure caption quality, not only perplexity; check rare actions and objects</td></tr>
+<tr><td>Research on sparsity</td><td>Wanda as a fast baseline: seconds per model instead of minutes for SparseGPT [Certain]</td><td>Compare at the same protocol (calibration data, sequence length, sparsity pattern)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ol>
+<li><b>Expecting speed from unstructured sparsity on a GPU.</b> The zeros are still stored and multiplied. Only 2:4 (or structured pruning) gives speed with standard GPU kernels; CSR at 50% is slower than dense (Figure 3).</li>
+<li><b>Comparing scores across the whole matrix with Wanda.</b> Wanda compares inside each output row. A global or per-layer comparison is the magnitude-pruning habit and works worse for LLMs.</li>
+<li><b>Calibrating with unpruned inputs.</b> If every block is scored with the inputs of the dense model, later blocks are pruned for inputs they will never see. Run the blocks in order and feed each one the outputs of the pruned blocks before it.</li>
+<li><b>Forgetting the mask during recovery.</b> Without \(W \leftarrow M \odot W\) after each step, the zeros fill up and the 2:4 pattern is lost. Count zeros after training.</li>
+<li><b>Recovering on the evaluation data.</b> Training on WikiText and testing on WikiText measures memorization of the domain. Recover on general text (C4 here) and test on something else.</li>
+<li><b>Trusting a paper’s numbers for a small model.</b> LLaMA-7B loses 2 times in perplexity at 2:4; our 135M model lost 8.1 times. Small models are much harder to prune.</li>
+<li><b>Promising 2× from 2:4.</b> 2 times is peak matrix math. Decode gains at most 1.78 times on weight reads, and measured end-to-end gains are about 1.2 to 1.6 times.</li>
+<li><b>Reading 1% perplexity differences as real.</b> The device alone changed our 2:4 result by 1.5%. Fix the device and seed, and look at differences much larger than that.</li></ol>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>You pruned 50% of the weights of an LLM and it is not faster. Why?<span class="lvl">basic</span></summary><div class="ans">Unstructured zeros are stored inside a dense matrix, and dense GPU kernels multiply them like any other number, so memory traffic and math are unchanged. Storing the matrix in a sparse format does not help at 50%: CSR with FP16 values and 16-bit indices is exactly as large as dense, and sparse kernels at this sparsity are slower than dense tensor-core kernels. On our CPU, CSR at 50% was 445 times slower than dense for one token. To get speed, use 2:4 sparsity with sparse tensor-core kernels, or structured pruning, which makes the matrices smaller.</div></details>
+<details class="qa"><summary>What is the Wanda score, and where does it come from?<span class="lvl">basic</span></summary><div class="ans">\(S_{ij} = |W_{ij}| \cdot \lVert X_j \rVert_2\): the weight size times the norm of its input feature over the calibration tokens. It comes from the layer-wise reconstruction error \(\lVert WX - (M \odot W)X \rVert^2\). Removing one weight adds \(W_{ij}^2 (XX^\top)_{jj} = W_{ij}^2 \lVert X_j \rVert^2\) if you keep only the diagonal of \(XX^\top\), so the cheapest weights to remove are those with the smallest \(S_{ij}\). It is the OBS saliency with a diagonal Hessian and no weight update. It matters because LLMs have a few input features that are much larger than the others; small weights on those features carry a lot of output (Figure 1).</div></details>
+<details class="qa"><summary>Why does Wanda compare weights inside each output row?<span class="lvl">core</span></summary><div class="ans">Each output feature is computed by its own row. If you compare across the whole matrix, some rows can lose most of their weights while others lose almost none, and the rows that are hit hard produce outputs that are badly wrong. Comparing inside each row removes the same share from every output, which keeps every output roughly intact. The Wanda paper found the per-output comparison clearly better for LLMs, while for image classifiers (ConvNeXt-B, DeiT-B) the per-layer comparison was slightly better, so this seems to be a property of LLMs [Certain]. A side benefit: 2:4 is also a per-row constraint, so the two fit together.</div></details>
+<details class="qa"><summary>What is 2:4 sparsity, how is it stored, and what speed-up can you expect?<span class="lvl">core</span></summary><div class="ans">In every group of 4 consecutive weights of a row, 2 are zero. The format stores the 2 kept values and a 2-bit position for each: \(b/2 + 1\) bits per weight, 9 bits for FP16 (56.25% of dense). Sparse tensor cores (NVIDIA Ampere and newer) skip the zeros and reach twice the peak math rate. Expect at most 2 times in compute-bound matmuls and at most 1.78 times in memory-bound decode, less end to end: the Wanda paper measured 1.54 to 1.63 times on LLaMA-65B matmuls and 1.24 times end to end on LLaMA-7B, because attention, norms and the KV cache are not sparse.</div></details>
+<details class="qa"><summary>Why does 2:4 hurt quality more than unstructured 50% at the same sparsity?<span class="lvl">core</span></summary><div class="ans">Unstructured pruning can put the zeros where they cost least: it may remove 4 weights from one group and none from another. 2:4 forces exactly 2 zeros into every group of 4, so in groups where 3 or 4 weights matter, it must remove important weights. On SmolLM2-135M, Wanda gave a WikiText-2 perplexity of 34.95 at 50% unstructured, 63.66 at 4:8 and 125.67 at 2:4, against 15.43 dense. On LLaMA-7B the paper reports 7.26, 8.57 and 11.53 against 5.68. The looser 4:8 pattern sits in between.</div></details>
+<details class="qa"><summary>Why recover with distillation instead of fine-tuning on the data?<span class="lvl">core</span></summary><div class="ans">The dense model is the behavior we want back, and it gives a full distribution over 49,152 tokens at every position instead of one correct token, so each step carries far more signal. CE on data pulls the student toward the data distribution, which is a different, noisier target. Minitron found the logit KL loss alone at temperature 1 better than conventional training after pruning, at the same compute. In our lab, with the same 819,200 tokens, KD reached 41.24 on WikiText-2 against 44.78 for CE, and KD after 100 steps was already better than CE after 200. The cost is a teacher forward pass per step (about a third more compute than CE) and memory for the teacher and its logits.</div></details>
+<details class="qa"><summary>How do you keep pruned weights at zero during recovery training?<span class="lvl">basic</span></summary><div class="ans">Keep the masks from pruning and apply \(W \leftarrow M \odot W\) after every optimizer step (or mask the gradients and make sure the optimizer adds nothing to masked entries; weight decay and momentum can otherwise move them). The mask is fixed: we train only the surviving weights. At the end, check that the sparsity is still exactly 50% and that every group of 4 has 2 non-zeros. With LoRA, merge the adapter and then apply the mask again, because the low-rank update is dense [Likely].</div></details>
+<details class="qa"><summary>Your 135M model loses 8 times in perplexity at 2:4, but the paper’s 7B loses 2 times. Is your code wrong?<span class="lvl">advanced</span></summary><div class="ans">Not necessarily. Larger models are easier to prune: they have more redundant weights, and the SparseGPT paper shows the gap to dense shrinks as the model grows. A 135M model has little to spare. Check the code anyway: the dense perplexity through the block-by-block path must equal the normal forward; the masks must have exactly 2 non-zeros per group; the scores must use the input norms of each layer (q, k and v share an input, gate and up share an input, o and down have their own); and calibration must feed pruned outputs forward. Then compare magnitude against Wanda: if Wanda is not far better than magnitude (125.67 against 2,547.5 for us), something is wrong.</div></details>
+<details class="qa"><summary>How do you report a pruning result honestly?<span class="lvl">advanced</span></summary><div class="ans">Give the full trade-off, not one number: perplexity (with the exact protocol: dataset, window length, overlapping or not) for dense, pruned and recovered models; at least one downstream task; the pattern (unstructured, 4:8, 2:4) and which layers were pruned; the memory of the stored model; and the measured speed-up on named hardware for decode and prefill, end to end, not only for one matmul. Report the recovery budget in tokens and GPU hours, and compare with simple alternatives at the same memory: a smaller dense model, or quantization.</div></details>
+<details class="qa"><summary>Can you combine 2:4 sparsity with quantization? What do you gain?<span class="lvl">advanced</span></summary><div class="ans">Yes. The values of a 2:4 matrix can be INT8, FP8 or INT4, and the hardware supports sparse INT8 and FP8 tensor-core math [Likely]. Bits per weight follow \(b/2 + 1\): 3 bits for 4-bit values, against 4 for dense INT4, so the gain over quantization alone is 4/3 = 1.33 times in bytes, not 2, because the metadata is a fixed 1 bit per weight. Quality losses add up, so prune first, recover, then quantize (or use a method that does both), and measure each step.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A row of a layer has weights \((0.8, -0.1, 0.4, 0.3)\) and input norms \((1, 10, 1, 2)\). Which 2 weights does Wanda remove under 2:4, and which does magnitude pruning remove? Compare the errors \(\sum W^2 \lVert X \rVert^2\) of the removed weights.</li>
+<li>Using formula (122.5), how many bits per weight does 2:4 need with FP8 values? How many megabytes are the linear layers of SmolLM2-135M in that format?</li>
+<li>In Figure 2, at which sparsity does magnitude pruning first become more than 4 times worse than Wanda? Explain why the gap grows with sparsity.</li>
+<li>A 2:4 model is pruned from ppl 15.43 to 125.67 and recovered to 30.0. What share of the gap is closed by formula (122.9)? What share would a perplexity of 20.0 mean?</li>
+<li>Decode of a model takes 20 ms per token; 70% of it is reading linear weights, the rest is attention, KV cache and other work. With 2:4 FP16 and perfect kernels, what is the best possible end-to-end speed-up?</li>
+<li>Our KD run used 819,200 tokens. How many tokens did the Wanda paper’s LoRA run see, if it ran for 12 hours at 5,000 tokens per second? What does this say about our 200-step result?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Wanda scores \(|W| \cdot \lVert X \rVert = (0.8, 1.0, 0.4, 0.6)\): in the one group of 4, Wanda removes weights 3 and 4 (scores 0.4 and 0.6), error \(0.16 + 0.09 \times 4 = 0.52\). Magnitude removes the two smallest \(|W|\), weights 2 and 4: error \(0.01 \times 100 + 0.36 = 1.36\). The total is 2.16, so Wanda loses 24% of the output energy and magnitude 63%: the weight −0.1 on the large input is the second most important one. 2. \(b = 8\): \(8/2 + 1 = 5\) bits per weight; \(106{,}168{,}320 \times 5 / 8 = 66.4\) MB, against 212.3 MB in FP16. 3. At 50%: magnitude 1,622.7 against Wanda 34.95, 46 times worse. At 40% the ratio is 3.3 (70.49 against 21.60), at 30% 1.7. Magnitude pruning ignores the input size, so it removes small weights on the outlier features first; the more you prune, the more of these important weights it removes, and the error grows much faster than for Wanda. 4. \((\ln 125.67 - \ln 30)/(\ln 125.67 - \ln 15.43) = 1.432/2.097 = 0.68\): 68% of the gap. A perplexity of 20.0 would mean 88%. 5. The weight part becomes \(0.7 \times 9/16 = 0.394\) of the old time; plus the other 0.3: 0.694 of 20 ms = 13.9 ms, a speed-up of 1.44 times at best. This is why measured end-to-end gains are far below 2 times. 6. \(12 \times 3600 \times 5000 = 216\) million tokens, 264 times our 819,200. Our run is a very short first look: its result is a lower bound on what recovery can do. The curves in Figure 4 flatten at the end because the cosine schedule brings the learning rate to zero, not because the repair is complete.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Wanda scores each weight by \(|W_{ij}| \cdot \lVert X_j \rVert_2\) (122.3), compares inside each output row and needs no weight update; on SmolLM2-135M at 50% it gave 34.95 against 1,622.7 for magnitude pruning (dense 15.43).</li>
+<li>2:4 (122.4) costs much more quality than unstructured 50%: 125.67 for our model. Small models break much faster than the 7B models in the papers.</li>
+<li>Unstructured 50% gives no speed or memory gain on a GPU. 2:4 stores \(b/2 + 1\) bits per weight (122.5) and gives at most 1.78× in decode and 2× in math (122.6); measured end-to-end gains are about 1.24×.</li>
+<li>Recover with a fixed mask (122.8) and distillation from the dense model (122.7). On our 2:4 model, 200 KD steps (819,200 tokens) went from 125.67 to 41.24 (53% of the log gap), better than CE (44.78), but the model is still 2.7 times worse than dense.</li>
+<li>Report the whole trade-off: perplexity before and after recovery, bytes, measured speed on named hardware, the recovery budget, and simple alternatives such as quantization.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ S_{ij} = |W_{ij}|\,\lVert X_j \rVert_2, \qquad \sum_{k=0}^{3} M_{i,4g+k} = 2, \qquad \text{bits}_{2:4} = \frac{b}{2} + 1, \qquad \text{speed-up}_\text{decode} \le \frac{16}{9} \]</div>
+<div class="eq">\[ \mathcal{L}_\text{KD} = \frac{1}{N}\sum_t \KL\big(p_T \,\|\, p_S\big), \qquad W \leftarrow M \odot \big(W - \eta\, u(W)\big), \qquad \text{gap closed} = \frac{\log \text{ppl}_\text{p} - \log \text{ppl}_\text{r}}{\log \text{ppl}_\text{p} - \log \text{ppl}_\text{d}} \]</div>
+<h2 class="plain" id="lab-prune-with-wanda-2-4-recover-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Sun et al. (2023). <a href="https://arxiv.org/abs/2306.11695" target="_blank" rel="noopener">A Simple and Effective Pruning Approach for Large Language Models (Wanda)</a></li><li>Mishra et al. (2021). <a href="https://arxiv.org/abs/2104.08378" target="_blank" rel="noopener">Accelerating Sparse Deep Neural Networks</a></li><li>Muralidharan et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Compact Language Models via Pruning and Knowledge Distillation (Minitron)&amp;quot;" target="_blank" rel="noopener">Compact Language Models via Pruning and Knowledge Distillation (Minitron)</a></li><li>Frantar &amp; Alistarh (2023). <a href="https://arxiv.org/abs/2301.00774" target="_blank" rel="noopener">SparseGPT: Massive Language Models Can Be Accurately Pruned in One-Shot</a></li><li>Allal et al. (2025). <a href="https://arxiv.org/abs/2502.02737" target="_blank" rel="noopener">SmolLM2: When Smol Goes Big -- Data-Centric Training of a Small Language Model</a></li><li>Raffel et al. (2020). <a href="https://arxiv.org/abs/1910.10683" target="_blank" rel="noopener">Exploring the Limits of Transfer Learning with a Unified Text-to-Text Transformer (T5, C4)</a></li><li>PyTorch (2025). <a href="https://docs.pytorch.org/docs/stable/sparse.html" target="_blank" rel="noopener">torch.sparse: Sparse Semi-Structured Tensors</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/dynamic-inference-early-exit-and-layer-skipping.html"><small>Previous · session 121</small>Dynamic inference: early exit and layer skipping</a><a class="next" href="../inference/runtime-profiling-where-the-time-goes.html"><small>Next · session 123</small>Runtime profiling: where the time goes</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="lab-prune-with-wanda-2-4-recover"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const NS="http://www.w3.org/2000/svg";
+const el=(tag,attrs,parent,txt)=>{const e=document.createElementNS(NS,tag);for(const k in attrs||{})if(attrs[k]!=null)e.setAttribute(k,attrs[k]);if(txt!=null)e.textContent=txt;if(parent)parent.appendChild(e);return e;};
+function seg(id,cb){const s=$("#"+id);if(!s)return()=>null;const bs=Array.from(s.querySelectorAll("button"));
+ const get=()=>{const b=bs.find(x=>x.getAttribute("aria-pressed")==="true");return b?b.dataset.v:bs[0].dataset.v;};
+ bs.forEach(b=>b.addEventListener("click",()=>{bs.forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(get());}));return get;}
+function line(svg,x1,y1,x2,y2,o){o=o||{};return el("line",{x1,y1,x2,y2,stroke:o.c||"var(--rule)","stroke-width":o.w||1,"stroke-dasharray":o.d||null,opacity:o.op||null},svg);}
+function txt(svg,x,y,s,o){o=o||{};return el("text",{x,y,"font-size":o.fs||12,"text-anchor":o.a||"start",fill:o.fill||"var(--ink2)","font-weight":o.fw||null},svg,s);}
+function path(svg,pts,o){o=o||{};return el("path",{d:pts.map((p,i)=>(i?"L":"M")+p[0].toFixed(1)+","+p[1].toFixed(1)).join(" "),fill:"none",stroke:o.c,"stroke-width":o.w||2,"stroke-dasharray":o.d||null,opacity:o.op||null},svg);}
+const f1=v=>v.toFixed(1),f2=v=>v.toFixed(2);
+const fq=v=>v>=1000?Math.round(v).toLocaleString("en-US"):v.toFixed(2);
+const fp=v=>v>=1000?Math.round(v).toLocaleString("en-US"):v>=100?v.toFixed(0):v.toFixed(1);
+const D={"dense":15.43,"sweep":{"magnitude":{"0.1":16.09,"0.2":19.24,"0.3":28.97,"0.4":70.49,"0.5":1622.66,"0.6":21331.96,"2:4":2547.47,"4:8":3408.05,"0.7":934886.23},"wanda":{"0.1":15.49,"0.2":15.93,"0.3":17.34,"0.4":21.6,"0.5":34.95,"2:4":125.67,"4:8":63.66,"0.6":116.37,"0.7":2318.71}},"bench":[{"shape":"up_proj 1536×576","tokens":1,"dense_ms":0.0064,"csr50_ms":2.8466,"csr24_ms":2.8572,"key":"smol"},{"shape":"up_proj 1536×576","tokens":16,"dense_ms":0.0518,"csr50_ms":3.1164,"csr24_ms":3.1124,"key":"smol"},{"shape":"up_proj 1536×576","tokens":512,"dense_ms":0.5374,"csr50_ms":16.7482,"csr24_ms":17.04,"key":"smol"},{"shape":"up_proj 11008×4096","tokens":1,"dense_ms":0.9446,"csr50_ms":145.9877,"csr24_ms":144.3576,"key":"llama"},{"shape":"up_proj 11008×4096","tokens":16,"dense_ms":6.8566,"csr50_ms":167.1164,"csr24_ms":191.9056,"key":"llama"},{"shape":"up_proj 11008×4096","tokens":512,"dense_ms":32.1677,"csr50_ms":1186.5435,"csr24_ms":1068.8,"key":"llama"}],"torch":"2.8","runs":{"24kd":{"label":"2:4 + KD","col":"var(--q)","mode":"kd","log":[{"step":0,"wiki":118.02,"c4":160.75},{"step":50,"wiki":42.93,"c4":52.63},{"step":100,"wiki":39.93,"c4":48.64},{"step":150,"wiki":38.98,"c4":47.44},{"step":200,"wiki":38.76,"c4":47.25}]},"24ce":{"label":"2:4 + CE","col":"var(--k)","mode":"ce","log":[{"step":0,"wiki":118.02,"c4":160.75},{"step":50,"wiki":45.21,"c4":54.77},{"step":100,"wiki":42.91,"c4":51.07},{"step":150,"wiki":42.16,"c4":49.99},{"step":200,"wiki":41.93,"c4":49.81}]},"50kd":{"label":"50% unstructured + KD","col":"var(--v)","mode":"kd","log":[{"step":0,"wiki":32.59,"c4":46.11},{"step":50,"wiki":24.94,"c4":33.52},{"step":100,"wiki":24.09,"c4":32.46},{"step":150,"wiki":23.84,"c4":32.11},{"step":200,"wiki":23.82,"c4":32.05}]}},"steps":200,"dense_sub":{"wiki":14.49,"c4":22.49},"trade":{"ours":{"dense":15.43,"ylo":12,"yhi":160,"yt":[15,20,30,50,100,150],"pts":[{"b":16,"v":34.95,"c":"var(--v)","l":"50% pruned","la":"l","dx":40},{"b":16,"v":25.24,"from":34.95,"c":"var(--v)","l":"50% + KD","la":"l","dx":40},{"b":9,"v":125.67,"c":"var(--q)","l":"2:4 pruned","la":"r"},{"b":9,"v":41.24,"from":125.67,"c":"var(--q)","l":"2:4 + KD","la":"r"},{"b":9,"v":44.78,"from":125.67,"c":"var(--k)","l":"2:4 + CE","la":"l","dx":-14}],"note":"SmolLM2-135M, 819,200 recovery tokens. 2:4: 125.67 → <b>41.24</b> with KD (53% of the log gap closed) and 44.78 with CE (49%). 50% unstructured: 34.95 → <b>25.24</b> with KD (40%), but it still reads 16 bits per weight on a GPU. Dense: 15.43."},"paper":{"dense":5.68,"ylo":5,"yhi":13,"yt":[5,6,7,8,10,12],"pts":[{"b":16,"v":7.26,"c":"var(--v)","l":"50% pruned","la":"l","dx":40},{"b":16,"v":6.84,"from":7.26,"c":"var(--v)","l":"50% + LoRA","la":"l","dx":40},{"b":16,"v":5.98,"c":"var(--v)","l":"50% + full FT","la":"r","dx":52},{"b":9,"v":11.53,"c":"var(--q)","l":"2:4 pruned","la":"r"},{"b":9,"v":8.24,"from":11.53,"c":"var(--q)","l":"2:4 + LoRA","la":"r"},{"b":9,"v":7.02,"c":"var(--k)","l":"2:4 + full FT","la":"l","dx":-14}],"note":"LLaMA-7B (Wanda paper, Table 6). 2:4: 11.53 → <b>8.24</b> with LoRA (1 GPU, 12 hours) and <b>7.02</b> with full fine-tuning (4 GPUs, 3 days), 1.24 times dense. 50%: 7.26 → 6.84 (LoRA) and 5.98 (full). Dense: 5.68."}}};
+
+/* ---------- Figure 1: Wanda vs magnitude on a 4 x 8 layer ---------- */
+(function(){
+ const svg=$("#pw-toy-svg");if(!svg)return;
+ const W=[[0.9,-0.2,0.5,0.15,-0.7,0.3,0.05,-0.6],[-0.3,0.8,-0.1,-0.25,0.4,-0.9,0.6,0.2],[0.6,0.1,-0.8,0.3,0.2,0.5,-0.4,0.7],[-0.5,0.4,0.3,-0.1,0.9,-0.2,0.7,-0.3]];
+ const BASE=[1.0,1.2,0.8,1,1.1,0.9,1.0,1.3],OUT=[1,4,8,16];
+ const si=$("#pw-toy-s"),info=$("#pw-toy-info");let meth="wanda",pat="u";
+ function masks(n){return W.map(r=>{const sc=r.map((w,j)=>Math.abs(w)*(meth==="wanda"?n[j]:1));const pr=new Set();
+  const lowest=(js,k)=>js.slice().sort((a,b)=>sc[a]-sc[b]||a-b).slice(0,k);
+  if(pat==="u")lowest([0,1,2,3,4,5,6,7],4).forEach(j=>pr.add(j));else{lowest([0,1,2,3],2).forEach(j=>pr.add(j));lowest([4,5,6,7],2).forEach(j=>pr.add(j));}
+  return r.map((w,j)=>!pr.has(j));});}
+ function draw(){
+  const s=OUT[+si.value];$("#pw-toy-sv").textContent=s+"×";
+  const n=BASE.slice();n[3]=s;const K=masks(n);
+  let tot=0,err=0,k3=0;W.forEach((r,i)=>r.forEach((w,j)=>{const e=(w*n[j])**2;tot+=e;if(!K[i][j])err+=e;}));K.forEach(r=>{if(r[3])k3++;});
+  svg.innerHTML="";const X0=120,CW=58,Y0=96,CH=40;
+  txt(svg,X0-10,40,"‖Xⱼ‖",{a:"end",fs:13,fill:"var(--ink)"});
+  const nm=Math.max(...n);
+  n.forEach((v,j)=>{const h=Math.max(2,58*v/nm);el("rect",{x:X0+j*CW+14,y:80-h,width:CW-28,height:h,rx:3,fill:"var(--k)",opacity:j===3?0.95:0.6},svg);txt(svg,X0+j*CW+CW/2,92,v.toFixed(1),{a:"middle",fs:11});});
+  if(pat==="24"){line(svg,X0+4*CW,Y0-4,X0+4*CW,Y0+4*CH+4,{c:"var(--ink2)",w:2,d:"5 4"});}
+  W.forEach((r,i)=>{txt(svg,X0-10,Y0+i*CH+CH/2+4,"row "+(i+1),{a:"end",fs:12});
+   r.forEach((w,j)=>{const x=X0+j*CW,y=Y0+i*CH,keep=K[i][j];
+    el("rect",{x:x+2,y:y+2,width:CW-4,height:CH-4,rx:4,fill:keep?"var(--q)":"var(--paper2)",opacity:keep?0.25+0.6*Math.min(1,Math.abs(w)):1,stroke:keep?"none":"var(--rule)"},svg);
+    const t=txt(svg,x+CW/2,y+CH/2+4,(w<0?"−":"")+Math.abs(w).toFixed(2),{a:"middle",fs:12.5,fill:keep?"var(--ink)":"var(--muted)",fw:keep?600:null});
+    if(!keep){line(svg,x+10,y+CH/2,x+CW-10,y+CH/2,{c:"var(--muted)",w:1.2});}
+   });});
+  txt(svg,X0+3*CW+CW/2,Y0+4*CH+22,"outlier feature",{a:"middle",fs:11.5,fill:"var(--k)",fw:600});
+  const rel=err/tot;
+  info.innerHTML=`<b>${meth==="wanda"?"Wanda":"Magnitude"}</b>, ${pat==="u"?"50% per row":"2:4"}, outlier ‖X<sub>4</sub>‖ = ${s.toFixed(1)}. Output error ≈ Σ<sub>pruned</sub> W²‖X‖² / Σ<sub>all</sub> W²‖X‖² = <b>${(100*rel).toFixed(1)}%</b>. Weights kept in the outlier column: <b>${k3} of 4</b>.`;
+  info.dataset.err=rel.toFixed(4);info.dataset.k3=String(k3);
+ }
+ seg("pw-toy-m",v=>{meth=v;draw();});seg("pw-toy-p",v=>{pat=v;draw();});si.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 2: real perplexity vs sparsity ---------- */
+(function(){
+ const svg=$("#pw-curve-svg");if(!svg)return;
+ const si=$("#pw-curve-s"),info=$("#pw-curve-info");
+ const S=[0,0.1,0.2,0.3,0.4,0.5,0.6,0.7];
+ const mag=S.map(s=>s===0?D.dense:D.sweep.magnitude[String(s)]),wan=S.map(s=>s===0?D.dense:D.sweep.wanda[String(s)]);
+ function draw(){
+  const k=+si.value;$("#pw-curve-sv").textContent=Math.round(100*S[k])+"%";
+  svg.innerHTML="";const X0=70,X1=610,Y0=18,Y1=230,lo=1,hi=5;
+  const xs=s=>X0+(X1-X0)*s/0.7,ys=v=>Y1-(Y1-Y0)*(Math.log10(Math.min(v,1e5))-lo)/(hi-lo);
+  line(svg,X0,Y1,X1,Y1);line(svg,X0,Y0,X0,Y1);
+  [10,100,1000,10000,100000].forEach(v=>{const y=ys(v);line(svg,X0,y,X1,y,{d:"2 4"});txt(svg,X0-6,y+4,v>=1000?(v/1000)+"k":String(v),{a:"end",fs:11});});
+  S.forEach(s=>txt(svg,xs(s),Y1+16,Math.round(100*s)+"%",{a:"middle",fs:11}));
+  txt(svg,(X0+X1)/2,Y1+34,"sparsity of the linear layers (unstructured)",{a:"middle",fs:12});
+  txt(svg,16,(Y0+Y1)/2,"WikiText-2 ppl (log)",{a:"middle",fs:12,fill:"var(--ink2)"}).setAttribute("transform",`rotate(-90 16 ${(Y0+Y1)/2})`);
+  line(svg,X0,ys(D.dense),X1,ys(D.dense),{c:"var(--muted)",d:"6 4",w:1.5});txt(svg,X1-4,ys(D.dense)-6,"dense "+f2(D.dense),{a:"end",fs:11});
+  path(svg,S.map((s,i)=>[xs(s),ys(mag[i])]),{c:"var(--k)",w:2.5});path(svg,S.map((s,i)=>[xs(s),ys(wan[i])]),{c:"var(--q)",w:2.5});
+  S.forEach((s,i)=>{el("circle",{cx:xs(s),cy:ys(mag[i]),r:i===k?6:3.5,fill:"var(--k)"},svg);el("circle",{cx:xs(s),cy:ys(wan[i]),r:i===k?6:3.5,fill:"var(--q)"},svg);});
+  [["4:8",-12],["2:4",12]].forEach(([p,dx])=>{[["magnitude","var(--k)"],["wanda","var(--q)"]].forEach(([m,c])=>{const v=D.sweep[m][p],x=xs(0.5)+dx,y=ys(v);
+   el("rect",{x:x-5,y:y-5,width:10,height:10,fill:"none",stroke:c,"stroke-width":2,transform:p==="4:8"?`rotate(45 ${x} ${y})`:null},svg);});});
+  line(svg,xs(S[k]),Y0,xs(S[k]),Y1,{c:"var(--ink2)",d:"3 3"});
+  const m=mag[k],w=wan[k];
+  let h=`Sparsity <b>${Math.round(100*S[k])}%</b>: magnitude ppl <b>${fq(m)}</b> (${f1(m/D.dense)}× dense), Wanda ppl <b>${fq(w)}</b> (${f1(w/D.dense)}× dense).`;
+  if(S[k]===0.5)h+=` At the same 50%, the N:M patterns: Wanda 4:8 <b>${fq(D.sweep.wanda["4:8"])}</b>, Wanda 2:4 <b>${fq(D.sweep.wanda["2:4"])}</b>; magnitude 4:8 ${fq(D.sweep.magnitude["4:8"])}, magnitude 2:4 ${fq(D.sweep.magnitude["2:4"])}.`;
+  info.innerHTML=h;info.dataset.w=w.toFixed(2);info.dataset.m=m.toFixed(2);
+ }
+ si.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: bytes and measured time ---------- */
+(function(){
+ const svg=$("#pw-mem-svg");if(!svg)return;const info=$("#pw-mem-info");
+ const FMT={fp16:["dense FP16",16],u50:["50% unstructured, dense storage",16],csr16:["50% CSR, 16-bit index",16],csr32:["50% CSR, 32-bit index",24],s24:["2:4 FP16 (values + 2-bit metadata)",9],i4:["dense INT4",4],s24i4:["2:4 INT4",3]};
+ const SH={smol:["SmolLM2-135M, all linear layers",106168320],llama:["LLaMA-7B, all linear layers",6476005376]};
+ let sh="smol",tok="1";
+ function draw(){
+  svg.innerHTML="";const N=SH[sh][1],X0=236,BW=250;const keys=Object.keys(FMT);
+  txt(svg,X0,16,"weight bytes read per forward pass (decode bound)",{fs:12,fill:"var(--ink)",fw:600});
+  keys.forEach((k,i)=>{const [lab,b]=FMT[k],y=26+i*26,mb=N*b/8/1e6;
+   txt(svg,X0-8,y+15,lab,{a:"end",fs:12,fill:"var(--ink)"});
+   el("rect",{x:X0,y,width:BW*b/24,height:18,rx:3,fill:k.startsWith("s24")?"var(--q)":k.startsWith("csr")?"var(--k)":"var(--v)",opacity:0.8},svg);
+   txt(svg,X0+BW*b/24+6,y+14,(mb>=1000?(mb/1000).toFixed(2)+" GB":mb.toFixed(0)+" MB")+" · "+b+" bit · ≤"+(16/b).toFixed(2)+"×",{fs:11.5});});
+  const bm=D.bench.filter(r=>r.key===sh&&String(r.tokens)===tok)[0];const yb=26+keys.length*26+26;
+  txt(svg,X0,yb,`measured CPU time: one ${bm.shape} matmul, ${tok} token${tok==="1"?"":"s"}`,{fs:12,fill:"var(--ink)",fw:600});
+  const mx=Math.max(bm.dense_ms,bm.csr50_ms,bm.csr24_ms);
+  [["dense",bm.dense_ms,"var(--v)"],["CSR, 50% random",bm.csr50_ms,"var(--k)"],["CSR, 2:4 mask",bm.csr24_ms,"var(--k)"]].forEach(([lab,v,c],i)=>{const y=yb+10+i*24;
+   txt(svg,X0-8,y+14,lab,{a:"end",fs:12,fill:"var(--ink)"});el("rect",{x:X0,y,width:Math.max(2,BW*v/mx),height:17,rx:3,fill:c,opacity:0.8},svg);
+   txt(svg,X0+BW*v/mx+6,y+13,(v<0.1?v.toFixed(4):v<10?v.toFixed(2):v.toFixed(0))+" ms"+(i?" ("+fp(v/bm.dense_ms)+"× slower)":""),{fs:11.5});});
+  info.innerHTML=`${SH[sh][0]}: ${N.toLocaleString("en-US")} weights. 2:4 in FP16 needs <b>${(N*9/8/1e6>=1000?(N*9/8/1e9).toFixed(2)+" GB":(N*9/8/1e6).toFixed(0)+" MB")}</b> instead of ${(N*2/1e6>=1000?(N*2/1e9).toFixed(2)+" GB":(N*2/1e6).toFixed(0)+" MB")}: at best 1.78× faster when decode is bound by weight reads. On our CPU, CSR at 50% is <b>${fp(bm.csr50_ms/bm.dense_ms)}× slower</b> than dense for ${tok} token${tok==="1"?"":"s"}.`;
+  info.dataset.ratio=(bm.csr50_ms/bm.dense_ms).toFixed(2);
+ }
+ seg("pw-mem-sh",v=>{sh=v;draw();});seg("pw-mem-t",v=>{tok=v;draw();});draw();
+})();
+
+/* ---------- Figure 4: real recovery runs ---------- */
+(function(){
+ const svg=$("#pw-rec-svg");if(!svg)return;const info=$("#pw-rec-info");
+ let run="24kd",ds="wiki";
+ function draw(){
+  svg.innerHTML="";const X0=70,X1=600,Y0=16,Y1=210;const runs=D.runs,dense=D.dense_sub[ds];
+  let hi=0;Object.values(runs).forEach(r=>r.log.forEach(e=>{hi=Math.max(hi,e[ds]);}));const lo=dense*0.9;hi*=1.08;
+  const lg=Math.log,xs=s=>X0+(X1-X0)*s/D.steps,ys=v=>Y1-(Y1-Y0)*(lg(v)-lg(lo))/(lg(hi)-lg(lo));
+  line(svg,X0,Y1,X1,Y1);line(svg,X0,Y0,X0,Y1);
+  const ticks=[];for(let v of [10,15,20,30,40,60,80,100,150,200,300])if(v>=lo&&v<=hi)ticks.push(v);
+  ticks.forEach(v=>{const y=ys(v);line(svg,X0,y,X1,y,{d:"2 4"});txt(svg,X0-6,y+4,String(v),{a:"end",fs:11});});
+  for(let s=0;s<=D.steps;s+=50)txt(svg,xs(s),Y1+16,String(s),{a:"middle",fs:11});
+  txt(svg,(X0+X1)/2,Y1+34,"recovery step (8 × 512 tokens each)",{a:"middle",fs:12});
+  line(svg,X0,ys(dense),X1,ys(dense),{c:"var(--muted)",d:"6 4",w:1.5});txt(svg,X1-4,ys(dense)-6,"dense teacher "+f2(dense),{a:"end",fs:11});
+  Object.keys(runs).forEach(k=>{const r=runs[k],on=k===run;path(svg,r.log.map(e=>[xs(e.step),ys(e[ds])]),{c:r.col,w:on?3:1.5,op:on?1:0.35,d:r.mode==="ce"?"7 4":null});
+   if(on)r.log.forEach(e=>el("circle",{cx:xs(e.step),cy:ys(e[ds]),r:4,fill:r.col},svg));});
+  const r=runs[run],a=r.log[0][ds],b=r.log[r.log.length-1][ds],gap=(lg(a)-lg(b))/(lg(a)-lg(dense));
+  info.innerHTML=`<b>${r.label}</b>, ${ds==="wiki"?"WikiText-2 (82k-token subset)":"held-out C4 (41k tokens)"}: ppl ${f2(a)} → <b>${f2(b)}</b> after ${D.steps} steps (dense ${f2(dense)}). Gap closed in log-ppl (122.9): <b>${Math.round(100*gap)}%</b>.`;
+  info.dataset.end=b.toFixed(2);info.dataset.gap=gap.toFixed(3);
+ }
+ seg("pw-rec-run",v=>{run=v;draw();});seg("pw-rec-ds",v=>{ds=v;draw();});draw();
+})();
+
+/* ---------- Figure 5: the trade-off report ---------- */
+(function(){
+ const svg=$("#pw-trade-svg");if(!svg)return;const info=$("#pw-trade-info");
+ let src="ours";
+ function draw(){
+  svg.innerHTML="";const T=D.trade[src];const X0=70,X1=600,Y0=16,Y1=210;
+  const xs=b=>X0+(X1-X0)*(16-b)/8,lo=Math.log(T.ylo),hi=Math.log(T.yhi),ys=v=>Y1-(Y1-Y0)*(Math.log(v)-lo)/(hi-lo);
+  line(svg,X0,Y1,X1,Y1);line(svg,X0,Y0,X0,Y1);
+  T.yt.forEach(v=>{const y=ys(v);line(svg,X0,y,X1,y,{d:"2 4"});txt(svg,X0-6,y+4,String(v),{a:"end",fs:11});});
+  [[16,"16 (dense FP16, also 50% unstructured)"],[9,"9 (2:4)"]].forEach(([b,l])=>txt(svg,xs(b),Y1+16,l,{a:b===16?"start":"middle",fs:11}));
+  txt(svg,(X0+X1)/2,Y1+34,"bits per linear-layer weight on the GPU (fewer = less to read per token)",{a:"middle",fs:12});
+  line(svg,X0,ys(T.dense),X1,ys(T.dense),{c:"var(--muted)",d:"6 4",w:1.5});txt(svg,X1-4,ys(T.dense)-6,"dense "+f2(T.dense),{a:"end",fs:11});
+  T.pts.forEach(p=>{const x=xs(p.b)+(p.dx||0),y=ys(p.v);
+   if(p.from){const y0=ys(p.from);line(svg,x,y0,x,y+6,{c:p.c,w:1.5,d:"3 3"});}
+   el("circle",{cx:x,cy:y,r:6,fill:p.c,stroke:"var(--paper)","stroke-width":1.5},svg);
+   txt(svg,x+(p.la==="l"?-10:10),y+4,p.l+" "+f2(p.v),{a:p.la==="l"?"end":"start",fs:11.5,fill:"var(--ink)"});});
+  info.innerHTML=T.note;info.dataset.src=src;
+ }
+ seg("pw-trade-src",v=>{src=v;draw();});draw();
+})();
+})();
+</script></body></html>

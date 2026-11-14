@@ -1,0 +1,545 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>The VLM inference path · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 196</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="the-vlm-inference-path">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="the-vlm-inference-path" data-session="the-vlm-inference-path" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">196</span><span>Track 7: Vision and VLMs · session 34 of 38</span></div><h1 class="chap-title">The VLM inference path</h1><p class="chap-sub">A VLM request does more work than a text request before the first word comes out: the image is decoded and resized on the CPU, run through a vision encoder, and turned into hundreds or thousands of extra prompt tokens that the language model must prefill and keep in its KV cache. This session follows one request through every stage, counts the cost of each with real model configs, and shows how encoder caching and prefix caching remove repeated work. It ends with a breakdown of where the time goes.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Sessions on the generation loop (78), the KV cache (80), memory management and prefix caching (134), anatomy of a VLM (177) and visual token efficiency (183)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The ten stages of a VLM request, from uploaded bytes to streamed text, and which ones run on the CPU and which on the GPU</li><li>Why image decode and resize can cost more than the GPU work for a small VLM, and how to move or shrink it (GPU decode, JPEG draft mode, client-side resize, overlap)</li><li>How to count vision-encoder FLOPs, why the encoder is about 5% of prefill in LLaVA-1.5 but about 30% in Qwen2.5-VL, and what window attention saves</li><li>Why image tokens make prefill long and compute-bound, and how to estimate time to first token from FLOPs</li><li>How much KV cache an image takes (288 MiB for LLaVA-1.5-7B, 147 MiB for a 1080p image in Qwen2.5-VL-7B) and what it does to decode</li><li>Encoder caching and multimodal prefix caching: hashing image bytes into block hashes, why the image should come before the question, and what each cache saves</li><li>A stage-by-stage time breakdown, and why TTFT and end-to-end latency have different bottlenecks</li></ul></div></header><style>
+.vp-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.vp-grid input[type=range]{width:100%}
+.vp-grid output{min-width:4.2em;text-align:right;font:500 14px var(--mono)}
+.vp-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.vp-leg span::before{content:"";display:inline-block;width:16px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px;background:var(--c);border:1px solid var(--b,transparent)}
+.vp-ctl{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;margin-bottom:8px}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Send a text question to a language model and the server does two things: prefill the prompt, then decode the answer token by token. Send the same question with a photo and the server does much more before the first word appears. It decodes the JPEG, resizes it, runs a vision encoder, maps the result into the language model’s space, and then prefills a prompt that is now hundreds or thousands of tokens longer.</p>
+<p>Each of these extra steps has a cost, and the costs land in different places. Some run on the CPU, some on the GPU. Some add to the <b>time to first token</b> (TTFT, the delay before the first output token), some fill GPU memory, and some slow every decode step. A team that profiles only the language model will miss half of the picture. For example, for a 7B LLaVA-style model, the GPU part of the prefill takes tens of milliseconds, while decoding and resizing a 12-megapixel phone photo on one CPU core can take longer than that. For a model with a bigger encoder and native resolution, such as Qwen2.5-VL, the vision encoder alone is about 30% of the prefill FLOPs.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “Walk me through what happens when a VLM serves a request with an image.”, “Our VLM has a high TTFT. Where do you look?”, “How much KV cache does one image take?”, “How does prefix caching work when the prompt contains an image?”. This session answers each with numbers.</aside>
+<p>In <a href="../vision/anatomy-of-a-vision-language-model.html">session 177</a> we built the model: encoder, connector, language model. In <a href="../vision/visual-token-efficiency.html">session 183</a> we counted visual tokens and learned to remove some. This session looks at the <b>serving path</b> of a request through that model, the way an inference engineer sees it. We follow one request stage by stage, count the cost of each stage using real model configs (LLaVA-1.5-7B and Qwen2.5-VL-7B), add the two caches that remove repeated work, and finish with a breakdown of where the time goes. The next session, <a href="../vision/quantizing-vlms.html">session 197</a>, then makes the remaining work cheaper.</p>
+
+<h2>The path of one request</h2>
+<p>Here is the full path, from the bytes the user uploads to the text that comes back. We give each stage a name, because a profile is only useful if you can say which stage a number belongs to.</p>
+<ol>
+<li><b>Receive.</b> The image arrives as a file upload, a URL to fetch, or a base64 string inside JSON. <b>Base64</b> is a way to write binary data as text; it makes the data 4/3 times larger.</li>
+<li><b>Decode.</b> The JPEG or PNG is decompressed into a grid of pixels: \(H \times W \times 3\) bytes (one byte per color channel).</li>
+<li><b>Resize and normalize.</b> The pixels are resized to what the encoder expects (a fixed 336 × 336 for LLaVA-1.5, a multiple of 28 pixels for Qwen2.5-VL), converted to floats, and normalized with a per-channel mean and standard deviation.</li>
+<li><b>Patchify.</b> The image is cut into square <b>patches</b> (14 × 14 pixels for both models), and each patch is flattened into a vector.</li>
+<li><b>Vision encoder.</b> A vision transformer (ViT) turns the patch vectors into feature vectors.</li>
+<li><b>Connector.</b> A small network maps the features into the language model’s embedding space. It may also merge neighbors to reduce the count (Qwen2.5-VL merges 2 × 2 patches into one token).</li>
+<li><b>Merge into the prompt.</b> The prompt has placeholder tokens where the image goes. Their embeddings are replaced by the image embeddings.</li>
+<li><b>Prefill.</b> The language model processes the whole prompt (text and image tokens) in one forward pass and writes keys and values for every token into the <b>KV cache</b>.</li>
+<li><b>Decode.</b> The model produces one token per step, each step reading all weights and the whole KV cache.</li>
+<li><b>Detokenize and stream.</b> Token ids are turned back into text and sent to the user.</li>
+</ol>
+<p>Stages 1 to 3 usually run on the CPU, in the server’s front-end process. Stages 4 to 9 run on the GPU (some processors, such as Qwen2.5-VL’s Hugging Face processor, already cut the patches on the CPU). Stage 10 is on the CPU again. Step through Figure 1 to see the tensor at every stage, for both models and three image sizes.</p>
+<figure class="fig wide" id="vp-path"><div class="fig-body">
+<div class="vp-ctl"><span class="seg" id="vp-path-model"><button type="button" data-v="llava" aria-pressed="true">LLaVA-1.5-7B</button><button type="button" data-v="qwen" aria-pressed="false">Qwen2.5-VL-7B</button></span>
+<span class="seg" id="vp-path-size"><button type="button" data-v="0" aria-pressed="false">640 × 480</button><button type="button" data-v="1" aria-pressed="true">1920 × 1080</button><button type="button" data-v="2" aria-pressed="false">4000 × 3000</button></span></div>
+<div class="controls"><button type="button" class="btn" id="vp-path-prev">Back</button><button type="button" class="btn primary" id="vp-path-play">Play</button><button type="button" class="btn" id="vp-path-next">Next</button><span id="vp-path-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="vp-path-svg" viewBox="0 0 800 190" role="img" aria-label="The ten stages of a VLM request, with the current stage highlighted"></svg></div>
+<div class="vp-leg"><span style="--c:var(--k-soft);--b:var(--k)">runs on the CPU</span><span style="--c:var(--q-soft);--b:var(--q)">runs on the GPU</span></div>
+<div class="readout" id="vp-path-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> One request through a VLM, stage by stage. The readout gives the tensor shape, its size in memory, and the work done at each stage, computed from the models’ published configs (a prompt with 50 text tokens).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Pick a model and an image size, then press Next. Watch three things. First, the pixel tensor after decode: a 4000 × 3000 photo is 36 MB of raw pixels, which the CPU must produce and then shrink. Second, the token count at the connector: LLaVA-1.5 always gives 576 tokens because it resizes every image to 336 × 336, while Qwen2.5-VL’s count grows with the image (2,691 tokens for 1920 × 1080). Third, the KV cache written at prefill: LLaVA-1.5 uses 0.5 MiB per token, Qwen2.5-VL only 56 KiB, because Qwen uses grouped-query attention with 4 key-value heads.</p></details></figure>
+
+<p>The general algorithm, as a serving engine runs it:</p>
+<div class="algo"><div class="algo-h">Algorithm 1: serve one VLM request</div><ol>
+<li><b>input:</b> request with text and image bytes \(r_1, \dots, r_k\)</li>
+<li><b>for</b> each image \(r_i\) <span class="c">// CPU, front-end process</span></li>
+<li>&nbsp;&nbsp;\(\text{key}_i \leftarrow \text{hash}(r_i)\) <span class="c">// used by both caches</span></li>
+<li>&nbsp;&nbsp;\(x_i \leftarrow \text{normalize}(\text{resize}(\text{decode}(r_i)))\) <span class="c">// skip if the processed pixels are cached</span></li>
+<li>tokens \(\leftarrow\) chat template with \(n_i\) placeholder tokens per image</li>
+<li>\(h \leftarrow\) longest cached prefix of tokens (with image keys) <span class="c">// prefix cache, Algorithm 2</span></li>
+<li><b>for</b> each image whose tokens are not all inside the first \(h\) <span class="c">// GPU</span></li>
+<li>&nbsp;&nbsp;\(E_i \leftarrow\) encoder cache[\(\text{key}_i\)] if present, else \(\text{connector}(\text{ViT}(\text{patchify}(x_i)))\)</li>
+<li>embeddings \(\leftarrow\) text embeddings with placeholders replaced by \(E_i\)</li>
+<li>KV, logits \(\leftarrow\) LLM prefill on positions \(h, \dots, n-1\) using the cached KV for \(0, \dots, h-1\)</li>
+<li><b>repeat</b> decode one token, append its KV, stream it <b>until</b> end token or length limit</li></ol></div>
+
+<aside class="note analogy side"><span class="nt">Analogy</span>A restaurant kitchen. Washing and cutting the vegetables (decode and resize) happens at a side counter. The big stove (the GPU) cooks. If one person preps all the vegetables slowly, the stove stands idle, however powerful it is. And if the same dish is ordered again, a smart kitchen keeps the prepped vegetables (the encoder cache) or even the half-cooked sauce (the prefix cache).</aside>
+
+<h2>Stage 1 to 3: preprocessing on the CPU or the GPU</h2>
+<p>The first cost is easy to forget because it is not on the GPU. Decoding a JPEG is real work: the CPU must undo the entropy coding, invert the discrete cosine transform for every 8 × 8 block, and convert colors. The output size is simple to compute:</p>
+<div class="eq">\[ B_{\text{pix}} = H \cdot W \cdot 3 \ \text{bytes}, \qquad B_{\text{base64}} = \tfrac{4}{3}\, B_{\text{file}} \tag{196.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(H, W\)</dt><dd>height and width of the decoded image in pixels</dd>
+<dt>\(B_{\text{pix}}\)</dt><dd>bytes of raw pixels after decode (8-bit RGB)</dd>
+<dt>\(B_{\text{file}}, B_{\text{base64}}\)</dt><dd>bytes of the compressed file, and of the same file written as base64 text</dd></dl>
+<p>A 12-megapixel phone photo (4000 × 3000) becomes \(4000 \times 3000 \times 3 = 36\) MB of pixels. LLaVA-1.5 then throws almost all of it away: 336 × 336 × 3 is only 0.34 MB. The resize itself is also work, because a good resize filter (bilinear or bicubic with antialiasing) reads every input pixel. In our own run on one laptop CPU core with Pillow, decoding plus resizing a synthetic 12-megapixel JPEG took about 0.1 to 0.25 seconds, depending on the image content. That is one machine and one image; measure your own with the snippet below. The point is the order of magnitude: it is in the same range as, or larger than, the whole GPU prefill of a 7B LLaVA model (about 18 ms in our estimate below).</p>
+<p>Why does this matter in a server? Because the front-end process is often a single Python process. If it decodes and resizes images one at a time, the GPU waits. Four fixes are used in practice:</p>
+<ul>
+<li><b>Resize on the client.</b> If the model will see 336 × 336 anyway, there is no reason to upload 12 MP. A phone app can resize before sending. This also cuts network time.</li>
+<li><b>Decode at reduced size.</b> JPEG can be decoded directly at 1/2, 1/4 or 1/8 of the size, by skipping high-frequency DCT coefficients. In Pillow this is <code>Image.draft()</code>. It is cheaper than a full decode followed by a resize.</li>
+<li><b>Decode on the GPU.</b> NVIDIA’s nvJPEG library decodes on the GPU; <code>torchvision.io.decode_jpeg(..., device="cuda")</code> and NVIDIA DALI use it. Then resize on the GPU too. The CPU only moves the compressed bytes. The cost is some GPU time and memory, taken from the model.</li>
+<li><b>Overlap.</b> Run preprocessing in a pool of worker processes, so the CPU prepares the next requests while the GPU runs the current batch. Most serving engines do this in a separate front-end process and also cache the processed result (vLLM keeps a processor cache for this [Likely]).</li>
+</ul>
+<figure class="fig" id="vp-overlap"><div class="fig-body">
+<div class="scroll-x"><svg viewBox="0 0 660 200" role="img" aria-label="Two timelines: serial preprocessing leaves the GPU idle; overlapped preprocessing keeps it busy">
+<g font-family="var(--sans)" font-size="13">
+<text x="10" y="22" font-weight="700" fill="var(--ink)">Serial: one process does everything</text>
+<text x="10" y="52" fill="var(--muted)">CPU</text><text x="10" y="82" fill="var(--muted)">GPU</text>
+<rect x="60" y="38" width="90" height="22" rx="4" fill="var(--k-soft)" stroke="var(--k)"/><text x="105" y="54" text-anchor="middle" fill="var(--ink)">prep A</text>
+<rect x="150" y="68" width="70" height="22" rx="4" fill="var(--q-soft)" stroke="var(--q)"/><text x="185" y="84" text-anchor="middle" fill="var(--ink)">run A</text>
+<rect x="220" y="38" width="90" height="22" rx="4" fill="var(--k-soft)" stroke="var(--k)"/><text x="265" y="54" text-anchor="middle" fill="var(--ink)">prep B</text>
+<rect x="310" y="68" width="70" height="22" rx="4" fill="var(--q-soft)" stroke="var(--q)"/><text x="345" y="84" text-anchor="middle" fill="var(--ink)">run B</text>
+<rect x="380" y="38" width="90" height="22" rx="4" fill="var(--k-soft)" stroke="var(--k)"/><text x="425" y="54" text-anchor="middle" fill="var(--ink)">prep C</text>
+<rect x="470" y="68" width="70" height="22" rx="4" fill="var(--q-soft)" stroke="var(--q)"/><text x="505" y="84" text-anchor="middle" fill="var(--ink)">run C</text>
+<text x="550" y="84" fill="var(--bad)" font-weight="700">GPU idle 56%</text>
+<text x="10" y="122" font-weight="700" fill="var(--ink)">Overlapped: worker pool prepares ahead</text>
+<text x="10" y="152" fill="var(--muted)">CPU</text><text x="10" y="182" fill="var(--muted)">GPU</text>
+<rect x="60" y="138" width="90" height="22" rx="4" fill="var(--k-soft)" stroke="var(--k)"/><text x="105" y="154" text-anchor="middle" fill="var(--ink)">prep A</text>
+<rect x="150" y="138" width="90" height="22" rx="4" fill="var(--k-soft)" stroke="var(--k)"/><text x="195" y="154" text-anchor="middle" fill="var(--ink)">prep B</text>
+<rect x="240" y="138" width="90" height="22" rx="4" fill="var(--k-soft)" stroke="var(--k)"/><text x="285" y="154" text-anchor="middle" fill="var(--ink)">prep C</text>
+<rect x="150" y="168" width="70" height="22" rx="4" fill="var(--q-soft)" stroke="var(--q)"/><text x="185" y="184" text-anchor="middle" fill="var(--ink)">run A</text>
+<rect x="240" y="168" width="70" height="22" rx="4" fill="var(--q-soft)" stroke="var(--q)"/><text x="275" y="184" text-anchor="middle" fill="var(--ink)">run B</text>
+<rect x="330" y="168" width="70" height="22" rx="4" fill="var(--q-soft)" stroke="var(--q)"/><text x="365" y="184" text-anchor="middle" fill="var(--ink)">run C</text>
+<text x="410" y="184" fill="var(--ok)" font-weight="700">done at 400 instead of 540</text>
+</g></svg></div>
+</div><figcaption><b>Figure 2.</b> A schematic timeline (not measured). With one process, the GPU waits while each image is prepared: here preparation takes 90 units and the GPU work 70, so the GPU is busy only 210 of 480 units after the start. With a worker pool, preparation of the next image overlaps the GPU work of the current one. With more CPU workers, the CPU line can be split across cores until the GPU is the bottleneck.</figcaption></figure>
+<p>The snippet below measures decode and resize on your machine. Run it on your real images (photos, scans, screenshots), because the cost depends on the content and on the JPEG quality.</p>
+<pre class="code"><span class="kw2">import</span> io, time
+<span class="kw2">from</span> PIL <span class="kw2">import</span> Image
+src = Image.merge(<span class="st">"RGB"</span>, [Image.effect_mandelbrot((4000, 3000), (-2, -1.2, 1, 1.2), q)
+                         <span class="kw2">for</span> q <span class="kw2">in</span> (40, 80, 160)])                  <span class="cm"># a 12-megapixel test image</span>
+buf = io.BytesIO(); src.save(buf, <span class="st">"JPEG"</span>, quality=90); raw = buf.getvalue()
+<span class="kw2">def</span> once():
+    t0 = time.perf_counter(); im = Image.open(io.BytesIO(raw)); im.load()     <span class="cm"># decode</span>
+    t1 = time.perf_counter(); im.resize((336, 336), Image.BICUBIC)            <span class="cm"># resize</span>
+    t2 = time.perf_counter(); <span class="kw2">return</span> t1 - t0, t2 - t1
+once()                                                               <span class="cm"># warm up</span>
+d, r = min(once() <span class="kw2">for</span> _ <span class="kw2">in</span> range(5))
+print(f<span class="st">"file {len(raw)/1e6:.1f} MB, decode {1e3*d:.0f} ms, resize {1e3*r:.0f} ms, "</span>
+      f<span class="st">"{12/(d + r):.0f} megapixels per second on one core"</span>)
+im = Image.open(io.BytesIO(raw)); im.draft(<span class="st">"RGB"</span>, (1000, 750))       <span class="cm"># JPEG DCT scaling: decode at 1/4 size</span>
+t0 = time.perf_counter(); im.load(); print(<span class="st">"draft decode"</span>, im.size, f<span class="st">"{1e3*(time.perf_counter()-t0):.0f} ms"</span>)</pre>
+<aside class="note watch side"><span class="nt">Watch out</span>Preprocessing must match training exactly: the same resize filter, the same mean and standard deviation, the same padding or cropping rule, and RGB (not BGR) channel order. A server that resizes with a different filter than the training pipeline can lose accuracy without any error message. When you move decode and resize to the GPU, test that outputs match the reference processor.</aside>
+
+<h2>Stage 4 to 6: the vision encoder and connector</h2>
+<p>The vision encoder is a ViT. Its cost follows the same rule as any transformer: about 2 FLOPs per parameter per token for the matrix multiplications, plus an attention term that grows with the square of the sequence length. The difference from the language model is what a “token” is: here it is a patch.</p>
+<h3>How many patches, how many tokens</h3>
+<p>LLaVA-1.5 uses CLIP ViT-L/14 at 336 pixels: \(336/14 = 24\), so \(24 \times 24 = 576\) patches, plus one class token. Every image gives 576 language-model tokens, whatever its original size. Qwen2.5-VL keeps the original aspect ratio. Its processor rounds the height and width to multiples of 28 (and shrinks very large images to at most 12,845,056 pixels), cuts 14 × 14 patches, and the connector merges each 2 × 2 group of patches into one token [Certain, from the model’s processor config]:</p>
+<div class="eq">\[ N_{\text{patch}} = \frac{H'}{14} \cdot \frac{W'}{14}, \qquad N_{\text{tok}} = \frac{N_{\text{patch}}}{4} = \frac{H' \cdot W'}{28^2} \tag{196.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(H', W'\)</dt><dd>the resized height and width, each a multiple of 28 (for example 1080 × 1920 becomes 1092 × 1932)</dd>
+<dt>\(N_{\text{patch}}\)</dt><dd>sequence length inside the vision encoder</dd>
+<dt>\(N_{\text{tok}}\)</dt><dd>number of image tokens the language model sees</dd></dl>
+<p>For a 1920 × 1080 image: \(N_{\text{patch}} = 78 \times 138 = 10{,}764\) and \(N_{\text{tok}} = 2{,}691\). Note the factor 4: the Qwen encoder works on a sequence 4 times longer than the one the language model sees.</p>
+<h3>Encoder FLOPs</h3>
+<p>For a ViT with \(L_v\) layers, width \(d_v\) and \(P_{\text{enc}}\) parameters, the forward cost is</p>
+<div class="eq">\[ F_{\text{enc}} \approx 2\, P_{\text{enc}}\, N_{\text{patch}} \;+\; 4\, d_v\, N_{\text{patch}} \Big( L_{\text{full}}\, N_{\text{patch}} + L_{\text{win}}\, w \Big) \tag{196.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2 P_{\text{enc}} N_{\text{patch}}\)</dt><dd>the matrix multiplications: 2 FLOPs (a multiply and an add) per weight per patch</dd>
+<dt>\(4 d_v N \cdot N\)</dt><dd>attention: \(QK^\top\) and the weighted sum of values, each \(2 d_v N^2\) FLOPs per layer when every patch sees every patch</dd>
+<dt>\(L_{\text{full}}, L_{\text{win}}\)</dt><dd>number of layers with full attention, and with window attention</dd>
+<dt>\(w\)</dt><dd>patches per window; Qwen2.5-VL uses 112 × 112 pixel windows, so \(w = 8 \times 8 = 64\)</dd></dl>
+<p>LLaVA-1.5’s encoder has 24 full-attention layers, width 1024, and about 0.30 B parameters in its layers; for 577 patches that is about 0.38 TFLOPs. Qwen2.5-VL’s encoder has 32 layers, width 1280 and about 0.68 B parameters; only 4 of its layers (numbers 7, 15, 23 and 31) use full attention, the other 28 use windows [Certain, from config.json]. Figure 3 shows what that choice saves.</p>
+<p>A quick rule tells you how big the encoder is relative to the language model. Ignoring attention, the ratio of encoder FLOPs to LLM prefill FLOPs for the image tokens is</p>
+<div class="eq">\[ \rho \approx \frac{s \cdot P_{\text{enc}}}{P_{\text{LLM}}} \tag{196.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(s\)</dt><dd>encoder patches per language-model token: 1 for LLaVA-1.5, 4 for Qwen2.5-VL (2 × 2 merge)</dd>
+<dt>\(P_{\text{enc}}, P_{\text{LLM}}\)</dt><dd>parameters of the encoder and of the language model (without the embedding table)</dd></dl>
+<p>LLaVA-1.5-7B: \(\rho = 1 \times 0.302 / 6.48 \approx 0.047\). The encoder is a rounding error next to the 7B language model. Qwen2.5-VL-7B: \(\rho = 4 \times 0.676 / 6.53 \approx 0.41\). The encoder is now a big part of the cost, and it grows faster than linearly with image size because of the full-attention layers.</p>
+<figure class="fig" id="vp-enc"><div class="fig-body">
+<div class="vp-ctl"><span class="seg" id="vp-enc-ar"><button type="button" data-v="1" aria-pressed="false">1 : 1</button><button type="button" data-v="0.75" aria-pressed="false">4 : 3</button><button type="button" data-v="0.5625" aria-pressed="true">16 : 9</button></span></div>
+<div class="vp-grid"><label for="vp-enc-w">Image width (pixels)</label><input type="range" id="vp-enc-w" min="224" max="4096" step="8" value="1920"><output id="vp-enc-wv"></output></div>
+<svg id="vp-enc-svg" viewBox="0 0 640 280" role="img" aria-label="Encoder FLOPs with window and full attention, and LLM prefill FLOPs, against image width"></svg>
+<div class="vp-leg"><span style="--c:var(--v)">encoder, window attention (Qwen2.5-VL)</span><span style="--c:var(--k)">same encoder, full attention in all 32 layers</span><span style="--c:var(--q)">LLM prefill (image tokens + 50 text tokens)</span></div>
+<div class="readout" id="vp-enc-info"></div>
+</div><figcaption><b>Figure 3.</b> Forward FLOPs of the Qwen2.5-VL-7B vision encoder (formula 196.3) and of the language-model prefill (formula 196.5), computed from the published config, as the image grows. The image is resized with the model’s own rule (multiples of 28, at most 12.8 MP).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At small sizes all three curves grow roughly linearly with the number of pixels, and the window encoder is about 25 to 30% of the total. As the image grows, the full-attention curve bends upward fast: at 4000 × 3000 it would cost more than the language model itself. Window attention keeps most layers linear; only the 4 full layers still grow with the square. The readout converts FLOPs to milliseconds assuming an H100 at 50% of its dense BF16 peak, which is an assumption, not a measurement.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: one 1920 × 1080 image in Qwen2.5-VL-7B</div>
+<p>Resize: 1080 → 1092 and 1920 → 1932 (nearest multiples of 28). Patches: \(78 \times 138 = 10{,}764\). Tokens: 2,691.</p>
+<p>Encoder (formula 196.3, with window attention): about 16.3 TFLOPs, of which attention is about 15%. With full attention in all 32 layers it would be about 32.8 TFLOPs, and attention would be 58% of it.</p>
+<p>Language-model prefill of 2,691 + 50 tokens (formula 196.5 below): about 38.8 TFLOPs. So the encoder is 30% of the GPU work before the first token.</p>
+<p>Time, if we assume an H100 SXM (989 TFLOP/s dense BF16 [Certain, NVIDIA spec]) running at 50% of peak: \((16.3 + 38.8) / 494.5 \approx 0.111\) s, about 111 ms. Of that, 33 ms is the encoder.</p></div>
+
+<h2>Stage 8: the long prefill of image tokens</h2>
+<p>Now the image tokens enter the language model. For the language model they are just prompt tokens: each one goes through every layer, and each one gets keys and values in the KV cache. The prefill cost for a prompt of \(n\) tokens is the familiar formula from <a href="../inference/the-generation-loop-prefill-and-decode.html">session 78</a>:</p>
+<div class="eq">\[ F_{\text{pre}}(n) \approx 2\, P_{\text{LLM}}\, n + 4\, L\, d\, n^2, \qquad n = N_{\text{img}} + N_{\text{text}} \tag{196.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P_{\text{LLM}}\)</dt><dd>parameters of the language model used per token (all layers, without the embedding table)</dd>
+<dt>\(L, d\)</dt><dd>number of layers and model width of the language model</dd>
+<dt>\(N_{\text{img}}, N_{\text{text}}\)</dt><dd>image tokens (sum over all images) and text tokens in the prompt</dd></dl>
+<p>We count the full \(n \times n\) attention; a causal kernel skips about half of it, so this is a slight overestimate. The key fact: with an image, \(n\) is dominated by \(N_{\text{img}}\). A 50-token question to LLaVA-1.5-7B costs about 0.65 TFLOPs of prefill. Add one image and the prompt is 626 tokens and about 8.3 TFLOPs, 12.8 times more. With Qwen2.5-VL and a high-resolution photo, the image can be 15,301 tokens (a 4000 × 3000 photo after resizing to 4004 × 2996).</p>
+<p>Prefill with many tokens is <b>compute-bound</b>: the GPU does many FLOPs per byte of weights it reads, so its speed is set by its arithmetic throughput, not its memory bandwidth (see <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>). So a FLOP count gives a usable estimate of TTFT:</p>
+<div class="eq">\[ \text{TTFT} \approx t_{\text{prep}} + \frac{F_{\text{enc}} + F_{\text{pre}}(n)}{u \cdot \Pi_{\text{peak}}} + t_{\text{queue}} \tag{196.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t_{\text{prep}}\)</dt><dd>CPU time for receive, decode and resize (stages 1 to 3), if it is not overlapped</dd>
+<dt>\(u\)</dt><dd>the fraction of peak the kernels really reach (model FLOPs utilization); 0.4 to 0.6 is a common range for large prefills [Likely], but you must measure it</dd>
+<dt>\(\Pi_{\text{peak}}\)</dt><dd>the GPU’s peak FLOP rate, for example 989 TFLOP/s dense BF16 on an H100 SXM</dd>
+<dt>\(t_{\text{queue}}\)</dt><dd>time waiting behind other requests in the scheduler</dd></dl>
+<div class="worked"><div class="wt">Worked example: LLaVA-1.5-7B, one image, 50 text tokens</div>
+<p>Encoder plus projector: \(0.381 + 0.024 = 0.405\) TFLOPs. Prefill of 626 tokens with \(P_{\text{LLM}} = 6.48\) B, \(L = 32\), \(d = 4096\): \(F_{\text{pre}} \approx 8.31\) TFLOPs. Total GPU work: 8.72 TFLOPs.</p>
+<p>At 50% of an H100’s peak: \(8.72 / 494.5 \approx 0.0176\) s, about 18 ms. The encoder’s share is under 1 ms. Without the image, the 50-token prefill would take about 1.3 ms.</p>
+<p>Compare with the CPU: if decode and resize run at 100 megapixels per second on one core (in the range of our laptop run), a 12 MP photo costs 120 ms of preprocessing, almost 7 times the GPU work. For this model, the image upload and the CPU are the first places to look when TTFT is high.</p></div>
+<p>Long image prefills also hurt <b>other</b> users. A 15,000-token prefill keeps the GPU busy for a long time, and the decode steps of other requests in the same batch wait for it. Chunked prefill (from <a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">session 135</a>) splits a long prompt into pieces and mixes them with decode steps. For a VLM there is one extra rule: the encoder runs on a whole image at once, so the engine must run the encoder for an image before the first chunk that contains its tokens, and keep the output until the last such chunk has been processed. vLLM schedules this with an encoder compute budget and keeps the outputs in an encoder cache on the GPU [Likely]. Some systems go further and put the encoder on separate GPUs, next to separate prefill and decode GPUs (EPD disaggregation; <a href="../inference/distributed-serving-and-prefill-decode-disaggregation.html">session 137</a>).</p>
+
+<h2>Image tokens in the KV cache</h2>
+<p>Every prompt token, image or text, leaves keys and values in every layer. The bytes per token are</p>
+<div class="eq">\[ b_{\text{KV}} = 2 \cdot L \cdot n_{\text{kv}} \cdot d_h \cdot b, \qquad M_{\text{img}} = N_{\text{tok}} \cdot b_{\text{KV}} \tag{196.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2\)</dt><dd>one key and one value vector</dd>
+<dt>\(n_{\text{kv}}, d_h\)</dt><dd>number of key-value heads and the size of each head</dd>
+<dt>\(b\)</dt><dd>bytes per number: 2 for FP16 or BF16</dd>
+<dt>\(M_{\text{img}}\)</dt><dd>KV-cache memory taken by one image</dd></dl>
+<p>LLaVA-1.5-7B (32 layers, 32 KV heads of size 128): \(b_{\text{KV}} = 2 \cdot 32 \cdot 32 \cdot 128 \cdot 2 = 524{,}288\) bytes, exactly 0.5 MiB per token, so <b>288 MiB per image</b>. Qwen2.5-VL-7B (28 layers, 4 KV heads of size 128, grouped-query attention): 57,344 bytes, 56 KiB per token. A 1920 × 1080 image (2,691 tokens) takes 147 MiB, about half of LLaVA’s image, although it has 4.7 times more tokens. Eight such images in one prompt take 1.15 GiB. This is the memory that limits how many requests fit in a batch.</p>
+<p>The KV cache also slows decode. Each decode step reads all the weights once and the KV cache of every request in the batch. Decode is <b>memory-bound</b>, so its time is bytes divided by bandwidth:</p>
+<div class="eq">\[ t_{\text{step}} \approx \frac{M_W + b_{\text{KV}} \sum_{j=1}^{B} n_j}{\eta \cdot \text{BW}} \tag{196.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(M_W\)</dt><dd>bytes of the language-model weights read per step (13.2 GB for LLaVA-1.5-7B in BF16)</dd>
+<dt>\(B, n_j\)</dt><dd>batch size, and the current context length of request \(j\) (its image and text tokens so far)</dd>
+<dt>\(\eta \cdot \text{BW}\)</dt><dd>achieved memory bandwidth: a fraction \(\eta\) of the peak (3.35 TB/s on an H100 SXM [Certain, NVIDIA spec])</dd></dl>
+<p>At batch size 1, one LLaVA image adds 313 MiB (626 tokens × 0.5 MiB) to the 13.2 GB of weights per step: about 2.4% slower decode. At batch size 32, the KV caches add 10.5 GB per step, almost as much as the weights. So image tokens hurt decode mainly at large batch sizes, and much less for GQA models like Qwen2.5-VL. The visual-token reduction methods from <a href="../vision/visual-token-efficiency.html">session 183</a> help here too, and so does KV-cache quantization.</p>
+
+<h2>Caching: do not do the same work twice</h2>
+<p>Real traffic repeats images. A user asks three questions about the same chart in a chat: the client sends the full history, image included, every turn. A shop has one product photo that thousands of users ask about. A document pipeline asks ten extraction questions about each page. Without caching, every one of these requests decodes the image, runs the encoder, and prefills all the image tokens again. Two caches remove this.</p>
+<h3>Encoder cache</h3>
+<p>The <b>encoder cache</b> maps a hash of the image to the encoder-plus-connector output \(E\) (the image embeddings, \(N_{\text{tok}} \times d\) numbers). The key must be the image <b>content</b>, for example SHA-256 of the file bytes or of the decoded pixels, not the URL or the file name: two users can upload the same file under different names, and one URL can change its content. A hit skips decode, resize and the encoder. It does <b>not</b> skip the language-model prefill.</p>
+<h3>Prefix cache with images</h3>
+<p>The <b>prefix cache</b> (<a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>) keeps the KV blocks of earlier prompts. A new request that starts with the same tokens reuses them and prefills only the rest. The KV cache is stored in blocks of \(B\) tokens (16 by default in vLLM), and each full block gets a hash that depends on everything before it:</p>
+<div class="eq">\[ h_j = \text{hash}\big(h_{j-1},\ t_{jB}, \dots, t_{jB+B-1},\ \text{extra}_j\big) \tag{196.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(h_j\)</dt><dd>the hash of block \(j\); because it includes \(h_{j-1}\), equal hashes mean the whole prefix up to that block is equal</dd>
+<dt>\(t_i\)</dt><dd>the token ids in the block</dd>
+<dt>\(\text{extra}_j\)</dt><dd>extra keys: here, the content hash of every image whose placeholder tokens appear in the block</dd></dl>
+<p>The extra key is essential for VLMs. The placeholder token ids are the <b>same</b> for every image (LLaVA uses token 32000 repeated 576 times). Without the image hash, two different photos would produce the same block hashes, and the second user would get answers about the first user’s photo. vLLM puts the image hash into the hash of every block that holds that image’s tokens [Certain, vLLM design docs]. SGLang’s radix tree uses image hashes in the same role [Likely].</p>
+<p>The number of tokens a request must prefill is then</p>
+<div class="eq">\[ n_{\text{new}} = n - h, \qquad h = B \left\lfloor \frac{\min(m,\ n - 1)}{B} \right\rfloor \tag{196.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(m\)</dt><dd>the number of leading tokens that match a cached prompt (same ids and same images)</dd>
+<dt>\(h\)</dt><dd>the cached prefix length: only full blocks count, and at least the last token is always computed (it produces the first output logits)</dd></dl>
+<div class="algo"><div class="algo-h">Algorithm 2: prefix lookup with image hashes, plus the encoder cache</div><ol>
+<li><b>input:</b> token ids \(t_0, \dots, t_{n-1}\), image keys with their token positions, block size \(B\)</li>
+<li>\(h_{-1} \leftarrow\) empty; \(\; h \leftarrow 0\)</li>
+<li><b>for</b> \(j = 0, 1, \dots\) while block \(j\) is full</li>
+<li>&nbsp;&nbsp;extra \(\leftarrow\) keys of images with any token in block \(j\)</li>
+<li>&nbsp;&nbsp;\(h_j \leftarrow \text{hash}(h_{j-1}, t_{jB..jB+B-1}, \text{extra})\) <span class="c">// formula (196.9)</span></li>
+<li>&nbsp;&nbsp;<b>if</b> \(h_j\) is in the block table <b>then</b> \(h \leftarrow (j+1)B\) <b>else break</b></li>
+<li>\(h \leftarrow \min(h, B\lfloor (n-1)/B \rfloor)\) <span class="c">// always compute the last token</span></li>
+<li><b>for</b> each image with a token at position \(\ge h\)</li>
+<li>&nbsp;&nbsp;\(E \leftarrow\) encoder cache[key] if present, else run the encoder and store it</li>
+<li>prefill positions \(h..n-1\); store the hashes of the new full blocks</li></ol></div>
+<p>Order matters. The prefix cache only helps if the shared part comes <b>first</b>. Put the image before the question (system prompt, image, question) and a second question about the same image hits the cache for the system prompt and all image tokens. Put the question first (system prompt, question, image) and the prefix differs right after the system prompt: the image tokens must be prefilled again, and only the encoder cache can help. Figure 4 lets you try both.</p>
+<figure class="fig wide" id="vp-cache"><div class="fig-body">
+<div class="vp-ctl"><label class="sl"><input type="checkbox" id="vp-cache-enc" checked> Encoder cache</label><label class="sl"><input type="checkbox" id="vp-cache-pre" checked> Prefix cache</label>
+<span class="seg" id="vp-cache-ord"><button type="button" data-v="img" aria-pressed="true">Image before question</button><button type="button" data-v="q" aria-pressed="false">Question before image</button></span></div>
+<div class="controls"><button type="button" class="btn" id="vp-cache-prev">Back</button><button type="button" class="btn primary" id="vp-cache-play">Play</button><button type="button" class="btn" id="vp-cache-next">Next</button><span id="vp-cache-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="vp-cache-svg" viewBox="0 0 800 250" role="img" aria-label="Prompt tokens of five requests, coloured by whether they are served from the prefix cache or recomputed"></svg></div>
+<div class="vp-leg"><span style="--c:var(--ok-soft);--b:var(--ok)">from prefix cache</span><span style="--c:var(--k-soft);--b:var(--k)">prefilled again</span><span style="--c:var(--q);--b:var(--q)">image tokens (dark band)</span></div>
+<div class="readout" id="vp-cache-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Five requests to LLaVA-1.5-7B: a three-turn chat about one photo, then a new user with the same photo and a new question, then a new user with a different photo. System prompt 40 tokens, image 576, each question 30, each answer 60, block size 16. FLOPs from formulas (196.3) and (196.5).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Each row is one request’s prompt, drawn to scale. Green parts come from the prefix cache, orange parts are prefilled. The dark band marks the 576 image tokens. Step through the five requests with both caches on, then turn the prefix cache off: every request prefills everything. Turn only the encoder cache on: the encoder runs twice instead of five times, but the saving is small for LLaVA, because its encoder is only about 5% of the work. Then switch to “Question before image” and look at request 4: the image tokens are recomputed. Note also that only 32 of the 40 system-prompt tokens are cached in request 5: only full blocks of 16 count.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: the three-turn chat of Figure 4</div>
+<p>Prompt lengths: turn 1 is \(40 + 576 + 30 = 646\) tokens, turn 2 adds the first answer and a new question (736), turn 3 adds another 90 (826). Without caches the engine prefills \(646 + 736 + 826 = 2{,}208\) tokens and runs the encoder 3 times.</p>
+<p>With the prefix cache, turn 2 finds the previous prompt and answer (706 tokens) in cache; full blocks give \(h = 16 \lfloor 706/16 \rfloor = 704\), so it prefills only 32 tokens. Turn 3: \(h = 16 \lfloor 796/16 \rfloor = 784\), so 42 tokens. Total: \(646 + 32 + 42 = 720\) tokens, and the encoder runs once (later turns have all image tokens inside the cached prefix).</p>
+<p>In FLOPs, the three turns cost 30.7 TFLOPs without caches and 10.0 TFLOPs with the prefix cache. The encoder cache alone saves only \(2 \times 0.405 = 0.81\) TFLOPs here. For Qwen2.5-VL with a high-resolution image, where the encoder is 30% of the work, the encoder cache matters much more.</p></div>
+<aside class="note watch side"><span class="nt">Watch out</span>Prefix-cache hits depend on <b>exact</b> token equality. A chat template that inserts the current date in the system prompt, a client that re-encodes the JPEG on every turn (different bytes, so a different hash), or a server that resizes slightly differently each time will all silently turn hits into misses. Log the cache hit rate per request.</aside>
+
+<h2>Where the time goes: a breakdown</h2>
+<p>We now have a formula for every stage. End-to-end latency for one request is</p>
+<div class="eq">\[ T_{\text{e2e}} = \underbrace{t_{\text{prep}} + t_{\text{enc}} + t_{\text{pre}}}_{\text{TTFT (no queue)}} + \sum_{k=1}^{N_{\text{out}}-1} t_{\text{step}}(n + k) \tag{196.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t_{\text{enc}}, t_{\text{pre}}\)</dt><dd>encoder and prefill time: FLOPs divided by \(u \cdot \Pi_{\text{peak}}\)</dd>
+<dt>\(N_{\text{out}}\)</dt><dd>number of output tokens; the first one comes out of the prefill, the other \(N_{\text{out}} - 1\) need a decode step each</dd>
+<dt>\(t_{\text{step}}(\cdot)\)</dt><dd>decode step time at the current context length, formula (196.8)</dd></dl>
+<p>Figure 5 puts it all together for batch size 1 on an H100. The answer to “where does the time go?” depends on what you measure. For TTFT, the image dominates: preprocessing for small encoders and big photos, encoder plus prefill for native-resolution models. For end-to-end latency with a long answer, decode dominates, because each of hundreds of steps reads 13 to 14 GB of weights. A short answer (a yes/no question, a label, a bounding box) makes the image stages matter much more.</p>
+<figure class="fig wide" id="vp-time"><div class="fig-body">
+<div class="vp-ctl"><span class="seg" id="vp-time-model"><button type="button" data-v="llava" aria-pressed="true">LLaVA-1.5-7B</button><button type="button" data-v="qwen" aria-pressed="false">Qwen2.5-VL-7B</button></span>
+<span class="seg" id="vp-time-size"><button type="button" data-v="0" aria-pressed="false">640 × 480</button><button type="button" data-v="1" aria-pressed="true">1920 × 1080</button><button type="button" data-v="2" aria-pressed="false">4000 × 3000</button></span></div>
+<div class="vp-grid">
+<label for="vp-time-n">Images in the prompt</label><input type="range" id="vp-time-n" min="1" max="8" step="1" value="1"><output id="vp-time-nv"></output>
+<label for="vp-time-o">Output tokens</label><input type="range" id="vp-time-o" min="1" max="1000" step="1" value="100"><output id="vp-time-ov"></output>
+<label for="vp-time-c">CPU decode + resize (MP/s, assumed)</label><input type="range" id="vp-time-c" min="20" max="400" step="10" value="100"><output id="vp-time-cv"></output>
+<label for="vp-time-u">Compute efficiency u</label><input type="range" id="vp-time-u" min="0.2" max="0.8" step="0.05" value="0.5"><output id="vp-time-uv"></output>
+<label for="vp-time-e">Bandwidth efficiency η</label><input type="range" id="vp-time-e" min="0.5" max="0.95" step="0.05" value="0.8"><output id="vp-time-ev"></output></div>
+<div class="scroll-x"><svg id="vp-time-svg" viewBox="0 0 760 170" role="img" aria-label="Stacked bars of preprocessing, encoder, prefill and decode time"></svg></div>
+<div class="vp-leg"><span style="--c:var(--k)">CPU preprocessing</span><span style="--c:var(--v)">vision encoder + connector</span><span style="--c:var(--q)">LLM prefill</span><span style="--c:var(--muted)">decode</span></div>
+<div class="readout" id="vp-time-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> An estimated time breakdown for one request at batch size 1 on an H100 SXM (989 TFLOP/s, 3.35 TB/s), using formulas (196.3), (196.5), (196.8) and (196.11) with 50 text tokens. The efficiencies and the CPU rate are assumptions you set; the model shapes come from the published configs. This is a planning model, not a benchmark.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>The top bar is TTFT, the bottom bar is the whole request, both on their own time scale. Start with LLaVA-1.5 and a 4000 × 3000 photo: preprocessing is most of TTFT, the encoder is a thin sliver. Switch to Qwen2.5-VL with the same photo: now the encoder and prefill take about 0.9 s and preprocessing is a smaller share. Set output tokens to 1: the end-to-end bar becomes almost all image work. Set it to 1000: decode takes over. Move the CPU rate to see how much a GPU decoder or client-side resizing could save.</p></details></figure>
+<p>How to get these numbers for your own system: put timers (or profiler ranges, see <a href="../inference/runtime-profiling-where-the-time-goes.html">session 123</a>) around each stage, synchronize the GPU before reading a timer, and report TTFT and time per output token separately, with their distributions, not only the mean (<a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>). Compare the measured numbers with the estimates above. A large gap tells you where to look: a slow stage that the model says should be fast is usually a bug or a missing overlap.</p>
+
+<h2>Code: a tiny VLM server with both caches</h2>
+<p>The code below builds a toy VLM (a small ViT encoder with an MLP connector, and a one-layer language model with a KV cache) and serves a three-turn chat. It implements the encoder cache keyed by a SHA-256 of the uploaded bytes, and the block-hash prefix cache of formula (196.9) with the image hash as an extra key. It counts encoder runs and prefilled tokens, checks that the cached path gives the same logits as the uncached path, and checks that a different image with the same placeholder tokens does not hit the image blocks. It runs on a CPU in a few seconds.</p>
+<pre class="code"><span class="kw2">import</span> hashlib, torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+D, P, S, BLK = 64, 8, 32, 4          <span class="cm"># model width, patch size, encoder input side, KV block size</span>
+IMG = 1000                            <span class="cm"># placeholder token id for one image token</span>
+
+<span class="kw2">def</span> decode(raw, H=480, W=640):        <span class="cm"># stands in for JPEG decode: file bytes -> (3, H, W) uint8</span>
+    <span class="kw2">return</span> torch.frombuffer(bytearray(raw), dtype=torch.uint8).view(3, H, W)
+
+<span class="kw2">def</span> preprocess(raw):
+    x = decode(raw).float().unsqueeze(0) / 255.0
+    x = F.interpolate(x, size=(S, S), mode=<span class="st">"bilinear"</span>, antialias=True, align_corners=False)
+    mean = torch.tensor([0.481, 0.458, 0.408]).view(1, 3, 1, 1)
+    std = torch.tensor([0.269, 0.261, 0.276]).view(1, 3, 1, 1)
+    <span class="kw2">return</span> (x - mean) / std           <span class="cm"># (1, 3, S, S)</span>
+
+<span class="kw2">class</span> Encoder(nn.Module):             <span class="cm"># tiny ViT + MLP connector</span>
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.patch = nn.Linear(3 * P * P, D)
+        s.pos = nn.Parameter(torch.randn((S // P) ** 2, D) * 0.02)
+        s.blocks = nn.TransformerEncoder(nn.TransformerEncoderLayer(D, 4, 4 * D, batch_first=True, dropout=0.0), 2)
+        s.proj = nn.Sequential(nn.Linear(D, D), nn.GELU(), nn.Linear(D, D))
+    <span class="kw2">def</span> forward(s, x):
+        p = F.unfold(x, P, stride=P).transpose(1, 2)    <span class="cm"># (1, 16 patches, 192)</span>
+        <span class="kw2">return</span> s.proj(s.blocks(s.patch(p) + s.pos))[0]   <span class="cm"># (16, D): one LLM token per patch</span>
+
+<span class="kw2">class</span> TinyLM(nn.Module):              <span class="cm"># one causal attention layer + MLP, with a KV cache</span>
+    <span class="kw2">def</span> __init__(s, V=1001):
+        super().__init__()
+        s.emb = nn.Embedding(V, D); s.qkv = nn.Linear(D, 3 * D); s.o = nn.Linear(D, D)
+        s.mlp = nn.Sequential(nn.Linear(D, 4 * D), nn.GELU(), nn.Linear(4 * D, D)); s.head = nn.Linear(D, V)
+    <span class="kw2">def</span> forward(s, h, past=None):     <span class="cm"># h: (n, D) new embeddings; past: (K, V) of earlier positions</span>
+        q, k, v = s.qkv(h).chunk(3, -1)
+        <span class="kw2">if</span> past <span class="kw2">is not</span> None: k, v = torch.cat([past[0], k]), torch.cat([past[1], v])
+        n, T = q.shape[0], k.shape[0]
+        mask = torch.ones(n, T, dtype=torch.bool).tril(T - n)            <span class="cm"># causal, offset by the cache</span>
+        a = F.scaled_dot_product_attention(q[None], k[None], v[None], attn_mask=mask[None])[0]
+        h = h + s.o(a); h = h + s.mlp(h)
+        <span class="kw2">return</span> s.head(h), (k, v)
+
+enc, lm = Encoder().eval(), TinyLM().eval()
+stats = {<span class="st">"encoder_runs"</span>: 0, <span class="st">"prefill_tokens"</span>: 0}
+enc_cache, prefix_cache = {}, {}      <span class="cm"># image hash -> embeddings ; block-chain hash -> (K, V) up to that block</span>
+
+<span class="kw2">def</span> img_key(raw): <span class="kw2">return</span> hashlib.sha256(raw).hexdigest()    <span class="cm"># hash the uploaded bytes</span>
+
+<span class="kw2">def</span> embed(tokens, images, use_enc_cache):
+    out, it, i = [], iter(images), 0
+    <span class="kw2">while</span> i &lt; len(tokens):
+        <span class="kw2">if</span> tokens[i] == IMG:                                 <span class="cm"># a run of 16 placeholders = one image</span>
+            raw = next(it); key = img_key(raw)
+            <span class="kw2">if not</span> (use_enc_cache <span class="kw2">and</span> key <span class="kw2">in</span> enc_cache):
+                stats[<span class="st">"encoder_runs"</span>] += 1; enc_cache[key] = enc(preprocess(raw))
+            out.extend(enc_cache[key]); i += (S // P) ** 2
+        <span class="kw2">else</span>: out.append(lm.emb.weight[tokens[i]]); i += 1
+    <span class="kw2">return</span> torch.stack(out)
+
+<span class="kw2">def</span> block_hashes(tokens, image_keys):  <span class="cm"># chain hash per full block; image hash is an "extra key", formula (196.9)</span>
+    hs, parent = [], b<span class="st">""</span>
+    <span class="kw2">for</span> b <span class="kw2">in</span> range(len(tokens) // BLK):
+        blk = tokens[b * BLK:(b + 1) * BLK]
+        extra = <span class="st">"|"</span>.join(image_keys) <span class="kw2">if</span> IMG <span class="kw2">in</span> tokens[:(b + 1) * BLK] <span class="kw2">else</span> <span class="st">""</span>
+        parent = hashlib.sha256(parent + str(blk).encode() + extra.encode()).digest(); hs.append(parent)
+    <span class="kw2">return</span> hs
+
+@torch.no_grad()
+<span class="kw2">def</span> prefill(tokens, images, use_enc_cache=True, use_prefix_cache=True):
+    keys = [img_key(r) <span class="kw2">for</span> r <span class="kw2">in</span> images]
+    h_all = embed(tokens, images, use_enc_cache)
+    start, past = 0, None
+    <span class="kw2">if</span> use_prefix_cache:                                     <span class="cm"># longest cached prefix of full blocks</span>
+        <span class="kw2">for</span> b, hb <span class="kw2">in</span> enumerate(block_hashes(tokens, keys)):
+            <span class="kw2">if</span> hb <span class="kw2">in</span> prefix_cache <span class="kw2">and</span> (b + 1) * BLK &lt; len(tokens): start, past = (b + 1) * BLK, prefix_cache[hb]
+    logits, kv = lm(h_all[start:], past)
+    stats[<span class="st">"prefill_tokens"</span>] += len(tokens) - start
+    <span class="kw2">for</span> b, hb <span class="kw2">in</span> enumerate(block_hashes(tokens, keys)):      <span class="cm"># store every full block</span>
+        prefix_cache[hb] = (kv[0][:(b + 1) * BLK], kv[1][:(b + 1) * BLK])
+    <span class="kw2">return</span> logits[-1]
+
+g = torch.Generator().manual_seed(1)
+photo = bytes(torch.randint(0, 256, (3 * 480 * 640,), generator=g).tolist())   <span class="cm"># "uploaded files"</span>
+other = bytes(torch.randint(0, 256, (3 * 480 * 640,), generator=g).tolist())
+sys_ = [1, 2, 3, 4, 5, 6, 7, 8]                              <span class="cm"># system prompt (8 tokens)</span>
+img = [IMG] * 16
+turns = [[11, 12, 13, 14], [21, 22, 23, 24, 25, 26, 27, 28], [31, 32, 33, 34]]
+
+<span class="kw2">for</span> enc_c, pre_c <span class="kw2">in</span> [(False, False), (True, False), (True, True)]:
+    enc_cache.clear(); prefix_cache.clear(); stats.update(encoder_runs=0, prefill_tokens=0); hist = sys_ + img
+    <span class="kw2">for</span> q <span class="kw2">in</span> turns:
+        hist = hist + q; out = prefill(hist, [photo], enc_c, pre_c)
+        hist = hist + [int(out.argmax())] * 4              <span class="cm"># pretend the model answered with 4 tokens</span>
+    print(f<span class="st">"encoder cache={enc_c!s:5} prefix cache={pre_c!s:5} -> {stats}"</span>)
+
+<span class="cm"># correctness: cached and uncached prefill give the same next-token logits</span>
+enc_cache.clear(); prefix_cache.clear()
+a = prefill(sys_ + img + turns[0], [photo]); b = prefill(sys_ + img + turns[1], [photo])
+c = prefill(sys_ + img + turns[1], [photo], False, False)
+print(<span class="st">"max |cached - uncached| ="</span>, f<span class="st">"{(b - c).abs().max().item():.1e}"</span>)
+<span class="cm"># a different image with identical placeholder tokens must NOT hit the image blocks</span>
+stats[<span class="st">"prefill_tokens"</span>] = 0; prefill(sys_ + img + turns[1], [other]); print(<span class="st">"other image prefilled:"</span>, stats[<span class="st">"prefill_tokens"</span>])</pre>
+<p>Output (PyTorch 2.8 on a CPU):</p>
+<pre class="code">encoder cache=False prefix cache=False -> {'encoder_runs': 3, 'prefill_tokens': 116}
+encoder cache=True  prefix cache=False -> {'encoder_runs': 1, 'prefill_tokens': 116}
+encoder cache=True  prefix cache=True  -> {'encoder_runs': 1, 'prefill_tokens': 48}
+max |cached - uncached| = 2.4e-07
+other image prefilled: 24</pre>
+<p>Read it like Figure 4. The prompts are 28, 40 and 48 tokens long (116 in total). The encoder cache cuts encoder runs from 3 to 1 but prefills the same 116 tokens. The prefix cache prefills only 28, then 12, then 8 tokens. The logits match to \(2.4 \times 10^{-7}\), so caching changes the cost, not the answer. And the other image reuses only the two system-prompt blocks (8 tokens) and prefills its 24 remaining tokens: the image hash in the block hash keeps the users apart.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>What dominates</th><th>What helps most</th></tr></thead><tbody>
+<tr><td>Multi-turn chat about a photo or chart</td><td>Re-prefilling the image every turn</td><td>Prefix cache (image before the question); stable chat template</td></tr>
+<tr><td>Document AI: many questions per page (invoices, forms, DocVQA)</td><td>High-resolution pages give thousands of tokens; same page asked many times</td><td>Prefix cache with the page first; batch the questions as one prompt if possible</td></tr>
+<tr><td>Product or catalog images seen by many users</td><td>Same image, different questions</td><td>Encoder cache keyed by content hash, shared across requests; prefix cache</td></tr>
+<tr><td>Video QA, action recognition, key-moment detection</td><td>Many frames: encoder and prefill grow with the frame count; video decode on the CPU</td><td>GPU video decoding, frame sampling, token reduction; cache per-frame embeddings when the same clip is asked about again</td></tr>
+<tr><td>Video retrieval, Video-RAG, fingerprinting</td><td>Encoding a large library once</td><td>Run the encoder offline in big batches; store embeddings; at query time only retrieve and prefill the chosen clips</td></tr>
+<tr><td>Screen and GUI agents (a screenshot every step)</td><td>A new large image every step; history grows</td><td>Prefix cache for the history; drop or downscale old screenshots</td></tr>
+<tr><td>On-device VLMs (phones, laptops)</td><td>Encoder and preprocessing on a weak CPU or NPU; memory</td><td>Small encoders, fixed low resolution, quantization (<a href="../vision/quantizing-vlms.html">session 197</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Profiling only the language model.</b> TTFT includes upload, decode, resize, encoder and queue time. Put a timer around every stage and synchronize the GPU before reading it.</li>
+<li><b>Uploading full-size photos to a fixed-resolution model.</b> A 12 MP photo for a 336-pixel encoder wastes network and CPU time. Resize on the client, or decode at reduced size.</li>
+<li><b>Hashing the URL or file name instead of the content.</b> The same image under two names misses the cache, and a changed image under the same URL hits a stale entry. Hash the bytes.</li>
+<li><b>Prefix cache without image hashes.</b> Placeholder tokens are identical for all images. Without the image hash in the block hash, one user can get answers about another user’s image: a privacy bug, not only a quality bug.</li>
+<li><b>Putting the question before the image</b> when many questions share one image. The prefix diverges before the image, and the image tokens are prefilled again for every question.</li>
+<li><b>Mismatched preprocessing.</b> A different resize filter, mean and standard deviation, or channel order than in training lowers accuracy with no error. Compare the server’s pixel tensors with the reference processor.</li>
+<li><b>Forgetting that image KV limits the batch.</b> At 0.5 MiB per token, one LLaVA image is 288 MiB. Size the KV budget with the image tokens, not only the text tokens.</li>
+<li><b>Ignoring the encoder for native-resolution models.</b> For Qwen2.5-VL the encoder is about 30% of prefill FLOPs, and a full-attention encoder grows with the square of the patch count. Cap the maximum pixels for your task.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Walk through what happens when a VLM server gets a request with one image.<span class="lvl">basic</span></summary><div class="ans">Receive the bytes (often base64, 4/3 larger), decode the JPEG to pixels, resize and normalize to the encoder’s input, cut into patches, run the vision encoder, run the connector (projector, maybe a 2×2 merge), replace the placeholder token embeddings in the prompt with the image embeddings, prefill the whole prompt to fill the KV cache, then decode token by token and stream the detokenized text. Steps 1–3 and the last one are usually on the CPU; the rest on the GPU.</div></details>
+<details class="qa"><summary>How many tokens and how much KV cache does one image take in LLaVA-1.5-7B?<span class="lvl">core</span></summary><div class="ans">The image is resized to 336×336 and cut into 14×14 patches: 24×24 = 576 tokens. KV per token is 2 × 32 layers × 32 KV heads × 128 × 2 bytes = 0.5 MiB, so 576 × 0.5 MiB = 288 MiB per image in FP16. A GQA model like Qwen2.5-VL-7B (4 KV heads, 28 layers) needs only 56 KiB per token, so a 1080p image with 2,691 tokens takes about 147 MiB.</div></details>
+<details class="qa"><summary>Our VLM has a high TTFT. Where do you look, in order?<span class="lvl">core</span></summary><div class="ans">First measure each stage separately. Then: (1) queueing in the scheduler; (2) network and base64 size; (3) CPU decode and resize, especially for big photos and a single-threaded front end; (4) the encoder, which matters for large or native-resolution encoders; (5) prefill length: count image tokens, which can be thousands; (6) cache hit rates. Fixes map to stages: client-side resizing or GPU decode, overlap with workers, capping max pixels or token reduction, chunked prefill, prefix and encoder caches.</div></details>
+<details class="qa"><summary>Why is the vision encoder a small share of compute in LLaVA-1.5 but a large one in Qwen2.5-VL?<span class="lvl">core</span></summary><div class="ans">Ignoring attention, encoder/LLM FLOPs ≈ s·P_enc/P_LLM, where s is patches per LLM token. LLaVA-1.5: s = 1, P_enc ≈ 0.30 B, P_LLM ≈ 6.5 B, ratio ≈ 0.05. Qwen2.5-VL: the 2×2 merge gives s = 4, and P_enc ≈ 0.68 B, so ratio ≈ 0.41. The encoder also works on a sequence 4× longer than the LLM sees, so its attention cost grows faster with resolution; that is why Qwen2.5-VL uses window attention in 28 of 32 layers.</div></details>
+<details class="qa"><summary>How does prefix caching work when the prompt contains images?<span class="lvl">core</span></summary><div class="ans">The KV cache is split into blocks; each full block gets a hash of the parent block’s hash, its token ids, and extra keys. For images, the extra key is the content hash of every image whose placeholder tokens are in the block. This is needed because placeholder ids are identical for all images. A new request walks its block hashes and reuses the longest run that is in the table, then prefills the rest. Put shared content (system prompt, image) first to get hits.</div></details>
+<details class="qa"><summary>What is the difference between an encoder cache and a prefix cache? When does each help?<span class="lvl">core</span></summary><div class="ans">The encoder cache stores the image embeddings (encoder + connector output) by image hash; a hit skips decode, resize and the encoder, but the LLM must still prefill the image tokens. The prefix cache stores KV blocks; a hit skips the LLM prefill for the matching prefix, and if the whole image is inside the hit, the encoder is not needed either. The encoder cache helps when the same image appears in a different context (after a different question, at a different position); the prefix cache helps when the same prefix repeats (multi-turn chat, shared system prompt and image). The encoder cache also lets chunked prefill reuse one encoder run across chunks.</div></details>
+<details class="qa"><summary>Is VLM prefill compute-bound or memory-bound? And decode?<span class="lvl">basic</span></summary><div class="ans">Prefill of hundreds or thousands of image tokens is compute-bound: each weight read is used for many tokens, so time ≈ FLOPs / (u · peak). Decode is memory-bound: each step reads all weights and the KV cache for one new token per request, so time ≈ bytes / bandwidth. Image tokens make prefill longer and make every decode step read more KV, which matters most at large batch sizes and for models without GQA.</div></details>
+<details class="qa"><summary>Estimate TTFT for LLaVA-1.5-7B with one image and a 50-token question on an H100.<span class="lvl">advanced</span></summary><div class="ans">Prompt: 576 + 50 = 626 tokens. Prefill ≈ 2·6.48e9·626 + 4·32·4096·626² ≈ 8.31 TFLOPs; encoder + projector ≈ 0.41 TFLOPs. At 50% of 989 TFLOP/s: ≈ 18 ms of GPU time. Add CPU preprocessing (can be 100+ ms for a 12 MP photo on one core), network and queueing. So for this model, the GPU part is often not the main part of TTFT. State the efficiency assumption and verify it by measuring.</div></details>
+<details class="qa"><summary>How does chunked prefill interact with the vision encoder?<span class="lvl">advanced</span></summary><div class="ans">Chunked prefill splits a long prompt into token chunks to interleave with decode steps. The encoder, though, processes a whole image at once (its attention spans all patches). So the scheduler must run the encoder for an image before the first chunk containing its tokens and keep the output until the last such chunk is done, which is what a GPU encoder cache does. It also needs a budget so that one huge image or many frames do not stall a step. Disaggregated designs (EPD) go further and run encoders on separate GPUs.</div></details>
+<details class="qa"><summary>A user sends a 4000×3000 photo to Qwen2.5-VL-7B. What happens to cost, and what would you change?<span class="lvl">advanced</span></summary><div class="ans">The processor keeps it under 12.8 MP: about 4004×2996, 61,204 patches and 15,301 LLM tokens. Encoder ≈ 156 TFLOPs with window attention (full attention everywhere would be ≈ 692), prefill ≈ 295 TFLOPs, so roughly 0.9 s of H100 time at 50% efficiency, plus 837 MiB of KV cache. For most tasks set max_pixels much lower (for example 1–2 MP), or let the model zoom in on crops only when needed. Keep high resolution only for tasks that need small text.</div></details>
+<details class="qa"><summary>Why can prefix caching with images be a security issue?<span class="lvl">advanced</span></summary><div class="ans">If the block hash covers only token ids, two different images give identical hashes, and one user’s cached KV (computed from their image) is reused for another user’s request: the model answers about the wrong image and leaks information. The image content hash must be part of the hash. Also, cache timing can reveal whether someone else sent the same image or prompt; multi-tenant systems use per-tenant cache salts for that.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Qwen2.5-VL gets a 1280 × 720 image. What size does the processor resize it to, and how many LLM tokens result?</li>
+<li>A prompt has eight 1920 × 1080 images for Qwen2.5-VL-7B. How many image tokens, and how much KV cache in BF16?</li>
+<li>Without caches, the three-turn chat of Figure 4 prefills 2,208 tokens. How many with the prefix cache, and why is it not just 646?</li>
+<li>A client sends a 3 MB JPEG as base64 inside JSON. How many bytes go over the network for the image?</li>
+<li>For LLaVA-1.5-7B at batch size 32, with each request holding 626 tokens, how many bytes does one decode step read for KV, and how does that compare with the weights?</li>
+<li>Using formula (196.4), how large would the encoder of a model with \(s = 4\) and a 7B language model have to be for the encoder to cost as much as the image-token prefill?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Round each side to a multiple of 28: 720/28 = 25.7 → 26 × 28 = 728, and 1280/28 = 45.7 → 46 × 28 = 1288. Tokens: 26 × 46 = 1,196. 2. 8 × 2,691 = 21,528 tokens; × 57,344 bytes = 1.15 GiB. 3. 646 + 32 + 42 = 720. Turns 2 and 3 reuse the previous prompt and answer, but only full blocks of 16: 704 of 706 and 784 of 796 tokens, so a few tokens before the new question are recomputed. 4. 3 MB × 4/3 = 4 MB. 5. 32 × 626 × 0.5 MiB = 10.5 GB (10,502,537,216 bytes), about 80% of the 13.2 GB of weights read in the same step. Per step, the bytes grow from 13.5 GB at batch size 1 to 23.7 GB, so each step is about 1.75 times slower (but it serves 32 requests). 6. ρ = 1 means 4·P_enc = P_LLM, so P_enc ≈ 6.5/4 ≈ 1.6 B parameters (ignoring attention).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A VLM request has ten stages; decode and resize run on the CPU (196.1) and can cost more than the GPU prefill for small encoders and big photos.</li>
+<li>Patches and tokens follow the processor rule (196.2); encoder FLOPs follow (196.3), and the ratio \(s P_{\text{enc}} / P_{\text{LLM}}\) (196.4) says if the encoder matters: about 5% for LLaVA-1.5, about 30–40% for Qwen2.5-VL.</li>
+<li>Image tokens make the prefill long and compute-bound (196.5, 196.6), and they fill the KV cache (196.7): 288 MiB per LLaVA image, 147 MiB for a 1080p Qwen2.5-VL image. They also make each decode step read more (196.8).</li>
+<li>The encoder cache skips the encoder for a repeated image; the prefix cache skips the prefill, with the image hash inside every block hash (196.9, 196.10). Put the image before the question.</li>
+<li>TTFT is dominated by image work; end-to-end latency with long answers by decode (196.11). Measure every stage separately.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ N_{\text{tok}} = \frac{H' W'}{28^2}, \qquad \rho \approx \frac{s\, P_{\text{enc}}}{P_{\text{LLM}}}, \qquad \text{TTFT} \approx t_{\text{prep}} + \frac{F_{\text{enc}} + F_{\text{pre}}}{u\, \Pi_{\text{peak}}} \]</div>
+<div class="eq">\[ b_{\text{KV}} = 2 L\, n_{\text{kv}}\, d_h\, b, \qquad h_j = \text{hash}(h_{j-1}, \text{tokens}_j, \text{image keys}_j), \qquad n_{\text{new}} = n - h \]</div>
+<h2 class="plain" id="the-vlm-inference-path-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 3: Vision Language Model Training</li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 3: Vision Language Model Training</li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.03744" target="_blank" rel="noopener">Improved Baselines with Visual Instruction Tuning</a></li><li>Bai et al. (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;Qwen2.5-VL Technical Report&amp;quot;" target="_blank" rel="noopener">Qwen2.5-VL Technical Report</a></li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Radford et al. (2021). <a href="https://arxiv.org/abs/2103.00020" target="_blank" rel="noopener">Learning Transferable Visual Models From Natural Language Supervision</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Zheng et al. (2023). <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">SGLang: Efficient Execution of Structured Language Model Programs</a></li><li>Agrawal et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve&amp;quot;" target="_blank" rel="noopener">Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></li><li>Zhong et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving&amp;quot;" target="_blank" rel="noopener">DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</a></li><li>Singh et al. (2025). <a href="https://arxiv.org/abs/2501.05460" target="_blank" rel="noopener">Efficiently Serving Large Multimodal Models Using EPD Disaggregation</a></li><li>vLLM team (2025). <a href="https://docs.vllm.ai/en/latest/design/prefix_caching.html" target="_blank" rel="noopener">vLLM design docs: Automatic Prefix Caching (multimodal block hashes)</a></li><li>PyTorch team (2024). <a href="https://pytorch.org/vision/stable/generated/torchvision.io.decode_jpeg.html" target="_blank" rel="noopener">torchvision.io.decode_jpeg (CPU and CUDA/nvJPEG decoding)</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/lab-preference-tuning-a-vlm-against-hallucination.html"><small>Previous · session 195</small>preference tuning a VLM against hallucination</a><a class="next" href="../vision/quantizing-vlms.html"><small>Next · session 197</small>Quantizing VLMs</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="the-vlm-inference-path"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmt=n=>Math.round(n).toLocaleString("en-US");
+const T=(x,y,s,o)=>{o=o||{};return `<text x="${x}" y="${y}" font-size="${o.fs||13}" font-weight="${o.fw||500}" text-anchor="${o.a||"middle"}" fill="${o.c||"var(--ink)"}" font-family="var(--sans)">${s}</text>`;};
+function seg(el,cb){const bs=[...el.querySelectorAll("button")];bs.forEach(b=>b.addEventListener("click",()=>{bs.forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);}));}
+const MB=b=>b>=1e9?(b/1e9).toFixed(2)+" GB":b>=1e6?(b/1e6).toFixed(2)+" MB":(b/1e3).toFixed(1)+" kB";
+const MiB=b=>b>=2**30?(b/2**30).toFixed(2)+" GiB":(b/2**20).toFixed(0)+" MiB";
+const ms=s=>s>=1?(s).toFixed(2)+" s":s*1e3>=10?(s*1e3).toFixed(0)+" ms":(s*1e3).toFixed(1)+" ms";
+const PEAK=989e12,BW=3.35e12,TXT=50;
+/* ---------- model costs (formulas 196.2 to 196.8), from the published configs ---------- */
+const rhe=x=>{const f=Math.floor(x),d=x-f;if(Math.abs(d-0.5)<1e-9)return f%2===0?f:f+1;return Math.round(x);}; /* Python round (half to even) */
+function smartResize(h,w){const f=28,mn=3136,mx=12845056;let hb=Math.max(f,rhe(h/f)*f),wb=Math.max(f,rhe(w/f)*f);
+ if(hb*wb>mx){const b=Math.sqrt(h*w/mx);hb=Math.floor(h/b/f)*f;wb=Math.floor(w/b/f)*f;}
+ else if(hb*wb<mn){const b=Math.sqrt(mn/(h*w));hb=Math.ceil(h*b/f)*f;wb=Math.ceil(w*b/f)*f;}return[hb,wb];}
+const llmF=(n,c,h)=>{h=h||0;return 2*c.P*n+4*c.L*c.d*n*(h+n);};
+const LL={name:"LLaVA-1.5-7B",L:32,d:4096,P:32*(4*4096*4096+3*4096*11008),kv:524288,W:(32*(4*4096*4096+3*4096*11008)+32064*4096)*2};
+const QW={name:"Qwen2.5-VL-7B",L:28,d:3584,P:28*(2*3584*3584+2*3584*512+3*3584*18944),kv:57344,W:(28*(2*3584*3584+2*3584*512+3*3584*18944)+152064*3584)*2};
+function llavaImg(){const n=577,vit=24*(2*n*(4*1024*1024+2*1024*4096)+4*n*n*1024),proj=2*576*(1024*4096+4096*4096);return{Hp:336,Wp:336,P:577,T:576,enc:vit+proj,vit,proj,att:24*4*n*n*1024};}
+function qwenImg(H,W,full){const[hb,wb]=smartResize(H,W);const gh=hb/14,gw=wb/14,P=gh*gw,Tk=P/4,dv=1280,fv=3420;
+ const lin=32*2*P*(4*dv*dv+3*dv*fv)+2*P*1176*dv+2*Tk*(5120*5120+5120*3584);let att;
+ if(full)att=32*4*P*P*dv;else{let s=0;for(let i=0;i<gh;i+=8)for(let j=0;j<gw;j+=8){const k=Math.min(8,gh-i)*Math.min(8,gw-j);s+=k*k;}att=28*4*s*dv+4*4*P*P*dv;}
+ return{Hp:hb,Wp:wb,P,T:Tk,enc:lin+att,att};}
+const SIZES=[[640,480],[1920,1080],[4000,3000]];
+
+/* ---------- Figure 1: the path of one request ---------- */
+(function(){
+ const svg=$("#vp-path-svg");if(!svg)return;const info=$("#vp-path-info");let model="llava",si=1,cur=0;
+ const ST=[["1 Receive","cpu"],["2 Decode","cpu"],["3 Resize + norm","cpu"],["4 Patchify","gpu"],["5 Vision encoder","gpu"],["6 Connector","gpu"],["7 Merge","gpu"],["8 Prefill","gpu"],["9 Decode loop","gpu"],["10 Detokenize","cpu"]];
+ function data(){const[W,H]=SIZES[si];const q=model==="qwen";const im=q?qwenImg(H,W,false):llavaImg();const c=q?QW:LL;const n=im.T+TXT;const pre=llmF(n,c);
+  const sub=[ "bytes / base64", `${W}×${H}×3 uint8`, `3×${im.Hp}×${im.Wp}`, q?`${fmt(im.P)} × 1176`:"576 × 588", q?`${fmt(im.P)} × 1280`:"577 × 1024", q?`${fmt(im.T)} × 3584`:"576 × 4096", `${fmt(n)} tokens`, `${(pre/1e12).toFixed(2)} TFLOPs`, `${MB(c.W+c.kv*n)}/step`, "ids → text"];
+  const txt=[
+   `<b>Receive.</b> The ${W} × ${H} image arrives as a compressed file (its size depends on the content and JPEG quality). Sent as base64 inside JSON it is 4/3 larger (formula 196.1). Runs in the server’s front-end process on the CPU.`,
+   `<b>Decode</b> on the CPU: the JPEG becomes ${W} × ${H} × 3 = <b>${MB(W*H*3)}</b> of 8-bit pixels (${(W*H/1e6).toFixed(2)} megapixels). At an assumed 100 megapixels per second on one core, decode plus resize would take about <b>${ms(W*H/1e8)}</b>.`,
+   q?`<b>Resize and normalize.</b> Qwen2.5-VL rounds each side to a multiple of 28: ${W} × ${H} → <b>${im.Wp} × ${im.Hp}</b>, keeping the aspect ratio. As float32 that is ${MB(3*im.Hp*im.Wp*4)}. Mean and std per channel are the CLIP values. The image is repeated twice in time, because the patch embedding also handles video (temporal patch 2).`
+    :`<b>Resize and normalize.</b> LLaVA-1.5 makes every image 336 × 336 (padding or cropping to a square first), whatever its size: ${MB(W*H*3)} of pixels shrink to 3 × 336 × 336 = ${MB(3*336*336)} as uint8 (${MB(3*336*336*4)} as float32).`,
+   q?`<b>Patchify.</b> 14 × 14 patches: ${im.Hp/14} × ${im.Wp/14} = <b>${fmt(im.P)} patches</b>, each with 2 × 3 × 14 × 14 = 1176 values (formula 196.2).`
+    :`<b>Patchify.</b> 336 / 14 = 24, so 24 × 24 = <b>576 patches</b> of 3 × 14 × 14 = 588 values, plus one class token: the encoder sequence has 577 positions.`,
+   q?`<b>Vision encoder</b> (0.68 B parameters, 32 layers, width 1280; window attention in 28 layers, full in 4): output ${fmt(im.P)} × 1280. Cost (formula 196.3): <b>${(im.enc/1e12).toFixed(2)} TFLOPs</b>, ${(100*im.att/im.enc).toFixed(0)}% of it attention. At 50% of an H100’s peak: ${ms(im.enc/(0.5*PEAK))}.`
+    :`<b>Vision encoder</b> CLIP ViT-L/14-336 (0.30 B parameters, 24 layers, width 1024): output 577 × 1024; LLaVA takes the second-to-last layer and drops the class token. Cost: <b>${(im.vit/1e12).toFixed(3)} TFLOPs</b>. At 50% of an H100’s peak: ${ms(im.vit/(0.5*PEAK))}.`,
+   q?`<b>Connector.</b> Each 2 × 2 group of patch features is concatenated (4 × 1280 = 5120) and an MLP maps it to the LLM width: <b>${fmt(im.T)} × 3584</b>. The LLM sees 4 times fewer positions than the encoder.`
+    :`<b>Connector.</b> A 2-layer MLP (1024 → 4096 → 4096) maps each feature to the LLM width: <b>576 × 4096</b>. Cost ${(im.proj/1e12).toFixed(3)} TFLOPs.`,
+   `<b>Merge.</b> The chat template holds ${fmt(im.T)} placeholder tokens; their embeddings are replaced by the image embeddings. The prompt is now ${fmt(im.T)} + ${TXT} = <b>${fmt(n)} tokens</b>, ${(100*im.T/n).toFixed(1)}% of them image tokens.`,
+   `<b>Prefill.</b> One forward pass over ${fmt(n)} tokens: <b>${(pre/1e12).toFixed(2)} TFLOPs</b> (formula 196.5), ${ms(pre/(0.5*PEAK))} at 50% of peak. It writes ${fmt(n)} × ${c.kv===524288?"0.5 MiB":"56 KiB"} = <b>${MiB(n*c.kv)}</b> of KV cache, ${MiB(im.T*c.kv)} for the image (formula 196.7).`,
+   `<b>Decode.</b> Each step reads ${MB(c.W)} of weights plus ${MiB(n*c.kv)} of KV (formula 196.8): <b>${ms((c.W+n*c.kv)/(0.8*BW))}</b> per token at 80% of 3.35 TB/s. The image tokens add ${(100*n*c.kv/c.W).toFixed(1)}% to the bytes of every step at batch size 1.`,
+   `<b>Detokenize and stream.</b> Token ids become text pieces on the CPU and are streamed to the client. Cheap, but it must not block the GPU loop.`];
+  return{sub,txt};}
+ function draw(k){cur=k;const{sub,txt}=data();let g=`<defs><marker id="vp-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="6" markerHeight="6" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+  ST.forEach(([lab,dev],i)=>{const r=Math.floor(i/5),c=r===0?i%5:4-(i%5);const x=12+c*158,y=14+r*96,on=i===k;const col=dev==="cpu"?"k":"q";
+   g+=`<rect x="${x}" y="${y}" width="140" height="64" rx="10" fill="var(--${col}-soft)" stroke="var(--${col})" stroke-width="${on?3.5:1.3}" opacity="${on?1:0.75}"/>`+T(x+70,y+26,lab,{fw:700,fs:13.5})+T(x+70,y+47,sub[i],{fs:11.5,c:"var(--ink2)"});
+   if(i<9){if(i===4)g+=`<path d="M${x+70} ${y+66} V${y+92}" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vp-ah)"/>`;
+    else if(r===0)g+=`<path d="M${x+142} ${y+32} H${x+156}" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vp-ah)"/>`;
+    else g+=`<path d="M${x-2} ${y+32} H${x-16}" stroke="var(--muted)" stroke-width="1.5" marker-end="url(#vp-ah)"/>`;}});
+  svg.innerHTML=g;info.innerHTML=txt[k];}
+ const st=B.stepper({n:10,prev:$("#vp-path-prev"),next:$("#vp-path-next"),play:$("#vp-path-play"),label:$("#vp-path-lab"),ms:2600,onStep:draw});
+ seg($("#vp-path-model"),v=>{model=v;draw(cur);});seg($("#vp-path-size"),v=>{si=+v;draw(cur);});
+})();
+
+/* ---------- Figure 3: encoder vs prefill FLOPs ---------- */
+(function(){
+ const svg=$("#vp-enc-svg");if(!svg)return;const Wi=$("#vp-enc-w"),info=$("#vp-enc-info");let ar=0.5625;
+ const X0=60,X1=620,Y0=240,Y1=14,lo=-1,hi=3;const X=w=>X0+(w-224)/(4096-224)*(X1-X0),Y=v=>Y0-(Math.log10(Math.max(v,1e-3))-lo)/(hi-lo)*(Y0-Y1);
+ function pt(w){const h=Math.max(28,Math.round(w*ar));const a=qwenImg(h,w,false),b=qwenImg(h,w,true);return{h,a,b,pre:llmF(a.T+TXT,QW)};}
+ function draw(){const w=+Wi.value;$("#vp-enc-wv").value=w;let g="";
+  for(let e=lo;e<=hi;e++){g+=`<line x1="${X0}" y1="${Y(10**e)}" x2="${X1}" y2="${Y(10**e)}" stroke="var(--rule)"/>`+T(X0-6,Y(10**e)+4,e<0?"0.1":fmt(10**e),{a:"end",fs:11.5,c:"var(--muted)"});}
+  [224,1000,2000,3000,4096].forEach(v=>g+=T(X(v),Y0+16,fmt(v),{fs:11.5,c:"var(--muted)"}));
+  g+=T((X0+X1)/2,Y0+32,"image width in pixels (height from the aspect ratio)",{fs:12,c:"var(--ink2)"})+`<text x="14" y="${(Y0+Y1)/2}" transform="rotate(-90 14 ${(Y0+Y1)/2})" text-anchor="middle" font-size="12" fill="var(--ink2)" font-family="var(--sans)">TFLOPs (log scale)</text>`;
+  const A=[],Bf=[],C=[];for(let v=224;v<=4096;v+=32){const p=pt(v);A.push([v,p.a.enc/1e12]);Bf.push([v,p.b.enc/1e12]);C.push([v,p.pre/1e12]);}
+  const line=(arr,c,dash)=>`<polyline points="${arr.map(q=>X(q[0]).toFixed(1)+","+Y(q[1]).toFixed(1)).join(" ")}" fill="none" stroke="${c}" stroke-width="2.6" ${dash?'stroke-dasharray="6 4"':""}/>`;
+  g+=line(Bf,"var(--k)",true)+line(C,"var(--q)")+line(A,"var(--v)");
+  const p=pt(w);g+=`<line x1="${X(w)}" y1="${Y1}" x2="${X(w)}" y2="${Y0}" stroke="var(--muted)" stroke-dasharray="3 4"/>`;
+  [[p.a.enc,"var(--v)"],[p.b.enc,"var(--k)"],[p.pre,"var(--q)"]].forEach(([v,c])=>g+=`<circle cx="${X(w)}" cy="${Y(v/1e12)}" r="5" fill="${c}"/>`);
+  svg.innerHTML=g;const tot=p.a.enc+p.pre;
+  info.innerHTML=`${w} × ${p.h} → resized to <b>${p.a.Wp} × ${p.a.Hp}</b>: <b>${fmt(p.a.P)}</b> patches, <b>${fmt(p.a.T)}</b> LLM tokens. Encoder with window attention <b>${(p.a.enc/1e12).toFixed(2)}</b> TFLOPs (attention ${(100*p.a.att/p.a.enc).toFixed(0)}%); with full attention ${(p.b.enc/1e12).toFixed(2)} TFLOPs (attention ${(100*p.b.att/p.b.enc).toFixed(0)}%). LLM prefill <b>${(p.pre/1e12).toFixed(2)}</b> TFLOPs. Encoder share of the GPU work: <b>${(100*p.a.enc/tot).toFixed(1)}%</b>. Estimated time at 50% of H100 peak: encoder ${ms(p.a.enc/(0.5*PEAK))} + prefill ${ms(p.pre/(0.5*PEAK))} = <b>${ms(tot/(0.5*PEAK))}</b>.`;}
+ seg($("#vp-enc-ar"),v=>{ar=+v;draw();});Wi.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 4: encoder cache and prefix cache over five requests ---------- */
+(function(){
+ const svg=$("#vp-cache-svg");if(!svg)return;const info=$("#vp-cache-info"),CE=$("#vp-cache-enc"),CP=$("#vp-cache-pre");let ord="img",cur=0;
+ const SYS=40,IM=576,Q=30,A=60,BL=16,ENC=llavaImg().enc;
+ const REQ=[["user 1, turn 1","p",[0]],["user 1, turn 2","p",[0,1]],["user 1, turn 3","p",[0,1,2]],["user 2, same photo, new question","p",[0],"u2"],["user 3, different photo","x",[0],"u3"]];
+ function layout(user,img,qs){const s=[["sys","s",SYS]];if(ord==="img")s.push(["img",img,IM]);
+  qs.forEach((q,i)=>{s.push(["q",user+":"+q,Q]);if(i===0&&ord!=="img")s.push(["img",img,IM]);if(i<qs.length-1)s.push(["a",user+":"+q,A]);});return s;}
+ const toks=s=>{const t=[];s.forEach(([k,id,n])=>{for(let j=0;j<n;j++)t.push(k+"|"+id+"|"+j);});return t;};
+ const blocks=t=>{const h=[];let par="";for(let b=0;b<Math.floor(t.length/BL);b++){par=hashStr(par+"#"+t.slice(b*BL,(b+1)*BL).join(","));h.push(par);}return h;};
+ function hashStr(s){let h1=0x811c9dc5,h2=0x1234567;for(let i=0;i<s.length;i++){const c=s.charCodeAt(i);h1=Math.imul(h1^c,16777619);h2=Math.imul(h2^c,2246822519);}return (h1>>>0).toString(16)+(h2>>>0).toString(16);}
+ function run(encc,prec){const cache=new Set(),encs=new Set(),out=[];
+  REQ.forEach(([lab,img,qs,u])=>{const user=u||"u1";const lay=layout(user,img,qs),t=toks(lay),n=t.length,bh=blocks(t);let h=0;
+   if(prec){for(let b=0;b<bh.length;b++){if(cache.has(bh[b]))h=(b+1)*BL;else break;}h=Math.min(h,Math.floor((n-1)/BL)*BL);}
+   let ip=-1;t.forEach((x,i)=>{if(x.startsWith("img|"))ip=i;});const need=ip>=h,ran=need&&!(encc&&encs.has(img));if(need)encs.add(img);
+   const full=t.concat(Array.from({length:A},(_,j)=>"a|"+user+":"+qs[qs.length-1]+"|"+j));if(prec)blocks(full).forEach(x=>cache.add(x));
+   out.push({lab,lay,n,h,nw:n-h,ran,F:llmF(n-h,LL,h)+(ran?ENC:0)});});return out;}
+ function draw(k){cur=k;const r=run(CE.checked,CP.checked),base=run(false,false);const X0=150,SC=630/826;let g="";
+  r.forEach((q,i)=>{const y=12+i*46,vis=i<=k;const op=vis?1:0.18;g+=`<g opacity="${op}">`+T(X0-8,y+20,"Request "+(i+1),{a:"end",fw:i===k?700:500,fs:13});
+   g+=`<rect x="${X0}" y="${y+4}" width="${(q.h*SC).toFixed(1)}" height="24" fill="var(--ok-soft)" stroke="var(--ok)" stroke-width="1.2"/>`;
+   g+=`<rect x="${(X0+q.h*SC).toFixed(1)}" y="${y+4}" width="${((q.n-q.h)*SC).toFixed(1)}" height="24" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1.2"/>`;
+   let p=0;q.lay.forEach(([kd,,len])=>{if(kd==="img")g+=`<rect x="${(X0+p*SC).toFixed(1)}" y="${y+24}" width="${(len*SC).toFixed(1)}" height="4" fill="var(--q)"/>`;p+=len;});
+   g+=T(X0+q.n*SC+6,y+20,vis?fmt(q.nw):"",{a:"start",fs:12,c:"var(--ink2)"})+`</g>`;});
+  g+=T(X0,248,"0",{fs:11,c:"var(--muted)"})+T(X0+826*SC,248,"826 tokens",{fs:11,c:"var(--muted)",a:"end"});
+  svg.innerHTML=g;const q=r[k];const sum=(a,f)=>a.slice(0,k+1).reduce((s,x)=>s+f(x),0);
+  info.innerHTML=`<b>${q.lab}</b>: prompt ${fmt(q.n)} tokens, cached prefix <b>${fmt(q.h)}</b>, prefilled <b>${fmt(q.nw)}</b>; encoder ${q.ran?"<b>runs</b>":"skipped"}; ${(q.F/1e12).toFixed(2)} TFLOPs. Requests 1–${k+1} so far: ${fmt(sum(r,x=>x.nw))} tokens prefilled, encoder runs <b>${sum(r,x=>x.ran?1:0)}</b>, <b>${(sum(r,x=>x.F)/1e12).toFixed(2)}</b> TFLOPs (no caches: ${fmt(sum(base,x=>x.nw))} tokens, ${sum(base,x=>x.ran?1:0)} encoder runs, ${(sum(base,x=>x.F)/1e12).toFixed(2)} TFLOPs).`;}
+ const st=B.stepper({n:5,prev:$("#vp-cache-prev"),next:$("#vp-cache-next"),play:$("#vp-cache-play"),label:$("#vp-cache-lab"),ms:2400,onStep:draw});
+ [CE,CP].forEach(e=>e.addEventListener("change",()=>draw(cur)));seg($("#vp-cache-ord"),v=>{ord=v;draw(cur);});
+})();
+
+/* ---------- Figure 5: where the time goes ---------- */
+(function(){
+ const svg=$("#vp-time-svg");if(!svg)return;const info=$("#vp-time-info");const N=$("#vp-time-n"),O=$("#vp-time-o"),Cc=$("#vp-time-c"),U=$("#vp-time-u"),E=$("#vp-time-e");let model="llava",si=1;
+ function draw(){const ni=+N.value,no=+O.value,cpu=+Cc.value,u=+U.value,eta=+E.value;$("#vp-time-nv").value=ni;$("#vp-time-ov").value=no;$("#vp-time-cv").value=cpu;$("#vp-time-uv").value=u.toFixed(2);$("#vp-time-ev").value=eta.toFixed(2);
+  const[W,H]=SIZES[si];const q=model==="qwen",c=q?QW:LL,im=q?qwenImg(H,W,false):llavaImg();const n=ni*im.T+TXT;
+  const tp=ni*W*H/1e6/cpu,te=ni*im.enc/(u*PEAK),tf=llmF(n,c)/(u*PEAK);let td=0;for(let k=1;k<no;k++)td+=(c.W+c.kv*(n+k))/(eta*BW);
+  const ttft=tp+te+tf,tot=ttft+td;const X0=110,WW=560;let g="";
+  const bar=(y,lab,parts,total)=>{let x=X0,s=T(X0-10,y+19,lab,{a:"end",fw:700});parts.forEach(([v,col])=>{const w=WW*v/total;s+=`<rect x="${x.toFixed(1)}" y="${y}" width="${Math.max(0,w).toFixed(1)}" height="28" fill="${col}" opacity="0.85"/>`;x+=w;});return s+T(X0+WW+8,y+19,ms(total),{a:"start",fw:700});};
+  g+=bar(16,"TTFT",[[tp,"var(--k)"],[te,"var(--v)"],[tf,"var(--q)"]],ttft);
+  g+=bar(96,"End to end",[[tp,"var(--k)"],[te,"var(--v)"],[tf,"var(--q)"],[td,"var(--muted)"]],tot);
+  g+=T(X0,62,`prep ${ms(tp)} · encoder ${ms(te)} · prefill ${ms(tf)}`,{a:"start",fs:12,c:"var(--ink2)"})+T(X0,142,`decode ${no-1} steps: ${ms(td)} (${no>1?ms(td/(no-1)):"0 ms"} per token)`,{a:"start",fs:12,c:"var(--ink2)"});
+  svg.innerHTML=g;const pc=v=>(100*v/ttft).toFixed(0)+"%";
+  info.innerHTML=`${c.name}, ${ni} image${ni>1?"s":""} of ${W} × ${H} → ${fmt(ni*im.T)} image tokens, prompt <b>${fmt(n)}</b> tokens, KV cache ${MiB(n*c.kv)}. <b>TTFT ≈ ${ms(ttft)}</b>: preprocessing ${pc(tp)}, encoder ${pc(te)}, prefill ${pc(tf)}. <b>End to end ≈ ${ms(tot)}</b>, decode ${(100*td/tot).toFixed(0)}% of it. Image stages (prep + encoder + image share of prefill) ≈ ${(100*(tp+te+tf*(ni*im.T)/n)/tot).toFixed(0)}% of the total.`;}
+ seg($("#vp-time-model"),v=>{model=v;draw();});seg($("#vp-time-size"),v=>{si=+v;draw();});[N,O,Cc,U,E].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>
