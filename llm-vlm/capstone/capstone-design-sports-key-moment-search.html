@@ -1,0 +1,511 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Capstone design: sports key-moment search · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=2e875ab0"><script src="../assets/book.js?v=2e875ab0"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../capstone/index.html">Capstone and interviews</a><span class="sep">/</span><span>Session 235</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="capstone-design-sports-key-moment-search">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="capstone-design-sports-key-moment-search" data-session="capstone-design-sports-key-moment-search" style="--tc:var(--t10)"><header class="chap-head"><div class="chap-kicker"><span class="num">235</span><span>Track 10: Capstone and interviews · session 2 of 6</span></div><h1 class="chap-title">Capstone design: sports key-moment search</h1><p class="chap-sub">A sports broadcaster wants editors and fans to type “penalty saved by the keeper in the second half” and get the exact seconds of video back. This capstone designs that system on paper before any code: the requirements, the pipeline (segments, embeddings, an index, a VLM re-ranker, timestamps), the latency and cost math on NVIDIA L4 GPUs with TensorRT, and the risks and metrics that decide whether it works.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises and your own design 1 to 2 hours)</span><span><b>Level:</b> Advanced, interview level (system design)</span><span><b>Before this:</b> Text-to-video retrieval (208), temporal grounding (207), vector search at scale (151), TensorRT (131), the L4 latency budget (199)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How to turn a vague product wish into requirements: query types, latency targets, accuracy metrics, cost limits and fixed hardware</li><li>A complete design: decode, shot-aware segments, SigLIP embeddings, an IVF-PQ index with metadata filters, transcript fusion, a VLM re-ranker and timestamp refinement</li><li>How window length and stride decide the best possible tIoU and the size of the index</li><li>Why metadata filters and the number of re-ranked candidates control recall, and how to reason about it with a simple model</li><li>Latency and cost math for a VLM re-ranker on an L4: visual tokens, FLOPs, milliseconds per candidate, GPUs and dollars per 1,000 queries</li><li>The main risks (replays, commentary delay, ambiguous queries, domain shift, model upgrades) and what to measure at each stage</li></ul></div></header><style>
+.kd-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.kd-grid input[type=range]{width:100%}
+.kd-grid output{min-width:4.6em;text-align:right;font:500 14px var(--mono)}
+.kd-ctl{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;font:500 14px var(--sans);color:var(--ink2);margin-bottom:8px}
+.kd-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.kd-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.kd-box rect{fill:var(--card);stroke:var(--rule);stroke-width:1.6;transition:fill .2s,stroke .2s}
+.kd-box.on rect{fill:var(--q-soft);stroke:var(--q);stroke-width:2.4}
+.kd-box.off rect{fill:var(--k-soft);stroke:var(--k);stroke-width:2.4}
+.kd-box text{font-family:var(--sans);text-anchor:middle;fill:var(--ink)}
+pre.code{font-variant-ligatures:none}
+@media (max-width:520px){.kd-grid{grid-template-columns:1fr auto}.kd-grid label{grid-column:1 / -1}}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A football broadcaster has 20,000 hours of match video. An editor needs “every penalty saved by a goalkeeper this season” for a show that airs in an hour. A fan types “Salah curling shot into the top corner”. Today, someone scrubs through video by hand, or searches a list of events that a logging team typed during the game. This session designs a system that answers such questions with the exact seconds of video, on a fixed hardware budget: NVIDIA L4 GPUs running TensorRT engines.</p>
+<p>It is a capstone because it uses almost everything in <a href="../video/index.html">Track 8</a> and much of the inference track: text-to-video retrieval (<a href="../video/text-to-video-retrieval.html">session 208</a>), temporal grounding (<a href="../video/temporal-grounding-and-key-moment-detection.html">session 207</a>), vector indexes (<a href="../applications/vector-search-at-scale.html">session 151</a>), compilation with TensorRT (<a href="../inference/tensorrt-and-tensorrt-llm-in-depth.html">session 131</a>), and the pencil-and-paper latency budget of <a href="../vision/a-latency-budget-on-an-nvidia-l4.html">session 199</a>. In <a href="../capstone/dissect-a-modern-open-model.html">session 234</a> you took one model apart. Here you put many models together into one service, and you decide <b>on paper</b> whether it can work before anyone writes code. In the next session, <a href="../capstone/index.html#row-lab-capstone-build" title="capstone build (planned)">session 236</a>, you build a small version of it.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Design a system that finds moments in sports video from a text query” is a common ML system-design question for video and multimodal roles. A strong answer has four parts, in this order: requirements with numbers, a pipeline diagram, back-of-the-envelope latency and cost, and risks with metrics. This page follows that order.</aside>
+<p>A <b>key moment</b> here means a short span of video (a few seconds to a minute) that matches what the user asked for: a goal, a save, a foul, a celebration, a tactical pattern. The system returns a ranked list of moments, each with a game, a start time and an end time.</p>
+
+<h2>Requirements: queries, latency, accuracy, cost, hardware</h2>
+<p>A design starts from requirements, not from models. Ask questions until every requirement is a number, or a short list. Here is the set we will design for. These are <b>our design inputs</b> for the example, not facts about any real broadcaster.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Requirement</th><th>Our value</th><th>Why it matters for the design</th></tr></thead><tbody>
+<tr><td>Archive</td><td>20,000 hours of football broadcasts (about 10,000 games of about 2 hours each, with pre-game and half-time)</td><td>sets the index size and the one-time ingest cost</td></tr>
+<tr><td>New video</td><td>about 100 hours per day; searchable within 1 hour after the game ends</td><td>sets the daily ingest cost; “1 hour” allows batch ingest, not streaming</td></tr>
+<tr><td>Query types</td><td>(a) event type: “all red cards”; (b) event + entity: “Haaland headers”; (c) free description: “keeper slips and the ball goes in”; (d) filters: team, season, competition, half</td><td>(a) and (d) can use structured data; (b) and (c) need visual search and a re-ranker</td></tr>
+<tr><td>Load</td><td>5 queries per second (QPS) at peak, 1 QPS on average</td><td>sets the number of GPUs for the online path</td></tr>
+<tr><td>Latency</td><td>first results in at most 0.3 s; final re-ranked results with timestamps in at most 1.5 s (95th percentile)</td><td>limits how much VLM work we can do per query</td></tr>
+<tr><td>Accuracy</td><td>Hit@10 at least 0.85 on our own test set of 500 queries; for hits, tIoU at least 0.5 in 85% of cases</td><td>defines “works”; we will measure each stage separately</td></tr>
+<tr><td>Cost</td><td>at most 12 L4 GPUs for the online path at peak</td><td>caps the re-ranker size and the number of candidates</td></tr>
+<tr><td>Hardware</td><td>NVIDIA L4 (fixed by the platform team), models compiled with TensorRT or TensorRT-LLM</td><td>fixes peak compute, memory and video decoders</td></tr></tbody></table></div>
+<p><b>Hit@10</b> means: the right moment is somewhere in the top 10 results. <b>tIoU</b> (temporal intersection over union) measures how well a predicted time span overlaps the true span; we define it in formula (235.2). <b>95th percentile</b> (p95) latency means that 95% of queries finish faster than this.</p>
+<h3>The hardware: what an L4 gives us</h3>
+<p>From NVIDIA’s product page [Certain]: 24 GB of memory, 300 GB/s of memory bandwidth, 72 W, and 242 TFLOP/s BF16 and 485 TFLOP/s FP8 on the tensor cores <b>with 2:4 sparsity</b>; dense numbers are half: 121 TFLOP/s BF16 and 242 TFLOP/s FP8. It also has 4 video decoders (NVDEC), 4 JPEG decoders and 2 video encoders. For video work the decoders matter as much as the tensor cores: frames must be decoded before any model can see them.</p>
+<p>As in <a href="../vision/a-latency-budget-on-an-nvidia-l4.html">session 199</a>, we assume real kernels reach \(\eta = 0.5\) of the dense peak, so about 60.5 TFLOP/s in BF16. This is an assumption to replace with a measurement later. [Likely]</p>
+<p><b>TensorRT</b> compiles a model graph into an <b>engine</b>: fused, timed kernels for one GPU model and one TensorRT version. [Certain] For us this means: build the engines on L4s, declare the input shapes you will use (batch sizes, image sizes) as optimization profiles, and rebuild when you upgrade TensorRT or change GPUs. TensorRT-LLM is the matching runtime for the language part of a VLM. Whether a given VLM is supported by TensorRT-LLM must be checked for the exact model and version. [Likely]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Do not accept “fast” or “accurate” as a requirement. “Final results in 1.5 s at p95 for 5 QPS” and “Hit@10 ≥ 0.85 on these 500 queries” are requirements. If the product team cannot give numbers, propose numbers and get them confirmed. Every later decision in this page depends on them.</aside>
+
+<h2>The design at a glance</h2>
+<p>The system has two paths. The <b>offline path</b> (ingest) runs once per game: it decodes the video, cuts it into short segments, computes vectors and text for each segment, and writes them into an index. The <b>online path</b> (query) runs for every user request: it reads the query, searches the index, re-ranks the best candidates with a vision-language model (VLM), and returns moments with precise times. The rule of the whole design: <b>do expensive work offline, once per video; do only cheap or query-specific work online.</b></p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A large library. Offline, librarians write a catalog card for every book (ingest). Online, a visitor asks a question; the catalog gives 20 likely books in a second (retrieval), and then a librarian actually opens those 20 books and checks the right page (re-ranking and timestamps). You never let the librarian read the whole library for each visitor.</aside>
+<figure class="fig" id="kd-arch"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="kd-arch-prev">Back</button><button type="button" class="btn primary" id="kd-arch-play">Play</button><button type="button" class="btn" id="kd-arch-next">Next</button><span id="kd-arch-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="kd-arch-svg" viewBox="0 0 780 300" role="img" aria-label="Architecture of the key-moment search system: an offline ingest path and an online query path"></svg></div>
+<div class="kd-leg"><span style="--c:var(--k)">offline: once per game</span><span style="--c:var(--q)">online: once per query</span></div>
+<div class="readout" id="kd-arch-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The two paths of the design. The top row runs at ingest time; the bottom row runs for every query. Step through to see what each box does, which model it uses, and the time or cost we budget for it.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Each step highlights one box and explains its job and its budget. Notice where the GPU time goes: offline, the frame encoder and the decoders; online, almost all of it goes to the VLM re-ranker. That is why most of the latency and cost math later in this page is about the re-ranker. The arrow from the index down to the online row is the only link between the two paths: the online path never touches raw video except to fetch a few frames for the re-ranker.</p></details></figure>
+
+<h2>Segmenting: the unit of search</h2>
+<p>We cannot index a 2-hour video as one vector: the query is about 5 seconds of it. We also should not index single frames: one frame cannot show “a slide tackle”, and frames are 7,200 per hour even at 2 frames per second. The unit of search is a <b>segment</b>: a short window of video, for example 6 seconds. We slide the window along the video with a <b>stride</b> (the step between window starts):</p>
+<div class="eq">\[ N_{\text{seg}} = \left\lfloor \frac{D - w}{s} \right\rfloor + 1 \;\approx\; \frac{D}{s}, \qquad N_{\text{archive}} \approx \frac{3600\, H}{s} \tag{235.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(D\)</dt><dd>length of one video in seconds</dd>
+<dt>\(w\)</dt><dd>window length in seconds (how much video one vector describes)</dd>
+<dt>\(s\)</dt><dd>stride in seconds; \(s \lt w\) means windows overlap</dd>
+<dt>\(H\)</dt><dd>hours of video in the archive</dd></dl>
+<p>With \(w = 6\) s and \(s = 3\) s (50% overlap), the 20,000-hour archive gives \(72{,}000{,}000 / 3 = 24.0\) million segments. Halving the stride doubles the index; doubling it halves the index but, as we see next, hurts the timestamps.</p>
+<h3>How good can a fixed window be?</h3>
+<p>A moment has a true span \([a^*, b^*]\). A window \([a, b]\) is scored against it with tIoU, the length of the overlap divided by the length of the union:</p>
+<div class="eq">\[ \text{tIoU}\big([a,b],[a^*,b^*]\big) = \frac{\max\!\big(0,\ \min(b, b^*) - \max(a, a^*)\big)}{\max(b, b^*) - \min(a, a^*)} \tag{235.2} \]</div>
+<p>Even a perfect retriever can only return the best window in the grid. Where the true event falls relative to the grid is random, so the best tIoU is a random number. Figure 2 computes its average and its worst case. Two facts come out. First, with a 6-s event, a 6-s window and a 3-s stride, the worst case is 0.60 and the average is 0.79: every event can be hit at tIoU 0.5. With a 6-s stride (no overlap), the worst case drops to 0.33 and only 67% of positions reach 0.5. Second, windows much shorter than the event can never reach 0.5 alone (a 2-s window on a 6-s event gives at most 0.33), so short windows need a later step that merges neighbors. That step is the timestamp refinement below.</p>
+<figure class="fig" id="kd-seg"><div class="fig-body">
+<div class="kd-grid">
+<label for="kd-seg-L">Event length (s)</label><input type="range" id="kd-seg-L" min="2" max="20" step="1" value="6"><output id="kd-seg-Lv"></output>
+<label for="kd-seg-w">Window \(w\) (s)</label><input type="range" id="kd-seg-w" min="2" max="20" step="1" value="6"><output id="kd-seg-wv"></output>
+<label for="kd-seg-s">Stride \(s\) (s)</label><input type="range" id="kd-seg-s" min="1" max="20" step="1" value="3"><output id="kd-seg-sv"></output>
+<label for="kd-seg-o">Event start inside the grid</label><input type="range" id="kd-seg-o" min="0" max="1" step="0.01" value="0.5"><output id="kd-seg-ov"></output></div>
+<div class="scroll-x"><svg id="kd-seg-svg" viewBox="0 0 640 300" role="img" aria-label="Sliding windows over a timeline with one event, and the best tIoU as a function of the event position"></svg></div>
+<div class="kd-leg"><span style="--c:var(--k)">true event</span><span style="--c:var(--q)">best window</span><span style="--c:var(--muted)">other windows</span></div>
+<div class="readout" id="kd-seg-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Window length and stride against the best possible tIoU. Top: the window grid and one event; the best window is highlighted. Bottom: the best tIoU for every possible event start within one stride (the pattern repeats every stride), with its average. The readout also gives the index size for the 20,000-hour archive.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Move “event start” to see the best and worst positions. Then raise the stride to the window length: the dip in the bottom curve gets deep, because some events fall between two windows. Lower the stride: the curve flattens, but the number of segments, and so the index memory, grows as \(1/s\). Set the event to 15 s and the window to 6 s: no single window can reach tIoU 0.5, so long events need merged windows or a refinement step.</p></details></figure>
+<p>Two practical rules improve on a plain grid. <b>Snap to shots:</b> broadcast video is cut into camera shots, and a replay or a close-up starts at a cut. A shot-boundary detector such as TransNet V2 (<a href="../video/production-video-understanding-pipelines.html">session 211</a>) lets us end windows at cuts, so a window does not mix the wide game camera with a crowd shot. <b>Keep finer data on the side:</b> we store the per-frame embeddings at 2 frames per second (not in the index, just on disk), so the timestamp step can work at 0.5-s resolution without a bigger index.</p>
+
+<h2>Embedding and indexing</h2>
+<p>Each segment needs a vector that a text query can be compared with. We use a contrastive image–text model such as SigLIP: it maps an image and a sentence into the same space, so that matching pairs have a high cosine similarity (<a href="../video/text-to-video-retrieval.html">session 208</a>). We embed frames, then pool them into one segment vector. CLIP4Clip showed that plain mean pooling of frame features is a strong, parameter-free baseline for video–text retrieval. [Likely]</p>
+<div class="eq">\[ \mathbf{v}_j = \frac{\bar{\mathbf{z}}_j}{\lVert \bar{\mathbf{z}}_j \rVert}, \quad \bar{\mathbf{z}}_j = \frac{1}{|S_j|} \sum_{f \in S_j} \mathbf{z}_f, \qquad \text{score}(q, j) = \mathbf{t}_q^\top \mathbf{v}_j \tag{235.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(S_j\)</dt><dd>the sampled frames inside segment \(j\) (12 frames for 6 s at 2 frames per second)</dd>
+<dt>\(\mathbf{z}_f\)</dt><dd>the image embedding of frame \(f\)</dd>
+<dt>\(\mathbf{v}_j\)</dt><dd>the unit-length segment vector stored in the index</dd>
+<dt>\(\mathbf{t}_q\)</dt><dd>the unit-length text embedding of the query; the dot product of two unit vectors is their cosine</dd></dl>
+<h3>Text from the broadcast</h3>
+<p>Sports video comes with strong text signals. The <b>commentary</b> says “GOAL!” and the player’s name; a speech recognizer such as Whisper turns it into timed text. The <b>scoreboard</b> shows the game clock and the score; reading it (OCR) gives a game time for every second of video, and a score change is a near-certain goal signal. Official <b>event feeds</b> (from the league or a data provider) list goals, cards and substitutions with game times. We index the transcript with a keyword index (BM25) next to the vector index and merge the two ranked lists with reciprocal rank fusion (RRF), which needs only ranks, not comparable scores:</p>
+<div class="eq">\[ \text{RRF}(j) = \sum_{m \in \text{lists}} \frac{1}{k + \operatorname{rank}_m(j)}, \qquad k = 60 \tag{235.4} \]</div>
+<p>A segment missing from a list adds nothing for that list. \(k = 60\) is the value from the original RRF paper. [Certain]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Commentary is late. The commentator shouts “goal” after the ball is in the net, and often keeps talking about it for a minute. A transcript hit is evidence that a goal happened <b>near</b> this time, not a timestamp. Use it to find candidates; use the frames to place the start.</aside>
+<h3>Index size</h3>
+<p>Memory for the vectors is simple arithmetic:</p>
+<div class="eq">\[ \text{Mem} = N \cdot (b_{\text{code}} + b_{\text{id}}), \qquad b_{\text{code}} = d \cdot \text{bytes per number (flat)}, \;\; \text{or } m \text{ bytes (PQ)} \tag{235.5} \]</div>
+<div class="worked"><div class="wt">Worked example: can the index live on one L4?</div>
+<p>\(N = 24.0\) million segments, \(d = 768\) (SigLIP base).</p>
+<p>FP32 flat: \(24 \times 10^6 \times 768 \times 4 = 73.7\) GB. FP16 flat: 36.9 GB. INT8: 18.4 GB. None of these fits next to a VLM on a 24 GB L4, and FP16 does not fit at all.</p>
+<p>IVF-PQ with \(m = 96\) bytes per vector plus an 8-byte id: \(24 \times 10^6 \times 104 = 2.50\) GB. This fits easily in CPU memory or on a GPU. Product quantization (PQ) stores each vector as 96 one-byte codes, and IVF searches only the few clusters near the query (<a href="../applications/vector-search-at-scale.html">session 151</a>). We keep the FP16 vectors on disk and re-score the top few hundred PQ results exactly.</p></div>
+<p>Two more index features matter as much as speed. <b>Metadata filters:</b> most queries name a team, a player, a season or a competition. Each segment carries the game id, teams, date, half and game clock, and the search runs only over the matching games. <b>Versioning:</b> every vector belongs to one embedding model version. A new model means re-embedding the archive into a new index, not mixing two models in one index.</p>
+<h3>Ingest cost</h3>
+<p>The offline cost per hour of video is the encoder FLOPs for all sampled frames divided by the effective GPU speed:</p>
+<div class="eq">\[ t_{\text{ingest}} \text{ per video-hour} = \frac{3600 \cdot f_s \cdot C_{\text{frame}}}{\eta\, P} \tag{235.6} \]</div>
+<div class="worked"><div class="wt">Worked example: embedding the archive with SigLIP-B/16 at 224×224</div>
+<p>The vision tower has 12 layers of width 768 and MLP width 3,072: about 85 million weights in its linear layers. A 224×224 frame gives \(14 \times 14 = 196\) patches. FLOPs per frame \(\approx 2 \times 85 \times 10^6 \times 196\) plus attention \(\approx 34.7\) GFLOP.</p>
+<p>At \(f_s = 2\) frames per second: \(7{,}200 \times 34.7 \text{ GFLOP} = 250\) TFLOP per video-hour. At 60.5 TFLOP/s, that is about <b>4.1 s of one L4 per video-hour</b>. The whole archive: \(20{,}000 \times 4.1\) s \(\approx\) <b>23 GPU-hours</b>. The daily 100 hours: about 7 minutes.</p>
+<p>The catch is decoding. A 25 frames-per-second broadcast has 90,000 frames per hour, and a decoder must decode nearly all of them to output 2 per second (only keyframes can be decoded alone). That is 12.5 times more frames decoded than embedded. On an L4 the 4 hardware decoders, not the tensor cores, often set the ingest speed; measure it with your codec and resolution before planning. [Likely]</p></div>
+
+<h2>Retrieve, then re-rank</h2>
+<p>A single embedding comparison is fast but shallow. It cannot reliably tell “the keeper saves the penalty” from “the penalty is scored”: both have a keeper, a ball and a penalty spot. A VLM that looks at the frames and the query together can tell, but it costs tens of milliseconds per candidate, so it cannot look at 24 million segments. The standard answer is a <b>cascade</b>: a cheap first stage returns the top \(K\) candidates, an expensive second stage re-orders only those \(K\). The second stage can never find a moment the first stage missed, so <b>recall@K of the first stage is the ceiling of the whole system</b>.</p>
+<h3>A simple model of first-stage recall</h3>
+<p>To reason about \(K\), use a toy model. The true segment gets a score \(x \sim \mathcal{N}(d, 1)\); each of \(M\) other segments in the search space gets an independent score from \(\mathcal{N}(0, 1)\). The number of other segments that beat the true one is then about Poisson with mean \(M\, Q(x)\), where \(Q\) is the tail of the standard normal. The true segment is in the top \(K\) when fewer than \(K\) others beat it:</p>
+<div class="eq">\[ \text{R@}K(d, M) = \E_{x \sim \mathcal{N}(d,1)} \Big[ \Pr\big( \text{Poisson}(M\, Q(x)) \lt K \big) \Big], \qquad Q(x) = \Pr\big(\mathcal{N}(0,1) \gt x\big) \tag{235.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(d\)</dt><dd>separation: how many noise units the right segment scores above a typical wrong one. A better embedding model or a better query gives a larger \(d\)</dd>
+<dt>\(M\)</dt><dd>size of the search space after filters</dd>
+<dt>\(K\)</dt><dd>number of candidates passed to the re-ranker</dd></dl>
+<p>This is a toy: real wrong segments are not independent (replays and similar plays score high together), so real recall is lower. But it shows the two levers clearly. With \(d = 5\): searching the whole archive (\(M = 24\) million) gives R@20 = 0.58. Filtering to one team’s season (38 games, \(M = 91{,}200\)) gives 0.93. Filtering to one game (\(M = 2{,}400\)) gives 0.995. <b>Metadata filters are the cheapest accuracy you can buy.</b> Raising \(K\) also helps, but each extra candidate costs re-ranker time.</p>
+<figure class="fig" id="kd-rec"><div class="fig-body">
+<div class="kd-ctl"><span>Search space:</span><span class="seg" id="kd-rec-m"><button type="button" data-v="24000000" aria-pressed="false">Whole archive</button><button type="button" data-v="912000" aria-pressed="false">One league season</button><button type="button" data-v="91200" aria-pressed="true">One team season</button><button type="button" data-v="2400" aria-pressed="false">One game</button></span></div>
+<div class="kd-grid">
+<label for="kd-rec-d">Separation \(d\)</label><input type="range" id="kd-rec-d" min="3" max="7" step="0.1" value="5"><output id="kd-rec-dv"></output>
+<label for="kd-rec-k">Candidates \(K\)</label><input type="range" id="kd-rec-k" min="1" max="200" step="1" value="20"><output id="kd-rec-kv"></output></div>
+<div class="scroll-x"><svg id="kd-rec-svg" viewBox="0 0 640 280" role="img" aria-label="First-stage recall at K against K for four search-space sizes"></svg></div>
+<div class="kd-leg"><span style="--c:var(--q)">selected search space</span><span style="--c:var(--muted)">other search spaces</span><span style="--c:var(--k)">your K</span></div>
+<div class="readout" id="kd-rec-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> First-stage recall@K from the toy model (235.7), against \(K\) on a log axis. A league season is 380 games and a team season 38 games, at about 2,400 segments per game (2 hours, 3-s stride). The readout also gives the VLM re-rank time for \(K\) candidates with the default re-ranker of Figure 5 (57.7 ms each on one L4).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The curves rise with \(K\) and flatten: going from 10 to 20 candidates helps much more than going from 100 to 200. Switch the search space: the curve for one game is near 1 already at \(K = 10\), while the whole archive needs a much better model (larger \(d\)) to get there. Compare the cost line in the readout: re-ranking 200 candidates would take more than 11 s. In practice you choose the smallest \(K\) whose recall is close to the flat part.</p></details></figure>
+<h3>The VLM re-ranker</h3>
+<p>The re-ranker gets, for each candidate, a few frames and a prompt such as: “Does this clip show: <i>penalty saved by the goalkeeper</i>? Answer yes or no.” We do not let it write an answer. We read the probability of the token “yes” after the prompt, and sort candidates by it. That needs only the <b>prefill</b> (the forward pass over the prompt), not a long decode, so it is compute-bound and easy to batch. (For prefill and decode, see <a href="../vision/the-vlm-inference-path.html">session 196</a>.)</p>
+<p>Take Qwen2.5-VL-3B as the example re-ranker. From its config.json [Certain]: patch size 14, a 2×2 spatial merge, a temporal patch size of 2 (two frames become one group), a vision encoder of 32 layers of width 1,280, and a language model of 36 layers of width 2,048. Counting the weights: about 0.667 billion in the vision encoder and merger, and 2.775 billion in the language model’s linear layers. For \(F\) frames at \(R \times R\) pixels:</p>
+<div class="eq">\[ T_v = \frac{F}{2} \left( \frac{R}{28} \right)^{2}, \qquad n_{\text{patch}} = 4\, T_v \tag{235.8} \]</div>
+<div class="eq">\[ C_{\text{cand}} \approx 2 P_{\text{vit}}\, n_{\text{patch}} + 2 P_{\text{llm}} \,(T_v + T_q), \qquad t_{\text{cand}} = \frac{C_{\text{cand}}}{\eta\, P_{\text{peak}}} \tag{235.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(T_v\)</dt><dd>visual tokens the language model reads; each token covers 2 frames × 28 × 28 pixels</dd>
+<dt>\(n_{\text{patch}}\)</dt><dd>14×14-pixel patches (two frames deep) that the vision encoder processes</dd>
+<dt>\(P_{\text{vit}}, P_{\text{llm}}\)</dt><dd>weights in the linear layers of the vision encoder and the language model</dd>
+<dt>\(T_q\)</dt><dd>text tokens of the prompt and query (we use 64)</dd>
+<dt>\(C_{\text{cand}}\)</dt><dd>FLOPs to score one candidate; “2 × weights × tokens” is the usual forward cost, ignoring attention (small here, as the vision encoder mostly uses windowed attention) [Likely]</dd></dl>
+<div class="worked"><div class="wt">Worked example: the cost of one candidate</div>
+<p>8 frames at 448×448: \(T_v = 4 \times 16^2 = 1{,}024\) tokens, \(n_{\text{patch}} = 4{,}096\). Encoder \(2 \times 0.667 \times 10^9 \times 4{,}096 = 5.46\) TFLOP; language model \(2 \times 2.775 \times 10^9 \times 1{,}088 = 6.05\) TFLOP. Total 11.5 TFLOP, so <b>190 ms</b> at 60.5 TFLOP/s. Twenty candidates: 3.8 s. Too slow for a 1.5 s target.</p>
+<p>4 frames at 336×336: \(T_v = 2 \times 12^2 = 288\), \(n_{\text{patch}} = 1{,}152\). Encoder 1.54 TFLOP, language model 1.96 TFLOP, total 3.49 TFLOP: <b>57.7 ms</b> per candidate, 1.15 s for 20. The frame budget is the first knob, exactly as for images.</p></div>
+
+<h2>Timestamps: from a segment to a moment</h2>
+<p>The re-ranker tells us which segments match. The user wants a start and an end. We refine around the best segment using the per-second scores we stored at ingest (the cosine between the query and each second’s frames, formula 235.3 without pooling). Take a window of about ±15 s around the segment, find the peak second \(p\), and grow a region left and right while the score stays above a fraction \(\alpha\) of the peak:</p>
+<div class="eq">\[ [\hat a, \hat b] = \text{the longest run of seconds } t \ni p \text{ with } s(t) \ge \alpha\, s(p), \qquad \text{clip} = [\hat a - \Delta_{\text{pre}},\ \hat b + \Delta_{\text{post}}] \tag{235.10} \]</div>
+<p>The detected moment \([\hat a, \hat b]\) is what we evaluate with tIoU. The <b>clip</b> we play adds a little context: editors want the build-up before a goal, so we add a pre-roll \(\Delta_{\text{pre}}\) and a short post-roll. If you have labeled data, a trained boundary model does better than a threshold: a per-clip saliency and boundary head (the UniVTG view) or a DETR-style moment decoder as in Moment-DETR, trained on QVHighlights-style data (<a href="../video/temporal-grounding-and-key-moment-detection.html">session 207</a>). The threshold rule is the training-free baseline you start with. It is also what the lab <a href="../video/lab-key-moment-detection.html">session 215</a> built.</p>
+<figure class="fig" id="kd-ts"><div class="fig-body">
+<div class="kd-grid">
+<label for="kd-ts-a">Threshold \(\alpha\) (fraction of the peak)</label><input type="range" id="kd-ts-a" min="0.2" max="0.95" step="0.05" value="0.5"><output id="kd-ts-av"></output>
+<label for="kd-ts-p">Pre-roll \(\Delta_{\text{pre}}\) (s)</label><input type="range" id="kd-ts-p" min="0" max="8" step="1" value="4"><output id="kd-ts-pv"></output></div>
+<div class="scroll-x"><svg id="kd-ts-svg" viewBox="0 0 640 260" role="img" aria-label="Per-second query score over 60 seconds with the true event, the threshold and the detected moment"></svg></div>
+<div class="kd-leg"><span style="--c:var(--k)">true event (20–28 s)</span><span style="--c:var(--q)">detected moment</span><span style="--c:var(--muted)">clip to play (with pre-roll, 2 s post-roll)</span></div>
+<div class="readout" id="kd-ts-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Timestamp refinement on a synthetic per-second score curve (a fixed formula, not real data). The true goal is at 20–28 s. The second bump near 44 s is a replay of the same goal from another camera.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>A low threshold grows the region into the noise; a high one keeps only the core of the event. Around \(\alpha = 0.35\)–0.5 the detected moment is [20, 27] s, tIoU 0.875. At \(\alpha = 0.8\) it shrinks to [22, 26] s and tIoU falls to 0.5. The replay bump is a separate region: the system must recognize it as the same event (same game clock on the scoreboard, a replay graphic, or a shot-type classifier) and either merge it or show it as “replay”, not as a second goal.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>Video time and game time differ. Users say “the 63rd minute”; the video says 1:21:40. The scoreboard OCR gives the mapping. Without it, filters like “second half” or “stoppage time” cannot work, and replays cannot be matched to their original event.</aside>
+
+<h2>Latency and cost math before building</h2>
+<p>Now add up the online path. Everything except the re-ranker is small, so we give each part a fixed <b>budget</b> (a target we will hold the implementation to, not a measurement):</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Stage</th><th>Budget</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Parse the query, extract filters (team and player dictionary, rules)</td><td>5 ms</td><td>a small LLM here would add 100+ ms; use it only when the rules fail</td></tr>
+<tr><td>Text embedding (SigLIP text tower, TensorRT FP16)</td><td>5 ms</td><td>about 11 GFLOP for 64 tokens: tiny</td></tr>
+<tr><td>IVF-PQ search with filters, exact re-score of top results</td><td>20 ms</td><td>CPU or GPU; filtered searches are small</td></tr>
+<tr><td>Transcript search and RRF fusion</td><td>10 ms</td><td>runs in parallel with the vector search in practice</td></tr>
+<tr><td>Fetch candidate frames (stored as JPEG at ingest)</td><td>40 ms</td><td>never decode the source video online</td></tr>
+<tr><td>Timestamp refinement and replay merge</td><td>10 ms</td><td>uses stored per-second scores</td></tr>
+<tr><td><b>Fixed part</b></td><td><b>90 ms</b></td><td></td></tr>
+<tr><td>VLM re-rank of \(N\) candidates</td><td>\(N \cdot t_{\text{cand}}\)</td><td>formula (235.9); the dominant term</td></tr></tbody></table></div>
+<div class="eq">\[ T_{\text{query}} \approx T_{\text{fixed}} + N \cdot t_{\text{cand}} \tag{235.11} \]</div>
+<p>The number of GPUs follows from the work per query. Each query keeps one GPU busy for \(N \cdot t_{\text{cand}}\) seconds. We do not run GPUs at 100%: queues grow without bound near full load and the 95th percentile explodes, so we plan for a target utilization \(u\) (we use 0.6):</p>
+<div class="eq">\[ G = \left\lceil \frac{\lambda \cdot N \cdot t_{\text{cand}}}{u} \right\rceil, \qquad \text{cost per 1,000 queries} = \frac{1000 \cdot N \cdot t_{\text{cand}}}{u \cdot 3600} \cdot \text{price per GPU-hour} \tag{235.12} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\lambda\)</dt><dd>peak queries per second</dd>
+<dt>\(N\)</dt><dd>candidates re-ranked per query (the \(K\) of Figure 3)</dd>
+<dt>\(u\)</dt><dd>planned average utilization of each GPU at peak</dd>
+<dt>\(G\)</dt><dd>number of L4s for the re-ranker</dd></dl>
+<div class="worked"><div class="wt">Worked example: the default plan</div>
+<p>Qwen2.5-VL-3B in BF16, 4 frames at 336×336, \(N = 20\): \(t_{\text{cand}} = 57.7\) ms, re-rank 1,154 ms, total \(90 + 1{,}154 = 1{,}244\) ms. Under the 1.5 s target, with about 250 ms left for queueing and variation.</p>
+<p>GPUs at 5 QPS: \(5 \times 1.154 / 0.6 = 9.6\), so <b>10 L4s</b>, within the cap of 12. At an example price of $0.80 per GPU-hour (prices vary by cloud and contract; use yours), one query costs \(1.154 / 0.6 = 1.92\) GPU-seconds, so <b>$0.43 per 1,000 queries</b>. Keeping 10 GPUs up all month costs \(10 \times 720 \times 0.80 = \$5{,}760\).</p>
+<p>Weights: about 3.75 billion parameters in BF16 is 7.5 GB, well within 24 GB, so one L4 holds one re-ranker with room for large batches.</p></div>
+<figure class="fig" id="kd-lat"><div class="fig-body">
+<div class="kd-ctl"><span>Re-ranker:</span><span class="seg" id="kd-lat-m"><button type="button" data-v="3B" aria-pressed="true">Qwen2.5-VL-3B</button><button type="button" data-v="7B" aria-pressed="false">Qwen2.5-VL-7B</button></span><span>Language model in:</span><span class="seg" id="kd-lat-p"><button type="button" data-v="bf16" aria-pressed="true">BF16</button><button type="button" data-v="fp8" aria-pressed="false">FP8</button></span></div>
+<div class="kd-grid">
+<label for="kd-lat-f">Frames per candidate \(F\)</label><input type="range" id="kd-lat-f" min="2" max="16" step="2" value="4"><output id="kd-lat-fv"></output>
+<label for="kd-lat-r">Frame size \(R\) (pixels)</label><input type="range" id="kd-lat-r" min="224" max="672" step="112" value="336"><output id="kd-lat-rv"></output>
+<label for="kd-lat-n">Candidates \(N\)</label><input type="range" id="kd-lat-n" min="1" max="50" step="1" value="20"><output id="kd-lat-nv"></output>
+<label for="kd-lat-q">Peak load (QPS)</label><input type="range" id="kd-lat-q" min="1" max="30" step="1" value="5"><output id="kd-lat-qv"></output>
+<label for="kd-lat-c">Price per GPU-hour ($, example)</label><input type="range" id="kd-lat-c" min="0.3" max="2" step="0.05" value="0.8"><output id="kd-lat-cv"></output></div>
+<div class="scroll-x"><svg id="kd-lat-svg" viewBox="0 0 640 220" role="img" aria-label="Estimated query latency split into the fixed part, the vision encoder and the language model, against the 1.5 second target, and the GPUs needed against the cap"></svg></div>
+<div class="kd-leg"><span style="--c:var(--muted)">fixed stages (90 ms)</span><span style="--c:var(--k)">VLM vision encoder</span><span style="--c:var(--q)">VLM language model (prefill)</span></div>
+<div class="readout" id="kd-lat-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> A latency and cost calculator for the online path on L4s (formulas 235.8–235.12), with \(\eta = 0.5\) of the dense peak (121 TFLOP/s BF16, 242 TFLOP/s FP8), 64 prompt tokens, the vision encoder always in BF16, and target utilization 0.6. Estimates of the mean, not measurements; the 95th percentile must be measured.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Start from the default (1,244 ms, 10 GPUs). Switch to 8 frames at 448: the bar passes 3.8 s and the GPU count passes 30. Switch to the 7B model: about 2.1 s, over budget. FP8 for the language model cuts its part in half (on the L4, an Ada GPU, FP8 tensor cores exist), giving 831 ms at the default settings. Lowering \(N\) to 10 halves both latency and cost, but read Figure 3 first: it also lowers the recall ceiling. Raise the load: latency per query does not change, but the GPU count grows linearly.</p></details></figure>
+<h3>Moving work offline</h3>
+<p>The numbers suggest another option: run the VLM <b>offline</b> on every segment once, write a caption (“Penalty kick; goalkeeper in yellow dives left and saves”), and search captions as text. The prefill alone for 24 million segments at 3.49 TFLOP each is about 385 GPU-hours at 60.5 TFLOP/s, plus the caption decoding. That is a one-time cost a little smaller than two days of the 10 online re-rankers (480 GPU-hours). Captions make many queries cheap, but they only contain what the caption model chose to say; a query about a detail it skipped (“the ball hits both posts”) still needs the online, query-specific re-ranker. A good design uses both: captions and transcripts as extra first-stage lists in RRF, and the online re-ranker on a small \(N\).</p>
+<aside class="note numbers side"><span class="nt">Numbers</span>Other knobs, from formulas (235.8)–(235.12): split the \(N\) candidates over 2 GPUs to halve latency at the same cost; cache results of popular queries (“all goals today”); skip the re-ranker when the first-stage margin between rank 1 and rank 2 is large; answer pure event-type queries (“all red cards”) from the event feed with no model at all.</aside>
+
+<h2>The algorithms and the code</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: ingest one game (offline)</div><ol>
+<li><b>input:</b> video file, game metadata (teams, date, competition), event feed if available</li>
+<li>decode with the hardware decoder; keep 2 frames per second; store one JPEG per second for the re-ranker</li>
+<li>detect shot boundaries; read the scoreboard clock every second (OCR); flag replay shots</li>
+<li>embed every kept frame with the image tower (TensorRT engine, FP16, batch 64) <span class="c">// formula (235.6) for the cost</span></li>
+<li>cut segments of \(w\) seconds with stride \(s\), snapped to shot boundaries; mean-pool and normalize <span class="c">// (235.1), (235.3)</span></li>
+<li>transcribe the commentary; align transcript and event feed to video time with the clock map</li>
+<li>write segment vectors (PQ codes) with metadata to the index version \(v\); write transcripts to the keyword index; store the 2-fps frame embeddings on disk for the per-second scores</li>
+<li>run validation: number of segments, clock coverage, a few known events must be found</li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: answer one query (online)</div><ol>
+<li><b>input:</b> query text, optional filters; index version \(v\)</li>
+<li>extract filters from the text (teams, players, season, half) with a dictionary; merge with explicit filters</li>
+<li>\(\mathbf{t}_q \leftarrow\) text embedding of the query (same model version \(v\) as the index)</li>
+<li>list A \(\leftarrow\) IVF-PQ top 200 within the filters, re-scored with exact FP16 vectors</li>
+<li>list B \(\leftarrow\) keyword search over transcripts and event feed within the filters</li>
+<li>candidates \(\leftarrow\) top \(N\) by RRF over lists A and B <span class="c">// (235.4)</span></li>
+<li>fetch 4 stored frames per candidate; VLM scores \(p(\text{yes})\) for all \(N\) in one batch <span class="c">// (235.8), (235.9)</span></li>
+<li>for the top results: refine \([\hat a, \hat b]\) from per-second scores; merge replays by game clock <span class="c">// (235.10)</span></li>
+<li><b>return</b> moments (game, start, end, clip with pre-roll, score), and log every stage’s time and output</li></ol></div>
+<p>The PyTorch program below runs the whole pipeline on a fake half of football: synthetic frame embeddings with three events and a replay, segments and mean pooling, search, RRF fusion with a fake transcript, threshold refinement, tIoU, and the re-rank budget. It is deterministic; the printed values are shown in the comments.</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+<span class="kw2">import</span> torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+D, FPS, DUR = 64, 2, 1800                 <span class="cm"># embedding size, sampled frames per second, a 30-minute half</span>
+
+<span class="cm"># 1) a fake broadcast: frame embeddings = camera noise + event "concepts" during the events</span>
+concepts = {e: F.normalize(torch.randn(D), dim=0) <span class="kw2">for</span> e <span class="kw2">in</span> ["goal", "corner", "yellow card"]}
+truth = {"goal": (600, 608), "corner": (300, 306), "yellow card": (1210, 1215)}
+frames = 0.35 * torch.randn(DUR * FPS, D) + F.normalize(torch.randn(D), dim=0)    <span class="cm"># shared "pitch" look</span>
+<span class="kw2">for</span> e, (s, t) <span class="kw2">in</span> truth.items():
+    frames[s * FPS:t * FPS] += 1.2 * concepts[e]
+frames[700 * FPS:706 * FPS] += 0.8 * concepts["goal"]        <span class="cm"># a replay of the goal, weaker and shorter</span>
+frames = F.normalize(frames, dim=-1)
+
+<span class="cm"># 2) segments: window w, stride s, mean pooling then L2-normalize (formulas 235.1 and 235.3)</span>
+w, s = 6, 3
+starts = torch.arange(0, DUR - w + 1, s)
+seg = torch.stack([frames[a * FPS:(a + w) * FPS].mean(0) <span class="kw2">for</span> a <span class="kw2">in</span> starts.tolist()])
+seg = F.normalize(seg, dim=-1)
+print("segments:", len(starts))                               <span class="cm"># 599 = (1800 - 6) // 3 + 1</span>
+
+<span class="cm"># 3) query: a "text embedding" near the concept (a real system uses the SigLIP text tower)</span>
+q = F.normalize(concepts["goal"] + 0.6 * torch.randn(D) / math.sqrt(D), dim=0)
+sim = seg @ q                                                  <span class="cm"># exact search; IVF-PQ at archive scale</span>
+top = sim.topk(5).indices
+print("top segment starts:", starts[top].tolist())            <span class="cm"># [600, 603, 702, 699, 597]: 702 and 699 are the replay</span>
+
+<span class="cm"># 4) fuse with a transcript list by reciprocal rank fusion (formula 235.4)</span>
+asr_hits = [598, 601, 604, 700]                               <span class="cm"># seconds where commentary says "goal"</span>
+asr_rank = {}
+<span class="kw2">for</span> r, t <span class="kw2">in</span> enumerate(asr_hits):
+    j = int(torch.argmin((starts - t).abs()))
+    asr_rank.setdefault(j, r + 1)
+vis_rank = {int(j): r + 1 <span class="kw2">for</span> r, j <span class="kw2">in</span> enumerate(sim.argsort(descending=True)[:50])}
+rrf = {j: sum(1 / (60 + rk[j]) <span class="kw2">for</span> rk <span class="kw2">in</span> (vis_rank, asr_rank) <span class="kw2">if</span> j <span class="kw2">in</span> rk)
+       <span class="kw2">for</span> j <span class="kw2">in</span> set(vis_rank) | set(asr_rank)}
+fused = sorted(rrf, key=rrf.get, reverse=True)[:5]
+print("fused starts:", [int(starts[j]) <span class="kw2">for</span> j <span class="kw2">in</span> fused])     <span class="cm"># [600, 603, 597, 699, 702]</span>
+
+<span class="cm"># 5) timestamps: per-second scores around the best segment, threshold at alpha * peak (formula 235.10)</span>
+per_sec = (frames @ q).view(DUR, FPS).mean(1)
+c = int(starts[fused[0]]); lo, hi = max(0, c - 15), min(DUR, c + 21)
+a = per_sec[lo:hi]; p = int(a.argmax()); tau = 0.5 * float(a[p])
+L = p
+<span class="kw2">while</span> L &gt; 0 <span class="kw2">and</span> a[L - 1] &gt;= tau: L -= 1
+R = p
+<span class="kw2">while</span> R &lt; len(a) - 1 <span class="kw2">and</span> a[R + 1] &gt;= tau: R += 1
+st, en = lo + L, lo + R + 1
+<span class="kw2">def</span> tiou(a, b):                                               <span class="cm"># formula 235.2</span>
+    inter = max(0, min(a[1], b[1]) - max(a[0], b[0]))
+    <span class="kw2">return</span> inter / (max(a[1], b[1]) - min(a[0], b[0]))
+print("moment:", (st, en), "tIoU:", round(tiou((st, en), truth["goal"]), 3))   <span class="cm"># (600, 608) tIoU: 1.0</span>
+
+<span class="cm"># 6) the re-rank budget (formulas 235.8, 235.9, 235.12) for a 3B VLM on one L4</span>
+<span class="kw2">def</span> rerank_ms(frames=4, res=336, n=20, p_vit=0.667e9, p_llm=2.775e9, text=64, eta=0.5, peak=121e12):
+    tv = frames / 2 * (res / 28) ** 2                           <span class="cm"># visual tokens after 2x2 merge, 2-frame groups</span>
+    flops = 2 * p_vit * 4 * tv + 2 * p_llm * (tv + text)
+    <span class="kw2">return</span> n * flops / (eta * peak) * 1e3
+ms = rerank_ms()
+print("re-rank ms:", round(ms), " GPUs for 5 QPS at 60% busy:", math.ceil(5 * ms / 1e3 / 0.6))   <span class="cm"># 1154, 10</span></pre>
+<p>Notice what the toy already shows: the replay (starting near 700 s) is in the top 5 twice. Without a replay merge, the user would see the same goal three times.</p>
+
+<h2>Risks, failure modes, and what to measure</h2>
+<p>A design review spends as long on what can go wrong as on the happy path. The table lists the main risks for this system, how each one shows up, and what reduces it.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Risk</th><th>How it shows up</th><th>Mitigation</th></tr></thead><tbody>
+<tr><td>Replays and highlights</td><td>the same goal appears 2–4 times in the top 10</td><td>replay detection (shot type, replay graphics), merge by game clock; SoccerNet-v2 even has a replay grounding task [Certain]</td></tr>
+<tr><td>Celebrations and reactions</td><td>close-ups of players celebrating rank above the event itself</td><td>re-ranker prompt asks for the action, not the reaction; timestamp step anchors on the action</td></tr>
+<tr><td>Commentary delay</td><td>transcript-based moments start 5–20 s late</td><td>use transcripts for candidates only; place the start from frames</td></tr>
+<tr><td>Ambiguous queries</td><td>“best goal”, “crazy moment”: no visual meaning</td><td>map to popularity or editor tags; ask a follow-up; do not let the VLM guess</td></tr>
+<tr><td>Fine-grained identity</td><td>“Haaland header” returns any header</td><td>player names come from the event feed, jersey numbers or the transcript, not from the frame embedding</td></tr>
+<tr><td>Domain shift</td><td>works on the main league, fails on women’s league, youth games, another sport, night games, low-resolution feeds</td><td>slice the test set by competition, camera and resolution; report each slice</td></tr>
+<tr><td>Model upgrade</td><td>new text tower with old segment vectors gives nonsense</td><td>versioned indexes; re-embed, compare on the test set, then switch</td></tr>
+<tr><td>Latency tails</td><td>p95 far above the mean when the re-ranker batch is large or GPUs are busy</td><td>plan utilization at 0.6; cap \(N\); a timeout that returns first-stage results</td></tr>
+<tr><td>VLM failure modes</td><td>always says “yes”, prefers the first candidate in a batch, or is fooled by on-screen text</td><td>calibrate \(p(\text{yes})\) on labeled pairs; score candidates independently; check with blind (text-only) baselines</td></tr>
+<tr><td>Rights and privacy</td><td>video from some competitions may not be stored or shown</td><td>rights metadata as an index filter, enforced on the server</td></tr></tbody></table></div>
+<h3>Measure each stage, not only the end</h3>
+<p>The end-to-end hit rate is roughly a product of stage success rates. For a query to succeed, the right moment must be in the first-stage list, the re-ranker must move it into the top 10, and the timestamp must be good:</p>
+<div class="eq">\[ P(\text{success}) \approx \text{R@}K_{\text{stage 1}} \times P(\text{top 10} \mid \text{in candidates}) \times P(\text{tIoU} \ge 0.5 \mid \text{found}) \tag{235.13} \]</div>
+<p>With example values 0.93, 0.90 and 0.85, the product is 0.71. Each factor looks fine; the system does not. And when the end number is bad, only per-stage numbers tell you which stage to fix. So we log and measure:</p>
+<ul>
+<li><b>Offline quality:</b> first-stage recall@\(K\) (the ceiling); re-ranker nDCG@10 and Hit@10 on the candidates; timestamp R1@IoU=0.5 and the mean start error in seconds; duplicate rate in the top 10. All on a fixed test set of real queries with labeled spans, split by query type, competition and camera (<a href="../video/evaluating-video-understanding.html">session 213</a>).</li>
+<li><b>Online behavior:</b> click-through and “clip used in an edit” rates; reformulated queries (the user did not find it); zero-result queries.</li>
+<li><b>System:</b> p50, p95 and p99 latency per stage; GPU utilization; queue length; cost per 1,000 queries; ingest lag after the final whistle; decoder throughput.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>When asked “how do you know it works?”, name the test set first (who labels it, how many queries, which slices), then the stage metrics, then the online metrics. Mention that a VLM re-ranker can look good on a test set made from its own outputs; the test set must be labeled independently.</aside>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>What changes in the design</th></tr></thead><tbody>
+<tr><td>Broadcaster archive search for editors</td><td>this page; filters and accuracy matter more than cost per query</td></tr>
+<tr><td>Fan-facing highlight search in a sports app</td><td>much higher QPS: cache popular queries, lower \(N\), more offline captions</td></tr>
+<tr><td>Automatic highlight reels</td><td>no query: score every segment for importance (saliency), then pick and order the best moments (<a href="../video/temporal-grounding-and-key-moment-detection.html">session 207</a>)</td></tr>
+<tr><td>Coaching and scouting tools</td><td>tactical queries (“high press after a goal kick”) need tracking data and player positions, not only frames (<a href="../video/video-object-segmentation-and-tracking-from-vos.html">session 204</a>)</td></tr>
+<tr><td>Content moderation and rights checks</td><td>near-duplicate search instead of text search (<a href="../video/video-fingerprinting-and-near-duplicate-detection.html">session 209</a>)</td></tr>
+<tr><td>Video-RAG assistants (“what happened before the red card?”)</td><td>the same retrieval feeds moments into a Video-LLM that writes an answer (<a href="../video/video-question-answering-and-video-rag.html">session 210</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Choosing the model before the requirements.</b> A 7B re-ranker with 8 frames looks great in a notebook and needs 55 L4s at 5 QPS (Figure 5).</li>
+<li><b>Running the VLM over the whole archive per query.</b> Expensive work belongs offline, or on a small candidate set.</li>
+<li><b>Re-ranking without measuring first-stage recall.</b> If the right moment is not in the top \(K\), no re-ranker can fix it; tune the first stage and the filters first.</li>
+<li><b>Stride equal to the window.</b> Events that fall across two windows get tIoU as low as 0.33 for a 6-s event (Figure 2). Overlap by about half.</li>
+<li><b>Using commentary time as the moment time.</b> Commentary is late; place the start from frames.</li>
+<li><b>Mixing embedding model versions in one index.</b> Vectors from different models are not comparable.</li>
+<li><b>Decoding source video online.</b> Store the frames the re-ranker needs at ingest; online, read JPEGs.</li>
+<li><b>Planning GPUs at 100% utilization.</b> The mean latency looks fine; the 95th percentile does not.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Walk me through your design for sports key-moment search.<span class="lvl">basic</span></summary><div class="ans">Two paths. Offline, per game: decode, sample 2 frames per second, detect shots and read the game clock, embed frames with a SigLIP-style model, pool them into overlapping 6-s segments, transcribe commentary, and write PQ-compressed vectors with metadata (game, teams, half, clock) to a versioned index plus a keyword index. Online, per query: extract filters, embed the text, search the vector and keyword indexes within the filters, fuse with RRF, re-rank the top 20 with a small VLM by \(p(\text{yes})\), refine start and end from per-second scores, merge replays by game clock, and return clips with pre-roll. Then give latency, cost and metrics.</div></details>
+<details class="qa"><summary>How do you choose the segment window and stride?<span class="lvl">core</span></summary><div class="ans">Start from the typical event length. The window should be about that length so one vector describes one event, and the stride about half the window so every event overlaps some window well: with 6-s events, \(w = 6\), \(s = 3\) gives a worst-case best tIoU of 0.60 and an average of 0.79, while \(s = 6\) has a worst case of 0.33. The cost is index size, which grows as \(1/s\): 24 million segments for 20,000 hours at \(s = 3\). Snap windows to shot boundaries, and keep per-frame embeddings on disk for the timestamp step.</div></details>
+<details class="qa"><summary>Why retrieve-then-re-rank, and how do you choose the number of candidates?<span class="lvl">core</span></summary><div class="ans">The embedding search is cheap enough for millions of segments but cannot read the query and the frames together; a VLM can, but costs about 58 ms per candidate on an L4 in our setting. The cascade gets the VLM’s accuracy for the price of a few candidates. The first stage’s recall@K is the ceiling of the whole system, so measure it as a function of \(K\) and pick the smallest \(K\) near the flat part of the curve, then check that \(K \cdot t_{\text{cand}}\) fits the latency budget and the GPU count fits the cost cap.</div></details>
+<details class="qa"><summary>Estimate the VLM re-rank latency for Qwen2.5-VL-3B on one L4.<span class="lvl">core</span></summary><div class="ans">Visual tokens: \(F/2 \cdot (R/28)^2\); with 4 frames at 336, 288 tokens and 1,152 encoder patches. FLOPs: \(2 \times 0.667\text{B} \times 1{,}152 = 1.54\) T for the encoder and \(2 \times 2.775\text{B} \times 352 = 1.96\) T for the language model, 3.49 TFLOP in total. At half of the 121 TFLOP/s dense BF16 peak, 57.7 ms per candidate, so 1.15 s for 20. With 8 frames at 448 it would be 190 ms per candidate and 3.8 s for 20. Only prefill is needed because we read \(p(\text{yes})\) instead of generating text.</div></details>
+<details class="qa"><summary>The index does not fit on one GPU. What do you do?<span class="lvl">core</span></summary><div class="ans">24 million 768-d vectors are 36.9 GB in FP16. Options: product quantization (96 bytes per vector, 2.5 GB with ids) inside an IVF index, with exact re-scoring of the top few hundred from FP16 vectors on disk or in CPU memory; run the ANN search on CPU, since filtered searches are small; shard by season or competition. Also reduce \(N\): metadata filters shrink each search to a few thousand or tens of thousands of segments.</div></details>
+<details class="qa"><summary>How do you handle replays?<span class="lvl">core</span></summary><div class="ans">A goal is typically shown live and then replayed from other cameras, sometimes several times, and every replay matches the query. Detect replays (shot-type classifier, replay transition graphics, a frozen or missing scoreboard clock) at ingest and mark those segments. At query time, merge results that map to the same game-clock time, keep the live one as the main result and attach replays as alternative angles. Measure the duplicate rate in the top 10.</div></details>
+<details class="qa"><summary>How do you produce precise timestamps?<span class="lvl">core</span></summary><div class="ans">Retrieval returns a segment, which is only as precise as the stride. Around it, use stored per-second scores: find the peak, grow a region while the score stays above a fraction of the peak, and report it; then add pre-roll for playback. On the synthetic curve of Figure 4, \(\alpha = 0.5\) gives [20, 27] for a true [20, 28], tIoU 0.875. With labeled data, train a boundary model (saliency plus boundary regression, or a Moment-DETR-style decoder). Use the scoreboard clock to report game time and to align with event feeds.</div></details>
+<details class="qa"><summary>How do you evaluate the system before launch?<span class="lvl">core</span></summary><div class="ans">Build a test set of a few hundred real queries from editors, with labeled spans, independent of the system’s own outputs, sliced by query type, competition, camera and resolution. Measure first-stage recall@K, re-ranker Hit@10 and nDCG@10, timestamp R1@IoU=0.5 and start error, duplicate rate, and per-stage p50/p95 latency under a load test at the peak QPS. Their product approximates end-to-end success (0.93 × 0.90 × 0.85 = 0.71 in our example), which shows which stage to improve.</div></details>
+<details class="qa"><summary>You upgrade the embedding model. What breaks and how do you roll it out?<span class="lvl">advanced</span></summary><div class="ans">Old segment vectors and new text vectors live in different spaces, so mixing them gives meaningless scores. Build a new index version by re-embedding the whole archive (about 23 L4-hours of encoder compute for SigLIP-B at 2 frames per second, plus decoding, which is often the real limit), evaluate both versions on the test set and on a shadow share of traffic, then switch atomically. Keep the old index until the new one is proven. The text tower and the index must always carry the same version id.</div></details>
+<details class="qa"><summary>A product manager now wants live games searchable within one minute. What changes?<span class="lvl">advanced</span></summary><div class="ans">Ingest becomes streaming: decode the live feed continuously, embed frames as they arrive (cheap: about 4 s of GPU per video-hour), and append segments to a small in-memory index for live games that is searched together with the main index, then merged into it after the game. Shot detection and segmenting must work on a sliding buffer; transcripts arrive in chunks; replays of a live goal arrive seconds later and must be merged as they come. Offline captioning can run later. Re-ranking is unchanged.</div></details>
+<details class="qa"><summary>Why TensorRT on the L4, and what are the pitfalls?<span class="lvl">advanced</span></summary><div class="ans">TensorRT fuses layers and picks the fastest kernels for the exact GPU, and it supports FP16 and, on an Ada GPU like the L4, FP8; TensorRT-LLM provides batching and the KV cache for the language part. Pitfalls: engines are specific to one GPU model and TensorRT version, so build them on L4s in CI; dynamic shapes need optimization profiles that cover your batch sizes and frame sizes; check that the engine’s outputs match the PyTorch model on a test batch (especially after FP8); and check that your exact VLM version is supported before you commit. [Likely]</div></details>
+<details class="qa"><summary>Should the VLM caption every segment offline instead of re-ranking online?<span class="lvl">advanced</span></summary><div class="ans">It is a trade-off. Captioning 24 million segments is a one-time cost of about 385 L4-hours for prefill at our settings plus decoding, a little less than two days of the online fleet, and it turns many queries into cheap text search. But captions only contain what the caption model wrote; queries about other details still need a query-specific look at the frames. Use captions as an extra list in the first stage, and keep a small online re-ranker for the final order.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Your archive is 500 hours. With \(w = 8\) s and \(s = 4\) s, how many segments are there, and how much memory do flat FP16 vectors with \(d = 768\) need?</li>
+<li>With formulas (235.8) and (235.9), compute the per-candidate time for Qwen2.5-VL-3B with 8 frames at 448×448 in BF16.</li>
+<li>Load grows to 12 QPS. With \(N = 10\), 4 frames at 336, 3B in BF16 and \(u = 0.6\), how many L4s do you need?</li>
+<li>First-stage recall@20 is 0.93, the re-ranker puts 90% of found moments in the top 10, and 85% of those have tIoU ≥ 0.5. What is the end-to-end success rate? Which stage would you improve first, and why?</li>
+<li>A 6-s event, a 6-s window. What is the worst-case best tIoU with stride 6 s, and with stride 3 s? Check with Figure 2.</li>
+<li>How many L4-seconds per day does it take to embed 100 new hours of video with SigLIP-B/16 at 2 frames per second? What part of ingest is more likely to be the bottleneck?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(500 \times 3600 / 4 = 450{,}000\) segments; \(450{,}000 \times 768 \times 2 = 0.69\) GB. It fits on one GPU; no PQ needed at this size. 2. \(T_v = 4 \times 16^2 = 1{,}024\), \(n_{\text{patch}} = 4{,}096\); FLOPs \(= 5.46 + 6.05 = 11.5\) T; at 60.5 TFLOP/s, 190 ms. 3. \(t_{\text{cand}} = 57.7\) ms, so 0.577 GPU-s per query; \(12 \times 0.577 / 0.6 = 11.5\), so 12 L4s, at the cap. 4. \(0.93 \times 0.90 \times 0.85 = 0.71\). Look at the per-stage numbers on failures; the cheapest gains are usually the first stage (filters, \(K\), transcript fusion) because it caps everything, and the timestamp step, which is cheap to improve with a trained boundary model. 5. Stride 6: \(3/9 = 0.33\) when the event starts in the middle of a window. Stride 3: \(4.5/7.5 = 0.60\). 6. \(100 \times 4.1 \approx 413\) s, about 7 minutes of one L4. Decoding is more likely the bottleneck, since the decoder must process about 90,000 frames per hour of 25-fps video, 12.5 times the frames that are embedded.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Start with numbers: query types, load, latency (1.5 s at p95), accuracy (Hit@10, tIoU), cost (12 L4s) and fixed hardware (L4 + TensorRT).</li>
+<li>Expensive work offline once per video (decode, embed, transcribe, index); online only cheap search plus a VLM re-ranker on a few candidates.</li>
+<li>Window and stride set the best possible tIoU and the index size (235.1, 235.2): 6-s windows with a 3-s stride give 24 million segments for 20,000 hours; PQ fits them in 2.5 GB.</li>
+<li>First-stage recall@K is the ceiling (235.7); metadata filters raise it more cheaply than anything else.</li>
+<li>The re-ranker dominates latency and cost (235.8–235.12): 57.7 ms per candidate for a 3B VLM with 4 frames at 336, so 1.24 s per query and 10 L4s at 5 QPS.</li>
+<li>Replays, late commentary, ambiguous queries and model upgrades are the main risks; measure each stage separately because end-to-end success is their product (235.13).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ N \approx \frac{3600 H}{s}, \quad T_v = \frac{F}{2}\Big(\frac{R}{28}\Big)^2, \quad t_{\text{cand}} = \frac{2 P_{\text{vit}} \cdot 4T_v + 2 P_{\text{llm}}(T_v + T_q)}{\eta P}, \quad G = \Big\lceil \frac{\lambda N t_{\text{cand}}}{u} \Big\rceil \]</div>
+<h2 class="plain" id="capstone-design-sports-key-moment-search-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 9: Video-Language Models</li><li>Lei et al. (2021). <a href="https://arxiv.org/abs/2107.09609" target="_blank" rel="noopener">QVHighlights: Detecting Moments and Highlights in Videos via Natural Language Queries</a></li><li>Luo et al. (2021). <a href="https://arxiv.org/abs/2104.08860" target="_blank" rel="noopener">CLIP4Clip: An Empirical Study of CLIP for End to End Video Clip Retrieval</a></li><li>Lei et al. (2021). <a href="https://arxiv.org/abs/2107.09609" target="_blank" rel="noopener">QVHighlights: Detecting Moments and Highlights in Videos via Natural Language Queries</a></li><li>Luo et al. (2021). <a href="https://arxiv.org/abs/2104.08860" target="_blank" rel="noopener">CLIP4Clip: An Empirical Study of CLIP for End to End Video Clip Retrieval</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 9: Video-Language Models</li><li>Zhai et al. (2023). <a href="https://arxiv.org/abs/2303.15343" target="_blank" rel="noopener">Sigmoid Loss for Language Image Pre-Training</a></li><li>Johnson et al. (2017). <a href="https://arxiv.org/abs/1702.08734" target="_blank" rel="noopener">Billion-scale similarity search with GPUs</a></li><li>Jégou et al. (2011). <a href="https://scholar.google.com/scholar?q=&amp;quot;Product Quantization for Nearest Neighbor Search&amp;quot;" target="_blank" rel="noopener">Product Quantization for Nearest Neighbor Search</a></li><li>Souček &amp; Lokoč (2020). <a href="https://scholar.google.com/scholar?q=&amp;quot;TransNet V2: An effective deep network architecture for fast shot transition detection&amp;quot;" target="_blank" rel="noopener">TransNet V2: An effective deep network architecture for fast shot transition detection</a></li><li>Radford et al. (2022). <a href="https://arxiv.org/abs/2212.04356" target="_blank" rel="noopener">Robust Speech Recognition via Large-Scale Weak Supervision</a></li><li>Bai et al. (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;Qwen2.5-VL Technical Report&amp;quot;" target="_blank" rel="noopener">Qwen2.5-VL Technical Report</a></li><li>Cormack, Clarke &amp; Buettcher (2009). <a href="https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf" target="_blank" rel="noopener">Reciprocal Rank Fusion outperforms Condorcet and individual Rank Learning Methods</a></li><li>NVIDIA (2023). <a href="https://www.nvidia.com/en-us/data-center/l4/" target="_blank" rel="noopener">NVIDIA L4 Tensor Core GPU (product page and datasheet)</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/deeplearning/tensorrt/" target="_blank" rel="noopener">TensorRT documentation</a></li><li>NVIDIA (code). <a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">TensorRT-LLM</a></li><li>Deliège et al. (2021). <a href="https://arxiv.org/abs/2011.13367" target="_blank" rel="noopener">SoccerNet-v2: A Dataset and Benchmarks for Holistic Understanding of Broadcast Soccer Videos</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../capstone/dissect-a-modern-open-model.html"><small>Previous · session 234</small>Dissect a modern open model</a><span class="next"><small>Next · session 236, planned</small>capstone build</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="capstone-design-sports-key-moment-search"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmt=(v,d)=>v.toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
+
+/* ---------- Figure 1: architecture stepper ---------- */
+(function(){
+ const svg=$("#kd-arch-svg");if(!svg)return;const info=$("#kd-arch-info");
+ const OFF=[["Decode and","sample frames"],["Shots, clock,","segments"],["Embed frames","(SigLIP, TRT)"],["Transcript and","event feed"],["Index","(IVF-PQ + meta)"]];
+ const ON=[["Query and","filters"],["Embed text,","vector search"],["Fuse with","keywords (RRF)"],["VLM re-rank","top N"],["Timestamps,","merge replays"],["Results","with clips"]];
+ const ox=i=>80+i*155,oy=78,nx=i=>66+i*129.6,ny=232,ow=128,nw=114;
+ const T=[
+  "Two paths. Top row: ingest, run once per game. Bottom row: the query path, run for every request. The only link between them is the index. Press Next to walk through each box.",
+  "<b>Decode and sample.</b> The L4’s 4 hardware video decoders (NVDEC) decode the broadcast. We keep 2 frames per second for embedding and store one JPEG per second for the re-ranker. A 25-fps hour means 90,000 decoded frames for 7,200 kept ones, so decoding often limits ingest speed.",
+  "<b>Shots, clock, segments.</b> A shot detector (TransNet V2) finds camera cuts; scoreboard OCR maps video time to game time; replay shots are flagged. Windows of 6 s with a 3-s stride, snapped to cuts: about 2,400 segments for a 2-hour broadcast.",
+  "<b>Embed frames.</b> The SigLIP-B/16 image tower runs as a TensorRT FP16 engine: about 34.7 GFLOP per frame, 250 TFLOP per video-hour, so about 4.1 s of one L4 per video-hour. The 12 frame vectors of each segment are mean-pooled and normalized (235.3).",
+  "<b>Transcript and event feed.</b> Speech recognition (for example Whisper) turns the commentary into timed text; the league’s event feed lists goals and cards. Both are aligned to video time with the clock map and go into a keyword index and into segment metadata.",
+  "<b>Index.</b> IVF-PQ with 96 bytes plus an 8-byte id per segment: 2.50 GB for 24.0 million segments. FP16 vectors stay on disk for exact re-scoring. Each index carries the embedding model version.",
+  "<b>Query and filters.</b> A dictionary of teams, players and competitions plus rules turns “Haaland headers last season” into filters and a cleaned text query. Budget: 5 ms.",
+  "<b>Embed text, vector search.</b> The SigLIP text tower (TensorRT, 5 ms) embeds the query with the same model version as the index. IVF-PQ returns the top 200 inside the filters, re-scored exactly (20 ms).",
+  "<b>Fuse with keywords.</b> Transcript and event-feed hits are merged with the vector hits by reciprocal rank fusion, k = 60 (10 ms). The top N = 20 go to the re-ranker. Their stored frames are fetched (40 ms).",
+  "<b>VLM re-rank.</b> Qwen2.5-VL-3B reads 4 stored frames at 336×336 (288 visual tokens) and the query, and we read the probability of “yes”. 3.49 TFLOP, so 57.7 ms per candidate on an L4 at η = 0.5: 1,154 ms for 20. This is the dominant cost of the whole online path.",
+  "<b>Timestamps, merge replays.</b> Around each hit, per-second scores are thresholded at α × peak to find start and end (235.10); replays of the same event are merged by game clock; pre-roll is added for playback (10 ms).",
+  "<b>Results.</b> Moments with game, start, end, clip and score. Estimated mean latency: 90 ms of fixed stages + 1,154 ms of re-ranking = <b>1,244 ms</b>, under the 1.5-s target; 10 L4s at 5 QPS."];
+ function box(cx,cy,w,lab,cls){return `<g class="kd-box${cls}"><rect x="${cx-w/2}" y="${cy-26}" width="${w}" height="52" rx="10"/><text x="${cx}" y="${cy-4}" font-size="13" font-weight="700">${lab[0]}</text><text x="${cx}" y="${cy+14}" font-size="12.5">${lab[1]}</text></g>`;}
+ function draw(k){
+  let g=`<defs><marker id="kd-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+  g+=`<text x="16" y="28" font-size="13" font-weight="700" fill="var(--k)" font-family="var(--sans)">OFFLINE: once per game</text><text x="16" y="182" font-size="13" font-weight="700" fill="var(--q)" font-family="var(--sans)">ONLINE: once per query</text>`;
+  for(let i=0;i<4;i++)g+=`<line x1="${ox(i)+ow/2}" y1="${oy}" x2="${ox(i+1)-ow/2-2}" y2="${oy}" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#kd-ah)"/>`;
+  for(let i=0;i<5;i++)g+=`<line x1="${nx(i)+nw/2}" y1="${ny}" x2="${nx(i+1)-nw/2-2}" y2="${ny}" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#kd-ah)"/>`;
+  g+=`<path d="M${ox(4)} ${oy+26} V150 H${nx(1)} V${ny-28}" fill="none" stroke="var(--muted)" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#kd-ah)"/><text x="${(ox(4)+nx(1))/2}" y="144" text-anchor="middle" font-size="12" fill="var(--muted)" font-family="var(--sans)">search the index</text>`;
+  OFF.forEach((l,i)=>g+=box(ox(i),oy,ow,l,k===i+1?" off":""));
+  ON.forEach((l,i)=>g+=box(nx(i),ny,nw,l,k===i+6?" on":""));
+  svg.innerHTML=g;info.innerHTML=T[k];}
+ B.stepper({n:T.length,prev:$("#kd-arch-prev"),next:$("#kd-arch-next"),play:$("#kd-arch-play"),label:$("#kd-arch-lab"),ms:3600,onStep:draw});
+})();
+
+/* ---------- Figure 2: window, stride and best tIoU ---------- */
+(function(){
+ const svg=$("#kd-seg-svg");if(!svg)return;const iL=$("#kd-seg-L"),iw=$("#kd-seg-w"),is=$("#kd-seg-s"),io=$("#kd-seg-o"),info=$("#kd-seg-info");
+ function bestW(Lv,w,s,o){let best=0,bk=0;const k0=Math.floor((o-w)/s)-1,k1=Math.ceil((o+Lv)/s)+1;
+  for(let k=k0;k<=k1;k++){const a=k*s,b=a+w;const inter=Math.max(0,Math.min(b,o+Lv)-Math.max(a,o));const uni=Math.max(b,o+Lv)-Math.min(a,o);const v=inter/uni;if(v>best+1e-12){best=v;bk=k;}}
+  return [best,bk];}
+ function draw(){
+  if(+is.value>+iw.value)is.value=iw.value;
+  const Lv=+iL.value,w=+iw.value,s=+is.value,of=+io.value;
+  $("#kd-seg-Lv").value=Lv+" s";$("#kd-seg-wv").value=w+" s";$("#kd-seg-sv").value=s+" s";$("#kd-seg-ov").value=(of*s).toFixed(1)+" s";
+  const n=600;let sum=0,mn=1,ok=0;for(let i=0;i<n;i++){const v=bestW(Lv,w,s,(i+0.5)/n*s)[0];sum+=v;mn=Math.min(mn,v);if(v>=0.5)ok++;}
+  const mean=sum/n;
+  // top: timeline
+  const span=Math.max(24,Lv+2*w+2*s),base=Math.floor((span/2-Lv/2)/s)*s,o=base+of*s;
+  const X=t=>30+t/span*580;const [bv,bk]=bestW(Lv,w,s,o);
+  const rows=Math.min(5,Math.ceil(w/s));let g=`<line x1="30" y1="132" x2="610" y2="132" stroke="var(--muted)"/>`;
+  for(let t=0;t<=span;t+=Math.max(2,Math.ceil(span/12/2)*2))g+=`<text x="${X(t)}" y="146" text-anchor="middle" class="svgs" font-size="11">${t}</text>`;
+  g+=`<rect x="${X(o)}" y="12" width="${X(o+Lv)-X(o)}" height="16" rx="3" fill="var(--k)" opacity=".85"/><text x="${X(o+Lv)+6}" y="25" class="svgs" font-size="11.5">event</text>`;
+  const kmin=Math.ceil(-w/s),kmax=Math.floor(span/s);
+  for(let k=kmin;k<=kmax;k++){const a=k*s,b=a+w;const x1=X(Math.max(0,a)),x2=X(Math.min(span,b));if(x2<=x1)continue;const r=((k%rows)+rows)%rows;const y=40+r*17;const isb=k===bk;
+   g+=`<rect x="${x1}" y="${y}" width="${x2-x1}" height="12" rx="3" fill="${isb?"var(--q)":"var(--muted)"}" opacity="${isb?0.95:0.35}"/>`;}
+  g+=`<text x="610" y="${40+rows*17+12}" text-anchor="end" class="svgs" font-size="11.5">time (s); best window tIoU = ${bv.toFixed(3)}</text>`;
+  // bottom: best tIoU vs offset
+  const PX=u=>60+u*540,PY=v=>282-v*100;
+  g+=`<path d="M60 182 V282 H600" fill="none" stroke="var(--muted)"/>`;[0,0.5,1].forEach(v=>g+=`<text x="54" y="${PY(v)+4}" text-anchor="end" class="svgs" font-size="11">${v}</text>`);
+  g+=`<line x1="60" y1="${PY(0.5)}" x2="600" y2="${PY(0.5)}" stroke="var(--rule)" stroke-dasharray="4 4"/><line x1="60" y1="${PY(mean)}" x2="600" y2="${PY(mean)}" stroke="var(--k)" stroke-dasharray="6 4"/>`;
+  let d="";for(let i=0;i<=160;i++){const u=i/160;d+=(i?"L":"M")+PX(u).toFixed(1)+" "+PY(bestW(Lv,w,s,u*s)[0]).toFixed(1);}
+  g+=`<path d="${d}" fill="none" stroke="var(--q)" stroke-width="2.5"/><circle cx="${PX(of)}" cy="${PY(bv)}" r="5" fill="var(--k)"/>`;
+  g+=`<text x="330" y="176" text-anchor="middle" class="svgs" font-size="11.5">best tIoU against the event start (0 to one stride); dashed orange = average</text>`;
+  svg.innerHTML=g;
+  const N=20000*3600/s;
+  info.innerHTML=`Best tIoU over all event positions: average <b>${mean.toFixed(3)}</b>, worst <b>${mn.toFixed(3)}</b>; <b>${(100*ok/n).toFixed(0)}%</b> of positions reach tIoU 0.5. Index for 20,000 hours: <b>${fmt(N/1e6,1)} million</b> segments, ${fmt(N*768*2/1e9,1)} GB as FP16 vectors (d = 768), ${fmt(N*104/1e9,2)} GB as PQ codes of 96 bytes plus 8-byte ids.${Math.min(w,Lv)/Math.max(w,Lv)<0.5?" Window and event lengths differ by more than 2×: no single window can reach tIoU 0.5.":""}`;}
+ [iL,iw,is,io].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: first-stage recall@K toy model ---------- */
+(function(){
+ const svg=$("#kd-rec-svg");if(!svg)return;const id=$("#kd-rec-d"),ik=$("#kd-rec-k"),seg=$("#kd-rec-m"),info=$("#kd-rec-info");
+ const Ms=[24000000,912000,91200,2400];let M=91200;const KMAX=200;
+ function erfc(x){const z=Math.abs(x),t=1/(1+0.5*z);const r=t*Math.exp(-z*z-1.26551223+t*(1.00002368+t*(0.37409196+t*(0.09678418+t*(-0.18628806+t*(0.27886807+t*(-1.13520398+t*(1.48851587+t*(-0.82215223+t*0.17087277)))))))));return x>=0?r:2-r;}
+ const Q=x=>0.5*erfc(x/Math.SQRT2);const phi=x=>Math.exp(-x*x/2)/Math.sqrt(2*Math.PI);
+ function curve(d,Mv){const G=400,lo=d-6,dx=12/G;const acc=new Float64Array(KMAX+1);
+  for(let i=0;i<G;i++){const x=lo+(i+0.5)*dx;const lam=Mv*Q(x);const wgt=phi(x-d)*dx;let term=Math.exp(-lam),c=0;
+   for(let K=1;K<=KMAX;K++){c+=term;term*=lam/K;acc[K]+=wgt*Math.min(1,c);}}
+  return acc;}
+ const X=K=>60+Math.log(K)/Math.log(KMAX)*550,Y=r=>240-r*210;
+ function draw(){const d=+id.value,K=+ik.value;$("#kd-rec-dv").value=d.toFixed(1);$("#kd-rec-kv").value=K;
+  let g=`<path d="M60 30 V240 H610" fill="none" stroke="var(--muted)"/>`;
+  [0,0.25,0.5,0.75,1].forEach(v=>g+=`<line x1="60" y1="${Y(v)}" x2="610" y2="${Y(v)}" stroke="var(--rule)" stroke-width=".7"/><text x="54" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11">${v}</text>`);
+  [1,2,5,10,20,50,100,200].forEach(k=>g+=`<text x="${X(k)}" y="256" text-anchor="middle" class="svgs" font-size="11">${k}</text>`);
+  g+=`<text x="335" y="274" text-anchor="middle" class="svgs" font-size="12">candidates K (log scale)</text>`;
+  let cur=null;const labs=[];
+  Ms.forEach(Mv=>{const a=curve(d,Mv);if(Mv===M)cur=a;let p="";for(let k=1;k<=KMAX;k++)p+=(k>1?"L":"M")+X(k).toFixed(1)+" "+Y(a[k]).toFixed(1);
+   g+=`<path d="${p}" fill="none" stroke="${Mv===M?"var(--q)":"var(--muted)"}" stroke-opacity="${Mv===M?1:0.55}" stroke-width="${Mv===M?3:1.8}"/>`;
+   const lab=Mv>=1e6?(Mv/1e6).toFixed(Mv>=1e7?0:2).replace(/\.?0+$/,"")+"M":(Mv/1e3).toFixed(1).replace(/\.0$/,"")+"k";labs.push([Y(a[KMAX])+4,lab]);});
+  labs.sort((u,v)=>u[0]-v[0]);for(let i=1;i<labs.length;i++)labs[i][0]=Math.max(labs[i][0],labs[i-1][0]+12);
+  labs.forEach(([y,l])=>g+=`<text x="613" y="${y}" class="svgs" font-size="10.5">${l}</text>`);
+  g+=`<line x1="${X(K)}" y1="30" x2="${X(K)}" y2="240" stroke="var(--k)" stroke-dasharray="4 4"/><circle cx="${X(K)}" cy="${Y(cur[K])}" r="6" fill="var(--k)"/>`;
+  svg.innerHTML=g;
+  const ms=K*57.7;
+  info.innerHTML=`Search space M = <b>${M.toLocaleString("en-US")}</b> segments, separation d = ${d.toFixed(1)}: R@${K} = <b>${cur[K].toFixed(3)}</b> (R@10 = ${cur[10].toFixed(3)}, R@50 = ${cur[50].toFixed(3)}). Re-ranking ${K} candidates at 57.7 ms each: <b>${ms>=1000?(ms/1000).toFixed(2)+" s":Math.round(ms)+" ms"}</b> of one L4.`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;M=+b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ [id,ik].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: timestamp refinement ---------- */
+(function(){
+ const svg=$("#kd-ts-svg");if(!svg)return;const ia=$("#kd-ts-a"),ip=$("#kd-ts-p"),info=$("#kd-ts-info");
+ const sf=t=>0.15+0.7*Math.exp(-(((t-23.5)/3.2)**2))+0.45*Math.exp(-(((t-44)/2.5)**2))+0.06*Math.sin(1.3*t)+0.04*Math.sin(3.7*t+1);
+ const S=Array.from({length:60},(_,t)=>sf(t+0.5));const TA=20,TB=28;
+ function region(a,lo,hi,alpha){let p=lo;for(let i=lo;i<hi;i++)if(a[i]>a[p])p=i;const tau=alpha*a[p];let l=p;while(l>lo&&a[l-1]>=tau)l--;let r=p;while(r<hi-1&&a[r+1]>=tau)r++;return {p,tau,st:l,en:r+1};}
+ const X=t=>50+t/60*570,Y=v=>205-v*190;
+ function draw(){const al=+ia.value,pre=+ip.value;$("#kd-ts-av").value=al.toFixed(2);$("#kd-ts-pv").value=pre+" s";
+  const m=region(S,0,60,al);const inter=Math.max(0,Math.min(m.en,TB)-Math.max(m.st,TA)),uni=Math.max(m.en,TB)-Math.min(m.st,TA),ti=inter/uni;
+  const c0=Math.max(0,m.st-pre),c1=Math.min(60,m.en+2);const rp=region(S,35,60,al);
+  let g=`<rect x="${X(TA)}" y="15" width="${X(TB)-X(TA)}" height="190" fill="var(--k)" opacity=".22"/><rect x="${X(m.st)}" y="15" width="${X(m.en)-X(m.st)}" height="190" fill="var(--q)" opacity=".16"/>`;
+  g+=`<path d="M50 15 V205 H620" fill="none" stroke="var(--muted)"/>`;[0,0.5,1].forEach(v=>g+=`<text x="44" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11">${v}</text>`);
+  for(let t=0;t<=60;t+=10)g+=`<text x="${X(t)}" y="221" text-anchor="middle" class="svgs" font-size="11">${t}</text>`;
+  g+=`<text x="335" y="252" text-anchor="middle" class="svgs" font-size="12">video time (s)</text>`;
+  let d="";S.forEach((v,t)=>d+=(t?"L":"M")+X(t+0.5).toFixed(1)+" "+Y(v).toFixed(1));
+  g+=`<path d="${d}" fill="none" stroke="var(--ink)" stroke-width="2"/>`+S.map((v,t)=>`<circle cx="${X(t+0.5).toFixed(1)}" cy="${Y(v).toFixed(1)}" r="2.4" fill="${t>=m.st&&t<m.en?"var(--q)":"var(--muted)"}"/>`).join("");
+  g+=`<line x1="50" y1="${Y(m.tau)}" x2="620" y2="${Y(m.tau)}" stroke="var(--q)" stroke-dasharray="5 4"/><text x="618" y="${Y(m.tau)-5}" text-anchor="end" class="svgs" font-size="11">τ = α × peak</text>`;
+  g+=`<path d="M${X(c0)} 232 V238 H${X(c1)} V232" fill="none" stroke="var(--muted)" stroke-width="2.5"/><text x="${X(rp.p+0.5)}" y="${Y(S[rp.p])-10}" text-anchor="middle" class="svgs" font-size="11">replay</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`Peak at second ${m.p} (score ${S[m.p].toFixed(3)}), threshold τ = <b>${m.tau.toFixed(3)}</b>. Detected moment <b>[${m.st}, ${m.en}] s</b>, tIoU with the true [${TA}, ${TB}] s = <b>${ti.toFixed(3)}</b>. Clip to play: [${c0}, ${c1}] s. The replay forms its own region [${rp.st}, ${rp.en}] s; merge it with the goal by game clock, do not show it as a second goal.`;}
+ [ia,ip].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 5: latency and cost calculator ---------- */
+(function(){
+ const svg=$("#kd-lat-svg");if(!svg)return;const iF=$("#kd-lat-f"),iR=$("#kd-lat-r"),iN=$("#kd-lat-n"),iQ=$("#kd-lat-q"),iC=$("#kd-lat-c"),sm=$("#kd-lat-m"),sp=$("#kd-lat-p"),info=$("#kd-lat-info");
+ const MOD={"3B":{vit:0.667e9,llm:2.775e9,emb:0.311e9},"7B":{vit:0.675e9,llm:6.525e9,emb:1.090e9}};
+ let model="3B",prec="bf16";const FIX=90,ETA=0.5,TQ=64,U=0.6,TARGET=1500,CAP=12;
+ function calc(){const F=+iF.value,Rs=+iR.value,N=+iN.value,q=+iQ.value,price=+iC.value;const m=MOD[model];
+  const tv=F/2*(Rs/28)**2,np=4*tv;const enc=2*m.vit*np,llm=2*m.llm*(tv+TQ);
+  const te=enc/(ETA*121e12),tl=llm/(ETA*(prec==="fp8"?242e12:121e12)),tc=te+tl;
+  const rer=N*tc*1000,tot=FIX+rer,gs=N*tc,G=Math.ceil(q*gs/U-1e-9),cost=1000*gs/U/3600*price,month=G*720*price;
+  const wgb=(2*m.vit+(prec==="fp8"?1:2)*m.llm+2*m.emb)/1e9;
+  return {F,Rs,N,q,price,tv,te,tl,tc,rer,tot,G,cost,month,wgb,flops:(enc+llm)/1e12};}
+ function draw(){const r=calc();$("#kd-lat-fv").value=r.F;$("#kd-lat-rv").value=r.Rs+" px";$("#kd-lat-nv").value=r.N;$("#kd-lat-qv").value=r.q;$("#kd-lat-cv").value="$"+r.price.toFixed(2);
+  const maxT=Math.max(2000,r.tot*1.08),X=v=>150+v/maxT*460;
+  let g=`<text x="10" y="52" class="svgs" font-size="12.5">query latency</text>`;
+  const eN=r.N*r.te*1000,lN=r.N*r.tl*1000;
+  g+=`<rect x="150" y="34" width="${X(FIX)-150}" height="28" fill="var(--muted)" opacity=".7"/><rect x="${X(FIX)}" y="34" width="${X(FIX+eN)-X(FIX)}" height="28" fill="var(--k)"/><rect x="${X(FIX+eN)}" y="34" width="${X(FIX+eN+lN)-X(FIX+eN)}" height="28" fill="var(--q)"/>`;
+  g+=`<line x1="${X(TARGET)}" y1="22" x2="${X(TARGET)}" y2="74" stroke="var(--bad)" stroke-width="2" stroke-dasharray="5 3"/><text x="${X(TARGET)}" y="16" text-anchor="middle" class="svgs" font-size="11">target 1.5 s</text>`;
+  g+=`<text x="${Math.min(X(r.tot)+6,560)}" y="${X(r.tot)+6>560?92:53}" class="svgs" font-size="12" font-weight="700">${fmt(r.tot,0)} ms</text>`;
+  [0,500,1000,1500,2000,3000,4000,6000,8000,12000,16000,24000,32000].filter(v=>v<=maxT&&(maxT<5000||v%1000===0)&&(maxT<12000||v%4000===0)).forEach(v=>g+=`<text x="${X(v)}" y="88" text-anchor="middle" class="svgs" font-size="10.5">${v>=1000?(v/1000)+" s":v}</text>`);
+  const maxG=Math.max(15,r.G*1.1),XG=v=>150+v/maxG*460;
+  g+=`<text x="10" y="142" class="svgs" font-size="12.5">L4s at peak load</text><rect x="150" y="124" width="${XG(r.G)-150}" height="28" fill="${r.G>CAP?"var(--bad)":"var(--good,var(--q))"}" opacity=".8"/>`;
+  g+=`<line x1="${XG(CAP)}" y1="112" x2="${XG(CAP)}" y2="164" stroke="var(--bad)" stroke-width="2" stroke-dasharray="5 3"/><text x="${XG(CAP)}" y="106" text-anchor="middle" class="svgs" font-size="11">cap 12</text>`;
+  g+=`<text x="${Math.min(XG(r.G)+6,560)}" y="${XG(r.G)+6>560?180:143}" class="svgs" font-size="12" font-weight="700">${r.G} GPUs</text>`;
+  g+=`<text x="10" y="205" class="svgs" font-size="11.5">weights on one L4: ${r.wgb.toFixed(1)} GB of 24 GB</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`Per candidate: T<sub>v</sub> = <b>${fmt(r.tv,0)}</b> visual tokens, ${r.flops.toFixed(2)} TFLOP, <b>${(r.tc*1000).toFixed(1)} ms</b> (encoder ${(r.te*1000).toFixed(1)} ms, language model ${(r.tl*1000).toFixed(1)} ms). Re-rank of ${r.N}: ${fmt(r.rer,0)} ms; query total ≈ <b>${fmt(r.tot,0)} ms</b> ${r.tot<=TARGET?"(under":"(<b style='color:var(--bad)'>over</b>"} the 1,500 ms target). At ${r.q} QPS and 60% utilization: <b>${r.G} L4s</b> ${r.G<=CAP?"(within":"(<b style='color:var(--bad)'>above</b>"} the cap of 12). Cost: <b>$${r.cost.toFixed(2)}</b> per 1,000 queries; $${fmt(r.month,0)} per 30-day month for the fleet.`;}
+ [sm,sp].forEach(s=>s.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;if(s===sm)model=b.dataset.v;else prec=b.dataset.v;s.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();}));
+ [iF,iR,iN,iQ,iC].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>
