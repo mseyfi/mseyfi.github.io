@@ -12,7 +12,7 @@ B.fmt=(x,d)=>Number(x).toFixed(d==null?2:d);
 /* theme */
 const root=document.documentElement;const th=B.store.get("llmvlm.theme",null);if(th)root.setAttribute("data-theme",th);
 document.addEventListener("click",e=>{const t=e.target.closest("[data-theme-toggle]");if(!t)return;
- const dark=root.getAttribute("data-theme")?root.getAttribute("data-theme")==="dark":matchMedia("(prefers-color-scheme: dark)").matches;
+ const dark=root.getAttribute("data-theme")!=="light";
  const n=dark?"light":"dark";root.setAttribute("data-theme",n);B.store.set("llmvlm.theme",n);});
 /* math */
 B.mathReady=new Promise(res=>{B._mres=res;});

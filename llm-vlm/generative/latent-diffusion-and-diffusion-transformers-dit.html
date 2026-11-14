@@ -1,0 +1,522 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Latent diffusion and diffusion transformers (DiT) · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../generative/index.html">Generative models</a><span class="sep">/</span><span>Session 228</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="latent-diffusion-and-diffusion-transformers-dit">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="latent-diffusion-and-diffusion-transformers-dit" data-session="latent-diffusion-and-diffusion-transformers-dit" style="--tc:var(--t9)"><header class="chap-head"><div class="chap-kicker"><span class="num">228</span><span>Track 9: Generative models · session 7 of 12</span></div><h1 class="chap-title">Latent diffusion and diffusion transformers (DiT)</h1><p class="chap-sub">Modern image and video generators do not run diffusion on pixels. They first compress the image with an autoencoder and run diffusion on the small latent, then decode once at the end. This session builds latent diffusion step by step, compares the U-Net backbone with the Diffusion Transformer (DiT), explains patchify and adaLN-Zero conditioning, and reads the DiT scaling results with real numbers.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Diffusion 1 and 2 (sessions 225 and 226), variational autoencoders (session 223), the Vision Transformer (session 164); basic PyTorch</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why diffusing in a compressed latent space is cheaper and better: perceptual vs semantic compression, and how to count the 48× saving of the Stable Diffusion autoencoder</li><li>How the autoencoder is trained (pixel, perceptual, adversarial and tiny KL losses), why the downsampling factor f = 4 to 8 works best, and why the latent scale 0.18215 matters</li><li>The latent diffusion training and sampling algorithms, and where the encoder, denoiser and decoder each run</li><li>The U-Net backbone with cross-attention to text, and its inductive biases</li><li>The Diffusion Transformer: patchify, the token count T = (I/p)², adaLN and adaLN-Zero conditioning, and the 2C-channel output</li><li>How to estimate the Gflops and parameters of a DiT from its config, and the DiT scaling result: compute, not parameter count, predicts FID</li><li>How DiT led to text-to-image and video transformers (PixArt-α, MM-DiT, spacetime patches)</li></ul></div></header><style>
+.ld-grid{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center;font:500 15px var(--sans)}
+.ld-grid input[type=range]{width:100%}
+.ld-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.ld-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.ld-box rect{fill:var(--card);stroke:var(--rule);stroke-width:1.6;transition:stroke .2s,fill .2s}
+.ld-box.on rect{stroke:var(--k);fill:var(--k-soft)}
+.ld-box text{font-family:var(--sans);text-anchor:middle}
+.ld-arr{fill:none;stroke:var(--muted);stroke-width:1.6}
+.ld-arr.on{stroke:var(--k);stroke-width:2.4}
+.ld-cell{cursor:pointer}
+.ld-pt{cursor:pointer}
+#ld-scale .seg button{padding:5px 10px}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Almost every well-known image and video generator since 2022 does its diffusion in a small <b>latent space</b>, not on pixels. Stable Diffusion, SDXL, PixArt, Stable Diffusion 3, FLUX and Sora all follow this plan. And since 2023, most new ones also replaced the convolutional U-Net with a plain <b>transformer</b>, the Diffusion Transformer (DiT).</p>
+<p>In <a href="../generative/diffusion-1-the-forward-noising-process-and.html">session 225</a> and <a href="../generative/diffusion-2-score-matching-ddim-and-fast.html">session 226</a> we learned to train a network that predicts noise, and to sample by removing noise step by step. Two problems remain. First, cost: a 512×512 RGB image has 786,432 numbers, and the network runs on all of them at every one of tens or hundreds of sampling steps. Second, most of those numbers are tiny details (exact texture, sensor noise) that the eye barely notices but that a pixel-space model must still spend capacity on. This session fixes both. We first <b>compress</b> the image with an autoencoder, then run diffusion on the small code. Then we change the denoiser from a U-Net to a transformer, which brings the scaling rules we know from LLMs to image generation.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “Why diffuse in latent space?”, “What does the VAE in Stable Diffusion do, and what are the latent shapes?”, “How does DiT turn a latent into tokens?”, “What is adaLN-Zero and why the zero?”, “What predicts the quality of a DiT model?”. Each one is answered below with numbers.</aside>
+<p>The two papers behind this session are Rombach et al., <i>High-Resolution Image Synthesis with Latent Diffusion Models</i> (LDM, 2021), and Peebles &amp; Xie, <i>Scalable Diffusion Models with Transformers</i> (DiT, 2022). We will read their key tables with real numbers.</p>
+
+<h2>Step 1: compress first, then diffuse</h2>
+<p>Think about what a generator must learn. Rombach et al. split it into two kinds of work. <b>Perceptual compression</b> removes high-frequency details that are hard to see but expensive to model. <b>Semantic compression</b> is the real creative part: which objects are in the scene, where, and how they relate. A pixel-space diffusion model does both jobs with one network. LDM gives the first job to an <b>autoencoder</b> that is trained once, and the second job to the diffusion model. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>An architect does not draw every brick when designing a house. She works on a floor plan (the latent), and a builder (the decoder) fills in the bricks later in a standard way. The plan is small, so she can try many ideas quickly.</aside>
+<p>The autoencoder has an <b>encoder</b> \(\mathcal{E}\) and a <b>decoder</b> \(\mathcal{D}\). The encoder shrinks the height and width by a <b>downsampling factor</b> \(f\) and outputs \(c\) channels:</p>
+<div class="eq">\[ \mathbf{z}_0 = s \cdot \mathcal{E}(\mathbf{x}) \in \R^{\frac{H}{f} \times \frac{W}{f} \times c}, \qquad \hat{\mathbf{x}} = \mathcal{D}(\mathbf{z}_0 / s) \in \R^{H \times W \times 3} \tag{228.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{x}\)</dt><dd>the image, \(H \times W\) pixels with 3 colors, scaled to \([-1, 1]\)</dd>
+<dt>\(\mathcal{E}, \mathcal{D}\)</dt><dd>the encoder and decoder of the autoencoder; both are convolutional networks, frozen during diffusion training</dd>
+<dt>\(f\)</dt><dd>the downsampling factor: each latent position covers an \(f \times f\) block of pixels</dd>
+<dt>\(c\)</dt><dd>the number of latent channels (4 in Stable Diffusion 1.x and 2.x and SDXL)</dd>
+<dt>\(s\)</dt><dd>a fixed scale factor that makes the latent values have standard deviation near 1 (explained below)</dd>
+<dt>\(\mathbf{z}_0\)</dt><dd>the clean latent: the “data” for the diffusion model</dd></dl>
+<p>The number of values shrinks by</p>
+<div class="eq">\[ \text{compression} = \frac{H \cdot W \cdot 3}{\frac{H}{f} \cdot \frac{W}{f} \cdot c} = \frac{3 f^2}{c} \tag{228.2} \]</div>
+<div class="worked"><div class="wt">Worked example: the Stable Diffusion autoencoder</div>
+<p>Stable Diffusion v1 uses \(f = 8\) and \(c = 4\). [Certain] A 512×512 image has \(512 \cdot 512 \cdot 3 = 786{,}432\) values. Its latent is \(64 \times 64 \times 4 = 16{,}384\) values. The ratio is \(3 \cdot 8^2 / 4 = 48\). For the 256×256 images used by DiT, the latent is \(32 \times 32 \times 4 = 4{,}096\) values instead of \(196{,}608\). Again 48 times fewer.</p>
+<p>Note that the spatial grid shrinks by \(f^2 = 64\), but the channel count grows from 3 to 4. So the latent is not 64 times smaller, “only” 48. Newer autoencoders (SD3, FLUX) keep \(f = 8\) but use \(c = 16\) to keep more detail, which gives \(3 \cdot 64/16 = 12\). [Likely]</p></div>
+<h3>How the autoencoder is trained</h3>
+<p>The autoencoder is a VAE-like network (<a href="../generative/variational-autoencoders-and-latent-spaces.html">session 223</a>) but tuned for sharp reconstructions, much like VQGAN (<a href="../generative/visual-tokenizers-for-generation.html">session 224</a>). Its loss mixes a pixel loss, a <b>perceptual loss</b> (distance between deep features of \(\mathbf{x}\) and \(\hat{\mathbf{x}}\)), a patch-based <b>adversarial loss</b> (a small discriminator that judges local realism), and a tiny regularizer on the latent:</p>
+<div class="eq">\[ \mathcal{L}_{\text{AE}} = \lVert \mathbf{x} - \hat{\mathbf{x}} \rVert_1 + \lambda_{P}\, \mathcal{L}_{\text{perc}}(\mathbf{x}, \hat{\mathbf{x}}) + \lambda_{G}\, \mathcal{L}_{\text{GAN}}(\hat{\mathbf{x}}) + \lambda_{\text{KL}}\, \KL\big(q(\mathbf{z} \mid \mathbf{x}) \,\Vert\, \mathcal{N}(\mathbf{0}, I)\big) \tag{228.3} \]</div>
+<p>The KL weight is very small (about \(10^{-6}\) in the released configs [Likely]). The KL term only stops the latent from drifting to huge values; it does not force the latent to be a nice Gaussian like in a real VAE. LDM also has a second option, a VQ layer instead of the KL term (“VQ-reg”). [Certain]</p>
+<h3>The scale factor \(s\)</h3>
+<p>Because the KL term is so weak, the raw latent has some arbitrary spread. The noise schedule from <a href="../generative/diffusion-1-the-forward-noising-process-and.html">session 225</a> assumes data with a standard deviation near 1: at step \(t\), the signal-to-noise ratio is \(\bar\alpha_t / (1 - \bar\alpha_t)\) times the data variance. If the latent is 5 times too large, every noise level is effectively 25 times weaker than planned. So LDM measures the standard deviation of the latents on a batch of images and multiplies by \(s = 1/\text{std}\). For the Stable Diffusion 1.x VAE, \(s = 0.18215\); for the SDXL VAE, \(s = 0.13025\). [Certain] Forgetting \(s\), or dividing by it twice at decode time, is a classic bug.</p>
+<h3>How much to compress: the factor \(f\)</h3>
+<p>LDM tried \(f \in \{1, 2, 4, 8, 16, 32\}\) on ImageNet. With \(f = 1\) or 2 (almost pixels), training is slow. With \(f = 32\), quality stops improving early: the autoencoder has thrown away detail that no diffusion model can bring back. \(f = 4\) to 16 is the good range, with \(f = 4\) and 8 best overall. After 2 million steps, LDM-8 had an FID about 38 points better than the pixel-space LDM-1. [Certain] FID (Fréchet Inception Distance) compares statistics of deep features of real and generated images; lower is better.</p>
+<p>Figure 1 lets you play with \(H\), \(f\), \(c\) and the patch size \(p\) that the transformer will use later.</p>
+<figure class="fig" id="ld-cost"><div class="fig-body">
+<div class="ld-grid">
+<span>Image size</span><span class="seg" id="ld-cost-h"><button type="button" data-v="256" aria-pressed="true">256</button><button type="button" data-v="512" aria-pressed="false">512</button><button type="button" data-v="1024" aria-pressed="false">1024</button></span>
+<span>Factor \(f\)</span><span class="seg" id="ld-cost-f"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="false">2</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="true">8</button><button type="button" data-v="16" aria-pressed="false">16</button><button type="button" data-v="32" aria-pressed="false">32</button></span>
+<span>Channels \(c\)</span><span class="seg" id="ld-cost-c"><button type="button" data-v="3" aria-pressed="false">3</button><button type="button" data-v="4" aria-pressed="true">4</button><button type="button" data-v="8" aria-pressed="false">8</button><button type="button" data-v="16" aria-pressed="false">16</button></span>
+<span>Patch \(p\)</span><span class="seg" id="ld-cost-p"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="true">2</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="false">8</button></span></div>
+<div class="scroll-x"><svg id="ld-cost-svg" viewBox="0 0 660 250" role="img" aria-label="Image, latent and token grid drawn side by side to scale"></svg></div>
+<div class="readout" id="ld-cost-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> From pixels to latents to transformer tokens. Left: the image. Middle: the latent grid, \(H/f\) on each side, with \(c\) channels stacked behind it. Right: the token grid after cutting the latent into \(p \times p\) patches. The readout counts values, tokens and the size of one attention matrix.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start at the DiT setting (256, \(f = 8\), \(c = 4\), \(p = 2\)): 48× compression and 256 tokens. Now set \(f = 1\): the same transformer on raw pixels would need 16,384 tokens, and each attention matrix would be 4,096 times larger. Set \(c = 16\) to see how modern VAEs trade compression for detail. Try 1024 with \(f = 8\), \(p = 2\): 4,096 tokens, which is why high-resolution DiTs are expensive.</p></details></figure>
+
+<h2>Step 2: diffusion in the latent space</h2>
+<p>Once the autoencoder is frozen, latent diffusion is <b>exactly</b> the DDPM of <a href="../generative/diffusion-1-the-forward-noising-process-and.html">session 225</a>, with \(\mathbf{x}_0\) replaced by \(\mathbf{z}_0\). We add noise, \(\mathbf{z}_t = \sqrt{\bar\alpha_t}\,\mathbf{z}_0 + \sqrt{1 - \bar\alpha_t}\,\varepsilon\), and train the denoiser to predict \(\varepsilon\):</p>
+<div class="eq">\[ \mathcal{L}_{\text{LDM}} = \E_{\mathbf{x},\, y,\, \varepsilon \sim \mathcal{N}(\mathbf{0}, I),\, t} \Big[ \big\lVert \varepsilon - \varepsilon_\theta\big(\mathbf{z}_t,\, t,\, \tau_\phi(y)\big) \big\rVert_2^2 \Big], \qquad \mathbf{z}_0 = s\,\mathcal{E}(\mathbf{x}) \tag{228.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\varepsilon_\theta\)</dt><dd>the denoiser (a U-Net or a DiT); it sees the noisy latent, the step and the condition</dd>
+<dt>\(y\)</dt><dd>the condition: a class label, a text prompt, a depth map, ...</dd>
+<dt>\(\tau_\phi\)</dt><dd>the condition encoder, for example a frozen CLIP text encoder that turns the prompt into a sequence of vectors</dd>
+<dt>\(t\)</dt><dd>the noise step, drawn uniformly from \(1, \dots, 1000\)</dd></dl>
+<p>Nothing about the diffusion math changes. That is the beauty of the design: the autoencoder is a plug-in. You can train it once and reuse it for many diffusion models. DiT, for example, did not train its own autoencoder at all; it used the off-the-shelf Stable Diffusion VAE. [Certain] Sampling also stays the same (DDPM, DDIM, or the fast solvers of <a href="../generative/diffusion-2-score-matching-ddim-and-fast.html">session 226</a>), and only at the very end do we call the decoder once.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: one training step of latent diffusion</div><ol>
+<li><b>input:</b> a batch of images \(\mathbf{x}\) and conditions \(y\); frozen \(\mathcal{E}\), scale \(s\); denoiser \(\varepsilon_\theta\); schedule \(\bar\alpha_1, \dots, \bar\alpha_{1000}\)</li>
+<li>\(\mathbf{z}_0 \leftarrow s \cdot \mathcal{E}(\mathbf{x})\) <span class="c">// no gradient; often pre-computed once for the whole dataset</span></li>
+<li>with probability 0.1, replace \(y\) by the empty condition \(\varnothing\) <span class="c">// enables classifier-free guidance</span></li>
+<li>\(t \sim \text{Uniform}\{1, \dots, 1000\}\), \(\;\varepsilon \sim \mathcal{N}(\mathbf{0}, I)\)</li>
+<li>\(\mathbf{z}_t \leftarrow \sqrt{\bar\alpha_t}\,\mathbf{z}_0 + \sqrt{1 - \bar\alpha_t}\,\varepsilon\)</li>
+<li>\(\mathcal{L} \leftarrow \lVert \varepsilon - \varepsilon_\theta(\mathbf{z}_t, t, \tau_\phi(y)) \rVert^2\) <span class="c">// formula (228.4)</span></li>
+<li>update \(\theta\) with AdamW; update an EMA copy of \(\theta\) <span class="c">// sample with the EMA weights</span></li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: sampling an image with latent diffusion and guidance</div><ol>
+<li><b>input:</b> condition \(y\), guidance scale \(w\), number of steps \(K\), decoder \(\mathcal{D}\), scale \(s\)</li>
+<li>\(\mathbf{z} \sim \mathcal{N}(\mathbf{0}, I)\) with the <b>latent</b> shape, e.g. \(4 \times 64 \times 64\) for a 512×512 image</li>
+<li><b>for</b> \(k = K, \dots, 1\) (steps \(t_K \gt \dots \gt t_1\)):</li>
+<li>&nbsp;&nbsp;\(\hat\varepsilon \leftarrow \varepsilon_\theta(\mathbf{z}, t_k, \varnothing) + w\,\big(\varepsilon_\theta(\mathbf{z}, t_k, y) - \varepsilon_\theta(\mathbf{z}, t_k, \varnothing)\big)\) <span class="c">// classifier-free guidance</span></li>
+<li>&nbsp;&nbsp;\(\mathbf{z} \leftarrow \text{SolverStep}(\mathbf{z}, \hat\varepsilon, t_k, t_{k-1})\) <span class="c">// DDPM, DDIM or DPM-Solver step</span></li>
+<li><b>return</b> \(\mathcal{D}(\mathbf{z} / s)\) <span class="c">// the decoder runs once, at the end</span></li></ol></div>
+<p>Figure 2 walks through both algorithms with the real shapes of a 256×256 DiT.</p>
+<figure class="fig wide" id="ld-pipe"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="ld-pipe-prev">Back</button><button type="button" class="btn primary" id="ld-pipe-play">Play</button><button type="button" class="btn" id="ld-pipe-next">Next</button><span id="ld-pipe-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="ld-pipe-svg" viewBox="0 0 800 280" role="img" aria-label="The latent diffusion pipeline: encoder, noising, denoiser, decoder"></svg></div>
+<div class="readout" id="ld-pipe-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The latent diffusion pipeline for 256×256 images (DiT setting: \(f = 8\), \(c = 4\)). The top row is training; the bottom row is sampling. The highlighted boxes are the ones active at each step.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Notice that the encoder appears only in training and the decoder only in sampling. The denoiser, the expensive part, never sees a pixel. During sampling it runs \(K\) times (twice per step with guidance), while the decoder runs once. This is where the savings of latent diffusion come from.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>The decoder is not free. For a 1024×1024 image, the VAE decoder works at full resolution and can take a noticeable share of the time and much of the peak memory, especially for video. Tiled decoding is a common fix. [Likely]</aside>
+
+<h2>The first backbone: a U-Net with cross-attention</h2>
+<p>The original LDM and all Stable Diffusion 1.x/2.x/XL models use a <b>U-Net</b> as \(\varepsilon_\theta\). A U-Net is a convolutional encoder–decoder. The down path halves the resolution several times (for a 64×64 latent: 64, 32, 16, 8) while adding channels. The up path doubles it back. <b>Skip connections</b> copy features from each down level to the matching up level, so fine details do not have to pass through the small bottleneck. Each level has residual conv blocks; the noise step \(t\) enters every block as an added embedding. At the lower resolutions there are also attention layers.</p>
+<p>The condition enters through <b>cross-attention</b> (<a href="../transformers/self-attention-vs-cross-attention.html">session 20</a>): the queries come from the image features, and the keys and values come from the text vectors \(\tau_\phi(y)\):</p>
+<div class="eq">\[ \text{CrossAttn}(\varphi, \tau) = \softmax\!\left( \frac{(\varphi W_Q)(\tau W_K)^\top}{\sqrt{d}} \right) (\tau W_V) \tag{228.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\varphi\)</dt><dd>the U-Net features at one level, flattened into a list of \(N\) spatial positions, shape \(N \times d_\varphi\)</dd>
+<dt>\(\tau = \tau_\phi(y)\)</dt><dd>the text vectors, shape \(M \times d_\tau\) (77 tokens × 768 for CLIP ViT-L/14 in SD v1)</dd>
+<dt>\(W_Q, W_K, W_V\)</dt><dd>learned projections into a shared width \(d\)</dd></dl>
+<p>Each image position asks “which words are about me?” and pulls in their meaning. Stable Diffusion v1 has an 860M-parameter U-Net and a 123M-parameter CLIP ViT-L/14 text encoder, and works at \(f = 8\). [Certain] SDXL made the U-Net about three times larger, mostly through more attention blocks and a wider cross-attention context from a second text encoder. [Certain]</p>
+<p>The U-Net has strong <b>inductive biases</b>: built-in assumptions about images. Convolutions are local and treat every position the same way, and the multi-scale design matches the fact that images have structure at many sizes. These biases help with little data. But they also make the network a hand-designed object: how many levels, where to put attention, how many channels at each level. Scaling it up is a craft.</p>
+
+<h2>The second backbone: the Diffusion Transformer (DiT)</h2>
+<p>Peebles &amp; Xie asked a simple question: does the denoiser need the U-Net’s image-specific design at all? They took a standard Vision Transformer (<a href="../vision/the-vision-transformer-vit.html">session 164</a>), changed as little as possible, and trained it on latents. The answer was no: with enough compute, the plain transformer is better, and its quality follows a clean scaling rule. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A U-Net is a custom-built machine for one job. A transformer is a general engine. Once people learned how to make the engine bigger in a predictable way (for LLMs), it became easier to just use a bigger engine than to keep tuning the custom machine.</aside>
+<h3>Patchify: from latent to tokens</h3>
+<p>The input is the noisy latent, \(I \times I \times C\) with \(I = 32\) and \(C = 4\) for 256×256 images. DiT cuts it into non-overlapping \(p \times p\) patches, flattens each patch into a vector of \(p^2 C\) numbers, and maps it to width \(d\) with one linear layer. Fixed sine-cosine position embeddings are added. The number of tokens is</p>
+<div class="eq">\[ T = \left( \frac{I}{p} \right)^{2}, \qquad \text{patch vector length} = p^2 C \tag{228.6} \]</div>
+<p>DiT tries \(p \in \{2, 4, 8\}\), giving \(T = 256, 64, 16\). Halving \(p\) multiplies \(T\) by 4 and the compute by at least 4, but leaves the parameter count almost unchanged: only the tiny input and output layers depend on \(p\). [Certain] So the patch size is a pure “compute knob”. Explore the order of the cut in Figure 3.</p>
+<figure class="fig" id="ld-patch"><div class="fig-body">
+<div class="controls"><span style="font:500 15px var(--sans)">Patch size \(p\)</span><span class="seg" id="ld-patch-p"><button type="button" data-v="1" aria-pressed="false">1</button><button type="button" data-v="2" aria-pressed="true">2</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="8" aria-pressed="false">8</button></span></div>
+<div class="scroll-x"><svg id="ld-patch-svg" viewBox="0 0 660 300" role="img" aria-label="An 8 by 8 latent grid with 4 channels cut into patches, and the resulting token sequence"></svg></div>
+<div class="readout" id="ld-patch-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Patchify on a toy 8×8 latent with \(C = 4\) channels (the real DiT latent is 32×32×4). Each patch becomes one token. Click any cell to select its patch: the readout shows the token index and the first values of its \(p^2 C\)-long vector, in the order DiT flattens them (row inside the patch, column inside the patch, then channel).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Tokens are numbered row by row over the patch grid, like reading a page. With \(p = 1\), every latent position is a token of only 4 numbers: 64 tokens. With \(p = 8\), the whole latent is one token of 256 numbers, and attention has nothing to attend to. Unpatchify, at the output, is the exact inverse: the same reshape, run backwards.</p></details></figure>
+<h3>The DiT block and how the condition gets in</h3>
+<p>A DiT block is a standard pre-norm transformer block: LayerNorm, self-attention, residual add, LayerNorm, MLP (width \(4d\), GELU), residual add (<a href="../transformers/the-residual-stream-and-normalization.html">session 22</a>). The question is how to feed in the step \(t\) and the class \(y\). First both become one vector per image:</p>
+<div class="eq">\[ \mathbf{c} = \text{MLP}\big(\text{sinusoid}(t)\big) + E_{\text{class}}[y] \in \R^{d} \tag{228.7} \]</div>
+<p>DiT compared four ways of using \(\mathbf{c}\), all on DiT-XL/2 [Certain]:</p>
+<ol><li><b>In-context:</b> append \(\mathbf{c}\) as two extra tokens, like a [CLS] token. Almost free.</li>
+<li><b>Cross-attention:</b> add a cross-attention layer to each block that attends to \(\mathbf{c}\) (as in the U-Net with text). Costs about 15% more compute.</li>
+<li><b>adaLN:</b> replace the fixed LayerNorm gain and bias by values <b>computed from</b> \(\mathbf{c}\).</li>
+<li><b>adaLN-Zero:</b> adaLN plus a learned gate on each residual branch, initialized to zero.</li></ol>
+<p><b>Adaptive LayerNorm (adaLN)</b> is the same idea as FiLM: normalize the token, then scale and shift it with numbers that depend on the condition. A small network (SiLU then one linear layer) maps \(\mathbf{c}\) to a shift \(\beta\), a scale \(\gamma\), and a gate \(\alpha\), each of size \(d\), separately for the attention branch and the MLP branch (6 vectors per block):</p>
+<div class="eq">\[ \text{adaLN}(\mathbf{h}; \mathbf{c}) = \text{LN}(\mathbf{h}) \odot \big(1 + \gamma(\mathbf{c})\big) + \beta(\mathbf{c}) \tag{228.8} \]</div>
+<div class="eq">\[ \begin{aligned} \mathbf{h} &\leftarrow \mathbf{h} + \alpha_1(\mathbf{c}) \odot \text{Attn}\big(\text{adaLN}_1(\mathbf{h}; \mathbf{c})\big) \\ \mathbf{h} &\leftarrow \mathbf{h} + \alpha_2(\mathbf{c}) \odot \text{MLP}\big(\text{adaLN}_2(\mathbf{h}; \mathbf{c})\big) \end{aligned} \tag{228.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\text{LN}\)</dt><dd>LayerNorm <b>without</b> its own learned gain and bias: subtract the mean, divide by the standard deviation</dd>
+<dt>\(\gamma, \beta\)</dt><dd>per-channel scale and shift, computed from \(\mathbf{c}\); the same for all \(T\) tokens of one image</dd>
+<dt>\(\alpha\)</dt><dd>per-channel gate on the residual branch; its producing layer starts at <b>zero</b></dd>
+<dt>\(\odot\)</dt><dd>element-wise multiplication</dd></dl>
+<p>Why the zero? With \(\alpha = 0\) at the start, every block outputs its input unchanged: the whole network is the identity function. This trick is well known from ResNets (start each residual branch at zero) and makes large models train stably. DiT also zero-initializes the final output layer, so the first prediction is exactly zero. [Certain] Why adaLN instead of cross-attention? The condition is <b>one vector</b> per image, so attending to it adds little; scaling the normalized features is a cheaper and more direct way to say “we are at a high noise level, act accordingly”.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Block design (DiT-XL/2, 400K steps)</th><th>Gflops</th><th>FID-50K, no guidance</th></tr></thead><tbody>
+<tr><td>In-context</td><td>119.4</td><td>35.24</td></tr>
+<tr><td>Cross-attention</td><td>137.6</td><td>26.14</td></tr>
+<tr><td>adaLN</td><td>118.6</td><td>25.21</td></tr>
+<tr><td><b>adaLN-Zero</b></td><td><b>118.6</b></td><td><b>19.47</b></td></tr></tbody></table></div>
+<p>Numbers from Peebles &amp; Xie, Table 4. [Certain] adaLN-Zero is both the cheapest and the best. Figure 4 lets you move the scale, shift and gate on one toy token.</p>
+<div class="worked"><div class="wt">Worked example: adaLN on one token</div>
+<p>Take a token \(\mathbf{h} = (1, 2, 3, 4)\). LayerNorm: mean 2.5, variance 1.25, so \(\text{LN}(\mathbf{h}) = (-1.342, -0.447, 0.447, 1.342)\). Suppose the condition gives \(\gamma = 0.5\) and \(\beta = 0.1\) in every channel. Then formula (228.8) gives \(1.5 \cdot \text{LN}(\mathbf{h}) + 0.1 = (-1.912, -0.571, 0.771, 2.112)\). At a different step \(t\), \(\mathbf{c}\) changes, so \(\gamma\) and \(\beta\) change, and the same weights process the token differently. If the gate \(\alpha = 0\), the block output is \(\mathbf{h} = (1, 2, 3, 4)\) again, whatever the attention or MLP computes.</p></div>
+<figure class="fig" id="ld-ada"><div class="fig-body">
+<div class="ld-grid" style="grid-template-columns:auto 1fr auto">
+<label for="ld-ada-g">scale \(\gamma\)</label><input type="range" id="ld-ada-g" min="-1" max="1" step="0.05" value="0.5"><output id="ld-ada-gv"></output>
+<label for="ld-ada-b">shift \(\beta\)</label><input type="range" id="ld-ada-b" min="-1" max="1" step="0.05" value="0.1"><output id="ld-ada-bv"></output>
+<label for="ld-ada-a">gate \(\alpha\)</label><input type="range" id="ld-ada-a" min="0" max="1" step="0.05" value="0"><output id="ld-ada-av"></output></div>
+<div class="scroll-x"><svg id="ld-ada-svg" viewBox="0 0 660 270" role="img" aria-label="Bar charts of a token before and after adaptive LayerNorm and the gated residual branch"></svg></div>
+<div class="ld-leg"><span style="--c:var(--muted)">input token h</span><span style="--c:var(--q)">adaLN(h) = LN(h)(1+γ)+β</span><span style="--c:var(--v)">branch F(adaLN(h))</span><span style="--c:var(--k)">output h + α·F</span></div>
+<div class="readout" id="ld-ada-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> One adaLN-Zero residual branch on an 8-dimensional toy token. \(F\) is a fixed random layer (\(\tanh\) of a matrix product) that stands in for attention or the MLP. In a real DiT, \(\gamma\), \(\beta\), \(\alpha\) are vectors computed from \(t\) and \(y\); here each slider sets all 8 channels at once.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>With the gate at 0 (its value at initialization), the orange output bars sit exactly on the grey input bars: the block is the identity. Raise the gate and the branch starts to change the token. Move \(\gamma\) to \(-1\): the normalized token is multiplied by 0, so only \(\beta\) passes into the branch, which is how a condition can “switch off” the content of a token at some noise levels.</p></details></figure>
+<h3>The output layer</h3>
+<p>After the last block, a final adaLN and a linear layer map each token back to \(p \times p \times 2C\) numbers, and unpatchify puts them back into the latent grid. Why \(2C\) and not \(C\)? DiT predicts both the noise \(\varepsilon\) (\(C\) channels) and the variance of each reverse step (another \(C\) channels), as in Improved DDPM (Nichol &amp; Dhariwal). The noise part is trained with the simple loss (228.4); the variance part with the full variational bound. [Certain] The Hugging Face config of DiT-XL-2-256 shows exactly this: <code>in_channels: 4</code>, <code>out_channels: 8</code>, <code>patch_size: 2</code>, <code>num_layers: 28</code>, 16 heads of size 72 (so \(d = 1152\)), and <code>norm_type: ada_norm_zero</code>. [Certain]</p>
+
+<h2>Counting the cost of a DiT</h2>
+<p>A DiT is a ViT, so we can count its cost with the same rules as an LLM (<a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a>). Per block, the attention projections have \(4d^2\) weights and the MLP \(8d^2\); every token uses each weight once. The attention scores and the weighted sum add \(2T^2 d\). DiT reports compute in “Gflops” that match multiply-add counts, so per forward pass:</p>
+<div class="eq">\[ \text{Gflops} \approx L \left( 12\, T d^2 + 2\, T^2 d \right) \cdot 10^{-9} \tag{228.10} \]</div>
+<div class="eq">\[ \text{params} \approx L \cdot (12 d^2 + 6 d^2) = 18\, L\, d^2 \tag{228.11} \]</div>
+<p>The extra \(6d^2\) per block is the adaLN layer that maps \(\mathbf{c}\) to six vectors. It runs once per image, not per token, so it adds parameters but almost no compute.</p>
+<div class="worked"><div class="wt">Worked example: DiT-XL/2</div>
+<p>DiT-XL has \(L = 28\), \(d = 1152\); with \(p = 2\), \(T = 256\). Per block: \(12 \cdot 256 \cdot 1152^2 = 4.077 \times 10^9\) for the weights and \(2 \cdot 256^2 \cdot 1152 = 0.151 \times 10^9\) for attention. Times 28 blocks: <b>118.4 Gflops</b>. The paper reports 118.6 (the difference is the patch embedding, output layer and small terms). Parameters: \(18 \cdot 28 \cdot 1152^2 = 668.9\)M in the blocks; with the embeddings and final layer our count is 675.0M, and the paper says 675M (not counting the 84M VAE). [Certain]</p>
+<p>At 512×512 the latent is 64×64, so \(T = 1024\) and the same model needs 524.6 Gflops (formula 228.10 gives 524.3). The pixel-space U-Net ADM needs 1120 Gflops at 256×256 and 1983 at 512×512. [Certain] Sampling with 250 DDPM steps costs \(250 \times 118.6 \approx 29.7\) Tflops per 256×256 image, and twice that with classifier-free guidance.</p></div>
+
+<h2>Scaling behavior of DiT</h2>
+<p>DiT trained 12 models: four sizes (S, B, L, XL) times three patch sizes (8, 4, 2), all for 400K steps at batch 256 with the same recipe (AdamW, constant learning rate \(10^{-4}\), no weight decay, EMA 0.9999). [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model</th><th>Layers \(L\)</th><th>Width \(d\)</th><th>Heads</th><th>Params (our count, 228.11 + extras)</th><th>Gflops at \(p = 4\)</th></tr></thead><tbody>
+<tr><td>DiT-S</td><td>12</td><td>384</td><td>6</td><td>33M</td><td>1.4</td></tr>
+<tr><td>DiT-B</td><td>12</td><td>768</td><td>12</td><td>130M</td><td>5.6</td></tr>
+<tr><td>DiT-L</td><td>24</td><td>1024</td><td>16</td><td>458M</td><td>19.7</td></tr>
+<tr><td>DiT-XL</td><td>28</td><td>1152</td><td>16</td><td>675M</td><td>29.1</td></tr></tbody></table></div>
+<p>Three findings matter [Certain]:</p>
+<ol><li><b>Compute predicts quality.</b> FID falls steadily as Gflops grow, and it does not matter much whether the Gflops come from a bigger model or from smaller patches (more tokens). The paper calls it a strong negative correlation between Gflops and FID.</li>
+<li><b>Parameters alone do not.</b> DiT-XL/8 has about 675M parameters but only 7.39 Gflops, and its FID is 106.41. DiT-S/2 has about 20 times fewer parameters (33M) and 6.06 Gflops, and its FID is 68.40. Smaller patches, which give more tokens per image, matter more than parameters here.</li>
+<li><b>Bigger models use training compute better.</b> At the same total training compute, larger DiTs reach lower FID. And extra sampling steps cannot make up for a small model: “scaling-up sampling compute cannot compensate for a lack of model compute.”</li></ol>
+<figure class="fig" id="ld-scale"><div class="fig-body">
+<div class="controls"><span class="seg" id="ld-scale-m"><button type="button" data-v="S" aria-pressed="false">S</button><button type="button" data-v="B" aria-pressed="false">B</button><button type="button" data-v="L" aria-pressed="false">L</button><button type="button" data-v="XL" aria-pressed="true">XL</button></span><span class="seg" id="ld-scale-p"><button type="button" data-v="8" aria-pressed="false">/8</button><button type="button" data-v="4" aria-pressed="false">/4</button><button type="button" data-v="2" aria-pressed="true">/2</button></span><label class="sl"><input type="checkbox" id="ld-scale-fit" checked> show fit</label></div>
+<div class="scroll-x"><svg id="ld-scale-svg" viewBox="0 0 660 320" role="img" aria-label="FID versus Gflops for twelve DiT models on log axes"></svg></div>
+<div class="ld-leg"><span style="--c:var(--muted)">DiT-S</span><span style="--c:var(--q)">DiT-B</span><span style="--c:var(--v)">DiT-L</span><span style="--c:var(--k)">DiT-XL</span></div>
+<div class="readout" id="ld-scale-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> The 12 DiT models of Peebles &amp; Xie (Table 4): FID-50K without guidance after 400K steps, against forward Gflops, both on log scales. Lines connect the same model size across patch sizes. The dashed line is our least-squares fit of \(\log \text{FID}\) on \(\log \text{Gflops}\). Click a point or use the buttons.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Points line up along one falling line regardless of color: that is “compute predicts FID”. Compare points that sit at similar Gflops but come from different models, such as B/2 (23.0 Gflops, FID 43.47), L/4 (19.7, 45.64) and XL/4 (29.1, 43.01): very different shapes, similar quality. The readout also checks formula (228.10) against the paper for the selected model.</p></details></figure>
+<div class="worked"><div class="wt">Reading the fit</div>
+<p>A least-squares line through the 12 points in log-log space has slope \(-0.365\) and correlation \(-0.94\). So, in this range, every 10× more forward compute divides FID by about \(10^{0.365} \approx 2.3\). This is our fit on the paper’s 12 numbers, not a law from the paper, and it holds only for this recipe and training length.</p></div>
+<p>With long training (7M steps) and classifier-free guidance at scale 1.5, DiT-XL/2 reached FID 2.27 on ImageNet 256×256, better than LDM-4-G (3.60) and pixel-space ADM. At 512×512 it reached 3.04 after 3M steps. [Certain] Guidance trades diversity for quality, so the guided model has higher precision (0.83) and lower recall (0.57) than the unguided one (0.67 and 0.67). [Certain] More on this trade-off in <a href="../generative/index.html#row-guidance-and-conditioning-classifier-guidance-classifier-free" title="Guidance and conditioning: classifier guidance, classifier-free guidance, ControlNet (planned)">session 227</a>.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>If asked “why did the field move from U-Nets to DiTs?”, give three reasons: (1) quality follows compute in a predictable way, so you can plan big runs like LLM runs; (2) one standard block, so all the transformer tooling (FlashAttention, tensor parallelism, FSDP) works unchanged; (3) tokens make it easy to mix modalities: text tokens, image tokens and video tokens in one sequence.</aside>
+
+<h2>After DiT: text, video and joint models</h2>
+<p>DiT was class-conditional: the condition was one label. Text needs more than one vector, so later models put cross-attention back in. PixArt-\(\alpha\) adds a cross-attention layer to each DiT block for T5 text features and reports training at about 10.8% of the time of Stable Diffusion v1.5 (675 vs 6,250 A100 GPU-days). [Certain] Stable Diffusion 3 and FLUX go further: text tokens and image tokens are processed in <b>one joint attention</b> over both (MM-DiT), still with adaLN for the timestep, and they train with rectified flow instead of DDPM (<a href="../generative/index.html#row-flow-matching-and-rectified-flow" title="Flow matching and rectified flow (planned)">session 229</a>). [Likely] U-ViT (Bao et al., 2022) independently showed that a ViT with long skip connections works as a diffusion backbone. [Certain]</p>
+<p>For video, the same recipe extends naturally. A video autoencoder compresses both space and time, and the latent is cut into <b>spacetime patches</b> (for example \(2 \times 2\) in space and a few frames in time), giving one long token sequence. OpenAI described Sora this way: a diffusion transformer on spacetime patches of a compressed video latent. [Likely] Because tokens are just a sequence, the same model can train on clips of different lengths, sizes and aspect ratios.</p>
+
+<h2>A minimal DiT in PyTorch</h2>
+<p>The code below builds a small DiT with patchify, adaLN-Zero blocks, the zero-initialized output, and trains it on toy “latents” (one fixed 4×8×8 pattern per class plus noise) with the DDPM loss. Then it samples with DDIM and classifier-free guidance, and checks that each sample is closest to the pattern of its class. In a real model, <code>z0</code> would be <code>s * vae.encode(x)</code> and the samples would go through <code>vae.decode(z / s)</code>. It runs on a CPU in about 15 seconds.</p>
+<pre class="code"><span class="kw2">import</span> math, torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="kw2">def</span> patchify(z, p):                        <span class="cm"># (B, C, H, W) -> (B, T, p*p*C), formula (228.6)</span>
+    B, C, H, W = z.shape
+    z = z.reshape(B, C, H // p, p, W // p, p).permute(0, 2, 4, 3, 5, 1)
+    <span class="kw2">return</span> z.reshape(B, (H // p) * (W // p), p * p * C)
+
+<span class="kw2">def</span> unpatchify(x, p, C, H, W):             <span class="cm"># (B, T, p*p*C) -> (B, C, H, W)</span>
+    x = x.reshape(x.shape[0], H // p, W // p, p, p, C).permute(0, 5, 1, 3, 2, 4)
+    <span class="kw2">return</span> x.reshape(x.shape[0], C, H, W)
+
+<span class="kw2">def</span> t_embed(t, dim=256):                   <span class="cm"># sinusoidal timestep features</span>
+    half = dim // 2
+    freqs = torch.exp(-math.log(10000) * torch.arange(half) / half)
+    a = t[:, None].float() * freqs[None]
+    <span class="kw2">return</span> torch.cat([torch.cos(a), torch.sin(a)], dim=-1)
+
+<span class="kw2">def</span> modulate(x, shift, scale):             <span class="cm"># formula (228.8)</span>
+    <span class="kw2">return</span> x * (1 + scale[:, None]) + shift[:, None]
+
+<span class="kw2">class</span> DiTBlock(nn.Module):
+    <span class="kw2">def</span> __init__(self, d, heads):
+        super().__init__()
+        self.n1 = nn.LayerNorm(d, elementwise_affine=False, eps=1e-6)
+        self.n2 = nn.LayerNorm(d, elementwise_affine=False, eps=1e-6)
+        self.attn = nn.MultiheadAttention(d, heads, batch_first=True)
+        self.mlp = nn.Sequential(nn.Linear(d, 4 * d), nn.GELU(approximate="tanh"), nn.Linear(4 * d, d))
+        self.ada = nn.Sequential(nn.SiLU(), nn.Linear(d, 6 * d))
+        nn.init.zeros_(self.ada[1].weight); nn.init.zeros_(self.ada[1].bias)   <span class="cm"># adaLN-Zero</span>
+
+    <span class="kw2">def</span> forward(self, x, c):                <span class="cm"># formula (228.9)</span>
+        b1, g1, a1, b2, g2, a2 = self.ada(c).chunk(6, dim=-1)
+        h = modulate(self.n1(x), b1, g1)
+        x = x + a1[:, None] * self.attn(h, h, h, need_weights=False)[0]
+        x = x + a2[:, None] * self.mlp(modulate(self.n2(x), b2, g2))
+        <span class="kw2">return</span> x
+
+<span class="kw2">class</span> TinyDiT(nn.Module):
+    <span class="kw2">def</span> __init__(self, I=8, C=4, p=2, d=64, depth=4, heads=4, n_cls=10):
+        super().__init__()
+        self.I, self.C, self.p = I, C, p
+        T = (I // p) ** 2
+        self.x_emb = nn.Linear(p * p * C, d)
+        self.pos = nn.Parameter(0.02 * torch.randn(1, T, d))
+        self.t_mlp = nn.Sequential(nn.Linear(256, d), nn.SiLU(), nn.Linear(d, d))
+        self.y_emb = nn.Embedding(n_cls + 1, d)              <span class="cm"># last id = "no class" (for CFG)</span>
+        self.blocks = nn.ModuleList([DiTBlock(d, heads) <span class="kw2">for</span> _ <span class="kw2">in</span> range(depth)])
+        self.n_out = nn.LayerNorm(d, elementwise_affine=False, eps=1e-6)
+        self.ada_out = nn.Sequential(nn.SiLU(), nn.Linear(d, 2 * d))
+        self.out = nn.Linear(d, p * p * C)                   <span class="cm"># real DiT: p*p*2C (noise + variance)</span>
+        <span class="kw2">for</span> m <span class="kw2">in</span> (self.ada_out[1], self.out):                <span class="cm"># zero init: output starts at 0</span>
+            nn.init.zeros_(m.weight); nn.init.zeros_(m.bias)
+
+    <span class="kw2">def</span> forward(self, z, t, y):
+        x = self.x_emb(patchify(z, self.p)) + self.pos       <span class="cm"># (B, T, d)</span>
+        c = self.t_mlp(t_embed(t)) + self.y_emb(y)           <span class="cm"># (B, d), formula (228.7)</span>
+        <span class="kw2">for</span> blk <span class="kw2">in</span> self.blocks:
+            x = blk(x, c)
+        b, g = self.ada_out(c).chunk(2, dim=-1)
+        x = self.out(modulate(self.n_out(x), b, g))          <span class="cm"># (B, T, p*p*C)</span>
+        <span class="kw2">return</span> unpatchify(x, self.p, self.C, self.I, self.I) <span class="cm"># predicted noise</span>
+
+<span class="cm"># DDPM schedule as in DiT: 1000 steps, linear betas from 1e-4 to 2e-2</span>
+betas = torch.linspace(1e-4, 2e-2, 1000)
+abar = torch.cumprod(1 - betas, dim=0)
+
+model = TinyDiT()
+print(<span class="st">"params:"</span>, sum(q.numel() <span class="kw2">for</span> q <span class="kw2">in</span> model.parameters()))        <span class="cm"># 331536</span>
+z = torch.randn(2, 4, 8, 8)
+print(<span class="st">"round trip:"</span>, torch.equal(unpatchify(patchify(z, 2), 2, 4, 8, 8), z))  <span class="cm"># True</span>
+print(<span class="st">"output at init:"</span>, model(z, torch.tensor([10, 500]), torch.tensor([3, 10])).abs().max().item())  <span class="cm"># 0.0</span>
+
+<span class="cm"># toy "latents": each of 10 classes is a fixed 4x8x8 pattern plus a little noise</span>
+protos = torch.randn(10, 4, 8, 8)
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=0.0)
+<span class="kw2">for</span> step <span class="kw2">in</span> range(1001):
+    y = torch.randint(0, 10, (64,))
+    z0 = protos[y] + 0.1 * torch.randn(64, 4, 8, 8)       <span class="cm"># real LDM: z0 = s * vae.encode(x)</span>
+    y_in = torch.where(torch.rand(64) &lt; 0.1, torch.full_like(y, 10), y)   <span class="cm"># drop the label 10% of the time</span>
+    t = torch.randint(0, 1000, (64,))
+    eps = torch.randn_like(z0)
+    a = abar[t].view(-1, 1, 1, 1)
+    zt = a.sqrt() * z0 + (1 - a).sqrt() * eps              <span class="cm"># forward noising, in latent space</span>
+    loss = F.mse_loss(model(zt, t, y_in), eps)             <span class="cm"># formula (228.4)</span>
+    opt.zero_grad(); loss.backward(); opt.step()
+    <span class="kw2">if</span> step % 250 == 0:
+        print(step, round(loss.item(), 4))                 <span class="cm"># 0.9967 at step 0, below 0.1 by step 1000</span>
+
+<span class="cm"># sampling: deterministic DDIM, 50 steps, classifier-free guidance w = 2</span>
+@torch.no_grad()
+<span class="kw2">def</span> sample(y, w=2.0, steps=50):
+    ts = torch.linspace(999, 0, steps).long()
+    zt = torch.randn(len(y), 4, 8, 8)
+    <span class="kw2">for</span> i, t <span class="kw2">in</span> enumerate(ts):
+        tt = t.repeat(len(y))
+        e_c = model(zt, tt, y)
+        e_u = model(zt, tt, torch.full_like(y, 10))
+        e = e_u + w * (e_c - e_u)
+        a = abar[t]
+        z0_hat = (zt - (1 - a).sqrt() * e) / a.sqrt()
+        a_prev = abar[ts[i + 1]] <span class="kw2">if</span> i + 1 &lt; steps <span class="kw2">else</span> torch.tensor(1.0)
+        zt = a_prev.sqrt() * z0_hat + (1 - a_prev).sqrt() * e
+    <span class="kw2">return</span> zt                                              <span class="cm"># real LDM: x = vae.decode(zt / s)</span>
+
+y = torch.arange(10)
+zs = sample(y)
+dist = ((zs[:, None] - protos[None]) ** 2).mean(dim=(2, 3, 4))   <span class="cm"># (10 samples, 10 patterns)</span>
+print(<span class="st">"nearest pattern:"</span>, dist.argmin(1).tolist())             <span class="cm"># [0, 1, 2, ..., 9]</span>
+print(<span class="st">"error to own pattern:"</span>, round(dist.diag().mean().item(), 4))  <span class="cm"># about 0.018 (data noise alone: 0.01)</span></pre>
+<p>Three checks in the output: the patchify round trip is exact, the untrained model outputs exactly 0 (adaLN-Zero plus the zero output layer), and every one of the 10 samples lands nearest to the pattern of the class it was asked for. The loss falls from 0.9967 at step 0 to below 0.1 by step 1,000 (CPU run, PyTorch 2.x; exact later values can differ slightly on other hardware).</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>System or task</th><th>Latent space</th><th>Denoiser</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Stable Diffusion 1.x (text-to-image)</td><td>\(f = 8\), \(c = 4\) KL autoencoder</td><td>860M U-Net, cross-attention to CLIP text</td><td>The model that made LDM popular; runs on a consumer GPU [Certain]</td></tr>
+<tr><td>SDXL</td><td>\(f = 8\), \(c = 4\), \(s = 0.13025\)</td><td>About 3× larger U-Net, two text encoders</td><td>[Certain]</td></tr>
+<tr><td>DiT (class-conditional ImageNet)</td><td>Stable Diffusion VAE, 32×32×4 for 256×256</td><td>Transformer with adaLN-Zero</td><td>FID 2.27 with guidance [Certain]</td></tr>
+<tr><td>PixArt-\(\alpha\), SD3, FLUX (text-to-image)</td><td>\(f = 8\); SD3 and FLUX use 16 channels [Likely]</td><td>DiT with cross-attention (PixArt) or joint text-image attention (MM-DiT)</td><td>Next session for the training objective</td></tr>
+<tr><td>Text-to-video generation (Sora and similar)</td><td>Video autoencoder that compresses space and time</td><td>DiT on spacetime patches</td><td>Variable length and aspect ratio come almost for free with tokens [Likely]</td></tr>
+<tr><td>Video editing, inpainting and super-resolution</td><td>Same latent; known regions are re-noised and kept</td><td>U-Net or DiT with extra input channels (mask, low-res frame)</td><td>LDM already did inpainting and super-resolution this way [Certain]</td></tr>
+<tr><td>Synthetic training data for video tasks (action recognition, key-moment detection)</td><td>Any latent video model</td><td>Any</td><td>Generate rare actions or camera views to balance a dataset; check for a domain gap [Speculation]</td></tr>
+<tr><td>Unified VLMs that also draw (e.g. Transfusion)</td><td>VAE latent patches inside the LLM sequence</td><td>The LLM transformer itself, with a diffusion loss on image patches</td><td>[Certain]; see <a href="../generative/index.html#row-native-multimodal-and-any-to-any-models" title="Native multimodal and any-to-any models (planned)">session 232</a></td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Forgetting the latent scale \(s\).</b> Training on raw VAE latents (std far from 1) silently changes every noise level of the schedule. Multiply by \(s\) after encoding and divide by \(s\) before decoding, exactly once each.</li>
+<li><b>Mixing VAEs.</b> A denoiser trained on one autoencoder’s latents is useless with another autoencoder (for example the 4-channel SD VAE vs a 16-channel VAE), even if the shapes match.</li>
+<li><b>Thinking the latent is a nice Gaussian.</b> With KL weight around \(10^{-6}\), the latent is closer to a plain autoencoder code. Interpolating or sampling it directly does not give images; only the diffusion model can.</li>
+<li><b>Choosing \(f\) too large.</b> Details lost by the encoder (small text, faces far away) cannot be recovered by the denoiser. When a generator draws bad small text, check the autoencoder’s reconstruction first.</li>
+<li><b>Comparing DiTs by parameter count.</b> Patch size changes compute 4× per halving with almost no change in parameters; compare by Gflops (formula 228.10).</li>
+<li><b>Using a normal random init for the adaLN layers.</b> Without the zero init, deep DiTs start far from the identity and train worse; the paper’s FID gap between adaLN and adaLN-Zero is 25.21 vs 19.47.</li>
+<li><b>Wrong patch order.</b> Patchify and unpatchify must be exact inverses. A mismatched reshape still trains, but the model must learn to undo the scramble, and position embeddings no longer match the content.</li>
+<li><b>Running the VAE in FP16 when it overflows.</b> Some VAEs (the SDXL VAE config sets <code>force_upcast: true</code>) produce NaNs in half precision; decode in FP32 or use a fixed VAE. [Likely]</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why do latent diffusion models diffuse in a latent space instead of pixels?<span class="lvl">basic</span></summary><div class="ans">Cost and focus. With \(f = 8\), \(c = 4\) the denoiser works on 48 times fewer values, and it runs at every sampling step, so the saving is paid back many times. And most pixel information is perceptual detail that a pretrained autoencoder (trained with perceptual and adversarial losses) can handle once; the diffusion model can then spend its capacity on semantic structure. LDM showed that \(f = 4\) to 8 gives the best trade-off; \(f = 32\) loses too much detail.</div></details>
+<details class="qa"><summary>Walk me through the shapes in Stable Diffusion v1 for a 512×512 image.<span class="lvl">basic</span></summary><div class="ans">Image \(3 \times 512 \times 512\) → VAE encoder (\(f = 8\)) → latent \(4 \times 64 \times 64\), multiplied by 0.18215. Prompt → CLIP ViT-L/14 text encoder → \(77 \times 768\). The U-Net takes the noisy latent \(4 \times 64 \times 64\), the step and the text (via cross-attention), and outputs predicted noise of the same shape. After sampling, divide by 0.18215 and decode back to \(3 \times 512 \times 512\).</div></details>
+<details class="qa"><summary>What does the scale factor 0.18215 do, and what happens if you forget it?<span class="lvl">core</span></summary><div class="ans">It rescales the latent to roughly unit standard deviation, which the noise schedule assumes. Without it, the latent has a larger spread, so at every step the signal-to-noise ratio is much higher than planned: the “fully noised” \(\mathbf{z}_T\) still contains signal, and the start of sampling from pure \(\mathcal{N}(0, I)\) does not match training. Results are washed out or broken. If you forget to divide by it before decoding, the decoder gets latents about 5.5 times too small.</div></details>
+<details class="qa"><summary>How does DiT turn a latent into tokens, and what does the patch size control?<span class="lvl">core</span></summary><div class="ans">It cuts the \(I \times I \times C\) latent into \(p \times p\) patches, flattens each to \(p^2 C\) numbers and projects to width \(d\), then adds fixed sine-cosine position embeddings. \(T = (I/p)^2\): 256 tokens for \(I = 32\), \(p = 2\). Halving \(p\) gives 4× the tokens and at least 4× the compute while parameters stay almost the same, so \(p\) is a compute knob; smaller patches gave much better FID.</div></details>
+<details class="qa"><summary>Explain adaLN-Zero. Why is it better than cross-attention for class conditioning in DiT?<span class="lvl">core</span></summary><div class="ans">The timestep and class embeddings are summed into one vector \(\mathbf{c}\). A linear layer maps \(\mathbf{c}\) to shift, scale and gate vectors for each block. LayerNorm without its own affine parameters is followed by \(\cdot(1 + \gamma) + \beta\), and each residual branch output is multiplied by the gate \(\alpha\). The layer producing these is initialized to zero, so every block starts as the identity. Cross-attention to a single vector adds about 15% compute and brings little; adaLN-Zero is the cheapest and gave the best FID (19.47 vs 26.14 for cross-attention, DiT-XL/2 at 400K steps).</div></details>
+<details class="qa"><summary>What is the scaling result of the DiT paper?<span class="lvl">core</span></summary><div class="ans">Across 12 models (S, B, L, XL × patch 8, 4, 2), FID is strongly predicted by forward Gflops, whether compute comes from depth and width or from more tokens. Parameters alone are a poor predictor: XL/8 (675M params, 7.4 Gflops) has FID 106, worse than S/2 (33M, 6.1 Gflops) at 68. Larger models are more training-compute-efficient, and more sampling steps cannot make up for a smaller model.</div></details>
+<details class="qa"><summary>Estimate the forward cost of DiT-XL/2 from its config.<span class="lvl">advanced</span></summary><div class="ans">\(L = 28\), \(d = 1152\), \(T = 256\). Per block: weights \(12 T d^2 \approx 4.08\)G multiply-adds, attention \(2T^2 d \approx 0.15\)G. Total \(28 \times 4.23 \approx 118.4\) Gflops vs 118.6 reported. Parameters \(\approx 18 L d^2 = 669\)M plus embeddings ≈ 675M. At 512×512, \(T = 1024\) and the attention term grows 16×, giving about 524 Gflops.</div></details>
+<details class="qa"><summary>Why does DiT output 2C channels instead of C?<span class="lvl">advanced</span></summary><div class="ans">It predicts the noise (C channels) and also a per-element variance for the reverse step (C channels), following Improved DDPM. The noise part is trained with the simple MSE; the variance part with the variational lower bound. Learned variances let DDPM sampling use fewer steps with good quality. Models trained with flow matching or used only with DDIM-style samplers usually drop the variance output.</div></details>
+<details class="qa"><summary>U-Net vs DiT: what are the trade-offs?<span class="lvl">core</span></summary><div class="ans">The U-Net has image priors (locality, multi-scale, skips), which help with little data and small compute, and its cost grows roughly linearly with pixels. DiT has few priors; global attention costs \(O(T^2)\) and it needs more data and compute, but it scales predictably, reuses all transformer infrastructure, and handles text and video tokens in the same sequence. At large scale DiTs win; that is why SD3, FLUX and video models use them.</div></details>
+<details class="qa"><summary>How would you condition a DiT on a text prompt instead of a class?<span class="lvl">advanced</span></summary><div class="ans">A prompt is a sequence of vectors, not one vector. Options: (1) add cross-attention to each block, with image tokens as queries and text tokens as keys and values (PixArt-\(\alpha\)); (2) concatenate text and image tokens and use joint self-attention with separate weights per modality (MM-DiT in SD3 and FLUX). Keep adaLN for the timestep and often a pooled text vector. For classifier-free guidance, drop the text (use an empty prompt) for about 10% of training examples.</div></details>
+<details class="qa"><summary>Your latent diffusion model draws blurry small text and faces. Where do you look first?<span class="lvl">advanced</span></summary><div class="ans">At the autoencoder: encode and decode real images and inspect the reconstructions. If small text is already broken there, no denoiser can fix it; you need a better autoencoder (more channels, e.g. 16, or smaller \(f\)), or a fine-tuned decoder. If reconstructions are fine, look at the denoiser: resolution of training data, guidance scale, number of steps, model size.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Compute the latent shape and the compression ratio for a 768×768 image with \(f = 8\), \(c = 4\), and with \(f = 8\), \(c = 16\).</li>
+<li>A DiT-B (\(L = 12\), \(d = 768\)) runs on a 32×32×4 latent with \(p = 4\). How many tokens? Estimate the Gflops with formula (228.10) and compare with Figure 5.</li>
+<li>Show that if \(\alpha = 0\) in every block and the output layer is zero, the DiT output is 0 for any input. Why does this not stop learning?</li>
+<li>You want 256×256 images with a DiT-L but can only afford about 20 Gflops per forward. Which patch size? What FID does Table 4 report at 400K steps?</li>
+<li>A latent has standard deviation 5.5 instead of 1. At a step where \(\bar\alpha_t = 0.5\), what is the signal-to-noise ratio \(\bar\alpha_t \sigma_z^2 / (1 - \bar\alpha_t)\), compared to the intended value?</li>
+<li>Count the tokens of a video DiT for 16 frames of 256×256 with a video autoencoder that compresses 8× in space and 4× in time, and patches of \(2 \times 2\) in space and 1 in time.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(96 \times 96 \times 4 = 36{,}864\) values vs \(768 \cdot 768 \cdot 3 = 1{,}769{,}472\): ratio 48. With \(c = 16\): \(96 \times 96 \times 16 = 147{,}456\), ratio 12. 2. \(T = (32/4)^2 = 64\). \(12 \cdot 12 \cdot 64 \cdot 768^2 + 12 \cdot 2 \cdot 64^2 \cdot 768 = 5.44 + 0.08 \approx 5.5\) Gflops; the paper reports 5.56. 3. With \(\alpha = 0\), each block returns \(\mathbf{h}\) unchanged; the zero output layer then maps everything to 0. Gradients still flow: the gradient with respect to the output layer’s weights is not zero (it depends on the features and the loss), and once those weights move, gradients reach the \(\alpha\) layers, which then open the branches. 4. \(p = 4\): DiT-L/4 has 19.70 Gflops and FID 45.64 (L/2 is 80.71 Gflops, L/8 only 5.01 with FID 118.87). 5. Intended: \(0.5 \cdot 1/0.5 = 1\). Actual: \(0.5 \cdot 30.25/0.5 = 30.25\), about 30 times more signal than the schedule assumes. 6. Latent: \(16/4 = 4\) frames of \(32 \times 32\); tokens \(4 \cdot (32/2)^2 = 4 \cdot 256 = 1{,}024\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Latent diffusion splits generation into perceptual compression (an autoencoder, trained once) and semantic generation (diffusion on the small latent), formula (228.1). Stable Diffusion: \(f = 8\), \(c = 4\), 48× fewer values (228.2).</li>
+<li>The diffusion math is unchanged; only the data is \(\mathbf{z}_0 = s\,\mathcal{E}(\mathbf{x})\) (228.4). The scale \(s\) (0.18215 for SD 1.x) keeps the noise schedule valid.</li>
+<li>The U-Net backbone uses convolutions, skips and cross-attention (228.5); DiT replaces it with a plain ViT on latent patches (228.6).</li>
+<li>DiT conditions through adaLN-Zero (228.8, 228.9): scale, shift and gate computed from the timestep and class; zero init makes every block start as the identity.</li>
+<li>DiT quality follows forward compute (228.10), not parameter count; smaller patches and bigger models both help, and bigger models use training compute better. DiT-XL/2: 675M params, 118.6 Gflops, FID 2.27 with guidance.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \frac{3f^2}{c}, \qquad \mathcal{L} = \lVert \varepsilon - \varepsilon_\theta(\mathbf{z}_t, t, y) \rVert^2, \qquad T = \Big(\frac{I}{p}\Big)^2, \qquad \text{LN}(\mathbf{h})(1 + \gamma) + \beta, \qquad L(12Td^2 + 2T^2 d) \]</div>
+<h2 class="plain" id="latent-diffusion-and-diffusion-transformers-dit-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Rombach et al. (2021). <a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noopener">High-Resolution Image Synthesis with Latent Diffusion Models</a></li><li>Peebles &amp; Xie (2022). <a href="https://arxiv.org/abs/2212.09748" target="_blank" rel="noopener">Scalable Diffusion Models with Transformers</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 10: Any-to-Any Models</li><li>Rombach et al. (2021). <a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noopener">High-Resolution Image Synthesis with Latent Diffusion Models</a></li><li>Peebles &amp; Xie (2022). <a href="https://arxiv.org/abs/2212.09748" target="_blank" rel="noopener">Scalable Diffusion Models with Transformers</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 10: Any-to-Any Models</li><li>Ho et al. (2020). <a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noopener">Denoising Diffusion Probabilistic Models</a></li><li>Song et al. (2020). <a href="https://arxiv.org/abs/2010.02502" target="_blank" rel="noopener">Denoising Diffusion Implicit Models</a></li><li>Ho &amp; Salimans (2022). <a href="https://arxiv.org/abs/2207.12598" target="_blank" rel="noopener">Classifier-Free Diffusion Guidance</a></li><li>Dhariwal &amp; Nichol (2021). <a href="https://arxiv.org/abs/2105.05233" target="_blank" rel="noopener">Diffusion Models Beat GANs on Image Synthesis</a></li><li>Esser et al. (2020). <a href="https://arxiv.org/abs/2012.09841" target="_blank" rel="noopener">Taming Transformers for High-Resolution Image Synthesis</a></li><li>Dosovitskiy et al. (2020). <a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener">An Image is Worth 16x16 Words: Transformers for Image Recognition at Scale</a></li><li>Radford et al. (2021). <a href="https://arxiv.org/abs/2103.00020" target="_blank" rel="noopener">Learning Transferable Visual Models From Natural Language Supervision</a></li><li>Ronneberger, Fischer &amp; Brox (2015). <a href="https://arxiv.org/abs/1505.04597" target="_blank" rel="noopener">U-Net: Convolutional Networks for Biomedical Image Segmentation</a></li><li>Nichol &amp; Dhariwal (2021). <a href="https://arxiv.org/abs/2102.09672" target="_blank" rel="noopener">Improved Denoising Diffusion Probabilistic Models</a></li><li>Perez et al. (2017). <a href="https://arxiv.org/abs/1709.07871" target="_blank" rel="noopener">FiLM: Visual Reasoning with a General Conditioning Layer</a></li><li>Bao et al. (2022). <a href="https://arxiv.org/abs/2209.12152" target="_blank" rel="noopener">All are Worth Words: A ViT Backbone for Diffusion Models</a></li><li>Chen et al. (2023). <a href="https://arxiv.org/abs/2310.00426" target="_blank" rel="noopener">PixArt-α: Fast Training of Diffusion Transformer for Photorealistic Text-to-Image Synthesis</a></li><li>Podell et al. (2023). <a href="https://arxiv.org/abs/2307.01952" target="_blank" rel="noopener">SDXL: Improving Latent Diffusion Models for High-Resolution Image Synthesis</a></li><li>Esser et al. (2024). <a href="https://arxiv.org/abs/2403.03206" target="_blank" rel="noopener">Scaling Rectified Flow Transformers for High-Resolution Image Synthesis</a></li><li>Brooks et al. (OpenAI) (2024). <a href="https://openai.com/index/video-generation-models-as-world-simulators/" target="_blank" rel="noopener">Video generation models as world simulators (technical report)</a></li><li>Zhou et al. (2024). <a href="https://arxiv.org/abs/2408.11039" target="_blank" rel="noopener">Transfusion: Predict the Next Token and Diffuse Images with One Multi-Modal Model</a></li></ol><nav class="pn" aria-label="Previous and next session"><span class="prev"><small>Previous · session 227, planned</small>Guidance and conditioning: classifier guidance, classifier-free guidance, ControlNet</span><span class="next"><small>Next · session 229, planned</small>Flow matching and rectified flow</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="latent-diffusion-and-diffusion-transformers-dit"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmt=n=>Math.round(n).toLocaleString("en-US");
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+function setSeg(el,v){el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.v===String(v)?"true":"false"));}
+
+/* ---------- Figure 1: pixels -> latent -> tokens ---------- */
+(function(){
+ const svg=$("#ld-cost-svg");if(!svg)return;const info=$("#ld-cost-info");
+ const st={H:256,f:8,c:4,p:2};
+ function grid(x,y,S,n,col){let g="";if(n<=64){for(let i=1;i<n;i++){const o=(S*i/n).toFixed(1);g+=`<line x1="${x}" y1="${(y+ +o).toFixed(1)}" x2="${x+S}" y2="${(y+ +o).toFixed(1)}" stroke="${col}" stroke-width="${n>32?0.4:0.8}"/><line x1="${(x+ +o).toFixed(1)}" y1="${y}" x2="${(x+ +o).toFixed(1)}" y2="${y+S}" stroke="${col}" stroke-width="${n>32?0.4:0.8}"/>`;}}return g;}
+ function draw(){
+  const {H,f,c,p}=st;const Hl=H/f;const Tside=Hl/p;const ok=Number.isInteger(Tside)&&Tside>=1;
+  const px=H*H*3,lat=Hl*Hl*c,T=ok?Tside*Tside:0,dim=p*p*c,att=T*T;
+  let g="";const S=150,y0=40;
+  // image
+  g+=`<text x="95" y="24" text-anchor="middle" class="svgs" font-size="13">image ${H}×${H}×3</text>`;
+  g+=`<defs><linearGradient id="ld-cost-gr" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="var(--q)" stop-opacity=".55"/><stop offset=".5" stop-color="var(--v)" stop-opacity=".45"/><stop offset="1" stop-color="var(--k)" stop-opacity=".55"/></linearGradient></defs>`;
+  g+=`<rect x="20" y="${y0}" width="${S}" height="${S}" fill="url(#ld-cost-gr)" stroke="var(--rule)"/>`;
+  // arrow
+  g+=`<path d="M180 ${y0+S/2} H222" stroke="var(--muted)" stroke-width="1.6" fill="none"/><text x="201" y="${y0+S/2-8}" text-anchor="middle" class="svgs" font-size="12">𝓔, ÷${f}</text>`;
+  // latent with c layers
+  const nl=Math.min(c,8),off=4;const LX=240,LS=S-off*(nl-1);
+  for(let k=nl-1;k>=0;k--){g+=`<rect x="${LX+k*off}" y="${y0+(nl-1-k)*off}" width="${LS}" height="${LS}" fill="var(--card)" stroke="var(--q)" stroke-width="1.2"/>`;}
+  g+=`<rect x="${LX}" y="${y0+(nl-1)*off}" width="${LS}" height="${LS}" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1.4"/>`+grid(LX,y0+(nl-1)*off,LS,Hl,"var(--q)");
+  g+=`<text x="${LX+S/2}" y="24" text-anchor="middle" class="svgs" font-size="13">latent ${Hl}×${Hl}×${c}</text>`;
+  g+=`<path d="M400 ${y0+S/2} H442" stroke="var(--muted)" stroke-width="1.6" fill="none"/><text x="421" y="${y0+S/2-8}" text-anchor="middle" class="svgs" font-size="12">patch ${p}</text>`;
+  // tokens
+  const TX=460;g+=`<rect x="${TX}" y="${y0}" width="${S}" height="${S}" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1.4"/>`+(ok?grid(TX,y0,S,Tside,"var(--k)"):"");
+  g+=`<text x="${TX+S/2}" y="24" text-anchor="middle" class="svgs" font-size="13">${ok?`${Tside}×${Tside} = ${fmt(T)} tokens`:"patch larger than latent"}</text>`;
+  if(ok&&Tside>64)g+=`<text x="${TX+S/2}" y="${y0+S/2+5}" text-anchor="middle" font-size="13" fill="var(--ink)" font-family="var(--sans)">(too many lines to draw)</text>`;
+  // log bars
+  const bx=20,bw=600,by=212;const L10=v=>Math.log10(Math.max(1,v));const mx=Math.log10(3*1024*1024*3);
+  const bar=(v,y,col,lab)=>`<rect x="${bx+120}" y="${y}" width="${(bw-140)*L10(v)/mx}" height="11" rx="3" fill="${col}"/><text x="${bx+114}" y="${y+10}" text-anchor="end" class="svgs" font-size="12">${lab}</text><text x="${bx+126+(bw-140)*L10(v)/mx}" y="${y+10}" class="svgs" font-size="12">${fmt(v)}</text>`;
+  g+=bar(px,by,"var(--muted)","pixel values")+bar(lat,by+16,"var(--q)","latent values");
+  svg.innerHTML=g;
+  let note="";
+  if(f<=2)note=" LDM found f = 1 and 2 train slowly: the denoiser still spends its effort on pixel detail.";
+  else if(f===32)note=" LDM found f = 32 stops improving early: the encoder throws away detail the denoiser cannot recover.";
+  else if(f===4||f===8)note=" f = 4 and 8 gave the best results in LDM.";
+  else note=" f = 16 is still in LDM’s good range (4 to 16).";
+  const ratio=px/lat;const ref=65536;
+  info.innerHTML=`Pixels: <b>${fmt(px)}</b> values. Latent: ${Hl}×${Hl}×${c} = <b>${fmt(lat)}</b> values, compression 3f²/c = <b>${(ratio%1?ratio.toFixed(2):ratio)}×</b>.`+(ok?` Tokens: (${Hl}/${p})² = <b>${fmt(T)}</b>, each a vector of p²c = <b>${dim}</b> numbers. One attention matrix: <b>${fmt(att)}</b> entries (${(att/ref)>=1?fmt(att/ref):(att/ref).toPrecision(2)}× the 256-token DiT-XL/2 setting).`:" The patch is larger than the latent: choose a smaller p.")+note;
+  svg.dataset.ratio=ratio;svg.dataset.tokens=T;}
+ seg($("#ld-cost-h"),v=>{st.H=+v;draw();});seg($("#ld-cost-f"),v=>{st.f=+v;draw();});seg($("#ld-cost-c"),v=>{st.c=+v;draw();});seg($("#ld-cost-p"),v=>{st.p=+v;draw();});
+ draw();
+})();
+
+/* ---------- Figure 2: the pipeline stepper ---------- */
+(function(){
+ const svg=$("#ld-pipe-svg");if(!svg)return;const info=$("#ld-pipe-info");
+ const N={x:[60,70,96,"image x","3×256×256"],E:[175,70,70,"encoder 𝓔","frozen"],z0:[290,70,100,"z₀ = s·𝓔(x)","4×32×32"],
+  zt:[420,70,110,"z_t","√ᾱ z₀ + √(1−ᾱ) ε"],den:[565,70,110,"ε_θ (DiT)","256 tokens"],loss:[715,70,100,"loss","‖ε − ε̂‖²"],
+  cond:[565,150,140,"t, y (class or text)","→ c, adaLN"],
+  zT:[100,225,120,"z_T ~ 𝒩(0, I)","4×32×32"],loop:[290,225,150,"ε_θ, K steps","+ CFG"],zs:[450,225,100,"z₀","after step K"],
+  D:[575,225,80,"decoder 𝓓","z₀ / s"],xh:[710,225,110,"image x̂","3×256×256"]};
+ const E=[["x","E"],["E","z0"],["z0","zt"],["zt","den"],["den","loss"],["cond","den"],["zT","loop"],["loop","zs"],["zs","D"],["D","xh"],["cond","loop"]];
+ const S=[
+  {on:[],t:"Two rows. <b>Training</b> (top): images go through the frozen encoder, get noised, and the denoiser learns to predict the noise. <b>Sampling</b> (bottom): start from noise in latent space, denoise K times, decode once. Press Next."},
+  {on:["x","E","z0"],t:"Training, step 1. The frozen encoder maps the 3×256×256 image (196,608 values) to a 4×32×32 latent (4,096 values), and we multiply by s = 0.18215 so the latent has standard deviation near 1. Many teams pre-compute these latents once for the whole dataset."},
+  {on:["z0","zt"],t:"Training, step 2. Draw t uniformly from 1 to 1000 and ε ~ 𝒩(0, I) with the latent’s shape. The noisy latent is z_t = √ᾱ_t z₀ + √(1 − ᾱ_t) ε. Exactly the DDPM forward process, only on latents."},
+  {on:["zt","den","cond"],t:"Training, step 3. The DiT cuts z_t into 2×2 patches: (32/2)² = 256 tokens of 2·2·4 = 16 numbers. The timestep and class become one vector c that drives adaLN-Zero in every block. DiT-XL/2 spends 118.6 Gflops here."},
+  {on:["den","loss"],t:"Training, step 4. The output is unpatchified back to 4×32×32 (plus 4 variance channels in DiT) and compared to ε with a mean squared error, formula (228.4). Only the denoiser gets gradients; the autoencoder stays frozen."},
+  {on:["zT"],t:"Sampling, step 1. Start from pure Gaussian noise of the <b>latent</b> shape 4×32×32. No encoder is needed at sampling time."},
+  {on:["zT","loop","zs","cond"],t:"Sampling, step 2. Run the denoiser K times with a DDPM, DDIM or DPM-Solver update. With classifier-free guidance each step needs two passes (with and without the condition). DiT’s 250 DDPM steps: 250 × 2 × 118.6 Gflops ≈ 59.3 Tflops per image."},
+  {on:["zs","D","xh"],t:"Sampling, step 3. Divide by s and call the decoder once to get the 3×256×256 image. The expensive loop never touched a pixel; this is the whole saving of latent diffusion."}];
+ function draw(k){const on=new Set(S[k].on);
+  let g=`<defs><marker id="ld-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+  g+=`<text x="8" y="20" class="svgs" font-size="13" font-weight="700">Training</text><text x="8" y="178" class="svgs" font-size="13" font-weight="700">Sampling</text><line x1="0" y1="186" x2="800" y2="186" stroke="var(--rule)" stroke-dasharray="4 4"/>`;
+  E.forEach(([u,v])=>{const a=N[u],b=N[v];let x1,y1,x2,y2;
+   if(u==="cond"){x1=a[0];y1=a[1]+(v==="den"?-20:20);x2=b[0]+(v==="loop"?b[2]/2-10:0);y2=v==="den"?b[1]+26:b[1]-26;}
+   else{x1=a[0]+a[2]/2;y1=a[1];x2=b[0]-b[2]/2;y2=b[1];}
+   const act=on.has(u)&&on.has(v);g+=`<path class="ld-arr${act?" on":""}" d="M${x1} ${y1} L${x2-3} ${y2}" marker-end="url(#ld-ah)"/>`;});
+  Object.entries(N).forEach(([id,[cx,cy,w,lab,sub]])=>{const h=id==="cond"?36:50;g+=`<g class="ld-box${on.has(id)?" on":""}"><rect x="${cx-w/2}" y="${cy-h/2}" width="${w}" height="${h}" rx="10"/><text x="${cx}" y="${cy-(id==="cond"?2:4)}" font-size="13" font-weight="700" fill="var(--ink)">${lab}</text><text x="${cx}" y="${cy+(id==="cond"?13:15)}" font-size="11.5" fill="var(--muted)">${sub}</text></g>`;});
+  svg.innerHTML=g;info.innerHTML=S[k].t;svg.dataset.step=k;}
+ B.stepper({n:S.length,prev:$("#ld-pipe-prev"),next:$("#ld-pipe-next"),play:$("#ld-pipe-play"),label:$("#ld-pipe-lab"),ms:3200,onStep:draw});
+})();
+
+/* ---------- Figure 3: patchify ---------- */
+(function(){
+ const svg=$("#ld-patch-svg");if(!svg)return;const info=$("#ld-patch-info");
+ const I=8,C=4;const r=gauss(rng(228));const V=[];for(let ch=0;ch<C;ch++){V.push([]);for(let i=0;i<I;i++){V[ch].push([]);for(let j=0;j<I;j++)V[ch][i].push(Math.round(r()*100)/100);}}
+ let p=2,sel=[2,5];
+ const cs=28,gx=20,gy=44;
+ function vec(pr,pc){const out=[];for(let a=0;a<p;a++)for(let b=0;b<p;b++)for(let ch=0;ch<C;ch++)out.push(V[ch][pr*p+a][pc*p+b]);return out;}
+ function draw(){
+  const np=I/p,T=np*np;const pr=Math.floor(sel[0]/p),pc=Math.floor(sel[1]/p),tok=pr*np+pc;
+  let g=`<text x="${gx}" y="20" class="svgs" font-size="13">latent 8×8×4 (channel 1 in front)</text>`;
+  for(let k=3;k>=1;k--)g+=`<rect x="${gx+k*5}" y="${gy-k*5}" width="${I*cs}" height="${I*cs}" fill="var(--card)" stroke="var(--rule)"/>`;
+  for(let i=0;i<I;i++)for(let j=0;j<I;j++){const v=V[0][i][j];const inP=Math.floor(i/p)===pr&&Math.floor(j/p)===pc;
+   const col=v>=0?"var(--q)":"var(--k)";const op=Math.min(0.85,0.12+Math.abs(v)*0.3);
+   g+=`<rect class="ld-cell" data-i="${i}" data-j="${j}" x="${gx+j*cs}" y="${gy+i*cs}" width="${cs}" height="${cs}" fill="${col}" fill-opacity="${op.toFixed(2)}" stroke="var(--rule)" stroke-width=".6"/>`;
+   if(inP)g+=`<rect x="${gx+j*cs+1}" y="${gy+i*cs+1}" width="${cs-2}" height="${cs-2}" fill="none" stroke="var(--ink)" stroke-width="1.2" pointer-events="none"/>`;}
+  for(let a=0;a<=np;a++){g+=`<line x1="${gx}" y1="${gy+a*p*cs}" x2="${gx+I*cs}" y2="${gy+a*p*cs}" stroke="var(--ink)" stroke-width="2" pointer-events="none"/><line x1="${gx+a*p*cs}" y1="${gy}" x2="${gx+a*p*cs}" y2="${gy+I*cs}" stroke="var(--ink)" stroke-width="2" pointer-events="none"/>`;}
+  if(p<=4)for(let a=0;a<np;a++)for(let b=0;b<np;b++){const t=a*np+b;g+=`<text x="${gx+(b+0.5)*p*cs}" y="${gy+(a+0.5)*p*cs+4}" text-anchor="middle" font-size="${p===1?10:13}" font-weight="700" fill="var(--ink)" font-family="var(--sans)" pointer-events="none">${t}</text>`;}
+  // token sequence
+  const sx=290,sy=34,cols=8,bw=42,bh=24;
+  g+=`<text x="${sx}" y="20" class="svgs" font-size="13">token sequence: T = ${T}, each ${p*p*C} numbers</text>`;
+  for(let t=0;t<T;t++){const a=Math.floor(t/cols),b=t%cols;const x=sx+b*bw,y=sy+a*(bh+4);
+   g+=`<rect x="${x}" y="${y}" width="${bw-4}" height="${bh}" rx="5" fill="${t===tok?"var(--k-soft)":"var(--card)"}" stroke="${t===tok?"var(--k)":"var(--rule)"}" stroke-width="${t===tok?2:1}"/><text x="${x+(bw-4)/2}" y="${y+16}" text-anchor="middle" font-size="12" fill="var(--ink)" font-family="var(--sans)">${t}</text>`;}
+  const v=vec(pr,pc);const shown=v.slice(0,12).map(x=>x.toFixed(2).replace("-","−"));
+  const vy=sy+Math.ceil(T/cols)*(bh+4)+22;
+  g+=`<text x="${sx}" y="${vy}" class="svgs" font-size="12.5">token ${tok} vector (first ${Math.min(12,v.length)} of ${v.length}):</text>`;
+  shown.forEach((s,k)=>{const x=sx+(k%6)*58,y=vy+12+Math.floor(k/6)*24;g+=`<rect x="${x}" y="${y}" width="54" height="20" rx="4" fill="var(--paper2)" stroke="var(--rule)"/><text x="${x+27}" y="${y+14}" text-anchor="middle" font-size="11.5" fill="var(--ink)" font-family="var(--mono)">${s}</text>`;});
+  svg.innerHTML=g;
+  info.innerHTML=`p = <b>${p}</b>: T = (8/${p})² = <b>${T}</b> tokens, each of length p²C = ${p}·${p}·4 = <b>${p*p*C}</b>. Selected cell (row ${sel[0]}, col ${sel[1]}) lies in patch (${pr}, ${pc}) = <b>token ${tok}</b> (index = patch row × ${np} + patch col). Its vector starts with the 4 channels of the top-left cell of the patch: ${v.slice(0,4).map(x=>x.toFixed(2).replace("-","−")).join(", ")}. For the real DiT latent (32×32×4) the same p gives ${(32/p)**2} tokens.`;
+  svg.dataset.T=T;svg.dataset.tok=tok;svg.dataset.dim=p*p*C;}
+ svg.addEventListener("click",e=>{const c=e.target.closest(".ld-cell");if(!c)return;sel=[+c.dataset.i,+c.dataset.j];draw();});
+ seg($("#ld-patch-p"),v=>{p=+v;draw();});draw();
+})();
+
+/* ---------- Figure 4: adaLN-Zero ---------- */
+(function(){
+ const svg=$("#ld-ada-svg");if(!svg)return;const info=$("#ld-ada-info");const G=$("#ld-ada-g"),Bt=$("#ld-ada-b"),A=$("#ld-ada-a");
+ const r=gauss(rng(7));const n=8;const h=Array.from({length:n},()=>0.6+1.2*r());const W=Array.from({length:n},()=>Array.from({length:n},()=>1.5*r()/Math.sqrt(n)));
+ function draw(){const g_=+G.value,b_=+Bt.value,a_=+A.value;$("#ld-ada-gv").value=g_.toFixed(2);$("#ld-ada-bv").value=b_.toFixed(2);$("#ld-ada-av").value=a_.toFixed(2);
+  const mu=h.reduce((s,x)=>s+x,0)/n,va=h.reduce((s,x)=>s+(x-mu)**2,0)/n,sd=Math.sqrt(va+1e-6);
+  const ln=h.map(x=>(x-mu)/sd),u=ln.map(x=>x*(1+g_)+b_),F=W.map(row=>Math.tanh(row.reduce((s,w,k)=>s+w*u[k],0))),out=h.map((x,k)=>x+a_*F[k]);
+  const diff=Math.sqrt(out.reduce((s,x,k)=>s+(x-h[k])**2,0));
+  const y0=135,sc=34,gw=78,bw=15;let g=`<line x1="20" y1="${y0}" x2="645" y2="${y0}" stroke="var(--muted)"/>`;
+  [-3,-2,-1,1,2,3].forEach(v=>g+=`<line x1="20" y1="${y0-v*sc}" x2="645" y2="${y0-v*sc}" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="16" y="${y0-v*sc+4}" text-anchor="end" class="svgs" font-size="11">${v}</text>`);
+  const cl=v=>Math.max(-3.6,Math.min(3.6,v));
+  const sets=[[h,"var(--muted)"],[u,"var(--q)"],[F,"var(--v)"],[out,"var(--k)"]];
+  for(let k=0;k<n;k++){const x0=30+k*gw;sets.forEach(([arr,col],s)=>{const v=cl(arr[k]);const y=v>=0?y0-v*sc:y0;g+=`<rect x="${x0+s*(bw+2)}" y="${y.toFixed(1)}" width="${bw}" height="${Math.max(0.5,Math.abs(v)*sc).toFixed(1)}" fill="${col}" rx="2"/>`;});
+   g+=`<text x="${x0+2*(bw+2)}" y="262" text-anchor="middle" class="svgs" font-size="11.5">ch ${k+1}</text>`;}
+  svg.innerHTML=g;
+  info.innerHTML=`LayerNorm of h: mean ${mu.toFixed(3)}, std ${sd.toFixed(3)}; after normalizing, mean 0 and std 1. Modulated: LN(h)·(1 + ${g_.toFixed(2)}) + ${b_.toFixed(2)}. Output h + α·F with α = ${a_.toFixed(2)}: ‖output − h‖ = <b>${diff.toFixed(3)}</b>`+(a_===0?". <b>The block is the identity</b>, which is how every DiT block starts (adaLN-Zero).":g_===-1?". With γ = −1 the token content is erased before the branch; only β gets through.":".");
+  svg.dataset.diff=diff.toFixed(4);}
+ [G,Bt,A].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 5: DiT scaling ---------- */
+(function(){
+ const svg=$("#ld-scale-svg");if(!svg)return;const info=$("#ld-scale-info");const fitBox=$("#ld-scale-fit");
+ const CFG={S:[12,384,6,"var(--muted)"],B:[12,768,12,"var(--q)"],L:[24,1024,16,"var(--v)"],XL:[28,1152,16,"var(--k)"]};
+ const TAB={"S/8":[0.36,153.60],"S/4":[1.41,100.41],"S/2":[6.06,68.40],"B/8":[1.42,122.74],"B/4":[5.56,68.38],"B/2":[23.01,43.47],"L/8":[5.01,118.87],"L/4":[19.70,45.64],"L/2":[80.71,23.33],"XL/8":[7.39,106.41],"XL/4":[29.05,43.01],"XL/2":[118.64,19.47]};
+ let m="XL",p="2";
+ const est=(L,d,T)=>L*(12*T*d*d+2*T*T*d)/1e9;
+ const params=(L,d,pp)=>{const C=4;return L*(18*d*d+19*d)+pp*pp*C*d+d+(256*d+d+d*d+d)+1001*d+(2*d*d+2*d+d*pp*pp*2*C+pp*pp*2*C);};
+ const keys=Object.keys(TAB);const lx=keys.map(k=>Math.log10(TAB[k][0])),ly=keys.map(k=>Math.log10(TAB[k][1]));
+ const mx=lx.reduce((a,b)=>a+b)/12,my=ly.reduce((a,b)=>a+b)/12;let sxy=0,sxx=0,syy=0;lx.forEach((x,i)=>{sxy+=(x-mx)*(ly[i]-my);sxx+=(x-mx)**2;syy+=(ly[i]-my)**2;});
+ const slope=sxy/sxx,icpt=my-slope*mx,corr=sxy/Math.sqrt(sxx*syy);
+ const X=g=>70+(Math.log10(g)-Math.log10(0.25))/(Math.log10(200)-Math.log10(0.25))*560,Y=f=>20+(Math.log10(200)-Math.log10(f))/(Math.log10(200)-Math.log10(15))*250;
+ function draw(){
+  let g=`<rect x="70" y="20" width="560" height="250" fill="none" stroke="var(--rule)"/>`;
+  [0.3,1,3,10,30,100].forEach(v=>g+=`<line x1="${X(v)}" y1="20" x2="${X(v)}" y2="270" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="${X(v)}" y="286" text-anchor="middle" class="svgs" font-size="12">${v}</text>`);
+  [20,30,50,100,150].forEach(v=>g+=`<line x1="70" y1="${Y(v)}" x2="630" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="64" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="12">${v}</text>`);
+  g+=`<text x="350" y="310" text-anchor="middle" class="svgs" font-size="12.5">forward Gflops (log scale)</text><text x="18" y="145" text-anchor="middle" class="svgs" font-size="12.5" transform="rotate(-90 18 145)">FID-50K (log)</text>`;
+  if(fitBox.checked){const a=0.3,b=150;g+=`<line x1="${X(a)}" y1="${Y(10**(icpt+slope*Math.log10(a)))}" x2="${X(b)}" y2="${Y(10**(icpt+slope*Math.log10(b)))}" stroke="var(--ink2)" stroke-width="1.5" stroke-dasharray="7 5"/>`;}
+  Object.entries(CFG).forEach(([mm,[L,d,hh,col]])=>{const pts=["8","4","2"].map(pp=>TAB[mm+"/"+pp]);g+=`<polyline points="${pts.map(q=>X(q[0]).toFixed(1)+","+Y(q[1]).toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="2"/>`;
+   ["8","4","2"].forEach(pp=>{const [gf,fd]=TAB[mm+"/"+pp];const isSel=mm===m&&pp===p;g+=`<circle class="ld-pt" data-m="${mm}" data-p="${pp}" cx="${X(gf).toFixed(1)}" cy="${Y(fd).toFixed(1)}" r="${isSel?9:6}" fill="${col}" stroke="${isSel?"var(--ink)":"var(--card)"}" stroke-width="${isSel?2.5:1.5}"/>`;});});
+  const [gf,fd]=TAB[m+"/"+p];g+=`<text x="${X(gf)+(gf>40?-12:12)}" y="${Y(fd)-12}" text-anchor="${gf>40?"end":"start"}" font-size="13" font-weight="700" fill="var(--ink)" font-family="var(--sans)">DiT-${m}/${p}</text>`;
+  svg.innerHTML=g;
+  const [L,d]=CFG[m];const pp=+p,T=(32/pp)**2;const e=est(L,d,T),pr=params(L,d,pp)/1e6;
+  info.innerHTML=`<b>DiT-${m}/${p}</b>: L = ${L}, d = ${d}, ${CFG[m][2]} heads, T = (32/${p})² = ${T} tokens. Paper: <b>${gf.toFixed(2)} Gflops</b>, FID <b>${fd.toFixed(2)}</b> (400K steps, no guidance). Formula (228.10): <b>${e.toFixed(2)}</b> Gflops (${(100*(e-gf)/gf).toFixed(1).replace("-","−")}%). Parameters (our count): <b>${pr.toFixed(1)}M</b>. Fit over all 12 models: slope ${slope.toFixed(3).replace("-","−")}, correlation ${corr.toFixed(2).replace("-","−")}.`;
+  svg.dataset.est=e.toFixed(2);svg.dataset.params=pr.toFixed(1);svg.dataset.slope=slope.toFixed(3);svg.dataset.corr=corr.toFixed(3);}
+ seg($("#ld-scale-m"),v=>{m=v;draw();});seg($("#ld-scale-p"),v=>{p=v;draw();});fitBox.addEventListener("change",draw);
+ svg.addEventListener("click",e=>{const c=e.target.closest(".ld-pt");if(!c)return;m=c.dataset.m;p=c.dataset.p;setSeg($("#ld-scale-m"),m);setSeg($("#ld-scale-p"),p);draw();});
+ draw();
+})();
+})();
+</script></body></html>

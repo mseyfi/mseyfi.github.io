@@ -1,0 +1,549 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><title>Diffusion 2: score matching, DDIM and fast samplers · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css"><script src="../assets/book.js"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../generative/index.html">Generative models</a><span class="sep">/</span><span>Session 226</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="diffusion-2-score-matching-ddim-and-fast">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="diffusion-2-score-matching-ddim-and-fast" data-session="diffusion-2-score-matching-ddim-and-fast" style="--tc:var(--t9)"><header class="chap-head"><div class="chap-kicker"><span class="num">226</span><span>Track 9: Generative models · session 5 of 12</span></div><h1 class="chap-title">Diffusion 2: score matching, DDIM and fast samplers</h1><p class="chap-sub">A diffusion model secretly learns the score: the direction in which an image becomes more likely. This session shows why removing noise and learning the score are the same task, how diffusion becomes a differential equation (a random one and a deterministic one), why DDIM can sample in 10 to 50 steps instead of 1000 with the same trained network, and how modern solvers such as Heun and DPM-Solver++ trade quality against the number of network calls.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate to interview level</span><span><b>Before this:</b> Diffusion 1 (session 225), Gaussians and the chain rule, basic ODEs (Euler's method); basic PyTorch</span></div><div class="learn"><h3>What you will learn</h3><ul><li>What the score of a distribution is, and why it does not need the normalizing constant</li><li>Why score matching on clean data is hard, and how denoising score matching turns it into plain noise prediction (Tweedie's formula)</li><li>Langevin dynamics, why one noise level fails, and how annealing over many noise levels (NCSN) fixes it</li><li>The forward SDE, the reverse-time SDE and the probability-flow ODE, and why they all share the same marginals</li><li>DDIM: the update rule, the η knob between DDIM and DDPM, why it is Euler's method on the ODE, and DDIM inversion</li><li>Higher-order and multistep solvers (Heun, DPM-Solver++, UniPC), the Karras noise schedule, and how to read error versus NFE</li><li>How to choose a sampler and a step count in practice, and where the network error, not the solver, sets the limit</li></ul></div></header><style>
+.d2-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.d2-grid input[type=range]{width:100%;min-width:0}
+.d2-grid output{font-family:var(--mono);font-size:14px;min-width:4.4em;text-align:right}
+.d2-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.d2-leg span::before{content:"";display:inline-block;width:18px;height:4px;border-radius:2px;margin-right:6px;vertical-align:3px;background:var(--c)}
+.d2-ar{fill:none;stroke:var(--muted);stroke-width:1.6}
+#d2-field-svg{cursor:crosshair}
+[data-session="diffusion-2-score-matching-ddim-and-fast"] pre.code{font-variant-ligatures:none}
+@media (max-width:640px){.d2-grid{grid-template-columns:1fr auto}.d2-grid label{grid-column:1 / -1}}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../generative/diffusion-1-the-forward-noising-process-and.html">session 225</a> you trained a network to predict the noise in a noisy image, and you sampled by undoing the noise one small step at a time, about 1000 times. This session answers two questions. What has the network really learned? And why can we sample with the <b>same</b> network in 20 steps instead of 1000?</p>
+<p>The answer to the first question is the <b>score</b>: for every noisy image, the direction in which it becomes more likely. A noise predictor is a score estimator in disguise. Once you see this, diffusion turns into a <b>differential equation</b> that runs from noise to data, and sampling becomes a problem of solving that equation numerically. Then the second question has a clean answer: a better numerical solver needs fewer network calls. DDIM is the simplest such solver (Euler's method); DPM-Solver++, UniPC and the Heun sampler of Karras et al. are better ones.</p>
+<p>The cost is real. Each sampling step is one full forward pass of a large U-Net or diffusion transformer. For a video model, one step processes every frame of the clip. Going from 1000 steps to 25 is a 40 times cheaper sample with no retraining. This is why every image and video product exposes a “sampler” and a “steps” setting, and why the choice matters for latency budgets.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Expect: “What is the score, and how does it relate to the noise prediction?”, “Why can DDIM skip steps without retraining?”, “What is the probability-flow ODE?”, “DDIM vs DDPM: what does η do?”, “How would you cut sampling from 50 to 10 steps?”. Each one is answered below, with numbers.</aside>
+<p>The plan: the score (what it is), score matching (how to learn it), Langevin dynamics and many noise levels (how to sample with it, the NCSN view), the SDE and ODE view (the unified picture), DDIM, and finally modern solvers and the step-count trade-off. The next session, <a href="../generative/index.html#row-guidance-and-conditioning-classifier-guidance-classifier-free" title="Guidance and conditioning: classifier guidance, classifier-free guidance, ControlNet (planned)">session 227</a>, adds a text prompt to the score.</p>
+
+<h2>The score: which way is “more likely”</h2>
+<p>Let \(p(\mathbf{x})\) be a probability density over images (or over any vectors). Its <b>score</b> is the gradient of its logarithm with respect to the input:</p>
+<div class="eq">\[ \mathbf{s}(\mathbf{x}) = \nabla_{\mathbf{x}} \log p(\mathbf{x}), \qquad p(\mathbf{x}) = \frac{e^{-E(\mathbf{x})}}{Z} \ \Rightarrow\ \mathbf{s}(\mathbf{x}) = -\nabla_{\mathbf{x}} E(\mathbf{x}) \tag{226.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{s}(\mathbf{x})\)</dt><dd>the score: a vector of the same shape as \(\mathbf{x}\) (for an image, one number per pixel and channel)</dd>
+<dt>\(E(\mathbf{x})\)</dt><dd>an <b>energy</b>: any function that is low where data is common; \(e^{-E}\) is the unnormalized density</dd>
+<dt>\(Z\)</dt><dd>the normalizing constant \(\int e^{-E(\mathbf{x})}\,d\mathbf{x}\), which makes the density integrate to 1; for images it is an integral over millions of dimensions and cannot be computed</dd></dl>
+<p>Two facts make the score useful. First, it points uphill in probability: a small move \(\mathbf{x} + \delta\,\mathbf{s}(\mathbf{x})\) makes \(\mathbf{x}\) more likely. Second, \(\log Z\) is a constant, so its gradient is zero and <b>the score never needs \(Z\)</b>. A model that outputs a score can be any neural network with an output of the same shape as its input; nothing has to integrate to 1. This is the main reason the score is easier to model than the density itself.</p>
+<p>The simplest example: for a Gaussian \(\mathcal{N}(\mu, v)\) in one dimension, \(\log p(x) = -(x-\mu)^2/(2v) + \text{const}\), so \(s(x) = -(x-\mu)/v\). The score points toward the mean, and it is stronger far from the mean and for narrow Gaussians. For a mixture of Gaussians the score is a weighted average of the scores of the components, weighted by how likely each component is to have produced \(\mathbf{x}\).</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>You stand on a dark hillside at night, and the hill is the probability landscape. You cannot see the height of the hill (that would need \(Z\), the total volume), but your feet feel which way is uphill. The score is that feeling under your feet. It is enough to climb, and with a little random stumbling (Langevin dynamics, below) it is enough to visit each hill in proportion to its size.</aside>
+<p>Diffusion never uses the score of the clean data alone. It uses the score of the data <b>after Gaussian noise of level \(\sigma\) has been added</b>, written \(p_\sigma\). Figure 1 shows this for a 2-D mixture of three Gaussians. With little noise, the score is huge near each mode and close to zero (and unreliable) in the empty space between them. With a lot of noise, \(p_\sigma\) is one wide blob, and the score points smoothly toward the data from everywhere.</p>
+<figure class="fig" id="d2-field"><div class="fig-body">
+<div class="d2-grid"><label for="d2-field-s">noise level σ (log scale)</label><input type="range" id="d2-field-s" min="-1.3" max="0.6" step="0.02" value="-0.5"><output id="d2-field-sv"></output></div>
+<svg id="d2-field-svg" viewBox="0 0 640 464" role="img" aria-label="Density of a noisy 2-D mixture of three Gaussians, with the score drawn as arrows on a grid, a probe point and its denoised estimate"></svg>
+<div class="d2-leg"><span style="--c:var(--q)">density \(p_\sigma\) (darker = more likely)</span><span style="--c:var(--ink2)">score direction</span><span style="--c:var(--k)">probe \(\mathbf{x}\)</span><span style="--c:var(--v)">denoised guess \(\mathbf{x} + \sigma^2 \mathbf{s}\)</span></div>
+<div class="readout" id="d2-field-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The score of a noisy distribution. The clean data is a mixture of three round Gaussians (standard deviation 0.3, weights 0.6, 0.25, 0.15). Adding noise of level \(\sigma\) widens each one to variance \(0.09 + \sigma^2\). Arrows show the direction of \(\nabla \log p_\sigma\) (length grows with the square root of its size). All values are exact.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Click anywhere to place the orange probe. The readout gives the exact score there and the green point \(\mathbf{x} + \sigma^2\,\mathbf{s}(\mathbf{x})\), which is the best guess of the clean point (formula 226.5 below). Move the slider down to σ = 0.05: between the modes the arrows still point somewhere, but the density there is almost zero, so a network trained on data would almost never see these points and could not learn these arrows. Move it up to σ = 2 or more: one smooth blob, and every arrow points toward the center of mass. A sampler that starts at high noise and follows the score down through the noise levels uses the easy, smooth field first and the sharp field only at the end.</p></details></figure>
+
+<h2>Learning the score: score matching and denoising</h2>
+<p>We want a network \(\mathbf{s}_\theta(\mathbf{x})\) with \(\mathbf{s}_\theta \approx \nabla \log p\). The natural loss is the squared distance between the two, averaged over the data. It is called the <b>Fisher divergence</b> or explicit score matching:</p>
+<div class="eq">\[ J_{\text{ESM}}(\theta) = \tfrac12\, \E_{\mathbf{x} \sim p} \big\lVert \mathbf{s}_\theta(\mathbf{x}) - \nabla_{\mathbf{x}} \log p(\mathbf{x}) \big\rVert^2 \tag{226.2} \]</div>
+<p>But we do not know \(\nabla \log p\); we only have samples. Hyvärinen (2005) showed with integration by parts that (226.2) equals, up to a constant that does not depend on \(\theta\),</p>
+<div class="eq">\[ J_{\text{ISM}}(\theta) = \E_{\mathbf{x} \sim p} \Big[ \operatorname{tr}\big(\nabla_{\mathbf{x}} \mathbf{s}_\theta(\mathbf{x})\big) + \tfrac12 \lVert \mathbf{s}_\theta(\mathbf{x}) \rVert^2 \Big] \tag{226.3} \]</div>
+<p>This needs no true score, but the trace of the Jacobian \(\nabla_{\mathbf{x}} \mathbf{s}_\theta\) costs one backward pass per input dimension. For a 64 × 64 × 3 image that is 12,288 backward passes per training example. It does not scale.</p>
+<h3>Denoising score matching</h3>
+<p>Vincent (2011) found the way out. Add Gaussian noise to a data point, \(\tilde{\mathbf{x}} = \mathbf{x} + \sigma\varepsilon\) with \(\varepsilon \sim \mathcal{N}(\mathbf{0}, I)\), and match the score of the <b>noisy</b> distribution \(p_\sigma\). For one fixed clean \(\mathbf{x}\), the noisy point has the simple density \(q(\tilde{\mathbf{x}} \mid \mathbf{x}) = \mathcal{N}(\tilde{\mathbf{x}}; \mathbf{x}, \sigma^2 I)\), whose score we know: \(-(\tilde{\mathbf{x}} - \mathbf{x})/\sigma^2 = -\varepsilon/\sigma\). Vincent proved that regressing on this known, per-example target gives the same minimizer as regressing on the unknown \(\nabla \log p_\sigma\):</p>
+<div class="eq">\[ J_{\text{DSM}}(\theta) = \tfrac12\, \E_{\mathbf{x},\, \varepsilon} \Big\lVert \mathbf{s}_\theta(\mathbf{x} + \sigma\varepsilon,\ \sigma) + \frac{\varepsilon}{\sigma} \Big\rVert^2 = \frac{1}{2\sigma^2}\, \E_{\mathbf{x},\, \varepsilon} \big\lVert \sigma\, \mathbf{s}_\theta(\tilde{\mathbf{x}}, \sigma) + \varepsilon \big\rVert^2 \tag{226.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\tilde{\mathbf{x}} = \mathbf{x} + \sigma\varepsilon\)</dt><dd>a training image with noise of level \(\sigma\) added</dd>
+<dt>\(-\varepsilon/\sigma\)</dt><dd>the target: the score of the noise distribution around this one clean image; it points from \(\tilde{\mathbf{x}}\) back to \(\mathbf{x}\)</dd>
+<dt>\(\mathbf{s}_\theta(\tilde{\mathbf{x}}, \sigma)\)</dt><dd>the network: it sees only the noisy image and \(\sigma\), never \(\mathbf{x}\), so the best it can do is average the target over all clean images that could have produced \(\tilde{\mathbf{x}}\); that average is exactly \(\nabla \log p_\sigma(\tilde{\mathbf{x}})\)</dd></dl>
+<p>Look at the right-hand side: \(\sigma\,\mathbf{s}_\theta\) must predict \(-\varepsilon\). Define \(\varepsilon_\theta = -\sigma\,\mathbf{s}_\theta\) and the loss becomes \(\lVert \varepsilon_\theta(\tilde{\mathbf{x}}, \sigma) - \varepsilon \rVert^2\): <b>the DDPM loss of <a href="../generative/diffusion-1-the-forward-noising-process-and.html">session 225</a> is denoising score matching</b>, with a weight of \(\sigma^2\) per noise level. Ho et al. (2020) made this link explicit. [Certain]</p>
+<h3>Tweedie’s formula: score = denoiser</h3>
+<p>There is a third view of the same object. The best estimate of the clean image given the noisy one, in the squared-error sense, is the posterior mean \(\E[\mathbf{x} \mid \tilde{\mathbf{x}}]\). <b>Tweedie’s formula</b> (Robbins 1956, popularized by Efron 2011) links it to the score:</p>
+<div class="eq">\[ D(\tilde{\mathbf{x}}; \sigma) := \E[\mathbf{x} \mid \tilde{\mathbf{x}}] = \tilde{\mathbf{x}} + \sigma^2\, \nabla_{\tilde{\mathbf{x}}} \log p_\sigma(\tilde{\mathbf{x}}) \tag{226.5} \]</div>
+<p>So the score, the noise and the clean image are three views of one network output. The conversions, in the plain noise-added form \(\tilde{\mathbf{x}} = \mathbf{x} + \sigma\varepsilon\) and in the DDPM form \(\mathbf{x}_t = \sqrt{\bar\alpha_t}\,\mathbf{x}_0 + \sqrt{1 - \bar\alpha_t}\,\varepsilon\), are:</p>
+<div class="eq">\[ \mathbf{s}_\theta = \frac{D_\theta - \tilde{\mathbf{x}}}{\sigma^2} = -\frac{\varepsilon_\theta}{\sigma}, \qquad \text{DDPM form: } \ \mathbf{s}_\theta(\mathbf{x}_t, t) = -\frac{\varepsilon_\theta(\mathbf{x}_t, t)}{\sqrt{1 - \bar\alpha_t}}, \quad \hat{\mathbf{x}}_0 = \frac{\mathbf{x}_t - \sqrt{1 - \bar\alpha_t}\,\varepsilon_\theta}{\sqrt{\bar\alpha_t}} \tag{226.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(D_\theta\)</dt><dd>the <b>denoiser</b>: the network’s guess of the clean image (also written \(\hat{\mathbf{x}}_0\))</dd>
+<dt>\(\varepsilon_\theta\)</dt><dd>the network’s guess of the noise that was added</dd>
+<dt>\(\bar\alpha_t\)</dt><dd>the DDPM signal level at step \(t\); the two forms are the same thing with \(\sigma = \sqrt{(1 - \bar\alpha_t)/\bar\alpha_t}\) and \(\tilde{\mathbf{x}} = \mathbf{x}_t / \sqrt{\bar\alpha_t}\)</dd></dl>
+<p>The last point is worth remembering: a DDPM noisy image is just a <b>scaled</b> version of “clean image plus noise of level \(\sigma\)”. For the linear schedule of DDPM (\(\beta\) from \(10^{-4}\) to 0.02 over 1000 steps), \(\bar\alpha_{1000} = 4.04 \times 10^{-5}\), which is \(\sigma \approx 157\), and \(\bar\alpha_1 = 0.9999\), which is \(\sigma = 0.01\). We will use the \(\sigma\) form for the math, because it is the simplest; every formula maps back to the \(\bar\alpha\) form by this rescaling.</p>
+<div class="worked"><div class="wt">Worked example: score, noise and denoiser for Gaussian data</div>
+<p>Let the data be \(\mathcal{N}(0, 1)\) in one dimension. Adding noise of level \(\sigma = 2\) gives \(p_\sigma = \mathcal{N}(0,\ 1 + 4) = \mathcal{N}(0, 5)\). At \(\tilde{x} = 3\):</p>
+<p>Score: \(s = -3/5 = -0.6\). Tweedie (226.5): \(D = 3 + 4 \cdot (-0.6) = 0.6\). Check against the direct posterior mean of a Gaussian, \(\tfrac{1}{1 + 4} \cdot 3 = 0.6\). Predicted noise: \(\varepsilon = (\tilde{x} - D)/\sigma = (3 - 0.6)/2 = 1.2\), and indeed \(-\varepsilon/\sigma = -0.6 = s\).</p>
+<p>In DDPM form this point has \(\bar\alpha = 1/(1 + \sigma^2) = 0.2\) and \(x_t = 3 \cdot \sqrt{0.2} = 1.342\). The three numbers \(s = -0.6\), \(D = 0.6\), \(\varepsilon = 1.2\) are what a perfect network would output, in its three possible parameterizations.</p></div>
+
+<h2>Sampling with the score: Langevin dynamics and many noise levels</h2>
+<p>Suppose we have the score. How do we turn it into samples? <b>Langevin dynamics</b> is a random walk that climbs the score and adds noise at each step:</p>
+<div class="eq">\[ \mathbf{x}_{k+1} = \mathbf{x}_k + \frac{\alpha}{2}\, \mathbf{s}(\mathbf{x}_k) + \sqrt{\alpha}\, \mathbf{z}_k, \qquad \mathbf{z}_k \sim \mathcal{N}(\mathbf{0}, I) \tag{226.7} \]</div>
+<p>Here \(\alpha \gt 0\) is the step size. The drift term alone would climb to the nearest peak and stop (that is gradient ascent on \(\log p\)). The noise term keeps the walker moving, and the two balance exactly so that, as \(\alpha \to 0\) and the number of steps grows, the walker’s position is distributed as \(p\). [Certain]</p>
+<p>In practice plain Langevin dynamics on the clean score fails, for two reasons that Song and Ermon (2019) pointed out:</p>
+<ul>
+<li><b>The score is wrong where there is no data.</b> The network is trained on samples, and the empty space between modes has almost none. It is exactly the space a walker must cross.</li>
+<li><b>Mixing between modes is extremely slow.</b> Even with the true score, a walker in one mode must cross a region of near-zero probability to reach another. In finite time, walkers stay in whichever mode they fell into first, so the share of samples per mode follows the size of each mode’s <b>basin of attraction</b>, not the true weights.</li></ul>
+<p>The fix of their <b>noise-conditional score network (NCSN)</b> is to train one network for many noise levels \(\sigma_1 \gt \sigma_2 \gt \dots \gt \sigma_L\) at once, with loss (226.4) summed over levels (weighted by \(\sigma^2\)), and to sample with <b>annealed Langevin dynamics</b>: run Langevin at the largest noise level, where \(p_\sigma\) is one smooth blob and all modes are connected, then use the result as the start for the next, smaller noise level, and so on.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: annealed Langevin dynamics (NCSN)</div><ol>
+<li><b>input:</b> score network \(\mathbf{s}_\theta(\mathbf{x}, \sigma)\); noise levels \(\sigma_1 \gt \dots \gt \sigma_L\) (geometric); steps per level \(T\); base step \(\epsilon\)</li>
+<li>\(\mathbf{x} \leftarrow\) a random start (uniform noise or \(\mathcal{N}(\mathbf{0}, \sigma_1^2 I)\))</li>
+<li><b>for</b> \(i = 1, \dots, L\): <span class="c">// from coarse to fine</span></li>
+<li>&nbsp;&nbsp;\(\alpha_i \leftarrow \epsilon\, \sigma_i^2 / \sigma_L^2\) <span class="c">// step size scales with the variance of the level</span></li>
+<li>&nbsp;&nbsp;<b>repeat</b> \(T\) times: \(\mathbf{z} \sim \mathcal{N}(\mathbf{0}, I)\); \(\ \mathbf{x} \leftarrow \mathbf{x} + \tfrac{\alpha_i}{2}\, \mathbf{s}_\theta(\mathbf{x}, \sigma_i) + \sqrt{\alpha_i}\, \mathbf{z}\) <span class="c">// formula (226.7)</span></li>
+<li><b>return</b> \(\mathbf{x}\) <span class="c">// later work adds one final denoising step with Tweedie (226.5)</span></li></ol></div>
+<p>The step size rule \(\alpha_i \propto \sigma_i^2\) keeps the “signal to noise ratio” of each update the same at every level. Figure 2 runs both versions on the mixture of Figure 1, with the exact score.</p>
+<figure class="fig" id="d2-lang"><div class="fig-body">
+<div class="controls"><span class="seg" id="d2-lang-mode"><button type="button" data-v="ann" aria-pressed="true">Annealed: σ from 3 down to 0.05</button><button type="button" data-v="plain" aria-pressed="false">Plain: σ = 0.05 only</button></span></div>
+<div class="controls"><button type="button" class="btn" id="d2-lang-prev">Back</button><button type="button" class="btn primary" id="d2-lang-play">Play</button><button type="button" class="btn" id="d2-lang-next">Next</button><span id="d2-lang-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<svg id="d2-lang-svg" viewBox="0 0 640 464" role="img" aria-label="Particles moving under Langevin dynamics toward three modes of a 2-D mixture"></svg>
+<div class="readout" id="d2-lang-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> 500 particles, started uniformly over the box, run 400 Langevin steps (10 stages of 40). Annealed: 10 geometric noise levels from 3 to 0.05 with \(\alpha_i = 0.3\,\sigma_i^2\). Plain: all 400 steps at \(\sigma = 0.05\) with \(\alpha = 0.02\). Fixed random seed; dashed circles mark the three modes.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Step through the stages. In the plain run, every particle slides into the nearest mode within the first stage and never leaves, so the shares end near the shares of the start box closest to each mode (0.30 / 0.29 / 0.41), far from the true 0.6 / 0.25 / 0.15. In the annealed run, the first stages pull all particles into one wide blob near the weighted center; as \(\sigma\) shrinks, the blob splits, and each part gets a share close to the true weight (0.55 / 0.30 / 0.16). The remaining gap comes from 500 particles and the short run; it shrinks with more steps per level.</p></details></figure>
+
+<h2>Diffusion as a differential equation</h2>
+<p>DDPM has 1000 discrete steps; NCSN has 10 or so noise levels. Song et al. (2021) took the limit of infinitely many tiny steps. The noising process then becomes a <b>stochastic differential equation (SDE)</b>: a differential equation with a random term.</p>
+<div class="eq">\[ d\mathbf{x} = \mathbf{f}(\mathbf{x}, t)\, dt + g(t)\, d\mathbf{w} \tag{226.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t \in [0, T]\)</dt><dd>continuous time; \(t = 0\) is clean data, \(t = T\) is (almost) pure noise</dd>
+<dt>\(\mathbf{f}(\mathbf{x}, t)\)</dt><dd>the <b>drift</b>: a deterministic push per unit time</dd>
+<dt>\(g(t)\, d\mathbf{w}\)</dt><dd>the <b>diffusion</b> term: \(d\mathbf{w}\) is a tiny Gaussian step with variance \(dt\) (Brownian motion), and \(g(t)\) sets how much noise is added per unit time</dd>
+<dt>VP SDE</dt><dd>\(\mathbf{f} = -\tfrac12 \beta(t)\,\mathbf{x}\), \(g = \sqrt{\beta(t)}\): the continuous version of DDPM; the signal shrinks while noise is added, so the variance stays bounded (“variance preserving”)</dd>
+<dt>VE SDE</dt><dd>\(\mathbf{f} = \mathbf{0}\), \(g = \sqrt{d\sigma^2(t)/dt}\): the continuous version of NCSN; only noise is added, so \(\mathbf{x}_t = \mathbf{x}_0 + \sigma(t)\varepsilon\) and the variance explodes (“variance exploding”)</dd></dl>
+<p>A classic result of Anderson (1982) says that this process can be run <b>backward in time</b>, and the reverse is again an SDE. Its drift needs only one thing we do not already know: the score of the noisy data at each time.</p>
+<div class="eq">\[ d\mathbf{x} = \big[ \mathbf{f}(\mathbf{x}, t) - g(t)^2\, \nabla_{\mathbf{x}} \log p_t(\mathbf{x}) \big]\, dt + g(t)\, d\bar{\mathbf{w}} \tag{226.9} \]</div>
+<p>Here time runs from \(T\) down to 0 (so \(dt\) is negative) and \(d\bar{\mathbf{w}}\) is Brownian motion in reverse time. Replace the score by the network \(\mathbf{s}_\theta(\mathbf{x}, t)\), start from noise, integrate down to \(t = 0\), and you have a sample. DDPM’s sampler is one discretization of this equation; adding Langevin “corrector” steps after each step gives the predictor–corrector sampler of the same paper.</p>
+<h3>The probability-flow ODE</h3>
+<p>The most useful result in the paper is this: there is a <b>deterministic</b> process, an ordinary differential equation (ODE) with no random term, whose solutions have exactly the same distribution \(p_t\) at every time \(t\) as the SDE:</p>
+<div class="eq">\[ \frac{d\mathbf{x}}{dt} = \mathbf{f}(\mathbf{x}, t) - \tfrac12\, g(t)^2\, \nabla_{\mathbf{x}} \log p_t(\mathbf{x}) \tag{226.10} \]</div>
+<p>Note the factor \(\tfrac12\) where the reverse SDE has 1, and the missing noise term. Intuitively, the reverse SDE moves twice as far up the score and then adds noise that spreads the samples back out by half that amount on average; the ODE takes only the net effect. For the VE form with \(\sigma\) as the time variable (Karras et al., 2022), and using Tweedie (226.5), the ODE becomes very simple:</p>
+<div class="eq">\[ \frac{d\mathbf{x}}{d\sigma} = -\sigma\, \nabla_{\mathbf{x}} \log p_\sigma(\mathbf{x}) = \frac{\mathbf{x} - D(\mathbf{x}; \sigma)}{\sigma} \tag{226.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{x} - D(\mathbf{x}; \sigma)\)</dt><dd>the part of \(\mathbf{x}\) the denoiser thinks is noise</dd>
+<dt>\((\mathbf{x} - D)/\sigma\)</dt><dd>the predicted noise \(\hat\varepsilon\): the ODE says “as \(\sigma\) goes down by \(d\sigma\), remove \(\hat\varepsilon\, d\sigma\) of noise”</dd></dl>
+<p>Why the ODE matters so much:</p>
+<ul>
+<li><b>Big steps.</b> An ODE has smooth solutions, and numerical analysis offers many accurate solvers for it. An SDE solver must also simulate the noise, which limits how large the steps can be.</li>
+<li><b>A fixed map from noise to images.</b> Each starting noise gives one image. This makes <b>inversion</b> possible: run the ODE forward from a real image to get its noise, then edit and run it back.</li>
+<li><b>Exact likelihoods.</b> With the change-of-variables formula of continuous normalizing flows, the ODE gives \(\log p(\mathbf{x})\); Song et al. report 2.99 bits per dimension on CIFAR-10. [Certain]</li></ul>
+<aside class="note analogy side"><span class="nt">Analogy</span>Think of a crowd leaving a stadium. The SDE describes each person walking a random, jittery path; the ODE describes a calm flow in which each person follows the average current. Seen from above, the density of the crowd at every moment is the same in both films. But in the calm flow, two people never cross paths, and if you play the film backward, everyone returns to their own seat.</aside>
+<p>Figure 3 shows both on a 1-D mixture of three Gaussians, with the exact denoiser. The knob \(\eta\) blends between them (this is the DDIM \(\eta\), next section): \(\eta = 0\) is the ODE, \(\eta = 1\) is the DDPM-like reverse SDE.</p>
+<figure class="fig" id="d2-traj"><div class="fig-body">
+<div class="d2-grid"><label for="d2-traj-eta">stochasticity η</label><input type="range" id="d2-traj-eta" min="0" max="1" step="0.05" value="0"><output id="d2-traj-etav"></output></div>
+<div class="controls" style="margin-top:8px"><button type="button" class="btn" id="d2-traj-seed">New noise</button></div>
+<div class="scroll-x"><svg id="d2-traj-svg" viewBox="0 0 640 380" role="img" aria-label="Forty sampling paths from noise to data as the noise level goes down, and a histogram of 2000 end points against the true density"></svg></div>
+<div class="d2-leg"><span style="--c:var(--q)">sampling paths (scaled by \(1/\sqrt{1 + \sigma^2}\))</span><span style="--c:var(--k)">true data density</span></div>
+<div class="readout" id="d2-traj-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> 2,000 samples of a 1-D mixture (weights 0.35, 0.45, 0.2; means −2, 0.5, 2.5; standard deviations 0.3, 0.4, 0.2), each run for 100 steps from \(\sigma = 80\) to 0 with the exact denoiser. Paths are drawn for 40 of them, scaled by \(1/\sqrt{1 + \sigma^2}\) (the DDPM view) so that the start fits on the plot. Right: histogram of all end points against the true density.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At \(\eta = 0\) the paths are smooth and never cross (the readout counts 0 swapped pairs): in one dimension the ODE keeps the order of its starting points, so it maps the \(k\)-th smallest noise to the \(k\)-th smallest sample. Raise \(\eta\): the paths become jittery and cross, and “New noise” changes the result. Yet the histogram on the right stays close to the true density at every \(\eta\), and the share per mode stays close to 0.35 / 0.45 / 0.2. Same marginals, different paths: that is the whole content of (226.9) versus (226.10). Notice also that the paths decide their mode in the middle, around \(\sigma\) between 0.3 and 3.</p></details></figure>
+
+<h2>DDIM: deterministic sampling with far fewer steps</h2>
+<p>DDIM (Song, Meng and Ermon, 2020) was found from a different angle, before the ODE view was common. The DDPM training loss only uses the <b>marginals</b> \(q(\mathbf{x}_t \mid \mathbf{x}_0) = \mathcal{N}(\sqrt{\bar\alpha_t}\,\mathbf{x}_0,\ (1 - \bar\alpha_t) I)\). It never uses the step-by-step chain \(q(\mathbf{x}_t \mid \mathbf{x}_{t-1})\). So any other forward process with the same marginals has the <b>same training loss</b> and can reuse the same trained network. DDIM picks a family of <b>non-Markovian</b> forward processes (each step may also look at \(\mathbf{x}_0\)) with these marginals, and derives their reverse step:</p>
+<div class="eq">\[ \mathbf{x}_{t'} = \sqrt{\bar\alpha_{t'}}\; \hat{\mathbf{x}}_0 + \sqrt{1 - \bar\alpha_{t'} - \sigma_t^2}\;\, \varepsilon_\theta(\mathbf{x}_t, t) + \sigma_t\, \mathbf{z}, \qquad \sigma_t = \eta \sqrt{\frac{1 - \bar\alpha_{t'}}{1 - \bar\alpha_t}} \sqrt{1 - \frac{\bar\alpha_t}{\bar\alpha_{t'}}} \tag{226.12} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t' \lt t\)</dt><dd>the next time step; it does not need to be \(t - 1\): any decreasing sub-sequence of the 1000 training steps works</dd>
+<dt>\(\hat{\mathbf{x}}_0\)</dt><dd>the predicted clean image from (226.6)</dd>
+<dt>\(\sqrt{1 - \bar\alpha_{t'} - \sigma_t^2}\; \varepsilon_\theta\)</dt><dd>the “direction pointing to \(\mathbf{x}_t\)”: the predicted noise, re-used at the lower noise level</dd>
+<dt>\(\sigma_t \mathbf{z}\)</dt><dd>fresh random noise; \(\mathbf{z} \sim \mathcal{N}(\mathbf{0}, I)\)</dd>
+<dt>\(\eta\)</dt><dd>\(\eta = 0\): deterministic <b>DDIM</b>. \(\eta = 1\): the DDPM posterior variance, so with \(t' = t - 1\) this is DDPM ancestral sampling</dd></dl>
+<p>Read (226.12) as two moves. First, jump to the network’s guess of the clean image. Then, put back exactly the noise that belongs at level \(t'\), using the <b>same</b> noise direction the network just predicted (plus fresh noise if \(\eta \gt 0\)). The paper reports samples of high quality 10 to 50 times faster in wall-clock time than DDPM. [Certain]</p>
+<h3>DDIM is Euler’s method on the probability-flow ODE</h3>
+<p>Divide (226.12) with \(\eta = 0\) by \(\sqrt{\bar\alpha_{t'}}\) and switch to the \(\sigma\) form, \(\mathbf{x} = \mathbf{x}_t / \sqrt{\bar\alpha_t}\) and \(\sigma = \sqrt{(1 - \bar\alpha_t)/\bar\alpha_t}\). With \(D = \hat{\mathbf{x}}_0\) the step becomes:</p>
+<div class="eq">\[ \mathbf{x}_{\text{next}} = D(\mathbf{x}; \sigma) + \frac{\sigma_{\text{next}}}{\sigma} \big( \mathbf{x} - D(\mathbf{x}; \sigma) \big) = \mathbf{x} + (\sigma_{\text{next}} - \sigma)\, \frac{\mathbf{x} - D(\mathbf{x}; \sigma)}{\sigma} \tag{226.13} \]</div>
+<p>The right-hand form is one step of <b>Euler’s method</b> on the ODE (226.11): current point plus step size times current slope. [Certain] So DDIM is the simplest possible ODE solver, applied in the coordinates where the ODE is simplest. The left-hand form has a nice picture, shown in Figure 4: the next point lies on the <b>straight line</b> from the current point to the current guess of the clean image, at the fraction \(\sigma_{\text{next}}/\sigma\) of the way back from the guess.</p>
+<figure class="fig" id="d2-geo"><div class="fig-body"><div class="scroll-x">
+<svg viewBox="0 0 640 300" role="img" aria-label="One DDIM step: from the noisy point, a straight line to the predicted clean image, and the next point on that line; the true ODE path curves slightly away">
+<defs><marker id="d2-ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+<ellipse cx="120" cy="240" rx="95" ry="38" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1.5"/>
+<text x="120" y="292" text-anchor="middle" class="svgs" font-size="12.5">clean data</text>
+<line x1="560" y1="50" x2="132" y2="232" stroke="var(--q)" stroke-width="2" stroke-dasharray="7 5"/>
+<path d="M560 50 C 470 92, 400 140, 362 166" fill="none" stroke="var(--v)" stroke-width="2.6"/>
+<path d="M362 166 C 300 196, 200 226, 150 236" fill="none" stroke="var(--v)" stroke-width="1.6" stroke-dasharray="3 4"/>
+<circle cx="560" cy="50" r="8" fill="var(--q)"/><text x="548" y="34" text-anchor="end" class="svgt" font-size="14" font-weight="700">x at level σ</text>
+<circle cx="132" cy="232" r="7" fill="var(--k)"/><text x="132" y="262" text-anchor="middle" class="svgt" font-size="13.5" font-weight="700">D(x; σ) = guess of x₀</text>
+<circle cx="346" cy="141" r="7" fill="var(--q)" stroke="var(--card)" stroke-width="2"/><text x="352" y="128" class="svgt" font-size="13.5" font-weight="700">DDIM: x_next</text>
+<circle cx="362" cy="166" r="6" fill="var(--v)"/><text x="372" y="186" class="svgt" font-size="13" fill="var(--v)">exact ODE at σ_next</text>
+<text x="620" y="240" class="svgs" font-size="12.5" text-anchor="end">x_next lies on the dashed line, at the fraction</text><text x="620" y="258" class="svgs" font-size="12.5" text-anchor="end">σ_next/σ of the way from D back toward x</text>
+<line x1="346" y1="141" x2="362" y2="166" stroke="var(--ink)" stroke-width="2"/><path class="d2-ar" d="M246 72 L 348 150" marker-end="url(#d2-ah2)"/><text x="244" y="66" text-anchor="end" class="svgs" font-size="12.5">error of one Euler step</text>
+</svg></div></div>
+<figcaption><b>Figure 4.</b> One DDIM step, drawn as a sketch (not to scale). DDIM jumps along the straight line (dashed) toward the current denoised guess and stops at the next noise level. The exact ODE path (green) curves, because the guess \(D\) changes as the noise goes down. The gap between the two is the error of one Euler step; it shrinks when steps are small or when the path is nearly straight.</figcaption></figure>
+<div class="worked"><div class="wt">Worked example: one DDIM step and one Heun step, with exact numbers</div>
+<p>Data \(\mathcal{N}(0, 1)\), start at \(x = 3\) with \(\sigma = 2\), step to \(\sigma_{\text{next}} = 1\). From the previous worked example, \(D = 0.6\) and \(\hat\varepsilon = 1.2\).</p>
+<p><b>DDIM</b> (226.13): \(x_{\text{next}} = 0.6 + \tfrac12 (3 - 0.6) = 1.8\). In DDPM form: \(\bar\alpha\) goes from 0.2 to 0.5, and \(\sqrt{0.5}\cdot 0.6 + \sqrt{0.5}\cdot 1.2 = 1.273 = 1.8/\sqrt{2}\). The two forms agree.</p>
+<p><b>Exact ODE</b>: for Gaussian data \(D = x/(1 + \sigma^2)\), so (226.11) reads \(dx/d\sigma = \sigma x/(1 + \sigma^2)\), whose solution is \(x \propto \sqrt{1 + \sigma^2}\). From \(x = 3\) at \(\sigma = 2\): \(x(1) = 3\sqrt{2/5} = 1.897\). DDIM is off by 0.097.</p>
+<p><b>Heun</b> (226.14 below): the Euler guess 1.8 gives a second slope at \(\sigma = 1\): \(D = 1.8/2 = 0.9\), slope \((1.8 - 0.9)/1 = 0.9\). Average slope \((1.2 + 0.9)/2 = 1.05\), so \(x_{\text{next}} = 3 - 1 \cdot 1.05 = 1.95\). Error 0.053, about half, for one extra network call.</p></div>
+<div class="algo"><div class="algo-h">Algorithm 2: DDIM sampling with S steps (DDPM-trained network)</div><ol>
+<li><b>input:</b> noise network \(\varepsilon_\theta\); schedule \(\bar\alpha_1, \dots, \bar\alpha_{1000}\); a decreasing sub-sequence \(\tau_S \gt \dots \gt \tau_1\) of training steps (for example every 50th step for \(S = 20\)); \(\eta\)</li>
+<li>\(\mathbf{x} \sim \mathcal{N}(\mathbf{0}, I)\) <span class="c">// at time \(\tau_S\)</span></li>
+<li><b>for</b> \(i = S, \dots, 1\): \(t \leftarrow \tau_i\); \(t' \leftarrow \tau_{i-1}\) (with \(\bar\alpha_{\tau_0} := 1\))</li>
+<li>&nbsp;&nbsp;\(\hat\varepsilon \leftarrow \varepsilon_\theta(\mathbf{x}, t)\); \(\ \hat{\mathbf{x}}_0 \leftarrow (\mathbf{x} - \sqrt{1 - \bar\alpha_t}\,\hat\varepsilon)/\sqrt{\bar\alpha_t}\) <span class="c">// formula (226.6); optionally clip to the data range</span></li>
+<li>&nbsp;&nbsp;\(\sigma_t \leftarrow\) formula (226.12) with \(\eta\); \(\ \mathbf{z} \sim \mathcal{N}(\mathbf{0}, I)\) if \(\eta \gt 0\)</li>
+<li>&nbsp;&nbsp;\(\mathbf{x} \leftarrow \sqrt{\bar\alpha_{t'}}\,\hat{\mathbf{x}}_0 + \sqrt{1 - \bar\alpha_{t'} - \sigma_t^2}\,\hat\varepsilon + \sigma_t \mathbf{z}\) <span class="c">// S network calls in total</span></li>
+<li><b>return</b> \(\mathbf{x}\)</li></ol></div>
+<h3>DDIM inversion</h3>
+<p>Because DDIM with \(\eta = 0\) is a deterministic ODE solver, it can also run in the other direction: from a real image, step <b>up</b> in noise with the same rule, and you get a noise \(\mathbf{x}_T\) that DDIM maps back to (almost) the same image. Editing methods then change the prompt or the noise and decode again. The inversion is only approximate: each Euler step uses the slope at the start of the step, which is slightly different going up than going down, and with classifier-free guidance the error grows. [Likely] Methods such as null-text inversion were built to fix this.</p>
+
+<h2>Modern solvers and the step-count trade-off</h2>
+<p>Once sampling is “solve the ODE (226.11) from \(\sigma_{\max}\) to 0”, the cost is counted in <b>NFE</b>, the number of function (network) evaluations. Everything else is cheap. Three ideas push quality per NFE up.</p>
+<h3>1. Higher-order steps (Heun)</h3>
+<p>Euler’s error per step is proportional to the step size squared, so its total error is proportional to the step size: halving the step size halves the error. <b>Heun’s method</b> takes an Euler step, evaluates the slope again at the end, and uses the average of the two slopes:</p>
+<div class="eq">\[ \mathbf{d}_i = \frac{\mathbf{x}_i - D(\mathbf{x}_i; \sigma_i)}{\sigma_i}, \quad \tilde{\mathbf{x}} = \mathbf{x}_i + (\sigma_{i+1} - \sigma_i)\, \mathbf{d}_i, \quad \mathbf{x}_{i+1} = \mathbf{x}_i + (\sigma_{i+1} - \sigma_i)\, \frac{\mathbf{d}_i + \tilde{\mathbf{d}}}{2} \tag{226.14} \]</div>
+<p>where \(\tilde{\mathbf{d}}\) is the slope at \((\tilde{\mathbf{x}}, \sigma_{i+1})\). Its total error falls with the <b>square</b> of the step size, but each step costs 2 NFE. Karras et al. (2022, “EDM”) use it with no extra step at the very end (the slope at \(\sigma = 0\) is undefined), so \(N\) steps cost \(2N - 1\) NFE; their CIFAR-10 result of FID 1.79 used 35 NFE [Certain], which is 18 steps. [Likely]</p>
+<h3>2. Where to put the steps: the noise schedule for sampling</h3>
+<p>The ODE path is nearly straight at high noise and bends strongly at low noise (Figure 3: the paths are flat at high noise and bend between \(\sigma \approx 3\) and 0.3). So steps should be dense at small \(\sigma\). EDM proposes:</p>
+<div class="eq">\[ \sigma_i = \Big( \sigma_{\max}^{1/\rho} + \tfrac{i}{N-1} \big( \sigma_{\min}^{1/\rho} - \sigma_{\max}^{1/\rho} \big) \Big)^{\rho}, \quad i = 0, \dots, N-1, \qquad \sigma_N = 0 \tag{226.15} \]</div>
+<p>with \(\sigma_{\max} = 80\), \(\sigma_{\min} = 0.002\), \(\rho = 7\). For \(N = 10\) this gives 80, 42.4, 21.1, 9.72, 4.07, 1.50, 0.470, 0.117, 0.0204, 0.002, then 0: half of the steps are below \(\sigma = 1.5\).</p>
+<h3>3. Exact linear part and multistep reuse (DPM-Solver, DPM-Solver++, UniPC)</h3>
+<p>Lu et al. (2022) noticed that the diffusion ODE has a linear part that can be integrated exactly, leaving only the network term to approximate. Written with \(\lambda = -\log\sigma\) and the data prediction \(D\), the first-order DPM-Solver++ step is exactly DDIM (226.13). The second-order <b>multistep</b> version, DPM-Solver++(2M), reuses the previous step’s \(D\) to estimate how \(D\) changes, so it gets second-order accuracy for <b>one</b> NFE per step:</p>
+<div class="eq">\[ h_i = \log\frac{\sigma_i}{\sigma_{i+1}}, \qquad \hat D_i = D_i + \frac{h_i}{2 h_{i-1}} \big( D_i - D_{i-1} \big), \qquad \mathbf{x}_{i+1} = \frac{\sigma_{i+1}}{\sigma_i}\, \mathbf{x}_i + \Big( 1 - \frac{\sigma_{i+1}}{\sigma_i} \Big) \hat D_i \tag{226.16} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(D_i\)</dt><dd>the denoiser output at step \(i\), \(D(\mathbf{x}_i; \sigma_i)\); \(D_{i-1}\) is kept from the previous step, so no extra network call</dd>
+<dt>\(h_i\)</dt><dd>the step size in log-noise; \(h_i / h_{i-1}\) corrects for unequal steps</dd>
+<dt>\(\hat D_i\)</dt><dd>a linear extrapolation of the clean-image guess toward the middle of the step; with \(\hat D_i = D_i\) the update is DDIM again</dd></dl>
+<p>The DPM-Solver paper reports FID 4.70 at 10 NFE and 2.87 at 20 NFE on CIFAR-10 [Certain]; DPM-Solver++ targets guided sampling, where it reports high quality in 15 to 20 steps, while DDIM “generally needs 100 to 250 steps” in that setting [Certain]. UniPC adds a corrector that reuses the new network output, and reports FID 3.87 on CIFAR-10 with 10 NFE. [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 3: a generic ODE sampler in σ form (DDIM, Heun or DPM-Solver++(2M))</div><ol>
+<li><b>input:</b> denoiser \(D_\theta(\mathbf{x}; \sigma)\); number of steps \(N\); schedule (226.15) \(\sigma_0 \gt \dots \gt \sigma_{N-1} \gt \sigma_N = 0\)</li>
+<li>\(\mathbf{x} \sim \mathcal{N}(\mathbf{0}, \sigma_0^2 I)\); \(\ D_{\text{prev}} \leftarrow\) none</li>
+<li><b>for</b> \(i = 0, \dots, N - 1\): \(\ D_i \leftarrow D_\theta(\mathbf{x}; \sigma_i)\) <span class="c">// 1 NFE</span></li>
+<li>&nbsp;&nbsp;<b>if</b> \(\sigma_{i+1} = 0\): \(\mathbf{x} \leftarrow D_i\); <b>break</b> <span class="c">// last step: just denoise</span></li>
+<li>&nbsp;&nbsp;<b>DDIM:</b> \(\mathbf{x} \leftarrow D_i + (\sigma_{i+1}/\sigma_i)(\mathbf{x} - D_i)\) <span class="c">// (226.13)</span></li>
+<li>&nbsp;&nbsp;<b>Heun:</b> Euler guess \(\tilde{\mathbf{x}}\), one more call \(D_\theta(\tilde{\mathbf{x}}; \sigma_{i+1})\), average slopes <span class="c">// (226.14), +1 NFE</span></li>
+<li>&nbsp;&nbsp;<b>DPM-Solver++(2M):</b> extrapolate \(\hat D_i\) from \(D_i, D_{\text{prev}}\); update with (226.16); \(D_{\text{prev}} \leftarrow D_i\)</li>
+<li><b>return</b> \(\mathbf{x}\) <span class="c">// for a latent model, decode with the VAE afterwards</span></li></ol></div>
+<p>Figure 5 runs all of these on the 1-D mixture of Figure 3 with the exact denoiser, so the only error left is the solver’s. Because the exact ODE in 1-D maps the \(k\)-th smallest starting noise to the \(k\)-th smallest data quantile, we can start from 1,000 evenly spaced quantiles of \(p_{80}\) and measure the error as the average distance between the sorted outputs and the true data quantiles (the 1-D <b>Wasserstein-1 distance</b> \(W_1\)).</p>
+<figure class="fig wide" id="d2-solv"><div class="fig-body">
+<div class="d2-grid"><label for="d2-solv-n">budget: network evaluations (NFE)</label><input type="range" id="d2-solv-n" min="2" max="60" step="1" value="10"><output id="d2-solv-nv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="seg" id="d2-solv-m"><button type="button" data-v="ddim" aria-pressed="true">DDIM</button><button type="button" data-v="heun" aria-pressed="false">Heun</button><button type="button" data-v="dpm" aria-pressed="false">DPM-Solver++(2M)</button><button type="button" data-v="anc" aria-pressed="false">Ancestral (η = 1)</button></span></div>
+<div class="scroll-x"><svg id="d2-solv-svg" viewBox="0 0 640 300" role="img" aria-label="Left: histogram of samples from the chosen sampler against the true density. Right: error versus number of network evaluations for four samplers on log-log axes"></svg></div>
+<div class="d2-leg"><span style="--c:var(--q)">DDIM</span><span style="--c:var(--k)">Heun</span><span style="--c:var(--v)">DPM-Solver++(2M)</span><span style="--c:var(--muted)">ancestral, η = 1 (dashed)</span></div>
+<div class="readout" id="d2-solv-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> The step-count trade-off with a perfect network. Sampling the 1-D mixture of Figure 3 with the schedule (226.15) (\(\sigma_{\max} = 80\), \(\sigma_{\min} = 0.002\), \(\rho = 7\)). Heun gets \(N = \lfloor(\text{NFE} + 1)/2\rfloor\) steps, so it uses \(2N - 1\) NFE. The ancestral sampler uses a fixed seed; with 1,000 random samples its error cannot go much below about 0.05 even with perfect steps.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Move the budget. At 10 NFE: DDIM 0.29, Heun 1.05 (only 5 steps, too coarse for a second-order method), DPM-Solver++(2M) 0.23. At 50 NFE: DDIM 0.054, Heun 0.019, DPM-Solver++(2M) 0.0047. On the log-log plot, the DDIM line has slope about −1 (error ∝ 1/NFE) and the two second-order methods have slope about −2: from 31 to 51 NFE, DDIM’s error falls by 1.67 times, DPM-Solver++(2M)’s by 2.9 times. Below about 8 NFE nothing is good, and Heun is the worst: its extra evaluations buy nothing when each step is huge. Look at the histogram at low NFE: the error shows up as modes that are too wide and too close together, the 1-D version of blurry, washed-out images.</p></details></figure>
+<h3>Choosing a sampler in practice</h3>
+<ul>
+<li><b>20 to 30 steps of a second-order multistep solver</b> (DPM-Solver++(2M), UniPC) is the usual default for latent image models; DDIM at 50 steps is the classic safe choice. [Likely]</li>
+<li><b>Stochastic samplers</b> (\(\eta \gt 0\), ancestral, SDE variants) need more steps, but the injected noise can correct earlier errors, and with many steps they sometimes give better quality than the ODE. EDM found that a modest amount of noise helps some models and hurts others. [Likely]</li>
+<li><b>Below about 8 steps</b>, solvers alone fail; you need a model trained or distilled for few steps: progressive distillation, consistency models, or straight flows (<a href="../generative/index.html#row-flow-matching-and-rectified-flow" title="Flow matching and rectified flow (planned)">session 229</a>, <a href="../generative/index.html#row-few-step-generation-consistency-models-and-distillation" title="Few-step generation: consistency models and distillation (planned)">session 230</a>).</li>
+<li><b>The network sets a floor.</b> A perfect solver of the wrong ODE is still wrong. Once the solver error is below the network’s own error, more steps change little (the PyTorch run below shows this).</li></ul>
+<div class="tblw"><table class="tb"><thead><tr><th>Sampler</th><th>Type</th><th>NFE per step</th><th>Order</th><th>Typical steps</th></tr></thead><tbody>
+<tr><td>DDPM ancestral</td><td>reverse SDE</td><td>1</td><td>1 (weak)</td><td>1000 in the original paper</td></tr>
+<tr><td>DDIM (\(\eta = 0\))</td><td>ODE, Euler</td><td>1</td><td>1</td><td>50 to 100 [Likely]</td></tr>
+<tr><td>Heun (EDM)</td><td>ODE, Runge–Kutta</td><td>2</td><td>2</td><td>18 steps = 35 NFE on CIFAR-10</td></tr>
+<tr><td>DPM-Solver-2 / -3 (single-step)</td><td>ODE, exponential integrator</td><td>2 / 3</td><td>2 / 3</td><td>10 to 20 NFE</td></tr>
+<tr><td>DPM-Solver++(2M)</td><td>ODE, multistep</td><td>1</td><td>2</td><td>15 to 25</td></tr>
+<tr><td>UniPC</td><td>ODE, predictor–corrector</td><td>1</td><td>2 to 3</td><td>10 to 20</td></tr>
+<tr><td>Predictor–corrector (score SDE)</td><td>SDE + Langevin</td><td>2</td><td>1</td><td>hundreds to thousands</td></tr></tbody></table></div>
+
+<h2>Score-based sampling in PyTorch</h2>
+<p>A complete, deterministic example on the 1-D mixture of Figures 3 and 5. It trains a small denoiser with denoising score matching (in the “predict the clean value” form, with the input and output scaling of EDM, which keeps the network’s inputs and targets near unit variance at every \(\sigma\)), then samples with DDIM, Heun and DPM-Solver++(2M), using both the exact denoiser and the trained network. It runs in about half a minute on a CPU.</p>
+<pre class="code">import math, torch, torch.nn as nn
+torch.manual_seed(0)
+
+<span class="cm"># toy data: a 1-D mixture of three Gaussians (weights, means, standard deviations)</span>
+W  = torch.tensor([0.35, 0.45, 0.20])
+MU = torch.tensor([-2.0, 0.5, 2.5])
+SD = torch.tensor([0.3, 0.4, 0.2])
+SIG_D = math.sqrt(float((W * (SD**2 + MU**2)).sum() - (W * MU).sum()**2))   <span class="cm"># data std</span>
+
+def sample_data(n):
+    c = torch.multinomial(W, n, replacement=True)
+    return MU[c] + SD[c] * torch.randn(n)
+
+def exact_D(x, s):
+    """Exact denoiser E[x0 | x_sigma = x] of the mixture (Tweedie): what a perfect network outputs."""
+    v = SD**2 + s[:, None]**2                                   <span class="cm"># variance of each noisy component</span>
+    logw = torch.log(W) - 0.5 * torch.log(v) - 0.5 * (x[:, None] - MU)**2 / v
+    r = torch.softmax(logw, dim=1)                              <span class="cm"># which component produced x?</span>
+    return (r * (MU + SD**2 / v * (x[:, None] - MU))).sum(1)
+
+class Denoiser(nn.Module):                                      <span class="cm"># D(x; sigma) with EDM preconditioning</span>
+    def __init__(self, h=128):
+        super().__init__()
+        self.f = nn.Sequential(nn.Linear(2, h), nn.SiLU(), nn.Linear(h, h), nn.SiLU(), nn.Linear(h, 1))
+    def forward(self, x, s):
+        c_in = 1 / torch.sqrt(s**2 + SIG_D**2)
+        c_skip = SIG_D**2 / (s**2 + SIG_D**2)
+        c_out = s * SIG_D / torch.sqrt(s**2 + SIG_D**2)
+        F = self.f(torch.stack([c_in * x, torch.log(s) / 4], dim=1)).squeeze(1)
+        return c_skip * x + c_out * F
+
+<span class="cm"># denoising score matching = train D to remove the noise (formula 226.4)</span>
+net = Denoiser()
+opt = torch.optim.Adam(net.parameters(), lr=2e-3)
+for step in range(6000):
+    x0 = sample_data(1024)
+    s = torch.exp(-1.2 + 1.2 * torch.randn(1024))              <span class="cm"># log-normal noise levels (EDM)</span>
+    x = x0 + s * torch.randn(1024)
+    lam = (s**2 + SIG_D**2) / (s * SIG_D)**2                    <span class="cm"># weight so every sigma counts equally</span>
+    loss = (lam * (net(x, s) - x0)**2).mean()
+    opt.zero_grad(); loss.backward(); opt.step()
+
+def karras(n, smin=0.002, smax=80.0, rho=7.0):                  <span class="cm"># formula (226.15), then a final 0</span>
+    i = torch.arange(n) / max(n - 1, 1)
+    s = (smax**(1 / rho) + i * (smin**(1 / rho) - smax**(1 / rho)))**rho
+    return torch.cat([s, torch.zeros(1)])
+
+@torch.no_grad()
+def sample(D, x, n, method):
+    sig = karras(n)
+    D_prev = h_prev = None
+    for i in range(n):
+        s, s2 = sig[i], sig[i + 1]
+        Dx = D(x, s.expand_as(x))
+        if method == "ddim" or s2 == 0:                         <span class="cm"># DDIM = Euler on the PF-ODE</span>
+            x = Dx + (s2 / s) * (x - Dx)
+        elif method == "heun":                                  <span class="cm"># EDM 2nd order: one extra evaluation</span>
+            d = (x - Dx) / s
+            xe = x + (s2 - s) * d
+            d2 = (xe - D(xe, s2.expand_as(x))) / s2
+            x = x + (s2 - s) * (d + d2) / 2
+        elif method == "dpm2m":                                 <span class="cm"># DPM-Solver++(2M): reuse the last D</span>
+            h = torch.log(s / s2)
+            Dd = Dx if D_prev is None else Dx + (Dx - D_prev) * h / (2 * h_prev)
+            x = (s2 / s) * x + (1 - s2 / s) * Dd
+            D_prev, h_prev = Dx, h
+    return x
+
+def mixture_quantiles(u, s):                                    <span class="cm"># exact quantiles of p_sigma by bisection</span>
+    lo, hi = torch.full_like(u, -500.), torch.full_like(u, 500.)
+    sd = torch.sqrt(SD**2 + s**2)
+    for _ in range(100):
+        mid = (lo + hi) / 2
+        cdf = (W * torch.special.ndtr((mid[:, None] - MU) / sd)).sum(1)
+        lo, hi = torch.where(cdf &lt; u, mid, lo), torch.where(cdf &lt; u, hi, mid)
+    return (lo + hi) / 2
+
+M = 1000
+u = (torch.arange(M, dtype=torch.float64) + 0.5) / M
+torch.set_default_dtype(torch.float32)
+xT = mixture_quantiles(u, 80.0).float()                         <span class="cm"># start noise, stratified</span>
+target = mixture_quantiles(u, 0.0).float()                      <span class="cm"># where the exact ODE must land</span>
+w1 = lambda x: (x.sort().values - target).abs().mean().item()   <span class="cm"># 1-D Wasserstein-1 distance</span>
+
+print(f"data std {SIG_D:.3f}, final training loss {loss.item():.3f}")
+xs = torch.tensor([-2.0, 0.0, 1.5]); ss = torch.tensor([0.5, 0.5, 0.5])
+print("D_net  ", [round(v, 3) for v in net(xs, ss).tolist()])
+print("D_exact", [round(v, 3) for v in exact_D(xs, ss).tolist()])
+for nfe in [5, 10, 20, 50]:
+    row = []
+    for D in (exact_D, net):
+        row += [w1(sample(D, xT, nfe, "ddim")), w1(sample(D, xT, (nfe + 1) // 2, "heun")),
+                w1(sample(D, xT, nfe, "dpm2m"))]
+    print(f"NFE {nfe:2d} | exact D: ddim {row[0]:.3f} heun {row[1]:.3f} dpm2m {row[2]:.3f}"
+          f" | network: ddim {row[3]:.3f} heun {row[4]:.3f} dpm2m {row[5]:.3f}")</pre>
+<p>On PyTorch 2.15 (CPU) this prints a data standard deviation of 1.695. The trained network is close to the exact denoiser: at \(x = -2, 0, 1.5\) and \(\sigma = 0.5\) it outputs −1.990, 0.288, 1.297 against the exact −1.999, 0.299, 1.246. The \(W_1\) errors:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>NFE</th><th>DDIM, exact D</th><th>Heun, exact D</th><th>DPM++(2M), exact D</th><th>DDIM, network</th><th>Heun, network</th><th>DPM++(2M), network</th></tr></thead><tbody>
+<tr><td>5</td><td>0.663</td><td>5.695</td><td>0.346</td><td>0.668</td><td>3.364</td><td>0.354</td></tr>
+<tr><td>10</td><td>0.291</td><td>1.053</td><td>0.228</td><td>0.258</td><td>0.990</td><td>0.318</td></tr>
+<tr><td>20</td><td>0.139</td><td>0.167</td><td>0.036</td><td>0.164</td><td>0.256</td><td>0.165</td></tr>
+<tr><td>50</td><td>0.054</td><td>0.019</td><td>0.005</td><td>0.152</td><td>0.164</td><td>0.161</td></tr></tbody></table></div>
+<p>With the exact denoiser the numbers match Figure 5 to three decimals: this is pure solver error. With the trained network, every solver ends near 0.15 to 0.16 from 20 NFE on: the network’s own error is now the floor, and a better solver cannot remove it. Other versions or hardware may print slightly different numbers.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What is used</th><th>What matters</th></tr></thead><tbody>
+<tr><td>Text-to-image (Stable Diffusion, SDXL, SD3 and others)</td><td>Swappable samplers: libraries such as diffusers ship DDIM, Euler, Heun, DPM-Solver++ and UniPC schedulers for the same trained model</td><td>Steps set latency directly; 20 to 30 steps of a multistep solver is common [Likely]</td></tr>
+<tr><td>Video generation</td><td>The same ODE solvers on spatio-temporal latents; one NFE processes the whole clip</td><td>NFE dominates cost, so solver order and distillation matter even more; see <a href="../generative/index.html#row-video-generation-temporal-coherence-video-dits-and" title="Video generation: temporal coherence, video DiTs and evaluation (planned)">session 231</a></td></tr>
+<tr><td>Image and video editing</td><td>DDIM inversion: map a real image or each video frame to noise, change the prompt, sample again</td><td>Inversion is approximate; errors grow with guidance; per-frame inversion can flicker [Likely]</td></tr>
+<tr><td>Inverse problems (inpainting, super-resolution, deblurring)</td><td>Score SDE with the measurement added to the score, or a DDIM loop that projects onto the known pixels</td><td>Uses the score as a learned prior without retraining</td></tr>
+<tr><td>Likelihood and anomaly scores</td><td>Probability-flow ODE plus the change-of-variables formula</td><td>Exact \(\log p(\mathbf{x})\) at the cost of an ODE solve with a trace estimator</td></tr>
+<tr><td>Robot and video-agent action generation</td><td>Diffusion policies sample action sequences with few DDIM-style steps [Likely]</td><td>Control loops need low latency, so step count is a hard budget</td></tr>
+<tr><td>Few-step generation</td><td>The ODE trajectory is the training target for distillation and consistency models</td><td><a href="../generative/index.html#row-few-step-generation-consistency-models-and-distillation" title="Few-step generation: consistency models and distillation (planned)">session 230</a> builds on the ODE of this session</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Mixing parameterizations.</b> Using an \(\varepsilon\)-prediction model in a sampler written for \(\mathbf{x}_0\)- or \(v\)-prediction (or the reverse) gives garbage. Convert with (226.6) and check one step by hand.</li>
+<li><b>Forgetting the input scaling.</b> In the \(\sigma\) form, the network of a DDPM model expects \(\mathbf{x}/\sqrt{1 + \sigma^2}\), not \(\mathbf{x}\). Samplers that work in \(\sigma\) form must scale before every call.</li>
+<li><b>Picking the DDIM sub-sequence badly.</b> Evenly spaced steps that skip the last training steps (for example, ending at \(t = 50\) instead of near 0) leave visible noise; a schedule that is too sparse at low noise blurs details.</li>
+<li><b>Expecting determinism with \(\eta \gt 0\).</b> Only \(\eta = 0\) is a fixed map from noise to image. Inversion, interpolation and caching of noises need \(\eta = 0\).</li>
+<li><b>Comparing samplers by steps instead of NFE.</b> A Heun step costs 2 NFE. Compare at equal NFE, as in Figure 5.</li>
+<li><b>Using a high-order single-step solver at very few steps or with strong guidance.</b> It can be worse than DDIM (Heun in Figure 5 below 10 NFE); DPM-Solver++ uses the data prediction and a multistep method for this reason.</li>
+<li><b>Blaming the sampler for a network problem.</b> If quality stops improving above 20 to 30 steps, the floor is the model, not the solver.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is the score of a distribution, and why is it easier to model than the density?<span class="lvl">basic</span></summary><div class="ans">The score is \(\nabla_{\mathbf{x}} \log p(\mathbf{x})\), a vector field that points toward higher probability. For \(p = e^{-E}/Z\), the score is \(-\nabla E\): the normalizing constant \(Z\), an intractable integral over all images, drops out. So a network that outputs a vector of the same shape as its input can represent a score with no constraint, while a density model must integrate to 1.</div></details>
+<details class="qa"><summary>Why is plain score matching impractical for images, and how does denoising score matching fix it?<span class="lvl">core</span></summary><div class="ans">The direct loss \(\lVert \mathbf{s}_\theta - \nabla \log p \rVert^2\) needs the unknown true score. Hyvärinen’s form removes it but needs the trace of the Jacobian of \(\mathbf{s}_\theta\), one backward pass per input dimension (12,288 for 64 × 64 × 3). Denoising score matching adds noise \(\tilde{\mathbf{x}} = \mathbf{x} + \sigma\varepsilon\) and regresses on the score of the noise kernel, \(-\varepsilon/\sigma\), which is known per example. Its minimizer is the score of the noisy distribution \(p_\sigma\). The loss is a plain regression, the same as DDPM’s noise prediction.</div></details>
+<details class="qa"><summary>How are the noise prediction, the score and the denoised image related?<span class="lvl">core</span></summary><div class="ans">In the form \(\tilde{\mathbf{x}} = \mathbf{x} + \sigma\varepsilon\): \(\mathbf{s} = -\varepsilon_\theta/\sigma\), and by Tweedie’s formula \(D = \E[\mathbf{x} \mid \tilde{\mathbf{x}}] = \tilde{\mathbf{x}} + \sigma^2 \mathbf{s} = \tilde{\mathbf{x}} - \sigma\varepsilon_\theta\). In DDPM form, \(\mathbf{s} = -\varepsilon_\theta/\sqrt{1 - \bar\alpha_t}\) and \(\hat{\mathbf{x}}_0 = (\mathbf{x}_t - \sqrt{1 - \bar\alpha_t}\varepsilon_\theta)/\sqrt{\bar\alpha_t}\). Example: data \(\mathcal{N}(0,1)\), \(\sigma = 2\), \(\tilde{x} = 3\): score −0.6, denoised 0.6, noise 1.2.</div></details>
+<details class="qa"><summary>Why does NCSN use many noise levels instead of one?<span class="lvl">core</span></summary><div class="ans">At low noise, the score is only learned near the data; in the empty space between modes the network has seen no samples, and Langevin dynamics cannot cross low-density regions in reasonable time, so samples get the wrong share per mode (they follow basins of attraction, not weights). Large noise fills the space and connects the modes, so the score is accurate everywhere and mixing is fast. Annealing from large to small noise gets both: correct global proportions from the high levels and sharp details from the low ones.</div></details>
+<details class="qa"><summary>What is the probability-flow ODE, and how does it differ from the reverse SDE?<span class="lvl">core</span></summary><div class="ans">For a forward SDE \(d\mathbf{x} = \mathbf{f}\,dt + g\,d\mathbf{w}\), the ODE \(d\mathbf{x}/dt = \mathbf{f} - \tfrac12 g^2 \nabla \log p_t\) has the same marginal distribution \(p_t\) at every time as the reverse SDE \(d\mathbf{x} = [\mathbf{f} - g^2 \nabla\log p_t]dt + g\,d\bar{\mathbf{w}}\). The ODE is deterministic (one image per noise), allows large steps with standard solvers, can be inverted, and gives exact likelihoods. The SDE has twice the score drift plus fresh noise; the noise can correct accumulated errors but needs more, smaller steps.</div></details>
+<details class="qa"><summary>Why can DDIM sample with 50 steps from a model trained with 1000 steps, without retraining?<span class="lvl">core</span></summary><div class="ans">The DDPM loss depends only on the marginals \(q(\mathbf{x}_t \mid \mathbf{x}_0)\), never on the step-by-step chain. DDIM defines non-Markovian forward processes with the same marginals, so the same network is the optimal denoiser for them too, and their reverse step can jump between any two time steps. With \(\eta = 0\), DDIM is exactly Euler’s method on the probability-flow ODE in the \(\sigma\) coordinates, and an ODE can be integrated with large steps.</div></details>
+<details class="qa"><summary>What does η do in DDIM?<span class="lvl">basic</span></summary><div class="ans">It sets the variance of fresh noise added at each step: \(\sigma_t = \eta \sqrt{(1 - \bar\alpha_{t'})/(1 - \bar\alpha_t)}\sqrt{1 - \bar\alpha_t/\bar\alpha_{t'}}\). \(\eta = 0\): deterministic DDIM (the ODE). \(\eta = 1\): the DDPM posterior variance, so with consecutive steps it is DDPM ancestral sampling (a discretized reverse SDE). In between, the samples have the same target distribution; only the paths and the step-size sensitivity change.</div></details>
+<details class="qa"><summary>DDIM inversion of a real image does not give back exactly the same image. Why?<span class="lvl">advanced</span></summary><div class="ans">Inversion runs the Euler step upward in noise, using the slope at the current (lower-noise) point, while sampling later uses the slope at the higher-noise point; the two differ by the local curvature of the ODE path, so each step adds an error of order step size squared. With few steps or strong classifier-free guidance (which makes the effective ODE less smooth and not exactly invertible), the errors add up. Fixes: more steps, higher-order or exactly invertible schemes, or optimizing the null-text embedding per step (null-text inversion).</div></details>
+<details class="qa"><summary>Heun is second order, yet at 10 NFE it was worse than DDIM in Figure 5. Explain.<span class="lvl">advanced</span></summary><div class="ans">Order describes how the error shrinks as the step size goes to zero; it says nothing about large steps. With a budget of 10 NFE, Heun gets only 5 steps, each spanning a large range of \(\sigma\) where the path bends, and its second slope is evaluated at a poor Euler guess. Multistep methods such as DPM-Solver++(2M) get second order for one NFE per step by reusing the previous denoiser output, so they keep the full number of steps. At 50 NFE, both second-order methods beat DDIM (0.019 and 0.0047 vs 0.054 in Figure 5).</div></details>
+<details class="qa"><summary>A latent image model looks good at 50 DDIM steps. Product wants 10 steps. What do you do?<span class="lvl">advanced</span></summary><div class="ans">First, without retraining: switch to a multistep solver (DPM-Solver++(2M) or UniPC), use a schedule dense at low noise (Karras \(\rho = 7\) or the solver’s recommended one), make sure the last step denoises fully, and compare at equal NFE, including guidance (each guided step may cost 2 NFE unless batched). Measure FID or human preference at 10, 15, 20 NFE. If 10 is still not good enough, train for few steps: progressive distillation, consistency distillation, or a rectified-flow fine-tune; these change the model, not just the sampler.</div></details>
+<details class="qa"><summary>How many NFE does a 18-step EDM Heun sampler use? And 20 steps of DPM-Solver++(2M) with classifier-free guidance?<span class="lvl">basic</span></summary><div class="ans">Heun: 2 per step except the last, \(2 \cdot 18 - 1 = 35\). DPM-Solver++(2M): 1 per step, 20 NFE without guidance; classifier-free guidance evaluates the network with and without the prompt, so 40 network evaluations (often run as one batch of 2, so about 20 batched calls).</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>The data is \(\mathcal{N}(1, 0.5^2)\). At noise level \(\sigma = 1\) and \(\tilde{x} = 2\), compute the score, the Tweedie denoised value and the predicted noise.</li>
+<li>Continue exercise 1: take one DDIM step to \(\sigma_{\text{next}} = 0.5\). Compare with the exact ODE solution (hint: for Gaussian data, \(x - \mu\) grows like \(\sqrt{s^2 + \sigma^2}\)).</li>
+<li>A DDPM point has \(\bar\alpha_t = 0.25\). What is \(\sigma\) in the \(\sigma\) form, and by what factor must you scale \(\mathbf{x}_t\)?</li>
+<li>One Langevin step (226.7) for the target \(\mathcal{N}(2, 1)\): \(x = 0\), \(\alpha = 0.1\), noise sample \(z = 0.5\). Where does \(x\) go?</li>
+<li>Show that \(\eta = 0\) in (226.12) gives a deterministic update, and that with \(\eta = 1\) the noise variance equals the DDPM posterior variance \(\tilde\beta_t = \frac{1 - \bar\alpha_{t-1}}{1 - \bar\alpha_t}\beta_t\) when \(t' = t - 1\).</li>
+<li>In Figure 5, find the smallest budget at which DPM-Solver++(2M) reaches \(W_1 \lt 0.05\). How many NFE does DDIM need for the same error?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(p_\sigma = \mathcal{N}(1, 0.25 + 1) = \mathcal{N}(1, 1.25)\). Score \(= -(2 - 1)/1.25 = -0.8\). Denoised \(D = 2 + 1 \cdot (-0.8) = 1.2\) (check: \(1 + \tfrac{0.25}{1.25} \cdot 1 = 1.2\)). Noise \(\hat\varepsilon = (2 - 1.2)/1 = 0.8\). 2. DDIM: \(1.2 + 0.5 \cdot 0.8 = 1.6\). Exact: \(1 + 1 \cdot \sqrt{0.5/1.25} = 1.632\). Error 0.032. 3. \(\sigma = \sqrt{0.75/0.25} = \sqrt{3} = 1.732\); divide \(\mathbf{x}_t\) by \(\sqrt{0.25} = 0.5\) (multiply by 2). 4. Score at 0 is \(-(0 - 2)/1 = 2\). \(x = 0 + 0.05 \cdot 2 + \sqrt{0.1} \cdot 0.5 = 0.1 + 0.158 = 0.258\). 5. With \(\eta = 0\), \(\sigma_t = 0\), the \(\mathbf{z}\) term disappears and the update is a fixed function of \(\mathbf{x}_t\). With \(\eta = 1\), \(t' = t - 1\): \(\sigma_t^2 = \frac{1 - \bar\alpha_{t-1}}{1 - \bar\alpha_t}\big(1 - \frac{\bar\alpha_t}{\bar\alpha_{t-1}}\big)\) and \(\bar\alpha_t/\bar\alpha_{t-1} = 1 - \beta_t\), so \(\sigma_t^2 = \frac{1 - \bar\alpha_{t-1}}{1 - \bar\alpha_t}\beta_t = \tilde\beta_t\). 6. Read it from the figure: DPM-Solver++(2M) needs 18 NFE; DDIM needs 54 NFE, so the second-order multistep solver is about 3 times cheaper at this quality.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>The score \(\nabla \log p\) (226.1) points toward more likely data and does not need the normalizing constant.</li>
+<li>Denoising score matching (226.4) learns the score of noisy data by plain regression; it is the DDPM noise loss. Score, noise and clean-image predictions convert into each other with Tweedie’s formula (226.5, 226.6).</li>
+<li>Langevin dynamics (226.7) samples with the score, but only across many noise levels (NCSN, annealing) does it get the mode proportions right.</li>
+<li>Diffusion is an SDE (226.8); its reverse (226.9) and the deterministic probability-flow ODE (226.10, 226.11) have the same marginals.</li>
+<li>DDIM (226.12) reuses a DDPM network with any sub-sequence of steps; with \(\eta = 0\) it is Euler’s method on the ODE (226.13).</li>
+<li>Better solvers (Heun 226.14, DPM-Solver++(2M) 226.16, UniPC) plus a schedule dense at low noise (226.15) give second-order error decay; compare at equal NFE, and remember the network’s own error is the floor.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \mathbf{s} = \nabla_{\mathbf{x}} \log p_\sigma = \frac{D - \mathbf{x}}{\sigma^2} = -\frac{\varepsilon}{\sigma}, \qquad J_{\text{DSM}} = \tfrac{1}{2\sigma^2}\,\E\lVert \sigma\mathbf{s}_\theta(\mathbf{x} + \sigma\varepsilon, \sigma) + \varepsilon \rVert^2 \]</div>
+<div class="eq">\[ \frac{d\mathbf{x}}{dt} = \mathbf{f} - \tfrac12 g^2 \nabla \log p_t, \qquad \frac{d\mathbf{x}}{d\sigma} = \frac{\mathbf{x} - D(\mathbf{x}; \sigma)}{\sigma}, \qquad \text{DDIM: } \mathbf{x}_{\text{next}} = D + \frac{\sigma_{\text{next}}}{\sigma}(\mathbf{x} - D) \]</div>
+<h2 class="plain" id="diffusion-2-score-matching-ddim-and-fast-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Song et al. (2020). <a href="https://arxiv.org/abs/2011.13456" target="_blank" rel="noopener">Score-Based Generative Modeling through Stochastic Differential Equations</a></li><li>Song et al. (2020). <a href="https://arxiv.org/abs/2010.02502" target="_blank" rel="noopener">Denoising Diffusion Implicit Models</a></li><li>Song &amp; Ermon (2019). <a href="https://arxiv.org/abs/1907.05600" target="_blank" rel="noopener">Generative Modeling by Estimating Gradients of the Data Distribution</a></li><li>Song et al. (2020). <a href="https://arxiv.org/abs/2011.13456" target="_blank" rel="noopener">Score-Based Generative Modeling through Stochastic Differential Equations</a></li><li>Song &amp; Ermon (2019). <a href="https://arxiv.org/abs/1907.05600" target="_blank" rel="noopener">Generative Modeling by Estimating Gradients of the Data Distribution</a></li><li>Song et al. (2020). <a href="https://arxiv.org/abs/2010.02502" target="_blank" rel="noopener">Denoising Diffusion Implicit Models</a></li><li>Ho et al. (2020). <a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noopener">Denoising Diffusion Probabilistic Models</a></li><li>Hyvärinen (2005). <a href="https://jmlr.org/papers/v6/hyvarinen05a.html" target="_blank" rel="noopener">Estimation of Non-Normalized Statistical Models by Score Matching</a></li><li>Vincent (2011). <a href="https://scholar.google.com/scholar?q=&amp;quot;A Connection Between Score Matching and Denoising Autoencoders&amp;quot;" target="_blank" rel="noopener">A Connection Between Score Matching and Denoising Autoencoders</a></li><li>Anderson (1982). <a href="https://scholar.google.com/scholar?q=&amp;quot;Reverse-Time Diffusion Equation Models&amp;quot;" target="_blank" rel="noopener">Reverse-Time Diffusion Equation Models</a></li><li>Efron (2011). <a href="https://scholar.google.com/scholar?q=&amp;quot;Tweedie&amp;#x27;s Formula and Selection Bias&amp;quot;" target="_blank" rel="noopener">Tweedie&#x27;s Formula and Selection Bias</a></li><li>Karras, Aittala, Aila &amp; Laine (2022). <a href="https://arxiv.org/abs/2206.00364" target="_blank" rel="noopener">Elucidating the Design Space of Diffusion-Based Generative Models</a></li><li>Lu, Zhou, Bao, Chen, Li &amp; Zhu (2022). <a href="https://arxiv.org/abs/2206.00927" target="_blank" rel="noopener">DPM-Solver: A Fast ODE Solver for Diffusion Probabilistic Model Sampling in Around 10 Steps</a></li><li>Lu, Zhou, Bao, Chen, Li &amp; Zhu (2022). <a href="https://arxiv.org/abs/2211.01095" target="_blank" rel="noopener">DPM-Solver++: Fast Solver for Guided Sampling of Diffusion Probabilistic Models</a></li><li>Zhao, Bai, Rao, Zhou &amp; Lu (2023). <a href="https://arxiv.org/abs/2302.04867" target="_blank" rel="noopener">UniPC: A Unified Predictor-Corrector Framework for Fast Sampling of Diffusion Models</a></li><li>Song &amp; Ermon (2020). <a href="https://arxiv.org/abs/2006.09011" target="_blank" rel="noopener">Improved Techniques for Training Score-Based Generative Models</a></li><li>Salimans &amp; Ho (2022). <a href="https://arxiv.org/abs/2202.00512" target="_blank" rel="noopener">Progressive Distillation for Fast Sampling of Diffusion Models</a></li><li>Song et al. (2023). <a href="https://arxiv.org/abs/2303.01469" target="_blank" rel="noopener">Consistency Models</a></li><li>Liu et al. (2022). <a href="https://arxiv.org/abs/2209.03003" target="_blank" rel="noopener">Flow Straight and Fast: Learning to Generate and Transfer Data with Rectified Flow</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../generative/diffusion-1-the-forward-noising-process-and.html"><small>Previous · session 225</small>Diffusion 1: the forward noising process and the reverse denoiser (DDPM)</a><span class="next"><small>Next · session 227, planned</small>Guidance and conditioning: classifier guidance, classifier-free guidance, ControlNet</span></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="diffusion-2-score-matching-ddim-and-fast"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fx=(v,d)=>{const s=(Math.abs(v)<0.5*Math.pow(10,-d)?0:v).toFixed(d);return s.replace("-","−");};
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segv=el=>el.querySelector('button[aria-pressed="true"]').dataset.v;
+function erf(x){const s=x<0?-1:1;x=Math.abs(x);const t=1/(1+0.3275911*x);const y=1-(((((1.061405429*t-1.453152027)*t)+1.421413741)*t-0.284496736)*t+0.254829592)*t*Math.exp(-x*x);return s*y;}
+const Phi=z=>0.5*(1+erf(z/Math.SQRT2));
+
+/* ---------- shared 2-D mixture (Figures 1 and 2) ---------- */
+const W2=[0.6,0.25,0.15],M2=[[-1.5,-1.0],[1.5,-1.0],[0.0,1.5]],S2=0.09;
+function post2(x,y,s){const v=S2+s*s;const lw=M2.map((m,i)=>Math.log(W2[i])-((x-m[0])*(x-m[0])+(y-m[1])*(y-m[1]))/(2*v));const mx=Math.max(...lw);const e=lw.map(l=>Math.exp(l-mx));const z=e.reduce((a,b)=>a+b,0);return e.map(t=>t/z);}
+function score2(x,y,s){const v=S2+s*s;const r=post2(x,y,s);let gx=0,gy=0;for(let i=0;i<3;i++){gx-=r[i]*(x-M2[i][0])/v;gy-=r[i]*(y-M2[i][1])/v;}return[gx,gy,r];}
+function dens2(x,y,s){const v=S2+s*s;let p=0;for(let i=0;i<3;i++){p+=W2[i]*Math.exp(-((x-M2[i][0])**2+(y-M2[i][1])**2)/(2*v))/(2*Math.PI*v);}return p;}
+const X0=-3.2,X1=3.2,Y0=-2.5,Y1=2.5,PU=88,OX=40,OY=12;
+const PX=x=>OX+(x-X0)*PU,PY=y=>OY+(Y1-y)*PU;
+
+/* ---------- Figure 1: the score field of a noisy 2-D mixture ---------- */
+(function(){
+ const svg=$("#d2-field-svg");if(!svg)return;const S=$("#d2-field-s"),info=$("#d2-field-info");let probe=[0.3,0.2];
+ function draw(){const s=Math.pow(10,+S.value);$("#d2-field-sv").value=s.toFixed(s<0.1?3:2);
+  let g="";const nx=40,ny=31,dx=(X1-X0)/nx,dy=(Y1-Y0)/ny;let mx=0;const dd=[];
+  for(let j=0;j<ny;j++)for(let i=0;i<nx;i++){const p=dens2(X0+(i+0.5)*dx,Y0+(j+0.5)*dy,s);dd.push(p);if(p>mx)mx=p;}
+  for(let j=0;j<ny;j++)for(let i=0;i<nx;i++){const o=Math.pow(dd[j*nx+i]/mx,0.5)*0.85;if(o<0.02)continue;g+=`<rect x="${PX(X0+i*dx).toFixed(1)}" y="${PY(Y0+(j+1)*dy).toFixed(1)}" width="${(dx*PU+0.6).toFixed(1)}" height="${(dy*PU+0.6).toFixed(1)}" fill="var(--q)" fill-opacity="${o.toFixed(3)}"/>`;}
+  g+=`<rect x="${PX(X0)}" y="${PY(Y1)}" width="${(X1-X0)*PU}" height="${(Y1-Y0)*PU}" fill="none" stroke="var(--rule)"/>`;
+  const ax=17,ay=13;const arr=[];let ms=0;
+  for(let j=0;j<ay;j++)for(let i=0;i<ax;i++){const x=X0+(i+0.5)*(X1-X0)/ax,y=Y0+(j+0.5)*(Y1-Y0)/ay;const sc=score2(x,y,s);const n=Math.hypot(sc[0],sc[1]);arr.push([x,y,sc[0],sc[1],n]);if(n>ms)ms=n;}
+  arr.forEach(a=>{if(a[4]<1e-9)return;const L=24*Math.sqrt(a[4]/ms)+2;const ux=a[2]/a[4],uy=a[3]/a[4];const x1=PX(a[0]),y1=PY(a[1]),x2=x1+ux*L,y2=y1-uy*L;
+   g+=`<line x1="${x1.toFixed(1)}" y1="${y1.toFixed(1)}" x2="${x2.toFixed(1)}" y2="${y2.toFixed(1)}" stroke="var(--ink2)" stroke-width="1.3" marker-end="url(#d2-ah)"/>`;});
+  M2.forEach((m,i)=>g+=`<text x="${PX(m[0])}" y="${PY(m[1])+(i===2?-22:30)}" text-anchor="middle" class="svgs" font-size="12">weight ${W2[i]}</text>`);
+  const sc=score2(probe[0],probe[1],s);const n=Math.hypot(sc[0],sc[1]);const Dx=probe[0]+s*s*sc[0],Dy=probe[1]+s*s*sc[1];
+  g+=`<line x1="${PX(probe[0])}" y1="${PY(probe[1])}" x2="${PX(Dx).toFixed(1)}" y2="${PY(Dy).toFixed(1)}" stroke="var(--v)" stroke-width="2" stroke-dasharray="5 4"/>`;
+  g+=`<circle cx="${PX(Dx).toFixed(1)}" cy="${PY(Dy).toFixed(1)}" r="6" fill="var(--v)"/>`;
+  g+=`<circle cx="${PX(probe[0])}" cy="${PY(probe[1])}" r="7" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;
+  g+=`<text x="${PX(X1)-6}" y="${PY(Y0)-8}" text-anchor="end" class="svgs" font-size="12">click to move the probe</text>`;
+  svg.innerHTML=`<defs><marker id="d2-ah" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="5" markerHeight="5" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--ink2)"/></marker></defs>`+g;
+  const r=sc[2];
+  info.innerHTML=`σ = <b>${fx(s,3)}</b>. Probe x = (${fx(probe[0],2)}, ${fx(probe[1],2)}). Score ∇log p<sub>σ</sub>(x) = (<b>${fx(sc[0],3)}</b>, <b>${fx(sc[1],3)}</b>), length ${fx(n,3)}. Tweedie denoised guess x + σ²·score = (<b>${fx(Dx,3)}</b>, <b>${fx(Dy,3)}</b>). Which mode produced x: ${r.map((t,i)=>"w"+W2[i]+": "+fx(t,3)).join(", ")}.`;}
+ S.addEventListener("input",draw);
+ svg.addEventListener("click",e=>{const pt=svg.createSVGPoint();pt.x=e.clientX;pt.y=e.clientY;const p=pt.matrixTransform(svg.getScreenCTM().inverse());const x=X0+(p.x-OX)/PU,y=Y1-(p.y-OY)/PU;if(x<X0||x>X1||y<Y0||y>Y1)return;probe=[Math.round(x*100)/100,Math.round(y*100)/100];draw();});
+ R.d2SetProbe=(x,y)=>{probe=[x,y];draw();};
+ draw();
+})();
+
+/* ---------- Figure 2: plain vs annealed Langevin dynamics ---------- */
+(function(){
+ const svg=$("#d2-lang-svg");if(!svg)return;const mode=$("#d2-lang-mode"),info=$("#d2-lang-info");
+ const P=500,L=10,T=40,EPS=0.3,SIGS=[];for(let i=0;i<L;i++)SIGS.push(3*Math.pow(0.05/3,i/(L-1)));
+ function run(m){const r=rng(7),gn=gauss(rng(11));let x=[],y=[];for(let k=0;k<P;k++){x.push(-3+6*r());y.push(-2.5+5*r());}
+  const snaps=[{x:x.slice(),y:y.slice(),s:null}];
+  for(let l=0;l<L;l++){const s=m==="ann"?SIGS[l]:0.05;const a=m==="ann"?EPS*s*s:0.02;
+   for(let t=0;t<T;t++)for(let k=0;k<P;k++){const sc=score2(x[k],y[k],s);x[k]+=a/2*sc[0]+Math.sqrt(a)*gn();y[k]+=a/2*sc[1]+Math.sqrt(a)*gn();}
+   snaps.push({x:x.slice(),y:y.slice(),s:s,a:a});}
+  return snaps;}
+ const cache={};let snaps=null,cur=0;
+ const near=(x,y)=>{let b=0,bd=1e9;M2.forEach((m,i)=>{const d=(x-m[0])**2+(y-m[1])**2;if(d<bd){bd=d;b=i;}});return b;};
+ function draw(i){cur=i;const sn=snaps[i];let g=`<rect x="${PX(X0)}" y="${PY(Y1)}" width="${(X1-X0)*PU}" height="${(Y1-Y0)*PU}" fill="none" stroke="var(--rule)"/>`;
+  M2.forEach((m,j)=>g+=`<circle cx="${PX(m[0])}" cy="${PY(m[1])}" r="${0.6*PU}" fill="none" stroke="var(--k)" stroke-width="1.5" stroke-dasharray="4 4"/><text x="${PX(m[0])}" y="${PY(m[1])+(j===2?-66:80)}" text-anchor="middle" class="svgs" font-size="12">true weight ${W2[j]}</text>`);
+  const cnt=[0,0,0];
+  for(let k=0;k<P;k++){const xx=Math.max(X0,Math.min(X1,sn.x[k])),yy=Math.max(Y0,Math.min(Y1,sn.y[k]));cnt[near(sn.x[k],sn.y[k])]++;g+=`<circle cx="${PX(xx).toFixed(1)}" cy="${PY(yy).toFixed(1)}" r="2.6" fill="var(--q)" fill-opacity="0.75"/>`;}
+  svg.innerHTML=g;const f=cnt.map(c=>c/P);
+  const st=i===0?"start: 500 particles spread uniformly over the box":(segv(mode)==="ann"?`after noise level ${i} of ${L}: σ = ${fx(sn.s,3)}, step α = ${fx(sn.a,5)}, ${i*T} Langevin steps so far`:`after ${i*T} Langevin steps, all at σ = 0.05, step α = 0.02`);
+  info.innerHTML=`${st}. Share of particles nearest each mode: <b>${f.map(v=>fx(v,3)).join(" / ")}</b> (true weights 0.6 / 0.25 / 0.15).`;
+  R.d2Lang={mode:segv(mode),step:i,frac:f};}
+ const st=B.stepper({n:L+1,prev:$("#d2-lang-prev"),next:$("#d2-lang-next"),play:$("#d2-lang-play"),label:$("#d2-lang-lab"),ms:900,onStep:i=>{if(!snaps)return;draw(i);}});
+ function setMode(m){if(!cache[m])cache[m]=run(m);snaps=cache[m];draw(Math.min(cur,L));}
+ seg(mode,v=>{setMode(v);});
+ R.d2LangGo=(m,i)=>{mode.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.v===m?"true":"false"));setMode(m);st.go(i);return R.d2Lang;};
+ setMode("ann");st.go(0);
+})();
+
+/* ---------- shared 1-D mixture and samplers (Figures 3 and 5) ---------- */
+const W1=[0.35,0.45,0.2],M1=[-2,0.5,2.5],SD1=[0.3,0.4,0.2],SMIN=0.002,SMAX=80,RHO=7;
+function D1(x,s){const lw=[0,0,0],m=[0,0,0];let mx=-1e300;for(let i=0;i<3;i++){const v=SD1[i]*SD1[i]+s*s;lw[i]=Math.log(W1[i])-0.5*Math.log(v)-0.5*(x-M1[i])*(x-M1[i])/v;m[i]=M1[i]+SD1[i]*SD1[i]/v*(x-M1[i]);if(lw[i]>mx)mx=lw[i];}
+ let z=0,o=0;for(let i=0;i<3;i++){const e=Math.exp(lw[i]-mx);z+=e;o+=e*m[i];}return o/z;}
+function pdf1(x,s){let p=0;for(let i=0;i<3;i++){const v=SD1[i]*SD1[i]+s*s;p+=W1[i]*Math.exp(-0.5*(x-M1[i])*(x-M1[i])/v)/Math.sqrt(2*Math.PI*v);}return p;}
+function cdf1(x,s){let c=0;for(let i=0;i<3;i++)c+=W1[i]*Phi((x-M1[i])/Math.sqrt(SD1[i]*SD1[i]+s*s));return c;}
+function quant1(u,s){let lo=-500,hi=500;for(let k=0;k<80;k++){const mid=(lo+hi)/2;if(cdf1(mid,s)<u)lo=mid;else hi=mid;}return(lo+hi)/2;}
+function karras(n){const a=[];for(let i=0;i<n;i++){const t=n>1?i/(n-1):0;a.push(Math.pow(Math.pow(SMAX,1/RHO)+t*(Math.pow(SMIN,1/RHO)-Math.pow(SMAX,1/RHO)),RHO));}a.push(0);return a;}
+const NQ=1000,UQ=[];for(let j=0;j<NQ;j++)UQ.push((j+0.5)/NQ);
+let XT=null,TGT=null;function initQ(){if(XT)return;XT=UQ.map(u=>quant1(u,SMAX));TGT=UQ.map(u=>quant1(u,0));}
+function sampler(method,n,x0,seed){const sg=karras(n),x=x0.slice(),N=x.length;let Dp=null,hp=0;const gn=gauss(rng(seed||1));
+ for(let i=0;i<n;i++){const s=sg[i],s2=sg[i+1];const Dc=new Array(N);for(let k=0;k<N;k++)Dc[k]=D1(x[k],s);
+  if(method==="ddim"||s2===0){for(let k=0;k<N;k++)x[k]=Dc[k]+(s2/s)*(x[k]-Dc[k]);continue;}
+  if(method==="heun"){for(let k=0;k<N;k++){const d=(x[k]-Dc[k])/s;const xe=x[k]+(s2-s)*d;const d2=(xe-D1(xe,s2))/s2;x[k]=x[k]+(s2-s)*(d+d2)/2;}}
+  else if(method==="dpm"){const h=Math.log(s/s2);for(let k=0;k<N;k++){const Dd=Dp?Dc[k]+(Dc[k]-Dp[k])*h/(2*hp):Dc[k];x[k]=(s2/s)*x[k]+(1-s2/s)*Dd;}Dp=Dc;hp=h;}
+  else if(method==="anc"){const su=Math.min(s2,Math.sqrt(s2*s2*(s*s-s2*s2)/(s*s))),sd=Math.sqrt(s2*s2-su*su);for(let k=0;k<N;k++)x[k]=Dc[k]+(sd/s)*(x[k]-Dc[k])+su*gn();}}
+ return x;}
+function w1(x){const a=x.slice().sort((p,q)=>p-q);let e=0;for(let j=0;j<a.length;j++)e+=Math.abs(a[j]-TGT[j]);return e/a.length;}
+const stepsFor=(m,nfe)=>m==="heun"?Math.max(1,Math.floor((nfe+1)/2)):nfe;
+const nfeOf=(m,n)=>m==="heun"?2*n-1:n;
+
+/* ---------- Figure 3: SDE vs ODE paths, DDIM eta ---------- */
+(function(){
+ const svg=$("#d2-traj-svg");if(!svg)return;const E=$("#d2-traj-eta"),info=$("#d2-traj-info");let seed=1;
+ const NS=100,NP=40,NH=2000;
+ function draw(){initQ();const eta=+E.value;$("#d2-traj-etav").value=eta.toFixed(2);const sg=karras(NS);
+  const x=[];for(let k=0;k<NH;k++)x.push(XT[Math.floor((k+0.5)*NQ/NH)]);
+  // paths use 40 evenly spaced start quantiles
+  const pid=[];for(let p=0;p<NP;p++)pid.push(Math.floor((p+0.5)*NH/NP));
+  const paths=pid.map(k=>[x[k]/Math.sqrt(1+sg[0]*sg[0])]);const gn=gauss(rng(1000+seed));
+  for(let i=0;i<NS;i++){const s=sg[i],s2=sg[i+1];const su=Math.min(s2,eta*Math.sqrt(s2*s2*(s*s-s2*s2)/(s*s))),sd=Math.sqrt(Math.max(0,s2*s2-su*su));
+   for(let k=0;k<NH;k++){const Dc=D1(x[k],s);x[k]=Dc+(sd/s)*(x[k]-Dc)+(su>0?su*gn():0);}
+   pid.forEach((k,p)=>paths[p].push(x[k]/Math.sqrt(1+s2*s2)));}
+  // left panel: paths vs step index (sigma on a log axis), right: histogram
+  const L0=50,L1=430,T0=20,T1=330,ymin=-3.2,ymax=3.2;const YY=v=>T1-(Math.max(ymin,Math.min(ymax,v))-ymin)/(ymax-ymin)*(T1-T0);
+  const lsx=Math.log(SMAX),lsn=Math.log(SMIN);const XX=i=>{const s=sg[i];return s>0?L0+(lsx-Math.log(s))/(lsx-lsn)*(L1-L0-20):L1;};
+  let g=`<line x1="${L0}" y1="${T1}" x2="${L1}" y2="${T1}" stroke="var(--muted)"/><line x1="${L0}" y1="${T0}" x2="${L0}" y2="${T1}" stroke="var(--muted)"/>`;
+  [80,10,1,0.1,0.01].forEach(s=>{const xx=L0+(lsx-Math.log(s))/(lsx-lsn)*(L1-L0-20);g+=`<line x1="${xx.toFixed(1)}" y1="${T1}" x2="${xx.toFixed(1)}" y2="${T1+5}" stroke="var(--muted)"/><text x="${xx.toFixed(1)}" y="${T1+19}" text-anchor="middle" class="svgs" font-size="11.5">${s}</text>`;});
+  g+=`<text x="${L1}" y="${T1+19}" text-anchor="middle" class="svgs" font-size="11.5">0</text><text x="${(L0+L1)/2}" y="${T1+38}" text-anchor="middle" class="svgs" font-size="12.5">noise level σ (log scale, sampling runs left to right)</text>`;
+  [-3,-2,-1,0,1,2,3].forEach(v=>g+=`<text x="${L0-6}" y="${YY(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${v<0?"−"+(-v):v}</text>`);
+  paths.forEach(pth=>{let d="";pth.forEach((v,i)=>d+=(i?"L":"M")+XX(i).toFixed(1)+" "+YY(v).toFixed(1));g+=`<path d="${d}" fill="none" stroke="var(--q)" stroke-width="1.1" stroke-opacity="0.75"/>`;});
+  // histogram of the 2000 end points
+  const H0=455,H1=625,nb=64;const cnt=new Array(nb).fill(0);x.forEach(v=>{const b=Math.floor((v-ymin)/(ymax-ymin)*nb);if(b>=0&&b<nb)cnt[b]++;});
+  const bw=(ymax-ymin)/nb;let mxd=0;for(let b=0;b<nb;b++)mxd=Math.max(mxd,cnt[b]/(NH*bw));let mp=0;for(let v=ymin;v<=ymax;v+=0.01)mp=Math.max(mp,pdf1(v,0));const sc=(H1-H0)/Math.max(mxd,mp);
+  for(let b=0;b<nb;b++){const h=cnt[b]/(NH*bw)*sc;if(h>0)g+=`<rect x="${H0}" y="${YY(ymin+(b+1)*bw).toFixed(1)}" width="${h.toFixed(1)}" height="${((T1-T0)/nb).toFixed(2)}" fill="var(--q-soft)" stroke="var(--q)" stroke-width="0.5"/>`;}
+  let d="";for(let v=ymin;v<=ymax+1e-9;v+=0.02)d+=(d?"L":"M")+(H0+pdf1(v,0)*sc).toFixed(1)+" "+YY(v).toFixed(1);g+=`<path d="${d}" fill="none" stroke="var(--k)" stroke-width="2"/>`;
+  g+=`<line x1="${H0}" y1="${T0}" x2="${H0}" y2="${T1}" stroke="var(--muted)"/><text x="${(H0+H1)/2}" y="${T1+19}" text-anchor="middle" class="svgs" font-size="12">2,000 end points</text>`;
+  svg.innerHTML=g;
+  const fr=[0,0,0];x.forEach(v=>fr[v<-0.75?0:v<1.5?1:2]++);const f=fr.map(c=>c/NH);
+  const ends=paths.map(p=>p[p.length-1]);let inv=0;for(let a=0;a<NP;a++)for(let b=a+1;b<NP;b++)if(ends[a]>ends[b])inv++;
+  info.innerHTML=`η = <b>${fx(eta,2)}</b> (${eta===0?"deterministic DDIM, the probability-flow ODE":eta===1?"DDPM-like ancestral sampling, the reverse SDE":"between ODE and SDE"}), ${NS} steps. Share of the 2,000 samples in each mode: <b>${f.map(v=>fx(v,3)).join(" / ")}</b> (true 0.35 / 0.45 / 0.2). Pairs of drawn paths that swapped order: <b>${inv}</b> of ${NP*(NP-1)/2}.`;
+  R.d2Traj={eta:eta,frac:f,inv:inv};}
+ E.addEventListener("input",draw);$("#d2-traj-seed").addEventListener("click",()=>{seed++;draw();});draw();
+})();
+
+/* ---------- Figure 5: solvers and the step-count trade-off ---------- */
+(function(){
+ const svg=$("#d2-solv-svg");if(!svg)return;const NN=$("#d2-solv-n"),MS=$("#d2-solv-m"),info=$("#d2-solv-info");
+ const NAMES={ddim:"DDIM (Euler)",heun:"Heun (EDM)",dpm:"DPM-Solver++(2M)",anc:"Ancestral (DDPM-like, η = 1)"},COL={ddim:"var(--q)",heun:"var(--k)",dpm:"var(--v)",anc:"var(--muted)"};
+ const GRID=[2,3,4,5,6,8,10,12,15,20,25,30,40,50,60];let curves=null;
+ function err(m,nfe){return w1(sampler(m,stepsFor(m,nfe),XT,42));}
+ function build(){initQ();curves={};Object.keys(NAMES).forEach(m=>{curves[m]=GRID.map(k=>[nfeOf(m,stepsFor(m,k)),err(m,k)]);});}
+ function draw(){if(!curves)build();const k=+NN.value,m=segv(MS);$("#d2-solv-nv").value=k;
+  const out=sampler(m,stepsFor(m,k),XT,42);const e=w1(out);
+  let g="";const L0=30,L1=300,T0=20,T1=250,xmin=-3.5,xmax=3.5,nb=56;const XX=v=>L0+(v-xmin)/(xmax-xmin)*(L1-L0);
+  const cnt=new Array(nb).fill(0);out.forEach(v=>{const b=Math.floor((v-xmin)/(xmax-xmin)*nb);if(b>=0&&b<nb)cnt[b]++;});const bw=(xmax-xmin)/nb;
+  let mp=0;for(let v=xmin;v<=xmax;v+=0.01)mp=Math.max(mp,pdf1(v,0));const YS=(T1-T0)/(mp*1.15);
+  for(let b=0;b<nb;b++){const h=Math.min(T1-T0,cnt[b]/(NQ*bw)*YS);if(h>0)g+=`<rect x="${XX(xmin+b*bw).toFixed(1)}" y="${(T1-h).toFixed(1)}" width="${((L1-L0)/nb).toFixed(2)}" height="${h.toFixed(1)}" fill="var(--q-soft)" stroke="${COL[m]}" stroke-width="0.6"/>`;}
+  let d="";for(let v=xmin;v<=xmax+1e-9;v+=0.02)d+=(d?"L":"M")+XX(v).toFixed(1)+" "+(T1-pdf1(v,0)*YS).toFixed(1);g+=`<path d="${d}" fill="none" stroke="var(--k)" stroke-width="2"/>`;
+  g+=`<line x1="${L0}" y1="${T1}" x2="${L1}" y2="${T1}" stroke="var(--muted)"/>`;[-3,-2,-1,0,1,2,3].forEach(v=>g+=`<text x="${XX(v)}" y="${T1+16}" text-anchor="middle" class="svgs" font-size="11.5">${v<0?"−"+(-v):v}</text>`);
+  g+=`<text x="${(L0+L1)/2}" y="${T1+34}" text-anchor="middle" class="svgs" font-size="12">samples of ${Book.esc(NAMES[m])}</text>`;
+  // right panel: log-log error vs NFE
+  const R0=375,R1=625,lx0=Math.log(2),lx1=Math.log(60),ly0=Math.log(0.002),ly1=Math.log(20);
+  const QX=n=>R0+(Math.log(n)-lx0)/(lx1-lx0)*(R1-R0),QY=v=>T1-(Math.log(Math.max(0.002,Math.min(20,v)))-ly0)/(ly1-ly0)*(T1-T0);
+  g+=`<line x1="${R0}" y1="${T1}" x2="${R1}" y2="${T1}" stroke="var(--muted)"/><line x1="${R0}" y1="${T0}" x2="${R0}" y2="${T1}" stroke="var(--muted)"/>`;
+  [2,5,10,20,50].forEach(n=>g+=`<text x="${QX(n)}" y="${T1+16}" text-anchor="middle" class="svgs" font-size="11.5">${n}</text>`);
+  [0.01,0.1,1,10].forEach(v=>g+=`<line x1="${R0}" y1="${QY(v)}" x2="${R1}" y2="${QY(v)}" stroke="var(--rule)"/><text x="${R0-5}" y="${QY(v)+4}" text-anchor="end" class="svgs" font-size="11">${v}</text>`);
+  g+=`<text x="${(R0+R1)/2}" y="${T1+34}" text-anchor="middle" class="svgs" font-size="12">network evaluations (NFE), log scale</text><text x="${R0+4}" y="${T0-6}" class="svgs" font-size="12">error W₁ (log scale)</text>`;
+  Object.keys(NAMES).forEach(mm=>{let p="";curves[mm].filter(c=>c[0]>=2).forEach((c,i)=>p+=(i?"L":"M")+QX(c[0]).toFixed(1)+" "+QY(c[1]).toFixed(1));g+=`<path d="${p}" fill="none" stroke="${COL[mm]}" stroke-width="${mm===m?3:1.6}" ${mm==="anc"?'stroke-dasharray="5 4"':""}/>`;});
+  const nf=nfeOf(m,stepsFor(m,k));g+=`<line x1="${QX(Math.max(2,nf))}" y1="${T0}" x2="${QX(Math.max(2,nf))}" y2="${T1}" stroke="var(--ink2)" stroke-dasharray="3 3"/><circle cx="${QX(Math.max(2,nf))}" cy="${QY(e)}" r="5" fill="${COL[m]}" stroke="var(--card)" stroke-width="1.5"/>`;
+  svg.innerHTML=g;
+  const all=Object.keys(NAMES).map(mm=>{const n=stepsFor(mm,k);return[mm,n,nfeOf(mm,n),w1(sampler(mm,n,XT,42))];});
+  info.innerHTML=`Budget ${k} NFE. Selected: <b>${Book.esc(NAMES[m])}</b>, ${stepsFor(m,k)} steps, ${nf} NFE, error W₁ = <b>${fx(e,4)}</b>. All four at this budget: `+all.map(a=>`${Book.esc(NAMES[a[0]])} ${fx(a[3],4)} (${a[2]} NFE)`).join("; ")+`. Data spread (std) is 1.70, so W₁ below about 0.05 looks right by eye.`;
+  R.d2Solv={nfe:k,m:m,err:all.map(a=>+a[3].toFixed(4))};}
+ NN.addEventListener("input",draw);seg(MS,draw);
+ // lazy: compute when the figure first comes near the screen
+ let done=false;const go=()=>{if(done)return;done=true;draw();};
+ if("IntersectionObserver" in window){const io=new IntersectionObserver(es=>{if(es.some(e=>e.isIntersecting)){io.disconnect();go();}},{rootMargin:"400px"});io.observe(svg);}else go();
+ R.d2SolvAt=(k,m)=>{done=true;NN.value=k;if(m)MS.querySelectorAll("button").forEach(b=>b.setAttribute("aria-pressed",b.dataset.v===m?"true":"false"));draw();return R.d2Solv;};
+})();
+})();
+</script></body></html>
