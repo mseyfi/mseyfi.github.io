@@ -17,9 +17,14 @@ document.addEventListener("click",e=>{const t=e.target.closest("[data-theme-togg
 /* math */
 B.mathReady=new Promise(res=>{B._mres=res;});
 window.MathJax={tex:{inlineMath:[["\\(","\\)"]],displayMath:[["\\[","\\]"]],tags:"ams",macros:{R:"\\mathbb{R}",E:"\\mathbb{E}",softmax:"\\operatorname{softmax}",argmax:"\\operatorname*{arg\\,max}",argmin:"\\operatorname*{arg\\,min}",KL:"\\operatorname{KL}"}},
- svg:{fontCache:"global"},startup:{pageReady:()=>window.MathJax.startup.defaultPageReady().then(()=>B._mres())}};
+ svg:{fontCache:"global"},startup:{pageReady:()=>{const MJ=window.MathJax,tp=MJ.typesetPromise.bind(MJ);
+   MJ.typesetPromise=els=>tp(els).then(r=>{(els&&els.length?els:[document]).forEach(e=>B.fitFig(e&&e.querySelectorAll?e:document));return r;});
+   return MJ.startup.defaultPageReady().then(()=>{B.fitFig();B._mres();});}}};
+/* shrink inline formulas in figures that are wider than their box (down to 70%), so live numbers stay visible */
+B.fitFig=root=>{(root||document).querySelectorAll('figure mjx-container:not([display="true"])').forEach(m=>{m.style.fontSize="";let s=100;while(m.scrollWidth>m.clientWidth+1&&s>70){s-=5;m.style.fontSize=s+"%";}});};
+addEventListener("resize",()=>{clearTimeout(B._fitT);B._fitT=setTimeout(()=>B.fitFig(),200);});
 const mj=document.createElement("script");mj.src="https://cdn.jsdelivr.net/npm/mathjax@3.2.2/es5/tex-svg.js";mj.async=true;mj.id="MathJax-script";document.head.appendChild(mj);
-B.typeset=el=>B.mathReady.then(()=>window.MathJax.typesetPromise(el?[el]:undefined)).catch(()=>{});
+B.typeset=el=>B.mathReady.then(()=>window.MathJax.typesetPromise(el?[el]:undefined)).then(()=>B.fitFig(el)).catch(()=>{});
 /* inline formulas wider than their line become scrollable (only those) */
 B.fitMath=()=>{B.$$('mjx-container[jax="SVG"]:not([display="true"])').forEach(m=>{let p=m.parentElement;while(p&&!/^(block|list-item|table-cell|flex|grid)$/.test(getComputedStyle(p).display))p=p.parentElement;if(!p)return;const pw=p.clientWidth;if(!pw)return;m.classList.remove("mjx-wide");if(m.getBoundingClientRect().width>pw+1)m.classList.add("mjx-wide");});};
 B.mathReady.then(()=>{B.fitMath();addEventListener("resize",()=>{clearTimeout(B._fm);B._fm=setTimeout(B.fitMath,200);});addEventListener("hashchange",()=>setTimeout(B.fitMath,60));});
