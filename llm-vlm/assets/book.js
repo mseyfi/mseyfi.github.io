@@ -44,8 +44,16 @@ document.addEventListener("DOMContentLoaded",()=>{
   b.addEventListener("click",()=>{const t=p.innerText.replace(/^Copy\n?|\nCopy$/g,"");(navigator.clipboard?navigator.clipboard.writeText(p.dataset.raw||t):Promise.reject()).then(()=>{b.textContent="Copied";setTimeout(()=>b.textContent="Copy",1400);}).catch(()=>{b.textContent="Select and copy";});});p.appendChild(b);});
  B.$$("[data-done]").forEach(dk=>{const key="llmvlm.done";const id=dk.dataset.done;
   const upd=()=>{const set=new Set(B.store.get(key,[]));dk.textContent=set.has(id)?"Done. Click to mark as not done":"Mark this session as done";dk.setAttribute("aria-pressed",set.has(id)?"true":"false");};
-  dk.addEventListener("click",()=>{const set=new Set(B.store.get(key,[]));set.has(id)?set.delete(id):set.add(id);B.store.set(key,[...set]);upd();});upd();});
+  dk.addEventListener("click",()=>{const set=new Set(B.store.get(key,[]));set.has(id)?set.delete(id):set.add(id);B.store.set(key,[...set]);upd();B.courseProgress();});upd();});
+ /* per-reader course completion (stored only in this browser) */
+ B.$$(".topbar-in").forEach(tb=>{if(B.$(".cprog",tb))return;const a=document.createElement("a");a.className="cprog";a.href="/#curriculum";a.title="Your course progress (saved in this browser)";
+  a.innerHTML='<span class="cprog-lab">Your progress</span><span class="cprog-bar"><i></i></span><b class="cprog-n"></b>';const sp=B.$(".tb-sp",tb);if(sp)sp.after(a);else tb.appendChild(a);});
+ B.courseProgress();
+ addEventListener("storage",e=>{if(e.key==="llmvlm.done")B.courseProgress();});
 });
+B.TOTAL=239;
+B.courseProgress=()=>{const n=new Set(B.store.get("llmvlm.done",[])).size,pc=Math.min(100,100*n/B.TOTAL);
+ B.$$(".cprog").forEach(c=>{const i=B.$(".cprog-bar i",c);if(i)i.style.width=pc.toFixed(1)+"%";const t=B.$(".cprog-n",c);if(t)t.textContent=n+" / "+B.TOTAL;c.setAttribute("aria-label","Course progress: "+n+" of "+B.TOTAL+" lessons done");});};
 /* simple step player: el with data-steps=N; calls onStep(i) */
 B.stepper=(opts)=>{let i=0,timer=null;const n=opts.n;const prev=opts.prev,next=opts.next,play=opts.play,lab=opts.label;
  const go=k=>{i=Math.max(0,Math.min(n-1,k));opts.onStep(i);if(prev)prev.disabled=i===0;if(next)next.disabled=i===n-1;if(lab)lab.textContent=`Step ${i+1} of ${n}`;};
