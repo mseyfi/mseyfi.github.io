@@ -1,0 +1,613 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>benchmark a serving system · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 142</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="lab-benchmark-a-serving-system">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="lab-benchmark-a-serving-system" data-session="lab-benchmark-a-serving-system" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">142</span><span>Track 5: LLM inference and serving · session 65 of 65</span></div><h1 class="chap-title">benchmark a serving system</h1><p class="chap-sub">In this lab you serve a 7B model with vLLM on one GPU, drive it with an open-loop load generator, and plot TTFT, TPOT and throughput against the request rate and the prompt length. Then you turn on prefix caching, chunked prefill, FP8 or INT4 weights, and speculative decoding, one at a time, and explain each change with the survey’s taxonomy. A small simulator tells you what to expect, so you can tell a real effect from a broken benchmark.</p><div class="meta-row"><span><b>Time:</b> 4 to 6 hours (mostly hands-on, on a rented GPU)</span><span><b>Level:</b> Intermediate · hands-on lab</span><span><b>Before this:</b> Sessions 81, 84 and 133 to 138 (metrics, batching, the serving stack, memory management, continuous batching, scheduling, vLLM internals); sessions 105 and 128 help for FP8 and speculative decoding</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How to write down a serving setup that someone else can reproduce: GPU, model, engine version and every scheduler flag</li><li>How to compute the KV-cache capacity of your GPU and the largest batch it allows, before you run anything</li><li>How to generate load correctly: open loop (Poisson arrivals) against closed loop (fixed concurrency), and why the send time must be the scheduled time</li><li>How TTFT, TPOT, ITL, throughput and goodput change as the load rises, and where the knee comes from (queueing once the batch is full)</li><li>How prompt length moves TTFT, TPOT and the maximum throughput, through compute and through KV-cache capacity</li><li>What prefix caching, chunked prefill, FP8, INT4 and speculative decoding each change, at low load and at overload</li><li>How to place each change in the survey’s taxonomy (memory management, batching, quantization, speculative decoding) and predict which metric it moves</li></ul></div></header><style>
+[data-session="lab-benchmark-a-serving-system"] pre.code,[data-session="lab-benchmark-a-serving-system"] code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.bs-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.bs-grid input[type=range]{width:100%;min-width:0}
+.bs-grid output{font:600 14px var(--mono);min-width:5.5em;text-align:right}
+.bs-grid .bs-row{display:contents}
+#bs-load-svg text,#bs-ctx-svg text,#bs-one-svg text,#bs-tax-svg text{font-family:var(--sans)}
+.bs-seg-wrap{display:flex;flex-wrap:wrap;gap:6px}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Every serving decision ends with a benchmark: which GPU to rent, how many replicas to run, whether FP8 is worth it, whether to turn on speculative decoding. A benchmark that is set up wrong gives numbers that look precise and mean nothing. In this lab you build a benchmark you can trust. You serve a real 7B model with vLLM on one GPU, send it load the way users send it, and measure how the latency and the throughput change as the load and the prompt length grow. Then you change one thing at a time and explain each change with the map of the efficient-inference survey.</p>
+<p>This lab closes <a href="../inference/index.html">Track 5</a>. It uses almost every session before it. <a href="../inference/inference-metrics-latency-memory-and-throughput.html">Session 81</a> defined TTFT, TPOT and throughput. <a href="../inference/batching-basics-and-the-latency-throughput-trade.html">Session 84</a> showed the latency–throughput trade-off of one batch. <a href="../inference/the-serving-stack-and-the-life-of.html">Session 133</a> followed one request through a server. <a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">Session 134</a> built paged KV blocks and prefix caching. <a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">Session 135</a> added continuous batching and chunked prefill, <a href="../inference/scheduling-fcfs-preemption-fairness-and-slos.html">session 136</a> the queue, and <a href="../inference/vllm-internals.html">Session 138</a> the engine you will now run. <a href="../inference/scenarios-and-capacity-planning-agents-long-context.html">Session 141</a> did capacity math on paper; here you check it against a running server.</p>
+<p>The lab has four parts, one per key point of the session:</p>
+<ol>
+<li>Serve Qwen2.5-7B-Instruct with vLLM on an NVIDIA L4 (and, optionally, with TensorRT-LLM on the same GPU).</li>
+<li>Plot TTFT, TPOT and throughput against the request rate, and against the prompt length.</li>
+<li>Turn on prefix caching, change chunked prefill, switch to FP8 or INT4 weights, and turn on speculative decoding, one at a time.</li>
+<li>Explain each change with the survey’s taxonomy: which part of the system it touches and which bottleneck it removes.</li></ol>
+<aside class="note interview side"><span class="nt">Interview tip</span>“How would you benchmark an LLM endpoint?” A strong answer has five parts: fix and record the setup; generate open-loop load with a realistic mix of prompt and output lengths; sweep the request rate until the latency explodes; report percentiles (p50 and p99) of TTFT and TPOT plus throughput and goodput under a stated SLO; and change one setting at a time, with a reason for each.</aside>
+<div class="note watch"><span class="nt">What is measured and what is modeled on this page</span>The commands on this page follow the vLLM documentation of November 2026 [Certain for the flags we quote from it]. We did <b>not</b> run vLLM for this page: we had no NVIDIA GPU. Every curve and every latency number in the figures comes from a small simulator of a continuous-batching server (given in full below), which uses the L4’s spec-sheet numbers and stated assumptions. The simulator is not a measurement. It is the “expected result” of the lab: run the real benchmark, put your numbers next to it, and explain the differences. The only things we measured ourselves are the dry run of the load generator against a fake server, and they are labeled [Certain, our run].</div>
+
+<h2>The setup: one GPU, one model, every flag written down</h2>
+<p>A benchmark result is only useful if someone else can repeat it. So you write down the whole setup before the first run: the GPU, the model and its precision, the engine and its version, and every scheduler setting. Do not rely on defaults. Defaults change between versions, and a different default is the most common reason two teams get different numbers for “the same” benchmark.</p>
+<p><b>The GPU.</b> An NVIDIA L4: 24 GB of memory, 300 GB/s of memory bandwidth, 121 TFLOP/s of dense BF16 matrix math and 242 TFLOP/s of dense FP8 [Certain: NVIDIA lists 242 and 485 “with sparsity” and says dense is one half]. It is a cheap 72 W inference card, available in most clouds. Any GPU with at least 24 GB works; your numbers will scale with its bandwidth and FLOP/s.</p>
+<p><b>The model.</b> Qwen2.5-7B-Instruct, in BF16. It has an Apache-2.0 license, so no access request is needed. From its config.json [Certain]: \(L = 28\) layers, width \(d = 3{,}584\), 28 query heads and \(n_{kv} = 4\) key-value heads of size \(d_h = 128\) (grouped-query attention), feed-forward width 18,944, a vocabulary of 152,064, and an output layer that is <i>not</i> tied to the input embedding. Hugging Face counts 7,615,616,512 parameters.</p>
+<div class="eq">\[ C_{\text{KV}} = \left\lfloor \frac{u\,M - W - R}{\text{kv}_{\text{tok}}} \right\rfloor, \qquad \text{kv}_{\text{tok}} = 2\,L\,n_{kv}\,d_h\,s \tag{142.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(C_{\text{KV}}\)</dt><dd>how many tokens of KV cache fit on the GPU, summed over all running requests</dd>
+<dt>\(u\)</dt><dd>the fraction of GPU memory the engine may use (vLLM’s <code>--gpu-memory-utilization</code>)</dd>
+<dt>\(M\)</dt><dd>GPU memory in bytes</dd>
+<dt>\(W\)</dt><dd>bytes of the stored weights</dd>
+<dt>\(R\)</dt><dd>memory kept for everything else: activations of the largest step, CUDA graphs, the sampler; here an assumed 1.5 GB</dd>
+<dt>\(\text{kv}_{\text{tok}}\)</dt><dd>bytes of cache per token: a key and a value (the 2) for every layer and every KV head</dd>
+<dt>\(s\)</dt><dd>bytes per number in the cache: 2 for BF16</dd></dl>
+<div class="worked"><div class="wt">Worked example: how many requests fit on an L4?</div>
+<p>Weights in BF16: \(7{,}615{,}616{,}512 \times 2 = 15.23\) GB. Cache per token: \(2 \cdot 28 \cdot 4 \cdot 128 \cdot 2 = 57{,}344\) bytes (56 KiB). With \(u = 0.9\) and \(R = 1.5\) GB: \(0.9 \cdot 24 - 15.23 - 1.5 = 4.87\) GB for the cache, so \(C_{\text{KV}} = 84{,}904\) tokens.</p>
+<p>One benchmark request has 1,024 prompt tokens and 256 output tokens, 1,280 in total. So at most \(\lfloor 84{,}904 / 1{,}280 \rfloor = 66\) requests can be in the batch at once. This one number explains a lot of what follows: no scheduler setting can run more than about 66 of these requests together on this GPU in BF16. With FP8 weights (8.71 GB) the cache grows to 198,702 tokens, room for 155 requests.</p>
+<p>vLLM prints its own version of this number at start-up, as the KV-cache size in tokens and the maximum concurrency for the configured model length [Likely: the exact wording of the log line changes between versions]. Compare it with your estimate. If they differ a lot, find out why before you benchmark.</p></div>
+<p><b>The engine.</b> Install vLLM in a fresh environment and record its version (<code>pip show vllm</code>). Start the server with every setting written out:</p>
+<pre class="code"><span class="cm"># the baseline server: BF16, chunked prefill with a 2,048-token budget, NO prefix caching</span>
+vllm serve Qwen/Qwen2.5-7B-Instruct \
+  --dtype bfloat16 --max-model-len 8192 --gpu-memory-utilization 0.9 \
+  --max-num-seqs 128 --max-num-batched-tokens 2048 \
+  --enable-chunked-prefill --disable-prefix-caching \
+  --port 8000</pre>
+<p><code>--max-num-batched-tokens</code> is the token budget of one engine iteration (the Sarathi-Serve “chunk size”); <code>--max-num-seqs</code> caps the number of requests in the batch. The baseline turns prefix caching <i>off</i>, because the random benchmark prompts share nothing and we want to add each feature ourselves. Recent vLLM versions spell the switch <code>--disable-prefix-caching</code>; older ones use <code>--no-enable-prefix-caching</code> [Certain for the current docs]. Check with <code>vllm serve --help</code>. When the log says the server is ready, send one request by hand to check that it answers.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A benchmark is a crash test. The car (the server) must be exactly the model you sell, the dummy (the workload) must have the right weight, and the speed of the impact (the request rate) must be set by the test, not by the car. If the car may choose its own speed, every car passes.</aside>
+
+<h2>What to measure, and how to generate the load</h2>
+<p>A streaming server returns tokens one chunk at a time. For each request \(i\) the client records three kinds of times: when the request was <b>scheduled</b> to be sent, when the first token arrived, and when every later chunk arrived. From these come the per-request metrics of <a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>:</p>
+<div class="eq">\[ \text{TTFT}_i = t^{\text{first}}_i - t^{\text{sched}}_i, \qquad \text{TPOT}_i = \frac{t^{\text{last}}_i - t^{\text{first}}_i}{O_i - 1}, \qquad \text{ITL}_{i,j} = t_{i,j+1} - t_{i,j} \tag{142.2} \]</div>
+<div class="eq">\[ \text{throughput} = \frac{\sum_i O_i}{t_{\text{end}} - t_{\text{start}}}, \qquad \text{goodput} = \frac{\#\{\, i : \text{TTFT}_i \le \tau_1,\ \text{TPOT}_i \le \tau_2 \,\}}{t_{\text{end}} - t_{\text{start}}} \tag{142.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t^{\text{sched}}_i\)</dt><dd>the time the load generator planned to send request \(i\) (not the time it actually managed to send it)</dd>
+<dt>\(t^{\text{first}}_i, t^{\text{last}}_i\)</dt><dd>arrival of the first and of the last output token</dd>
+<dt>\(O_i\)</dt><dd>output tokens of request \(i\); TPOT averages over the \(O_i - 1\) gaps after the first token</dd>
+<dt>\(\text{ITL}_{i,j}\)</dt><dd>inter-token latency: the gap between two chunks; its p99 shows the stalls that the TPOT average hides</dd>
+<dt>\(\tau_1, \tau_2\)</dt><dd>the service-level objectives (SLOs) for TTFT and TPOT; goodput counts only the requests that meet both, per second</dd></dl>
+<p>Report percentiles, not means. The median (p50) tells you what a typical user sees; p99 tells you what the unlucky one in a hundred sees, and it is usually what an SLO is written on. Goodput is the most honest single number: requests per second that were <i>useful</i> to their users. DistServe made it the main target for LLM serving [Likely].</p>
+<h3>Open loop, closed loop, and the scheduled send time</h3>
+<p>There are two ways to generate load. In a <b>closed loop</b>, \(N\) virtual users each send a request, wait for the answer, and send the next. In an <b>open loop</b>, requests arrive on a schedule that does not depend on the server, for example a Poisson process with rate \(\lambda\): the gaps between arrivals are random with mean \(1/\lambda\), like real users who do not know each other.</p>
+<p>The two answer different questions. A closed loop can never overload the server: when it slows down, the users slow down with it, so the queue stays short and the latency looks fine. Real traffic does not slow down because your server is slow. So for capacity questions use an open loop and sweep \(\lambda\). The two are linked by Little’s law [Certain]:</p>
+<div class="eq">\[ \bar N = \lambda \cdot \bar W \tag{142.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\bar N\)</dt><dd>the average number of requests inside the server (waiting or running)</dd>
+<dt>\(\lambda\)</dt><dd>the arrival rate in requests per second (in a steady state it equals the completion rate)</dd>
+<dt>\(\bar W\)</dt><dd>the average time a request spends inside: queueing + TTFT + the decode time, so about \(\text{TTFT} + (O-1)\,\text{TPOT}\)</dd></dl>
+<p>For example, if the server answers 1 request per second and each request takes about 20 s from arrival to last token, then about 20 requests are inside at any time. A closed loop with 20 users would produce about the same state. But a closed loop with 200 users at a slow server only shows you a long queue at a <i>lower</i> rate; it never shows you the rate at which the queue starts to grow without bound.</p>
+<p>The last trap is subtle. If the load generator measures TTFT from the moment it actually sent the request, and it sends late because it was busy or blocked, the waiting time disappears from the numbers. This is called <b>coordinated omission</b>: the slow moments of the server delay the measurements that would have shown them. Always measure from the scheduled send time.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: an open-loop benchmark run</div><ol>
+<li><b>input:</b> rate \(\lambda\), number of requests \(n\), prompt and output lengths, seed</li>
+<li>\(t \leftarrow\) now; <b>for</b> \(i = 1, \dots, n\):</li>
+<li>&nbsp;&nbsp;\(t \leftarrow t + \text{Exp}(\lambda)\) <span class="c">// Poisson arrivals; \(t\) is the scheduled time</span></li>
+<li>&nbsp;&nbsp;wait until \(t\); start request \(i\) in its own thread or task, streaming, with <code>ignore_eos</code> <span class="c">// never wait for the answer here</span></li>
+<li>&nbsp;&nbsp;the task records \(t^{\text{sched}}_i = t\) and the arrival time of every chunk</li>
+<li>wait for all tasks; compute (142.2) and (142.3); report p50 and p99</li>
+<li><b>repeat</b> for each \(\lambda\) in the sweep; discard nothing, but check that the run was long enough (several hundred requests)</li></ol></div>
+<p><code>ignore_eos</code> makes the model generate exactly the requested number of tokens, even if it would stop earlier. Without it, the output lengths depend on what the model writes, and two configurations are no longer doing the same work.</p>
+<p>vLLM ships a benchmark client that does all of this [Certain]. One run at 2 requests per second:</p>
+<pre class="code">vllm bench serve --backend vllm --model Qwen/Qwen2.5-7B-Instruct --port 8000 \
+  --dataset-name random --random-input-len 1024 --random-output-len 256 \
+  --num-prompts 300 --request-rate 2 --ignore-eos --seed 1 \
+  --percentile-metrics ttft,tpot,itl,e2el --metric-percentiles 50,99 \
+  --goodput ttft:1000 tpot:100 --save-result</pre>
+<p>Its documented behavior [Certain]: <code>--request-rate</code> gives Poisson arrivals (<code>inf</code> sends everything at time 0); <code>--burstiness</code> below 1 makes the arrivals burstier; <code>--max-concurrency</code> caps the requests in flight, which turns the run into a partly closed loop; <code>--goodput</code> takes SLOs in milliseconds. We also give a 60-line client of our own below, so you can see every step and run it against any OpenAI-compatible server.</p>
+
+<h2>A model to compare against</h2>
+<p>Before you rent the GPU, predict the result. A prediction tells you what “normal” looks like, so you notice when a run is broken. Our simulator is the continuous-batching loop of <a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">session 135</a>, with a cost model from <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a> for each iteration.</p>
+<div class="eq">\[ t_{\text{step}} = \max\!\left( \frac{F_{\text{step}}}{\eta_c\, F_{\text{peak}}},\ \frac{Q_{\text{step}}}{\eta_m\, \text{BW}} \right) + t_{\text{oh}} \tag{142.5} \]</div>
+<div class="eq">\[ F_{\text{step}} = \sum_{j} \Big( 2 N_{\text{body}}\, n_j + 4 L d\,\big(n_j p_j + \tfrac{n_j (n_j+1)}{2}\big) \Big) + 2 N_{\text{out}} b, \qquad Q_{\text{step}} = W_{\text{read}} + \text{kv}_{\text{tok}} \sum_j (p_j + n_j) \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(j\)</dt><dd>one request in this iteration: a decode (\(n_j = 1\)) or a piece of a prefill (\(n_j\) up to the token budget)</dd>
+<dt>\(p_j\)</dt><dd>tokens of request \(j\) already in the cache</dd>
+<dt>\(N_{\text{body}}, N_{\text{out}}\)</dt><dd>weights of the 28 blocks (6.53 billion) and of the output layer (0.545 billion); \(b\) is the number of positions that produce logits</dd>
+<dt>\(W_{\text{read}}\)</dt><dd>weight bytes read once per iteration: 14.14 GB in BF16 (the embedding lookup reads only a few rows)</dd>
+<dt>\(\eta_c, \eta_m\)</dt><dd>assumed fractions of peak FLOP/s and bandwidth that real kernels reach: 0.6 and 0.8</dd>
+<dt>\(t_{\text{oh}}\)</dt><dd>assumed fixed cost of one iteration (scheduling, launches, sampling): 2 ms</dd></dl>
+<p>The scheduler copies vLLM’s main rule <a href="../inference/vllm-internals.html">Session 138</a>: in every iteration, first one token for each running decode, then the rest of the token budget goes to unfinished prefills, then new requests are admitted first-come-first-served while the budget and the KV cache allow. Three simplifications make it smaller than vLLM: it reserves the whole KV cache of a request at admission (vLLM allocates blocks as it goes and preempts when memory runs out, so it packs a few more requests); it ignores sampling, detokenization and network time; and the efficiencies are constants, while real kernels are faster at some shapes than others. Treat its numbers as a sketch with the right shape, good to maybe 20 to 50% [Speculation].</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A bus that leaves every stop on a fixed rhythm. Each trip costs the weight of the bus (the weights, read once per iteration) plus a little per passenger (their caches). New passengers board at the front (prefill), which takes time, and the bus cannot leave until they are seated. Seats are limited (the KV cache). When people arrive faster than seats free up, the queue on the sidewalk grows without limit.</aside>
+<div class="worked"><div class="wt">Worked example: the capacity of the L4 before running anything</div>
+<p><b>One decode step, batch 1.</b> It reads 14.14 GB of weights: at the spec bandwidth that is 47.1 ms, and with \(\eta_m = 0.8\) and the 2 ms overhead, 60.9 ms. So no setting can make TPOT much below about 50 to 60 ms for this model in BF16 on an L4.</p>
+<p><b>One prefill of 1,024 tokens.</b> \(F = 13.58\) TFLOP; at \(0.6 \times 121\) TFLOP/s that is 187 ms, plus 2 ms: 189 ms. Its bytes would take only 59 ms, so prefill is compute-bound. The lowest possible TTFT is about 0.19 s.</p>
+<p><b>The full batch.</b> At most \(B = 66\) requests fit (worked example above). With an average context of about 1,152 tokens, one decode step of 66 requests reads \(14.14 + 66 \cdot 1{,}153 \cdot 57{,}344 / 10^9 = 18.50\) GB and takes 79.1 ms. Each request needs one prefill and 256 output tokens, so a batch of 66 is replaced about every \(66\,t_{\text{pre}} + 256\, t_{\text{dec}}(66)\) seconds:</p>
+<div class="eq">\[ \lambda_{\max} \approx \frac{B}{B\, t_{\text{pre}} + O\, t_{\text{dec}}(B)} = \frac{66}{66 \cdot 0.189 + 256 \cdot 0.0791} = 2.02 \ \text{req/s} \tag{142.6} \]</div>
+<p>That is about \(2.02 \times 256 = 516\) output tokens per second. The full simulation gives 2.05 requests per second (525 tokens per second) when every request is sent at once. Above about 2 requests per second the queue must grow without limit, whatever the scheduler does.</p></div>
+
+<h2>Part 1: TTFT, TPOT and throughput against the load</h2>
+<p>Sweep the request rate: 0.25, 0.5, 1, 1.5, 2, 2.5, 3 and 4 requests per second, and <code>inf</code>, 300 requests each, 1,024 prompt tokens and 256 output tokens. A shell loop with the command above and <code>--request-rate $r</code> does it; the slow rates take longest (300 requests at 0.25 per second need 20 minutes), so the whole sweep takes about an hour. Restart nothing between runs, but send a few warm-up requests first. Then plot each metric against the rate. Figure 1 shows what the simulator predicts.</p>
+<figure class="fig wide" id="bs-load"><div class="fig-body">
+<div class="bs-grid">
+<label for="bs-load-r">Request rate \(\lambda\)</label><input type="range" id="bs-load-r" min="0" max="13" step="1" value="7"><output id="bs-load-rv"></output>
+<label for="bs-load-st">TTFT SLO \(\tau_1\)</label><input type="range" id="bs-load-st" min="0.25" max="5" step="0.25" value="1"><output id="bs-load-stv"></output>
+<label for="bs-load-sp">TPOT SLO \(\tau_2\)</label><input type="range" id="bs-load-sp" min="60" max="150" step="5" value="100"><output id="bs-load-spv"></output></div>
+<div class="scroll-x"><svg id="bs-load-svg" viewBox="0 0 680 420" role="img" aria-label="Simulated TTFT, TPOT, throughput and goodput of Qwen2.5-7B on an L4 as the request rate grows from 0.25 to 4 requests per second"></svg></div>
+<div class="readout" id="bs-load-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The load sweep, from the simulator (not measured): Qwen2.5-7B-Instruct in BF16 on one L4, 300 requests per point with Poisson arrivals, 1,024 prompt tokens and 256 output tokens, chunked prefill with a 2,048-token budget. Red dashed lines are your SLOs. Goodput (142.3) is drawn in output tokens per second (requests per second × 256) so that it shares the throughput axis.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start at the default, 2 requests per second, with SLOs of 1 s and 100 ms. TTFT p50 is still 271 ms, close to the 189 ms of a lone prefill, but TPOT p50 has grown from 64 ms (at 0.25 requests per second) to 102 ms, because the batch is bigger and every iteration reads more cache and carries prefill chunks. Throughput is 464 tokens per second, yet goodput is only 0.75 requests per second: most requests miss the 100 ms TPOT SLO. Move the rate to 2.25 and then 2.5: the TTFT curves jump from below one second to 4 to 14 seconds. That is the knee: the batch is full (about 66 requests), new requests wait in a queue, and the queue grows for as long as the run lasts. Throughput stops growing at about 525 tokens per second. Now loosen the TPOT SLO to 120 ms: the highest rate that meets both SLOs at p99 moves from 1.5 to 2 requests per second.</p></details></figure>
+<h3>What the curves say</h3>
+<ul>
+<li><b>Below the knee, TTFT is set by the prefill, TPOT by the batch.</b> TTFT stays near the cost of one prefill. TPOT grows slowly and steadily with the rate, because more requests share each iteration, which then reads more KV cache and carries more prefill work.</li>
+<li><b>At the knee, TTFT explodes and TPOT flattens.</b> Once the KV cache is full, new requests wait outside. Their waiting time is part of TTFT, and it grows with the length of the run, so p99 TTFT above the knee is not a property of the server but of how long you ran the test. The running requests are not affected, so TPOT stops growing.</li>
+<li><b>Throughput saturates; goodput falls.</b> Above the knee the server does the same amount of work per second. Goodput falls to zero, because almost every request now misses the TTFT SLO.</li>
+<li><b>The useful capacity is the rate where the SLO breaks, not where throughput peaks.</b> With the default SLOs that is 1.5 requests per second in the simulator, 73% of the maximum.</li></ul>
+<aside class="note watch side"><span class="nt">Watch out</span>If your measured TTFT stays low far above the rate where throughput stops growing, your load is not open loop. Check for <code>--max-concurrency</code>, a thread pool that is too small, or a client that measures from the actual send time.</aside>
+
+<h2>Part 2: the effect of prompt length</h2>
+<p>Now fix a moderate rate and change the prompt: 256, 512, 1,024, 2,048, 4,096 and 8,192 tokens, still with 256 output tokens. Also run each length with <code>--request-rate inf</code> to find the maximum throughput. Longer prompts act through two channels: more prefill compute per request (TTFT), and fewer requests in the KV cache (capacity and throughput).</p>
+<figure class="fig wide" id="bs-ctx"><div class="fig-body">
+<div class="controls"><span>Rate</span><span class="seg" id="bs-ctx-rate"><button type="button" data-v="0.25" aria-pressed="false">0.25 req/s</button><button type="button" data-v="0.5" aria-pressed="true">0.5 req/s</button><button type="button" data-v="1" aria-pressed="false">1 req/s</button></span></div>
+<div class="bs-grid">
+<label for="bs-ctx-i">Input length</label><input type="range" id="bs-ctx-i" min="0" max="5" step="1" value="2"><output id="bs-ctx-iv"></output></div>
+<div class="scroll-x"><svg id="bs-ctx-svg" viewBox="0 0 680 400" role="img" aria-label="Simulated TTFT, TPOT and maximum throughput as the prompt length grows from 256 to 8,192 tokens"></svg></div>
+<div class="readout" id="bs-ctx-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The prompt-length sweep, from the simulator (not measured), same server as Figure 1. The top two panels use the chosen request rate; the bottom panel sends all 300 requests at once and shows the highest throughput the server reaches.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>At 0.5 requests per second, TTFT p50 grows from 92 ms at 256 tokens to 502 ms at 2,048 and 1.47 s at 4,096: prefill is compute-bound, so its time follows the prompt tokens (and the attention term, which grows with the square). At 8,192 tokens the server cannot keep up any more: it serves only about 0.29 requests per second, so the queue grows and TTFT is minutes. The maximum throughput falls from 1,163 tokens per second at 256 tokens to 525 at 1,024 and 74 at 8,192. Two causes add up: each request brings more prefill work, and only 10 requests of 8,448 tokens fit in the cache, against 165 requests of 512 tokens (256 in, 256 out). Switch to 1 request per second: 4,096 tokens now break the server too.</p></details></figure>
+<p>This is why long-context serving is a capacity problem first. The cache per token is fixed by the model; a longer context means fewer requests per GPU. Grouped-query attention, KV-cache quantization (FP8 cache: <code>--kv-cache-dtype fp8</code>), and prefix caching all attack this, and so does moving to a GPU with more memory.</p>
+
+<h2>Part 3: one change at a time</h2>
+<p>Now change the server, one setting per experiment, and re-run the same sweep. Keep everything else fixed: same seed, same number of requests, same lengths, same vLLM version. If two settings change at once, you cannot say which one caused the effect.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: the one-change protocol</div><ol>
+<li>run the baseline sweep (Part 1) and save the JSON results with the full command line</li>
+<li><b>for</b> each change \(c\) (prefix caching, chunked prefill, FP8, INT4, speculation):</li>
+<li>&nbsp;&nbsp;write down the prediction: which bottleneck \(c\) attacks, which metric should move, at low load and at overload</li>
+<li>&nbsp;&nbsp;restart the server with only \(c\) changed; check the start-up log (KV-cache size, quantization, speculation settings)</li>
+<li>&nbsp;&nbsp;re-run the same sweep, with the same seed, on the workload that \(c\) needs (shared prefixes for prefix caching, real text for speculation)</li>
+<li>&nbsp;&nbsp;plot baseline and \(c\) together; compare with the prediction; if they disagree, find out why before the next change</li></ol></div>
+<h3>Prefix caching</h3>
+<p>Turn it on with <code>--enable-prefix-caching</code>. Random prompts share nothing, so you need a workload with shared prefixes, as in a chat product with one long system prompt or a RAG system that sends the same documents many times. vLLM’s client has one [Certain]: <code>--dataset-name prefix_repetition --prefix-repetition-prefix-len 768 --prefix-repetition-suffix-len 256 --prefix-repetition-num-prefixes 10 --prefix-repetition-output-len 256</code>. Run the baseline (cache off) on the same workload, so that the comparison is fair. The engine hashes each full 16-token block together with all the blocks before it <a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>; a new request whose first blocks match skips their prefill.</p>
+<p><b>Prediction.</b> A cached request computes only 256 of its 1,024 prompt tokens, so its prefill drops from 189 ms to about 49 ms. TTFT should fall about 2 to 4 times at low load. At overload the gain is much bigger: less prefill work per request means more requests per second, and the shared prefix is stored once, so more requests fit in the cache.</p>
+<h3>Chunked prefill and the token budget</h3>
+<p>The baseline already uses chunked prefill with a 2,048-token budget. Try budgets of 512 and 8,192, and try <code>--disable-chunked-prefill</code> [Certain: the flag is in the current docs; some vLLM versions may not support every combination]. Without chunking, a new prompt runs as a whole in its own iteration and every running decode waits for it. With a small budget, a prompt is split into small pieces that ride along with the decodes.</p>
+<p><b>Prediction.</b> The cost of a prefill does not go away; chunking only spreads it. So TTFT rises a little with a small budget, while the long gaps between tokens (ITL p99) shrink. Look at ITL p99, not at TPOT p50: the average hides the stalls.</p>
+<h3>FP8 and INT4 weights</h3>
+<p>For FP8, add <code>--quantization fp8</code>: vLLM quantizes the BF16 checkpoint to FP8 when it loads it, and on GPUs with FP8 tensor cores (Ada, such as the L4, and Hopper) it also runs the matrix multiplies in FP8 [Likely: support depends on the GPU and the vLLM version; check the log]. For INT4, serve the official AWQ checkpoint <code>Qwen/Qwen2.5-7B-Instruct-AWQ</code>; vLLM reads its quantization method from the config. Measure quality too: run a small accuracy check (a few hundred questions from a benchmark you trust) next to the speed test, because a faster wrong answer is not a win (<a href="../inference/lab-compare-rtn-gptq-awq-smoothquant-and.html">session 112</a>).</p>
+<p><b>Prediction.</b> At low load, decode is memory-bound, so TPOT follows the weight bytes: 14.14 GB in BF16, 7.62 GB in FP8, about 4.56 GB in INT4 (the embedding and the output layer stay in BF16). FP8 also doubles the math speed, so prefill gets faster too. INT4 AWQ keeps the math in BF16 and has to unpack the weights, so at large batches and in prefill it can be slower than BF16 [Likely]; our simulator models this with a low compute efficiency (0.35), which is an assumption. Both free memory for the KV cache, so the batch can grow: 155 requests in FP8 and 196 in INT4 instead of 66.</p>
+<h3>Speculative decoding</h3>
+<p>The simplest drafter needs no second model: n-gram (prompt-lookup) decoding looks for the last few generated tokens in the prompt and proposes the tokens that followed them there. The vLLM docs give this example [Certain]:</p>
+<pre class="code">vllm serve Qwen/Qwen2.5-7B-Instruct ... \
+  --speculative-config '{"method": "ngram", "num_speculative_tokens": 4,
+                         "prompt_lookup_min": 2, "prompt_lookup_max": 5}'</pre>
+<p>Do not benchmark it on random token prompts: the outputs will not repeat the prompt, so almost no draft is accepted. Use real text where the answer copies from the prompt, such as summarization, code editing or RAG, through one of the client’s file-based datasets. Read the acceptance rate from the server’s metrics; vLLM reports accepted and drafted tokens [Likely: the metric names change between versions].</p>
+<p>With \(k\) draft tokens and a probability \(\alpha\) that each one is accepted (independently, for simplicity), one verification pass yields on average</p>
+<div class="eq">\[ \E[\text{tokens per step}] = \frac{1 - \alpha^{k+1}}{1 - \alpha} \tag{142.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(k\)</dt><dd>draft tokens checked in one pass (here 4); the pass costs the compute of \(k + 1\) tokens per request</dd>
+<dt>\(\alpha\)</dt><dd>acceptance probability of each draft token; 0 for random prompts, higher when the output copies the input</dd></dl>
+<p><b>Prediction.</b> With \(k = 4\) and \(\alpha = 0.7\), each pass gives \(2.77\) tokens for about the cost of one memory-bound step, so TPOT at low load should fall about 2.5 to 3 times. The cost is compute: \(k + 1\) tokens per request per step, and they also use the token budget that prefills need. With \(\alpha = 0\) you pay the compute and get nothing. The vLLM docs say the same in words: speculation aims to reduce inter-token latency “under medium-to-low QPS”, memory-bound workloads [Certain].</p>
+<figure class="fig wide" id="bs-one"><div class="fig-body">
+<div class="controls"><span>Change</span><span class="seg" id="bs-one-ch"><button type="button" data-v="prefix" aria-pressed="true">prefix caching</button><button type="button" data-v="chunk" aria-pressed="false">chunk budget</button><button type="button" data-v="fp8" aria-pressed="false">FP8</button><button type="button" data-v="int4" aria-pressed="false">INT4 AWQ</button><button type="button" data-v="spec" aria-pressed="false">speculation</button></span></div>
+<div class="bs-grid">
+<label for="bs-one-r">Request rate</label><input type="range" id="bs-one-r" min="0" max="13" step="1" value="3"><output id="bs-one-rv"></output>
+<span class="bs-row" id="bs-one-brow"><label for="bs-one-b">Token budget</label><input type="range" id="bs-one-b" min="0" max="5" step="1" value="1"><output id="bs-one-bv"></output></span>
+<span class="bs-row" id="bs-one-arow"><label for="bs-one-a">Acceptance \(\alpha\)</label><input type="range" id="bs-one-a" min="0" max="0.9" step="0.1" value="0.7"><output id="bs-one-av"></output></span></div>
+<div class="scroll-x"><svg id="bs-one-svg" viewBox="0 0 680 460" role="img" aria-label="Simulated effect of one change on TTFT, TPOT, ITL p99 and throughput against the request rate; the baseline is dashed"></svg></div>
+<div class="readout" id="bs-one-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> One change at a time, from the simulator (not measured). The dashed grey line is the baseline of Figure 1 (for prefix caching: the same shared-prefix workload with the cache off); the colored line is the changed server. “Token budget: off” means chunked prefill off.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p><b>Prefix caching</b> at 1 request per second: TTFT p50 233 → 103 ms, and at 4 requests per second the server still keeps up, at 876 instead of 528 tokens per second. <b>Chunk budget:</b> at 1 request per second, a budget of 512 gives ITL p99 97 ms against 194 ms for 2,048 and 444 ms with chunking off, while TTFT p50 rises from 237 to 306 ms. In the simulator a small budget also raises the overload throughput (642 against 529 tokens per second), because more prefill work hides under the memory time of decode steps; a budget of 256 goes too far: TTFT p50 at 2 requests per second is 645 ms, and the overload throughput falls back to 598. <b>FP8:</b> TPOT p50 at 1 request per second falls from 76.9 to 39.2 ms, and the knee moves beyond 4 requests per second (TTFT p50 is still 150 ms there). <b>INT4:</b> TPOT is lowest at low load (26 ms at 0.5 requests per second), but at 2 requests per second TTFT p50 is 830 ms against 271 ms, and from 3 requests per second on TPOT is about twice that of BF16 (about 205 against 113 ms), because the slow BF16 math on unpacked weights now dominates. <b>Speculation:</b> at \(\alpha = 0.7\), TPOT p50 at 1 request per second falls from 76.9 to 26.5 ms; set \(\alpha = 0\) and every curve gets a bit worse. In our simulator speculation keeps helping at overload when \(\alpha \ge 0.3\), because the KV cache keeps the batch at about 66 requests, well below the point where the steps become compute-bound; a real server pays extra costs we do not model (drafting, the verification kernels, rejected tokens), so expect smaller gains [Likely].</p></details></figure>
+
+<h2>Part 4: explain each change with the survey’s taxonomy</h2>
+<p>The efficient-inference survey (Zhou et al.) sorts every technique into three levels [Certain]: <b>data-level</b> (change the input or the output organization), <b>model-level</b> (change the model: structure, quantization, sparsity, distillation, dynamic inference) and <b>system-level</b> (change how the same model runs: the inference engine, the serving system, hardware). The system level splits again into the <b>inference engine</b> (graph and operator optimization, speculative decoding, offloading) and the <b>serving system</b> (memory management, continuous batching, scheduling, distributed systems). Placing a change on this map tells you what it can and cannot do. A serving-system change can never make one forward pass faster; a model-level change can, but it may change the outputs.</p>
+<figure class="fig" id="bs-tax"><div class="fig-body">
+<div class="controls"><span>Change</span><span class="seg" id="bs-tax-ch"><button type="button" data-v="prefix" aria-pressed="true">prefix caching</button><button type="button" data-v="chunk" aria-pressed="false">chunked prefill</button><button type="button" data-v="fp8" aria-pressed="false">FP8</button><button type="button" data-v="int4" aria-pressed="false">INT4</button><button type="button" data-v="spec" aria-pressed="false">speculation</button></span></div>
+<div class="scroll-x"><svg id="bs-tax-svg" viewBox="0 0 680 245" role="img" aria-label="The survey's taxonomy in three columns, data-level, model-level and system-level, with the chosen change highlighted"></svg></div>
+<div class="readout" id="bs-tax-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The survey’s taxonomy (section numbers of arXiv 2404.14294), with the place of each change of Part 3. Choose a change to see its branch, the bottleneck it attacks, and the metric it should move.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Prefix caching and chunked prefill sit in the same column and the same branch (serving system), but on different leaves: one changes what is <i>stored</i> (memory management), the other what goes into one <i>iteration</i> (batching). FP8 and INT4 sit on the same model-level leaf, yet they behave differently in Figure 3, because FP8 also speeds up the math while INT4 only cuts bytes. Speculation is a system-level change in the inference engine: it keeps the model and the outputs (for exact verification) and changes how many tokens one pass produces.</p></details></figure>
+<div class="tblw"><table class="tb"><thead><tr><th>Change</th><th>Survey place</th><th>Bottleneck it attacks</th><th>Should move</th><th>Simulator, baseline → changed</th></tr></thead><tbody>
+<tr><td>Prefix caching</td><td>6.2.1 memory management</td><td>repeated prefill of the same tokens; duplicate KV blocks</td><td>TTFT; capacity</td><td>TTFT p50 233 → 103 ms at 1 req/s; 528 → 876 tok/s at 4 req/s</td></tr>
+<tr><td>Chunk budget 512</td><td>6.2.2 continuous batching</td><td>prefills that stall decodes</td><td>ITL p99 down, TTFT up a little</td><td>ITL p99 194 → 97 ms, TTFT p50 237 → 306 ms at 1 req/s</td></tr>
+<tr><td>FP8 W8A8</td><td>5.2.1 quantization</td><td>weight bytes (decode) and FLOP/s (prefill)</td><td>TPOT, TTFT, capacity</td><td>TPOT p50 76.9 → 39.2 ms at 1 req/s; 529 → 900 tok/s at 4 req/s</td></tr>
+<tr><td>INT4 AWQ</td><td>5.2.1 quantization</td><td>weight bytes only</td><td>TPOT at low load</td><td>TPOT p50 68.1 → 26.4 ms at 0.5 req/s; 102 → 91 ms at 2 req/s, TTFT p50 271 → 830 ms</td></tr>
+<tr><td>n-gram speculation, \(\alpha = 0.7\)</td><td>6.1.2 speculative decoding</td><td>one token per weight read</td><td>TPOT at low load</td><td>TPOT p50 76.9 → 26.5 ms at 1 req/s</td></tr></tbody></table></div>
+<p>The pattern to remember: serving-system changes (memory management, batching, scheduling) move the <b>queue and the capacity</b>, and show up mostly near and above the knee. Model-level and engine-level changes move the <b>cost of one iteration</b>, and show up at every load. A change that saves bytes helps most where decode is memory-bound (low load, small batch); a change that adds compute to save bytes (speculation, INT4 unpacking) loses some of its gain as the batch grows.</p>
+
+<h2>Optional: TensorRT-LLM on the same L4</h2>
+<p>TensorRT-LLM has its own OpenAI-compatible server, <code>trtllm-serve</code> (<a href="../inference/tensorrt-and-tensorrt-llm-in-depth.html">session 131</a>). Its documented flags include <code>--max_batch_size</code>, <code>--max_num_tokens</code> (the token budget of one iteration) and <code>--kv_cache_free_gpu_memory_fraction</code> [Certain]:</p>
+<pre class="code">trtllm-serve Qwen/Qwen2.5-7B-Instruct --host 0.0.0.0 --port 8001 \
+  --max_batch_size 128 --max_num_tokens 2048 --kv_cache_free_gpu_memory_fraction 0.9
+
+<span class="cm"># the same client, pointed at the OpenAI-compatible endpoint</span>
+vllm bench serve --backend openai --base-url http://localhost:8001 --endpoint /v1/completions \
+  --model Qwen/Qwen2.5-7B-Instruct --dataset-name random --random-input-len 1024 \
+  --random-output-len 256 --num-prompts 300 --request-rate 2 --ignore-eos --seed 1</pre>
+<p><code>openai</code> is one of the client’s documented back-ends, and <code>/v1/completions</code> its default endpoint [Certain]. To compare engines fairly, match three things. The same work: identical prompts and output lengths, with <code>ignore_eos</code> on both servers (check that the other server honors it). The same memory: TensorRT-LLM’s fraction is of the memory left <i>after</i> the weights, vLLM’s fraction is of the whole GPU, so “0.9” is not the same setting; compare the KV-cache sizes that both servers print. The same scheduler limits: batch size and token budget. Then report the sweep, not one point: one engine may win at low load and the other at overload.</p>
+
+<h2>The code</h2>
+<p>Two short programs. The first is an open-loop load generator that speaks the OpenAI streaming protocol, so it works with vLLM, <code>trtllm-serve</code>, SGLang and others. It uses only the Python standard library. It sends token ids as the prompt (the completions API accepts a list of integers, so the prompt length is exact), uses one thread per request so that a slow answer never delays the next send, and measures from the scheduled time.</p>
+<pre class="code"><span class="cm"># bench.py: an open-loop load generator for any OpenAI-compatible server (vLLM, trtllm-serve, SGLang)</span>
+<span class="cm"># Standard library only. Usage: python3 bench.py URL MODEL RATE [N] [INPUT] [OUTPUT] [PREFIX]</span>
+import json, math, random, sys, threading, time, urllib.request
+
+def one_request(url, model, prompt, out_len, t_sched, rec):
+    body = json.dumps({"model": model, "prompt": prompt, "max_tokens": out_len, "temperature": 0,
+                       "ignore_eos": True, "stream": True}).encode()
+    req = urllib.request.Request(url + "/v1/completions", body, {"Content-Type": "application/json"})
+    chunks = []                                   <span class="cm"># arrival time of every streamed chunk with text</span>
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        for line in resp:                         <span class="cm"># server-sent events: b"data: {...}\n"</span>
+            line = line.strip()
+            if not line.startswith(b"data: ") or line == b"data: [DONE]":
+                continue
+            if json.loads(line[6:])["choices"][0].get("text"):
+                chunks.append(time.perf_counter())
+    rec.append({"sched": t_sched, "chunks": chunks, "out": out_len})
+
+def run(url, model, rate, n=200, inp=1024, out=256, prefix=0, nprefix=10, seed=0):
+    rnd = random.Random(seed)
+    prefixes = [[rnd.randrange(1000, 30000) for _ in range(prefix)] for _ in range(nprefix)]
+    rec, threads, t0 = [], [], time.perf_counter()
+    t_next = t0
+    for i in range(n):
+        if rate != math.inf:
+            t_next += rnd.expovariate(rate)        <span class="cm"># Poisson arrivals: open loop</span>
+        prompt = (prefixes[rnd.randrange(nprefix)] if prefix else []) + \
+                 [rnd.randrange(1000, 30000) for _ in range(inp - prefix)]   <span class="cm"># token ids</span>
+        time.sleep(max(0.0, t_next - time.perf_counter()))
+        th = threading.Thread(target=one_request, args=(url, model, prompt, out, t_next, rec))
+        th.start(); threads.append(th)
+    for th in threads:
+        th.join()
+    return summarize(rec, t0)
+
+def pct(a, p):
+    a = sorted(a); k = (len(a) - 1) * p / 100; lo, hi = math.floor(k), math.ceil(k)
+    return a[lo] + (a[hi] - a[lo]) * (k - lo)
+
+def summarize(rec, t0):
+    ttft = [r["chunks"][0] - r["sched"] for r in rec]          <span class="cm"># from the SCHEDULED send time</span>
+    tpot = [(r["chunks"][-1] - r["chunks"][0]) / (r["out"] - 1) for r in rec]
+    itl = [b - a for r in rec for a, b in zip(r["chunks"], r["chunks"][1:])]
+    dur = max(r["chunks"][-1] for r in rec) - t0
+    return {"ttft_p50_ms": 1e3 * pct(ttft, 50), "ttft_p99_ms": 1e3 * pct(ttft, 99),
+            "tpot_p50_ms": 1e3 * pct(tpot, 50), "tpot_p99_ms": 1e3 * pct(tpot, 99),
+            "itl_p99_ms": 1e3 * pct(itl, 99), "req_per_s": len(rec) / dur,
+            "out_tok_per_s": sum(r["out"] for r in rec) / dur}
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    url, model, rate = a[0], a[1], float(a[2])
+    args = [int(x) for x in a[3:]]
+    print(json.dumps({k: round(v, 2) for k, v in run(url, model, rate, *args).items()}))</pre>
+<p>Test the client before you trust it. This fake server waits 50 ms plus 0.1 ms per prompt token, then streams one token every 20 ms:</p>
+<pre class="code"><span class="cm"># mock_server.py: a fake OpenAI-compatible streaming server to dry-run bench.py without a GPU</span>
+import json, socket, sys, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+class H(BaseHTTPRequestHandler):
+    def log_message(self, *a): pass
+    def do_POST(self):
+        self.connection.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)   <span class="cm"># no Nagle delay</span>
+        q = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        self.send_response(200); self.send_header("Content-Type", "text/event-stream"); self.end_headers()
+        time.sleep(0.05 + 1e-4 * len(q["prompt"]))          <span class="cm"># fake prefill: 50 ms + 0.1 ms per token</span>
+        for _ in range(q["max_tokens"]):
+            self.wfile.write(b'data: {"choices": [{"text": " x"}]}\n\n'); self.wfile.flush()
+            time.sleep(0.02)                                  <span class="cm"># fake decode: 20 ms per token</span>
+        self.wfile.write(b"data: [DONE]\n\n")
+
+ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) &gt; 1 else 8011), H).serve_forever()</pre>
+<p>Our dry run (<code>python3 mock_server.py 8011</code>, then <code>python3 bench.py http://127.0.0.1:8011 mock 5 20 1024 32</code>) printed TTFT p50 171 ms, TPOT p50 28 ms and 3.5 requests per second [Certain, our run]. Two lessons. TPOT was 28 ms, not 20: a direct check showed that <code>time.sleep(0.02)</code> itself took 28.6 ms on our busy laptop, so the client was right and the fake server was slow. Always check the measuring tool against a known load. And 20 requests sent at 5 per second came out as 3.5 per second: in a short run the time to finish the last requests is a large part of the total. Use several hundred requests per point.</p>
+<p>The second program is the simulator behind Figures 1 to 3, the “expected result” of this lab. It is deterministic: the same seed gives the same numbers, here and in the figures.</p>
+<pre class="code"><span class="cm"># sim.py: a deterministic model of a continuous-batching server (Qwen2.5-7B, BF16 KV cache, one L4)</span>
+import math
+
+def rng(seed):                                <span class="cm"># mulberry32, the same generator as the page figures</span>
+    st = [seed &amp; 0xFFFFFFFF]
+    mul = lambda a, b: (a * b) &amp; 0xFFFFFFFF
+    def r():
+        st[0] = (st[0] + 0x6D2B79F5) &amp; 0xFFFFFFFF; s = st[0]
+        t = mul(s ^ (s &gt;&gt; 15), 1 | s)
+        t = ((t + mul(t ^ (t &gt;&gt; 7), 61 | t)) &amp; 0xFFFFFFFF) ^ t
+        return (t ^ (t &gt;&gt; 14)) / 4294967296
+    return r
+
+V, D, L, H, KVH, DH = 152064, 3584, 28, 28, 4, 128          <span class="cm"># Qwen2.5-7B config.json</span>
+N_EMB = V * D; N_BODY = 7_615_616_512 - 2 * N_EMB           <span class="cm"># untied embedding and output layer</span>
+KV_TOK = 2 * L * KVH * DH * 2                               <span class="cm"># 57,344 bytes per token</span>
+BW, MEM, ETA_M, T_OH, RESERVE, UTIL = 300e9, 24e9, 0.8, 0.002, 1.5e9, 0.9   <span class="cm"># L4 + assumptions</span>
+FMT = {"bf16": (2.0, 121e12, 0.6), "fp8": (1.0, 242e12, 0.6), "int4": (0.53125, 121e12, 0.35)}
+
+def weights(f):                               <span class="cm"># (bytes stored, bytes read per step)</span>
+    sb = FMT[f][0]; return sb * N_BODY + 4 * N_EMB, sb * N_BODY + 2 * N_EMB
+def kv_capacity(f): return int((UTIL * MEM - weights(f)[0] - RESERVE) // KV_TOK)
+
+def step_time(pieces, f):                     <span class="cm"># pieces: (new tokens, past tokens, logits) per sequence</span>
+    _, peak, eta = FMT[f]; F = 0.0; Q = weights(f)[1]
+    for n, p, nl in pieces:
+        F += 2 * N_BODY * n + 2 * N_EMB * nl + 4 * L * H * DH * (n * p + n * (n + 1) / 2)
+        Q += (p + n) * KV_TOK
+    return max(F / (peak * eta), Q / (BW * ETA_M)) + T_OH
+
+def workload(n, rate, inp, out, seed=1, prefix=0, nprefix=10):
+    r = rng(seed); t = 0.0; reqs = []
+    for _ in range(n):
+        if rate != math.inf: t += -math.log(1 - r()) / rate     <span class="cm"># Poisson arrivals</span>
+        pid = int(r() * nprefix) if prefix else -1
+        reqs.append(dict(arr=t, P=inp, O=out, pid=pid, pre=prefix))
+    return reqs
+
+def simulate(reqs, fmt="bf16", chunked=True, budget=2048, max_seqs=128, prefix_cache=False,
+             spec_k=0, alpha=0.0, seed=7, max_len=8192):
+    r = rng(seed); cap = kv_capacity(fmt); waiting = list(range(len(reqs))); running = []
+    used = 0; resident = set(); clock = 0.0; finished = 0
+    st = [dict(done=0, gen=0, first=None, last=None, times=[], need=0) for _ in reqs]
+    def admit(i):                             <span class="cm"># reserve the whole KV of a request, FCFS</span>
+        nonlocal used
+        q = reqs[i]; hit = prefix_cache and q["pid"] in resident
+        need = q["P"] + q["O"] - (q["pre"] if hit else 0)
+        if used + need &gt; cap or len(running) &gt;= max_seqs: return False
+        used += need; st[i]["need"] = need; st[i]["done"] = (q["pre"] // 16) * 16 if hit else 0
+        if prefix_cache and q["pid"] &gt;= 0: resident.add(q["pid"])
+        running.append(i); waiting.remove(i); return True
+    while finished &lt; len(reqs):
+        if not running and reqs[waiting[0]]["arr"] &gt; clock: clock = reqs[waiting[0]]["arr"]
+        arrived = [i for i in waiting if reqs[i]["arr"] &lt;= clock]
+        pieces, plan = [], []; left = budget if chunked else max(budget, max_len)
+        if chunked:
+            for i in running:                 <span class="cm"># 1. every decoding sequence: 1 token (k + 1 if speculating)</span>
+                if st[i]["done"] &gt;= reqs[i]["P"]:
+                    pieces.append((1 + spec_k, reqs[i]["P"] + st[i]["gen"], 1 + spec_k))
+                    plan.append((i, "d")); left -= 1 + spec_k
+            for i in running:                 <span class="cm"># 2. continue unfinished prefills</span>
+                q = reqs[i]
+                if st[i]["done"] &lt; q["P"] and left &gt; 0:
+                    c = min(left, q["P"] - st[i]["done"]); pieces.append((c, st[i]["done"], 1))
+                    plan.append((i, c)); left -= c
+            for i in arrived:                 <span class="cm"># 3. admit new requests while budget and memory allow</span>
+                if left &lt;= 0 or not admit(i): break
+                c = min(left, reqs[i]["P"] - st[i]["done"]); pieces.append((c, st[i]["done"], 1))
+                plan.append((i, c)); left -= c
+        else:                                 <span class="cm"># prefill-first: whole prompts, decodes wait</span>
+            for i in arrived:
+                q = reqs[i]; hit = prefix_cache and q["pid"] in resident
+                if q["P"] - ((q["pre"] // 16) * 16 if hit else 0) &gt; left or not admit(i): break
+                c = q["P"] - st[i]["done"]; pieces.append((c, st[i]["done"], 1)); plan.append((i, c)); left -= c
+            if not pieces:
+                for i in running:
+                    pieces.append((1 + spec_k, reqs[i]["P"] + st[i]["gen"], 1 + spec_k)); plan.append((i, "d"))
+        if not pieces:                        <span class="cm"># idle: jump to the next arrival</span>
+            clock = min(reqs[i]["arr"] for i in waiting if reqs[i]["arr"] &gt; clock); continue
+        clock += step_time(pieces, fmt)
+        for i, w in plan:
+            s, q = st[i], reqs[i]
+            if w == "d":
+                a = 0
+                while a &lt; spec_k and r() &lt; alpha: a += 1          <span class="cm"># accepted draft tokens</span>
+                k = min(a + 1, q["O"] - s["gen"]); s["gen"] += k; s["last"] = clock; s["times"].append(clock)
+            else:
+                s["done"] += w
+                if s["done"] &gt;= q["P"]:
+                    s["gen"] = 1; s["first"] = s["last"] = clock; s["times"].append(clock)
+            if s["first"] is not None and s["gen"] &gt;= q["O"]:
+                running.remove(i); used -= s["need"]; finished += 1
+    return metrics(reqs, st)
+
+def pct(a, p):
+    a = sorted(a); k = (len(a) - 1) * p / 100; lo, hi = math.floor(k), math.ceil(k)
+    return a[lo] + (a[hi] - a[lo]) * (k - lo)
+
+def metrics(reqs, st):
+    ttft = [s["first"] - q["arr"] for q, s in zip(reqs, st)]
+    tpot = [(s["last"] - s["first"]) / (q["O"] - 1) for q, s in zip(reqs, st)]
+    itl = [b - a for s in st for a, b in zip(s["times"], s["times"][1:])]
+    dur = max(s["last"] for s in st) - min(q["arr"] for q in reqs)
+    return dict(ttft50=pct(ttft, 50), ttft99=pct(ttft, 99), tpot50=pct(tpot, 50), tpot99=pct(tpot, 99),
+                itl99=pct(itl, 99), thr=sum(q["O"] for q in reqs) / dur, rps=len(reqs) / dur)
+
+if __name__ == "__main__":
+    print("KV capacity:", kv_capacity("bf16"), "tokens")
+    for rate in [0.5, 1, 2, 3, 4]:
+        m = simulate(workload(300, rate, 1024, 256))
+        print(f"{rate:4} req/s  TTFT p50 {m['ttft50']:.3f} s  p99 {m['ttft99']:.3f} s  "
+              f"TPOT p50 {1e3 * m['tpot50']:.1f} ms  ITL p99 {1e3 * m['itl99']:.0f} ms  {m['thr']:.0f} tok/s")</pre>
+<p>Its output:</p>
+<pre class="code">KV capacity: 84904 tokens
+ 0.5 req/s  TTFT p50 0.224 s  p99 0.596 s  TPOT p50 68.1 ms  ITL p99 191 ms  126 tok/s
+   1 req/s  TTFT p50 0.237 s  p99 0.639 s  TPOT p50 76.9 ms  ITL p99 194 ms  246 tok/s
+   2 req/s  TTFT p50 0.271 s  p99 0.947 s  TPOT p50 102.4 ms  ITL p99 377 ms  464 tok/s
+   3 req/s  TTFT p50 13.139 s  p99 31.828 s  TPOT p50 112.0 ms  ITL p99 377 ms  523 tok/s
+   4 req/s  TTFT p50 26.180 s  p99 54.831 s  TPOT p50 113.3 ms  ITL p99 377 ms  529 tok/s</pre>
+<p>When you have your measurements, fit the simulator to them: change \(\eta_m\) until TPOT at 0.25 requests per second matches, \(\eta_c\) until TTFT at low load matches, and \(R\) until the KV capacity matches vLLM’s log. If the fitted simulator then also predicts the knee, you understand your server. If it does not, the difference is the interesting part: preemption, scheduling details, or costs outside the GPU.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Where</th><th>What you benchmark</th><th>What it decides</th></tr></thead><tbody>
+<tr><td>Capacity planning (<a href="../inference/scenarios-and-capacity-planning-agents-long-context.html">session 141</a>)</td><td>Goodput against rate under the product’s SLOs</td><td>Requests per GPU, number of replicas, cost per million tokens</td></tr>
+<tr><td>Choosing a GPU or an engine</td><td>The same sweep on each candidate, same workload</td><td>Price-performance at the operating point, not at one peak number</td></tr>
+<tr><td>Chat products with a long system prompt</td><td>Prefix caching on a shared-prefix workload</td><td>TTFT and capacity; how to order the prompt so the shared part comes first</td></tr>
+<tr><td>Quantization roll-out</td><td>Speed sweep plus an accuracy check on the same model</td><td>Whether FP8 or INT4 is worth the quality risk</td></tr>
+<tr><td>Video question answering and Video-RAG</td><td>Long prompts (thousands of visual tokens per clip), Part 2 sweep</td><td>Frames per request, visual-token compression, chunk budget; TTFT dominates</td></tr>
+<tr><td>Video retrieval and key-moment detection with VLM captioning</td><td>Offline throughput at <code>--request-rate inf</code></td><td>Cost of captioning a video archive; batch jobs care about throughput, not TTFT</td></tr>
+<tr><td>Agents with many short calls</td><td>Short prompts with shared prefixes, high rate</td><td>Prefix caching, speculation on tool-output copying</td></tr>
+<tr><td>Performance regression tests</td><td>A fixed small sweep after every engine upgrade</td><td>Catches a changed default or a slower kernel before users do</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Closed-loop load for a capacity question.</b> A fixed number of users can never overload the server, so the knee never appears. Use Poisson arrivals and sweep the rate.</li>
+<li><b>Measuring from the actual send time.</b> When the client is late, the waiting time vanishes from TTFT (coordinated omission). Measure from the scheduled time, and give each request its own thread or task.</li>
+<li><b>Relying on defaults.</b> Prefix caching, chunked prefill, the token budget and CUDA graphs have different defaults in different versions. Write every flag, and record the version.</li>
+<li><b>Benchmarking prefix caching or speculation on random prompts.</b> Random prompts share no prefix and give the n-gram drafter nothing to copy, so both features look useless, or the cache looks magic if the client reuses the same prompt by mistake.</li>
+<li><b>Letting output lengths vary between configurations.</b> Without <code>ignore_eos</code>, a quantized model that stops earlier looks faster. Fix the output length for speed tests; test quality separately.</li>
+<li><b>Reporting the mean, or one rate.</b> The mean hides the tail, and one rate hides the knee. Report p50 and p99 over a sweep, and goodput under a stated SLO.</li>
+<li><b>Runs that are too short or not warmed up.</b> The first requests pay for CUDA graph capture and caches; a short run is dominated by its start and its end. Warm up, then use several hundred requests per point.</li>
+<li><b>Changing two things at once.</b> FP8 also frees memory, which changes the batch; switching engines also changes defaults. One change per experiment, and check the start-up log each time.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is the difference between open-loop and closed-loop load, and which one should a capacity benchmark use?<span class="lvl">basic</span></summary><div class="ans">In a closed loop, a fixed number of users each wait for an answer before sending the next request, so the arrival rate adapts to the server: a slow server receives fewer requests. In an open loop, requests arrive on a schedule that ignores the server, usually a Poisson process at rate \(\lambda\). Real traffic behaves like an open loop, and only an open loop shows the knee where the queue grows without bound. So a capacity benchmark sweeps \(\lambda\) with open-loop load. A closed loop is still useful to ask “what latency do \(N\) concurrent users see”, and Little’s law \(\bar N = \lambda \bar W\) links the two views.</div></details>
+<details class="qa"><summary>Why does p99 TTFT jump by orders of magnitude at a certain request rate, while TPOT barely changes?<span class="lvl">core</span></summary><div class="ans">Below that rate, the server admits each request almost at once, so TTFT is about one prefill. At that rate the batch is full: the KV cache (or the sequence limit) cannot take more requests, so new ones wait in a queue. When the arrival rate is above the service rate, the queue grows linearly with time, and the waiting time is part of TTFT, so TTFT grows with the length of the run. The requests already running are not slowed by the queue, so TPOT stays at the full-batch value. In our simulator for a 7B model on an L4, TTFT p50 is 271 ms at 2 requests per second and 4.1 s at 2.5.</div></details>
+<details class="qa"><summary>What is goodput, and why can it fall while throughput rises?<span class="lvl">basic</span></summary><div class="ans">Goodput is the number of requests per second that meet their SLOs, for example TTFT at most 1 s and TPOT at most 100 ms. Throughput counts every token, also the ones that came too late to be useful. As the load grows, batches get bigger, so throughput rises, but each request’s TPOT rises too; past some point most requests miss the TPOT SLO. Past the knee, TTFT misses too. In our simulator at 2 requests per second, throughput is 464 tokens per second, yet only 0.75 of the 1.81 requests per second meet both SLOs.</div></details>
+<details class="qa"><summary>How do you estimate the maximum request rate of one GPU before running any benchmark?<span class="lvl">core</span></summary><div class="ans">First the batch: the KV-cache capacity \((uM - W - R)/\text{kv}_{\text{tok}}\) divided by the tokens per request. For Qwen2.5-7B in BF16 on an L4 that is 84,904 tokens, so 66 requests of 1,280 tokens. Then the costs: one prefill of the prompt (compute-bound, about 189 ms here) and one decode step of the full batch (memory-bound: weights plus all caches, about 79 ms). Each request needs one prefill and \(O\) decode steps shared by \(B\) requests, so \(\lambda_{\max} \approx B / (B t_{\text{pre}} + O t_{\text{dec}}(B))\) = 2.02 requests per second here. The full simulation gives 2.05. The real server will differ, but the estimate tells you where to look for the knee.</div></details>
+<details class="qa"><summary>Chunked prefill: what does the token budget trade, and how would you choose it?<span class="lvl">core</span></summary><div class="ans">Each iteration has a token budget shared by decodes and prefill pieces. A large budget lets a long prompt run in few iterations, so its TTFT is low, but every iteration that carries a big prefill piece is long, and all running decodes wait for it: ITL p99 and the TPOT tail grow. A small budget splits prompts into many pieces, so the stalls are short, but each prompt needs more iterations and TTFT grows. Too small, and the fixed overhead of each iteration dominates. Choose it with the sweep: the smallest budget whose TTFT still meets the SLO, or the largest whose ITL p99 still meets the TPOT SLO. Sarathi-Serve picks it from the TPOT target and a profile of the GPU [Likely]. In our simulator at 1 request per second, budget 512 gives ITL p99 97 ms and TTFT 306 ms; budget 2,048 gives 194 ms and 237 ms.</div></details>
+<details class="qa"><summary>FP8 and INT4 both cut weight bytes. Why can INT4 win at low load and lose at high load?<span class="lvl">advanced</span></summary><div class="ans">At low load, a decode step is memory-bound, so its time follows the bytes read: INT4 reads about 4.6 GB per step for this model, FP8 7.6 GB, BF16 14.1 GB, and INT4 has the lowest TPOT. W4A16 kernels such as AWQ must unpack the 4-bit weights and still do the math in BF16, so when the step becomes compute-bound (large batch, long prefill pieces) INT4 gets no faster math and pays the unpacking cost, while FP8 W8A8 runs the math on FP8 tensor cores at twice the BF16 rate. So at high load FP8 can be faster than INT4 and much faster than BF16. Both also free memory for the KV cache, which raises the batch limit. Always check quality next to speed.</div></details>
+<details class="qa"><summary>Why does speculative decoding help at low load and help less, or hurt, at high load?<span class="lvl">advanced</span></summary><div class="ans">At low load a decode step is memory-bound: the GPU reads all weights to produce one token per request and its compute units are mostly idle. Verifying \(k\) draft tokens in the same pass costs almost nothing extra and yields \((1 - \alpha^{k+1})/(1 - \alpha)\) tokens on average, 2.77 for \(k = 4\) and \(\alpha = 0.7\). As the batch grows, the step uses more of the compute, and \(k + 1\) tokens per request multiply that compute; the drafts also take token budget away from prefills, so TTFT rises. Rejected drafts are pure waste. When the step becomes compute-bound, speculation can make it slower. With random benchmark prompts \(\alpha \approx 0\) for an n-gram drafter, so it only costs. The vLLM docs describe the target as medium-to-low QPS, memory-bound workloads.</div></details>
+<details class="qa"><summary>You turned on prefix caching and TTFT dropped 10 times. What do you check before you believe it?<span class="lvl">core</span></summary><div class="ans">That the workload is realistic: how much of each prompt is really shared in production, and how many distinct prefixes there are. A benchmark with one prefix and many repeats gives an upper bound. That the client does not send identical full prompts by mistake (then even the suffix is cached). That the baseline ran the same workload with the cache off. That the cache would survive real traffic: with many distinct prefixes and memory pressure, blocks are evicted (LRU) and the hit rate falls; read the hit rate from the server’s metrics. And that the prefix is block-aligned: only full blocks are cached, so a prefix of 770 tokens shares 768.</div></details>
+<details class="qa"><summary>How would you compare vLLM and TensorRT-LLM fairly on the same GPU?<span class="lvl">advanced</span></summary><div class="ans">Same model checkpoint and precision, same prompts and output lengths with <code>ignore_eos</code> honored by both, the same client against both OpenAI-compatible endpoints, and matched scheduler limits (maximum batch, token budget). Match memory by the KV-cache size each engine reports, not by the memory flag, because vLLM’s fraction is of the whole GPU and TensorRT-LLM’s of the memory left after the weights. Warm up both. Run the full rate sweep and report p50 and p99 TTFT and TPOT, throughput and goodput under one SLO. Record the versions. Expect the winner to depend on the operating point.</div></details>
+<details class="qa"><summary>Your benchmark shows TTFT p99 of 0.4 s at 4 requests per second, but the server only completes 2 requests per second. What is wrong?<span class="lvl">core</span></summary><div class="ans">In a steady state, completions equal arrivals. If only 2 per second complete while 4 per second are offered, the queue must grow and TTFT must grow with it. A low TTFT means the queueing time is missing from the measurement. Either the load is effectively closed loop (a concurrency limit in the client, a small thread pool, a connection limit) so requests were not really sent at 4 per second, or the client measures TTFT from the actual send time instead of the scheduled time (coordinated omission). Check the achieved request rate, the concurrency limit, and where the clock starts.</div></details>
+<details class="qa"><summary>What do you record so that someone else can reproduce your serving benchmark?<span class="lvl">basic</span></summary><div class="ans">The GPU model and count, driver and CUDA versions; the engine and its exact version; the full server command with every flag, including the ones you left at default (and the KV-cache size it printed); the model checkpoint and revision, precision and quantization method; the client command, dataset, prompt and output length distributions, number of requests, arrival process, seed and <code>ignore_eos</code>; warm-up; and the raw per-request results, not only the summary, so that other percentiles can be computed later.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Use (142.1) to compute the KV-cache capacity of the L4 for the FP8 model (weights 8.71 GB) and the number of 1,280-token requests that fit. How many more is that than in BF16?</li>
+<li>In the simulator at 1.5 requests per second, TTFT p50 is 252 ms and TPOT p50 is 88.4 ms for 256 output tokens. Use Little’s law to estimate how many requests are inside the server. Does it fit in the KV cache?</li>
+<li>With \(k = 4\), compute the expected tokens per verification pass for \(\alpha = 0.5\). How much compute does a pass cost compared with a plain decode step, in tokens per request?</li>
+<li>Compute the lowest possible TPOT at batch 1 for the INT4 model (4.557 GB read per step), first at the spec bandwidth and then with the simulator’s assumptions (\(\eta_m = 0.8\), 2 ms overhead).</li>
+<li>A colleague benchmarks with <code>--max-concurrency 16</code> and reports that the server handles 8 requests per second with TTFT p99 of 0.5 s. What did they really measure? How do you get the capacity instead?</li>
+<li>Run the lab: the baseline sweep and at least two changes on a real GPU. Fit \(\eta_m\), \(\eta_c\) and \(R\) of the simulator to your baseline, and check whether the fitted simulator predicts your knee within 20%.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \((0.9 \cdot 24 - 8.706 - 1.5)\ \text{GB} / 57{,}344 = 198{,}702\) tokens, so \(\lfloor 198{,}702 / 1{,}280 \rfloor = 155\) requests, 89 more than the 66 of BF16 (the cache grows from 4.87 to 11.39 GB). 2. \(\bar W \approx 0.252 + 255 \times 0.0884 = 22.8\) s, so \(\bar N \approx 1.5 \times 22.8 = 34\) requests. That is below the 66 that fit, so there is no queue yet, which matches the low TTFT. 3. \((1 - 0.5^5)/(1 - 0.5) = 1.9375\) tokens per pass. The pass computes \(k + 1 = 5\) tokens per request instead of 1, so 5 times the matmul FLOPs, for 1.94 times the tokens; it pays off only while the step is memory-bound. 4. \(4.557 / 300 = 15.2\) ms at the spec bandwidth; \(4.557 / 240 + 2 = 21.0\) ms with the assumptions. 5. With at most 16 requests in flight, the client sends a new request only when an old one finishes, so the rate adapts to the server (closed loop). They measured the latency of 16 concurrent users and the rate those users achieve, not the rate the server can absorb from independent users. Run an open-loop sweep without the concurrency cap and find where TTFT p99 breaks the SLO. 6. Open: compare your knee with the 2.0 to 2.25 requests per second of Figure 1.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Write down the whole setup and every flag; defaults change between versions. Compute the KV capacity first: for Qwen2.5-7B in BF16 on an L4 it is about 85,000 tokens, 66 requests of 1,280 tokens.</li>
+<li>Use open-loop load (Poisson arrivals), measure from the scheduled send time, fix output lengths with <code>ignore_eos</code>, and run several hundred requests per point after a warm-up.</li>
+<li>Sweep the rate. Below the knee, TTFT is one prefill and TPOT grows slowly; at the knee the batch is full, TTFT explodes and throughput saturates. Capacity is the rate where the SLO breaks, read from goodput.</li>
+<li>Longer prompts cost compute (TTFT) and cache capacity (fewer requests at once); long context is a capacity problem first.</li>
+<li>Change one thing at a time, on the workload it needs: shared prefixes for prefix caching, real text for speculation, an accuracy check for quantization.</li>
+<li>Serving-system changes (memory management, batching) move the queue and the capacity; model-level and engine-level changes (quantization, speculation) move the cost of each iteration. Byte-saving changes help most where decode is memory-bound.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ C_{\text{KV}} = \frac{uM - W - R}{2 L n_{kv} d_h s}, \qquad \bar N = \lambda \bar W, \qquad \lambda_{\max} \approx \frac{B}{B\,t_{\text{pre}} + O\,t_{\text{dec}}(B)} \]</div>
+<div class="eq">\[ \text{TTFT}_i = t^{\text{first}}_i - t^{\text{sched}}_i, \quad \text{TPOT}_i = \frac{t^{\text{last}}_i - t^{\text{first}}_i}{O_i - 1}, \quad \text{goodput} = \frac{\#\{i \text{ meeting both SLOs}\}}{T} \]</div>
+<div class="eq">\[ t_{\text{step}} = \max\!\left(\frac{F}{\eta_c F_{\text{peak}}}, \frac{Q}{\eta_m \text{BW}}\right) + t_{\text{oh}}, \qquad \E[\text{tokens per step}] = \frac{1 - \alpha^{k+1}}{1 - \alpha} \]</div>
+<h2 class="plain" id="lab-benchmark-a-serving-system-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>vLLM project (docs). <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM documentation</a></li><li>NVIDIA (code). <a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">TensorRT-LLM</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Agrawal et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve&amp;quot;" target="_blank" rel="noopener">Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></li><li>Yu et al. (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;Orca: A Distributed Serving System for Transformer-Based Generative Models&amp;quot;" target="_blank" rel="noopener">Orca: A Distributed Serving System for Transformer-Based Generative Models</a></li><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Micikevicius et al. (2022). <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">FP8 Formats for Deep Learning</a></li><li>Leviathan et al. (2022). <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">Fast Inference from Transformers via Speculative Decoding</a></li><li>Zhong et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving&amp;quot;" target="_blank" rel="noopener">DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</a></li><li>Qwen Team (2024). <a href="https://huggingface.co/Qwen/Qwen2.5-7B-Instruct" target="_blank" rel="noopener">Qwen2.5-7B-Instruct model card and config.json (Hugging Face)</a></li><li>NVIDIA (2023). <a href="https://www.nvidia.com/en-us/data-center/l4/" target="_blank" rel="noopener">NVIDIA L4 Tensor Core GPU (product page and specifications)</a></li><li>vLLM project (2026). <a href="https://docs.vllm.ai/en/latest/cli/bench/serve.html" target="_blank" rel="noopener">vllm bench serve: command-line reference</a></li><li>Saxena (2023). <a href="https://github.com/apoorvumang/prompt-lookup-decoding" target="_blank" rel="noopener">Prompt Lookup Decoding (code repository)</a></li><li>Little (1961). <a href="https://scholar.google.com/scholar?q=&amp;quot;A Proof for the Queuing Formula: L = λW&amp;quot;" target="_blank" rel="noopener">A Proof for the Queuing Formula: L = λW</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/scenarios-and-capacity-planning-agents-long-context.html"><small>Previous · session 141</small>Scenarios and capacity planning: agents, long context, edge, cost</a><a class="next" href="../applications/prompting-and-in-context-learning.html"><small>Next · session 143</small>Prompting and in-context learning</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="lab-benchmark-a-serving-system"]');if(!R)return;
+const $=s=>R.querySelector(s);
+/* ---------- the simulator (same code as sim.py in the page) ---------- */
+function rng(seed){let s=seed>>>0;return function(){s=(s+0x6D2B79F5)>>>0;let t=Math.imul(s^(s>>>15),1|s);t=((t+Math.imul(t^(t>>>7),61|t))>>>0)^t;return((t^(t>>>14))>>>0)/4294967296;};}
+const V=152064,D=3584,L=28,H=28,KVH=4,DH=128,N_ALL=7615616512,N_EMB=V*D,N_BODY=N_ALL-2*N_EMB,KV_TOK=2*L*KVH*DH*2;
+const BW=300e9,F16=121e12,F8=242e12,MEM=24e9,ETA_M=0.8,ETA_C=0.6,T_OH=0.002,RESERVE=1.5e9,UTIL=0.9;
+const FMT={bf16:{sb:2,peak:F16,eta:ETA_C},fp8:{sb:1,peak:F8,eta:ETA_C},int4:{sb:0.53125,peak:F16,eta:0.35}};
+function weights(f){const sb=FMT[f].sb;return[sb*N_BODY+4*N_EMB,sb*N_BODY+2*N_EMB];}
+function kvCap(f){return Math.floor((UTIL*MEM-weights(f)[0]-RESERVE)/KV_TOK);}
+function stepTime(pieces,f){const read=weights(f)[1],p=FMT[f];let F=0,Q=read;
+ for(const [n,pp,nl] of pieces){F+=2*N_BODY*n+2*N_EMB*nl+4*L*H*DH*(n*pp+n*(n+1)/2);Q+=(pp+n)*KV_TOK;}
+ return Math.max(F/(p.peak*p.eta),Q/(BW*ETA_M))+T_OH;}
+function workload(n,rate,inp,out,seed,prefix,nprefix){seed=seed===undefined?1:seed;prefix=prefix||0;nprefix=nprefix||10;
+ const r=rng(seed);let t=0;const q=[];
+ for(let i=0;i<n;i++){if(rate!==Infinity)t+=-Math.log(1-r())/rate;const pid=prefix?Math.floor(r()*nprefix):-1;q.push({arr:t,P:inp,O:out,pid:pid,pre:prefix});}
+ return q;}
+function simulate(reqs,o){o=o||{};const f=o.fmt||"bf16",chunked=o.chunked!==false,budget=o.budget||2048,maxSeqs=o.maxSeqs||128,pc=!!o.prefixCache,K=o.specK||0,alpha=o.alpha||0,maxLen=o.maxLen||8192;
+ const r=rng(o.seed||7),cap=kvCap(f);let waiting=reqs.map((_,i)=>i);const running=[];let used=0;const resident=new Set();let clock=0;
+ const st=reqs.map(()=>({done:0,gen:0,first:null,last:null,times:[],need:0}));let finished=0,steps=0;
+ const rm=(a,x)=>{const k=a.indexOf(x);if(k>=0)a.splice(k,1);};
+ function admit(i){const q=reqs[i],hit=pc&&resident.has(q.pid);const skip=hit?Math.floor(q.pre/16)*16:0;let need=q.P+q.O-(hit?q.pre:0);
+  if(pc&&!hit&&q.pid>=0)need=q.P+q.O;if(used+need>cap||running.length>=maxSeqs)return false;
+  used+=need;st[i].done=skip;st[i].need=need;if(pc&&q.pid>=0)resident.add(q.pid);running.push(i);rm(waiting,i);return true;}
+ while(finished<reqs.length){
+  if(!running.length&&waiting.length&&reqs[waiting[0]].arr>clock)clock=reqs[waiting[0]].arr;
+  const arrived=waiting.filter(i=>reqs[i].arr<=clock);const pieces=[],plan=[];let left=chunked?budget:Math.max(budget,maxLen);
+  if(chunked){
+   for(const i of running){if(st[i].done>=reqs[i].P){const n=1+K;pieces.push([n,reqs[i].P+st[i].gen,n]);plan.push([i,"d"]);left-=n;}}
+   for(const i of running){const q=reqs[i];if(st[i].done<q.P&&left>0){const c=Math.min(left,q.P-st[i].done);pieces.push([c,st[i].done,1]);plan.push([i,c]);left-=c;}}
+   for(const i of arrived){if(left<=0)break;if(!admit(i))break;const q=reqs[i],c=Math.min(left,q.P-st[i].done);pieces.push([c,st[i].done,1]);plan.push([i,c]);left-=c;}
+  }else{
+   for(const i of arrived){const q=reqs[i];const rem=q.P-((pc&&resident.has(q.pid))?Math.floor(q.pre/16)*16:0);if(rem>left)break;if(!admit(i))break;
+    const c=q.P-st[i].done;pieces.push([c,st[i].done,1]);plan.push([i,c]);left-=c;}
+   if(!pieces.length){for(const i of running){const n=1+K;pieces.push([n,reqs[i].P+st[i].gen,n]);plan.push([i,"d"]);}}
+  }
+  if(!pieces.length){let nx=Infinity;for(const i of waiting)if(reqs[i].arr>clock&&reqs[i].arr<nx)nx=reqs[i].arr;clock=nx;continue;}
+  clock+=stepTime(pieces,f);steps++;
+  for(const [i,w] of plan){const s=st[i],q=reqs[i];
+   if(w==="d"){let k=1;if(K){let a=0;while(a<K&&r()<alpha)a++;k=a+1;}k=Math.min(k,q.O-s.gen);s.gen+=k;s.times.push(clock);s.last=clock;}
+   else{s.done+=w;if(s.done>=q.P){s.gen=1;s.first=clock;s.last=clock;s.times.push(clock);}}
+   if(s.gen>=q.O&&s.first!==null){rm(running,i);used-=s.need;finished++;}}
+ }
+ return metrics(reqs,st,steps);}
+function pct(a,p){a=a.slice().sort((x,y)=>x-y);const k=(a.length-1)*p/100,lo=Math.floor(k),hi=Math.ceil(k);return a[lo]+(a[hi]-a[lo])*(k-lo);}
+function metrics(reqs,st,steps){const ttft=reqs.map((q,i)=>st[i].first-q.arr),tpot=reqs.map((q,i)=>(st[i].last-st[i].first)/(q.O-1));const itl=[];
+ st.forEach(s=>{for(let j=1;j<s.times.length;j++)itl.push(s.times[j]-s.times[j-1]);});
+ let t0=Infinity,t1=-Infinity,out=0;reqs.forEach((q,i)=>{t0=Math.min(t0,q.arr);t1=Math.max(t1,st[i].last);out+=q.O;});
+ return{ttft50:pct(ttft,50),ttft99:pct(ttft,99),tpot50:pct(tpot,50),tpot99:pct(tpot,99),itl99:pct(itl,99),thr:out/(t1-t0),rps:reqs.length/(t1-t0),steps:steps,ttft:ttft,tpot:tpot,dur:t1-t0};}
+function goodput(m,a,b){let ok=0;for(let i=0;i<m.ttft.length;i++)if(m.ttft[i]<=a&&m.tpot[i]<=b)ok++;return ok/m.dur;}
+const CACHE={};function run(key,fn){if(!(key in CACHE))CACHE[key]=fn();return CACHE[key];}
+const RATES=[0.25,0.5,0.75,1,1.25,1.5,1.75,2,2.25,2.5,2.75,3,3.5,4];
+function sweep(tag,wk,opt){return RATES.map(rt=>run(tag+"|"+rt,()=>simulate(workload(300,rt,wk.inp||1024,wk.out||256,1,wk.prefix||0),opt)));}
+window.__bsSim={simulate,workload,kvCap,weights,stepTime,goodput,sweep,RATES};
+/* ---------- plotting helpers ---------- */
+const fx=(v,d)=>v.toFixed(d);
+const ms=v=>v<1?Math.round(v*1e3)+" ms":(v<10?v.toFixed(2):v.toFixed(1))+" s";
+function rows(defs,xs,xsel,xlab,xfmt,opts){ /* defs: [{t,unit,log,lo,hi,series:[{v:[],c,dash}]}] */
+ const W=680,X0=64,X1=W-20,RH=opts.rh||100,G=opts.gap||44;let g="";const xmin=opts.xmin,xmax=opts.xmax,XL=opts.xlog;
+ const X=v=>XL?X0+(Math.log(v)-Math.log(xmin))/(Math.log(xmax)-Math.log(xmin))*(X1-X0):X0+(v-xmin)/(xmax-xmin)*(X1-X0);
+ defs.forEach((d,k)=>{const y0=26+k*(RH+G),y1=y0+RH;const Y=v=>{v=Math.max(d.lo,Math.min(d.hi,v));return d.log?y1-(Math.log(v)-Math.log(d.lo))/(Math.log(d.hi)-Math.log(d.lo))*RH:y1-(v-d.lo)/(d.hi-d.lo)*RH;};
+  g+=`<text x="${X0}" y="${y0-12}" font-size="12.5" font-weight="700" fill="var(--ink)">${d.t}</text>`;
+  (d.ticks||[]).forEach(tv=>{g+=`<line x1="${X0}" x2="${X1}" y1="${Y(tv).toFixed(1)}" y2="${Y(tv).toFixed(1)}" stroke="var(--rule)" stroke-width="1"/><text x="${X0-6}" y="${(Y(tv)+4).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--muted)">${d.tf?d.tf(tv):tv}</text>`;});
+  (d.hl||[]).forEach(h=>{g+=`<line x1="${X0}" x2="${X1}" y1="${Y(h.v).toFixed(1)}" y2="${Y(h.v).toFixed(1)}" stroke="var(--bad, #c0392b)" stroke-width="1.3" stroke-dasharray="6 4"/><text x="${X0+6}" y="${(Y(h.v)-4).toFixed(1)}" text-anchor="start" font-size="11" fill="var(--bad, #c0392b)">${h.l}</text>`;});
+  g+=`<path d="M${X0} ${y0+4} V${y1} H${X1}" fill="none" stroke="var(--muted)"/>`;
+  d.series.forEach(s=>{const pts=s.v.map((v,i)=>X(xs[i]).toFixed(1)+","+Y(v).toFixed(1)).join(" ");
+   g+=`<polyline points="${pts}" fill="none" stroke="${s.c}" stroke-width="${s.w||2.4}" ${s.dash?'stroke-dasharray="5 4"':''} stroke-linejoin="round"/>`;
+   if(!s.dash)s.v.forEach((v,i)=>{g+=`<circle cx="${X(xs[i]).toFixed(1)}" cy="${Y(v).toFixed(1)}" r="${xs[i]===xsel?5:2.6}" fill="${s.c}"/>`;});});
+  xs.forEach(v=>{if(opts.xt&&opts.xt.indexOf(v)<0)return;g+=`<text x="${X(v).toFixed(1)}" y="${y1+14}" text-anchor="middle" font-size="11" fill="var(--muted)">${xfmt(v)}</text>`;});});
+ const yb=26+defs.length*(RH+G)-G;g+=`<line x1="${X(xsel).toFixed(1)}" x2="${X(xsel).toFixed(1)}" y1="10" y2="${yb}" stroke="var(--ink)" stroke-width="1" stroke-dasharray="2 3" opacity=".6"/>`;
+ g+=`<text x="${(X0+X1)/2}" y="${yb+30}" text-anchor="middle" font-size="12.5" fill="var(--ink2, var(--ink))">${xlab}</text>`;
+ return {g,h:yb+40};}
+const TT=[0.1,0.3,1,3,10,30,100];const ttf=v=>v<1?(v*1e3)+" ms":v+" s";
+/* ---------- Figure 1: load sweep ---------- */
+(function(){
+ const svg=$("#bs-load-svg");if(!svg)return;const RS=$("#bs-load-r"),S1=$("#bs-load-st"),S2=$("#bs-load-sp"),info=$("#bs-load-info");
+ function draw(){const ri=+RS.value,rt=RATES[ri],sa=+S1.value,sb=+S2.value/1e3;$("#bs-load-rv").value=rt+" req/s";$("#bs-load-stv").value=ms(sa);$("#bs-load-spv").value=Math.round(sb*1e3)+" ms";
+  const M=sweep("base",{},{});const m=M[ri];
+  const P=rows([{t:"TTFT (log scale): p50 solid, p99 dashed",log:true,lo:0.05,hi:150,ticks:TT,tf:ttf,hl:[{v:sa,l:"TTFT SLO"}],series:[{v:M.map(x=>x.ttft50),c:"var(--q)"},{v:M.map(x=>x.ttft99),c:"var(--q)",dash:1}]},
+   {t:"TPOT: p50 solid, p99 dashed",lo:0,hi:0.15,ticks:[0,0.05,0.1,0.15],tf:v=>Math.round(v*1e3)+" ms",hl:[{v:sb,l:"TPOT SLO"}],series:[{v:M.map(x=>x.tpot50),c:"var(--k)"},{v:M.map(x=>x.tpot99),c:"var(--k)",dash:1}]},
+   {t:"Output throughput (tok/s) and goodput (dashed, as tok/s)",lo:0,hi:600,ticks:[0,200,400,600],series:[{v:M.map(x=>x.thr),c:"var(--v)"},{v:M.map(x=>goodput(x,sa,sb)*256),c:"var(--tc)",dash:1}]}],
+   RATES,rt,"request rate (requests per second, Poisson arrivals)",v=>v,{xmin:0,xmax:4.1,rh:92,xt:[0.25,1,2,3,4]});
+  svg.setAttribute("viewBox","0 0 680 "+P.h);svg.innerHTML=P.g;
+  let best=null;M.forEach((x,i)=>{if(x.ttft99<=sa&&x.tpot99<=sb)best=RATES[i];});
+  const gp=goodput(m,sa,sb);
+  info.innerHTML=`At <b>${rt} req/s</b>: TTFT p50 ${ms(m.ttft50)}, p99 ${ms(m.ttft99)}; TPOT p50 ${fx(m.tpot50*1e3,1)} ms, p99 ${fx(m.tpot99*1e3,1)} ms; ITL p99 ${Math.round(m.itl99*1e3)} ms; output <b>${Math.round(m.thr)} tok/s</b> (${fx(m.rps,2)} req/s served). Goodput: <b>${fx(gp,2)} req/s</b> meet both SLOs (${Math.round(100*gp/m.rps)}% of requests). Highest swept rate whose p99 TTFT and p99 TPOT both meet the SLOs: <b>${best===null?"none":best+" req/s"}</b>.`;}
+ [RS,S1,S2].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+/* ---------- Figure 2: context-length sweep ---------- */
+(function(){
+ const svg=$("#bs-ctx-svg");if(!svg)return;const IS=$("#bs-ctx-i"),seg=$("#bs-ctx-rate"),info=$("#bs-ctx-info");let rate=0.5;const INS=[256,512,1024,2048,4096,8192];
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;rate=+b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ function draw(){const k=+IS.value,I=INS[k];$("#bs-ctx-iv").value=I+" tok";
+  const M=INS.map(n=>run("ctx|"+rate+"|"+n,()=>simulate(workload(300,rate,n,256,1),{})));
+  const S=INS.map(n=>run("ctx|inf|"+n,()=>simulate(workload(300,Infinity,n,256,1),{})));
+  const P=rows([{t:`TTFT at ${rate} req/s (log scale): p50 solid, p99 dashed`,log:true,lo:0.05,hi:500,ticks:[0.1,1,10,100],tf:ttf,series:[{v:M.map(x=>x.ttft50),c:"var(--q)"},{v:M.map(x=>x.ttft99),c:"var(--q)",dash:1}]},
+   {t:`TPOT p50 at ${rate} req/s`,lo:0,hi:0.15,ticks:[0,0.05,0.1,0.15],tf:v=>Math.round(v*1e3)+" ms",series:[{v:M.map(x=>x.tpot50),c:"var(--k)"}]},
+   {t:"Maximum output throughput (all requests sent at once), tok/s",lo:0,hi:1200,ticks:[0,400,800,1200],series:[{v:S.map(x=>x.thr),c:"var(--v)"}]}],
+   INS,I,"input length (tokens, log scale); output 256 tokens",v=>v,{xmin:200,xmax:10000,xlog:true,rh:88});
+  svg.setAttribute("viewBox","0 0 680 "+P.h);svg.innerHTML=P.g;const m=M[k],s=S[k],cap=kvCap("bf16"),seqs=Math.floor(cap/(I+256));
+  info.innerHTML=`Input <b>${I}</b> tokens + 256 output. KV cache holds ${cap.toLocaleString("en-US")} tokens, so at most <b>${seqs}</b> requests fit at once. At ${rate} req/s: TTFT p50 ${ms(m.ttft50)}, p99 ${ms(m.ttft99)}, TPOT p50 ${fx(m.tpot50*1e3,1)} ms, served ${fx(m.rps,2)} req/s${m.rps<rate*0.9?" — <b>the server cannot keep up</b>":""}. Maximum throughput: <b>${Math.round(s.thr)} tok/s</b> = ${fx(s.rps,2)} req/s.`;}
+ IS.addEventListener("input",draw);draw();
+})();
+/* ---------- Figure 3: one change at a time ---------- */
+(function(){
+ const svg=$("#bs-one-svg");if(!svg)return;const seg=$("#bs-one-ch"),RS=$("#bs-one-r"),BS=$("#bs-one-b"),AS=$("#bs-one-a"),info=$("#bs-one-info"),rowB=$("#bs-one-brow"),rowA=$("#bs-one-arow");let ch="prefix";
+ const BUD=[256,512,1024,2048,4096,0];
+ const NAME={prefix:"prefix caching",chunk:"chunked prefill",fp8:"FP8 weights and activations",int4:"INT4 weights (AWQ)",spec:"speculative decoding (n-gram, k = 4)"};
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;ch=b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ function cfg(){const bi=+BS.value,bud=BUD[bi],al=+AS.value;
+  if(ch==="prefix")return{base:["pfx0",{prefix:768},{}],var:["pfx1",{prefix:768},{prefixCache:true}],lab:"768 of 1,024 prompt tokens are one of 10 shared prefixes"};
+  if(ch==="chunk")return{base:["base",{},{}],var:["bud"+bud,{},bud?{budget:bud}:{chunked:false}],lab:bud?`chunked prefill, token budget ${bud}`:"chunked prefill off: whole prompts, decodes wait"};
+  if(ch==="fp8")return{base:["base",{},{}],var:["fp8",{},{fmt:"fp8"}],lab:"FP8 W8A8: 1 byte per weight, FP8 tensor cores"};
+  if(ch==="int4")return{base:["base",{},{}],var:["int4",{},{fmt:"int4"}],lab:"INT4 AWQ: about 0.53 byte per weight, BF16 math"};
+  return{base:["base",{},{}],var:["spec"+al,{},{specK:4,alpha:al}],lab:`acceptance rate per draft token α = ${al.toFixed(2)}`};}
+ function draw(){const ri=+RS.value,rt=RATES[ri],bi=+BS.value,al=+AS.value;$("#bs-one-rv").value=rt+" req/s";$("#bs-one-bv").value=BUD[bi]?BUD[bi]:"off";$("#bs-one-av").value=al.toFixed(2);
+  rowB.style.display=ch==="chunk"?"":"none";rowA.style.display=ch==="spec"?"":"none";
+  const c=cfg(),M0=sweep(c.base[0],c.base[1],c.base[2]),M1=sweep(c.var[0],c.var[1],c.var[2]);
+  const P=rows([{t:"TTFT p50 (log scale)",log:true,lo:0.05,hi:150,ticks:[0.1,1,10,100],tf:ttf,series:[{v:M0.map(x=>x.ttft50),c:"var(--muted)",dash:1},{v:M1.map(x=>x.ttft50),c:"var(--q)"}]},
+   {t:"TPOT p50",lo:0,hi:0.25,ticks:[0,0.1,0.2],tf:v=>Math.round(v*1e3)+" ms",series:[{v:M0.map(x=>x.tpot50),c:"var(--muted)",dash:1},{v:M1.map(x=>x.tpot50),c:"var(--k)"}]},
+   {t:"ITL p99 (the longest gaps between tokens)",lo:0,hi:1,ticks:[0,0.5,1],tf:v=>Math.round(v*1e3)+" ms",series:[{v:M0.map(x=>x.itl99),c:"var(--muted)",dash:1},{v:M1.map(x=>x.itl99),c:"var(--tc)"}]},
+   {t:"Output throughput (tok/s)",lo:0,hi:1200,ticks:[0,400,800,1200],series:[{v:M0.map(x=>x.thr),c:"var(--muted)",dash:1},{v:M1.map(x=>x.thr),c:"var(--v)"}]}],
+   RATES,rt,"request rate (requests per second)",v=>v,{xmin:0,xmax:4.1,rh:80,gap:44,xt:[0.25,1,2,3,4]});
+  svg.setAttribute("viewBox","0 0 680 "+P.h);svg.innerHTML=P.g;const a=M0[ri],b=M1[ri];
+  const sat0=M0[M0.length-1].thr,sat1=M1[M1.length-1].thr;
+  info.innerHTML=`<b>${NAME[ch]}</b> (${c.lab}). At ${rt} req/s, baseline → changed: TTFT p50 ${ms(a.ttft50)} → <b>${ms(b.ttft50)}</b>; TPOT p50 ${fx(a.tpot50*1e3,1)} → <b>${fx(b.tpot50*1e3,1)} ms</b>; ITL p99 ${Math.round(a.itl99*1e3)} → <b>${Math.round(b.itl99*1e3)} ms</b>; throughput ${Math.round(a.thr)} → <b>${Math.round(b.thr)} tok/s</b>. At 4 req/s (overload): ${Math.round(sat0)} → <b>${Math.round(sat1)} tok/s</b>.`;}
+ [RS,BS,AS].forEach(e=>e.addEventListener("input",draw));draw();
+ /* warm the cache in small background tasks so that later clicks are fast */
+ const Q=[];const add=(tag,wk,opt)=>RATES.forEach(rt=>Q.push([tag+"|"+rt,()=>simulate(workload(300,rt,wk.inp||1024,wk.out||256,1,wk.prefix||0),opt)]));
+ add("bud0",{},{chunked:false});add("bud512",{},{budget:512});add("fp8",{},{fmt:"fp8"});add("int4",{},{fmt:"int4"});add("spec0.7",{},{specK:4,alpha:0.7});
+ [256,512,1024,4096].forEach(b=>add("bud"+b,{},{budget:b}));[0,0.1,0.2,0.3,0.4,0.5,0.6,0.8,0.9].forEach(al=>add("spec"+al,{},{specK:4,alpha:al}));
+ (function tick(){const t0=performance.now();while(Q.length&&performance.now()-t0<12){const [k,fn]=Q.shift();if(!(k in CACHE))CACHE[k]=fn();}if(Q.length)setTimeout(tick,30);})();
+})();
+/* ---------- Figure 4: the survey's taxonomy ---------- */
+(function(){
+ const svg=$("#bs-tax-svg");if(!svg)return;const seg=$("#bs-tax-ch"),info=$("#bs-tax-info");let ch="prefix";
+ const COLS=[["Data-level","4",["4.1 Input compression","4.2 Output organization"]],["Model-level","5",["5.1 Efficient structure","5.2.1 Quantization","5.2.2+ Pruning, distillation"]],["System-level","6",["6.1.1 Graph and operator opt.","6.1.2 Speculative decoding","6.2.1 Memory management","6.2.2 Continuous batching","6.2.3 Scheduling"]]];
+ const MAP={prefix:{leaf:"6.2.1 Memory management",bott:"repeated prefill compute; the same KV blocks stored once per request",metric:"TTFT falls most; more requests fit",why:"The engine keeps the KV blocks of a prompt prefix and reuses them by hash, so a new request with the same prefix skips that part of the prefill. The survey files this under memory management of the serving system (block-level KV storage, PagedAttention, RadixAttention)."},
+  chunk:{leaf:"6.2.2 Continuous batching",bott:"long prefills that block decode steps",metric:"ITL p99 and TPOT tail fall; TTFT may rise a little",why:"Chunked prefill splits a long prompt into pieces that share each iteration with the running decodes (Sarathi-Serve, SplitFuse). The survey treats it as part of batching: what goes into one iteration."},
+  fp8:{leaf:"5.2.1 Quantization",bott:"weight bytes per step (decode), FLOP/s (prefill)",metric:"TPOT falls about 2× at low load; capacity grows",why:"FP8 W8A8 halves the bytes of every weight read and runs the matrix multiplies on FP8 tensor cores. It changes the model, not the server, so the survey places it at the model level, under quantization."},
+  int4:{leaf:"5.2.1 Quantization",bott:"weight bytes per step",metric:"TPOT falls at low load; may lose at high load",why:"INT4 weight-only quantization (AWQ, GPTQ) cuts weight bytes about 3.8×, but the math still runs in BF16 after an unpack step. Good when decode is memory-bound (small batch); weak when the step is compute-bound (large batch, prefill). Model level, quantization."},
+  spec:{leaf:"6.1.2 Speculative decoding",bott:"one token per weight read",metric:"TPOT falls at low load if α is high; hurts at high load",why:"A cheap drafter (here n-gram lookup in the prompt) proposes k tokens and the model verifies them in one pass. It trades extra compute for fewer weight reads, so it helps only while decode is memory-bound. The survey places it in the inference engine, not in the serving system."}};
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;ch=b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});
+ function draw(){const m=MAP[ch];let g="";const CW=220,X=[10,235,460];
+  COLS.forEach(([t,n,leaves],k)=>{const x=X[k],on=leaves.indexOf(m.leaf)>=0;
+   g+=`<rect x="${x}" y="10" width="${CW-10}" height="34" rx="8" fill="${on?"var(--tc)":"none"}" fill-opacity="${on?0.18:0}" stroke="${on?"var(--tc)":"var(--muted)"}" stroke-width="${on?2:1}"/><text x="${x+(CW-10)/2}" y="32" text-anchor="middle" font-size="13.5" font-weight="700" fill="var(--ink)">${t} (§${n})</text>`;
+   leaves.forEach((lf,j)=>{const y=58+j*36,hit=lf===m.leaf;
+    g+=`<line x1="${x+14}" y1="${y-14}" x2="${x+14}" y2="${y+12}" stroke="var(--rule)"/><rect x="${x+24}" y="${y}" width="${CW-34}" height="26" rx="6" fill="${hit?"var(--k)":"none"}" fill-opacity="${hit?0.22:0}" stroke="${hit?"var(--k)":"var(--rule)"}" stroke-width="${hit?2.2:1}"/><text x="${x+32}" y="${y+17}" font-size="12" fill="var(--ink)" font-weight="${hit?700:400}">${lf}</text>`;});});
+  svg.innerHTML=g;info.innerHTML=`<b>${m.leaf}</b>. Bottleneck it attacks: ${m.bott}. Metric that should move: <b>${m.metric}</b>. ${m.why}`;}
+ draw();
+})();
+})();
+</script></body></html>

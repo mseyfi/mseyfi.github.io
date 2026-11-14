@@ -1,0 +1,447 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Quantizing VLMs · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 197</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="quantizing-vlms">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="quantizing-vlms" data-session="quantizing-vlms" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">197</span><span>Track 7: Vision and VLMs · session 35 of 38</span></div><h1 class="chap-title">Quantizing VLMs</h1><p class="chap-sub">A 7B vision-language model writes about three times faster with 4-bit weights in its language model, but not because the image is encoded faster. This session finds where the time and memory go in each stage of a VLM request, explains why the vision encoder and connector are usually left in 16-bit, shows why calibration data must contain images, and gives a test plan that checks the model can still see.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions on quantization math (103), where quantization helps (104), AWQ (107), SmoothQuant (108) and the anatomy of a VLM (177)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The roofline view of a VLM request: why the vision encoder and prefill are compute-bound and decode is bandwidth-bound, with Qwen2-VL-7B numbers on A100, H100 and L4</li><li>How to compute the memory and decode speed of a quantized VLM part by part, and why quantizing the vision tower saves memory but no decode time</li><li>The VLM asymmetry: size, run frequency and risk of the vision encoder, the connector, the LLM blocks and the lm_head</li><li>Why outliers and the calibration distribution decide what a quantizer protects, and why text-only calibration leaves image-token channels unprotected</li><li>Modality balance in calibration: image tokens outnumber text tokens, but language tokens are more sensitive (MBQ)</li><li>A precision plan and a test plan: which parts to quantize, which tasks reveal vision damage, and how to read small eval differences</li></ul></div></header><style>
+.qv-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.qv-grid input[type=range]{width:100%}
+.qv-grid output{min-width:3.4em;text-align:right;font:500 14px var(--mono)}
+.qv-ctl{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;font:500 14px var(--sans);color:var(--ink2);margin-bottom:8px}
+.qv-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.qv-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A 7B vision-language model (VLM) in BF16 needs about 16.6 GB just for its weights. That is too much for a 16 GB laptop GPU and leaves little room on a 24 GB card. With 4-bit weights in the language model, the same model fits in about 7 GB, and it writes answers about three times faster. This session explains where that speed comes from, which parts of a VLM you should quantize, and how to check that the model can still see.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “Why does 4-bit make generation faster but not the image encoding?”, “Would you quantize the vision encoder?”, “What calibration data do you use for a VLM?”, “The quantized model has the same perplexity but fails on invoices. Why?”. Every answer below starts from one picture: which stage of the request is limited by memory bandwidth, and which by compute.</aside>
+<p><b>Quantization</b> means storing numbers with fewer bits: for example, each weight as a 4-bit integer plus a shared scale, instead of a 16-bit float. You met the math in <a href="../inference/quantization-math-scale-zero-point-granularity-and.html">session 103</a>, the speed model in <a href="../inference/where-quantization-helps-weight-only-vs-weight.html">session 104</a>, and the main methods in <a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>, <a href="../inference/weight-ptq-2-awq-outliers-and-mixed.html">session 107</a> and <a href="../inference/weight-activation-quantization-llm-int8-smoothquant-zeroquant.html">session 108</a>. All of those sessions treat a text-only LLM. A VLM adds three new things:</p>
+<ol>
+<li><b>A second network.</b> A vision encoder (a ViT, see <a href="../vision/the-vision-transformer-vit.html">session 164</a>) and a connector (<a href="../vision/connectors-projector-q-former-perceiver-resampler-pixel.html">session 178</a>) run before the LLM. They run once per image, not once per generated token. So they have a very different cost profile.</li>
+<li><b>A second kind of token.</b> Image tokens enter the LLM next to text tokens. Their activations have different sizes and different outlier channels. A quantizer that only saw text during calibration does not know about them.</li>
+<li><b>A second kind of quality.</b> A quantized VLM can keep its text quality and still lose the small details of an image: the digits on a receipt, a small object, the count of items. You only see this if you test on vision tasks.</li>
+</ol>
+<p>Real systems follow this pattern. The official 4-bit AWQ release of Qwen2-VL-7B-Instruct quantizes the LLM to 4 bits with groups of 128 and lists the whole <code>visual</code> module (vision encoder and merger) as “not converted”, so it stays in 16-bit. [Certain] llama.cpp ships the vision part of a VLM as a separate “mmproj” file, which is usually kept in F16 while the LLM file is 4-bit. [Likely] In the previous session, <a href="../vision/the-vlm-inference-path.html">session 196</a>, we followed one request through a VLM. Now we ask what quantization does to each step of that path. In the next session, <a href="../vision/serving-vlms-vllm-tensorrt-llm-and-the.html">session 198</a>, we put the quantized model behind a server.</p>
+
+<h2>Decode is bandwidth-bound: one request, stage by stage</h2>
+<p>Every stage of a request does some arithmetic (FLOPs) and reads some bytes from GPU memory. A GPU has a peak compute rate \(P\) (FLOPs per second) and a memory bandwidth \(B_w\) (bytes per second). A stage cannot finish faster than either limit allows. This is the <b>roofline</b> model:</p>
+<div class="eq">\[ t_{\text{stage}} \;\ge\; \max\!\left( \frac{F}{P},\ \frac{Q}{B_w} \right) \tag{197.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(F\)</dt><dd>FLOPs of the stage. A linear layer with \(N\) weights costs about \(2N\) FLOPs per token (one multiply and one add per weight).</dd>
+<dt>\(Q\)</dt><dd>bytes the stage reads from memory: mostly the weights, plus the KV cache in the LLM</dd>
+<dt>\(P,\ B_w\)</dt><dd>peak compute and memory bandwidth of the GPU, for example 312 TFLOP/s and 2.039 TB/s on an A100 80GB in BF16</dd></dl>
+<aside class="note analogy side"><span class="nt">Analogy</span>A restaurant kitchen. The vision encoder is the prep cook who chops all the vegetables at the start: a lot of work, done once, limited by how fast he can cut. Decode is the waiter who walks to the storeroom and back for every single plate. Making the storeroom boxes smaller (quantization) helps the waiter on every trip. It does not make the prep cook cut faster.</aside>
+<p>Which limit wins? Divide FLOPs by bytes. This ratio is the <b>arithmetic intensity</b> \(I\). For a linear layer with \(N\) weights stored at \(b\) bits that processes \(n\) tokens at once:</p>
+<div class="eq">\[ I \;=\; \frac{F}{Q} \;\approx\; \frac{2\,N\,n}{N\,b/8} \;=\; \frac{16\,n}{b} \qquad \text{compute-bound if } I \gt \frac{P}{B_w} \tag{197.2} \]</div>
+<p>The number \(P/B_w\) is the GPU’s <b>ridge point</b>: about 153 FLOPs per byte on an A100, 295 on an H100 and 403 on an L4. Now look at the stages of a VLM request:</p>
+<ul>
+<li><b>Vision encoder.</b> All patches of the image go through the ViT at once. A 448×448 image in Qwen2-VL has \(32 \times 32 = 1{,}024\) patches of 14×14 pixels, so \(n = 1{,}024\) and \(I\) is about 1,000 in BF16. Far above the ridge: <b>compute-bound</b>.</li>
+<li><b>Connector.</b> The merger joins each 2×2 block of patches into one token (256 tokens) and maps it to the LLM width. It is small and fast.</li>
+<li><b>LLM prefill.</b> The prompt (256 image tokens plus text) goes through the LLM in one pass. With a few hundred tokens, \(I\) is near or above the ridge.</li>
+<li><b>LLM decode.</b> Each new token needs one pass through the LLM with \(n = 1\) (at batch size 1). So \(I \approx 16/b = 1\) FLOP per byte in BF16. Far below the ridge: <b>bandwidth-bound</b>. And this stage runs once per output token.</li>
+</ul>
+<p>In decode, the time per token is set by the bytes read, so the bound becomes:</p>
+<div class="eq">\[ t_{\text{token}} \;\approx\; \frac{\tfrac{b}{8}\,N_{\text{lin}} \;+\; 2\,N_{\text{head}} \;+\; \text{KV}(T)}{B_w} \tag{197.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N_{\text{lin}}\)</dt><dd>weights in the linear layers of the LLM blocks (attention and MLP). These are the ones we quantize.</dd>
+<dt>\(N_{\text{head}}\)</dt><dd>weights of the output layer (lm_head), usually kept in 16-bit, so 2 bytes each</dd>
+<dt>\(\text{KV}(T)\)</dt><dd>bytes of the KV cache for a context of \(T\) tokens; it grows with the number of image tokens</dd>
+<dt>\(b\)</dt><dd>effective bits per quantized weight, including the scales: 4-bit with one 16-bit scale and one 16-bit zero point per group of 128 gives \(4 + 32/128 = 4.25\)</dd></dl>
+<p>The vision encoder is <b>not</b> in formula (197.3). Its weights are read once per image, during prefill, and never again while the model writes. That one fact explains most of this session. Step through Figure 1.</p>
+
+<figure class="fig wide" id="qv-path"><div class="fig-body">
+<div class="qv-ctl"><span>GPU</span><span class="seg" id="qv-path-gpu"><button type="button" data-g="A100" aria-pressed="true">A100</button><button type="button" data-g="H100" aria-pressed="false">H100</button><button type="button" data-g="L4" aria-pressed="false">L4</button></span></div>
+<div class="controls"><button type="button" class="btn" id="qv-path-prev">Back</button><button type="button" class="btn primary" id="qv-path-play">Play</button><button type="button" class="btn" id="qv-path-next">Next</button><span id="qv-path-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="qv-path-svg" viewBox="0 0 640 220" role="img" aria-label="Compute time and memory time of each stage of a VLM request, in BF16 and with 4-bit weights"></svg></div>
+<div class="qv-leg"><span style="--c:var(--k)">compute time F/P</span><span style="--c:var(--q)">memory time, BF16 weights</span><span style="--c:var(--v)">memory time, 4-bit weights (4.25 bits)</span></div>
+<div class="readout" id="qv-path-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Roofline lower bounds (formula 197.1) for each stage of one Qwen2-VL-7B request: a 448×448 image, 50 text tokens, 200 output tokens, batch size 1. Parameter counts come from the model’s config.json. Real kernels reach maybe 50–80% of these peaks, so real times are longer; the ratios are what matter.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>For each stage, the longest of the three bars sets the time. In the vision encoder, the orange compute bar is the longest, so shrinking the weights (blue to green) changes nothing. In the decode step, the blue memory bar is about 150 times longer than the compute bar, so 4-bit weights cut the time by about 3×. The last step multiplies the decode step by 200 output tokens: almost all of the request time is decode. Switch to the L4 (a low-cost inference GPU with only 0.30 TB/s) and every decode bar grows by about 7×.</p></details></figure>
+
+<div class="worked"><div class="wt">Worked example: Qwen2-VL-7B on an A100</div>
+<p>From the config (28 layers, width 3,584, MLP width 18,944, 4 KV heads, vocabulary 152,064) the LLM blocks have \(N_{\text{lin}} = 6.525\) B linear weights and the lm_head has \(152{,}064 \times 3{,}584 = 0.545\) B. The vision encoder (32 layers, width 1,280) has 631 M weights and the merger 44.6 M, so the vision side is 676 M; the whole model is 8.29 B.</p>
+<p><b>Decode, BF16:</b> \(Q = 2 \times 6.525 + 2 \times 0.545 = 14.14\) GB, plus a KV cache of \(306 \times 57{,}344\) bytes = 0.018 GB. At 2.039 TB/s: <b>6.94 ms per token</b>, at most 144 tokens per second.</p>
+<p><b>Decode, 4-bit LLM:</b> \(Q = 6.525 \times 4.25/8 + 1.090 + 0.018 = 4.57\) GB, so <b>2.24 ms per token</b>, 3.10× faster.</p>
+<p><b>Vision encoder:</b> \(F = 2 \times 0.6295\text{ B} \times 1{,}024 + \text{attention} = 1.46\) TFLOP, so 4.68 ms of compute; its weights take only 0.62 ms to read. Compute-bound: 4-bit weights would not speed it up.</p>
+<p><b>Whole request:</b> 1,406 ms in BF16 against 466 ms with a 4-bit LLM (3.02×). Decode is 98.7% of the BF16 time.</p></div>
+
+<h2>What quantization buys in a VLM: memory and speed</h2>
+<p>Memory is a sum over the parts of the model, each at its own precision:</p>
+<div class="eq">\[ M \;=\; \sum_{c\, \in\, \text{parts}} \frac{b_c}{8}\, N_c \;+\; \underbrace{B \cdot T \cdot \text{kv}_{\text{tok}}}_{\text{KV cache}}, \qquad \text{kv}_{\text{tok}} = 2\, L\, H_{kv}\, d_h \cdot 2 \text{ bytes} \tag{197.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N_c,\ b_c\)</dt><dd>number of weights in part \(c\) (vision encoder, connector, LLM blocks, embedding, lm_head) and its bits per weight</dd>
+<dt>\(B,\ T\)</dt><dd>batch size (requests at the same time) and tokens per request (image tokens + text + output)</dd>
+<dt>\(L,\ H_{kv},\ d_h\)</dt><dd>LLM layers, KV heads and head size. For Qwen2-VL-7B: \(2 \times 28 \times 4 \times 128 \times 2 = 57{,}344\) bytes per token</dd></dl>
+<p>The decode speed-up from quantizing only the LLM blocks follows from formula (197.3):</p>
+<div class="eq">\[ S_{\text{dec}} \;=\; \frac{2\,N_{\text{lin}} + 2\,N_{\text{head}} + \text{KV}}{\tfrac{b}{8}\,N_{\text{lin}} + 2\,N_{\text{head}} + \text{KV}} \tag{197.5} \]</div>
+<p>Notice what is missing: no term for the vision encoder. Quantizing it changes \(M\) but never \(S_{\text{dec}}\). Try it in Figure 2.</p>
+
+<figure class="fig" id="qv-mem"><div class="fig-body">
+<div class="qv-ctl"><span>LLM blocks</span><span class="seg" id="qv-mem-bl"><button type="button" data-b="16" aria-pressed="false">BF16</button><button type="button" data-b="8" aria-pressed="false">8-bit</button><button type="button" data-b="4.25" aria-pressed="true">4-bit g128</button></span></div>
+<div class="qv-ctl"><span>Vision encoder + connector</span><span class="seg" id="qv-mem-bv"><button type="button" data-b="16" aria-pressed="true">BF16</button><button type="button" data-b="8" aria-pressed="false">8-bit</button><button type="button" data-b="4.25" aria-pressed="false">4-bit g128</button></span></div>
+<div class="qv-ctl"><span>GPU</span><span class="seg" id="qv-mem-gpu"><button type="button" data-g="A100" aria-pressed="true">A100 80GB</button><button type="button" data-g="H100" aria-pressed="false">H100</button><button type="button" data-g="L4" aria-pressed="false">L4 24GB</button></span></div>
+<div class="qv-grid">
+<label for="qv-mem-img">Images per request (256 tokens each)</label><input type="range" id="qv-mem-img" min="1" max="16" step="1" value="1"><output id="qv-mem-imgv"></output>
+<label for="qv-mem-b">Batch size B</label><input type="range" id="qv-mem-b" min="1" max="64" step="1" value="1"><output id="qv-mem-bv2"></output></div>
+<div class="scroll-x"><svg id="qv-mem-svg" viewBox="0 0 640 186" role="img" aria-label="Stacked memory bar of a quantized Qwen2-VL-7B and its decode speed"></svg></div>
+<div class="readout" id="qv-mem-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Memory (formula 197.4) and decode speed (formulas 197.1 and 197.3) of Qwen2-VL-7B. Each request has its images, 50 prompt tokens and 200 output tokens; the KV cache is counted at the end of the answer. The embedding table and lm_head stay in BF16, as in common AWQ and GPTQ checkpoints.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Start with the default (4-bit LLM, BF16 vision): 7.03 GB, and the vision tower is 19.2% of it. Now set the vision side to 4-bit: memory drops by 0.99 GB, but the decode speed does not move at all. Then set the LLM back to BF16: memory jumps to 16.6 GB and the decode time grows 3×. Finally raise the batch size and the number of images: the KV cache grows, and at large batches the compute time starts to matter. Also note the grey part: the embedding and lm_head (2.18 GB) become about a third of a 4-bit model.</p></details></figure>
+
+<div class="worked"><div class="wt">Worked example: is the vision tower worth quantizing?</div>
+<p>In the 4-bit model above, the BF16 vision tower is 1.35 GB of 7.03 GB. Quantizing it to 4.25 bits saves 0.99 GB (14% of the total) and changes the decode time by 0 ms. Encoding time does not drop either, because the encoder is compute-bound (Figure 1). So the gain is only memory, and only when memory is the real limit: a phone, a 16 GB laptop, or a GPU packed with many requests. The risk is quality on fine visual detail, which we look at next.</p></div>
+
+<h2>The VLM asymmetry: vision encoder and connector</h2>
+<p>A VLM is not uniform. Its three parts differ in size, in when they run, and in how much damage a quantization error does. The table puts the Qwen2-VL-7B numbers next to each other.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Part</th><th>Weights</th><th>Runs</th><th>Bound</th><th>Gain from 4-bit weights</th><th>Risk</th></tr></thead><tbody>
+<tr><td>Vision encoder (ViT)</td><td>631 M (7.6%)</td><td>once per image</td><td>compute</td><td>about 1 GB of memory; no speed</td><td>errors reach every image token; fine detail (text, small objects) suffers first [Likely]</td></tr>
+<tr><td>Connector (merger / projector)</td><td>44.6 M (0.5%)</td><td>once per image</td><td>tiny</td><td>about 0.07 GB; nothing else</td><td>the only path from vision to language; a shift here moves all image tokens at once [Likely]</td></tr>
+<tr><td>LLM blocks</td><td>6.53 B (78.7%)</td><td>once per output token</td><td>bandwidth (decode)</td><td>about 9.6 GB of memory and about 3× decode speed</td><td>well studied; 4-bit AWQ or GPTQ usually costs little [Likely]</td></tr>
+<tr><td>Embedding + lm_head</td><td>1.09 B (13.1%)</td><td>lm_head once per token</td><td>bandwidth</td><td>possible, but often kept in 16-bit</td><td>the lm_head is sensitive; errors change token probabilities directly [Likely]</td></tr></tbody></table></div>
+<p>Why do many people say the vision side is more sensitive? There are four reasons, and they are partly about risk and partly about measured error.</p>
+<ol>
+<li><b>Small networks have less slack.</b> For LLMs, smaller models lose more quality under the same bit width. [Likely] A 0.6 B encoder has fewer redundant weights than a 7 B LLM.</li>
+<li><b>One error, many tokens.</b> A weight error in the ViT changes the features of every patch. The LLM then reads 256 (or thousands of) slightly wrong tokens. The connector is worse: it is a short MLP with no residual path, and it maps features into the LLM’s embedding space, where the LLM expects a specific range of values.</li>
+<li><b>ViT activations have their own outliers.</b> Large ViTs, supervised and self-supervised, produce a few <b>high-norm tokens</b> in background areas (Darcet et al., “Vision Transformers Need Registers”) and “massive activations” in a few channels (Sun et al.). [Certain] These make <b>activation</b> quantization of the encoder hard, as in LLMs.</li>
+<li><b>The tasks are fine-grained.</b> Reading a 10-pixel digit needs precise features. Captioning a beach photo does not. Damage shows up on documents, charts and counting long before it shows up on general questions. [Likely]</li>
+</ol>
+<p>The evidence is mixed, so treat “the vision side is more sensitive” as a starting assumption to test, not a law. The MBQ paper (Li et al., 2024) quantizes the ViT of LLaVA-OneVision with W4A8 SmoothQuant and reports that the encoder is <b>not</b> especially sensitive in its setup; inside the LLM, it finds language tokens about ten times more sensitive than vision tokens, measured by gradients. [Certain] Q-VLM (Wang et al., 2024) also quantizes the visual encoder and reports 2.78× memory compression and 1.44× faster generation on a 13B LLaVA model with no loss on its multimodal benchmarks. [Certain] The practical rule that follows is about cost and benefit: the vision side gives little memory and no decode speed, so the default is to keep it in 16-bit and quantize it only when you need the memory and have measured the damage.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Video changes the balance. A 64-frame video can produce thousands of ViT tokens per request, and the encoder can become a large part of prefill time. Then <b>weight–activation</b> quantization of the encoder (INT8 or FP8 with SmoothQuant-style smoothing) can help, because it speeds up compute, not memory reads. Weight-only 4-bit still would not.</aside>
+
+<h2>Outliers, and why calibration data must include images</h2>
+<p>Post-training quantization methods such as GPTQ and AWQ use a small <b>calibration set</b>: a few hundred example inputs run through the model to measure the activations. They then choose the quantized weights that keep the layer’s <b>output</b> close to the original on those inputs. The error of one output, for a weight error \(\Delta W = \hat W - W\), is:</p>
+<div class="eq">\[ \E_{x \sim \mathcal{D}} \big\lVert \Delta W\, x \big\rVert^2 \;\approx\; \sum_{j} \big\lVert \Delta W_{:,j} \big\rVert^2 \; \E_{\mathcal{D}}\!\big[x_j^2\big] \tag{197.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathcal{D}\)</dt><dd>the distribution of inputs to this layer: what the calibration set says the layer will see</dd>
+<dt>\(\Delta W_{:,j}\)</dt><dd>the error in column \(j\): all weights that multiply input channel \(j\)</dd>
+<dt>\(\E_{\mathcal{D}}[x_j^2]\)</dt><dd>how large input channel \(j\) is on average. Large channels make their column’s error count more. (The approximation drops cross terms between channels.)</dd></dl>
+<p>So the quantizer protects the columns of channels that are large <b>in the calibration data</b>. In a VLM, the LLM layers see two kinds of tokens with different statistics. If the calibration set is a mixture with a fraction \(p\) of image tokens:</p>
+<div class="eq">\[ \E_{\mathcal{D}}\big[x_j^2\big] \;=\; (1 - p)\, \E_{\text{text}}\big[x_j^2\big] \;+\; p\, \E_{\text{image}}\big[x_j^2\big] \tag{197.7} \]</div>
+<p>With \(p = 0\) (text-only calibration, the default of many LLM tools), a channel that is large only on image tokens looks like an ordinary channel. Its weights get no protection, and every image token pays for it. AWQ makes this concrete. It scales input channel \(j\) up by \(s_j\) before rounding (and the activation down by \(s_j\)), which makes the rounding error of that column relatively smaller. The scales come from the calibration activations:</p>
+<div class="eq">\[ s_j = \big(\overline{|x_j|}\big)^{\alpha}, \qquad \alpha^{*} = \argmin_{\alpha \in [0, 1]} \sum_{x \in \mathcal{D}} \Big\lVert Q\big(W \operatorname{diag}(\mathbf{s})\big) \operatorname{diag}(\mathbf{s})^{-1} x \;-\; W x \Big\rVert^2 \tag{197.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\overline{|x_j|}\)</dt><dd>mean absolute value of input channel \(j\) over the calibration tokens</dd>
+<dt>\(\alpha\)</dt><dd>how strongly to follow the activation sizes: 0 means no scaling (plain rounding), 1 means fully proportional</dd>
+<dt>\(Q(\cdot)\)</dt><dd>round-to-nearest quantization per group of weights (here groups of 32 input channels)</dd></dl>
+<p>Both the scales and the search for \(\alpha\) depend only on \(\mathcal{D}\). Figure 3 is a toy layer with 64 input channels. Text tokens have outlier channels 3 and 17 (standard deviation 8). Image tokens have outlier channels 40 and 52 (standard deviation 12) and a mild channel 3. Move the image share of the calibration set and watch the error on held-out tokens.</p>
+
+<figure class="fig" id="qv-cal"><div class="fig-body">
+<div class="qv-ctl"><span>Weight bits</span><span class="seg" id="qv-cal-bits"><button type="button" data-b="3" aria-pressed="true">3-bit</button><button type="button" data-b="4" aria-pressed="false">4-bit</button></span><label class="sl"><input type="checkbox" id="qv-cal-auto" checked> Search α on the calibration set (AWQ)</label></div>
+<div class="qv-grid">
+<label for="qv-cal-p">Image tokens in calibration</label><input type="range" id="qv-cal-p" min="0" max="100" step="12.5" value="0"><output id="qv-cal-pv"></output>
+<label for="qv-cal-a">α (when not searched)</label><input type="range" id="qv-cal-a" min="0" max="1" step="0.05" value="0.5"><output id="qv-cal-av"></output></div>
+<div class="scroll-x"><svg id="qv-cal-svg" viewBox="0 0 640 210" role="img" aria-label="Per-channel calibration activation sizes and AWQ scales for a toy layer"></svg></div>
+<div class="qv-leg"><span style="--c:var(--q)">text outlier channel</span><span style="--c:var(--k)">image outlier channel</span><span style="--c:var(--tc)">outlier for both</span><span style="--c:var(--rule)">ordinary channel</span></div>
+<div class="readout" id="qv-cal-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> A toy linear layer (32 outputs, 64 inputs, Gaussian weights, seeded) quantized with AWQ-style scales (formula 197.8). The calibration set has 64 tokens; the test sets have 256 text and 256 image tokens. The error is \(\lVert \hat Y - Y \rVert^2 / \lVert Y \rVert^2\). RTN is plain round-to-nearest with no scaling. This is an illustration of formula (197.7), not a measurement on a real model.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At 0% image tokens, the bars for channels 40 and 52 are short: the calibration set never saw them light up. AWQ protects channels 3 and 17, and the text error falls from 6.06% to 3.06%, but the image error stays near plain rounding (4.92% against 5.53%). At 25% image tokens, the image channels appear, and both errors are low (3.15% and 2.53%). At 100%, the text outliers disappear from view and the text error (6.81%) becomes worse than plain rounding. Turn off the search and move α to see the trade-off by hand.</p></details></figure>
+
+<p>Three practical rules follow:</p>
+<ul>
+<li><b>Calibrate with real image–text pairs, run through the full model.</b> The LLM layers must see image tokens exactly as they come out of the connector, inside the chat template you serve with. MBQ, for example, uses 128 image–caption pairs from COCO captions (as improved by ShareGPT4V), formatted with the model’s conversation template. [Certain]</li>
+<li><b>Match the deployment mix.</b> If you serve documents, put documents in the calibration set; if you serve video, put frames in it. Number of images per sample and image resolution change the token mix too.</li>
+<li><b>Do not let image tokens drown the text.</b> One image gives hundreds of tokens, a caption gives twenty. If every token counts the same in formula (197.8), the image tokens dominate, as at the 100% end of Figure 3. MBQ fixes this by weighting the error of each token type by the average gradient of the loss with respect to those tokens; in its experiments, language tokens had about ten times larger gradients than vision tokens. [Certain] MBQ reports up to 4.4% higher accuracy than earlier methods at W3 and up to 11.6% at W4A8 on 7B to 70B VLMs. [Certain]</li>
+</ul>
+<p>The modality-balanced objective, in a simple form:</p>
+<div class="eq">\[ \mathcal{L}_{\text{cal}} \;=\; \lambda_{\text{t}} \sum_{x \in \text{text}} \lVert \Delta W\, x \rVert \;+\; \lambda_{\text{v}} \sum_{x \in \text{image}} \lVert \Delta W\, x \rVert, \qquad \lambda_{\text{m}} = \overline{\big| \partial \mathcal{L}_{\text{SFT}} / \partial y_{\text{m}} \big|} \tag{197.9} \]</div>
+<p>Here \(\lambda_{\text{m}}\) is the mean absolute gradient of the training loss with respect to the layer’s outputs on tokens of modality m. MBQ uses an absolute-error (not squared) form, which it reports works better. [Certain]</p>
+
+<div class="algo"><div class="algo-h">Algorithm 1: AWQ scale search with VLM calibration data</div><ol>
+<li><b>input:</b> VLM, calibration set of image–text conversations, bits \(b\), group size \(g\), grid of \(\alpha\) values</li>
+<li>run the full model (encoder, connector, LLM) on the calibration set; at each LLM linear layer, record its inputs \(X\) and mark each row as text or image</li>
+<li><b>for</b> each LLM linear layer \(W\): <span class="c">// vision encoder and connector skipped (Algorithm 2)</span></li>
+<li>&nbsp;&nbsp;\(\bar m_j \leftarrow\) mean of \(|X_{:,j}|\) over all recorded tokens</li>
+<li>&nbsp;&nbsp;<b>for</b> each \(\alpha\) in the grid: \(\mathbf{s} \leftarrow \bar{\mathbf{m}}^{\alpha}\); \(\hat W \leftarrow Q_{b,g}(W \operatorname{diag}\mathbf{s})\operatorname{diag}\mathbf{s}^{-1}\)</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;error \(\leftarrow \lambda_{\text{t}}\,\lVert (\hat W - W) X_{\text{text}}^\top\rVert + \lambda_{\text{v}}\,\lVert (\hat W - W) X_{\text{image}}^\top \rVert\) <span class="c">// formula (197.9); λ = 1 gives plain AWQ</span></li>
+<li>&nbsp;&nbsp;keep the \(\alpha\) with the lowest error; store \(Q_{b,g}(W\operatorname{diag}\mathbf{s})\) and fold \(\mathbf{s}^{-1}\) into the previous norm or layer</li>
+<li><b>return</b> the quantized LLM</li></ol></div>
+
+<h2>A recipe: which parts to quantize</h2>
+<div class="algo"><div class="algo-h">Algorithm 2: a precision plan for a VLM</div><ol>
+<li><b>input:</b> VLM, target hardware, memory budget, latency target, task suite</li>
+<li>LLM linear layers \(\leftarrow\) 4-bit weight-only, group 128 (AWQ or GPTQ) <span class="c">// the decode win, formula (197.5)</span></li>
+<li>embedding, lm_head, norms \(\leftarrow\) BF16 <span class="c">// small and sensitive</span></li>
+<li>vision encoder and connector \(\leftarrow\) BF16</li>
+<li>KV cache \(\leftarrow\) BF16, or FP8 if many images or long video fill memory (<a href="../inference/kv-cache-quantization-kivi-and-kvquant.html">session 110</a>)</li>
+<li>measure memory and quality on the task suite (Algorithm 3)</li>
+<li><b>if</b> memory is still over budget: encoder \(\leftarrow\) 8-bit weights; re-test the vision tasks</li>
+<li><b>if</b> encoder compute dominates (video, many high-resolution images): encoder \(\leftarrow\) W8A8 INT8 or FP8 with smoothing; re-test</li>
+<li>connector \(\leftarrow\) quantize last, if ever</li></ol></div>
+<p>The runnable PyTorch below has two parts. Part 1 is the toy of Figure 3 written with tensors (its random numbers differ from the figure, but the story is the same). Part 2 shows the module filter that every real tool needs: quantize the LLM linear layers, skip anything under <code>visual</code> and the lm_head.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+
+<span class="kw2">def</span> fake_quant(w, bits=4, group=32):
+    <span class="st">"""Symmetric per-group round-to-nearest along the input dimension."""</span>
+    o, i = w.shape
+    g = w.reshape(o, i // group, group)
+    qmax = 2 ** (bits - 1) - 1
+    d = g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / qmax
+    <span class="kw2">return</span> (torch.round(g / d).clamp(-qmax - 1, qmax) * d).reshape(o, i)
+
+<span class="kw2">def</span> awq_quant(w, calib, bits=4, group=32, grid=21):
+    <span class="st">"""AWQ-style: s_j = mean|x_j|^alpha, search alpha on the calibration set (197.8)."""</span>
+    m = calib.abs().mean(dim=0).clamp(min=1e-4)
+    y = calib @ w.T
+    best = (float(<span class="st">"inf"</span>), None, None)
+    <span class="kw2">for</span> k <span class="kw2">in</span> range(grid):
+        a = k / (grid - 1)
+        s = m ** a
+        s = s / (s.max() * s.min()).sqrt()
+        wq = fake_quant(w * s, bits, group) / s
+        err = ((calib @ wq.T - y) ** 2).sum().item()
+        <span class="kw2">if</span> err &lt; best[0]:
+            best = (err, a, wq)
+    <span class="kw2">return</span> best[2], best[1]
+
+<span class="kw2">def</span> rel_err(w, wq, x):
+    y = x @ w.T
+    <span class="kw2">return</span> (((x @ wq.T) - y) ** 2).sum().item() / (y ** 2).sum().item()
+
+<span class="cm"># 1) activations: text and image tokens use DIFFERENT outlier channels</span>
+d_in, d_out = 64, 32
+<span class="kw2">def</span> tokens(n, outliers):
+    sd = torch.ones(d_in)
+    <span class="kw2">for</span> j, v <span class="kw2">in</span> outliers.items():
+        sd[j] = v
+    <span class="kw2">return</span> torch.randn(n, d_in) * sd
+TEXT, IMAGE = {3: 8.0, 17: 8.0}, {40: 12.0, 52: 12.0, 3: 2.0}
+W = torch.randn(d_out, d_in)
+cal_t, cal_i = tokens(64, TEXT), tokens(64, IMAGE)
+test_t, test_i = tokens(256, TEXT), tokens(256, IMAGE)
+
+wq = fake_quant(W, bits=3)
+print(f<span class="st">"RTN         text {rel_err(W, wq, test_t):.4f}  image {rel_err(W, wq, test_i):.4f}"</span>)
+<span class="kw2">for</span> name, calib <span class="kw2">in</span> [(<span class="st">"text only"</span>, cal_t),
+                    (<span class="st">"75/25 mix"</span>, torch.cat([cal_t[:48], cal_i[:16]])),
+                    (<span class="st">"image only"</span>, cal_i)]:
+    wq, a = awq_quant(W, calib, bits=3)
+    print(f<span class="st">"{name:11s} alpha {a:.2f}  text {rel_err(W, wq, test_t):.4f}  image {rel_err(W, wq, test_i):.4f}"</span>)
+
+<span class="cm"># 2) choose WHICH modules to quantize: skip the vision tower, connector and lm_head</span>
+<span class="kw2">class</span> ToyVLM(torch.nn.Module):
+    <span class="kw2">def</span> __init__(self):
+        super().__init__()
+        self.visual = torch.nn.ModuleDict({<span class="st">"block"</span>: torch.nn.Linear(64, 64),
+                                           <span class="st">"merger"</span>: torch.nn.Linear(64, 128)})
+        self.layers = torch.nn.ModuleList([torch.nn.Linear(128, 128) <span class="kw2">for</span> _ <span class="kw2">in</span> range(4)])
+        self.lm_head = torch.nn.Linear(128, 1000, bias=False)
+
+SKIP = (<span class="st">"visual"</span>, <span class="st">"lm_head"</span>)
+model = ToyVLM()
+q_params = kept = 0
+<span class="kw2">with</span> torch.no_grad():
+    <span class="kw2">for</span> name, mod <span class="kw2">in</span> model.named_modules():
+        <span class="kw2">if not</span> isinstance(mod, torch.nn.Linear):
+            <span class="kw2">continue</span>
+        <span class="kw2">if</span> any(name.startswith(s) <span class="kw2">for</span> s <span class="kw2">in</span> SKIP):
+            kept += mod.weight.numel()
+            <span class="kw2">continue</span>
+        mod.weight.copy_(fake_quant(mod.weight, bits=4, group=32))
+        q_params += mod.weight.numel()
+print(<span class="st">"quantized weights:"</span>, q_params, <span class="st">" kept in 16-bit:"</span>, kept)
+
+<span class="cm"># Output (PyTorch 2.8, CPU):</span>
+<span class="cm"># RTN         text 0.0446  image 0.0465</span>
+<span class="cm"># text only   alpha 0.35  text 0.0307  image 0.0480   &lt;- image tokens worse than RTN</span>
+<span class="cm"># 75/25 mix   alpha 0.40  text 0.0309  image 0.0266</span>
+<span class="cm"># image only  alpha 0.25  text 0.0428  image 0.0212</span>
+<span class="cm"># quantized weights: 65536  kept in 16-bit: 140288</span></pre>
+<p>Real tools have the same switch under different names. The Qwen2-VL AWQ checkpoint lists <code>visual</code> in <code>modules_to_not_convert</code>. [Certain] In Hugging Face <code>BitsAndBytesConfig</code>, the parameter is <code>llm_int8_skip_modules</code>. [Certain] Tools such as llm-compressor take an <code>ignore</code> list of module names or patterns. [Likely] Whatever the tool, print the list of quantized modules and check it before you trust the result.</p>
+
+<h2>Test quality on vision tasks, not only text</h2>
+<p>The usual LLM check after quantization is perplexity on WikiText plus a few text benchmarks. For a VLM this is not enough. Perplexity on text never runs the vision encoder or the connector, and it never puts image tokens through the LLM. A model can pass every text test and still lose the digits on an invoice. Figure 4 shows which tests touch which part.</p>
+
+<figure class="fig wide" id="qv-plan"><div class="fig-body">
+<div class="scroll-x"><svg viewBox="0 0 720 300" role="img" aria-label="A precision plan for a VLM and the tests that check each part">
+<defs><marker id="qv-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>
+<g font-family="var(--sans)">
+<rect x="10" y="30" width="90" height="60" rx="10" fill="var(--card)" stroke="var(--rule)" stroke-width="1.6"/><text x="55" y="65" text-anchor="middle" class="svgt" font-size="13" font-weight="700">image</text>
+<rect x="125" y="22" width="150" height="76" rx="10" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1.8"/><text x="200" y="48" text-anchor="middle" class="svgt" font-size="13.5" font-weight="700">vision encoder</text><text x="200" y="67" text-anchor="middle" class="svgs" font-size="12">BF16 (default)</text><text x="200" y="85" text-anchor="middle" class="svgs" font-size="12">or W8A8 for video</text>
+<rect x="300" y="22" width="110" height="76" rx="10" fill="var(--k-soft)" stroke="var(--k)" stroke-width="1.8"/><text x="355" y="48" text-anchor="middle" class="svgt" font-size="13.5" font-weight="700">connector</text><text x="355" y="67" text-anchor="middle" class="svgs" font-size="12">BF16</text><text x="355" y="85" text-anchor="middle" class="svgs" font-size="12">quantize last</text>
+<rect x="435" y="22" width="160" height="76" rx="10" fill="var(--q-soft)" stroke="var(--q)" stroke-width="1.8"/><text x="515" y="48" text-anchor="middle" class="svgt" font-size="13.5" font-weight="700">LLM blocks</text><text x="515" y="67" text-anchor="middle" class="svgs" font-size="12">4-bit g128, AWQ/GPTQ</text><text x="515" y="85" text-anchor="middle" class="svgs" font-size="12">image+text calibration</text>
+<rect x="620" y="22" width="90" height="76" rx="10" fill="var(--card)" stroke="var(--rule)" stroke-width="1.6"/><text x="665" y="48" text-anchor="middle" class="svgt" font-size="13.5" font-weight="700">lm_head</text><text x="665" y="67" text-anchor="middle" class="svgs" font-size="12">BF16</text>
+<path d="M100 60 H123" stroke="var(--muted)" stroke-width="2" marker-end="url(#qv-ah)"/><path d="M275 60 H298" stroke="var(--muted)" stroke-width="2" marker-end="url(#qv-ah)"/><path d="M410 60 H433" stroke="var(--muted)" stroke-width="2" marker-end="url(#qv-ah)"/><path d="M595 60 H618" stroke="var(--muted)" stroke-width="2" marker-end="url(#qv-ah)"/>
+<text x="10" y="134" class="svgt" font-size="13" font-weight="700">Which tests reach which part</text>
+<rect x="125" y="146" width="470" height="26" rx="6" fill="var(--q-soft)" stroke="var(--q)"/><text x="360" y="164" text-anchor="middle" class="svgt" font-size="12.5">document, chart, OCR questions (DocVQA, ChartQA, TextVQA): fine detail</text>
+<rect x="125" y="180" width="470" height="26" rx="6" fill="var(--q-soft)" stroke="var(--q)"/><text x="360" y="198" text-anchor="middle" class="svgt" font-size="12.5">hallucination and counting (POPE, counting sets), grounding boxes</text>
+<rect x="125" y="214" width="470" height="26" rx="6" fill="var(--q-soft)" stroke="var(--q)"/><text x="360" y="232" text-anchor="middle" class="svgt" font-size="12.5">general VQA and reasoning (MMMU), multi-image, video frames</text>
+<rect x="435" y="248" width="275" height="26" rx="6" fill="var(--card)" stroke="var(--rule)"/><text x="572" y="266" text-anchor="middle" class="svgs" font-size="12.5">text-only perplexity and text benchmarks</text>
+<text x="10" y="164" class="svgs" font-size="12">all parts</text><text x="10" y="198" class="svgs" font-size="12">all parts</text><text x="10" y="232" class="svgs" font-size="12">all parts</text><text x="10" y="266" class="svgs" font-size="12">LLM only</text>
+</g></svg></div>
+</div><figcaption><b>Figure 4.</b> A default precision plan for a VLM (top) and the tests that exercise each part (bottom). Text-only tests never touch the vision encoder or the connector, and they never put image tokens through the LLM.</figcaption></figure>
+
+<p>Two numbers are useful for each task. The <b>relative drop</b> compares the score of the quantized model with the original. The <b>agreement rate</b> counts how often the two models give the same answer; it catches changes that a score can hide (one error fixed, another added):</p>
+<div class="eq">\[ \Delta_{\text{rel}} = \frac{\text{acc}_{q} - \text{acc}_{\text{fp}}}{\text{acc}_{\text{fp}}}, \qquad \text{agree} = \frac{1}{n} \sum_{i=1}^{n} \mathbb{1}\big[\, \hat y^{\,q}_i = \hat y^{\,\text{fp}}_i \,\big] \tag{197.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\text{acc}_q,\ \text{acc}_{\text{fp}}\)</dt><dd>accuracy of the quantized and of the original (full-precision) model on the same questions</dd>
+<dt>\(\hat y^{\,q}_i,\ \hat y^{\,\text{fp}}_i\)</dt><dd>the answers of the two models on question \(i\), with greedy decoding so the comparison is deterministic</dd></dl>
+<p>Small eval sets are noisy. With \(n\) questions and accuracy near \(a\), the standard error of the score is \(\sqrt{a(1-a)/n}\). For \(a = 0.8\) and \(n = 500\), that is 1.8 points, so a 1-point drop on 500 questions is not evidence of anything. Compare both models on the <b>same</b> questions and look at the questions where they disagree.</p>
+
+<div class="algo"><div class="algo-h">Algorithm 3: checking a quantized VLM</div><ol>
+<li><b>input:</b> original model \(f\), quantized model \(f_q\), task suite with at least one task per row of Figure 4</li>
+<li><b>for</b> each task: run \(f\) and \(f_q\) with greedy decoding, the same prompts, image sizes and number of image tokens</li>
+<li>&nbsp;&nbsp;record \(\Delta_{\text{rel}}\) and the agreement rate (formula 197.10)</li>
+<li>&nbsp;&nbsp;save every question where the two answers differ</li>
+<li>read 20–50 of the disagreements by hand: are they digits, small objects, counts, or long answers drifting?</li>
+<li><b>if</b> damage is on fine detail: undo vision quantization first, then raise the LLM bits or add matching images to the calibration set</li>
+<li>also test the serving settings: largest image resolution, most images per request, long videos <span class="c">// image tokens change the KV cache and the token mix</span></li>
+<li><b>return</b> a table: task, \(\text{acc}_{\text{fp}}\), \(\text{acc}_q\), \(\Delta_{\text{rel}}\), agreement, memory, tokens per second</li></ol></div>
+<p>See <a href="../vision/evaluating-vlms.html">session 192</a> for the benchmarks themselves and <a href="../vision/vlm-failure-modes.html">session 193</a> for why small text and counting break first.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical choice</th><th>Why</th></tr></thead><tbody>
+<tr><td>Serving a 7B VLM on one GPU (chat, visual question answering)</td><td>4-bit AWQ or GPTQ on the LLM, BF16 vision, e.g. the official Qwen2-VL AWQ checkpoint</td><td>about 3× faster decode and less than half the memory (Figure 2); the vision side adds no decode cost</td></tr>
+<tr><td>Laptop, phone or edge box (llama.cpp, MLX)</td><td>LLM in 4-bit GGUF or MLX format; vision projector file in F16 [Likely]</td><td>memory and bandwidth are tight; the projector is small</td></tr>
+<tr><td>Document and invoice extraction</td><td>conservative: 8-bit or 4-bit LLM, BF16 vision, calibration with documents</td><td>digits and small text are the first to break; test on DocVQA-style data</td></tr>
+<tr><td>Video question answering, key-moment detection, Video-RAG</td><td>4-bit LLM; encoder in W8A8 INT8 or FP8 if many frames make encoding slow; FP8 KV cache</td><td>thousands of frame tokens make the encoder and the KV cache matter</td></tr>
+<tr><td>Large-scale video retrieval and fingerprinting with a vision encoder</td><td>INT8 or FP8 encoder (weights and activations), embeddings checked for recall</td><td>the encoder is the whole cost here, and it is compute-bound, so only weight–activation formats help</td></tr>
+<tr><td>Fine-tuning a VLM on one GPU</td><td>QLoRA: 4-bit frozen LLM, adapters in BF16, vision tower in BF16</td><td>training memory, see <a href="../posttraining/qlora-and-training-with-quantized-weights.html">session 58</a> and <a href="../vision/vlm-sft-and-peft.html">session 189</a></td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Calibrating with text only.</b> Many LLM tools default to a text corpus. The LLM layers then never see image tokens, and their outlier channels are left unprotected (Figure 3).</li>
+<li><b>Quantizing the vision tower to “save time”.</b> Weight-only quantization does not speed up a compute-bound encoder. It only saves about 1 GB on a 7B VLM.</li>
+<li><b>Quantizing the connector with the LLM by accident.</b> A name filter that matches every <code>Linear</code> catches the projector and the merger too. Print the list of quantized modules.</li>
+<li><b>Testing only perplexity.</b> Text perplexity never runs the image path. Test on documents, counting, hallucination and video.</li>
+<li><b>Testing at a different resolution than you serve.</b> More image tokens change the token mix and the KV cache. A model that works at 448×448 may degrade at 1,344×1,344.</li>
+<li><b>Calling a 1-point drop on 300 questions a regression (or a win).</b> Compute the standard error first, and compare answers question by question.</li>
+<li><b>Forgetting the embedding and lm_head.</b> They stay in 16-bit in most checkpoints. In a 4-bit Qwen2-VL-7B they are about 31% of the weights in memory, so the model is bigger than “8.29 B × 4 bits”.</li>
+<li><b>Expecting prefill to get 3× faster.</b> With many image tokens prefill is compute-bound; weight-only formats can even make it a little slower, because the kernels must also dequantize. [Likely]</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why does 4-bit weight-only quantization speed up decoding but not image encoding?<span class="lvl">basic</span></summary><div class="ans">Decode processes one token per step, so it does about 2 FLOPs per weight it reads: arithmetic intensity near 1, far below the GPU ridge point (about 153 on an A100). Its time is the bytes read divided by bandwidth, and 4-bit weights cut those bytes by about 3.8× (to 4.25 bits). The vision encoder processes all patches at once (1,024 for a 448×448 image in Qwen2-VL), so its intensity is about 1,000: it is compute-bound, and reading fewer bytes does not change its time.</div></details>
+<details class="qa"><summary>Estimate the decode speed of Qwen2-VL-7B on an A100 in BF16 and with a 4-bit LLM.<span class="lvl">core</span></summary><div class="ans">Bytes per token: LLM linear weights 6.525 B and lm_head 0.545 B, so \(2 \times 7.07 = 14.14\) GB in BF16, about 6.94 ms per token at 2.039 TB/s, at most 144 tokens/s. With 4.25-bit LLM weights and a BF16 lm_head: \(3.47 + 1.09 = 4.56\) GB plus a small KV cache, about 2.24 ms, around 446 tokens/s, a 3.1× gain. Real numbers are lower because kernels do not reach peak bandwidth, but the ratio holds roughly.</div></details>
+<details class="qa"><summary>Would you quantize the vision encoder? Defend your answer.<span class="lvl">core</span></summary><div class="ans">By default, no. It is about 8% of a 7B VLM’s weights, it does not appear in the decode cost, and weight-only formats do not speed it up because it is compute-bound. The risk is on fine-grained tasks (small text, counting), because its error reaches every image token. I would quantize it in two cases: memory is the hard limit (edge device), using 8-bit weights first; or encoder compute dominates (video, many images), using W8A8 INT8 or FP8 with smoothing. Either way I re-test document and counting tasks. Some papers (MBQ, Q-VLM) report that the ViT tolerates such quantization well, so it is a measured decision, not a fixed rule.</div></details>
+<details class="qa"><summary>Why might the connector be the most fragile part?<span class="lvl">advanced</span></summary><div class="ans">It is the only path from vision to language. It is a short MLP (or a resampler) with no residual connection, so an error is not diluted by an identity path. It maps vision features into the LLM’s embedding space, where the LLM expects a specific range and distribution; a systematic shift moves all image tokens at once, which looks to the LLM like a different image. And it saves almost nothing: 44.6 M weights in Qwen2-VL-7B, about 0.07 GB at 4 bits. High risk, tiny gain. [Likely]</div></details>
+<details class="qa"><summary>What calibration data do you use for a VLM, and why?<span class="lvl">core</span></summary><div class="ans">Real image–text conversations in the serving chat template, run through the full model, so the LLM layers see image tokens exactly as they come out of the connector. Methods such as AWQ and GPTQ minimize output error weighted by the calibration activations (formula 197.6); channels that are large only on image tokens get no protection if the calibration set has no images. Match the deployment mix (documents, photos, video frames, resolution), use a few hundred samples, and balance modalities so the many image tokens do not drown the text tokens.</div></details>
+<details class="qa"><summary>Image tokens outnumber text tokens 10 to 1 in your calibration set. Is that a problem?<span class="lvl">advanced</span></summary><div class="ans">It can be. If every token counts the same in the reconstruction loss, the quantizer mostly optimizes for image tokens. But the MBQ paper found that the final loss is about ten times more sensitive to errors on language tokens than on vision tokens (measured with gradients). So the effective weighting is backwards. MBQ weights each modality’s error by its mean absolute gradient (formula 197.9) and reports gains of up to 4.4% at W3 and 11.6% at W4A8. A simpler fix is to reweight or subsample tokens per modality.</div></details>
+<details class="qa"><summary>Your 4-bit VLM has the same WikiText perplexity as the BF16 one, but users say it misreads invoices. What happened and what do you do?<span class="lvl">core</span></summary><div class="ans">Perplexity never runs the vision path, so it cannot see damage there. Likely causes: the vision encoder or connector was quantized; the calibration set had no document images, so document-specific channels were unprotected; or the serving resolution differs from the tested one. Steps: compare the two models on a document set (DocVQA-style) with greedy decoding; read the disagreements; undo vision and connector quantization; recalibrate with document images; if still bad, raise the LLM to 8 bits or use a better method (GPTQ with act-order, or AWQ with modality balancing).</div></details>
+<details class="qa"><summary>Where do the bytes of a 4-bit Qwen2-VL-7B go?<span class="lvl">basic</span></summary><div class="ans">About 7.0 GB in total: LLM linear layers 3.47 GB (4.25 bits), embedding plus lm_head 2.18 GB (BF16), vision encoder plus merger 1.35 GB (BF16), and a small KV cache for one short request. So only about half the memory is the 4-bit part; the 16-bit embedding, lm_head and vision tower are the rest.</div></details>
+<details class="qa"><summary>When does weight–activation quantization (W8A8, FP8) beat weight-only for a VLM?<span class="lvl">advanced</span></summary><div class="ans">When the important stages are compute-bound: large-batch serving, long prefill with many image tokens, and the vision encoder on video. W8A8 doubles the tensor-core rate (INT8 or FP8 against BF16), which helps compute-bound work. Weight-only 4-bit only helps when reading weights is the bottleneck (small-batch decode). Activation quantization needs outlier handling, such as SmoothQuant, which moves the difficulty from activations to weights, or rotations; ViTs have high-norm tokens and massive activations, so the encoder needs this care too.</div></details>
+<details class="qa"><summary>How do you decide whether a 1.5-point drop after quantization is real?<span class="lvl">core</span></summary><div class="ans">Compute the standard error: \(\sqrt{a(1-a)/n}\). At 80% accuracy on 500 questions it is 1.8 points, so 1.5 points is within noise. Because both models answer the same questions, a paired test is stronger: count questions only the original got right and questions only the quantized got right, and test whether the two counts differ (McNemar’s test). Also report the agreement rate, and read the disagreements to see whether they cluster on one skill.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Using formula (197.2), what is the arithmetic intensity of the Qwen2-VL vision encoder’s linear layers in BF16 for a 448×448 image? Is it compute-bound on an L4?</li>
+<li>In Figure 1, switch to the L4. How long is one BF16 decode step, and how long with a 4-bit LLM?</li>
+<li>Qwen2-VL-7B serves 32 requests at once, each with 4 images, 50 prompt tokens and 200 output tokens, on an A100 with a 4-bit LLM. Compute the KV cache at the end of the answers. Check with Figure 2.</li>
+<li>In Figure 3 (3-bit, α searched), find the image share of the calibration set where the text and image errors are both closest to their best values. Why does 100% image tokens hurt the text?</li>
+<li>You serve 1,000 questions at 70% accuracy. What is the standard error of the accuracy?</li>
+<li>A colleague quantizes the vision tower and connector of Qwen2-VL-7B to 4.25 bits. How much memory does that save, and how many ms per decode token?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(I = 16 \times 1{,}024 / 16 = 1{,}024\) FLOPs per byte (the full count with attention, in Figure 1, is about 1,157). The L4 ridge is \(121/0.30 = 403\), so yes, compute-bound. 2. 47.2 ms in BF16 and 15.2 ms with a 4-bit LLM (14.16 GB and 4.57 GB at 0.30 TB/s). 3. \(T = 4 \times 256 + 250 = 1{,}274\) tokens per request; \(32 \times 1{,}274 \times 57{,}344 = 2.34\) GB. 4. With the grid in the figure, 12.5% or 25% image tokens: both kinds of outlier channel appear in the calibration means, so both get scaled. At 100%, channels 3 and 17 look small in the calibration data (channel 3 only has standard deviation 2 on image tokens), so text outliers lose their protection and the text error goes above plain rounding. 5. \(\sqrt{0.7 \times 0.3/1000} = 0.0145\), about 1.4 points. 6. From 1.35 GB to 0.36 GB, so 0.99 GB saved; 0 ms per decode token, because the vision tower is not read during decode.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Each stage runs at the slower of compute and memory (197.1). The vision encoder and long prefills are compute-bound; decode at small batch is bandwidth-bound (197.2).</li>
+<li>Decode time is the bytes of LLM weights plus KV divided by bandwidth (197.3). 4-bit LLM weights give about 3× faster decode for Qwen2-VL-7B; the vision encoder is not in this formula at all (197.5).</li>
+<li>The vision side is small (about 8% of a 7B VLM), runs once per image, and affects every image token. Default: keep the encoder and connector in 16-bit; quantize them only for memory or video compute, and measure.</li>
+<li>Quantizers protect channels that are large in the calibration data (197.6, 197.7). Calibrate with real image–text conversations, match the serving mix, and balance the modalities (197.8, 197.9).</li>
+<li>Text perplexity cannot see vision damage. Test documents, counting, hallucination and video, compare answers one by one, and respect the noise of small eval sets (197.10).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ t \ge \max\!\left(\frac{F}{P}, \frac{Q}{B_w}\right), \quad I \approx \frac{16\,n}{b}, \quad t_{\text{token}} \approx \frac{\tfrac{b}{8}N_{\text{lin}} + 2N_{\text{head}} + \text{KV}}{B_w} \]</div>
+<div class="eq">\[ \E\lVert \Delta W x\rVert^2 \approx \sum_j \lVert \Delta W_{:,j}\rVert^2\, \E_{\mathcal{D}}[x_j^2], \quad \E_{\mathcal{D}}[x_j^2] = (1-p)\,\E_{\text{text}}[x_j^2] + p\,\E_{\text{image}}[x_j^2] \]</div>
+<h2 class="plain" id="quantizing-vlms-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Xiao et al. (2022). <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Xiao et al. (2022). <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</a></li><li>Frantar et al. (2022). <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</a></li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Li, Hu, Ning, Liu, Hong, Jia, Li, Yan, Ran, Dai, Yan, Yang &amp; Wang (2024). <a href="https://arxiv.org/abs/2412.19509" target="_blank" rel="noopener">MBQ: Modality-Balanced Quantization for Large Vision-Language Models</a></li><li>Wang, Wang, Xu, Tang, Zhou &amp; Lu (2024). <a href="https://arxiv.org/abs/2410.08119" target="_blank" rel="noopener">Q-VLM: Post-training Quantization for Large Vision-Language Models</a></li><li>Darcet, Oquab, Mairal &amp; Bojanowski (2023). <a href="https://arxiv.org/abs/2309.16588" target="_blank" rel="noopener">Vision Transformers Need Registers</a></li><li>Sun, Chen, Kolter &amp; Liu (2024). <a href="https://arxiv.org/abs/2402.17762" target="_blank" rel="noopener">Massive Activations in Large Language Models</a></li><li>Qwen team (2024). <a href="https://huggingface.co/Qwen/Qwen2-VL-7B-Instruct-AWQ" target="_blank" rel="noopener">Qwen2-VL-7B-Instruct-AWQ model card and config.json</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/the-vlm-inference-path.html"><small>Previous · session 196</small>The VLM inference path</a><a class="next" href="../vision/serving-vlms-vllm-tensorrt-llm-and-the.html"><small>Next · session 198</small>Serving VLMs: vLLM, TensorRT-LLM and the edge</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="quantizing-vlms"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+function seg(el,attr,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+const ms=v=>v>=100?v.toFixed(0):v>=10?v.toFixed(1):v>=1?v.toFixed(2):v.toFixed(3);
+
+/* Qwen2-VL-7B, counted from its config.json (see the text) */
+const Q2={visLin:629514240,visAll:631183360,merLin:44573184,merAll:44575744,llmLin:6525417472,head:152064*3584,emb:152064*3584,llmOther:28*2*3584+3584,kvTok:2*28*4*128*2,E:1280,H:3584,Lv:32,Ll:28};
+const GPU={A100:{P:312e12,B:2.039e12,M:80,name:"A100 80GB (312 TFLOP/s BF16, 2.039 TB/s)"},H100:{P:989e12,B:3.35e12,M:80,name:"H100 SXM (989 TFLOP/s BF16, 3.35 TB/s)"},L4:{P:121e12,B:0.3e12,M:24,name:"L4 (121 TFLOP/s FP16, 0.30 TB/s)"}};
+
+/* ---------- Figure 1: where the time goes, stage by stage ---------- */
+(function(){
+ const svg=$("#qv-path-svg");if(!svg)return;const info=$("#qv-path-info");let gk="A100",step=0;
+ const nv=1024,ni=256,nt=50,T=ni+nt,OUT=200;
+ function stages(g){const P=GPU[g].P,Bw=GPU[g].B;
+  const enc={F:2*Q2.visLin*nv+Q2.Lv*4*nv*nv*Q2.E,Q16:2*Q2.visAll,Q4:4.25/8*Q2.visLin+2*(Q2.visAll-Q2.visLin)};
+  const mer={F:2*Q2.merLin*ni,Q16:2*Q2.merAll,Q4:4.25/8*Q2.merLin+2*(Q2.merAll-Q2.merLin)};
+  const pre={F:2*Q2.llmLin*T+Q2.Ll*4*T*T*Q2.H+2*Q2.head,Q16:2*(Q2.llmLin+Q2.head)+Q2.kvTok*T,Q4:4.25/8*Q2.llmLin+2*Q2.head+Q2.kvTok*T};
+  const dec={F:2*(Q2.llmLin+Q2.head),Q16:2*(Q2.llmLin+Q2.head)+Q2.kvTok*T,Q4:4.25/8*Q2.llmLin+2*Q2.head+Q2.kvTok*T};
+  [enc,mer,pre,dec].forEach(s=>{s.tc=s.F/P*1e3;s.t16=Math.max(s.tc,s.Q16/Bw*1e3);s.t4=Math.max(s.tc,s.Q4/Bw*1e3);s.m16=s.Q16/Bw*1e3;s.m4=s.Q4/Bw*1e3;s.I=s.F/s.Q16;});
+  return {enc,mer,pre,dec,ridge:P/Bw};}
+ const NAMES=["Vision encoder","Connector (merger)","LLM prefill","One decode step"];
+ const TXT=[
+  s=>`A request: one 448×448 image (1,024 patches of 14×14 pixels, merged 2×2 into 256 image tokens) plus 50 text tokens, then 200 generated tokens. Each stage has a compute time F/P and a memory time Q/B. The larger one is the lower bound (formula 197.1). Ridge point of this GPU: <b>${s.ridge.toFixed(0)} FLOPs per byte</b>.`,
+  s=>`<b>Vision encoder</b> (631 M parameters, 1,024 patch tokens): F = ${(s.enc.F/1e12).toFixed(2)} TFLOP, weights ${(s.enc.Q16/1e9).toFixed(2)} GB. Intensity about ${s.enc.I.toFixed(0)} FLOPs/byte, above the ridge: <b>compute-bound</b>. Compute ${ms(s.enc.tc)} ms vs memory ${ms(s.enc.m16)} ms (BF16) or ${ms(s.enc.m4)} ms (4-bit). 4-bit weights do not change the bound: still <b>${ms(s.enc.t4)} ms</b>.`,
+  s=>`<b>Connector</b> (44.6 M parameters, 256 merged tokens): compute ${ms(s.mer.tc)} ms, memory ${ms(s.mer.m16)} ms. It is tiny in time and in memory, so quantizing it saves almost nothing. But every image token passes through it, so its error reaches the LLM on every token.`,
+  s=>`<b>LLM prefill</b> of ${T} tokens: F = ${(s.pre.F/1e12).toFixed(2)} TFLOP, intensity about ${s.pre.I.toFixed(0)} FLOPs/byte (ridge ${s.ridge.toFixed(0)}). Compute ${ms(s.pre.tc)} ms vs memory ${ms(s.pre.m16)} ms in BF16: <b>${s.pre.tc>=s.pre.m16?"compute-bound":"memory-bound, but close to the ridge"}</b>. With 4-bit weights: ${ms(s.pre.t4)} ms. More image tokens push prefill further into compute-bound.`,
+  s=>`<b>One decode step</b> (batch 1): F = ${(s.dec.F/1e9).toFixed(1)} GFLOP, but it must read ${(s.dec.Q16/1e9).toFixed(2)} GB in BF16. Intensity about ${s.dec.I.toFixed(1)} FLOP/byte: <b>bandwidth-bound</b>. Compute ${ms(s.dec.tc)} ms, memory ${ms(s.dec.m16)} ms. With 4-bit LLM weights only ${(s.dec.Q4/1e9).toFixed(2)} GB: <b>${ms(s.dec.t4)} ms</b>, ${(s.dec.t16/s.dec.t4).toFixed(2)}× faster.`,
+  s=>{const a=s.enc.t16+s.mer.t16+s.pre.t16+OUT*s.dec.t16,b=s.enc.t16+s.mer.t16+s.pre.t4+OUT*s.dec.t4;return `<b>The whole request</b> (lower bounds): BF16 ${ms(a)} ms; 4-bit LLM with BF16 vision ${ms(b)} ms, so <b>${(a/b).toFixed(2)}×</b> faster. Decode is ${(100*OUT*s.dec.t16/a).toFixed(1)}% of the BF16 time. Quantizing the vision encoder to 4-bit as well would change this lower bound by only ${ms(s.enc.t16-s.enc.t4)} ms, because the encoder is compute-bound.`;}];
+ function draw(k){step=k;const s=stages(gk);const L=[s.enc,s.mer,s.pre,s.dec];
+  let g="";const bx=[10,158,306,454],bw=136;
+  NAMES.forEach((n,i)=>{const on=step===i+1||step===5;g+=`<rect x="${bx[i]}" y="14" width="${bw}" height="44" rx="9" fill="${on?"var(--q-soft)":"var(--card)"}" stroke="${on?"var(--q)":"var(--rule)"}" stroke-width="1.8"/><text x="${bx[i]+bw/2}" y="41" text-anchor="middle" class="svgt" font-size="13" font-weight="700">${n}</text>`;
+   if(i<3)g+=`<path d="M${bx[i]+bw+1} 36 h7" stroke="var(--muted)" stroke-width="2"/>`;});
+  g+=`<text x="596" y="41" class="svgs" font-size="12">×${OUT}</text>`;
+  const sel=step>=1&&step<=4?[step-1]:[0,1,2,3];const rows=[];
+  sel.forEach(i=>{const st=L[i];const f=step===5&&i===3?OUT:1;rows.push([NAMES[i]+(f>1?" ×"+OUT:""),st.tc*f,st.m16*f,st.m4*f]);});
+  const mx=Math.max(...rows.map(r=>Math.max(r[1],r[2],r[3])));const X=v=>190+v/mx*360;
+  let y=88;const rh=step>=1&&step<=4?44:30;
+  const single=step>=1&&step<=4;if(single)y=110;
+  rows.forEach(r=>{g+=single?`<text x="20" y="${y-20}" class="svgt" font-size="13" font-weight="700">${r[0]}</text>`:`<text x="20" y="${y+rh*0.5}" class="svgt" font-size="12.5" font-weight="700">${r[0]}</text>`;
+   [["compute F/P",r[1],"var(--k)"],["memory, BF16",r[2],"var(--q)"],["memory, 4-bit",r[3],"var(--v)"]].forEach(([lab,v,c],j)=>{const yy=y+j*(rh/3+2)-8;
+    g+=`<rect x="190" y="${yy}" width="${Math.max(1.5,X(v)-190)}" height="${rh/3-2}" fill="${c}" opacity=".85"/>`;
+    if(step>=1&&step<=4||j===0)g+=`<text x="186" y="${yy+rh/3-4}" text-anchor="end" class="svgs" font-size="11">${step>=1&&step<=4?lab:""}</text>`;
+    g+=`<text x="${X(v)+5}" y="${yy+rh/3-4}" class="svgm" font-size="11">${ms(v)} ms</text>`;});
+   y+=rh+26;});
+  g+=`<text x="20" y="${Math.max(y,200)+4}" class="svgs" font-size="12">${GPU[gk].name}. Bars: lower-bound times; the longest bar of each stage sets its speed.</text>`;
+  svg.setAttribute("viewBox",`0 0 640 ${Math.max(y,200)+16}`);svg.innerHTML=g;info.innerHTML=TXT[step](s);}
+ const st=B.stepper({n:6,prev:$("#qv-path-prev"),next:$("#qv-path-next"),play:$("#qv-path-play"),label:$("#qv-path-lab"),ms:3200,onStep:draw});
+ seg($("#qv-path-gpu"),"g",v=>{gk=v;draw(st.i);});
+})();
+
+/* ---------- Figure 2: memory and decode speed calculator ---------- */
+(function(){
+ const svg=$("#qv-mem-svg");if(!svg)return;const info=$("#qv-mem-info");const NI=$("#qv-mem-img"),BS=$("#qv-mem-b");
+ let bl=4.25,bv=16,gk="A100";
+ seg($("#qv-mem-bl"),"b",v=>{bl=+v;draw();});seg($("#qv-mem-bv"),"b",v=>{bv=+v;draw();});seg($("#qv-mem-gpu"),"g",v=>{gk=v;draw();});
+ function draw(){const n=+NI.value,b=+BS.value;$("#qv-mem-imgv").value=n;$("#qv-mem-bv2").value=b;const G=GPU[gk];
+  const T=256*n+50+200;
+  const vis=(bv/8*(Q2.visLin+Q2.merLin)+2*(Q2.visAll+Q2.merAll-Q2.visLin-Q2.merLin))/1e9;
+  const eh=2*(Q2.emb+Q2.head+Q2.llmOther)/1e9,lin=bl/8*Q2.llmLin/1e9,kv=b*T*Q2.kvTok/1e9;
+  const tot=vis+eh+lin+kv;
+  const Qd=(bl/8*Q2.llmLin+2*Q2.head)+b*T*Q2.kvTok,Fd=2*b*(Q2.llmLin+Q2.head);
+  const tm=Qd/G.B*1e3,tc=Fd/G.P*1e3,t=Math.max(tm,tc);
+  const parts=[["vision encoder + connector",vis,"var(--k)"],["embedding + lm_head + norms (BF16)",eh,"var(--muted)"],["LLM linear layers",lin,"var(--q)"],["KV cache (BF16)",kv,"var(--v)"]];
+  const cap=G.M,mx=Math.max(cap,tot)*1.05,X=v=>20+v/mx*600;
+  let g="",x=20;parts.forEach(([l,v,c])=>{const w=X(v)-20;g+=`<rect x="${x}" y="30" width="${Math.max(0,w)}" height="40" fill="${c}" opacity=".85"/>`;x+=w;});
+  g+=`<line x1="${X(cap)}" y1="18" x2="${X(cap)}" y2="82" stroke="var(--bad)" stroke-width="2" stroke-dasharray="5 4"/><text x="${X(cap)-4}" y="14" text-anchor="end" class="svgs" font-size="12">GPU memory ${cap} GB</text>`;
+  parts.forEach(([l,v,c],i)=>{const yy=104+i*22;g+=`<rect x="20" y="${yy-11}" width="14" height="14" fill="${c}" opacity=".85"/><text x="42" y="${yy}" class="svgt" font-size="12.5">${l}</text><text x="380" y="${yy}" class="svgm" font-size="12.5" text-anchor="end">${v.toFixed(2)} GB</text><text x="390" y="${yy}" class="svgs" font-size="12">${(100*v/tot).toFixed(1)}%</text>`;});
+  g+=`<text x="450" y="104" class="svgs" font-size="12">bytes read per decode step</text><text x="450" y="126" class="svgm" font-size="13">${(Qd/1e9).toFixed(2)} GB</text><text x="450" y="148" class="svgs" font-size="12">vision tower read: 0 GB</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`Total <b>${tot.toFixed(2)} GB</b> ${tot<=cap?"(fits":"(<b style='color:var(--bad)'>does not fit</b>"} in ${cap} GB). Context per request ${T} tokens. Decode step: memory ${ms(tm)} ms, compute ${ms(tc)} ms, so <b>${ms(t)} ms</b> and about <b>${(b/t*1e3).toFixed(0)} tokens/s</b> in total (${(1e3/t).toFixed(0)} per request), ${tm>=tc?"bandwidth-bound":"compute-bound"}. The vision tower is ${(100*vis/tot).toFixed(1)}% of memory and 0% of the bytes read per decode step.`;}
+ [NI,BS].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: calibration with and without image tokens (toy) ---------- */
+(function(){
+ const svg=$("#qv-cal-svg");if(!svg)return;const info=$("#qv-cal-info");const P=$("#qv-cal-p"),A=$("#qv-cal-a"),AU=$("#qv-cal-auto");let bits=3;
+ const DI=64,DO=32,G=32,TXT={3:8,17:8},IMG={40:12,52:12,3:2};
+ const gw=gauss(rng(11));const W=Array.from({length:DO},()=>Float64Array.from({length:DI},()=>gw()));
+ function toks(kind,n,seed){const g=gauss(rng(seed)),S=kind==="t"?TXT:IMG;return Array.from({length:n},()=>Float64Array.from({length:DI},(_,j)=>g()*(S[j]||1)));}
+ const CT=toks("t",64,21),CI=toks("i",64,22),TT=toks("t",256,31),TI=toks("i",256,32);
+ function quant(M,b){const q=2**(b-1)-1;return M.map(row=>{const r=new Float64Array(DI);for(let g0=0;g0<DI;g0+=G){let m=0;for(let j=g0;j<g0+G;j++)m=Math.max(m,Math.abs(row[j]));const d=m/q||1;for(let j=g0;j<g0+G;j++)r[j]=d*Math.round(row[j]/d);}return r;});}
+ function qhat(s,b){const Q=quant(W.map(row=>row.map((v,j)=>v*s[j])),b);return Q.map(row=>row.map((v,j)=>v/s[j]));}
+ function err(Wh,X){let num=0,den=0;for(const x of X)for(let o=0;o<DO;o++){let y=0,yh=0;const w=W[o],h=Wh[o];for(let j=0;j<DI;j++){y+=w[j]*x[j];yh+=h[j]*x[j];}num+=(y-yh)**2;den+=y*y;}return num/den;}
+ function scales(cal,a){const m=new Float64Array(DI);cal.forEach(x=>{for(let j=0;j<DI;j++)m[j]+=Math.abs(x[j]);});const s=Array.from(m,v=>Math.max(v/cal.length,1e-4)**a);const n=Math.sqrt(Math.max(...s)*Math.min(...s));return s.map(v=>v/n);}
+ function calib(p){const ni=Math.round(64*p/100);return CI.slice(0,ni).concat(CT.slice(0,64-ni));}
+ const cache={};function rtn(b){if(!cache[b]){const Q=quant(W,b);cache[b]=[err(Q,TT),err(Q,TI)];}return cache[b];}
+ function draw(){const p=+P.value,auto=AU.checked;$("#qv-cal-pv").value=p+"%";A.disabled=auto;const cal=calib(p);let a=+A.value;
+  if(auto){let best=Infinity;for(let k=0;k<=20;k++){const e=err(qhat(scales(cal,k/20),bits),cal);if(e<best){best=e;a=k/20;}}A.value=a;}
+  $("#qv-cal-av").value=a.toFixed(2);
+  const s=scales(cal,a),Wh=qhat(s,bits),et=err(Wh,TT),ei=err(Wh,TI),[rt,ri]=rtn(bits);
+  const m=new Float64Array(DI);cal.forEach(x=>{for(let j=0;j<DI;j++)m[j]+=Math.abs(x[j])/cal.length;});
+  const mx=10,X=j=>40+j*9,Y=v=>170-Math.min(v,mx)/mx*140;
+  let g=`<line x1="36" y1="170" x2="620" y2="170" stroke="var(--muted)"/>`;
+  [0,5,10].forEach(v=>g+=`<text x="32" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11">${v}</text>`);
+  for(let j=0;j<DI;j++){const c=TXT[j]&&IMG[j]?"var(--tc)":TXT[j]?"var(--q)":IMG[j]?"var(--k)":"var(--rule)";g+=`<rect x="${X(j)}" y="${Y(m[j])}" width="7" height="${170-Y(m[j])}" fill="${c}"/>`;
+   const sy=Y(Math.min(s[j]*1.0,mx));g+=`<circle cx="${X(j)+3.5}" cy="${sy}" r="2.4" fill="var(--ink)"/>`;}
+  [0,16,32,48,63].forEach(j=>g+=`<text x="${X(j)+3.5}" y="186" text-anchor="middle" class="svgs" font-size="11">${j}</text>`);
+  g+=`<text x="330" y="202" text-anchor="middle" class="svgs" font-size="12">input channel j (groups of 32: channels 0–31 and 32–63)</text><text x="40" y="18" class="svgs" font-size="12">bars: calibration mean |x_j|; dots: AWQ scale s_j (capped at ${mx})</text>`;
+  svg.innerHTML=g;
+  const pct=(e,r)=>`${(100*e).toFixed(2)}% (RTN ${(100*r).toFixed(2)}%)`;
+  info.innerHTML=`${bits}-bit, group 32, calibration = ${64-Math.round(64*p/100)} text + ${Math.round(64*p/100)} image tokens, α = ${a.toFixed(2)}${auto?" (searched on the calibration set)":""}. Relative output error on held-out <b>text</b> tokens: <b>${pct(et,rt)}</b>; on held-out <b>image</b> tokens: <b>${pct(ei,ri)}</b>.${ei>ri?" <b style='color:var(--bad)'>Image tokens are worse than plain rounding.</b>":""}${et>rt?" <b style='color:var(--bad)'>Text tokens are worse than plain rounding.</b>":""}`;}
+ seg($("#qv-cal-bits"),"b",v=>{bits=+v;draw();});[P,A].forEach(e=>e.addEventListener("input",draw));AU.addEventListener("change",draw);draw();
+})();
+})();
+</script></body></html>

@@ -1,0 +1,481 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Unstructured and 2:4 pruning: SparseGPT, Wanda, OWL · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 114</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="unstructured-and-2-4-pruning-sparsegpt-wanda">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="unstructured-and-2-4-pruning-sparsegpt-wanda" data-session="unstructured-and-2-4-pruning-sparsegpt-wanda" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">114</span><span>Track 5: LLM inference and serving · session 37 of 65</span></div><h1 class="chap-title">Unstructured and 2:4 pruning: SparseGPT, Wanda, OWL</h1><p class="chap-sub">Magnitude pruning breaks large language models at 50% sparsity, but two one-shot methods do not. SparseGPT removes weights and moves the remaining ones to cancel the error, using the same inverse-Hessian machinery as GPTQ. Wanda only multiplies each weight by the size of its input and needs no weight update at all. This session builds both, adds OWL (a different sparsity for each layer) and shows how NVIDIA's 2:4 pattern turns zeros into real speed.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Pruning basics (session 113), Weight PTQ 1: GPTQ (session 106), basic linear algebra</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why pruning an LLM is solved one layer at a time with the objective ‖WX − (M ⊙ W)X‖², and why magnitude pruning fails on LLMs</li><li>SparseGPT: OBS-style mask selection and weight compensation, made fast with GPTQ's fixed column order, lazy blocks and a Cholesky factor</li><li>Wanda: the score |W_ij| · ‖X_j‖₂, why it is OBS with a diagonal Hessian, and why it compares weights inside each output row</li><li>OWL: measure outliers per layer and give layers with many outliers a lower sparsity, at the same average</li><li>2:4 semi-structured sparsity: the storage format, the sparse tensor core dot product, and how much speed it really gives</li><li>How to read memory formulas for sparse weights, and why unstructured 50% sparsity saves no memory on a GPU</li><li>What the papers measured: perplexity at 50%, 4:8, 2:4 and 70% sparsity, pruning time and speed-up</li></ul></div></header><style>
+.sg-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.sg-grid input[type=range]{width:100%}
+.sg-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.sg-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c);border:1.5px solid var(--b,transparent)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A pruned model has many weights set to exactly zero. Zeros need no multiplication and, in the right format, no storage. The question of this session is simple: how do we set half of the weights of a 7B or 175B model to zero, in one shot, without retraining, and without breaking the model? And when do those zeros make the GPU faster?</p>
+<p>In <a href="../inference/pruning-basics-magnitude-obd-and-obs-structured.html">session 113</a> we saw that the simplest rule, <b>magnitude pruning</b> (remove the weights with the smallest \(|w|\)), works well for small networks with retraining. For LLMs it fails badly. In the Wanda paper, 50% magnitude pruning raises the WikiText perplexity of LLaMA-7B from 5.68 to 17.29. Two methods from 2023 get the same 50% almost for free: <b>SparseGPT</b> reaches 7.22 and <b>Wanda</b> reaches 7.26. [Certain] On OPT-175B, SparseGPT at 50% sparsity even has a slightly lower perplexity than the dense model (8.21 against 8.35), while magnitude pruning gives about 43,000. [Certain]</p>
+<p>The two methods start from the same idea and then go in opposite directions. Both care about the <b>output</b> of each layer, not about the weights alone. SparseGPT is the "Optimal Brain Surgeon" of <a href="../inference/pruning-basics-magnitude-obd-and-obs-structured.html">session 113</a>, made fast with the GPTQ tricks of <a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>: it removes weights and <b>moves the remaining weights</b> to cancel the error. Wanda is the opposite: one multiplication per weight, no weight update, and hundreds of times faster to run. [Certain] Then <b>OWL</b> asks a third question: should every layer get the same sparsity? It says no, and it matters a lot at 70% sparsity.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: "Why does magnitude pruning fail on LLMs?", "What is the Wanda score and where does it come from?", "How does SparseGPT relate to GPTQ?", "What is 2:4 sparsity and how much faster is it really?", "Why does 50% unstructured sparsity not save memory?". All are answered below, with numbers from the papers.</aside>
+<p>Finally, zeros only help if the hardware can skip them. NVIDIA GPUs since the Ampere generation (A100) have <b>sparse tensor cores</b> that skip half of the weights if every group of 4 consecutive weights has at most 2 non-zeros. This is the <b>2:4</b> pattern. It is the main way that pruned LLMs get a real speed-up on GPUs today. [Likely] After this session, <a href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html">session 115</a> removes whole heads, channels and layers instead of single weights.</p>
+
+<h2>The layer-wise pruning problem</h2>
+<p>Retraining a 7B model after pruning costs a lot of GPU time. So, as in GPTQ, both methods solve one small problem per <b>linear layer</b>. Take a layer with weights \(W \in \R^{d_{out} \times d_{in}}\). Run a small calibration set (both papers use 128 sequences of web text from C4) through the model and stack the inputs of this layer as the columns of \(X \in \R^{d_{in} \times n}\). [Certain] A <b>mask</b> \(M\) has the same shape as \(W\): 1 means keep the weight, 0 means remove it. We want a mask with the target sparsity, and new values \(\hat W\) for the kept weights, so that the layer output does not change much:</p>
+<div class="eq">\[ \min_{M,\ \hat W} \; \big\lVert W X - (M \odot \hat W)\, X \big\rVert_F^2 \tag{114.1} \]</div>
+<p>under the constraint that a fraction \(s\) of the entries of \(M\) are 0.</p>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W, \hat W\)</dt><dd>original weights and new weights of the layer (one row per output channel)</dd>
+<dt>\(M\)</dt><dd>the mask; \(\odot\) is element-wise multiplication, so \(M \odot \hat W\) has zeros where the mask is 0</dd>
+<dt>\(X\)</dt><dd>calibration inputs of this layer, one column per token (about 262,000 tokens: 128 × 2,048)</dd>
+<dt>\(s\)</dt><dd>the sparsity: the fraction of weights that become zero (for example 0.5)</dd></dl>
+<p>Problem (114.1) has two parts. Choosing the mask is a hard combinatorial problem. If the mask is fixed, finding \(\hat W\) is an ordinary least-squares problem, one per row. Magnitude pruning chooses the mask from \(|W|\) alone and keeps \(\hat W = W\). Wanda chooses a better mask and keeps \(\hat W = W\). SparseGPT chooses the mask and \(\hat W\) together.</p>
+<p>As in <a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>, the error of one row \(\mathbf{w}\) with change \(\delta = \hat{\mathbf{w}} - \mathbf{w}\) is exactly quadratic:</p>
+<div class="eq">\[ E(\delta) = \delta\, X X^\top \delta^\top = \tfrac12\, \delta\, H\, \delta^\top, \qquad H = 2 X X^\top + \lambda I \tag{114.2} \]</div>
+<p>\(H\) is the Hessian of the row error. It depends only on the inputs, so all rows share it. The small \(\lambda I\) ("dampening", 1% of the mean diagonal) keeps \(H\) invertible when some input channels are almost always zero.</p>
+
+<h3>Why magnitude pruning fails on LLMs</h3>
+<p>The diagonal entry \(H_{jj} = 2 \lVert X_j \rVert^2\) is the energy of input channel \(j\) (\(X_j\) is row \(j\) of \(X\): the values of input feature \(j\) over all tokens). LLMs have a few <b>outlier features</b>: input channels whose values are 10 to 100 times larger than the others, in every layer (Dettmers et al., LLM.int8()). [Certain] A small weight on such a channel can carry a large part of the output. Magnitude pruning looks only at \(|w|\), so it removes exactly these weights. This is the main reason Wanda gives for the failure. [Certain, as the paper's explanation]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>You must cut half of the pipes in a water system. Magnitude pruning cuts the thinnest pipes. But one thin pipe may be connected to the main tank at high pressure and carry more water than a thick pipe on a quiet branch. Wanda multiplies the width of each pipe by the pressure at its input. SparseGPT also opens the remaining valves a little to make up for the water that was lost.</aside>
+<div class="worked"><div class="wt">Worked example: one row, four weights</div>
+<p>One output row has weights \(\mathbf{w} = (1.0,\ -0.6,\ 0.2,\ 0.9)\). The input norms are \(\lVert X_j \rVert = (0.5,\ 1.0,\ 8.0,\ 0.4)\): channel 3 is an outlier. Assume the input channels are uncorrelated, so the error of removing a set \(P\) of weights is \(\sum_{j \in P} w_j^2 \lVert X_j \rVert^2\). The full output energy is \(\sum_j w_j^2 \lVert X_j\rVert^2 = 0.25 + 0.36 + 2.56 + 0.1296 = 3.2996\).</p>
+<p><b>Magnitude</b> removes the two smallest \(|w|\): weights 3 (0.2) and 2 (0.6). Error \(= 2.56 + 0.36 = 2.92\), which is <b>88.5%</b> of the output energy.</p>
+<p><b>Wanda</b> computes \(|w_j| \cdot \lVert X_j \rVert = (0.5,\ 0.6,\ 1.6,\ 0.36)\) and removes the two smallest: weights 4 and 1. Error \(= 0.1296 + 0.25 = 0.3796\), which is <b>11.5%</b>. Same sparsity, 7.7 times less error. The tiny weight 0.2 is the most important one in the row.</p></div>
+
+<h2>SparseGPT: OBS that scales to 175B</h2>
+<p><b>Optimal Brain Surgeon (OBS)</b> (Hassibi and Stork, 1993) answers this question: if we must set weight \(m\) to zero, how should the other weights move, and how much error is left? For the quadratic error (114.2), a Lagrange multiplier gives the exact answer, the same derivation as the GPTQ step with "round" replaced by "set to 0":</p>
+<div class="eq">\[ \delta = -\,\frac{w_m}{[H^{-1}]_{mm}}\, (H^{-1})_{m,:}, \qquad \varepsilon_m = \frac{w_m^2}{2\,[H^{-1}]_{mm}} \tag{114.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(w_m\)</dt><dd>the weight we remove; after the update, its new value is exactly 0</dd>
+<dt>\(H^{-1}\)</dt><dd>the inverse Hessian of the weights that are still free (\(m\) included)</dd>
+<dt>\((H^{-1})_{m,:}\)</dt><dd>row \(m\) of the inverse: the direction in which all other weights move to cancel the error</dd>
+<dt>\(\varepsilon_m\)</dt><dd>the OBS saliency: the error that is left after the best compensation. Small \(\varepsilon_m\) = safe to remove</dd></dl>
+<p>Exact OBS is far too expensive for LLMs. Each row has its own mask, so each row needs its own sequence of shrinking inverse Hessians: \(O(d_{in}^3)\) per row and \(O(d_{out}\, d_{in}^3)\) per layer. The previous best method of this kind (OBC, Frantar and Alistarh, 2022) is accurate on models of 100 million parameters but cannot run on billions. [Certain]</p>
+<p>SparseGPT (Frantar and Alistarh, 2023) makes three changes. They are the same as in GPTQ, and in fact SparseGPT and GPTQ come from the same authors, and the SparseGPT code is built on the GPTQ code. [Likely]</p>
+<ul><li><b>One fixed column order for all rows.</b> Go through the columns from left to right. At column \(j\), each row decides whether its weight \(j\) is kept; if not, it is set to 0 and the error is spread over the columns to its right only. Because the set of "free" columns is the same for every row, all rows share one sequence of inverse Hessians. The rows can have different masks: a pruned weight is just a weight whose target value is 0, and a kept weight has error 0.</li>
+<li><b>The Cholesky form.</b> The row of the inverse needed at step \(j\) is row \(j\) of the upper Cholesky factor \(U\) of \(H^{-1}\) (see <a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>, formula 106.11). So \(U\) is computed once.</li>
+<li><b>Lazy updates in blocks of 128 columns</b>, applied to the rest of the matrix with one matrix multiplication.</li></ul>
+<p>With \(U\), the step for column \(j\) is short. Let \(m_{ij} \in \{0, 1\}\) be the mask entry of row \(i\):</p>
+<div class="eq">\[ \begin{aligned} e_{i} &= \frac{w_{ij} - m_{ij}\, w_{ij}}{U_{jj}}, \qquad \text{score}_{ij} = \frac{w_{ij}^2}{U_{jj}^2} \\ \mathbf{w}_{i,\,j:} &\leftarrow \mathbf{w}_{i,\,j:} - e_{i}\, U_{j,\,j:} \end{aligned} \tag{114.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(U\)</dt><dd>upper triangular, with \(H^{-1} = U^\top U\); \(U_{jj}^2\) equals \([H_{F}^{-1}]_{jj}\) for the free set \(F = \{j, j+1, \dots\}\)</dd>
+<dt>\(e_i\)</dt><dd>the scaled error of row \(i\) at column \(j\): zero if the weight is kept, \(w_{ij} / U_{jj}\) if it is removed</dd>
+<dt>\(\mathbf{w}_{i,\,j:}\)</dt><dd>the part of row \(i\) from column \(j\) to the end; the update sets \(w_{ij}\) to its target and moves the later weights</dd>
+<dt>\(\text{score}_{ij}\)</dt><dd>the OBS saliency (114.3) in Cholesky form, used to choose the mask</dd></dl>
+<h3>Adaptive mask selection</h3>
+<p>When is the mask chosen? Choosing it all at the start ignores how the weights move. Choosing each weight one by one is too slow. SparseGPT chooses the mask for a block of \(B_s = 128\) columns at a time: when the algorithm reaches the start of a block, it computes the score (114.4) on the <b>already updated</b> weights of the next 128 columns and, in each row, removes the fraction \(s\) with the smallest score. [Certain] So the mask can follow the compensation updates, and different rows and different blocks can have different sparsity, as long as the average is \(s\). For the \(n{:}m\) patterns (such as 2:4), the choice is made for every group of \(m\) columns: in each row, keep the \(n\) largest scores among the \(m\) weights.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: SparseGPT for one layer (unstructured or n:m)</div><ol>
+<li><b>input:</b> \(W \in \R^{d_{out} \times d_{in}}\), calibration inputs \(X\), sparsity \(s\) or pattern \(n{:}m\), block size \(B = 128\)</li>
+<li>\(H \leftarrow 2XX^\top + \lambda I\) <span class="c">// formula (114.2), \(\lambda\) = 1% of the mean diagonal</span></li>
+<li>\(U \leftarrow \operatorname{Cholesky}(H^{-1})\), upper triangular <span class="c">// computed once</span></li>
+<li><b>for</b> \(b = 0, B, 2B, \dots\): <span class="c">// one block of columns</span></li>
+<li>&nbsp;&nbsp;<b>if</b> unstructured: in each row, mask the fraction \(s\) of block columns with the smallest \(w^2 / U_{jj}^2\)</li>
+<li>&nbsp;&nbsp;<b>for</b> \(j = b, \dots, b + B - 1\):</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;<b>if</b> \(n{:}m\) and \(j\) is the first column of a group: in each row, keep the \(n\) of \(m\) columns with the largest score</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(E_{:,j} \leftarrow (W_{:,j} - M_{:,j} \odot W_{:,j}) / U_{jj}\) <span class="c">// formula (114.4); 0 for kept weights</span></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(W_{:,j:b+B} \leftarrow W_{:,j:b+B} - E_{:,j}\, U_{j,\,j:b+B}\) <span class="c">// compensate inside the block</span></li>
+<li>&nbsp;&nbsp;\(W_{:,b+B:} \leftarrow W_{:,b+B:} - E_{:,b:b+B}\, U_{b:b+B,\; b+B:}\) <span class="c">// lazy update, one matmul</span></li>
+<li><b>return</b> \(M \odot W\)</li></ol></div>
+<p>The cost is the same as GPTQ: \(O(d_{in}^3)\) for the Cholesky plus \(O(d_{out}\, d_{in}^2)\) for the updates, for the whole layer. The whole model is processed one transformer block at a time, each block calibrated on the outputs of the already pruned blocks. SparseGPT prunes OPT-175B and BLOOM-176B in about 4 hours on one A100 80 GB GPU. [Certain] The paper also observes that larger models are easier to prune: the gap to the dense model shrinks as the model grows. [Certain]</p>
+<p>A bonus of the shared framework: the column step can prune <b>and</b> quantize at the same time (remove the weight, or round it to the grid). On OPT-175B, 50% sparsity plus 4-bit weights gives a perplexity of 8.29, better than 3-bit GPTQ (8.68) at a similar storage size. [Certain]</p>
+
+<h2>Wanda: no Hessian, no update</h2>
+<p>Wanda ("pruning by Weights and activations", Sun, Liu, Bair and Kolter, 2023) asks: how much of SparseGPT do we really need? Its answer is a single score per weight:</p>
+<div class="eq">\[ S_{ij} = |W_{ij}| \cdot \lVert X_j \rVert_2 \tag{114.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W_{ij}\)</dt><dd>the weight from input \(j\) to output \(i\)</dd>
+<dt>\(\lVert X_j \rVert_2\)</dt><dd>the L2 norm of input feature \(j\) over all \(n\) calibration tokens: \(\sqrt{\sum_t x_{jt}^2}\)</dd>
+<dt>\(S_{ij}\)</dt><dd>the importance of the weight; Wanda removes the weights with the smallest \(S_{ij}\) and does <b>not</b> change the others</dd></dl>
+<p>Where does this score come from? Take the OBS saliency (114.3) and pretend the Hessian is diagonal (inputs uncorrelated, dampening ignored). Then \([H^{-1}]_{jj} = 1 / H_{jj} = 1 / (2 \lVert X_j\rVert^2)\), and</p>
+<div class="eq">\[ \varepsilon_{ij} = \frac{w_{ij}^2}{2\,[H^{-1}]_{jj}} = w_{ij}^2\, \lVert X_j \rVert^2 = S_{ij}^2 \tag{114.6} \]</div>
+<p>So Wanda is OBS with a diagonal Hessian, and with a diagonal Hessian OBS also says that the other weights should not move (the off-diagonal entries of \(H^{-1}\) are zero). Wanda is exactly right when the inputs are uncorrelated, which the worked example above assumed. In real LLMs the inputs are correlated, so SparseGPT's compensation helps, and it helps most when the pruning is hard (2:4, high sparsity). [Certain, from the paper tables below]</p>
+<h3>The comparison group matters</h3>
+<p>Which weights compete with each other? Magnitude pruning usually ranks all weights of a layer together. Wanda ranks the weights <b>within each output row</b> (all weights that feed the same output neuron) and removes the fraction \(s\) of every row. The paper reports that for LLMs this per-output grouping is clearly better than per-layer ranking, for Wanda and also for magnitude pruning. [Likely] One reason: with per-layer ranking, a few rows with small weights can lose almost all of their inputs, and that output neuron dies.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: Wanda for a whole model</div><ol>
+<li><b>input:</b> model, 128 calibration sequences, sparsity \(s\) (or pattern \(n{:}m\))</li>
+<li>\(Z \leftarrow\) hidden states after the embedding layer, for all calibration tokens</li>
+<li><b>for</b> each transformer block:</li>
+<li>&nbsp;&nbsp;run \(Z\) through the block with hooks; for each linear layer collect \(\lVert X_j \rVert_2\) for every input \(j\) <span class="c">// one forward pass</span></li>
+<li>&nbsp;&nbsp;<b>for</b> each linear layer: \(S \leftarrow |W| \odot \mathbf{1}\, \lVert X \rVert^\top\) <span class="c">// formula (114.5), broadcast over rows</span></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;unstructured: in each row, set the fraction \(s\) of weights with the smallest \(S\) to 0</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(n{:}m\): in each row and each group of \(m\) consecutive inputs, keep the \(n\) largest \(S\)</li>
+<li>&nbsp;&nbsp;\(Z \leftarrow\) output of the <b>pruned</b> block on \(Z\)</li>
+<li><b>return</b> the pruned model (no weight was changed except to 0)</li></ol></div>
+<p>The cost is tiny: one forward pass and a sort per row. Computing the pruning metric takes 0.54 s for LLaMA-7B and 5.6 s for LLaMA-65B, against 203.1 s and 1353.4 s for SparseGPT (Wanda paper, same hardware). [Certain] That is about 240 to 380 times faster. Because no weights move, Wanda also works well as the first step before a short fine-tuning run, and it is easy to apply during training.</p>
+<p>Figure 1 runs all three methods on a tiny layer of 6 outputs and 8 inputs. Input 3 is an outlier channel whose size you control.</p>
+<figure class="fig wide" id="sg-lab"><div class="fig-body">
+<div class="controls"><span class="seg" id="sg-lab-m"><button type="button" data-v="mag" aria-pressed="false">Magnitude</button><button type="button" data-v="wanda" aria-pressed="true">Wanda</button><button type="button" data-v="sgpt" aria-pressed="false">SparseGPT</button></span>
+<span class="seg" id="sg-lab-p"><button type="button" data-v="u" aria-pressed="true">50% per row</button><button type="button" data-v="s" aria-pressed="false">2:4</button></span></div>
+<div class="sg-grid" style="margin-top:8px"><label for="sg-lab-o">size of input 3</label><input type="range" id="sg-lab-o" min="1" max="20" step="1" value="8"><output id="sg-lab-ov"></output></div>
+<div class="scroll-x"><svg id="sg-lab-svg" viewBox="0 0 600 362" role="img" aria-label="A 6 by 8 weight matrix after pruning, with the input norms on top"></svg></div>
+<div class="sg-leg"><span style="--c:var(--q-soft);--b:var(--q)">kept, positive</span><span style="--c:var(--k-soft);--b:var(--k)">kept, negative</span><span style="--c:var(--card);--b:var(--muted)">removed (original value, ✕)</span><span style="--c:var(--k)">bar: the outlier input</span></div>
+<div class="readout" id="sg-lab-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> A layer \(W\) of 6 × 8 random weights pruned to 50% with each method. The bars show \(\lVert X_j \rVert\) of the 32 calibration tokens; inputs 2 and 6 are correlated. The readout gives the relative output error \(\lVert WX - \hat W X\rVert^2 / \lVert WX \rVert^2\) of all three methods. Fixed seed: the numbers are repeatable.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start at size 1: all inputs are similar, and all three methods are close; SparseGPT is a little better because it compensates (its changed weights carry a *). Slide the size of input 3 up. The weights on input 3 are small, so magnitude pruning still removes them in 5 of 6 rows, and its error grows to about 40%. Wanda and SparseGPT see the large input and keep those weights; their error falls. Switch to 2:4: the vertical line splits the inputs into two groups of 4, and every row keeps exactly 2 per group. 2:4 is harder than free 50% because good weights in the same group must compete.</p></details></figure>
+
+<h2>What the papers measured</h2>
+<p>The Wanda paper compares all three methods on LLaMA and LLaMA-2 with the same calibration data (WikiText perplexity, lower is better). [Certain] Figure 3 in the next section plots all of them; here is the core of the table.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model (dense)</th><th>Pattern</th><th>Magnitude</th><th>SparseGPT</th><th>Wanda</th></tr></thead><tbody>
+<tr><td rowspan="3">LLaMA-7B (5.68)</td><td>50%</td><td>17.29</td><td>7.22</td><td>7.26</td></tr>
+<tr><td>4:8</td><td>16.84</td><td>8.61</td><td>8.57</td></tr>
+<tr><td>2:4</td><td>42.13</td><td>11.00</td><td>11.53</td></tr>
+<tr><td rowspan="3">LLaMA-2-13B (4.57)</td><td>50%</td><td>6.37</td><td>5.63</td><td>5.56</td></tr>
+<tr><td>4:8</td><td>6.76</td><td>6.60</td><td>6.55</td></tr>
+<tr><td>2:4</td><td>8.33</td><td>8.32</td><td>8.27</td></tr></tbody></table></div>
+<p>Three lessons. First, at 50% unstructured both methods lose little, and Wanda is as good as SparseGPT. Second, the 2:4 pattern costs much more than free 50%: LLaMA-7B goes from 7.2 to about 11. The constraint "2 in every 4" forces the removal of some important weights. Third, on the hardest setting (2:4 on a 7B model) SparseGPT's compensation wins (11.00 against 11.53). Larger models lose less in every column. [Certain]</p>
+
+<h2>OWL: a different sparsity for each layer</h2>
+<p>Both SparseGPT and Wanda give every layer the same sparsity \(s\). At 50% that is fine. At 70% both break down: Wanda's LLaMA-7B perplexity is 85.77. [Certain] <b>OWL</b> ("Outlier Weighed Layerwise sparsity", Yin et al., 2023) notices that outlier features are not spread evenly over the depth of the model: some blocks have many more outliers than others. Its rule: blocks with more outliers keep more of their weights.</p>
+<p>OWL first counts outliers in each layer \(l\), with the Wanda score \(A_{ij} = \lVert X_j\rVert_2 \, |W_{ij}|\):</p>
+<div class="eq">\[ D^{l} = \frac{\#\{(i, j) : A^{l}_{ij} \gt M \cdot \bar A^{l}\}}{C_{in}\, C_{out}} \tag{114.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(D^l\)</dt><dd>the Layerwise Outlier Distribution (LOD): the fraction of weights in layer \(l\) whose score is "large"</dd>
+<dt>\(\bar A^l\)</dt><dd>the mean score in layer \(l\)</dd>
+<dt>\(M\)</dt><dd>the outlier threshold; the paper uses 5 for LLaMA-7B (values 3 to 10 were tried)</dd>
+<dt>\(C_{in}, C_{out}\)</dt><dd>input and output size of the layer, so \(C_{in} C_{out}\) is its number of weights</dd></dl>
+<p>Then it maps the outlier ratio to a sparsity for each transformer block (the paper found per-block better than per-linear-layer). Sparsity goes down linearly as \(D^l\) goes up, the spread between the most and least pruned block is \(2\lambda\), and the average stays at the target \(S\). [Certain] The official code does this as follows (we write it as a formula): [Likely]</p>
+<div class="eq">\[ r_l = 2\lambda\, \frac{D^l - D_{min}}{D_{max} - D_{min}}, \qquad S_l = S - \big(r_l - \bar r\big) \tag{114.8} \]</div>
+<p>Here \(\bar r\) is the mean of the \(r_l\), so the average of the \(S_l\) is exactly \(S\). The block with the most outliers gets \(S_l\) at the bottom of the range, the one with the fewest at the top. For LLaMA-7B the paper uses \(\lambda = 8\%\): at a target of 70%, the blocks range over about 16 points. [Certain] Then Wanda or SparseGPT prunes each block with its own \(S_l\). OWL costs almost nothing extra: the scores are the Wanda scores.</p>
+<figure class="fig wide" id="sg-owl"><div class="fig-body">
+<div class="sg-grid">
+<label for="sg-owl-s">target sparsity \(S\)</label><input type="range" id="sg-owl-s" min="40" max="80" step="1" value="70"><output id="sg-owl-sv"></output>
+<label for="sg-owl-l">range \(\lambda\)</label><input type="range" id="sg-owl-l" min="0" max="20" step="1" value="8"><output id="sg-owl-lv"></output></div>
+<div class="scroll-x"><svg id="sg-owl-svg" viewBox="0 0 660 300" role="img" aria-label="Sparsity per transformer block from OWL, with the outlier ratio of each block"></svg></div>
+<div class="sg-leg"><span style="--c:var(--q)">sparsity of the block</span><span style="--c:var(--k)">outlier ratio (LOD), scaled</span></div>
+<div class="readout" id="sg-owl-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> OWL allocation (formula 114.8) for 32 transformer blocks. The outlier profile is <b>made up for illustration</b>: many outliers in the first blocks, a second bump near the end. It is not measured on a real model.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With \(\lambda = 0\) all blocks get the target sparsity: this is plain Wanda or SparseGPT. Raise \(\lambda\): the blocks with tall orange bars (many outliers) get shorter purple bars (lower sparsity), and the others are pruned more. The dashed line is the target; the readout shows that the average stays on it for any \(\lambda\). The spread between the lowest and highest block is always \(2\lambda\).</p></details></figure>
+<p>The effect at 70% sparsity is large (OWL paper, Table 3, WikiText perplexity): [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model (dense)</th><th>Magnitude</th><th>Wanda</th><th>OWL + Wanda</th><th>SparseGPT</th><th>OWL + SparseGPT</th></tr></thead><tbody>
+<tr><td>LLaMA-7B (5.68)</td><td>48419.12</td><td>85.77</td><td>24.55</td><td>26.30</td><td>19.49</td></tr>
+<tr><td>LLaMA-13B (5.09)</td><td>84539.45</td><td>55.90</td><td>17.17</td><td>19.24</td><td>14.55</td></tr>
+<tr><td>LLaMA-30B</td><td>977.73</td><td>17.37</td><td>10.75</td><td>12.56</td><td>10.28</td></tr></tbody></table></div>
+<figure class="fig wide" id="sg-res"><div class="fig-body">
+<div class="controls"><span class="seg" id="sg-res-m"><button type="button" data-v="l7" aria-pressed="true">LLaMA-7B</button><button type="button" data-v="l13" aria-pressed="false">LLaMA-13B</button><button type="button" data-v="m7" aria-pressed="false">LLaMA-2-7B</button><button type="button" data-v="m13" aria-pressed="false">LLaMA-2-13B</button><button type="button" data-v="owl" aria-pressed="false">OWL at 70%</button></span></div>
+<div class="scroll-x"><svg id="sg-res-svg" viewBox="0 0 690 256" role="img" aria-label="WikiText perplexity of magnitude, SparseGPT and Wanda pruning on a log scale"></svg></div>
+<div class="sg-leg"><span style="--c:var(--muted)">magnitude</span><span style="--c:var(--k)">SparseGPT</span><span style="--c:var(--q)">Wanda</span></div>
+<div class="readout" id="sg-res-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> WikiText perplexity (log scale) from the Wanda paper (Table 2: 50% unstructured, 4:8 and 2:4) and from the OWL paper (Table 3: LLaMA-7B at 70% unstructured). The dashed line is the dense model.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>For each model, three groups of bars: 50%, 4:8 and 2:4. The grey magnitude bars are far above the dashed dense line, except on LLaMA-2-13B. SparseGPT and Wanda stay close to the line at 50% and move up as the pattern gets stricter. The OWL view uses its own colors (green = with OWL) and shows the 70% setting, where layer-wise sparsity matters most.</p></details></figure>
+<p>OWL + Wanda improves Wanda by 61.22 perplexity points on LLaMA-7B, with the same total number of zeros. Note that 70% is still far from the dense model: one-shot pruning at that level needs recovery training to be useful. [Likely] And the gain is a perplexity gain; it does not change the speed, because unstructured 70% sparsity still needs a sparse kernel (next section).</p>
+
+<h2>2:4 semi-structured sparsity: zeros that the GPU can skip</h2>
+<p>Unstructured sparsity puts the zeros anywhere. A GPU tensor core multiplies dense tiles of numbers; it cannot skip random zeros. To store random zeros we also need their positions, and those indices cost memory. <b>Semi-structured</b> (or \(n{:}m\)) sparsity is the middle ground: in every group of \(m\) consecutive weights along the input dimension, at most \(n\) are non-zero. NVIDIA Ampere and later GPUs support \(2{:}4\) in hardware: sparse tensor cores deliver twice the math throughput of dense ones for 2:4 matrices. [Certain]</p>
+<p>The storage format is simple. In each group of 4, keep the 2 values and a 2-bit index (0 to 3) for each of them. With \(b\)-bit values:</p>
+<div class="eq">\[ \text{bits per weight} = \frac{2b + 2 \cdot 2}{4} = \frac{b}{2} + 1 \tag{114.9} \]</div>
+<p>For FP16 (\(b = 16\)) that is 9 bits per weight, <b>56.25%</b> of dense. For INT8 it is 5 bits (62.5%). [Certain, arithmetic] At compute time, the indices select which entries of the input vector to read:</p>
+<div class="eq">\[ y_i = \sum_{g=0}^{d_{in}/4 - 1} \; \sum_{k=1}^{2} v_{i,g,k}\; x_{4g + \text{idx}_{i,g,k}} \tag{114.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(g\)</dt><dd>the group of 4 inputs, \(4g\) to \(4g + 3\)</dd>
+<dt>\(v_{i,g,k}\)</dt><dd>the \(k\)-th kept value of row \(i\) in group \(g\) (stored compressed)</dd>
+<dt>\(\text{idx}_{i,g,k}\)</dt><dd>its 2-bit position inside the group (the "metadata")</dd>
+<dt>\(y_i\)</dt><dd>the same result as the dense dot product of the masked row, with half the multiply-adds</dd></dl>
+<p>Step through it in Figure 4.</p>
+<figure class="fig wide" id="sg-nm"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="sg-nm-prev">Back</button><button type="button" class="btn primary" id="sg-nm-play">Play</button><button type="button" class="btn" id="sg-nm-next">Next</button><span id="sg-nm-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="sg-nm-svg" viewBox="0 0 670 256" role="img" aria-label="A row of 16 weights compressed to the 2:4 format and multiplied with an input vector"></svg></div>
+<div class="readout" id="sg-nm-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> One row of 16 FP16 weights made 2:4 sparse (here by magnitude), compressed into 8 values plus 8 two-bit indices, and multiplied with an input vector of 16 numbers.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Use Next and Back. The groups are along the input dimension, the one that is summed. The 2-bit codes under the compressed values are the positions 0 to 3 inside each group. In the last step only the highlighted inputs are read. The sparse result equals the dense product of the masked row exactly; the difference to the unpruned row is the pruning error, which the pruning method (Wanda, SparseGPT) tries to keep small.</p></details></figure>
+<h3>How much faster is it really?</h3>
+<p>"Twice the math" does not mean "twice as fast". There are two regimes, as in <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>:</p>
+<ul><li><b>Compute-bound</b> (prefill, large batches): the upper limit is 2× for the matrix multiplications only. Attention, normalization and the rest do not get faster.</li>
+<li><b>Memory-bound</b> (decoding with a small batch): the time is set by bytes read. FP16 2:4 reads 9 bits instead of 16 per weight, so the upper limit is \(16 / 9 \approx 1.78\times\) for the weight reads.</li></ul>
+<p>Measured numbers are lower. In the Wanda paper, the matrix multiplications of LLaMA-65B at batch size 1 run 1.54× to 1.63× faster with 2:4 (for example 3.49 ms to 2.14 ms for the q/k/v/o projections), and the end-to-end latency of LLaMA-7B goes from 312 ms to 251 ms: <b>1.24×</b>. [Certain] So 2:4 gives a real but modest speed-up, at a real accuracy cost (the 2:4 row of the table above). This trade-off is why 2:4 is often combined with quantization and with a short recovery fine-tuning. [Likely]</p>
+<h3>Why unstructured 50% saves no memory on a GPU</h3>
+<p>A general sparse format must store the position of every non-zero. In CSR (compressed sparse row), each non-zero has a value and a column index; with 32-bit indices and \(b\)-bit values, the bytes per weight at sparsity \(s\) are</p>
+<div class="eq">\[ \text{CSR bytes per weight} = \Big(\frac{b}{8} + 4\Big)(1 - s), \qquad \text{smaller than dense only if } s \gt \frac{32}{b + 32} \tag{114.11} \]</div>
+<p>For FP16 the break-even is \(32/48 = 66.7\%\) sparsity: at 50%, CSR uses 3 bytes per weight, <b>more</b> than the 2 bytes of dense. A bitmap (1 bit per position, then the values) is better: 1.125 bytes per weight at 50%, the same as 2:4. But a bitmap needs a special kernel to decode, and on GPUs such kernels (for example Flash-LLM) pay off mainly for memory-bound decoding at high sparsity. [Likely] On CPUs, sparse engines such as DeepSparse do turn unstructured sparsity into speed: the OWL paper measures 2.6× at 70% sparsity on LLaMA-2-7B-chat (213.83 ms to 81.89 ms per token, Intel Xeon, 36 cores). [Certain]</p>
+<figure class="fig" id="sg-mem"><div class="fig-body">
+<div class="controls"><span class="seg" id="sg-mem-b"><button type="button" data-v="16" aria-pressed="true">FP16 weights</button><button type="button" data-v="8" aria-pressed="false">INT8 weights</button></span></div>
+<div class="sg-grid" style="margin-top:8px"><label for="sg-mem-s">sparsity</label><input type="range" id="sg-mem-s" min="0" max="100" step="1" value="50"><output id="sg-mem-sv"></output></div>
+<div class="scroll-x"><svg id="sg-mem-svg" viewBox="0 0 640 262" role="img" aria-label="Bytes per weight against sparsity for dense, CSR and bitmap storage, with the 2:4 point"></svg></div>
+<div class="sg-leg"><span style="--c:var(--muted)">dense</span><span style="--c:var(--k)">CSR, 32-bit index</span><span style="--c:var(--q)">bitmap</span><span style="--c:var(--v);--b:var(--ink)">2:4 (fixed at 50%)</span></div>
+<div class="readout" id="sg-mem-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Storage cost per weight (formulas 114.9 and 114.11) as a function of sparsity. Index and bitmap overheads only; real kernels may add padding or tile headers.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Move the slider. CSR starts at 6 bytes per weight at 0% sparsity (FP16 value + 4-byte index) and crosses the dense line at 66.7%. The bitmap line is always close to the values alone plus 1/8 byte. The green square is 2:4: at its fixed 50%, it costs the same as a bitmap, but the GPU can use it directly in tensor cores. Switch to INT8: the index overhead is relatively larger, so CSR needs 80% sparsity to save memory.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: memory of a 7B model in 2:4</div>
+<p>The linear layers of LLaMA-7B hold \(32 \times (4 \cdot 4096^2 + 3 \cdot 4096 \cdot 11008) \approx 6.48 \times 10^9\) weights. In FP16 that is 12.95 GB. In FP16 2:4 (9 bits per weight, formula 114.9) it is 7.29 GB: 5.7 GB less, 56.25% of dense. As CSR with 32-bit indices at the same 50%, it would be 19.4 GB, more than dense. Embeddings and the output layer are not pruned and stay as they were.</p></div>
+
+<h2>Pruning in PyTorch</h2>
+<p>The code builds one layer of 256 × 512 weights with 2,048 calibration tokens, 8 of whose input channels are outliers (20 times larger), and compares magnitude, Wanda and SparseGPT at 50% per row and at 2:4. The SparseGPT function follows Algorithm 1, the Wanda function follows formula (114.5). It runs on CPU in about 3 seconds; we ran it with PyTorch 2.15.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+d_out, d_in, n_tok = 256, 512, 2048
+W = torch.randn(d_out, d_in) / d_in ** 0.5
+<span class="cm"># calibration inputs with a few outlier features (as in real LLMs)</span>
+X = torch.randn(d_in, n_tok)
+X[torch.randperm(d_in)[:8]] *= 20.0      <span class="cm"># 8 outlier input channels at random places</span>
+
+<span class="kw2">def</span> rel_err(W, Wp, X):
+    <span class="kw2">return</span> ((W @ X - Wp @ X).norm() ** 2 / (W @ X).norm() ** 2).item()
+
+<span class="kw2">def</span> nm_mask(score, n=2, m=4):
+    <span class="cm"># keep the n largest scores in every group of m consecutive inputs</span>
+    s = score.reshape(score.shape[0], -1, m)
+    idx = s.topk(n, dim=-1).indices
+    mask = torch.zeros_like(s, dtype=torch.bool).scatter_(-1, idx, True)
+    <span class="kw2">return</span> mask.reshape(score.shape)
+
+<span class="kw2">def</span> row_mask(score, sparsity):
+    <span class="cm"># per-output comparison group: prune the same fraction in every row</span>
+    k = int(score.shape[1] * sparsity)
+    idx = score.argsort(dim=1)[:, :k]
+    <span class="kw2">return</span> ~torch.zeros_like(score, dtype=torch.bool).scatter_(1, idx, True)
+
+<span class="kw2">def</span> magnitude(W, X, sparsity=0.5, nm=False):
+    s = W.abs()
+    <span class="kw2">return</span> W * (nm_mask(s) <span class="kw2">if</span> nm <span class="kw2">else</span> row_mask(s, sparsity))
+
+<span class="kw2">def</span> wanda(W, X, sparsity=0.5, nm=False):
+    s = W.abs() * X.norm(dim=1)[None, :]        <span class="cm"># formula (114.5)</span>
+    <span class="kw2">return</span> W * (nm_mask(s) <span class="kw2">if</span> nm <span class="kw2">else</span> row_mask(s, sparsity))
+
+<span class="kw2">def</span> sparsegpt(W, X, sparsity=0.5, nm=False, block=128, damp=0.01):
+    W = W.clone(); d = W.shape[1]
+    H = 2 * X @ X.T                              <span class="cm"># formula (114.2)</span>
+    H += damp * H.diagonal().mean() * torch.eye(d)
+    Hinv = torch.linalg.cholesky(torch.cholesky_inverse(torch.linalg.cholesky(H)), upper=True)
+    <span class="kw2">for</span> b0 <span class="kw2">in</span> range(0, d, block):
+        b1 = min(b0 + block, d); W1 = W[:, b0:b1].clone(); E = torch.zeros_like(W1)
+        Hb = Hinv[b0:b1, b0:b1]
+        <span class="kw2">if not</span> nm:                               <span class="cm"># adaptive mask for this block of columns</span>
+            score = W1 ** 2 / Hb.diagonal()[None, :] ** 2
+            mask = row_mask(score, sparsity)
+        <span class="kw2">for</span> j <span class="kw2">in</span> range(b1 - b0):
+            w = W1[:, j]; h = Hb[j, j]
+            <span class="kw2">if</span> nm <span class="kw2">and</span> j % 4 == 0:                <span class="cm"># choose 2 of the next 4 columns, per row</span>
+                sc = W1[:, j:j + 4] ** 2 / Hb.diagonal()[j:j + 4][None, :] ** 2
+                m4 = nm_mask(sc)
+            keep = m4[:, j % 4] <span class="kw2">if</span> nm <span class="kw2">else</span> mask[:, j]
+            q = w * keep                         <span class="cm"># pruned weights become 0</span>
+            e = (w - q) / h                      <span class="cm"># formula (114.4), scaled error</span>
+            W1[:, j:] -= e[:, None] * Hb[j, j:][None, :]   <span class="cm"># fix the remaining columns</span>
+            W1[:, j] = q; E[:, j] = e
+        W[:, b0:b1] = W1
+        W[:, b1:] -= E @ Hinv[b0:b1, b1:]        <span class="cm"># lazy update of later blocks</span>
+    <span class="kw2">return</span> W
+
+<span class="kw2">for</span> name, f <span class="kw2">in</span> [(<span class="st">"magnitude"</span>, magnitude), (<span class="st">"wanda"</span>, wanda), (<span class="st">"sparsegpt"</span>, sparsegpt)]:
+    u = f(W, X); s = f(W, X, nm=True)
+    print(f<span class="st">"{name:10s} 50%: {rel_err(W, u, X):.4f}   2:4: {rel_err(W, s, X):.4f}   zeros: {(s == 0).float().mean():.2f}"</span>)
+
+s = sparsegpt(W, X, nm=True)
+ok = ((s != 0).reshape(d_out, -1, 4).sum(-1) == 2).all().item()
+print(<span class="st">"every group of 4 has exactly 2 non-zeros:"</span>, ok)
+
+<span class="cm"># Output (PyTorch 2.15, CPU):</span>
+<span class="cm"># magnitude  50%: 0.0669   2:4: 0.1305   zeros: 0.50</span>
+<span class="cm"># wanda      50%: 0.0101   2:4: 0.0187   zeros: 0.50</span>
+<span class="cm"># sparsegpt  50%: 0.0093   2:4: 0.0167   zeros: 0.50</span>
+<span class="cm"># every group of 4 has exactly 2 non-zeros: True</span></pre>
+<p>Read the output like the paper tables: magnitude is about 7 times worse than the others because it removes weights on the outlier channels; Wanda and SparseGPT are close, and SparseGPT's compensation helps more at 2:4. Here the inputs are uncorrelated apart from scale, so Wanda is almost optimal; with correlated inputs the gap to SparseGPT grows.</p>
+<p>To run a 2:4 model fast on a GPU, the weights must be converted to the compressed format and used with a sparse kernel. PyTorch has the function <code>to_sparse_semi_structured</code> in <code>torch.sparse</code> for this (CUDA, Ampere or newer), and NVIDIA cuSPARSELt and CUTLASS provide the kernels; serving engines such as vLLM can load 2:4 checkpoints. [Likely] We did not run these here (no GPU); check the current documentation of your library version.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical use</th><th>Why</th></tr></thead><tbody>
+<tr><td>Serving on A100 / H100 class GPUs</td><td>2:4 sparse LLM weights, often with FP8 or INT4, after a short recovery fine-tuning [Likely]</td><td>Sparse tensor cores: up to 2× matmul math, about 44% less weight memory in FP16</td></tr>
+<tr><td>CPU and edge inference</td><td>Unstructured 50% to 80% sparsity with a sparse CPU engine</td><td>CPUs can skip arbitrary zeros; 2.6× at 70% measured in the OWL paper</td></tr>
+<tr><td>Fast compression experiments</td><td>Wanda as a baseline that takes seconds; SparseGPT when accuracy matters more than pruning time</td><td>0.54 s against 203.1 s for LLaMA-7B</td></tr>
+<tr><td>High sparsity (60% to 70%)</td><td>OWL layer-wise ratios on top of Wanda or SparseGPT</td><td>Same zeros, much lower perplexity</td></tr>
+<tr><td>VLMs (vision-language models)</td><td>Prune the language model; keep the vision encoder and the projector dense or prune them lightly [Likely]</td><td>The language model holds most weights and dominates decode time</td></tr>
+<tr><td>Video-RAG and video QA on one GPU</td><td>A 2:4 + quantized VLM answers questions over retrieved clips</td><td>Freed weight memory goes to the long KV cache of many frame tokens</td></tr>
+<tr><td>Video classification and action recognition</td><td>2:4 pruning of a video transformer backbone, calibrated on in-domain clips</td><td>The input-aware score (114.5) uses real activation statistics of video tokens</td></tr>
+<tr><td>Starting point for structured pruning and distillation</td><td>Wanda scores to rank channels or as the first step before training (<a href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html">session 115</a>, <a href="../inference/lab-prune-with-wanda-2-4-recover.html">session 122</a>)</td><td>Activation-aware importance is cheap and transfers to larger units</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Expecting speed from unstructured sparsity on a GPU.</b> Random zeros are multiplied like any other number by dense kernels. Without a sparse format and kernel, 50% unstructured sparsity gives no speed and no memory gain, and CSR at 50% even uses more memory (formula 114.11).</li>
+<li><b>Groups along the wrong dimension.</b> The 2:4 groups must be 4 consecutive weights along the input (reduction) dimension, the one the dot product sums over. Groups along the output dimension do not match the hardware.</li>
+<li><b>Ranking all weights of a layer together.</b> For LLMs, compare weights inside each output row (Wanda's grouping). Per-layer ranking can empty whole rows.</li>
+<li><b>Calibrating every layer on the dense model's inputs.</b> Process the model block by block and feed each block the outputs of the already pruned blocks, so later layers see the inputs they will really get.</li>
+<li><b>Computing the Wanda norm per sequence or per batch only.</b> \(\lVert X_j\rVert_2\) must be accumulated over all calibration tokens (sum of squares, then the square root at the end).</li>
+<li><b>Forgetting dampening in SparseGPT.</b> Dead input channels make \(2XX^\top\) singular; the Cholesky then fails or the updates explode.</li>
+<li><b>Judging only by WikiText perplexity.</b> Pruned models can lose more on reasoning, long-context and knowledge-heavy tasks than perplexity suggests. Evaluate on the tasks you care about. [Likely]</li>
+<li><b>Promising 2× speed for 2:4.</b> The 2× is for the matrix math only; measured end-to-end gains are closer to 1.2× to 1.6×.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why does magnitude pruning fail on LLMs while it works on CNNs?<span class="lvl">basic</span></summary><div class="ans">LLMs have outlier features: a few input channels with values 10 to 100 times larger than the rest. A weight's effect on the output is roughly \(|w_{ij}| \cdot \lVert X_j \rVert\), not \(|w_{ij}|\). Magnitude pruning removes small weights even when they sit on huge inputs, so it destroys important outputs. On LLaMA-7B at 50%, perplexity goes from 5.68 to 17.29 with magnitude and to 7.26 with Wanda. CNNs are usually pruned with retraining and have fewer extreme activation outliers, so magnitude works there. [Likely for the CNN part]</div></details>
+<details class="qa"><summary>What is the Wanda score, and how can you derive it from OBS?<span class="lvl">core</span></summary><div class="ans">\(S_{ij} = |W_{ij}| \cdot \lVert X_j\rVert_2\). The OBS saliency is \(w^2 / (2[H^{-1}]_{jj})\) with \(H = 2XX^\top\). If \(H\) is diagonal, \([H^{-1}]_{jj} = 1/(2\lVert X_j \rVert^2)\) and the saliency is \(w^2 \lVert X_j \rVert^2 = S_{ij}^2\). With a diagonal \(H\), OBS also says the other weights should not move, which is why Wanda does no update. Wanda is the diagonal-Hessian special case of OBS.</div></details>
+<details class="qa"><summary>Explain SparseGPT. How does it relate to GPTQ?<span class="lvl">core</span></summary><div class="ans">SparseGPT solves the layer-wise problem \(\min \lVert WX - (M\odot \hat W)X\rVert^2\). It goes through the columns in a fixed order; at each column it sets the masked weights to 0 and spreads the error over the remaining columns with the OBS update, using the Cholesky factor \(U\) of \(H^{-1}\): \(e = (w_j - m_j w_j)/U_{jj}\), \(\mathbf{w}_{j:} \mathrel{-}= e\, U_{j,j:}\). The mask is chosen per block of 128 columns with the score \(w^2/U_{jj}^2\) on the updated weights. GPTQ is the same algorithm with "round to the grid" instead of "set to 0"; both share the fixed order, lazy block updates and the Cholesky trick, and the two can be done in one pass.</div></details>
+<details class="qa"><summary>Why can SparseGPT use one sequence of inverse Hessians when every row has a different mask?<span class="lvl">advanced</span></summary><div class="ans">Exact OBS removes weights in a different order per row, so each row has its own free set and its own inverse. SparseGPT instead treats every column in the same left-to-right order for all rows: at step \(j\), every row "fixes" weight \(j\), either to 0 (pruned) or to its current value (kept, error 0), and the free set is always the columns to the right of \(j\). Because \(H\) depends only on \(X\), the free set and the inverse are the same for all rows. The mask only changes the size of the error, not which inverse is used.</div></details>
+<details class="qa"><summary>Why does Wanda compare weights per output row instead of per layer?<span class="lvl">core</span></summary><div class="ans">The paper found per-output grouping clearly better for LLMs, for both Wanda and magnitude. Each output neuron then keeps the same fraction of its inputs, so no output loses almost all of its inputs. Different rows can have different weight scales; a global ranking would prune rows with small weights much more. It also matches \(n{:}m\) patterns, which are defined per row anyway.</div></details>
+<details class="qa"><summary>What is 2:4 sparsity, and how is it stored?<span class="lvl">basic</span></summary><div class="ans">In every group of 4 consecutive weights along the input dimension, at most 2 are non-zero, so the sparsity is 50%. The hardware stores the 2 values plus a 2-bit index for each: \(b/2 + 1\) bits per weight, 9 bits for FP16 (56.25% of dense). Sparse tensor cores (NVIDIA Ampere and later) use the indices to pick the matching inputs and do half the multiply-adds, which gives twice the math throughput.</div></details>
+<details class="qa"><summary>A colleague says "2:4 makes our model 2× faster". What do you answer?<span class="lvl">core</span></summary><div class="ans">The 2× is the peak math throughput of the matrix multiplications only. In compute-bound prefill, the other operators (attention, norms, activations) do not speed up. In memory-bound decode, the gain is limited by bytes read: 16 to 9 bits per weight, at most about 1.78× on the weight reads. The Wanda paper measured 1.54× to 1.63× on LLaMA-65B matmuls at batch size 1 and 1.24× end to end on LLaMA-7B. And 2:4 costs accuracy (LLaMA-7B perplexity about 11 instead of 5.68), so it is usually combined with recovery training.</div></details>
+<details class="qa"><summary>Why does 50% unstructured sparsity save no memory on a GPU?<span class="lvl">core</span></summary><div class="ans">Each non-zero needs its position. In CSR with 32-bit column indices and FP16 values, each kept weight costs 6 bytes, so at 50% sparsity the average is 3 bytes per weight against 2 for dense; break-even is at \(32/(16+32) = 66.7\%\). A bitmap reaches 1.125 bytes but needs a custom kernel. Dense GPU kernels also do not skip zeros, so there is no compute gain either. 2:4 fixes both with a tiny fixed-size index and hardware support.</div></details>
+<details class="qa"><summary>What does OWL do and why does it help at high sparsity?<span class="lvl">advanced</span></summary><div class="ans">OWL measures, for each layer, the fraction of weights whose Wanda score exceeds \(M\) times the layer mean (the Layerwise Outlier Distribution). Blocks with more outliers get a lower sparsity, others a higher one, with a spread of \(2\lambda\) and the same average as the target. Outliers carry much of the model's function, so protecting the layers that hold many of them keeps the model working. On LLaMA-7B at 70%, Wanda goes from 85.77 to 24.55 perplexity and SparseGPT from 26.30 to 19.49.</div></details>
+<details class="qa"><summary>When would you choose SparseGPT over Wanda, and the other way round?<span class="lvl">core</span></summary><div class="ans">At 50% unstructured on large models they are about equal, and Wanda is hundreds of times cheaper (5.6 s against 1353.4 s for the metric on LLaMA-65B), needs no matrix inverse and no extra memory for \(H\). SparseGPT is worth its cost on harder settings: 2:4 on smaller models (LLaMA-7B 11.00 against 11.53), very high sparsity, or joint pruning and quantization in one pass. If a recovery fine-tuning follows, the cheaper Wanda mask is often good enough. [Likely for the last point]</div></details>
+<details class="qa"><summary>Can you combine 2:4 sparsity with quantization? What is the memory?<span class="lvl">advanced</span></summary><div class="ans">Yes. The 2:4 format stores the kept values in any supported type plus 2-bit indices, so with \(b\)-bit values the cost is \(b/2 + 1\) bits per weight: 5 bits for INT8 and 3 bits for INT4, plus quantization scales. SparseGPT can prune and quantize in the same column pass; on OPT-175B, 50% + 4-bit gives 8.29 perplexity against 8.68 for 3-bit GPTQ. Hardware support for sparse INT8 and FP8 exists on recent NVIDIA GPUs. [Likely]</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>How many bits per weight does 2:4 need with INT4 values (ignore scales)? What fraction of dense INT4 is that?</li>
+<li>With FP16 values and 16-bit (instead of 32-bit) column indices, at what sparsity does CSR start to save memory?</li>
+<li>One row: \(\mathbf{w} = (0.3, -1.2, 0.5, 0.1)\), \(\lVert X_j\rVert = (10, 1, 2, 4)\), uncorrelated inputs. Which 2 weights do magnitude and Wanda keep under 2:4? Compute both errors \(\sum_{\text{pruned}} w_j^2 \lVert X_j\rVert^2\).</li>
+<li>OWL with target \(S = 70\%\), \(\lambda = 8\%\) and three blocks with LOD 9%, 5% and 1%. Compute the sparsity of each block with formula (114.8). Check the average.</li>
+<li>How many different 2:4 patterns does one group of 4 have? What is the minimum number of index bits per group, and how many does the hardware format use?</li>
+<li>A decode step reads FP16 weights and is completely memory-bound. What is the best possible speed-up from 2:4 for the weight reads? Compare with the measured 1.24× end to end and explain the gap.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \((2 \cdot 4 + 2 \cdot 2)/4 = 3\) bits per weight, 75% of dense INT4: the index overhead is relatively larger at low bit widths. 2. Bytes per weight \((2 + 2)(1 - s)\) against 2 for dense: CSR saves memory only above \(s = 50\%\). 3. Scores \(|w|\cdot\lVert X\rVert = (3.0, 1.2, 1.0, 0.4)\). Wanda keeps weights 1 and 2 and prunes 3 and 4: error \(1.0^2 + 0.4^2 = 1.16\). Magnitude keeps weights 2 and 3 (\(|w| = 1.2, 0.5\)) and prunes 1 and 4: error \(3.0^2 + 0.4^2 = 9.16\), out of a total of 11.6. 4. \(r = 2 \cdot 0.08 \cdot (D - 1)/(9 - 1) = (0.16, 0.08, 0)\), \(\bar r = 0.08\), so \(S_l = 0.70 - (r_l - 0.08) = (62\%, 70\%, 78\%)\). The block with the most outliers is pruned least; the average is 70%. 5. \(\binom{4}{2} = 6\) patterns, so at least \(\log_2 6 \approx 2.58\) bits per group; the format uses 2 indices of 2 bits = 4 bits, which is simpler to decode. 6. \(16/9 \approx 1.78\times\). The measured 1.24× is lower because attention, the KV cache reads, norms, sampling and kernel launches are not made sparse, and the sparse kernels do not reach the full bandwidth limit.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>LLM pruning is solved layer by layer: keep \(WX\) close to \((M\odot \hat W)X\) on about 128 calibration sequences (114.1). The error is quadratic with \(H = 2XX^\top\) (114.2).</li>
+<li>Magnitude pruning fails because of outlier features: a small weight on a large input can matter most.</li>
+<li>SparseGPT = OBS (114.3) with GPTQ's fixed column order, Cholesky factor and lazy blocks (114.4), plus adaptive masks per 128 columns. 175B models in about 4 GPU hours.</li>
+<li>Wanda = OBS with a diagonal Hessian: score \(|W_{ij}|\,\lVert X_j\rVert_2\) (114.5, 114.6), per-output ranking, no update, seconds instead of minutes. As good as SparseGPT at 50%; slightly worse on 2:4.</li>
+<li>OWL gives blocks with many outliers a lower sparsity (114.7, 114.8); at 70% it cuts LLaMA-7B perplexity from 85.77 to 24.55 with Wanda.</li>
+<li>2:4 is the GPU-friendly pattern: \(b/2 + 1\) bits per weight (114.9), 2× peak matmul math, about 1.2× to 1.6× measured. Unstructured sparsity needs index storage (114.11) and special kernels.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \varepsilon_m = \frac{w_m^2}{2[H^{-1}]_{mm}}, \qquad \delta = -\frac{w_m}{[H^{-1}]_{mm}}(H^{-1})_{m,:} \]</div>
+<div class="eq">\[ S_{ij} = |W_{ij}|\,\lVert X_j\rVert_2, \qquad S_l = S - (r_l - \bar r) \]</div>
+<div class="eq">\[ \text{2:4 bits/weight} = \frac{b}{2} + 1, \qquad \text{CSR bytes/weight} = \Big(\frac{b}{8} + 4\Big)(1 - s) \]</div>
+
+<h2 class="plain" id="unstructured-and-2-4-pruning-sparsegpt-wanda-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Frantar &amp; Alistarh (2023). <a href="https://arxiv.org/abs/2301.00774" target="_blank" rel="noopener">SparseGPT: Massive Language Models Can Be Accurately Pruned in One-Shot</a></li><li>Sun et al. (2023). <a href="https://arxiv.org/abs/2306.11695" target="_blank" rel="noopener">A Simple and Effective Pruning Approach for Large Language Models (Wanda)</a></li><li>Yin et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Outlier Weighed Layerwise Sparsity (OWL): A Missing Secret Sauce for Pruning LLMs to High Sparsity&amp;quot;" target="_blank" rel="noopener">Outlier Weighed Layerwise Sparsity (OWL): A Missing Secret Sauce for Pruning LLMs to High Sparsity</a></li><li>Mishra et al. (2021). <a href="https://arxiv.org/abs/2104.08378" target="_blank" rel="noopener">Accelerating Sparse Deep Neural Networks</a></li><li>Frantar &amp; Alistarh (2023). <a href="https://arxiv.org/abs/2301.00774" target="_blank" rel="noopener">SparseGPT: Massive Language Models Can Be Accurately Pruned in One-Shot</a></li><li>Sun et al. (2023). <a href="https://arxiv.org/abs/2306.11695" target="_blank" rel="noopener">A Simple and Effective Pruning Approach for Large Language Models (Wanda)</a></li><li>Yin et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Outlier Weighed Layerwise Sparsity (OWL): A Missing Secret Sauce for Pruning LLMs to High Sparsity&amp;quot;" target="_blank" rel="noopener">Outlier Weighed Layerwise Sparsity (OWL): A Missing Secret Sauce for Pruning LLMs to High Sparsity</a></li><li>Mishra et al. (2021). <a href="https://arxiv.org/abs/2104.08378" target="_blank" rel="noopener">Accelerating Sparse Deep Neural Networks</a></li><li>Hassibi &amp; Stork (1993). <a href="https://scholar.google.com/scholar?q=&amp;quot;Second order derivatives for network pruning: Optimal Brain Surgeon&amp;quot;" target="_blank" rel="noopener">Second order derivatives for network pruning: Optimal Brain Surgeon</a></li><li>Frantar &amp; Alistarh (2022). <a href="https://arxiv.org/abs/2208.11580" target="_blank" rel="noopener">Optimal Brain Compression: A Framework for Accurate Post-Training Quantization and Pruning</a></li><li>Frantar et al. (2022). <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/pruning-basics-magnitude-obd-and-obs-structured.html"><small>Previous · session 113</small>Pruning basics: magnitude, OBD and OBS; structured vs unstructured</a><a class="next" href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html"><small>Next · session 115</small>Structured pruning: LLM-Pruner, Sheared LLaMA, SliceGPT, Minitron</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="unstructured-and-2-4-pruning-sparsegpt-wanda"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const mn=s=>String(s).replace(/^-/,"−");
+const f2=v=>mn((Math.abs(v)<5e-3?0:v).toFixed(2));
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function gauss(r){let sp=null;return()=>{if(sp!==null){const v=sp;sp=null;return v;}const u=Math.max(1e-12,r()),v=r(),m=Math.sqrt(-2*Math.log(u));sp=m*Math.sin(2*Math.PI*v);return m*Math.cos(2*Math.PI*v);};}
+function segInit(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+
+/* ---------- small linear algebra (8 x 8 is enough) ---------- */
+function inv(A){const n=A.length;const M=A.map((r,i)=>r.concat(Array.from({length:n},(_,j)=>i===j?1:0)));
+ for(let c=0;c<n;c++){let p=c;for(let r=c+1;r<n;r++)if(Math.abs(M[r][c])>Math.abs(M[p][c]))p=r;[M[c],M[p]]=[M[p],M[c]];const d=M[c][c];for(let j=0;j<2*n;j++)M[c][j]/=d;
+  for(let r=0;r<n;r++)if(r!==c){const f=M[r][c];if(f)for(let j=0;j<2*n;j++)M[r][j]-=f*M[c][j];}}
+ return M.map(r=>r.slice(n));}
+function cholUpper(A){/* A = U^T U */const n=A.length;const L=A.map(()=>new Array(n).fill(0));
+ for(let i=0;i<n;i++)for(let j=0;j<=i;j++){let s=A[i][j];for(let k=0;k<j;k++)s-=L[i][k]*L[j][k];L[i][j]=i===j?Math.sqrt(s):s/L[j][j];}
+ return L[0].map((_,i)=>L.map(r=>r[i]));}
+
+/* ---------- Figure 1: prune a tiny layer three ways ---------- */
+(function(){
+ const svg=$("#sg-lab-svg");if(!svg)return;const info=$("#sg-lab-info"),OS=$("#sg-lab-o");
+ const DO=6,DI=8,N=32,OUT=2;let method="wanda",pat="u";
+ const g=gauss(rng(15));
+ const W=Array.from({length:DO},()=>Array.from({length:DI},()=>+(0.5*g()).toFixed(2)));
+ const X0=Array.from({length:DI},()=>Array.from({length:N},()=>g()));
+ for(let t=0;t<N;t++)X0[5][t]=0.8*X0[1][t]+0.6*X0[5][t];/* channel 5 is correlated with channel 1 */
+ function inputs(o){return X0.map((r,j)=>r.map(v=>j===OUT?o*v:v));}
+ const mm=(A,X)=>A.map(r=>X[0].map((_,t)=>r.reduce((s,w,j)=>s+w*X[j][t],0)));
+ function relErr(Wp,X){const Y=mm(W,X),Yp=mm(Wp,X);let a=0,b=0;Y.forEach((r,i)=>r.forEach((v,t)=>{a+=(v-Yp[i][t])**2;b+=v*v;}));return a/b;}
+ function keepRow(sc){/* per-output group: keep the 4 largest of 8 */const idx=sc.map((v,j)=>[v,j]).sort((a,b)=>a[0]-b[0]);const k=new Array(sc.length).fill(true);idx.slice(0,sc.length/2).forEach(([,j])=>k[j]=false);return k;}
+ function keep24(sc){/* in every group of 4 inputs keep the 2 largest */const k=new Array(sc.length).fill(false);for(let g0=0;g0<sc.length;g0+=4){const idx=[0,1,2,3].map(o=>[sc[g0+o],g0+o]).sort((a,b)=>b[0]-a[0]);k[idx[0][1]]=true;k[idx[1][1]]=true;}return k;}
+ const keepBy=(sc)=>pat==="u"?keepRow(sc):keep24(sc);
+ function prune(m,X){
+  if(m==="mag"){const K=W.map(r=>keepBy(r.map(Math.abs)));return{Wp:W.map((r,i)=>r.map((w,j)=>K[i][j]?w:0)),K};}
+  const nrm=X.map(r=>Math.sqrt(r.reduce((s,v)=>s+v*v,0)));
+  if(m==="wanda"){const K=W.map(r=>keepBy(r.map((w,j)=>Math.abs(w)*nrm[j])));return{Wp:W.map((r,i)=>r.map((w,j)=>K[i][j]?w:0)),K,nrm};}
+  /* SparseGPT: H = 2XX^T + damping, U = upper Cholesky of H^-1, one block of 8 columns */
+  const H=X.map(a=>X.map(b=>2*a.reduce((s,v,t)=>s+v*b[t],0)));const md=H.reduce((s,r,i)=>s+r[i],0)/DI;H.forEach((r,i)=>r[i]+=0.01*md);
+  const U=cholUpper(inv(H));const Wp=W.map(r=>r.slice());const K=W.map(()=>new Array(DI).fill(true));
+  if(pat==="u")Wp.forEach((r,i)=>{K[i]=keepRow(r.map((w,j)=>w*w/(U[j][j]*U[j][j])));});
+  for(let j=0;j<DI;j++){
+   if(pat==="s"&&j%4===0)Wp.forEach((r,i)=>{const sc=[0,1,2,3].map(o=>r[j+o]*r[j+o]/(U[j+o][j+o]*U[j+o][j+o]));const k=keep24(sc);for(let o=0;o<4;o++)K[i][j+o]=k[o];});
+   Wp.forEach((r,i)=>{const w=r[j],q=K[i][j]?w:0,e=(w-q)/U[j][j];for(let c=j;c<DI;c++)r[c]-=e*U[j][c];r[j]=q;});}
+  return{Wp,K,nrm};}
+ function draw(){const o=+OS.value;$("#sg-lab-ov").value="×"+o;const X=inputs(o);const nrm=X.map(r=>Math.sqrt(r.reduce((s,v)=>s+v*v,0)));
+  const res={mag:prune("mag",X),wanda:prune("wanda",X),sgpt:prune("sgpt",X)};const err={};for(const k in res)err[k]=relErr(res[k].Wp,X);
+  const cur=res[method];const cw=62,ch=40,x0=96,y0=92;let s="";
+  const mx=Math.max(...nrm);
+  s+=`<text x="10" y="22" class="svgs" font-size="12.5">‖X<tspan dy="4" font-size="9">j</tspan><tspan dy="-4">‖ of each input</tspan></text>`;
+  nrm.forEach((v,j)=>{const h=46*v/mx;s+=`<rect x="${x0+j*cw+14}" y="${74-h}" width="${cw-28}" height="${h}" rx="3" fill="${j===OUT?"var(--k)":"var(--v)"}" opacity=".85"/><text x="${x0+j*cw+cw/2}" y="${70-h}" text-anchor="middle" class="svgs" font-size="11">${v.toFixed(1)}</text>`;});
+  for(let i=0;i<DO;i++){s+=`<text x="${x0-10}" y="${y0+i*ch+ch/2+5}" text-anchor="end" class="svgs" font-size="12.5">out ${i+1}</text>`;
+   for(let j=0;j<DI;j++){const w=cur.Wp[i][j],k=cur.K[i][j],x=x0+j*cw,y=y0+i*ch;const a=Math.min(1,Math.abs(w)/1.2);
+    const changed=method==="sgpt"&&k&&Math.abs(w-W[i][j])>0.005;
+    s+=`<rect x="${x+2}" y="${y+2}" width="${cw-4}" height="${ch-4}" rx="6" fill="${k?(w>=0?"var(--q)":"var(--k)"):"none"}" fill-opacity="${k?(0.15+0.6*a).toFixed(2):0}" stroke="${k?"var(--rule)":"var(--muted)"}" stroke-dasharray="${k?"":"3 3"}"/>`;
+    s+=k?`<text x="${x+cw/2}" y="${y+ch/2+5}" text-anchor="middle" class="svgm" font-size="13" font-weight="${changed?700:400}">${f2(w)}${changed?"*":""}</text>`:`<text x="${x+cw/2}" y="${y+ch/2+5}" text-anchor="middle" class="svgs" font-size="12">${f2(W[i][j])} ✕</text>`;}}
+  if(pat==="s")s+=`<line x1="${x0+4*cw}" y1="${y0-4}" x2="${x0+4*cw}" y2="${y0+DO*ch+4}" stroke="var(--ink)" stroke-width="2"/>`;
+  for(let j=0;j<DI;j++)s+=`<text x="${x0+j*cw+cw/2}" y="${y0+DO*ch+18}" text-anchor="middle" class="svgs" font-size="12">in ${j+1}</text>`;
+  svg.innerHTML=s;
+  const nm={mag:"Magnitude",wanda:"Wanda",sgpt:"SparseGPT"};const nch=method==="sgpt"?cur.Wp.reduce((a,r,i)=>a+r.filter((w,j)=>cur.K[i][j]&&Math.abs(w-W[i][j])>0.005).length,0):0;
+  const lost=cur.K.filter(r=>!r[OUT]).length;
+  info.innerHTML=`Relative output error ‖WX − ŴX‖² / ‖WX‖² with ${pat==="u"?"50% per output row":"2:4 sparsity"}: Magnitude <b>${err.mag.toFixed(3)}</b>, Wanda <b>${err.wanda.toFixed(3)}</b>, SparseGPT <b>${err.sgpt.toFixed(3)}</b>. ${nm[method]} prunes input 3 (the outlier channel) in ${lost} of 6 rows.${method==="sgpt"?` SparseGPT also changed ${nch} kept weights (marked *) to cancel the error.`:""}`;}
+ segInit($("#sg-lab-m"),v=>{method=v;draw();});segInit($("#sg-lab-p"),v=>{pat=v;draw();});OS.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 2: 2:4 compression and the sparse dot product ---------- */
+(function(){
+ const svg=$("#sg-nm-svg");if(!svg)return;const info=$("#sg-nm-info");
+ const w=[0.42,-0.07,0.91,0.15,-0.33,0.58,0.04,-0.76,0.12,0.09,-0.64,0.27,0.81,-0.22,0.36,-0.05];
+ const x=[1,2,-1,0.5,0.5,-1,3,1,2,1,0.5,-2,-0.5,1,1,4];
+ const keep=w.map(()=>false);for(let g=0;g<16;g+=4){const idx=[0,1,2,3].sort((a,b)=>Math.abs(w[g+b])-Math.abs(w[g+a]));keep[g+idx[0]]=true;keep[g+idx[1]]=true;}
+ const vals=[],meta=[];for(let g=0;g<16;g+=4)for(let o=0;o<4;o++)if(keep[g+o]){vals.push(w[g+o]);meta.push(o);}
+ const dense=w.reduce((s,v,i)=>s+v*x[i],0),masked=w.reduce((s,v,i)=>s+(keep[i]?v*x[i]:0),0);let sp=0;vals.forEach((v,k)=>{sp+=v*x[4*Math.floor(k/2)+meta[k]];});
+ const cw=38,x0=20;
+ function cell(xx,y,t,fill,op,dash,bold){return `<rect x="${xx}" y="${y}" width="${cw-4}" height="34" rx="6" fill="${fill}" fill-opacity="${op}" stroke="var(--rule)" stroke-dasharray="${dash||""}"/><text x="${xx+(cw-4)/2}" y="${y+22}" text-anchor="middle" class="svgm" font-size="11.5" font-weight="${bold?700:400}">${t}</text>`;}
+ const S=[
+  {t:"A dense row of 16 FP16 weights: 16 × 16 = <b>256 bits</b>. The tensor core would do 16 multiply-adds with an input vector of 16 numbers."},
+  {t:"Cut the row into groups of 4 consecutive weights (along the input dimension, the dimension that is summed in the dot product)."},
+  {t:"In every group keep exactly 2 weights (here the 2 with the largest |w|; Wanda or SparseGPT scores work the same way). Half the weights are now zero, and every group has the same shape."},
+  {t:`Compressed form: the 8 kept values (8 × 16 = 128 bits) plus a 2-bit position (0 to 3) for each kept value (8 × 2 = 16 bits). Total <b>144 bits</b>, which is <b>56.25%</b> of 256.`},
+  {t:`Sparse dot product: the 2-bit positions select the matching inputs, so the hardware does only <b>8</b> multiply-adds instead of 16. Result ${f2(sp)} = the masked dense result ${f2(masked)}. (The unpruned row gives ${f2(dense)}; the gap is the pruning error, not a hardware error.)`}];
+ function draw(k){let s="";
+  s+=`<text x="${x0}" y="18" class="svgs" font-size="12.5">weights w (one output row)</text>`;
+  w.forEach((v,i)=>{const gx=x0+i*cw+(k>=1?Math.floor(i/4)*10:0);const pr=k>=2&&!keep[i];s+=cell(gx,26,pr?"0":f2(v),pr?"none":(v>=0?"var(--q)":"var(--k)"),pr?0:0.2+0.5*Math.min(1,Math.abs(v)),pr?"3 3":"",false);});
+  if(k>=1)for(let g=0;g<4;g++){const gx=x0+g*4*cw+g*10;s+=`<text x="${gx+2*cw-2}" y="80" text-anchor="middle" class="svgs" font-size="12">group ${g+1}</text>`;}
+  if(k>=3){s+=`<text x="${x0}" y="112" class="svgs" font-size="12.5">compressed values (FP16) and 2-bit positions</text>`;
+   vals.forEach((v,i)=>{const gx=x0+i*(cw+6);s+=cell(gx,120,f2(v),v>=0?"var(--q)":"var(--k)",0.3,"",true)+`<text x="${gx+(cw-4)/2}" y="172" text-anchor="middle" class="svgm" font-size="12" style="fill:var(--v)">${meta[i].toString(2).padStart(2,"0")}</text>`;});
+   s+=`<text x="${x0+8*(cw+6)+6}" y="142" class="svgs" font-size="12">128 bits</text><text x="${x0+8*(cw+6)+6}" y="176" class="svgs" font-size="12">+16 bits</text>`;}
+  if(k>=4){s+=`<text x="${x0}" y="206" class="svgs" font-size="12.5">input x: only the selected entries are read</text>`;
+   x.forEach((v,i)=>{const gx=x0+i*cw+Math.floor(i/4)*10;s+=cell(gx,214,f2(v),keep[i]?"var(--v)":"none",keep[i]?0.35:0,keep[i]?"":"3 3",keep[i]);});}
+  svg.innerHTML=s;info.innerHTML=S[k].t;}
+ B.stepper({n:S.length,prev:$("#sg-nm-prev"),next:$("#sg-nm-next"),play:$("#sg-nm-play"),label:$("#sg-nm-lab"),ms:3000,onStep:draw});
+})();
+
+/* ---------- Figure 3: memory per weight for sparse formats ---------- */
+(function(){
+ const svg=$("#sg-mem-svg");if(!svg)return;const SS=$("#sg-mem-s"),info=$("#sg-mem-info");let bits=16;
+ const fm={dense:s=>bits/8,csr:s=>(bits/8+4)*(1-s),bmp:s=>(bits/8)*(1-s)+1/8};
+ const X=s=>60+s*560,top=()=>bits===16?6:5,Y=v=>220-v/top()*200;
+ function draw(){const s=+SS.value/100;$("#sg-mem-sv").value=SS.value+"%";
+  let g=`<path d="M60 16 V220 H625" fill="none" stroke="var(--muted)"/>`;
+  for(let p=0;p<=100;p+=25)g+=`<text x="${X(p/100)}" y="238" text-anchor="middle" class="svgs" font-size="12">${p}%</text>`;
+  for(let v=0;v<=top();v++)g+=`<text x="52" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="12">${v}</text><line x1="60" x2="625" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--rule)" stroke-width=".6"/>`;
+  g+=`<text x="340" y="256" text-anchor="middle" class="svgs" font-size="12.5">sparsity (fraction of zero weights)</text><text x="14" y="120" class="svgs" font-size="12.5" transform="rotate(-90 14 120)" text-anchor="middle">bytes per weight</text>`;
+  const col={dense:"var(--muted)",csr:"var(--k)",bmp:"var(--q)"};
+  for(const k in fm){let d="";for(let i=0;i<=100;i++){const v=fm[k](i/100);d+=(i?"L":"M")+X(i/100).toFixed(1)+" "+Y(Math.min(top(),v)).toFixed(1);}g+=`<path d="${d}" fill="none" stroke="${col[k]}" stroke-width="2.6"/>`;}
+  const v24=bits/16+0.125;g+=`<rect x="${X(0.5)-7}" y="${Y(v24)-7}" width="14" height="14" fill="var(--v)" stroke="var(--ink)" stroke-width="1"/>`;
+  g+=`<line x1="${X(s)}" x2="${X(s)}" y1="16" y2="220" stroke="var(--ink)" stroke-dasharray="4 4"/>`;for(const k in fm)g+=`<circle cx="${X(s)}" cy="${Y(Math.min(top(),fm[k](s)))}" r="5" fill="${col[k]}"/>`;
+  svg.innerHTML=g;const be=32/(bits+32);
+  info.innerHTML=`${bits===16?"FP16":"INT8"} weights at <b>${SS.value}%</b> sparsity, bytes per weight: dense <b>${fm.dense(s).toFixed(3)}</b>, CSR (value + 32-bit column index) <b>${fm.csr(s).toFixed(3)}</b>, bitmap (value + 1 bit per position) <b>${fm.bmp(s).toFixed(3)}</b>. 2:4 at its fixed 50%: <b>${v24.toFixed(3)}</b> (${(100*v24/fm.dense(0)).toFixed(2)}% of dense). CSR only saves memory above ${(100*be).toFixed(1)}% sparsity.`;}
+ segInit($("#sg-mem-b"),v=>{bits=+v;draw();});SS.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 4: OWL layer-wise sparsity ---------- */
+(function(){
+ const svg=$("#sg-owl-svg");if(!svg)return;const SS=$("#sg-owl-s"),LL=$("#sg-owl-l"),info=$("#sg-owl-info");const L=32;
+ /* a made-up outlier profile (LOD in %), for illustration only */
+ const D=Array.from({length:L},(_,l)=>+(2+7*Math.exp(-l/4)+1.6*Math.exp(-((l-27)**2)/10)+0.6*Math.sin(1.7*l)).toFixed(2));
+ function alloc(S,lam){const mx=Math.max(...D),mi=Math.min(...D);const r=D.map(d=>(d-mi)/(mx-mi)*2*lam);const m=r.reduce((a,b)=>a+b,0)/L;return r.map(v=>S-(v-m));}
+ const bw=17,x0=50,Y=v=>230-v*200;
+ function draw(){const S=+SS.value/100,lam=+LL.value/100;$("#sg-owl-sv").value=SS.value+"%";$("#sg-owl-lv").value=LL.value+"%";const sp=alloc(S,lam);
+  let g=`<path d="M${x0} 20 V230 H${x0+L*bw+6}" fill="none" stroke="var(--muted)"/>`;
+  [0,0.25,0.5,0.75,1].forEach(v=>g+=`<text x="${x0-6}" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${v*100}%</text><line x1="${x0}" x2="${x0+L*bw+6}" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--rule)" stroke-width=".6"/>`);
+  const dm=Math.max(...D);
+  sp.forEach((v,l)=>{const xx=x0+4+l*bw;g+=`<rect x="${xx}" y="${Y(v)}" width="${bw-4}" height="${230-Y(v)}" rx="2" fill="var(--q)" opacity=".75"/><rect x="${xx+3}" y="${262-26*D[l]/dm}" width="${bw-10}" height="${26*D[l]/dm}" fill="var(--k)"/>`;
+   if(l%4===0)g+=`<text x="${xx+(bw-4)/2}" y="278" text-anchor="middle" class="svgs" font-size="11">${l+1}</text>`;});
+  g+=`<line x1="${x0}" x2="${x0+L*bw+6}" y1="${Y(S)}" y2="${Y(S)}" stroke="var(--ink)" stroke-dasharray="5 4" stroke-width="1.6"/><text x="${x0+L*bw+10}" y="${Y(S)+4}" class="svgs" font-size="11.5">target</text>`;
+  g+=`<text x="${x0+L*bw+10}" y="256" class="svgs" font-size="11.5">LOD</text><text x="${x0+L*bw/2}" y="296" text-anchor="middle" class="svgs" font-size="12">transformer block</text>`;
+  svg.innerHTML=g;const mean=sp.reduce((a,b)=>a+b,0)/L;const imin=sp.indexOf(Math.min(...sp)),imax=sp.indexOf(Math.max(...sp));
+  info.innerHTML=`Average sparsity <b>${(100*mean).toFixed(1)}%</b> (equal to the target). Block ${imin+1} has the most outliers (LOD ${D[imin].toFixed(2)}%) and gets the lowest sparsity, <b>${(100*sp[imin]).toFixed(1)}%</b>. Block ${imax+1} has the fewest (LOD ${D[imax].toFixed(2)}%) and gets the highest, <b>${(100*sp[imax]).toFixed(1)}%</b>. Spread: ${(100*(sp[imax]-sp[imin])).toFixed(1)} points = 2λ.`;}
+ [SS,LL].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 5: what the papers measured ---------- */
+(function(){
+ const svg=$("#sg-res-svg");if(!svg)return;const info=$("#sg-res-info");
+ /* WikiText perplexity, Wanda paper (Sun et al. 2023), Table 2 */
+ const T={l7:{n:"LLaMA-7B",d:5.68,r:[["50%",17.29,7.22,7.26],["4:8",16.84,8.61,8.57],["2:4",42.13,11.00,11.53]]},
+  l13:{n:"LLaMA-13B",d:5.09,r:[["50%",20.21,6.21,6.15],["4:8",13.84,7.40,7.40],["2:4",18.37,9.11,9.58]]},
+  m7:{n:"LLaMA-2-7B",d:5.12,r:[["50%",14.89,6.51,6.42],["4:8",16.48,8.12,7.97],["2:4",54.59,10.17,11.02]]},
+  m13:{n:"LLaMA-2-13B",d:4.57,r:[["50%",6.37,5.63,5.56],["4:8",6.76,6.60,6.55],["2:4",8.33,8.32,8.27]]}};
+ /* OWL paper (Yin et al. 2023), Table 3, LLaMA-7B at 70% unstructured */
+ const OWL={d:5.68,r:[["Magnitude",48419.12],["Wanda",85.77],["OWL + Wanda",24.55],["SparseGPT",26.30],["OWL + SparseGPT",19.49]]};
+ const lo=Math.log10(2),hi=5,Y=v=>230-(Math.log10(Math.min(v,1e5))-lo)/(hi-lo)*210;
+ function axis(){let g=`<path d="M60 20 V230 H630" fill="none" stroke="var(--muted)"/>`;[2,5,10,20,50,100,1000,10000,100000].forEach(v=>g+=`<text x="54" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${v>=1000?v/1000+"k":v}</text><line x1="60" x2="630" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--rule)" stroke-width=".5"/>`);return g;}
+ function bar(x,w,v,c,lab){return `<rect x="${x}" y="${Y(v)}" width="${w}" height="${230-Y(v)}" rx="3" fill="${c}"/><text x="${x+w/2}" y="${Y(v)-5}" text-anchor="middle" class="svgm" font-size="11">${v>=1000?Math.round(v):v.toFixed(2)}</text>`+(lab?`<text x="${x+w/2}" y="248" text-anchor="middle" class="svgs" font-size="11.5">${lab}</text>`:"");}
+ function draw(k){let g=axis();
+  if(k==="owl"){const d=OWL.d;g+=`<line x1="60" x2="630" y1="${Y(d)}" y2="${Y(d)}" stroke="var(--ink)" stroke-dasharray="5 4"/><text x="636" y="${Y(d)-3}" class="svgs" font-size="11.5">dense</text><text x="636" y="${Y(d)+11}" class="svgs" font-size="11.5">${d}</text>`;
+   const c=["var(--muted)","var(--q)","var(--v)","var(--k)","var(--v)"];OWL.r.forEach(([n,v],i)=>{g+=bar(80+i*110,80,v,c[i],n);});svg.innerHTML=g;
+   info.innerHTML=`LLaMA-7B at <b>70%</b> unstructured sparsity, WikiText perplexity (OWL paper, Table 3): dense 5.68, magnitude 48419.12, Wanda <b>85.77</b> → OWL + Wanda <b>24.55</b>, SparseGPT <b>26.30</b> → OWL + SparseGPT <b>19.49</b>. Same total sparsity; only the split across layers changed.`;return;}
+  const t=T[k];g+=`<line x1="60" x2="630" y1="${Y(t.d)}" y2="${Y(t.d)}" stroke="var(--ink)" stroke-dasharray="5 4"/><text x="636" y="${Y(t.d)-3}" class="svgs" font-size="11.5">dense</text><text x="636" y="${Y(t.d)+11}" class="svgs" font-size="11.5">${t.d.toFixed(2)}</text>`;
+  t.r.forEach(([p,m,s,w],gi)=>{const gx=90+gi*185;g+=bar(gx,46,m,"var(--muted)")+bar(gx+52,46,s,"var(--k)")+bar(gx+104,46,w,"var(--q)")+`<text x="${gx+75}" y="250" text-anchor="middle" class="svgt" font-size="13" font-weight="700">${p}</text>`;});
+  svg.innerHTML=g;
+  info.innerHTML=`${t.n}, WikiText perplexity (Wanda paper, Table 2; dense ${t.d.toFixed(2)}). `+t.r.map(([p,m,s,w])=>`${p}: magnitude ${m.toFixed(2)}, SparseGPT <b>${s.toFixed(2)}</b>, Wanda <b>${w.toFixed(2)}</b>`).join("; ")+".";}
+ segInit($("#sg-res-m"),draw);draw("l7");
+})();
+})();
+</script></body></html>

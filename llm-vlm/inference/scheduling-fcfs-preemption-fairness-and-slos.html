@@ -1,0 +1,457 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Scheduling: FCFS, preemption, fairness and SLOs · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 136</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="scheduling-fcfs-preemption-fairness-and-slos">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="scheduling-fcfs-preemption-fairness-and-slos" data-session="scheduling-fcfs-preemption-fairness-and-slos" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">136</span><span>Track 5: LLM inference and serving · session 59 of 65</span></div><h1 class="chap-title">Scheduling: FCFS, preemption, fairness and SLOs</h1><p class="chap-sub">A serving engine has more requests than batch slots, so after every token it must decide who runs, who waits and who is paused. This session shows why first-come-first-served makes short requests wait behind long ones, how preemption works when every paused request owns a KV cache, how FastServe’s multi-level feedback queue and the Virtual Token Counter (VTC) fix speed and fairness, and how latency targets (SLOs) and output-length prediction shape admission.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Session 81 (inference metrics), Session 84 (batching basics), Session 135 (continuous batching and chunked prefill), Session 80 (the KV cache)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why FCFS causes head-of-line blocking, and why SJF and SRPT minimize the mean completion time (with the exchange argument)</li><li>What preemption does to the KV cache: keep, swap or recompute, with the cost of each for Llama 3 8B</li><li>How FastServe’s skip-join multi-level feedback queue approximates SJF without knowing output lengths, and why long prompts must skip the top queue</li><li>How the Virtual Token Counter shares the GPU fairly by weighted tokens, why it lifts returning clients, and what its 2× bound says</li><li>How a TPOT target and KV memory together cap the batch size, and how to compute that cap</li><li>How output-length prediction and learning to rank make SJF-like scheduling practical, and why the P99 must be watched</li></ul></div></header><style>
+.sch-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.sch-grid input[type=range]{width:100%}
+.sch-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.sch-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+pre.code,.sch-mono{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A serving engine always has more requests than it can run at once. Every few milliseconds it must decide: which waiting requests join the batch, which running requests keep going, and which ones are paused. This decision is <b>scheduling</b>. The GPU does the same total work under every policy, but the users see very different waiting times.</p>
+<p>In <a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">session 135</a> we learned <i>how</i> requests share one batch: continuous batching adds and removes requests at every decode step, and chunked prefill splits long prompts so they do not stall the decodes. This session is about <i>who</i> gets the batch slots and the KV-cache memory when there is not enough for everyone. Four problems appear in every real service:</p>
+<ul>
+<li><b>Head-of-line blocking.</b> With first-come-first-served (FCFS), a request that needs 2,000 output tokens can make ten requests that need 20 tokens wait behind it.</li>
+<li><b>Preemption.</b> To let short requests pass, we must be able to pause a long one in the middle. Its KV cache must then be kept, moved to CPU memory, or thrown away and rebuilt later. Each choice has a cost.</li>
+<li><b>Fairness between users.</b> One customer who sends 1,000 requests per minute should not make another customer who sends 10 wait for minutes.</li>
+<li><b>Service-level objectives (SLOs).</b> The service promises numbers, such as “first token within 1 second, then at least 20 tokens per second”. The scheduler must keep these promises for as many requests as possible.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “Why is FCFS bad for LLM serving?”, “How would you schedule if you do not know the output length?”, “What happens to the KV cache when you preempt a request?”, “How do you stop one tenant from starving the others?”, “How do you trade throughput against a TPOT target?”. Each one has a section below.</aside>
+<p>These are real system choices. vLLM schedules FCFS by default, puts all running decodes into the batch before new prefills, and, when the KV cache is full, preempts requests and later recomputes them [Certain] (vLLM docs). It also offers a priority policy [Likely]. FastServe (Wu et al.) replaced FCFS with a preemptive multi-level feedback queue and reports up to 31.4× higher throughput than vLLM under the same average-latency target, on OPT models [Certain]. The Virtual Token Counter (VTC, Sheng et al.) gives each client a fair share of tokens with a proven bound [Certain]. The survey of Zhou et al. (section 6.2) lists scheduling as one of the main parts of a serving system.</p>
+
+<h2>What the scheduler controls, and how we score it</h2>
+<p>Think of the engine as a loop. One <b>iteration</b> is one forward pass of the model over the current batch. In each iteration, every running request in decode makes one new token, and requests in prefill process (part of) their prompt. Between two iterations the scheduler may change the batch. This is <b>iteration-level scheduling</b> (Orca), and it is what makes all the policies in this session possible: a request can be paused after any token.</p>
+<p>The metrics come from <a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>. For a request that arrives at time \(a\), gets its first token at \(t_1\) and its last (the \(n\)-th) at \(t_n\):</p>
+<div class="eq">\[ \text{TTFT} = t_1 - a, \qquad \text{TPOT} = \frac{t_n - t_1}{n - 1}, \qquad \text{JCT} = t_n - a \tag{136.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>TTFT</dt><dd>time to first token: queueing time plus prefill time</dd>
+<dt>TPOT</dt><dd>time per output token after the first one (the average inter-token latency)</dd>
+<dt>JCT</dt><dd>job completion time: the full time from arrival to the last token (also called end-to-end latency)</dd></dl>
+<p>Scheduling papers often also use the <b>slowdown</b> (or normalized latency) of a request: its JCT divided by its own length. A request of 5 tokens that waits 100 steps has slowdown 20; a request of 1,000 tokens that takes 1,100 steps has slowdown 1.1. Average slowdown punishes policies that make short requests wait, which is what users feel.</p>
+<div class="eq">\[ \text{slowdown}_i = \frac{\text{JCT}_i}{n_i}, \qquad \text{goodput} = \frac{\big|\{ i : \text{TTFT}_i \le \tau_{\text{ttft}},\ \text{TPOT}_i \le \tau_{\text{tpot}} \}\big|}{T} \tag{136.2} \]</div>
+<p>Goodput (from <a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>) counts only the requests that met both SLO targets \(\tau_{\text{ttft}}\) and \(\tau_{\text{tpot}}\) in a time window \(T\). A scheduler is good when it raises goodput, not only raw tokens per second.</p>
+
+<h2>FCFS and head-of-line blocking</h2>
+<p><b>First-come-first-served</b> runs requests in the order they arrive. It is simple, it never starves anybody, and it needs no information about the requests. But LLM requests have very different lengths: one asks “yes or no?”, another asks for a 3,000-word essay. When a long request is in front, every short request behind it waits for the long one. This is <b>head-of-line (HOL) blocking</b>.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A supermarket with one till. You hold one bottle of water, and the person in front of you has two full carts. FCFS says you wait 20 minutes for a 10-second purchase. The “express lane” for few items is a shortest-job-first rule.</aside>
+<p>Take one server that runs one request at a time. One long request of length \(L\) arrives first, then \(k\) short ones of length \(s\), all at time 0. Under FCFS the \(j\)-th short request finishes at \(L + js\). If we run the short ones first (<b>shortest job first</b>, SJF), the long one finishes last at \(L + ks\):</p>
+<div class="eq">\[ \overline{\text{JCT}}_{\text{FCFS}} = \frac{L + \sum_{j=1}^{k}(L + j s)}{k+1}, \qquad \overline{\text{JCT}}_{\text{SJF}} = \frac{\sum_{j=1}^{k} j s + (L + k s)}{k+1} \tag{136.3} \]</div>
+<div class="worked"><div class="wt">Worked example: one long request in front</div>
+<p>Let \(L = 100\) steps, \(k = 9\) short requests of \(s = 1\) step. FCFS: \((100 + 9 \cdot 100 + 45)/10 = 104.5\) steps on average. SJF: \((45 + 109)/10 = 15.4\) steps. SJF is 6.8 times better on average. The long request pays for it: its JCT grows from 100 to 109 steps, which is only 9% more.</p></div>
+<p>This is a general result. On one server with all jobs present at time 0, sort the jobs by length \(p_{(1)} \le p_{(2)} \le \dots \le p_{(n)}\). The total completion time is</p>
+<div class="eq">\[ \sum_{i=1}^{n} C_i = \sum_{j=1}^{n} (n - j + 1)\, p_{(j)} \tag{136.4} \]</div>
+<p>because the \(j\)-th job delays itself and every job after it. To make the sum small, the largest weight \(n\) must multiply the smallest \(p\). So SJF minimizes the mean completion time (the “exchange argument”: swapping any long job ahead of a short one makes the sum larger) [Certain]. When jobs arrive over time, the preemptive version, <b>shortest remaining processing time</b> (SRPT), is optimal for the mean [Certain]. There are two catches for LLMs. First, we do not know the output length in advance. Second, preemption is not free because of the KV cache. The rest of the session deals with both.</p>
+<p>Figure 1 runs nine requests through a small engine with 1 to 3 batch slots. Each step, every running request makes one token. Request J1 is long and arrives first.</p>
+<figure class="fig wide" id="sch-p1"><div class="fig-body">
+<div class="controls"><span class="seg" id="sch-p1-pol"><button type="button" data-v="fcfs" aria-pressed="true">FCFS</button><button type="button" data-v="sjf" aria-pressed="false">SJF (true length)</button><button type="button" data-v="sjfp" aria-pressed="false">SJF (predicted)</button><button type="button" data-v="srpt" aria-pressed="false">SRPT (preemptive)</button><button type="button" data-v="mlfq" aria-pressed="false">MLFQ (no length)</button></span></div>
+<div class="sch-grid">
+<label for="sch-p1-L">Length of J1 (tokens)</label><input type="range" id="sch-p1-L" min="4" max="40" step="1" value="20"><output id="sch-p1-Lv"></output>
+<label for="sch-p1-B">Batch slots</label><input type="range" id="sch-p1-B" min="1" max="3" step="1" value="1"><output id="sch-p1-Bv"></output>
+<label for="sch-p1-s">Prediction noise σ (SJF predicted)</label><input type="range" id="sch-p1-s" min="0" max="1.5" step="0.1" value="0.5"><output id="sch-p1-sv"></output></div>
+<div class="scroll-x"><svg id="sch-p1-svg" viewBox="0 0 680 300" role="img" aria-label="Timeline of nine requests under the chosen scheduling policy"></svg></div>
+<div class="sch-leg"><span style="--c:var(--k)">long request J1 running</span><span style="--c:var(--q)">short request running</span><span style="--c:var(--rule)">arrived and waiting</span></div>
+<div class="readout" id="sch-p1-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Nine requests, five policies. Each row is one request; each column is one engine step. The number on the right is the request’s JCT in steps. MLFQ uses quanta of 1, 2, 4, 8 … tokens and knows nothing about lengths.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with FCFS and 1 slot: J1 runs for 20 steps and all eight short requests wait behind it (mean JCT of the short ones: 32.25 steps). Switch to SJF: the short ones finish early (8.88 steps on average) and J1 finishes last. SJF with predicted lengths uses a noisy guess \(\hat n = n\, e^{\sigma z}\); raise σ and watch it make mistakes, but still beat FCFS. MLFQ does not know any length, yet it is far better than FCFS (21.67 against 30.89). Now set 2 slots: SRPT, which may pause J1 at any step, gives the lowest mean, while J1 itself gets slower. Now go back to 1 slot and shorten J1 to 4 tokens: FCFS comes close to SJF (14.89 against 10.89), because HOL blocking needs a long job, and MLFQ becomes worse than FCFS (18.22). When no job is long, MLFQ’s switching between jobs only delays everybody.</p></details></figure>
+
+<h2>Preemption: pausing a request at a token boundary</h2>
+<p>SRPT and MLFQ are <b>preemptive</b>: they may stop a running request to run another one. For a classic web server, pausing a job is cheap. For an LLM, a paused request owns its <b>KV cache</b>: the keys and values of every token so far, which it needs to continue (<a href="../inference/the-kv-cache.html">session 80</a>). There are three options [Certain]:</p>
+<ol>
+<li><b>Keep it on the GPU.</b> The request just skips a few iterations. No extra work, but its memory stays taken, so fewer new requests fit.</li>
+<li><b>Swap it out</b> to CPU memory over PCIe, and swap it back in before it runs again.</li>
+<li><b>Drop it and recompute.</b> Free the memory now. When the request resumes, run a prefill over its prompt plus all tokens it already generated, which rebuilds the cache.</li></ol>
+<p>The size of the cache decides the price. For a model with \(n_\ell\) layers, \(n_{kv}\) key-value heads of dimension \(d_h\), and \(b\) bytes per number:</p>
+<div class="eq">\[ \kappa = 2\, n_\ell\, n_{kv}\, d_h\, b \ \ \text{bytes per token}, \qquad T_{\text{swap}} \approx \frac{\kappa\, \ell}{B_{\text{link}}}, \qquad T_{\text{recompute}} \approx \frac{2 N \ell}{F_{\text{eff}}} \tag{136.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\kappa\)</dt><dd>KV-cache bytes per token; the 2 counts keys and values</dd>
+<dt>\(\ell\)</dt><dd>number of tokens in the request so far (prompt plus generated)</dd>
+<dt>\(B_{\text{link}}\)</dt><dd>bandwidth of the GPU–CPU link actually achieved</dd>
+<dt>\(N\)</dt><dd>number of model parameters; a prefill costs about \(2N\) FLOPs per token (attention adds a little more)</dd>
+<dt>\(F_{\text{eff}}\)</dt><dd>FLOPs per second the GPU actually achieves during prefill</dd></dl>
+<div class="worked"><div class="wt">Worked example: swap or recompute for Llama 3 8B</div>
+<p>Llama 3 8B has 32 layers, 8 KV heads and head dimension 128 [Certain] (its config.json). In BF16: \(\kappa = 2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) bytes, that is 128 KiB per token. A request with \(\ell = 2{,}000\) tokens owns 262 MB of cache.</p>
+<p><b>Swap:</b> assume a PCIe 5.0 x16 link that achieves 50 GB/s (peak is about 64 GB/s per direction) [Likely]: 262 MB / 50 GB/s = 5.2 ms one way. <b>Recompute:</b> \(2 \cdot 8.03 \times 10^{9} \cdot 2{,}000 = 32.1\) TFLOP. On an H100 (989 dense BF16 TFLOPS peak) at 50% utilization, that is 65 ms.</p>
+<p>So per request, swapping is about 12 times faster in raw time here. Why does vLLM V1 recompute by default? Recompute frees memory at once and needs no CPU buffers. The rebuild is a prefill, which is compute-bound, so it can share an iteration with memory-bound decodes and use compute that would be idle (<a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">session 135</a>). Swapping instead needs the copy to overlap with compute, or the GPU waits. vLLM’s docs say recompute has lower overhead in the V1 design [Certain]. With GQA the cache is small, so both options are cheap for short requests.</p></div>
+<p>Who gets preempted? vLLM preempts the most recently admitted request first, so the oldest requests keep making progress (a FCFS-friendly rule) [Likely]. A preemptive policy like SRPT or MLFQ preempts by priority instead. Either way, preemption should be <b>rare</b>: every preemption wastes some work or bandwidth, and it adds a gap in the paused user’s token stream.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: one iteration of a preemptive scheduler (iteration level)</div><ol>
+<li><b>input:</b> running set \(R\), waiting queue \(W\), KV blocks free \(F\), token budget per iteration \(K\), a priority function \(\pi\) (smaller runs first)</li>
+<li>sort \(R \cup W\) by \(\pi\) <span class="c">// FCFS: \(\pi\) = arrival time; SRPT: remaining tokens; MLFQ: queue level</span></li>
+<li><b>for</b> each running request \(r\) that needs a new KV block <b>do</b></li>
+<li>&nbsp;&nbsp;<b>while</b> \(F = 0\) <b>do</b> preempt the request in \(R\) with the worst \(\pi\): swap its blocks out, or free them and mark it “recompute”; move it to \(W\)</li>
+<li>&nbsp;&nbsp;give \(r\) one block, \(F \leftarrow F - 1\)</li>
+<li><b>for</b> each request \(w \in W\) in order of \(\pi\) <b>do</b></li>
+<li>&nbsp;&nbsp;<b>if</b> \(\pi(w)\) is better than the worst \(\pi\) in \(R\) and preemption is allowed <b>then</b> preempt that worst request</li>
+<li>&nbsp;&nbsp;<b>if</b> \(w\) fits in \(F\) and in the token budget \(K\) <b>then</b> move \(w\) to \(R\) (its prefill, or recompute, may be chunked) <b>else break</b></li>
+<li>run one forward pass over \(R\); append one token to every decoding request; remove finished requests and free their blocks</li></ol></div>
+
+<h2>FastServe: a preemptive multi-level feedback queue</h2>
+<p>SRPT needs the remaining length, which we do not know. Operating systems had the same problem for decades and solved it with a <b>multi-level feedback queue</b> (MLFQ). The idea: we cannot see how long a job is, but we can see how long it has <b>already</b> run. A job that has run a long time is probably a long job. So:</p>
+<ul>
+<li>There are queues \(Q_1, Q_2, \dots, Q_m\). \(Q_1\) has the highest priority. The scheduler always runs jobs from the highest non-empty queue, FIFO inside a queue.</li>
+<li>Each queue has a <b>quantum</b>: the amount of service a job may use in that queue. Quanta grow down the queues.</li>
+<li>A new job starts at the top. When it uses up its quantum, it is <b>demoted</b> one queue down.</li></ul>
+<p>Short jobs finish while still in the top queues. Long jobs sink and run when nothing short is waiting. MLFQ approximates SJF without knowing any lengths. FastServe (Wu et al.) applies this to LLM serving, with preemption at the granularity of one output token [Certain]. Its quanta double from queue to queue, starting from the time of the shortest iteration [Certain]:</p>
+<div class="eq">\[ q_i = 2^{\,i-1}\, q_1, \qquad i = 1, \dots, m \tag{136.6} \]</div>
+<h3>Skip-join: the prefill problem</h3>
+<p>Plain MLFQ has an LLM-specific flaw. The first iteration of a request is its <b>prefill</b>, and its time grows with the prompt length. A request with a 4,000-token prompt has a first iteration many times longer than a decode step. If it enters \(Q_1\), it blows through the tiny quantum in its very first iteration, and while it runs, it blocks all the short jobs in \(Q_1\). Then it is demoted step by step, wasting priority on the way. FastServe’s fix is <b>skip-join</b>: profile the prefill time \(t_{\text{init}}\) from the prompt length (which <i>is</i> known at arrival), and let the request join directly the highest queue whose quantum can hold its first iteration [Certain]:</p>
+<div class="eq">\[ i^\star = \min\{\, i : q_i \ge t_{\text{init}} \,\} = 1 + \left\lceil \log_2 \frac{t_{\text{init}}}{q_1} \right\rceil \tag{136.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(q_i\)</dt><dd>quantum of queue \(i\): how much execution time a job may use there before it is demoted</dd>
+<dt>\(t_{\text{init}}\)</dt><dd>predicted time of the request’s first iteration (its prefill), from its prompt length</dd>
+<dt>\(i^\star\)</dt><dd>the queue where the new request starts (for \(t_{\text{init}} \le q_1\) it is queue 1)</dd></dl>
+<p>Example: with \(q_1 = 1\) unit, a request with \(t_{\text{init}} = 3\) skips to \(Q_3\) (quantum 4); one with \(t_{\text{init}} = 8\) goes to \(Q_4\) (quantum 8). Long prompts start at lower priority. Short prompts start at the top.</p>
+<p>Two more pieces complete FastServe. <b>Starvation prevention:</b> any job that has waited longer than a threshold \(\alpha\) is promoted back to \(Q_1\); the paper sets \(\alpha\) from the SLO, with a default of 300 ms [Certain]. <b>Proactive KV-cache swapping:</b> MLFQ keeps many paused jobs, and their caches fill the GPU. FastServe swaps caches to host memory <i>while</i> other jobs run, so the copy is not on the critical path. It estimates for each job when it will run next, swaps out the job that will wait longest, and swaps in the one that will run soonest [Certain]. Their OPT-175B example: one decode iteration takes about 60 ms, while moving a 2.3 GB KV cache takes about 36 ms, so the copy can hide behind the compute [Certain].</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A hospital emergency room. Everyone starts as “quick check”. If a patient still needs care after the quick slot, they move to a longer-care line. A patient who arrives by ambulance with an obvious big problem (a long prompt) is sent straight to the right line instead of blocking the quick-check desk.</aside>
+<div class="algo"><div class="algo-h">Algorithm 2: skip-join MLFQ (FastServe, simplified to one job per iteration)</div><ol>
+<li><b>input:</b> quanta \(q_1 \lt q_2 \lt \dots \lt q_m\) with \(q_i = 2^{i-1} q_1\), starvation threshold \(\alpha\)</li>
+<li><b>on arrival</b> of request \(r\): estimate \(t_{\text{init}}(r)\) from its prompt length; put \(r\) at the tail of \(Q_{i^\star}\) (formula 136.7); \(\text{used}(r) \leftarrow 0\)</li>
+<li><b>loop</b> every iteration:</li>
+<li>&nbsp;&nbsp;<b>for</b> each waiting \(r\) with wait time \(\ge \alpha\): move \(r\) to the tail of \(Q_1\), \(\text{used}(r) \leftarrow 0\) <span class="c">// no starvation</span></li>
+<li>&nbsp;&nbsp;pick the head \(r\) of the highest non-empty queue \(Q_i\); swap its KV cache in if needed</li>
+<li>&nbsp;&nbsp;run one iteration of \(r\) (prefill if it has no token yet, else one decode step); \(\text{used}(r) \mathrel{+}= \) its time</li>
+<li>&nbsp;&nbsp;<b>if</b> \(r\) finished <b>then</b> free its cache</li>
+<li>&nbsp;&nbsp;<b>else if</b> \(\text{used}(r) \ge q_i\) <b>then</b> demote \(r\) to the tail of \(Q_{\min(i+1, m)}\), \(\text{used}(r) \leftarrow 0\)</li>
+<li>&nbsp;&nbsp;in the background: swap out caches of jobs that will run last, swap in those that will run next</li></ol></div>
+<p>The real FastServe runs a batch of the top jobs together, not one, and demotes by more than one level when the next iteration is long [Certain]. Figure 2 keeps one job per iteration so you can follow every step.</p>
+<figure class="fig wide" id="sch-mq"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="sch-mq-prev">Back</button><button type="button" class="btn primary" id="sch-mq-play">Play</button><button type="button" class="btn" id="sch-mq-next">Next</button><span id="sch-mq-lab" style="font:500 14px var(--sans);color:var(--muted)"></span><label class="sl"><input type="checkbox" id="sch-mq-skip" checked> Skip-join</label></div>
+<div class="scroll-x"><svg id="sch-mq-svg" viewBox="0 0 680 330" role="img" aria-label="Four priority queues with jobs moving between them, and a timeline of executed iterations"></svg></div>
+<div class="readout" id="sch-mq-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Skip-join MLFQ on five requests. Quanta are 1, 2, 4, 8 time units (one decode iteration = 1 unit). Prefill times \(t_{\text{init}}\): A = 4, B = 1, C = 2, D = 1, E = 8; output lengths: A = 8, B = 3, C = 5, D = 2, E = 3 tokens. A and B arrive at time 0, C at 1, D at 3, E at 6. Starvation threshold \(\alpha = 12\).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Each step is one iteration. The four lanes are the queues; the small numbers on a chip are the time it has used in that queue and the quantum. The bar at the bottom shows which job ran when (wide blocks are prefills). With skip-join on, A (prefill 4) starts in \(Q_3\) and E (prefill 8) in \(Q_4\), so the short requests B and D finish at once: mean JCT 15.4 units, against 17.8 for FCFS run-to-completion. In iteration 13 (time 23) A is promoted back to \(Q_1\): it has waited 12 units since it last ran. Turn skip-join off: everybody starts in \(Q_1\), every long prefill runs at top priority and blocks the others, and the mean JCT becomes 24.0, worse than FCFS.</p></details></figure>
+
+<h2>Fairness between users: the Virtual Token Counter</h2>
+<p>So far every request was alone. A real API serves many <b>clients</b> (customers, apps, tenants). If client A sends 10 times more requests than client B, FCFS gives A about 10 times more GPU and makes B’s few requests wait in A’s long queue. A common fix is a request-per-minute (RPM) limit per client. Sheng et al. show that RPM limits are not <b>work-conserving</b>: the GPU can sit partly idle while a limited client still has requests waiting, so throughput is lost [Certain]. They want a scheduler that never idles when work exists and still shares the GPU fairly.</p>
+<p>First, what is “service”? Counting requests is wrong, because requests have very different sizes. VTC counts tokens, with a weight for input tokens and one for output tokens:</p>
+<div class="eq">\[ W_i(t_1, t_2) = w_p\, n_p + w_q\, n_q \tag{136.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W_i(t_1, t_2)\)</dt><dd>service received by client \(i\) in the time window \([t_1, t_2)\)</dd>
+<dt>\(n_p, n_q\)</dt><dd>input (prompt) tokens processed and output tokens generated for client \(i\) in that window</dd>
+<dt>\(w_p, w_q\)</dt><dd>weights; the paper uses \(w_p = 1\), \(w_q = 2\), following API prices where output tokens cost about twice as much [Certain]</dd></dl>
+<p>Fair means: two clients that both always have requests waiting (“backlogged”) receive about the same \(W\). A client that asks for less than its share gets all it asks for, quickly. This is the classic idea of fair queuing from networks, adapted to continuous batching.</p>
+<h3>How VTC works</h3>
+<p>Each client \(i\) has a counter \(c_i\) of the service it got. Three rules [Certain]:</p>
+<ol>
+<li><b>Pick the least-served client.</b> When there is room in the batch, take the client with the smallest counter among clients with waiting requests, and admit that client’s oldest request. Add \(w_p \times\) (its input length) to the client’s counter at admission.</li>
+<li><b>Charge as you go.</b> After each decode step, add \(w_q\) to the counter of every client with a running request, once per token it produced.</li>
+<li><b>Lift the counter of a returning client.</b> When a request arrives from a client with nothing in the queue, raise its counter so it cannot use credit saved while it was idle:</li></ol>
+<div class="eq">\[ c_u \leftarrow \max\Big( c_u,\ \min_{i \in \mathcal{Q}} c_i \Big) \tag{136.9} \]</div>
+<p>Here \(\mathcal{Q}\) is the set of clients with waiting requests. (If the queue is empty, the paper lifts \(c_u\) to the counter of the last client that left the queue.) Without the lift, a client that was quiet for an hour would return with a tiny counter and take the whole GPU until it caught up, starving everybody. The idea is “no saving up”: fairness is about the present, not about the past. The paper calls VTC without the lift “least counter first” (LCF).</p>
+<p>The main result bounds the difference in service between any two backlogged clients \(f\) and \(g\), over <b>any</b> time window [Certain]:</p>
+<div class="eq">\[ \big| W_f(t_1, t_2) - W_g(t_1, t_2) \big| \le 2 \cdot \max\big( w_p L_{\text{input}},\ w_q M \big) \tag{136.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(L_{\text{input}}\)</dt><dd>the maximum input length of a request</dd>
+<dt>\(M\)</dt><dd>the maximum number of tokens that fit in one running batch (KV-cache capacity)</dd></dl>
+<p>The bound does not grow with the window length: over an hour or a day, the gap stays the same constant. The paper also shows that some work-conserving schedule must have a gap of at least \(w_q M\), so the factor 2 is close to the best possible [Certain]. The scheduler is about 100 lines on top of S-LoRA [Certain].</p>
+<div class="algo"><div class="algo-h">Algorithm 3: Virtual Token Counter (Sheng et al., simplified)</div><ol>
+<li><b>state:</b> counters \(c_i = 0\) for all clients; waiting queue \(\mathcal{W}\); running batch \(R\); weights \(w_p, w_q\)</li>
+<li><b>on arrival</b> of request \(r\) from client \(u\): <b>if</b> \(u\) has no request in \(\mathcal{W}\) <b>then</b> lift \(c_u\) by formula (136.9); append \(r\) to \(\mathcal{W}\)</li>
+<li><b>each iteration:</b></li>
+<li>&nbsp;&nbsp;<b>while</b> \(\mathcal{W}\) is not empty <b>do</b></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;\(k \leftarrow \argmin_{i \text{ with requests in } \mathcal{W}} c_i\); \(r \leftarrow\) oldest request of \(k\)</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;<b>if</b> \(r\) does not fit in memory <b>then break</b></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;move \(r\) to \(R\); \(c_k \leftarrow c_k + w_p \cdot \text{input\_len}(r)\)</li>
+<li>&nbsp;&nbsp;run one decode step on \(R\); <b>for</b> each running request of client \(i\): \(c_i \leftarrow c_i + w_q\)</li></ol></div>
+<p>VTC also works with other cost functions, for example a cost based on FLOPs, where tokens with a long prefix cost more because of attention, or a profiled cost curve, and it extends to weighted shares (a paying tier gets twice the weight) [Certain]. Figure 3 compares FCFS, LCF and VTC.</p>
+<figure class="fig" id="sch-vtc"><div class="fig-body">
+<div class="controls"><span class="seg" id="sch-vtc-pol"><button type="button" data-v="fcfs" aria-pressed="false">FCFS</button><button type="button" data-v="lcf" aria-pressed="false">LCF (no lift)</button><button type="button" data-v="vtc" aria-pressed="true">VTC</button></span></div>
+<div class="sch-grid">
+<label for="sch-vtc-c">Client C starts sending at step</label><input type="range" id="sch-vtc-c" min="40" max="160" step="10" value="80"><output id="sch-vtc-cv"></output></div>
+<svg id="sch-vtc-svg" viewBox="0 0 640 280" role="img" aria-label="Cumulative service of three clients over 200 steps"></svg>
+<div class="sch-leg"><span style="--c:var(--q)">client A (heavy, 1 request per step)</span><span style="--c:var(--k)">client B (light, 1 request per 8 steps)</span><span style="--c:var(--v)">client C (heavy, joins later)</span></div>
+<div class="readout" id="sch-vtc-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Three clients share an engine with 4 batch slots. Every request has 16 input and 8 output tokens, so it costs \(16 w_p + 8 w_q = 32\) with \(w_p = 1\), \(w_q = 2\). The engine can finish half a request per step, so A alone already overloads it. Lines show the cumulative service \(W\) of each client.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>FCFS: A’s flood fills the queue, B’s requests wait behind it (49.55 steps on average) and C gets almost nothing. LCF: B is served at once, but when C joins at step 80 its counter is 0, so C takes every slot and A is not admitted for 81 steps. That is the “saved credit” problem. VTC: C’s counter is lifted to A’s, so from then on A and C grow at the same slope (480 each in steps 120–199), and B, which asks for less than its share, gets all its 320 with zero waiting. Move the start step of C and check that the pattern stays.</p></details></figure>
+
+<h2>SLOs and output-length prediction</h2>
+<p>A production service has explicit targets, such as TTFT ≤ 1 s at P99 and TPOT ≤ 50 ms. Scheduling affects both. TTFT is mostly <b>queueing</b>: how long a request waits for a slot and for its prefill. TPOT is mostly <b>batch size</b>: every running request shares each iteration, and a bigger batch makes each iteration slower. A simple model of one memory-bound decode iteration (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>) is that it reads all weights once plus the KV cache of every request in the batch:</p>
+<div class="eq">\[ \text{TPOT}(b) \approx \frac{P + b\, \ell\, \kappa}{\text{BW}}, \qquad b_{\max} = \min\left( \left\lfloor \frac{\tau_{\text{tpot}}\, \text{BW} - P}{\ell\, \kappa} \right\rfloor,\ \left\lfloor \frac{M_{\text{KV}}}{\ell\, \kappa} \right\rfloor \right) \tag{136.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(b\)</dt><dd>number of requests in the batch</dd>
+<dt>\(P\)</dt><dd>bytes of model weights</dd>
+<dt>\(\ell\)</dt><dd>context length of each request (assumed equal here); \(\kappa\) is KV bytes per token, formula (136.5)</dd>
+<dt>BW</dt><dd>HBM bandwidth of the GPU</dd>
+<dt>\(\tau_{\text{tpot}}\)</dt><dd>the TPOT target</dd>
+<dt>\(M_{\text{KV}}\)</dt><dd>memory available for KV cache</dd></dl>
+<p>This is a best case: it assumes full bandwidth and ignores compute, which is fair while the batch is small enough for decode to stay memory-bound. The first term of \(b_{\max}\) is the SLO limit; the second is the memory limit. An SLO-aware scheduler admits requests only up to \(b_{\max}\) and lets the rest wait (or sends them to another replica). Admitting more raises tokens per second but makes every running user slower.</p>
+<div class="worked"><div class="wt">Worked example: how many users fit under a 20 ms TPOT target?</div>
+<p>Llama 3 8B in BF16 has \(P = 8.03 \times 10^9 \times 2 = 16.06\) GB. On an H100 SXM (80 GB, 3.35 TB/s), reading the weights alone takes \(16.06 / 3350 = 4.79\) ms. Each request with \(\ell = 2{,}048\) tokens adds \(2{,}048 \times 131{,}072\) bytes = 268 MB, which is 0.080 ms more per iteration.</p>
+<p>SLO limit: \(\lfloor (20 - 4.79)/0.080 \rfloor = 189\) requests. Memory limit, if 90% of 80 GB is usable: \(\lfloor (72 - 16.06)\ \text{GB} / 268\ \text{MB} \rfloor = 208\). So \(b_{\max} = 189\), TPOT is 19.94 ms, and the GPU makes \(189 / 0.01994 \approx 9{,}479\) tokens per second at best. With a looser 50 ms target, memory becomes the limit (208 requests) and TPOT is only 21.5 ms.</p></div>
+<figure class="fig" id="sch-slo"><div class="fig-body">
+<div class="sch-grid">
+<label for="sch-slo-L">Context per request (tokens)</label><input type="range" id="sch-slo-L" min="0" max="6" step="1" value="2"><output id="sch-slo-Lv"></output>
+<label for="sch-slo-t">TPOT target (ms)</label><input type="range" id="sch-slo-t" min="6" max="60" step="1" value="20"><output id="sch-slo-tv"></output></div>
+<svg id="sch-slo-svg" viewBox="0 0 640 270" role="img" aria-label="TPOT against batch size with the SLO line and the memory limit"></svg>
+<div class="sch-leg"><span style="--c:var(--q)">TPOT(b), formula (136.11)</span><span style="--c:var(--k)">TPOT target</span><span style="--c:var(--v)">KV-memory limit</span></div>
+<div class="readout" id="sch-slo-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> SLO-aware admission for Llama 3 8B (BF16) on one H100 SXM, with the best-case memory-bound model (136.11). The dot marks the largest batch that meets both the TPOT target and the memory limit.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The solid line rises with batch size because each request adds its KV cache to every iteration’s reads. Where it crosses the dashed target line, the SLO stops you; at the shaded wall, KV memory stops you. Long contexts (16K, 32K) make each request expensive, so few users fit and memory is often the limit first. Short contexts and a strict target make the SLO the limit. A target below 4.79 ms cannot be met at all: that is the time to read the weights once.</p></details></figure>
+<h3>Deadline-aware ordering</h3>
+<p>Given targets, the scheduler can also choose the <b>order</b>. Earliest deadline first (EDF) runs the request whose TTFT deadline \(a_i + \tau_{\text{ttft}}\) comes soonest. Under heavy overload, EDF can fail badly, because it spends time on requests that will miss anyway. A common fix is to drop or delay requests that cannot make their deadline any more, and serve those that still can [Likely]. Andes (Liu et al.) goes one step further and schedules at the token level to maximize users’ quality of experience: a user who reads slowly does not need tokens faster than they read, so their request can be paused briefly while another user catches up [Certain].</p>
+<h3>Predicting the output length</h3>
+<p>SJF and SRPT beat FCFS, but they need lengths. The prompt length is known; the output length is not. Three ways to get it:</p>
+<ul>
+<li><b>Ask the model.</b> Zheng et al. let the LLM itself estimate its response length (“response length perception”) and group requests of similar predicted length into one batch, so they finish together; they report 86% higher throughput with a LLaMA-based model [Certain].</li>
+<li><b>A small predictor.</b> S³ (Jin et al.) trains a small classifier on the prompt to predict the output length bucket, sizes the KV allocation by it, and handles mispredictions; it reports 6.49× higher throughput than systems that assume the worst-case length [Certain].</li>
+<li><b>Predict the order, not the number.</b> Fu et al. argue that exact lengths are hard to predict but the <i>ranking</i> of requests by length is easier. They train a ranker with learning to rank and approximate SJF with it; they report 2.8× lower latency for chatbot serving and 6.5× higher throughput for synthetic data generation [Certain].</li></ul>
+<p>The third idea fits the math: SJF (formula 136.4) needs only the order of the jobs, not their exact sizes. A predictor that gets the order mostly right gives most of the gain, as the “SJF (predicted)” option in Figure 1 shows. Two cautions: a prediction can be badly wrong (a “short” request that writes an essay), so pair it with preemption or MLFQ-style demotion; and strict SJF starves long requests under load, so add aging (raise the priority of a request as it waits), as FastServe does with \(\alpha\).</p>
+<aside class="note watch side"><span class="nt">Watch out</span>The mean improves but the tail of long requests gets worse. In the code below, SRPT cuts the mean JCT by half against FCFS, while the P99 JCT almost doubles. Always report both, and decide with the product team which users may wait.</aside>
+
+<h2>The code: a small scheduling simulator</h2>
+<p>This simulator mirrors Figure 1 on a random workload: 200 requests, Poisson-like arrivals, log-normal output lengths (many short, a few very long, as in chat traffic), 8 batch slots. It compares FCFS, SJF with a noisy length predictor, MLFQ with doubling quanta, and SRPT with true lengths. The last lines show the VTC rules. It is deterministic: run it twice and you get the same numbers.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(0)
+
+<span class="cm"># A toy iteration-level engine: B batch slots, one token per running request per step.</span>
+N, B = 200, 8
+arrival = torch.cumsum(torch.distributions.Exponential(0.22).sample((N,)), 0).floor().long()
+length  = torch.distributions.LogNormal(3.0, 1.0).sample((N,)).ceil().long().clamp(1, 1000)
+pred    = length.float() * torch.exp(0.5 * torch.randn(N))     <span class="cm"># a noisy length predictor</span>
+
+<span class="kw2">def</span> simulate(policy):
+    rem, lvl, used, enq = length.clone(), [0] * N, [0] * N, arrival.tolist()
+    done, running, t = [None] * N, [], 0
+    <span class="kw2">while</span> any(d <span class="kw2">is</span> None <span class="kw2">for</span> d <span class="kw2">in</span> done):
+        ready = [i <span class="kw2">for</span> i <span class="kw2">in</span> range(N) <span class="kw2">if</span> arrival[i] &lt;= t <span class="kw2">and</span> done[i] <span class="kw2">is</span> None]
+        <span class="kw2">if</span> policy <span class="kw2">in</span> ("fcfs", "sjf_pred"):                  <span class="cm"># non-preemptive: keep running jobs</span>
+            running = [i <span class="kw2">for</span> i <span class="kw2">in</span> running <span class="kw2">if</span> done[i] <span class="kw2">is</span> None]
+            key = (<span class="kw2">lambda</span> i: arrival[i].item()) <span class="kw2">if</span> policy == "fcfs" <span class="kw2">else</span> (<span class="kw2">lambda</span> i: pred[i].item())
+            waiting = sorted((i <span class="kw2">for</span> i <span class="kw2">in</span> ready <span class="kw2">if</span> i <span class="kw2">not in</span> running), key=key)
+            running += waiting[: B - len(running)]
+            batch = running
+        <span class="kw2">elif</span> policy == "srpt":                              <span class="cm"># preemptive, oracle remaining length</span>
+            batch = sorted(ready, key=<span class="kw2">lambda</span> i: rem[i].item())[:B]
+        <span class="kw2">else</span>:                                               <span class="cm"># "mlfq": no length knowledge</span>
+            batch = sorted(ready, key=<span class="kw2">lambda</span> i: (lvl[i], enq[i]))[:B]
+        <span class="kw2">for</span> i <span class="kw2">in</span> batch:
+            rem[i] -= 1
+            <span class="kw2">if</span> rem[i] == 0:
+                done[i] = t + 1
+            <span class="kw2">elif</span> policy == "mlfq":
+                used[i] += 1
+                <span class="kw2">if</span> used[i] >= 2 ** lvl[i]:                  <span class="cm"># quantum doubles per level, formula (136.6)</span>
+                    lvl[i], used[i], enq[i] = lvl[i] + 1, 0, t + 1
+        t += 1
+    jct = torch.tensor(done) - arrival
+    <span class="kw2">return</span> jct.float().mean().item(), jct.float().quantile(0.99).item()
+
+<span class="kw2">for</span> p <span class="kw2">in</span> ["fcfs", "sjf_pred", "mlfq", "srpt"]:
+    mean, p99 = simulate(p)
+    print(f"{p:9s} mean JCT {mean:7.1f}   p99 JCT {p99:7.1f}  (steps)")
+
+<span class="cm"># Virtual Token Counter: pick the backlogged client with the smallest counter, formulas (136.8)-(136.9)</span>
+<span class="kw2">def</span> vtc_pick(counters, queued_clients):
+    <span class="kw2">return</span> min(queued_clients, key=<span class="kw2">lambda</span> u: (counters[u], u))
+
+<span class="kw2">def</span> vtc_on_arrival(counters, u, queued_clients):
+    <span class="kw2">if</span> u <span class="kw2">not in</span> queued_clients <span class="kw2">and</span> queued_clients:          <span class="cm"># counter lift: no saved-up credit</span>
+        counters[u] = max(counters[u], min(counters[v] <span class="kw2">for</span> v <span class="kw2">in</span> queued_clients))
+
+c = {"A": 900.0, "B": 0.0, "C": 1500.0}
+vtc_on_arrival(c, "B", ["A", "C"])
+print(c, vtc_pick(c, ["A", "B", "C"]))</pre>
+<p>Output with PyTorch 2.8 on CPU (about 5 seconds):</p>
+<pre class="code">fcfs      mean JCT   108.4   p99 JCT   295.7  (steps)
+sjf_pred  mean JCT    71.5   p99 JCT   546.8  (steps)
+mlfq      mean JCT    78.4   p99 JCT   812.2  (steps)
+srpt      mean JCT    53.8   p99 JCT   571.8  (steps)
+{'A': 900.0, 'B': 900.0, 'C': 1500.0} A</pre>
+<p>Read it carefully. SRPT halves the mean against FCFS, and a predictor with large noise (\(\sigma = 0.5\), so a guess is often off by 1.6× or more) still gets most of that gain. But all three non-FCFS policies make the P99 worse, and MLFQ without starvation prevention is the worst at the tail: long requests sink to the bottom queue and wait behind every newcomer. This is exactly why FastServe adds the promotion threshold \(\alpha\). In the last line B returned with counter 0, was lifted to 900 (the smallest counter in the queue), and wins the tie-break only by name: A and B now share fairly, and C waits until they catch up.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical policy</th><th>Why</th></tr></thead><tbody>
+<tr><td>vLLM (default)</td><td>FCFS; decodes first, then prefills in the token budget; preempt by recompute when KV memory runs out [Certain]</td><td>Simple, no starvation, predictable; chunked prefill limits the worst HOL effect of long prompts</td></tr>
+<tr><td>Interactive chat with a TTFT and TPOT SLO</td><td>SLO-aware admission (cap the batch, formula 136.11), priority to interactive traffic, aging</td><td>Goodput, not raw throughput, is what users and contracts measure</td></tr>
+<tr><td>Multi-tenant API (many customers on one model)</td><td>Fair queuing by weighted tokens (VTC), plus per-tier weights</td><td>A heavy tenant must not slow down a light one, and the GPU must not idle</td></tr>
+<tr><td>Offline batch jobs (evaluation, synthetic data, labeling)</td><td>Throughput-first; group by predicted length; run at low priority behind interactive work</td><td>No user is waiting; length grouping reduces wasted slots (Zheng et al., Fu et al.)</td></tr>
+<tr><td>Video-RAG and video question answering</td><td>Separate long-prompt requests (thousands of visual tokens) by skip-join-like priority or a separate prefill pool</td><td>A video request’s prefill is long; without care it blocks short chat turns (<a href="../inference/distributed-serving-and-prefill-decode-disaggregation.html">session 137</a>)</td></tr>
+<tr><td>Live key-moment detection and alerts on a video stream</td><td>Strict priority plus deadlines (EDF) for alert requests; captions and summaries as background work</td><td>An alert that arrives late is worthless; a summary can wait</td></tr>
+<tr><td>Video retrieval, classification and fingerprinting with an LLM or VLM re-ranker</td><td>Short, fixed-length outputs, so FCFS with batching is fine; fairness across indexing jobs</td><td>Lengths are known and equal, so HOL blocking is small</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Optimizing only the mean.</b> SJF and SRPT lower the mean JCT but can starve long requests. Report P50 and P99, and add aging or a starvation threshold.</li>
+<li><b>Ignoring the cost of preemption.</b> A preemption either wastes recompute FLOPs or uses PCIe bandwidth. A policy that preempts every few steps can lose more than it gains. Keep a minimum run time or quantum.</li>
+<li><b>Putting long prompts at the top priority.</b> In a token-quantum MLFQ, a long prefill uses its whole first iteration at top priority and blocks short jobs. Use the prompt length (skip-join) or chunked prefill.</li>
+<li><b>Counting requests instead of tokens for fairness.</b> A client with few huge requests can then take most of the GPU. Charge by weighted input and output tokens (formula 136.8).</li>
+<li><b>Letting idle clients bank credit.</b> Least-counter-first without the lift (136.9) lets a returning client starve everybody.</li>
+<li><b>Trusting length predictions blindly.</b> Pair predictions with a fallback: preempt or demote a request that runs much longer than predicted.</li>
+<li><b>Admitting until memory is full.</b> The memory limit is not the SLO limit. A full batch can violate the TPOT target for every user at once (Figure 4).</li>
+<li><b>Benchmarking at one arrival rate.</b> Policies look the same at low load, where the queue is empty. Their differences appear near and above full load. Sweep the request rate.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is head-of-line blocking in LLM serving, and why is it worse than in a typical web server?<span class="lvl">basic</span></summary><div class="ans">With FCFS, a request at the head of the queue that takes a long time makes every request behind it wait, even if they need only a few tokens. It is worse for LLMs because request lengths vary by orders of magnitude (a few tokens to thousands), and the length is unknown at arrival. With one long request of 100 steps in front of nine requests of 1 step, the mean JCT is 104.5 steps under FCFS and 15.4 under SJF.</div></details>
+<details class="qa"><summary>Why does SJF minimize the mean completion time?<span class="lvl">core</span></summary><div class="ans">On one server with all jobs present, the total completion time is \(\sum_j (n-j+1)\,p_{(j)}\): the \(j\)-th job delays itself and all later jobs. The largest multiplier should go to the smallest job. If a longer job ran right before a shorter one, swapping them lowers the sum (exchange argument). With arrivals over time, the preemptive SRPT is optimal for the mean.</div></details>
+<details class="qa"><summary>You do not know output lengths. How can you still get most of the benefit of SJF?<span class="lvl">core</span></summary><div class="ans">Two ways. (1) Use attained service as a signal: a multi-level feedback queue starts every job at high priority and demotes it after it uses its quantum, so short jobs finish early and long ones sink (FastServe). (2) Predict: a small model or the LLM itself predicts the output length or a length bucket, or a learned ranker predicts the order of requests by length (learning to rank). SJF needs only the order, so a ranker is enough. Always add a fallback for mispredictions and aging against starvation.</div></details>
+<details class="qa"><summary>What is skip-join in FastServe, and what problem does it solve?<span class="lvl">advanced</span></summary><div class="ans">In MLFQ every job usually starts in the top queue with the smallest quantum. For an LLM the first iteration is the prefill, whose time grows with the prompt. A long prompt would use far more than the top quantum in one iteration while blocking short jobs, then be demoted step by step. Skip-join estimates the prefill time from the prompt length and puts the job directly in the highest queue whose quantum is at least that time: \(i^\star = \min\{i : q_i \ge t_{\text{init}}\}\), with quanta doubling per queue.</div></details>
+<details class="qa"><summary>A request is preempted. What happens to its KV cache? Compare the options.<span class="lvl">core</span></summary><div class="ans">Keep it on the GPU (no extra work, but memory stays taken), swap it to CPU memory (costs \(\kappa \ell / B_{\text{link}}\) each way and CPU buffers; it must overlap with compute to be hidden), or drop it and recompute (a prefill over prompt plus generated tokens, about \(2N\ell\) FLOPs, but memory is freed at once and the work is compute-bound, so it can share iterations with memory-bound decodes). For Llama 3 8B and 2,000 tokens: 262 MB, about 5 ms to swap at 50 GB/s versus about 65 ms to recompute at half of H100 peak. vLLM V1 defaults to recompute because it has lower overhead in its design.</div></details>
+<details class="qa"><summary>Why are request-per-minute limits a poor way to get fairness?<span class="lvl">basic</span></summary><div class="ans">They are not work-conserving: a client at its limit is blocked even when the GPU has spare capacity, so throughput is wasted. They also count requests, not work, so one client with few long requests can still use most of the GPU. Inside the limit, requests are still served FCFS, so a burst still blocks others.</div></details>
+<details class="qa"><summary>Explain the Virtual Token Counter and why it needs a counter lift.<span class="lvl">core</span></summary><div class="ans">Each client has a counter of weighted service, \(w_p\) per input token and \(w_q\) per output token (1 and 2 in the paper). When the batch has room, the scheduler admits the oldest request of the backlogged client with the smallest counter, and counters grow as tokens are processed. Without a lift, a client that was idle has a small counter and on return monopolizes the GPU until it catches up, starving others. The lift sets a returning client’s counter to at least the minimum counter of the waiting clients, so no credit is saved while idle.</div></details>
+<details class="qa"><summary>What fairness guarantee does VTC give, and what do the terms mean?<span class="lvl">advanced</span></summary><div class="ans">For any two clients that are backlogged during a window, the difference in received service is at most \(2\max(w_p L_{\text{input}}, w_q M)\), where \(L_{\text{input}}\) is the largest input length and \(M\) the largest number of tokens in a running batch. The bound is independent of the window length, so the shares converge. The authors also show a lower bound of \(w_q M\) for some work-conserving schedule, so VTC is within a factor of 2 of the best possible bound.</div></details>
+<details class="qa"><summary>Your service has a 50 ms TPOT SLO and you see violations at high load. What do you do?<span class="lvl">core</span></summary><div class="ans">TPOT rises with batch size because every iteration reads every running request’s KV cache. Cap the batch with SLO-aware admission (\(b_{\max}\) from \(\text{TPOT}(b) \le \tau\)) so excess requests wait or go to another replica. Use chunked prefill so prefills do not create long iterations, separate long-context requests, or disaggregate prefill and decode. Measure per-request TPOT at P99, not only the mean, and add capacity if goodput is still too low.</div></details>
+<details class="qa"><summary>Why can earliest-deadline-first scheduling fail under overload, and how do you fix it?<span class="lvl">advanced</span></summary><div class="ans">EDF always serves the most urgent request. Under overload, many requests are already late or will be; EDF keeps spending time on them, so others become late too (a domino effect) and goodput collapses. Fixes: admission control, dropping or deprioritizing requests that cannot meet their deadline any more, and scheduling for goodput (serve requests that can still make it). Token-level schemes such as Andes also use the fact that a reader does not need tokens faster than they read.</div></details>
+<details class="qa"><summary>Design the scheduler for an API with free and paid tiers, chat and batch traffic.<span class="lvl">advanced</span></summary><div class="ans">Classes first: interactive chat with SLOs above batch jobs; batch only fills spare capacity and is preempted first (by recompute, since it is not latency-sensitive). Inside the interactive class, weighted fair queuing by tokens (VTC with higher weight for paid tenants) so no tenant starves others. Within a tenant, a length-aware order (MLFQ or a learned ranker) with aging. Admission capped by the TPOT SLO and KV memory. Monitor goodput and P99 TTFT per tier; route overflow to other replicas.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>One server, all at time 0: one request of 50 steps and four requests of 2 steps each. Compute the mean JCT under FCFS (long first) and under SJF.</li>
+<li>FastServe-style quanta with \(q_1 = 1\) decode iteration, doubling. A request’s prefill is estimated at 3.5 iterations. Which queue does it join with skip-join?</li>
+<li>Llama 3 8B, BF16, a paused request with 4,096 tokens. How large is its KV cache, and how long does one swap-out take at 50 GB/s?</li>
+<li>With \(w_p = 1\) and \(w_q = 2\), what is the VTC cost of one request with 300 input and 100 output tokens? Client A sends 10 of them; client B sent none so far but now arrives while A is the only waiting client with counter 5,000. What is B’s counter after the lift?</li>
+<li>Use formula (136.11) with the numbers of the worked example, but \(\ell = 4{,}096\) and a TPOT target of 30 ms. What is \(b_{\max}\), which limit binds, and what is the TPOT then? Check it in Figure 4.</li>
+<li>In Figure 2, turn skip-join off. Explain in two sentences why the mean JCT gets worse than FCFS.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. FCFS: completions 50, 52, 54, 56, 58, mean 54. SJF: 2, 4, 6, 8, 58, mean 15.6. 2. \(q_3 = 4 \ge 3.5\) and \(q_2 = 2 \lt 3.5\), so \(Q_3\) (formula 136.7: \(1 + \lceil \log_2 3.5 \rceil = 3\)). 3. \(4{,}096 \times 131{,}072 = 537\) MB; \(537\ \text{MB} / 50\ \text{GB/s} = 10.7\) ms. 4. \(300 + 2 \cdot 100 = 500\); A’s ten requests cost 5,000. B is lifted to \(\max(0, 5{,}000) = 5{,}000\), so it cannot jump ahead with saved credit. 5. Weights 4.79 ms, each request 0.160 ms: SLO limit \(\lfloor (30 - 4.79)/0.160 \rfloor = 157\); memory limit \(\lfloor 55.94\ \text{GB} / 0.537\ \text{GB} \rfloor = 104\). Memory binds, \(b_{\max} = 104\), and TPOT \(= (16.06 + 104 \times 0.537)/3.35 = 21.5\) ms, well under the target. 6. Every request starts in \(Q_1\), so the long prefills of A (4 units) and E (8 units) run at top priority, and the short requests that arrive meanwhile wait behind them, which is HOL blocking again. Then all jobs are demoted together and the decodes interleave, so even the short jobs B and D finish late (26 and 18 units instead of 3 and 4).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Iteration-level scheduling lets the engine change the batch after every token; the policy decides TTFT, TPOT and JCT (136.1) and goodput (136.2), even though total work is the same.</li>
+<li>FCFS suffers head-of-line blocking (136.3). SJF minimizes the mean completion time (136.4); SRPT is its preemptive, optimal version, but both need lengths and can starve long jobs.</li>
+<li>Preemption costs memory, PCIe bandwidth or recompute (136.5). For Llama 3 8B a 2,000-token cache is 262 MB: about 5 ms to swap, about 65 ms to recompute; vLLM V1 recomputes by default.</li>
+<li>FastServe uses an MLFQ with doubling quanta (136.6), skip-join by prefill time (136.7), starvation promotion and proactive KV swapping.</li>
+<li>VTC shares the GPU by weighted tokens (136.8), lifts returning clients (136.9), and bounds the service gap by \(2\max(w_p L_{\text{input}}, w_q M)\) (136.10).</li>
+<li>SLO-aware admission caps the batch where TPOT meets the target or memory runs out (136.11). Output-length prediction or ranking makes SJF-like ordering possible; always add a fallback and aging.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \sum_i C_i = \sum_j (n-j+1)\, p_{(j)}, \qquad i^\star = \min\{ i : 2^{i-1} q_1 \ge t_{\text{init}} \}, \qquad \kappa = 2 n_\ell n_{kv} d_h b \]</div>
+<div class="eq">\[ c_u \leftarrow \max\big(c_u, \min_{i \in \mathcal{Q}} c_i\big), \qquad |W_f - W_g| \le 2\max(w_p L_{\text{input}}, w_q M), \qquad \text{TPOT}(b) \approx \frac{P + b \ell \kappa}{\text{BW}} \]</div>
+<h2 class="plain" id="scheduling-fcfs-preemption-fairness-and-slos-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Wu et al. (2023). <a href="https://arxiv.org/abs/2305.05920" target="_blank" rel="noopener">Fast Distributed Inference Serving for Large Language Models (FastServe)</a></li><li>Sheng et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Fairness in Serving Large Language Models (VTC)&amp;quot;" target="_blank" rel="noopener">Fairness in Serving Large Language Models (VTC)</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Wu et al. (2023). <a href="https://arxiv.org/abs/2305.05920" target="_blank" rel="noopener">Fast Distributed Inference Serving for Large Language Models (FastServe)</a></li><li>Sheng et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Fairness in Serving Large Language Models (VTC)&amp;quot;" target="_blank" rel="noopener">Fairness in Serving Large Language Models (VTC)</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Yu et al. (2022). <a href="https://scholar.google.com/scholar?q=&amp;quot;Orca: A Distributed Serving System for Transformer-Based Generative Models&amp;quot;" target="_blank" rel="noopener">Orca: A Distributed Serving System for Transformer-Based Generative Models</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Agrawal et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve&amp;quot;" target="_blank" rel="noopener">Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></li><li>Fu, Zhu, Su, Qiao, Stoica, Zhang (2024). <a href="https://arxiv.org/abs/2408.15792" target="_blank" rel="noopener">Efficient LLM Scheduling by Learning to Rank</a></li><li>Zheng, Ren, Xue, Luo, Jiang, You (2023). <a href="https://arxiv.org/abs/2305.13144" target="_blank" rel="noopener">Response Length Perception and Sequence Scheduling: An LLM-Empowered LLM Inference Pipeline</a></li><li>Jin, Wu, Brooks, Wei (2023). <a href="https://arxiv.org/abs/2306.06000" target="_blank" rel="noopener">S3: Increasing GPU Utilization during Generative Inference for Higher Throughput</a></li><li>Liu, Chung, Wu, Lai, Lee, Chowdhury (2024). <a href="https://arxiv.org/abs/2404.16283" target="_blank" rel="noopener">Andes: Defining and Enhancing Quality-of-Experience in LLM-Based Text Streaming Services</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html"><small>Previous · session 135</small>Batching: continuous batching, chunked prefill, split-fuse</a><a class="next" href="../inference/distributed-serving-and-prefill-decode-disaggregation.html"><small>Next · session 137</small>Distributed serving and prefill–decode disaggregation</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="scheduling-fcfs-preemption-fairness-and-slos"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const f2=v=>v.toFixed(2);
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function seg(el,cb){const bs=[...el.querySelectorAll("button")];bs.forEach(b=>b.addEventListener("click",()=>{bs.forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);}));return()=>bs.find(b=>b.getAttribute("aria-pressed")==="true").dataset.v;}
+
+/* ---------- Figure 1: five policies on nine requests ---------- */
+(function(){
+ const svg=$("#sch-p1-svg");if(!svg)return;const info=$("#sch-p1-info");
+ const SL=$("#sch-p1-L"),SB=$("#sch-p1-B"),SS=$("#sch-p1-s");
+ const ARR=[0,0,1,1,2,3,4,5,6],LEN=[0,3,5,2,4,1,6,2,3];
+ const r=rng(7),Z=[];for(let i=0;i<9;i++){const u=Math.max(1e-12,r()),v=r();Z.push(Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v));}
+ let pol="fcfs";
+ function sim(policy,Ll,Bs,sigma){
+  const L=LEN.slice();L[0]=Ll;const n=L.length;const pred=L.map((x,i)=>x*Math.exp(sigma*Z[i]));
+  const rem=L.slice(),done=Array(n).fill(null),lvl=Array(n).fill(0),used=Array(n).fill(0),enq=ARR.slice();let running=[];const sched=[];let t=0;
+  const cmp=(ka)=>(a,b)=>{const x=ka(a),y=ka(b);for(let k=0;k<x.length;k++){if(x[k]!==y[k])return x[k]-y[k];}return 0;};
+  while(done.some(d=>d===null)&&t<500){
+   const avail=[];for(let i=0;i<n;i++)if(ARR[i]<=t&&done[i]===null)avail.push(i);
+   let run;
+   if(policy==="fcfs"||policy==="sjf"||policy==="sjfp"){
+    running=running.filter(i=>done[i]===null);
+    const key=policy==="fcfs"?(i=>[ARR[i],i]):policy==="sjf"?(i=>[L[i],ARR[i],i]):(i=>[pred[i],ARR[i],i]);
+    const wait=avail.filter(i=>!running.includes(i)).sort(cmp(key));
+    while(running.length<Bs&&wait.length)running.push(wait.shift());run=running.slice();
+   }else if(policy==="srpt"){run=avail.slice().sort(cmp(i=>[rem[i],ARR[i],i])).slice(0,Bs);}
+   else{run=avail.slice().sort(cmp(i=>[lvl[i],enq[i],i])).slice(0,Bs);}
+   sched.push(run);
+   run.forEach(i=>{rem[i]-=1;if(rem[i]===0)done[i]=t+1;else if(policy==="mlfq"){used[i]+=1;if(used[i]>=2**lvl[i]&&lvl[i]<5){lvl[i]+=1;used[i]=0;enq[i]=t+1;}}});
+   t+=1;}
+  const jct=done.map((d,i)=>d-ARR[i]);return{L,sched,done,jct,pred};}
+ function draw(){
+  const Ll=+SL.value,Bs=+SB.value,sg=+SS.value;$("#sch-p1-Lv").textContent=Ll;$("#sch-p1-Bv").textContent=Bs;$("#sch-p1-sv").textContent=sg.toFixed(1);
+  const res=sim(pol,Ll,Bs,sg);const Tm=Math.max(...res.done);const x0=78,cw=Math.min(16,560/Tm),rh=26,y0=38;
+  let g=`<text x="${x0-8}" y="${y0-9}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">step →</text>`;
+  for(let t=0;t<=Tm;t+=5){const x=x0+t*cw;g+=`<line x1="${x}" y1="${y0-6}" x2="${x}" y2="${y0+9*rh}" stroke="var(--rule)" stroke-width="1"/><text x="${x}" y="${y0-9}" font-size="11" fill="var(--muted)" text-anchor="middle" font-family="var(--sans)">${t}</text>`;}
+  const runAt=res.sched.map(s=>new Set(s));
+  for(let i=0;i<9;i++){const y=y0+i*rh;
+   g+=`<text x="${x0-8}" y="${y+16}" font-size="12.5" text-anchor="end" fill="var(--ink)" font-family="var(--sans)" font-weight="${i===0?700:500}">J${i+1} (${res.L[i]})</text>`;
+   for(let t=0;t<Tm;t++){if(t<ARR[i]||t>=res.done[i])continue;const on=runAt[t].has(i);
+    g+=`<rect x="${(x0+t*cw+0.5).toFixed(1)}" y="${y+3}" width="${Math.max(1,cw-1).toFixed(1)}" height="${rh-6}" rx="2" fill="${on?(i===0?"var(--k)":"var(--q)"):"var(--rule)"}" opacity="${on?0.9:0.55}"/>`;}
+   g+=`<text x="${x0+res.done[i]*cw+6}" y="${y+16}" font-size="12" fill="var(--ink2)" font-family="var(--mono)">${res.jct[i]}</text>`;
+   }
+  svg.innerHTML=g;
+  const n=9,mean=res.jct.reduce((a,b)=>a+b,0)/n,ms=res.jct.slice(1).reduce((a,b)=>a+b,0)/8,sd=res.jct.reduce((a,b,i)=>a+b/res.L[i],0)/n;
+  const name={fcfs:"FCFS",sjf:"SJF (true length)",sjfp:"SJF (predicted)",srpt:"SRPT",mlfq:"MLFQ"}[pol];
+  info.innerHTML=`<b>${name}</b>, ${Bs} slot${Bs>1?"s":""}: mean JCT <b>${f2(mean)}</b> steps · mean JCT of the 8 short requests <b>${f2(ms)}</b> · J1 finishes after <b>${res.jct[0]}</b> steps · mean slowdown <b>${f2(sd)}</b>`+(pol==="sjfp"?`<br>Predicted lengths: ${res.pred.map((p,i)=>"J"+(i+1)+" "+p.toFixed(1)).join(", ")}`:"");}
+ seg($("#sch-p1-pol"),v=>{pol=v;draw();});[SL,SB,SS].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: skip-join MLFQ stepper ---------- */
+(function(){
+ const svg=$("#sch-mq-svg");if(!svg)return;const info=$("#sch-mq-info"),SK=$("#sch-mq-skip");
+ const J=[["A",0,4,8],["B",0,1,3],["C",1,2,5],["D",3,1,2],["E",6,8,3]],Q=[1,2,4,8],AL=12,COL=["var(--q)","var(--k)","var(--v)","var(--tc)","var(--muted)"];
+ function run(skip){
+  const n=J.length,lvl=Array(n).fill(null),used=Array(n).fill(0),out=Array(n).fill(0),enq=Array(n).fill(0),last=Array(n).fill(0),done=Array(n).fill(null);let T=0;const segs=[],snaps=[];
+  const arrive=()=>{J.forEach((j,i)=>{if(j[1]<=T&&lvl[i]===null){lvl[i]=skip?Q.findIndex(q=>q>=j[2]):0;enq[i]=j[1];last[i]=j[1];}});};
+  const snap=(msg)=>{const qs=[[],[],[],[]];for(let i=0;i<n;i++)if(lvl[i]!==null&&done[i]===null)qs[lvl[i]].push(i);qs.forEach(q=>q.sort((a,b)=>enq[a]-enq[b]||a-b));
+   snaps.push({T,qs,used:used.slice(),out:out.slice(),done:done.slice(),segs:segs.slice(),msg});};
+  arrive();snap(`Time 0. A (prefill ${J[0][2]}) and B (prefill ${J[1][2]}) arrive. `+(skip?`Skip-join puts A in Q${lvl[0]+1} (the first quantum ≥ 4) and B in Q1.`:`Without skip-join both start in Q1.`));
+  let guard=0;
+  while(done.some(d=>d===null)&&guard++<100){
+   arrive();let act=[];for(let i=0;i<n;i++)if(lvl[i]!==null&&done[i]===null)act.push(i);
+   if(!act.length){T=Math.min(...J.filter((j,i)=>lvl[i]===null).map(j=>j[1]));continue;}
+   const pro=[];act.forEach(i=>{if(T-last[i]>=AL&&lvl[i]>0){lvl[i]=0;used[i]=0;enq[i]=T;pro.push(J[i][0]);}});
+   const i=act.slice().sort((a,b)=>lvl[a]-lvl[b]||enq[a]-enq[b]||a-b)[0];const lv=lvl[i];
+   const pf=out[i]===0,cost=pf?J[i][2]:1,st=T;T+=cost;out[i]+=1;used[i]+=cost;last[i]=T;segs.push([i,st,T,pf]);
+   let m=(pro.length?`Starvation check: ${pro.join(", ")} waited ≥ ${AL} units and is promoted to Q1. `:"")+`Time ${st}–${T}: run <b>${J[i][0]}</b> from Q${lv+1} (${pf?"prefill, "+cost+" unit"+(cost>1?"s":""):"one decode step"}), token ${out[i]} of ${J[i][3]}.`;
+   if(out[i]===J[i][3]){done[i]=T;m+=` ${J[i][0]} is finished: JCT = ${T} − ${J[i][1]} = <b>${T-J[i][1]}</b>.`;}
+   else if(used[i]>=Q[lv]){const nl=Math.min(lv+1,3);m+=` It used ${used[i]} ≥ quantum ${Q[lv]}, so it ${nl>lv?"is demoted to Q"+(nl+1):"stays in Q4 (the last queue)"}.`;lvl[i]=nl;used[i]=0;enq[i]=T;}
+   const before=J.filter((j,k)=>lvl[k]===null&&j[1]<=T).map(j=>j[0]);arrive();if(before.length)m+=` Arrived by now: ${before.join(", ")}`+(skip?` (joins Q${before.map(nm=>lvl[J.findIndex(j=>j[0]===nm)]+1).join(", Q")}).`:` (joins Q1).`);
+   snap(m);}
+  return snaps;}
+ const S={on:run(true),off:run(false)};const nSteps=S.on.length;
+ let cur=0;
+ function draw(k){cur=k;const sn=(SK.checked?S.on:S.off)[k];const x0=110;let g="";
+  for(let q=0;q<4;q++){const y=12+q*46;g+=`<rect x="4" y="${y}" width="672" height="40" rx="8" fill="var(--paper2)" stroke="var(--rule)"/><text x="14" y="${y+17}" font-size="13" font-weight="700" fill="var(--ink)" font-family="var(--sans)">Q${q+1}</text><text x="14" y="${y+33}" font-size="11.5" fill="var(--muted)" font-family="var(--sans)">quantum ${Q[q]}</text>`;
+   sn.qs[q].forEach((i,p)=>{const x=x0+p*92;g+=`<rect x="${x}" y="${y+5}" width="84" height="30" rx="7" fill="var(--card)" stroke="${COL[i]}" stroke-width="2"/><text x="${x+10}" y="${y+25}" font-size="14" font-weight="700" fill="${COL[i]}" font-family="var(--sans)">${J[i][0]}</text><text x="${x+76}" y="${y+18}" font-size="10.5" text-anchor="end" fill="var(--ink2)" font-family="var(--mono)">${sn.used[i]}/${Q[q]}</text><text x="${x+76}" y="${y+31}" font-size="10.5" text-anchor="end" fill="var(--muted)" font-family="var(--mono)">tok ${sn.out[i]}/${J[i][3]}</text>`;});}
+  const fin=J.map((j,i)=>sn.done[i]!==null?`${j[0]} ${sn.done[i]-j[1]}`:null).filter(Boolean);
+  g+=`<text x="676" y="214" font-size="12" text-anchor="end" fill="var(--ink2)" font-family="var(--sans)">finished (JCT): ${fin.length?fin.join(" · "):"none yet"}</text>`;
+  const tx=t=>14+t*19.5,yb=246;g+=`<text x="14" y="${yb-10}" font-size="12" fill="var(--muted)" font-family="var(--sans)">timeline (time units), clock = ${sn.T}</text>`;
+  for(let t=0;t<=32;t+=2)g+=`<text x="${tx(t)}" y="${yb+48}" font-size="10.5" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">${t}</text><line x1="${tx(t)}" y1="${yb}" x2="${tx(t)}" y2="${yb+36}" stroke="var(--rule)"/>`;
+  sn.segs.forEach(([i,a,b,pf])=>{g+=`<rect x="${tx(a)+0.5}" y="${yb+4}" width="${tx(b)-tx(a)-1}" height="28" rx="3" fill="${COL[i]}" opacity="${pf?0.95:0.6}"/><text x="${(tx(a)+tx(b))/2}" y="${yb+23}" font-size="12" text-anchor="middle" fill="var(--paper)" font-weight="700" font-family="var(--sans)">${J[i][0]}</text>`;});
+  svg.innerHTML=g;let m=sn.msg;
+  if(k===nSteps-1){const fs=SK.checked?S.on:S.off;const last=fs[nSteps-1];const jc=J.map((j,i)=>last.done[i]-j[1]);m+=` <br>All done. JCTs: ${J.map((j,i)=>j[0]+" "+jc[i]).join(", ")}. Mean JCT <b>${(jc.reduce((a,b)=>a+b,0)/5).toFixed(1)}</b> units (FCFS run-to-completion: 17.8).`;}
+  info.innerHTML=m;}
+ const st=B.stepper({n:nSteps,prev:$("#sch-mq-prev"),next:$("#sch-mq-next"),play:$("#sch-mq-play"),label:$("#sch-mq-lab"),ms:2200,onStep:draw});
+ SK.addEventListener("change",()=>draw(st.i));
+})();
+
+/* ---------- Figure 3: FCFS vs LCF vs VTC ---------- */
+(function(){
+ const svg=$("#sch-vtc-svg");if(!svg)return;const info=$("#sch-vtc-info"),SC=$("#sch-vtc-c");
+ const WP=1,WQ=2,IN=16,OUT=8,S=4,T=200;let pol="vtc";
+ function sim(policy,cs){
+  const c=[0,0,0],W=[0,0,0];let q=[],run=[],seq=0,lastleft=null;const waits=[[],[],[]],adm=[[],[],[]],hist=[];
+  for(let t=0;t<T;t++){
+   const arr=[0];if(t%8===0)arr.push(1);if(t>=cs)arr.push(2);
+   arr.forEach(u=>{if(policy==="vtc"&&!q.some(x=>x[0]===u)){if(q.length)c[u]=Math.max(c[u],Math.min(...q.map(x=>c[x[0]])));else if(lastleft!==null)c[u]=Math.max(c[u],c[lastleft]);}q.push([u,t,seq++]);});
+   while(run.length<S&&q.length){let k;
+    if(policy==="fcfs")k=0;
+    else{const cl=[...new Set(q.map(x=>x[0]))].sort((a,b)=>c[a]-c[b]||a-b)[0];k=q.findIndex(x=>x[0]===cl);}
+    const rq=q.splice(k,1)[0],u=rq[0];c[u]+=WP*IN;W[u]+=WP*IN;lastleft=u;waits[u].push(t-rq[1]);adm[u].push(t);run.push([u,OUT]);}
+   run.forEach(x=>{c[x[0]]+=WQ;W[x[0]]+=WQ;x[1]-=1;});run=run.filter(x=>x[1]>0);hist.push(W.slice());}
+  const a=[cs].concat(adm[0].filter(x=>x>=cs));let gap=0;for(let i=1;i<a.length;i++)gap=Math.max(gap,a[i]-a[i-1]);if(a.length===1)gap=T-cs;
+  const w0=Math.max(120,cs+20);const win=[0,1,2].map(i=>hist[T-1][i]-(w0>0?hist[w0-1][i]:0));
+  const bw=waits[1].reduce((s,v)=>s+v,0)/waits[1].length;return{hist,W,win,w0,bw,bmax:Math.max(...waits[1]),gap};}
+ function draw(){const cs=+SC.value;$("#sch-vtc-cv").textContent=cs;const res=sim(pol,cs);
+  const X=t=>60+t*2.85,ym=Math.max(...res.W)*1.05,Y=v=>246-v/ym*226;let g="";
+  for(let k=0;k<=4;k++){const v=ym*k/4;g+=`<line x1="60" y1="${Y(v)}" x2="630" y2="${Y(v)}" stroke="var(--rule)"/><text x="54" y="${Y(v)+4}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">${Math.round(v)}</text>`;}
+  for(let t=0;t<=200;t+=40)g+=`<text x="${X(t)}" y="264" font-size="11" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">${t}</text>`;
+  g+=`<text x="630" y="278" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">engine step</text><text x="64" y="16" font-size="11" fill="var(--muted)" font-family="var(--sans)">cumulative service W = 1·input + 2·output tokens</text>`;
+  g+=`<rect x="${X(res.w0)}" y="20" width="${X(200)-X(res.w0)}" height="226" fill="var(--paper2)" opacity="0.6"/><line x1="${X(cs)}" y1="20" x2="${X(cs)}" y2="246" stroke="var(--v)" stroke-dasharray="4 4"/><text x="${X(cs)+4}" y="32" font-size="11" fill="var(--v)" font-family="var(--sans)">C joins</text>`;
+  ["var(--q)","var(--k)","var(--v)"].forEach((col,i)=>{let d="";res.hist.forEach((h,t)=>{d+=(t?"L":"M")+X(t+1).toFixed(1)+" "+Y(h[i]).toFixed(1);});g+=`<path d="${d}" fill="none" stroke="${col}" stroke-width="2.4"/>`;});
+  svg.innerHTML=g;const nm={fcfs:"FCFS",lcf:"LCF (no lift)",vtc:"VTC"}[pol];
+  info.innerHTML=`<b>${nm}</b>. Service in steps ${res.w0}–199 (shaded): A <b>${res.win[0]}</b>, B <b>${res.win[1]}</b>, C <b>${res.win[2]}</b>. B’s mean wait in the queue: <b>${f2(res.bw)}</b> steps (max ${res.bmax}). Longest time A gets no new request admitted after C joins: <b>${res.gap}</b> steps.`;}
+ seg($("#sch-vtc-pol"),v=>{pol=v;draw();});SC.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 4: SLO-aware batch cap ---------- */
+(function(){
+ const svg=$("#sch-slo-svg");if(!svg)return;const info=$("#sch-slo-info"),SLs=$("#sch-slo-L"),ST=$("#sch-slo-t");
+ const Ls=[512,1024,2048,4096,8192,16384,32768],P=8.03e9*2,BW=3.35e12,KV=131072,MEM=80e9*0.9;
+ function draw(){const L=Ls[+SLs.value],slo=+ST.value;$("#sch-slo-Lv").textContent=L.toLocaleString("en-US");$("#sch-slo-tv").textContent=slo;
+  const t0=P/BW*1e3,per=L*KV/BW*1e3,tp=b=>t0+b*per;
+  const bslo=slo>t0?Math.floor((slo-t0)/per):0,bmem=Math.floor((MEM-P)/(L*KV)),b=Math.max(0,Math.min(bslo,bmem));
+  const xm=Math.max(10,Math.ceil(1.25*Math.max(bmem,Math.min(bslo,2*bmem)))),ym=Math.max(slo,tp(bmem))*1.3;
+  const X=v=>60+v/xm*560,Y=v=>236-Math.min(v,ym)/ym*216;let g="";
+  for(let k=0;k<=4;k++){const v=ym*k/4;g+=`<line x1="60" y1="${Y(v)}" x2="620" y2="${Y(v)}" stroke="var(--rule)"/><text x="54" y="${Y(v)+4}" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">${v.toFixed(0)}</text>`;}
+  for(let k=0;k<=5;k++){const v=Math.round(xm*k/5);g+=`<text x="${X(v)}" y="254" font-size="11" text-anchor="middle" fill="var(--muted)" font-family="var(--sans)">${v}</text>`;}
+  g+=`<text x="620" y="268" font-size="11" text-anchor="end" fill="var(--muted)" font-family="var(--sans)">batch size b (requests)</text><text x="64" y="14" font-size="11" fill="var(--muted)" font-family="var(--sans)">TPOT (ms)</text>`;
+  const bEnd=Math.min(xm,(ym-t0)/per);g+=`<line x1="${X(0)}" y1="${Y(t0)}" x2="${X(bEnd)}" y2="${Y(tp(bEnd))}" stroke="var(--q)" stroke-width="2.6"/>`;
+  g+=`<line x1="60" y1="${Y(slo)}" x2="620" y2="${Y(slo)}" stroke="var(--k)" stroke-width="2" stroke-dasharray="6 4"/>`;
+  g+=`<rect x="${X(bmem)}" y="20" width="${Math.max(0,620-X(bmem))}" height="216" fill="var(--v)" opacity="0.12"/><line x1="${X(bmem)}" y1="20" x2="${X(bmem)}" y2="236" stroke="var(--v)" stroke-width="2"/><text x="${Math.min(X(bmem)+4,560)}" y="34" font-size="11" fill="var(--v)" font-family="var(--sans)">KV memory full</text>`;
+  if(b>0)g+=`<circle cx="${X(b)}" cy="${Y(tp(b))}" r="6" fill="var(--tc)"/>`;
+  svg.innerHTML=g;
+  if(b===0){info.innerHTML=`Target <b>${slo} ms</b> is below <b>${t0.toFixed(2)} ms</b>, the time to read the weights once: no batch size can meet it on this GPU.`;return;}
+  const t=tp(b),thr=b/(t/1e3);
+  info.innerHTML=`Weights alone: <b>${t0.toFixed(2)} ms</b>; each request adds <b>${per.toFixed(3)} ms</b>. SLO limit <b>${bslo}</b>, memory limit <b>${bmem}</b> → max batch <b>${b}</b> (${bslo<=bmem?"the SLO binds":"memory binds"}). TPOT there: <b>${t.toFixed(2)} ms</b>; throughput ≈ <b>${Math.round(thr).toLocaleString("en-US")}</b> tokens/s, ${(1000/t).toFixed(1)} tokens/s per user.`;}
+ [SLs,ST].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

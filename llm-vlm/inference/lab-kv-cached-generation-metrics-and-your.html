@@ -1,0 +1,525 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>KV-cached generation, metrics and your GPU’s roofline · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 87</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="lab-kv-cached-generation-metrics-and-your">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="lab-kv-cached-generation-metrics-and-your" data-session="lab-kv-cached-generation-metrics-and-your" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">87</span><span>Track 5: LLM inference and serving · session 10 of 65</span></div><h1 class="chap-title">KV-cached generation, metrics and your GPU’s roofline</h1><p class="chap-sub">In this lab you write the generation loop twice, without and with a KV cache, check that both give the same tokens, and time them on your own GPU. You measure time to first token and time per output token as the prompt and the batch grow, measure your GPU’s real memory bandwidth and matmul speed, draw its roofline, and place your own prefill and decode passes on it.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (mostly hands-on)</span><span><b>Level:</b> Intermediate · hands-on lab</span><span><b>Before this:</b> Sessions 78, 80, 81 and 82 (generation loop, KV cache, metrics, roofline); PyTorch</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How to write generate() without and with a preallocated KV cache, and how to test it (FP32 token equality; why BF16 can flip near-ties)</li><li>Why the cache saves more than 99% of the FLOPs but can save much less time: memory-bound steps make the saved math free</li><li>How to time GPU code correctly: warm-up, synchronization, repeats, and what launch overhead does to a token loop</li><li>How TTFT grows with prompt tokens and why TPOT grows much more slowly than the batch size, measured on a 1B-shaped model</li><li>How to measure memory bandwidth (a 1 GiB copy) and matmul speed, and draw the measured roofline with its ridge</li><li>How to place prefill and decode on the roofline from FLOP and byte counts, and read the efficiency of your software</li><li>Why repeating grouped K and V before attention makes long-context decode slow</li></ul></div></header><style>
+[data-session="lab-kv-cached-generation-metrics-and-your"] pre.code,[data-session="lab-kv-cached-generation-metrics-and-your"] code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.kg-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.kg-grid input[type=range]{width:100%;min-width:0}
+.kg-grid output{font:600 14px var(--mono);min-width:4.5em;text-align:right}
+.kg-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.kg-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+#kg-cost-svg text,#kg-time-svg text,#kg-meas-svg text,#kg-roof-svg text{font-family:var(--sans)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">You have read that decode is memory-bound, that prefill is compute-bound, and that a KV cache makes generation fast. In this lab you stop taking these sentences on trust. You write the generation loop twice, time it on your own GPU, measure the two numbers that define your GPU (memory bandwidth and matmul speed), and place your own measurements on a roofline. At the end you can say, with your own numbers, why your model is as fast as it is and what would make it faster.</p>
+<p>This lab ties together five earlier sessions. <a href="../inference/the-generation-loop-prefill-and-decode.html">Session 78</a> gave the two phases, prefill and decode. <a href="../inference/the-kv-cache.html">Session 80</a> gave the cache and its size. <a href="../inference/inference-metrics-latency-memory-and-throughput.html">Session 81</a> defined time to first token (TTFT) and time per output token (TPOT). <a href="../inference/why-inference-is-slow-three-root-causes.html">Session 82</a> gave the cost formulas and the roofline, with spec-sheet numbers. <a href="../inference/gpu-kernels-2-write-kernels-in-the.html">Session 86</a> showed how to measure the effective bandwidth of one kernel. Here you do the same for a whole model.</p>
+<p>The work has four parts, one per key point of the session:</p>
+<ol>
+<li>Write <code>generate()</code> without and with a KV cache, check that both give the same tokens, and measure the speed-up.</li>
+<li>Measure TTFT and TPOT as the prompt length and the batch size change.</li>
+<li>Measure the memory bandwidth and the matmul speed of your GPU, and draw its roofline.</li>
+<li>Place your prefill and decode passes on that roofline.</li></ol>
+<aside class="note interview side"><span class="nt">Interview tip</span>“How would you check that an inference stack is fast enough?” A strong answer is this lab in four sentences: measure the hardware’s real bandwidth and FLOP/s, compute the best-case time of each phase from bytes and FLOPs, measure TTFT and TPOT correctly (warm-up, synchronize, repeat), and report the ratio of measured time to the bound. A ratio near 1 means “buy better hardware or move fewer bytes”; a ratio of 2 or more means “fix the software first”.</aside>
+<p>All our numbers come from one machine: a laptop with an Apple M5 Pro chip (20-core GPU, 48 GB of unified memory), PyTorch 2.8 with the MPS back-end, in BF16. Other jobs were running on the machine at the same time, so our times are noisy and somewhat pessimistic; we report the best of several repeats. Your numbers will be different. The point of the lab is the method and the shape of the curves, which carry over to any GPU.</p>
+
+<h2>The lab model: a 1B-shaped transformer with random weights</h2>
+<p>For timing we do not need a trained model. The time of a forward pass depends on the shapes of the matrices, not on their values. So we build a model with the exact shape of <b>Llama 3.2 1B</b> and fill it with random numbers. This needs no download and no license, and it runs on any GPU with about 4 GB of free memory.</p>
+<p>The shape, from the model’s config.json [Certain]: vocabulary \(V = 128{,}256\), model width \(d = 2048\), \(L = 16\) layers, 32 query heads and \(n_{kv} = 8\) key-value heads of size \(d_h = 64\) (grouped-query attention, from <a href="../inference/efficient-attention-1-mqa-gqa-and-mla.html">session 97</a>), a SwiGLU feed-forward layer of width 8,192, and an output layer that shares (ties) its weights with the input embedding. We leave out the RoPE scaling for long contexts; it does not change the cost.</p>
+<div class="eq">\[ N_{mm} = \underbrace{L\,\big(d\,(h + 2n_{kv})\,d_h + d^2 + 3\,d\,d_{ff}\big)}_{N_{\text{body}}} + \underbrace{V d}_{N_{\text{emb}}}, \qquad \text{kv}_{\text{tok}} = 2\, L\, n_{kv}\, d_h\, s \tag{87.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N_{mm}\)</dt><dd>the weights used in matrix multiplies during one step: the 16 blocks plus the output layer (tied to the embedding, but still read once per step)</dd>
+<dt>\(h, n_{kv}, d_h\)</dt><dd>32 query heads, 8 key-value heads, head size 64</dd>
+<dt>\(d_{ff}\)</dt><dd>feed-forward width, 8,192 (SwiGLU has three matrices of size \(d \times d_{ff}\))</dd>
+<dt>\(\text{kv}_{\text{tok}}\)</dt><dd>bytes of KV cache per token: keys and values (the 2), for every layer and KV head</dd>
+<dt>\(s\)</dt><dd>bytes per number: 2 for BF16</dd></dl>
+<div class="worked"><div class="wt">Worked example: the size of the lab model</div>
+<p>One block: \(2048 \cdot 48 \cdot 64 + 2048^2 + 3 \cdot 2048 \cdot 8192 = 6{,}291{,}456 + 4{,}194{,}304 + 50{,}331{,}648 = 60{,}817{,}408\) weights. Sixteen blocks: \(N_{\text{body}} = 973{,}078{,}528\). Embedding: \(128{,}256 \times 2048 = 262{,}668{,}288\). With the norms, PyTorch counts <b>1,235,814,400</b> parameters, so 2.47 GB in BF16. Every decode step must read about 2.47 GB of weights.</p>
+<p>KV cache: \(2 \cdot 16 \cdot 8 \cdot 64 \cdot 2 = 32{,}768\) bytes = 32 KiB per token. A 4,096-token context needs 134 MB per sequence, about 5% of the weights. Thanks to grouped-query attention this is four times less than with 32 KV heads.</p></div>
+<p>The full code is in the section “The whole lab in one file” below. The model is about 60 lines: an RMSNorm, RoPE, a block with fused QKV and gate-up matrices, and a forward pass that returns the logits of the last position only. The cache is a list of preallocated tensors, one key tensor and one value tensor per layer, of shape (batch, \(n_{kv}\), max length, \(d_h\)). A forward pass with a cache writes the new keys and values at positions <code>start</code> to <code>start + T</code> and attends over everything up to there.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A crash-test car does not need a real driver; it needs a dummy of the right weight and shape. Random weights are our dummy: same shapes, same bytes, same FLOPs, so the same time. They are useless for quality, and that is fine, because we only measure speed. (There is one catch, for the correctness test: see below.)</aside>
+
+<h2>Part 1: generate() without and with a KV cache</h2>
+<p>Without a cache, every step feeds the <b>whole</b> sequence so far through the model and keeps only the last logits. With a cache, the first call (the prefill) processes the prompt and stores every layer’s keys and values; every later call (a decode step) feeds <b>one</b> token, appends its key and value, and attends over the stored ones.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: generate without a cache</div><ol>
+<li><b>input:</b> model \(f\), prompt tokens \(x_{1..P}\), number of new tokens \(n\)</li>
+<li>\(\text{seq} \leftarrow x_{1..P}\)</li>
+<li><b>for</b> \(i = 0, \dots, n-1\):</li>
+<li>&nbsp;&nbsp;\(\ell \leftarrow f(\text{seq})\) <span class="c">// all P + i positions, all layers, every time</span></li>
+<li>&nbsp;&nbsp;\(\text{seq} \leftarrow \text{seq} \,\Vert\, \arg\max \ell_{\text{last}}\)</li>
+<li><b>return</b> the last \(n\) tokens of seq</li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: generate with a KV cache</div><ol>
+<li><b>input:</b> model \(f\), prompt \(x_{1..P}\), \(n\); allocate \(K, V\) of shape \((L, B, n_{kv}, P + n, d_h)\)</li>
+<li>\(\ell \leftarrow f(x_{1..P};\ \text{write } K, V \text{ at } 0..P-1)\) <span class="c">// prefill: one pass over the prompt</span></li>
+<li>\(y_1 \leftarrow \arg\max \ell_{\text{last}}\) <span class="c">// the first token: TTFT ends here</span></li>
+<li><b>for</b> \(i = 1, \dots, n-1\):</li>
+<li>&nbsp;&nbsp;\(\ell \leftarrow f(y_i;\ \text{write at } P+i-1,\ \text{read } K, V[0..P+i-1])\) <span class="c">// decode: one token</span></li>
+<li>&nbsp;&nbsp;\(y_{i+1} \leftarrow \arg\max \ell\)</li>
+<li><b>return</b> \(y_{1..n}\)</li></ol></div>
+<p>Both loops are greedy, so with exact arithmetic they must return the same tokens. That is the first test you run.</p>
+
+<h3>The correctness test, and why it needs FP32</h3>
+<p>Run both loops on a tiny model (width 128, 2 layers, 4 prompts of 16 tokens, 48 new tokens) and compare. In FP32, on CPU and on the GPU, all 192 tokens match, and the logits differ by at most \(3 \times 10^{-7}\). In BF16 on the GPU, only 97.9% match: one of the four rows goes a different way at token 37. [Certain, our run]</p>
+<p>This is not a bug in the cache. The two loops add the same numbers in a different order (different matrix shapes pick different kernels), and BF16 keeps only about 3 significant digits. The logits differ by up to 0.023, and random weights give logits that are close together (all within about ±1.3 here), so a small difference can swap the top token. After one swap, the two sequences are different texts. A trained model has sharper logits and swaps less often, but it can still happen. So test the logic in FP32, where it must be exact, and test BF16 only with a tolerance on the logits.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>The most common cache bugs make the output <i>slightly</i> wrong, not obviously wrong: a position offset off by one in RoPE, writing the new key at the wrong index, or attending to unwritten (zero) slots of the preallocated cache. The FP32 token-equality test catches all three.</aside>
+
+<h3>How much work does the cache save?</h3>
+<p>Count FLOPs and bytes of one forward pass, as in <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>. Our model computes logits only for the last position, so the output layer costs the same in every pass.</p>
+<div class="eq">\[ F_{\text{pre}}(T) = 2 N_{\text{body}} T + 2 N_{\text{emb}} + 2 L d\, T^2, \qquad Q_{\text{pre}}(T) \approx s\, N_{mm} + T\, \text{kv}_{\text{tok}} \tag{87.2} \]</div>
+<div class="eq">\[ F_{\text{dec}}(b, c) = b\,\big(2 N_{mm} + 4 L d\, c\big), \qquad Q_{\text{dec}}(b, c) = s\, N_{mm} + b\, c\, \text{kv}_{\text{tok}} \tag{87.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(F, Q\)</dt><dd>FLOPs of the pass and bytes it must move between GPU memory and the chip (at least)</dd>
+<dt>\(T\)</dt><dd>tokens in a prefill pass (or in a no-cache step)</dd>
+<dt>\(2LdT^2\)</dt><dd>causal attention: scores and the weighted sum, \(4Ld\) FLOPs per pair of tokens, over about \(T^2/2\) pairs</dd>
+<dt>\(b, c\)</dt><dd>sequences decoding together and their context length</dd>
+<dt>\(4Ldc\)</dt><dd>attention of one new token over \(c\) cached tokens</dd></dl>
+<p>A no-cache step at length \(P + i\) is a full prefill of \(P + i\) tokens. A cached loop is one prefill of \(P\) tokens and then \(n - 1\) decode steps:</p>
+<div class="eq">\[ F_{\text{no cache}} = \sum_{i=0}^{n-1} F_{\text{pre}}(P+i), \qquad F_{\text{cache}} = F_{\text{pre}}(P) + \sum_{i=1}^{n-1} F_{\text{dec}}(1, P+i) \tag{87.4} \]</div>
+<p>If we keep only the linear layers, the ratio has a simple form: the no-cache loop pushes \(\sum_i (P+i)\) tokens through the weights, the cached loop \(P + n - 1\):</p>
+<div class="eq">\[ \frac{F_{\text{no cache}}}{F_{\text{cache}}} \approx \frac{nP + n(n-1)/2}{P + n - 1} \tag{87.5} \]</div>
+<p>For \(P = 128\) and \(n = 256\) that is \(65{,}408 / 383 = 170.8\). The exact count of (87.4), with the output layer and attention, gives 144.6. So the cache saves more than 99% of the FLOPs. Does it save 99% of the time? Not necessarily, and this is the first surprise of the lab.</p>
+<div class="eq">\[ t \;\ge\; \max\!\left(\frac{F}{F_{\text{peak}}},\ \frac{Q}{\text{BW}}\right) \tag{87.6} \]</div>
+<p>A pass cannot be faster than its math at peak speed, nor faster than its bytes at full bandwidth. Every pass reads all the weights at least once, so every pass costs at least \(sN_{mm}/\text{BW}\). A no-cache step with a few hundred tokens does a few hundred times more math than a decode step, but if that math still fits under the memory time, it is <b>free</b>: the step takes the same time. The saved FLOPs turn into saved time only when the no-cache steps become compute-bound, that is, when \(P + i\) passes the ridge of the GPU (about 295 tokens on an H100 in BF16).</p>
+
+<figure class="fig" id="kg-cost"><div class="fig-body">
+<div class="controls"><span>GPU</span><span class="seg" id="kg-cost-gpu"><button type="button" data-v="m5" aria-pressed="true">Our M5 Pro (measured)</button><button type="button" data-v="l4" aria-pressed="false">L4</button><button type="button" data-v="a100" aria-pressed="false">A100</button><button type="button" data-v="h100" aria-pressed="false">H100</button></span></div>
+<div class="kg-grid">
+<label for="kg-cost-p">Prompt length \(P\)</label><input type="range" id="kg-cost-p" min="4" max="13" step="0.5" value="7"><output id="kg-cost-pv"></output>
+<label for="kg-cost-n">New tokens \(n\)</label><input type="range" id="kg-cost-n" min="4" max="10" step="0.5" value="8"><output id="kg-cost-nv"></output></div>
+<div class="scroll-x"><svg id="kg-cost-svg" viewBox="0 0 680 250" role="img" aria-label="Best-case time of each generation step without a cache (rising curve) and with a cache (flat curve)"></svg></div>
+<div class="kg-leg"><span style="--c:var(--k)">no cache: step i is a prefill of P + i tokens</span><span style="--c:var(--q)">with cache: one prefill, then decode steps</span></div>
+<div class="readout" id="kg-cost-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Best-case time per step (formula 87.6 applied to 87.2 and 87.3) for the lab model in BF16. The area under each curve is the total time. “Our M5 Pro” uses the bandwidth and matmul speed we measured in Part 3; the other GPUs use their spec-sheet numbers.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with the defaults (\(P = 128\), \(n = 256\), our M5 Pro): the cache saves 144.6 times the FLOPs, but the best-case speed-up is only about 1.63×, because the first no-cache steps are memory-bound and cost the same as a cached step. Switch to the H100: its ridge is higher, every no-cache step stays under it, and the best-case speed-up drops to 1.00×. Now drag the prompt to 2,048: the no-cache curve climbs steeply, the steps are compute-bound, and the speed-up grows to 6 on the H100 and 13.6 on the M5 Pro. Long prompts are where the cache pays most. Notice that the cached curve hardly moves: its steps are set by the weight bytes.</p></details></figure>
+
+<h3>What we measured</h3>
+<p>With a 128-token prompt and 256 new tokens, one sequence, BF16: the no-cache loop took <b>32.5 s</b> and the cached loop <b>7.75 s</b>, a speed-up of <b>4.2×</b>. [Certain, our run] That is more than the best case of Figure 1 (1.63×). Why? Because the real no-cache steps are far from the roof. Our measured prefill of 128 tokens took 46 ms against a bound of 10.6 ms; real kernels for medium-size matrices are slow, and PyTorch’s attention on this back-end has its own overhead. The cached loop runs mostly decode steps, which are simple and close to the memory bound. So the measured speed-up depends on how good your kernels are at each shape, not only on FLOPs. On a data-center GPU with well-tuned kernels, expect the measured speed-up at short prompts to be small and the speed-up at long prompts to be large [Likely].</p>
+
+<h2>Measuring time correctly</h2>
+<p>Before Part 2, learn the four rules of GPU timing. Most wrong benchmark numbers you will see break one of them.</p>
+<ul>
+<li><b>The GPU runs asynchronously.</b> A PyTorch call on a GPU tensor puts a kernel in a queue and returns at once. If you read the clock right after, you measured how long Python took to <i>issue</i> the work. Call <code>torch.cuda.synchronize()</code> (or <code>torch.mps.synchronize()</code>) before you stop the clock.</li>
+<li><b>Warm up first.</b> The first call allocates memory, picks kernels, compiles shaders or graphs, and fills caches. Run the measured function once or twice before timing it.</li>
+<li><b>Repeat and report a robust statistic.</b> Use the minimum to estimate what the hardware <i>can</i> do, and the median or a percentile to describe what users <i>will</i> see. Never a single run.</li>
+<li><b>Measure what the user waits for.</b> TTFT ends when the first token exists (after the prefill and the first argmax); TPOT is the time of one decode step, including the sync that brings the token to the CPU, because a real loop needs it there to stream it or to check for the end-of-sequence token.</li></ul>
+<div class="algo"><div class="algo-h">Algorithm 3: a fair GPU timer</div><ol>
+<li><b>input:</b> a function \(g\) that launches GPU work; \(w\) warm-up runs; \(r\) timed runs</li>
+<li><b>repeat</b> \(w\) times: \(g()\) <span class="c">// allocation, kernel choice, compilation</span></li>
+<li>synchronize; \(\text{best} \leftarrow \infty\)</li>
+<li><b>repeat</b> \(r\) times: \(t_0 \leftarrow\) clock; \(g()\); synchronize; \(\text{best} \leftarrow \min(\text{best}, \text{clock} - t_0)\)</li>
+<li><b>return</b> best <span class="c">// or keep all r times and report the median and P90</span></li></ol></div>
+<figure class="fig" id="kg-time"><div class="fig-body">
+<div class="controls"><span>Timer</span><span class="seg" id="kg-time-mode"><button type="button" data-v="none" aria-pressed="true">no sync</button><button type="button" data-v="end" aria-pressed="false">sync at the end</button><button type="button" data-v="each" aria-pressed="false">sync every step</button></span></div>
+<div class="kg-grid">
+<label for="kg-time-a">CPU time to issue one step</label><input type="range" id="kg-time-a" min="1" max="10" step="1" value="2"><output id="kg-time-av"></output>
+<label for="kg-time-g">GPU time of one step</label><input type="range" id="kg-time-g" min="1" max="10" step="1" value="6"><output id="kg-time-gv"></output></div>
+<div class="scroll-x"><svg id="kg-time-svg" viewBox="0 0 680 160" role="img" aria-label="Timeline of five decode steps: the CPU issues work, the GPU runs it later from a queue, and the timer stops at a point that depends on synchronization"></svg></div>
+<div class="kg-leg"><span style="--c:var(--v)">CPU issues the kernels of a step</span><span style="--c:var(--k)">GPU runs the step</span><span style="--c:var(--q)">what the timer sees</span></div>
+<div class="readout" id="kg-time-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> A schematic of five decode steps (the durations are made-up units, not measurements). The CPU puts work in a queue and the GPU runs it later. Where the timer stops depends on where you synchronize.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With the defaults (issue 2 ms, GPU 6 ms) and “no sync”, the timer reads 10 ms, but the GPU finishes at 32 ms: the number is three times too small. “Sync at the end” gives the true 32 ms. “Sync every step” gives 40 ms, 8 ms per step, because the GPU now waits while the CPU issues each next step. Now set the issue time to 8 ms: the loop becomes <b>launch-bound</b>, and the GPU is idle most of the time. This is what happens to a small model run in eager PyTorch, and why serving engines use CUDA graphs (<a href="../pretraining/making-training-fast-compile-cuda-graphs-fused.html">session 50</a>).</p></details></figure>
+<p>On our laptop the launch cost is real: one decode step of the 1B model issues several hundred small GPU operations from Python (16 layers, each with a few dozen operations: norms, RoPE, cache writes, attention, the matmuls). This is one reason why our measured TPOT is about twice the bandwidth bound (Part 2). On a CUDA GPU you can remove most of this cost with CUDA graphs or <code>torch.compile(mode="reduce-overhead")</code>, which record the step once and replay it with a single launch [Certain].</p>
+
+<h2>Part 2: TTFT and TPOT vs prompt length and batch size</h2>
+<p>We measure the two phases separately, as in <a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>:</p>
+<div class="eq">\[ \text{TTFT}(P, B) \approx t_{\text{pre}}(B \times P \text{ tokens}), \qquad \text{TPOT}(B, c) \approx t_{\text{dec}}(B, c) \tag{87.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t_{\text{pre}}\)</dt><dd>measured time of one prefill pass plus the argmax of the first token, with an empty queue (no waiting time)</dd>
+<dt>\(t_{\text{dec}}(B, c)\)</dt><dd>measured time of one decode step for \(B\) sequences that each have \(c\) tokens in the cache</dd>
+<dt>\(P\)</dt><dd>prompt length; \(B\) is the batch size</dd></dl>
+<p>Measuring one decode step at a fixed context is cleaner than timing a whole loop: you control \(c\) exactly, and you can sweep \(B\) and \(c\) on a grid. The lab code does exactly this: it fills a cache of the right size (the values do not matter for timing) and times one call at position \(c\).</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A bus. TTFT is the time to load all passengers’ luggage at the first stop: more luggage (a longer prompt) takes longer, almost in proportion. TPOT is the time between stops: the bus is heavy (the weights) whether it carries 1 passenger or 60, so adding passengers (batch) barely changes the trip, until the bus is so full that boarding time (the KV cache) starts to matter.</aside>
+<figure class="fig" id="kg-meas"><div class="fig-body">
+<div class="controls"><span>Show</span><span class="seg" id="kg-meas-view"><button type="button" data-v="ttft" aria-pressed="true">TTFT vs prompt</button><button type="button" data-v="tpotb" aria-pressed="false">TPOT vs batch</button><button type="button" data-v="tpotc" aria-pressed="false">TPOT vs context</button></span></div>
+<div class="scroll-x"><svg id="kg-meas-svg" viewBox="0 0 680 270" role="img" aria-label="Measured TTFT and TPOT of the lab model on log-log axes, with the best-case bound as dotted lines"></svg></div>
+<div class="readout" id="kg-meas-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Our measurements (points, best of several repeats) for the 1B-shaped model in BF16 on the M5 Pro, with the best-case bound of formula (87.6) as dotted lines, using our measured bandwidth and matmul speed. Both axes are logarithmic.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p><b>TTFT vs prompt:</b> the line for one sequence rises roughly in proportion to \(P\) from 512 tokens on, a bit faster at the long end. Eight sequences of \(P\) tokens cost about as much as one sequence of \(8P\) tokens, or less, because each sequence’s attention covers only its own \(P\) tokens. Both stay a factor of about 2 to 5 above the bound. <b>TPOT vs batch:</b> the work grows 128 times from 1 to 128 sequences, but TPOT grows only about 2 times, so total throughput grows about 55 times. The bound grows too, because 128 caches of 512 tokens add 2.1 GB to each step. The points in the middle are noisy. <b>TPOT vs context:</b> with grouped attention the step barely grows up to 16K tokens of context for one sequence. The dashed lines repeat K and V four times before attention (the naive way to run grouped-query attention); at long contexts and batch 16 this is many times slower. The readout lists every point and its ratio to the bound.</p></details></figure>
+
+<h3>What the curves say</h3>
+<ul>
+<li><b>TTFT grows with the number of prompt tokens in the batch.</b> For one sequence, TTFT went from 46 ms at 128 tokens to 1,161 ms at 4,096. [Certain, our run] Prefill is compute-bound from a few hundred tokens on (Part 4), so its time follows the FLOPs, and the FLOPs follow \(B \times P\) (plus the \(T^2\) attention term, which matters at long prompts).</li>
+<li><b>TPOT grows much more slowly than the batch.</b> At 512 tokens of context, one sequence took 20.1 ms per step and 128 sequences 46.5 ms. [Certain, our run] So 128 users get 55 times the total tokens per second of one user, while each of them waits only about twice as long per token. This is the whole reason for batching (<a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>). The bound for batch 1 is 10.7 ms; we are at 1.9× the bound, mostly because of the launch overhead of Figure 2.</li>
+<li><b>Long contexts cost bytes, and kernels decide how many.</b> One sequence at 16K context adds \(16{,}384 \times 32\) KiB = 0.54 GB to each step’s 2.47 GB of weights: about 22% more bytes. With the grouped kernel we measured 26.6 ms; with K and V repeated four times, 176 ms. The naive version writes and reads a four-times larger copy of the cache in every layer, every step.</li></ul>
+<div class="worked"><div class="wt">Worked example: is our decode step close to the bound?</div>
+<p>One decode step, batch 1, context 512. Bytes: \(Q = 2 \times 1{,}235{,}746{,}816 + 512 \times 32{,}768 = 2.488\) GB (formula 87.3; \(N_{mm}\) leaves out the norms). With our measured bandwidth of 233 GB/s: \(2.488 / 233 = 10.7\) ms. FLOPs: \(2 \times 1.236 \times 10^9 + 4 \cdot 16 \cdot 2048 \cdot 512 = 2.54\) GFLOP, which at 29.2 TFLOP/s takes 0.09 ms. Memory wins by about 123 times.</p>
+<p>Measured: 20.1 ms, so 1.9× the bound, or 53% of the bandwidth. On this machine about half of the step is not memory traffic: it is launch overhead and small kernels that do not reach full bandwidth. The bound tells you that a perfect implementation could run at most 1.9 times faster; it could not run 10 times faster.</p></div>
+
+<h2>Part 3: measure your GPU and draw its roofline</h2>
+<p>The roofline needs two numbers: how many bytes per second the GPU can move, and how many FLOPs per second it can compute. Spec sheets give peak values; we measure what we can actually reach, because the measured values are what limit your code.</p>
+<div class="eq">\[ \text{BW}_{\text{meas}} = \frac{2\, s\, n}{t_{\text{copy}}}, \qquad F_{\text{meas}} = \frac{2 M K N}{t_{\text{matmul}}} \tag{87.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n, s\)</dt><dd>number of elements copied and bytes per element; a copy reads and writes each byte once, hence the 2</dd>
+<dt>\(t_{\text{copy}}, t_{\text{matmul}}\)</dt><dd>best measured time of <code>y.copy_(x)</code> and of the matrix multiply</dd>
+<dt>\(M, K, N\)</dt><dd>the matmul shape: an \(M \times K\) matrix times a \(K \times N\) matrix; each output needs \(K\) multiply-adds, 2 FLOPs each</dd></dl>
+<p>Use a big copy (1 GiB here) so that the fixed launch cost is negligible and caches cannot hold the data. Use a big square matmul (4096 or larger) for the compute roof.</p>
+<div class="worked"><div class="wt">Worked example: our machine</div>
+<p><b>Bandwidth.</b> Copying 1 GiB of BF16 (\(2^{29}\) elements) moves 2.15 GB. Our best copy reached <b>233 GB/s</b>; a pure read (<code>x.sum()</code>) reached 216 GB/s. Apple lists the M5 Pro with memory bandwidth “up to 307 GB/s” [Certain], so we reach about 76% of the spec. Reaching 70 to 90% of the spec bandwidth in a simple copy is typical for GPUs [Likely].</p>
+<p><b>Compute.</b> A 4096 × 4096 BF16 matmul (\(2 \cdot 4096^3 = 137.4\) GFLOP) reached 26.1 TFLOP/s, and the best shape in our sweep (\(M = 1,024\), see below) 29.2 TFLOP/s. We use 29.2 as the roof.</p>
+<p><b>Ridge.</b> \(I^* = F / \text{BW} = 29.2 \times 10^{12} / 233 \times 10^{9} = 125\) FLOP per byte. For comparison, from the spec sheets: H100 SXM 295, L4 403, A100 153. A pass needs more than 125 FLOPs per byte moved to be compute-bound on our machine.</p></div>
+<p>Then measure the roofline itself, not only its two ends. Multiply an \(M \times 8192\) matrix by a fixed \(8192 \times 8192\) weight for \(M = 1, 2, 4, \dots, 4096\). This is exactly a linear layer applied to \(M\) tokens. Its intensity is</p>
+<div class="eq">\[ I(M) = \frac{2 M K N}{s\,(KN + MK + MN)} \;\approx\; M \quad \text{for } M \ll K = N \text{ in BF16} \tag{87.9} \]</div>
+<p>because the weight (\(KN\) numbers, 134 MB here) dominates the bytes. So \(M\) tokens give about \(M\) FLOPs per byte. On our machine the sweep went from 0.15 TFLOP/s at \(M = 1\) (an effective 148 GB/s) up to 29.2 TFLOP/s at \(M = 1,024\), The points run parallel to the slanted roof, at about 50 to 75% of it, up to \(M = 128\), then bend onto the flat roof, which they reach at \(M = 1{,}024\); the two largest shapes are a little slower again. [Certain, our run] At \(M = 1\) the effective bandwidth is lower than the copy’s because one 134 MB matrix–vector product is a single short kernel.</p>
+<div class="algo"><div class="algo-h">Algorithm 4: draw your roofline and place a pass on it</div><ol>
+<li>\(\text{BW} \leftarrow\) best of copy(1 GiB); \(\;F \leftarrow\) best of a large matmul <span class="c">// formula (87.8)</span></li>
+<li>roof: \(P(I) = \min(F,\ I \cdot \text{BW})\) on log-log axes; ridge at \(I^* = F / \text{BW}\)</li>
+<li><b>for</b> each pass you care about (prefill at \(T\), decode at \(b, c\)):</li>
+<li>&nbsp;&nbsp;count \(F_{\text{pass}}\) and \(Q_{\text{pass}}\) with (87.2) or (87.3); \(\;I \leftarrow F_{\text{pass}} / Q_{\text{pass}}\)</li>
+<li>&nbsp;&nbsp;time the pass with Algorithm 3: \(t\); \(\;\text{achieved} \leftarrow F_{\text{pass}} / t\)</li>
+<li>&nbsp;&nbsp;plot the point \((I, \text{achieved})\); efficiency \(= \text{achieved} / P(I)\)</li></ol></div>
+
+<h2>Part 4: place prefill and decode on the roofline</h2>
+<div class="eq">\[ P(I) = \min\big(F,\ I \cdot \text{BW}\big), \qquad \text{efficiency} = \frac{F_{\text{pass}} / t_{\text{meas}}}{P(F_{\text{pass}} / Q_{\text{pass}})} = \frac{t_{\text{bound}}}{t_{\text{meas}}} \tag{87.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P(I)\)</dt><dd>the attainable FLOP/s at intensity \(I\): the roof</dd>
+<dt>\(F_{\text{pass}} / t_{\text{meas}}\)</dt><dd>the achieved FLOP/s of your measured pass</dd>
+<dt>efficiency</dt><dd>how close you are to the roof; it equals the bound time (87.6) divided by the measured time</dd></dl>
+<p>From (87.2), a prefill of \(T\) tokens has intensity about \(2T/s = T\) in BF16 (more with attention). From (87.3), a decode step has intensity about \(b\) for short contexts, and less when the KV cache bytes grow. So the two phases sit far apart:</p>
+<ul>
+<li><b>Prefill</b> at 2,048 tokens: \(I \approx 1,679\), far right of our ridge (125). Compute-bound. Measured 534 ms, so 8.0 TFLOP/s achieved, 27% of the roof.</li>
+<li><b>Decode</b> at batch 1, context 512: \(I = 1.02\), far left. Memory-bound. Achieved 0.13 TFLOP/s, 53% of the slanted roof at that intensity.</li>
+<li><b>Decode</b> at batch 128: \(I = 70.3\). Still left of our ridge, still memory-bound, but now 7.0 TFLOP/s. Batching moves decode to the right along the slope.</li></ul>
+<figure class="fig wide" id="kg-roof"><div class="fig-body">
+<div class="controls"><span>GPU</span><span class="seg" id="kg-roof-gpu"><button type="button" data-v="m5" aria-pressed="true">Our M5 Pro (measured)</button><button type="button" data-v="l4" aria-pressed="false">L4</button><button type="button" data-v="a100" aria-pressed="false">A100</button><button type="button" data-v="h100" aria-pressed="false">H100</button></span></div>
+<div class="kg-grid">
+<label for="kg-roof-t">Prompt length \(T\) (prefill)</label><input type="range" id="kg-roof-t" min="4" max="14" step="0.25" value="11"><output id="kg-roof-tv"></output>
+<label for="kg-roof-b">Batch \(b\) (decode)</label><input type="range" id="kg-roof-b" min="0" max="10" step="0.25" value="0"><output id="kg-roof-bv"></output>
+<label for="kg-roof-c">Context \(c\) (decode)</label><input type="range" id="kg-roof-c" min="7" max="15" step="0.25" value="9"><output id="kg-roof-cv"></output></div>
+<div class="scroll-x"><svg id="kg-roof-svg" viewBox="0 0 720 340" role="img" aria-label="Roofline of the chosen GPU on log-log axes, with the prefill and decode points of the lab model and, for our machine, the measured matmul sweep and measured passes"></svg></div>
+<div class="kg-leg"><span style="--c:var(--ink)">roof of the chosen GPU</span><span style="--c:var(--muted)">other GPUs (dashed)</span><span style="--c:var(--q)">prefill</span><span style="--c:var(--k)">decode</span><span style="--c:var(--tc)">measured matmul sweep (squares)</span></div>
+<div class="readout" id="kg-roof-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The roofline (87.10) of the chosen GPU with the lab model’s prefill and decode points (filled circles, placed on the roof: the best case). For our M5 Pro the figure also shows what we measured: the matmul sweep of (87.9) as squares, and our real prefill passes (\(B = 1\), \(T = 128\) to 4,096) and decode steps (\(c = 512\), \(B = 1\) to 128) as open circles at their achieved FLOP/s.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>With the defaults, the prefill point (2,048 tokens) sits on the flat roof and the decode point (batch 1) at the far left, low on the slope: about 123 times less FLOP/s. The open circles show the truth on our machine: the measured prefill passes sit below the roof, and the measured decode steps sit at about half the slope. Raise the batch: the decode point climbs the slope; it reaches our ridge near \(b = 710\). Raise the context to 32K with a large batch: the decode point moves back left, because the KV cache bytes grow with \(b \times c\) while the weights are shared. Switch to the H100: the whole roof moves up and its ridge moves right, so more batch is needed before decode becomes compute-bound.</p></details></figure>
+<aside class="note numbers side"><span class="nt">Numbers</span>The four GPUs of the figures: H100 SXM 989 TFLOP/s and 3.35 TB/s; A100 80GB SXM 312 TFLOP/s and 2.039 TB/s; L4 121 TFLOP/s and 300 GB/s (all BF16 dense, from NVIDIA’s spec sheets, as in <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>); our M5 Pro: 29.2 TFLOP/s and 233 GB/s, measured. [Certain for the specs; our numbers are from one run]</aside>
+<p>Yuan et al. built the same kind of analysis into a tool (LLM-Viewer) and report it layer by layer for real models: prefill operations are mostly compute-bound, decode operations are memory-bound. [Certain] Your measured roofline tells you something the spec-sheet roofline cannot: how far your <i>software</i> is from the hardware. On our machine, prefill reaches about 27% of the measured roof and decode about 53% of the slope. These two percentages are the targets of the rest of <a href="../inference/index.html">Track 5</a>: better kernels and fewer launches raise them; quantization and smaller caches change the bytes and move the points.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>The intensities of (87.2) and (87.3) assume the weights are read exactly once per pass. Real kernels may read more (cache misses, repeated K and V, extra copies) or less (a small model can partly stay in a large on-chip cache). So the point on the roofline is a model, and only the measured time is a fact. If a measured point lies <i>above</i> the roof, your byte count is wrong, not the hardware.</aside>
+
+<h2>The whole lab in one file</h2>
+<p>This script runs on an NVIDIA GPU, on Apple silicon (MPS) or, slowly, on a CPU. It is deterministic (fixed seeds) except for the timings. It needs PyTorch 2.x and about 4 GB of GPU memory for the BF16 model (more for the batch-64 decode test). We ran exactly this file on our machine. [Certain]</p>
+<pre class="code"># lab.py: KV-cached generation, metrics and the roofline (PyTorch 2.x, CUDA, Apple MPS or CPU)
+import time, torch, torch.nn as nn, torch.nn.functional as F
+
+class Cfg:   # the shape of Llama 3.2 1B (RoPE scaling left out); weights are random
+    vocab, d, L, h, kv, ff, theta = 128256, 2048, 16, 32, 8, 8192, 500000.0
+class Tiny(Cfg):
+    vocab, d, L, h, kv, ff = 512, 128, 2, 4, 2, 256
+
+class RMSNorm(nn.Module):
+    def __init__(s, d): super().__init__(); s.w = nn.Parameter(torch.ones(d))
+    def forward(s, x):
+        x32 = x.float()
+        return (x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + 1e-5)).type_as(x) * s.w
+
+def rope(pos, dh, theta):
+    inv = theta ** (-torch.arange(0, dh, 2, device=pos.device).float() / dh)
+    ang = pos.float()[:, None] * inv[None]
+    ang = torch.cat([ang, ang], -1)
+    return ang.cos(), ang.sin()
+
+def rot(x, cos, sin):
+    a, b = x.chunk(2, -1)
+    return x * cos + torch.cat([-b, a], -1) * sin
+
+class Block(nn.Module):
+    def __init__(s, c):
+        super().__init__(); s.c = c; dh = c.d // c.h
+        s.n1, s.n2 = RMSNorm(c.d), RMSNorm(c.d)
+        s.qkv = nn.Linear(c.d, (c.h + 2 * c.kv) * dh, bias=False)
+        s.o = nn.Linear(c.h * dh, c.d, bias=False)
+        s.gu = nn.Linear(c.d, 2 * c.ff, bias=False)
+        s.down = nn.Linear(c.ff, c.d, bias=False)
+    def forward(s, x, cos, sin, cache=None, start=0):
+        c = s.c; B, T, _ = x.shape; dh = c.d // c.h; r = c.h // c.kv
+        q, k, v = s.qkv(s.n1(x)).split([c.h * dh, c.kv * dh, c.kv * dh], -1)
+        q = q.view(B, T, c.h, dh).transpose(1, 2)
+        k = k.view(B, T, c.kv, dh).transpose(1, 2)
+        v = v.view(B, T, c.kv, dh).transpose(1, 2)
+        cos, sin = cos.to(q.dtype), sin.to(q.dtype)
+        q, k = rot(q, cos, sin), rot(k, cos, sin)
+        if cache is not None:                  # write the new K, V; then read all past ones
+            K, V = cache
+            K[:B, :, start:start + T] = k; V[:B, :, start:start + T] = v
+            k, v = K[:B, :, :start + T], V[:B, :, :start + T]
+        if T == 1:                             # decode: group the r query heads of each KV head
+            a = F.scaled_dot_product_attention(q.view(B, c.kv, r, dh), k, v).view(B, c.h, 1, dh)
+        else:                                  # prefill: repeat K, V for the r query heads
+            k, v = k.repeat_interleave(r, 1), v.repeat_interleave(r, 1)
+            a = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        x = x + s.o(a.transpose(1, 2).reshape(B, T, c.d))
+        g, u = s.gu(s.n2(x)).chunk(2, -1)
+        return x + s.down(F.silu(g) * u)
+
+class LM(nn.Module):
+    def __init__(s, c):
+        super().__init__(); s.c = c
+        s.emb = nn.Embedding(c.vocab, c.d)
+        s.blocks = nn.ModuleList(Block(c) for _ in range(c.L))
+        s.norm = RMSNorm(c.d)
+    def forward(s, idx, caches=None, start=0):
+        pos = torch.arange(start, start + idx.shape[1], device=idx.device)
+        cos, sin = rope(pos, s.c.d // s.c.h, s.c.theta)
+        x = s.emb(idx)
+        for i, b in enumerate(s.blocks):
+            x = b(x, cos, sin, None if caches is None else caches[i], start)
+        return s.norm(x[:, -1:]) @ s.emb.weight.T   # logits of the last position only (tied head)
+
+def build(c, dev, dt, seed=0):
+    m = LM(c); g = torch.Generator().manual_seed(seed)
+    for p in m.parameters():
+        if p.dim() &gt; 1: p.data.copy_(torch.randn(p.shape, generator=g) * 0.02)
+    return m.to(dev, dt).eval()
+
+def make_cache(c, B, Tmax, dev, dt):   # one (K, V) pair per layer: (B, n_kv, Tmax, d_h)
+    shape = (B, c.kv, Tmax, c.d // c.h)
+    return [(torch.zeros(shape, device=dev, dtype=dt), torch.zeros(shape, device=dev, dtype=dt))
+            for _ in range(c.L)]
+
+@torch.no_grad()
+def generate_nocache(m, prompt, n):
+    seq = prompt
+    for _ in range(n):                                  # the whole sequence, every step
+        nxt = m(seq)[:, -1].argmax(-1, keepdim=True)
+        seq = torch.cat([seq, nxt], 1)
+    return seq[:, prompt.shape[1]:]
+
+@torch.no_grad()
+def generate_cache(m, prompt, n):
+    B, P = prompt.shape; p = next(m.parameters())
+    caches = make_cache(m.c, B, P + n, p.device, p.dtype)
+    out = [m(prompt, caches, 0)[:, -1].argmax(-1, keepdim=True)]     # prefill fills the cache
+    for t in range(n - 1):                                            # decode: one token per step
+        out.append(m(out[-1], caches, P + t)[:, -1].argmax(-1, keepdim=True))
+    return torch.cat(out, 1)
+
+# ---------- timing helpers ----------
+dev = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+def sync():
+    if dev == "cuda": torch.cuda.synchronize()
+    elif dev == "mps": torch.mps.synchronize()
+def bench(f, warmup=2, reps=5):            # best (min) wall time of f(), with the GPU queue drained
+    for _ in range(warmup): f()
+    sync(); best = float("inf")
+    for _ in range(reps):
+        t = time.perf_counter(); f(); sync(); best = min(best, time.perf_counter() - t)
+    return best
+
+if __name__ == "__main__":
+    torch.manual_seed(0)
+    # 1. correctness: both loops must give the same tokens (FP32, tiny model)
+    tiny = build(Tiny(), dev, torch.float32)
+    pr = torch.randint(0, 512, (4, 16), generator=torch.Generator().manual_seed(1)).to(dev)
+    a, b = generate_nocache(tiny, pr, 48), generate_cache(tiny, pr, 48)
+    print("same tokens:", torch.equal(a, b))
+
+    # 2. speed-up of the cache: 128-token prompt, 256 new tokens, 1B shape in BF16
+    dt = torch.bfloat16 if dev != "cpu" else torch.float32
+    c = Cfg(); m = build(c, dev, dt)
+    pr = torch.randint(0, c.vocab, (1, 128), generator=torch.Generator().manual_seed(1)).to(dev)
+    t_nc = bench(lambda: generate_nocache(m, pr, 256), 1, 2)
+    t_c = bench(lambda: generate_cache(m, pr, 256), 1, 2)
+    print(f"no cache {t_nc:.2f} s, cache {t_c:.2f} s, speed-up {t_nc / t_c:.1f}x")
+
+    # 3. TTFT = one prefill pass; TPOT = one decode step at context c
+    with torch.no_grad():
+        for B in [1, 8]:
+            for P in [128, 512, 2048]:
+                p = torch.randint(0, c.vocab, (B, P), device=dev); ca = make_cache(c, B, P + 1, dev, dt)
+                print(f"TTFT B={B} P={P}: {1e3 * bench(lambda: m(p, ca, 0).argmax(-1)):.1f} ms")
+        for B in [1, 16, 64]:
+            ca = make_cache(c, B, 513, dev, dt); tok = torch.zeros(B, 1, dtype=torch.long, device=dev)
+            print(f"TPOT B={B} c=512: {1e3 * bench(lambda: m(tok, ca, 512).argmax(-1)):.1f} ms")
+        del ca
+
+    # 4. the roofline: bandwidth (copy 1 GiB) and peak matmul speed
+    x = torch.randn(2**29, device=dev, dtype=dt); y = torch.empty_like(x)
+    bw = 2 * x.numel() * x.element_size() / bench(lambda: y.copy_(x))      # read + write
+    A = torch.randn(4096, 4096, device=dev, dtype=dt)
+    fl = 2 * 4096**3 / bench(lambda: A @ A)
+    print(f"bandwidth {bw / 1e9:.0f} GB/s, matmul {fl / 1e12:.1f} TFLOP/s, ridge {fl / bw:.0f} FLOP/byte")
+    W = torch.randn(8192, 8192, device=dev, dtype=dt)
+    for M in [1, 8, 64, 512, 4096]:           # X (M, 8192) @ W: intensity about M FLOP/byte
+        X = torch.randn(M, 8192, device=dev, dtype=dt)
+        t = bench(lambda: X @ W.T)
+        I = 2 * M * 8192**2 / (2 * (8192**2 + 2 * M * 8192))
+        print(f"M={M:5d}  I={I:7.1f} FLOP/B  {2 * M * 8192**2 / t / 1e12:6.2f} TFLOP/s")</pre>
+<p>The output of one run of this file on our machine. Other jobs were using the machine at the same time, so these single-run numbers are noisier and slower than the best-of-repeats numbers in the text and the figures, which come from a longer benchmark with the same model and the same measurements. Your numbers will differ.</p>
+<pre class="code">same tokens: True</pre>
+<p>Things to try next, each a few lines of change: time the decode step with <code>torch.compile</code> on a CUDA GPU and see how much of the gap to the bound was launch overhead; replace the grouped decode attention with the repeat version and reproduce the TPOT-vs-context gap of Figure 3; store the cache in FP8 and see how TPOT at long context changes; add a timer around the argmax and the <code>.item()</code> that a real server needs, and see what fraction of TPOT it is.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Where</th><th>What you measure</th><th>What it decides</th></tr></thead><tbody>
+<tr><td>Choosing a GPU for serving</td><td>Bytes per decode step and your measured bandwidth</td><td>TPOT and cost per token; the bandwidth ratio predicts the decode speed-up between two GPUs</td></tr>
+<tr><td>Capacity planning (<a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>)</td><td>TTFT vs prompt length, TPOT vs batch</td><td>The largest batch that meets a latency target, and so requests per GPU</td></tr>
+<tr><td>Serving engines (vLLM, SGLang, TensorRT-LLM)</td><td>Benchmark scripts that report TTFT, TPOT and ITL percentiles [Certain]</td><td>Scheduler settings: batch size, chunked-prefill size, CUDA graphs</td></tr>
+<tr><td>Kernel work (<a href="../inference/gpu-kernels-2-write-kernels-in-the.html">session 86</a>)</td><td>Achieved bandwidth or FLOP/s against the measured roof</td><td>Whether a kernel is worth optimizing further</td></tr>
+<tr><td>Long-context and video models</td><td>Prefill time for very long inputs (thousands of visual tokens per video), KV bytes per step</td><td>Whether to compress visual tokens, use a smaller cache, or split prefill into chunks; video question answering and Video-RAG send long prompts, so TTFT dominates</td></tr>
+<tr><td>On-device inference (laptops, phones)</td><td>Bandwidth of unified memory, launch overhead</td><td>Model size and quantization: decode speed is about bandwidth divided by model bytes</td></tr>
+<tr><td>Performance regression tests</td><td>The same fixed-shape benchmark after every change</td><td>Catches a slower kernel or a missing cache before users do</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>No synchronize before stopping the clock.</b> You measure Python, not the GPU (Figure 2). The numbers look too good, and they do not change when you change the model size.</li>
+<li><b>No warm-up.</b> The first call includes memory allocation and kernel selection or compilation. A single cold run can be several times slower than the steady state.</li>
+<li><b>Testing the cache in BF16 with exact token equality.</b> Order-of-addition differences can flip a near-tie, and then the texts differ. Test the logic in FP32; test BF16 with a logit tolerance.</li>
+<li><b>Using <code>is_causal=True</code> when the query is shorter than the keys.</b> In PyTorch the causal mask is aligned to the top-left, so a one-token query over a cache would see only the first key. Decode needs no mask at all (all cached keys are in the past); a chunk of several new tokens needs an explicit mask shifted by the cache length.</li>
+<li><b>Timing one whole <code>generate()</code> and calling it “TPOT”.</b> The total mixes prefill, decode at many context lengths and Python overhead. Time the phases separately, at fixed shapes.</li>
+<li><b>Measuring bandwidth with a small tensor.</b> A 64 MB copy stays partly in on-chip caches or is dominated by launch cost; our first try with a 64 MB tensor gave a lower number than the 1 GiB copy. Use at least several hundred MB.</li>
+<li><b>Comparing your measurement with the spec-sheet peak only.</b> Then a well-written kernel looks bad. Compare with your measured roof, and report both.</li>
+<li><b>Expanding grouped K and V before attention.</b> <code>repeat_interleave</code> makes a full-size copy of the cache in every layer, every step; at long contexts it costs more than the attention itself (Figure 3, TPOT vs context).</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why can greedy generation with and without a KV cache give different tokens, and how do you test a cache implementation?<span class="lvl">basic</span></summary><div class="ans">With exact arithmetic they are identical. In BF16 the two paths run different kernels on different shapes, so sums are done in a different order and the logits differ in the last bits (up to about 0.02 in our test). If two candidate tokens are within that distance, argmax can pick a different one, and from then on the sequences differ. So test the logic in FP32, where the tokens must match exactly and the logits to about \(10^{-6}\); in BF16, compare logits for the same input sequence with a tolerance. Test several prompts in a batch, including position offsets, because the typical bugs are a wrong RoPE position or a wrong write index.</div></details>
+<details class="qa"><summary>The KV cache saves more than 99% of the FLOPs. Why can the measured speed-up be only 2 to 4 times?<span class="lvl">core</span></summary><div class="ans">Because time is set by the larger of compute time and memory time (87.6), and every step, with or without cache, reads all the weights. A no-cache step with a few hundred tokens does a few hundred times more math, but if that math is still below the ridge (about 295 FLOP per byte on an H100 in BF16), the step is memory-bound and costs about the same as a decode step. The saved FLOPs were free. Only when the sequence grows beyond the ridge does each no-cache step become compute-bound and grow linearly, and then quadratically with attention. So the speed-up is small for short prompts on big GPUs and large for long prompts. Kernel efficiency at each shape changes the measured number further.</div></details>
+<details class="qa"><summary>How do you measure the time of a GPU operation correctly in PyTorch?<span class="lvl">basic</span></summary><div class="ans">Warm up with one or more calls (allocation, kernel selection, compilation). Synchronize before you start and before you stop the clock, because kernels run asynchronously; or use CUDA events recorded on the stream. Repeat many times and report the minimum (hardware capability) and the median or P90 (user experience). Keep the inputs fixed in shape, avoid printing or <code>.item()</code> inside the timed region unless it belongs to what you measure, and make sure other jobs are not sharing the GPU.</div></details>
+<details class="qa"><summary>How would you measure your GPU’s memory bandwidth, and why is it below the spec?<span class="lvl">core</span></summary><div class="ans">Time a large device-to-device copy, for example 1 GiB with <code>y.copy_(x)</code>, take the best of several runs, and divide \(2 \times\) the bytes by the time (one read and one write per byte). Also time a pure read such as a sum. The result is typically 70 to 90% of the spec [Likely], because the spec is the raw interface rate and real traffic has refresh cycles, row switches, and read/write turnarounds. On our M5 Pro we measured 233 GB/s against a spec of 307 GB/s. Use a large tensor; small ones fit in caches or are dominated by launch cost.</div></details>
+<details class="qa"><summary>What is the arithmetic intensity of a decode step, and how does batching change it?<span class="lvl">core</span></summary><div class="ans">FLOPs divided by bytes moved. For a decode step, \(F = b(2N + 4Ldc)\) and \(Q = sN + bc\,\text{kv}_{\text{tok}}\). In BF16 with short contexts, \(I \approx b\): every sequence in the batch reuses the same weight bytes. So batching moves decode right along the slanted roof, and throughput grows almost linearly with \(b\) at almost constant TPOT. Two things stop it: the KV cache, which is read per sequence and so has a fixed intensity (\(2g/s\) FLOPs per byte, where \(g = h/n_{kv}\) query heads share one KV head: 4 for our model), and the memory capacity needed to hold that cache. The ridge of an H100 is about 295, so a batch of a few hundred short sequences would be needed to make decode compute-bound.</div></details>
+<details class="qa"><summary>Why does TTFT grow linearly with prompt length while TPOT barely grows with context length?<span class="lvl">basic</span></summary><div class="ans">TTFT is one prefill pass, which is compute-bound beyond a few hundred tokens; its FLOPs are \(2N\) per token plus attention, so its time is about proportional to the prompt length (and grows faster than linearly for very long prompts because of the \(T^2\) attention term). TPOT is one decode step, which is memory-bound; its bytes are the weights plus the cache, and the cache of one sequence is small next to the weights. For our 1B model, 16K tokens of context add 0.54 GB to 2.47 GB of weights. For a model with a bigger cache per token or a large batch, TPOT does grow with context.</div></details>
+<details class="qa"><summary>Your measured TPOT is twice the bandwidth bound. What do you check?<span class="lvl">advanced</span></summary><div class="ans">First, the bound: count the bytes (weights, cache, output layer) and use your measured bandwidth, not the spec. Then profile the step: is the GPU idle between kernels? If yes, the loop is launch-bound; use CUDA graphs or <code>torch.compile(mode="reduce-overhead")</code>, and fuse small operations. Then check each kernel’s achieved bandwidth: matrix-vector products at batch 1 often do not reach full bandwidth; the attention over the cache may copy K and V (for example repeating them for grouped heads); RoPE and norms may be separate memory-bound kernels. Finally check for host syncs inside the step, such as <code>.item()</code> or Python conditions on GPU values.</div></details>
+<details class="qa"><summary>Where on the roofline do prefill and decode sit, and what optimizations does each position suggest?<span class="lvl">core</span></summary><div class="ans">Prefill of \(T\) tokens has intensity about \(T\) FLOPs per byte in BF16, so for prompts beyond the ridge (a few hundred tokens) it sits on the flat compute roof. Faster math helps it: better matmul and attention kernels (FlashAttention), lower-precision compute (FP8), more GPUs. Decode at small batch has intensity about \(b\), far left on the slope: memory-bound. Fewer bytes help it: weight quantization, KV-cache quantization, grouped or latent attention, and more sequences per step (batching), which raises the intensity. Speculative decoding also helps by verifying several tokens per weight read.</div></details>
+<details class="qa"><summary>Why do we time a decode step at a fixed context, instead of averaging over a full generation?<span class="lvl">advanced</span></summary><div class="ans">Because TPOT depends on the context length and the batch, and a full generation mixes many contexts and includes the prefill and the start-up costs. Fixing the shape gives one clean number per \((B, c)\) and lets you sweep a grid. It also lets you put each point on the roofline, since its FLOPs and bytes are known exactly. For the end-to-end view you then combine them: E2E ≈ TTFT + \(\sum_i \text{TPOT}(B, P + i)\). Afterwards, check the combination against one real end-to-end run to catch costs the model misses.</div></details>
+<details class="qa"><summary>A laptop GPU and a data-center GPU: which ratio predicts the speed-up of decode, and which predicts prefill?<span class="lvl">core</span></summary><div class="ans">Decode is memory-bound, so its speed-up is close to the ratio of bandwidths: 3.35 TB/s against our measured 233 GB/s gives about 14×. Prefill is compute-bound, so its speed-up is close to the ratio of matmul speeds: 989 against about 29.2 TFLOP/s gives about 34×. This assumes both machines reach the same fraction of their roofs, which is rarely exactly true: data-center GPUs run well-tuned CUDA kernels and can use CUDA graphs.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Use (87.5) to estimate the FLOP ratio between the no-cache and the cached loop for \(P = 2048\) and \(n = 256\). Then use Figure 1 to find the best-case time ratio on an H100. Why are they so different?</li>
+<li>Our model has 8 KV heads of size 64 in 16 layers. What would \(\text{kv}_{\text{tok}}\) be with 32 KV heads (plain multi-head attention)? At a 16K context and batch 1, by how much would the bytes of one decode step grow?</li>
+<li>A colleague reports a TPOT of 0.8 ms for the lab model on our laptop. Using the bound, explain why the number must be wrong, and name the most likely mistake.</li>
+<li>Compute the intensity (87.9) of the matmul sweep at \(M = 64\) and \(M = 1024\) with \(K = N = 8192\) in BF16. On our measured roof, which one is memory-bound?</li>
+<li>For the H100 (989 TFLOP/s, 3.35 TB/s), at what batch does a decode step of the lab model at context 512 reach the ridge? Use (87.3). Could it be reached at context 32K?</li>
+<li>Run the lab file on your GPU. Write down your bandwidth, matmul speed and ridge, and the ratio of your measured TPOT (batch 1) to its bound. Is your loop closer to the bound than ours?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \((256 \cdot 2048 + 256 \cdot 255/2) / (2048 + 255) = 556{,}928 / 2{,}303 = 241.8\); the exact count (87.4) gives 234.4. The best-case time ratio on the H100 is only about 5.95. The cached steps are memory-bound: each reads 2.47 GB and cannot take less than 0.74 ms. The no-cache steps are compute-bound, but each costs only about 4 to 5 ms on an H100. The FLOP ratio would be the time ratio only if both loops were compute-bound. 2. \(2 \cdot 16 \cdot 32 \cdot 64 \cdot 2 = 131{,}072\) bytes (128 KiB) per token, four times more. At 16K tokens: 2.15 GB of cache instead of 0.54 GB, so a step reads 4.62 GB instead of 3.01 GB, 1.54 times more. 3. The step must read at least 2.47 GB; at 233 GB/s that takes at least 10.6 ms, so 0.8 ms would need 3.1 TB/s. The timer most likely stopped without a synchronize (Figure 2). 4. \(M = 64\): \(2 \cdot 64 \cdot 8192^2 / (2(8192^2 + 2 \cdot 64 \cdot 8192)) = 63.0\); \(M = 1024\): 819.2. Our ridge is 125, so \(M = 64\) is memory-bound and \(M = 1024\) is compute-bound; the sweep agrees (7.7 TFLOP/s at 64, 29.2 at 1024). 5. Need \(b(2N_{mm} + 4Ldc) / (sN_{mm} + bc\,\text{kv}_{\text{tok}}) = 295\). At \(c = 512\): \(b = 295 \cdot 2.4715\text{e}9 / (2.4715\text{e}9 + 67.1\text{e}6 - 295 \cdot 16.78\text{e}6) \). The denominator is negative, so no batch reaches the ridge: as \(b\) grows, \(I\) approaches \((2N_{mm} + 4Ldc)/(c\,\text{kv}_{\text{tok}}) = 151\), the limit set by the cache bytes. At 32K the limit is about 6.3. Decode of this model never becomes compute-bound on an H100; capacity (memory size) stops the batch first. 6. Open: compare with our 1.9× and with the spec of your GPU.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Write the cached loop as one prefill that fills a preallocated cache, then one-token decode steps that write at position \(P + i - 1\) and read everything before. Test it in FP32 for exact token equality; BF16 can flip near-ties.</li>
+<li>The cache saves about \((nP + n^2/2)/(P+n)\) times the FLOPs, but the time saved depends on whether the no-cache steps were compute-bound. On our laptop: 32.5 s against 7.75 s, 4.2×.</li>
+<li>Time GPUs with warm-up, synchronization and repeats. Without a sync you measure Python. With a sync every step you see the launch overhead that a real loop pays.</li>
+<li>TTFT grows with the prompt tokens in the batch (compute-bound). TPOT grows much more slowly than the batch (memory-bound: the weights are read once per step and shared), so batching multiplies throughput.</li>
+<li>Measure your roof: a 1 GiB copy for bandwidth, a large matmul for FLOP/s. Ours: 233 GB/s, 29.2 TFLOP/s, ridge 125.</li>
+<li>Prefill sits on the flat roof (\(I \approx T\)), decode on the slope (\(I \approx b\)). The ratio of your measured time to the bound is the most useful single number for deciding what to optimize.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ F_{\text{pre}}(T) \approx 2N_{\text{body}}T + 2LdT^2, \qquad F_{\text{dec}} = b(2N_{mm} + 4Ldc), \qquad Q_{\text{dec}} = sN_{mm} + bc\,\text{kv}_{\text{tok}} \]</div>
+<div class="eq">\[ \frac{F_{\text{no cache}}}{F_{\text{cache}}} \approx \frac{nP + n(n-1)/2}{P + n - 1}, \qquad t \ge \max\!\left(\frac{F}{F_{\text{peak}}}, \frac{Q}{\text{BW}}\right) \]</div>
+<div class="eq">\[ \text{BW} = \frac{2sn}{t_{\text{copy}}}, \quad F = \frac{2MKN}{t_{\text{mm}}}, \quad P(I) = \min(F, I \cdot \text{BW}), \quad \text{efficiency} = \frac{t_{\text{bound}}}{t_{\text{meas}}} \]</div>
+<h2 class="plain" id="lab-kv-cached-generation-metrics-and-your-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Raschka, <a href="https://github.com/rasbt/reasoning-from-scratch" target="_blank" rel="noopener"><i>Build a Reasoning Model (From Scratch)</i></a>, chapter E: Batching and throughput-oriented execution</li><li>Yuan et al. (2024). <a href="https://arxiv.org/abs/2402.16363" target="_blank" rel="noopener">LLM Inference Unveiled: Survey and Roofline Model Insights</a></li><li>Raschka, <a href="https://github.com/rasbt/reasoning-from-scratch" target="_blank" rel="noopener"><i>Build a Reasoning Model (From Scratch)</i></a>, chapter E: Batching and throughput-oriented execution</li><li>Yuan et al. (2024). <a href="https://arxiv.org/abs/2402.16363" target="_blank" rel="noopener">LLM Inference Unveiled: Survey and Roofline Model Insights</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Meta (2024). <a href="https://huggingface.co/meta-llama/Llama-3.2-1B" target="_blank" rel="noopener">Llama 3.2 1B model card and config.json (Hugging Face)</a></li><li>PyTorch (2024). <a href="https://pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">Scaled dot-product attention in torch.nn.functional (documentation)</a></li><li>Apple (2026). <a href="https://www.apple.com/ee/newsroom/2026/03/apple-debuts-m5-pro-and-m5-max-to-supercharge-the-most-demanding-pro-workflows/" target="_blank" rel="noopener">Apple debuts M5 Pro and M5 Max (press release, memory bandwidth up to 307 GB/s)</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/gpu-kernels-2-write-kernels-in-the.html"><small>Previous · session 86</small>GPU kernels 2: write kernels in the Triton language</a><a class="next" href="../inference/prompt-pruning-selective-context-llmlingua-longllmlingua.html"><small>Next · session 88</small>Prompt pruning: Selective Context, LLMLingua, LongLLMLingua</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const Bk=window.Book;const R=document.querySelector('[data-session="lab-kv-cached-generation-metrics-and-your"]');if(!R)return;
+const $=s=>R.querySelector(s);
+/* ---------- the model: Llama 3.2 1B shape, BF16 (formulas 87.1 to 87.3, 87.8, 87.9) ---------- */
+const M={V:128256,d:2048,L:16,h:32,kv:8,ff:8192};M.dh=M.d/M.h;
+const Nbody=M.L*(M.d*(M.h+2*M.kv)*M.dh+M.d*M.d+3*M.d*M.ff),Nemb=M.V*M.d,Nmm=Nbody+Nemb,S=2,KV=2*M.L*M.kv*M.dh*S;
+const pre=T=>({F:2*Nbody*T+2*Nemb+2*M.L*M.d*T*T,Q:S*Nmm+T*KV});
+const dec=(b,c)=>({F:b*(2*Nmm+4*M.L*M.d*c),Q:S*Nmm+b*c*KV});
+/* ---------- measured on our machine (Apple M5 Pro, PyTorch MPS, BF16; best of repeats) ---------- */
+const D=/*DATA*/{"ttft": {"1": [[128, 46.1], [256, 78.1], [512, 103.3], [1024, 210.6], [2048, 534.5], [4096, 1160.6]], "8": [[128, 209.4], [256, 334.6], [512, 766.9], [1024, 1975.2], [2048, 3967.9]]}, "tpotb": [[1, 20.1], [2, 31.5], [4, 40.0], [8, 34.7], [16, 29.4], [32, 40.7], [64, 39.1], [128, 46.5]], "tpotc": {"1,1": [[128, 23.3], [512, 20.1], [2048, 19.3], [8192, 31.6], [16384, 26.6]], "1,16": [[128, 40.1], [512, 29.4], [2048, 56.4], [8192, 57.9]], "0,1": [[128, 18.6], [512, 22.7], [2048, 29.0], [8192, 72.3], [16384, 176.0]], "0,16": [[128, 38.2], [512, 64.6], [2048, 241.3], [8192, 785.2]]}, "bw": 233, "bwr": 216, "mm": 26.1, "sweep": [[1, 0.148], [2, 0.338], [4, 0.627], [8, 1.13], [16, 2.177], [32, 3.889], [64, 7.674], [128, 14.703], [256, 21.166], [512, 27.832], [1024, 29.195], [2048, 24.961], [4096, 22.938]], "nc": 32.55, "c": 7.75}/*END*/;
+const mmPeak=Math.max(...D.sweep.map(p=>p[1]));
+const GPU={m5:{n:"our M5 Pro (measured)",F:mmPeak*1e12,BW:D.bw*1e9},h100:{n:"H100 SXM (spec)",F:989e12,BW:3.35e12},a100:{n:"A100 80GB SXM (spec)",F:312e12,BW:2.039e12},l4:{n:"L4 (spec)",F:121e12,BW:300e9}};
+const tm=(w,g)=>Math.max(w.F/g.F,w.Q/g.BW);
+const bound=(w,g)=>w.F/g.F>=w.Q/g.BW?"compute":"memory";
+const f1=v=>v.toFixed(1),f2=v=>v.toFixed(2),fi=v=>Math.round(v).toLocaleString("en-US");
+const fk=v=>v>=1024&&v%1024===0?(v/1024)+"K":String(v);
+const ms=v=>v>=1?v.toFixed(v>=100?0:v>=10?1:2)+" ms":(v*1e3).toFixed(0)+" µs";
+const secs=v=>v>=1?v.toFixed(2)+" s":(v*1e3).toFixed(v>=0.1?0:1)+" ms";
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segVal=el=>el.querySelector('button[aria-pressed="true"]').dataset.v;
+const T=(x,y,s,a)=>`<text x="${x}" y="${y}" font-size="12" fill="var(--muted)" ${a||""}>${s}</text>`;
+
+/* ---------- Figure 1: cost of generate() with and without the cache ---------- */
+(function(){
+ const svg=$("#kg-cost-svg");if(!svg)return;const sP=$("#kg-cost-p"),sN=$("#kg-cost-n"),sg=$("#kg-cost-gpu"),info=$("#kg-cost-info");
+ const W=680,H=250,x0=62,x1=660,y0=210,y1=18;
+ function draw(){const P=Math.round(2**+sP.value),n=Math.round(2**+sN.value),g=GPU[segVal(sg)];$("#kg-cost-pv").value=fi(P);$("#kg-cost-nv").value=fi(n);
+  let Fnc=0,Fc=0,tnc=0,tc=0,flip=-1;const anc=[],ac=[];
+  for(let i=0;i<n;i++){const w=pre(P+i);Fnc+=w.F;const t1=tm(w,g);tnc+=t1;anc.push(t1);if(flip<0&&bound(w,g)==="compute")flip=i;
+   const v=i===0?pre(P):dec(1,P+i);Fc+=v.F;const t2=tm(v,g);tc+=t2;ac.push(t2);}
+  const ymax=Math.max(...anc,...ac)*1.1*1e3;const X=i=>x0+(x1-x0)*i/Math.max(1,n-1),Y=v=>y0-(y0-y1)*v*1e3/ymax;
+  let h=`<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y0}" stroke="var(--rule)"/><line x1="${x0}" y1="${y0}" x2="${x0}" y2="${y1}" stroke="var(--rule)"/>`;
+  for(let k=0;k<=4;k++){const v=ymax*k/4;const y=y0-(y0-y1)*k/4;h+=`<line x1="${x0}" y1="${y}" x2="${x1}" y2="${y}" stroke="var(--rule)" opacity=".5"/>`+T(x0-6,y+4,v<10?v.toFixed(1):v.toFixed(0),'text-anchor="end"');}
+  for(let k=0;k<=4;k++){const i=Math.round((n-1)*k/4);h+=T(X(i),y0+16,fi(i),'text-anchor="middle"');}
+  h+=T((x0+x1)/2,y0+34,"decode step i (token number)",'text-anchor="middle"')+`<text x="14" y="${(y0+y1)/2}" font-size="12" fill="var(--muted)" transform="rotate(-90 14 ${(y0+y1)/2})" text-anchor="middle">ms per step (best case)</text>`;
+  const path=a=>a.map((v,i)=>`${i?"L":"M"}${X(i).toFixed(1)} ${Y(v).toFixed(1)}`).join(" ");
+  h+=`<path d="${path(anc)} L${X(n-1)} ${y0} L${x0} ${y0}Z" fill="var(--k)" opacity=".18"/><path d="${path(anc)}" fill="none" stroke="var(--k)" stroke-width="2.4"/>`;
+  h+=`<path d="${path(ac)} L${X(n-1)} ${y0} L${x0} ${y0}Z" fill="var(--q)" opacity=".25"/><path d="${path(ac)}" fill="none" stroke="var(--q)" stroke-width="2.4"/>`;
+  if(flip>0)h+=`<line x1="${X(flip)}" y1="${y1}" x2="${X(flip)}" y2="${y0}" stroke="var(--muted)" stroke-dasharray="4 4"/>`+T(X(flip)+4,y1+12,"no-cache step becomes compute-bound");
+  svg.innerHTML=h;
+  info.innerHTML=`Prompt <b>${fi(P)}</b>, <b>${fi(n)}</b> new tokens, ${g.n}. FLOPs: no cache <b>${f2(Fnc/1e12)}</b> TFLOP, cache <b>${f2(Fc/1e12)}</b> TFLOP, ratio <b>${f1(Fnc/Fc)}×</b>. Best-case time (formula 87.6): no cache <b>${secs(tnc)}</b>, cache <b>${secs(tc)}</b>, speed-up <b>${f2(tnc/tc)}×</b>. `+(flip<0?"Every no-cache step is still memory-bound, so it costs about the same as a cached step: the saved FLOPs were free.":flip===0?"Every no-cache step is compute-bound: the saved FLOPs turn directly into saved time.":`No-cache steps become compute-bound from step ${fi(flip)} (length ${fi(P+flip)}); before that the saved FLOPs were free.`);}
+ [sP,sN].forEach(e=>e.addEventListener("input",draw));seg(sg,draw);draw();
+})();
+
+/* ---------- Figure 2: what the timer sees (schematic) ---------- */
+(function(){
+ const svg=$("#kg-time-svg");if(!svg)return;const sa=$("#kg-time-a"),sgp=$("#kg-time-g"),md=$("#kg-time-mode"),info=$("#kg-time-info");const n=5;
+ function draw(){const a=+sa.value,g=+sgp.value,mode=segVal(md);$("#kg-time-av").value=a+" ms";$("#kg-time-gv").value=g+" ms";
+  const cpu=[],gpu=[];let ge=0,cs=0;
+  for(let i=0;i<n;i++){if(mode==="each"&&i>0)cs=ge;const ce=cs+a;cpu.push([cs,ce]);const gs=Math.max(ce,ge);ge=gs+g;gpu.push([gs,ge]);cs=ce;}
+  const stop=mode==="none"?cpu[n-1][1]:ge,span=Math.max(ge,stop);const x0=96,x1=660,X=t=>x0+(x1-x0)*t/(span*1.04);
+  let h=T(8,52,"CPU (Python)")+T(8,112,"GPU queue");
+  for(let i=0;i<n;i++){const [c0,c1]=cpu[i],[g0,g1]=gpu[i];
+   h+=`<rect x="${X(c0).toFixed(1)}" y="36" width="${Math.max(1,X(c1)-X(c0)-1.5).toFixed(1)}" height="24" rx="4" fill="var(--v)" opacity=".8"/><text x="${((X(c0)+X(c1))/2).toFixed(1)}" y="52" text-anchor="middle" font-size="11" fill="var(--paper)">${X(c1)-X(c0)>26?"issue "+(i+1):""}</text>`;
+   h+=`<rect x="${X(g0).toFixed(1)}" y="96" width="${Math.max(1,X(g1)-X(g0)-1.5).toFixed(1)}" height="24" rx="4" fill="var(--k)" opacity=".85"/><text x="${((X(g0)+X(g1))/2).toFixed(1)}" y="112" text-anchor="middle" font-size="11" fill="var(--paper)">${X(g1)-X(g0)>26?"step "+(i+1):""}</text>`;
+   if(mode==="each"&&i<n-1)h+=`<line x1="${X(g1)}" y1="94" x2="${X(g1)}" y2="62" stroke="var(--muted)" stroke-dasharray="3 3"/>`;}
+  h+=`<line x1="${X(0)}" y1="22" x2="${X(0)}" y2="136" stroke="var(--q)" stroke-width="2"/>`+`<text x="${X(0)+4}" y="20" font-size="12" fill="var(--q)">timer start</text>`;
+  h+=`<line x1="${X(stop)}" y1="22" x2="${X(stop)}" y2="136" stroke="var(--q)" stroke-width="2"/>`+`<text x="${X(stop)-4}" y="150" text-anchor="end" font-size="12" fill="var(--q)">timer stop</text>`;
+  svg.innerHTML=h;const busy=n*g;
+  const what=mode==="none"?`The timer stopped when Python finished <i>issuing</i> the work. It reads <b>${f1(stop)}</b> ms, but the GPU finished at <b>${f1(ge)}</b> ms.`+(stop<ge-1e-9?` The measurement is wrong by ${f1(ge-stop)} ms.`:" Here the two agree only because the CPU is slower than the GPU.")
+   :mode==="end"?`One sync at the end: the timer reads <b>${f1(stop)}</b> ms, the true time of the whole loop. The CPU ran ahead and kept the queue full.`
+   :`A sync after every step (what a real token loop does, because it needs each token on the CPU): <b>${f1(stop)}</b> ms, so <b>${f1(stop/n)}</b> ms per step = issue ${a} + GPU ${g}.`;
+  info.innerHTML=what+` GPU busy ${busy} of ${f1(span)} ms (<b>${Math.round(100*busy/span)}%</b>). `+(a>g?"The CPU issues work more slowly than the GPU runs it: the loop is <b>launch-bound</b>, and the GPU waits.":"The GPU is the slower side: the loop is <b>GPU-bound</b>.");}
+ [sa,sgp].forEach(e=>e.addEventListener("input",draw));seg(md,draw);draw();
+})();
+
+/* ---------- Figure 3: measured TTFT and TPOT against the best-case bound ---------- */
+(function(){
+ const svg=$("#kg-meas-svg");if(!svg)return;const vw=$("#kg-meas-view"),info=$("#kg-meas-info");const g=GPU.m5;
+ const x0=70,x1=650,y0=230,y1=16;
+ function draw(){const v=segVal(vw);let series=[],xl="",note="";
+  if(v==="ttft"){xl="prompt length P (tokens)";for(const B of ["1","8"])series.push({c:B==="1"?"var(--q)":"var(--k)",lab:`B = ${B}`,pts:D.ttft[B],bd:x=>tm({F:+B*pre(x).F,Q:S*Nmm+(+B)*x*KV},g)});}
+  else if(v==="tpotb"){xl="batch B (sequences decoding together), context 512";series.push({c:"var(--q)",lab:"measured",pts:D.tpotb,bd:x=>tm(dec(x,512),g)});}
+  else{xl="context length c (tokens)";series.push({c:"var(--q)",lab:"grouped GQA, B = 1",pts:D.tpotc["1,1"],bd:x=>tm(dec(1,x),g)},{c:"var(--v)",lab:"grouped GQA, B = 16",pts:D.tpotc["1,16"],bd:x=>tm(dec(16,x),g)},{c:"var(--k)",lab:"repeat K, V 4×, B = 1",pts:D.tpotc["0,1"],dash:1},{c:"var(--tc)",lab:"repeat K, V 4×, B = 16",pts:D.tpotc["0,16"],dash:1});}
+  const xs=series.flatMap(s=>s.pts.map(p=>p[0])),ys=series.flatMap(s=>s.pts.map(p=>p[1]));
+  const lx0=Math.log2(Math.min(...xs))-0.3,lx1=Math.log2(Math.max(...xs))+0.3;
+  const yb=series.filter(s=>s.bd).flatMap(s=>s.pts.map(p=>s.bd(p[0])*1e3));
+  const ly0=Math.floor(Math.log10(Math.min(...ys,...yb))*2)/2,ly1=Math.ceil(Math.log10(Math.max(...ys))*2)/2;
+  const X=x=>x0+(x1-x0)*(Math.log2(x)-lx0)/(lx1-lx0),Y=y=>y0-(y0-y1)*(Math.log10(y)-ly0)/(ly1-ly0);
+  let h=`<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y0}" stroke="var(--rule)"/><line x1="${x0}" y1="${y0}" x2="${x0}" y2="${y1}" stroke="var(--rule)"/>`;
+  for(let e=Math.ceil(ly0);e<=ly1;e++){const y=Y(10**e);h+=`<line x1="${x0}" y1="${y}" x2="${x1}" y2="${y}" stroke="var(--rule)" opacity=".5"/>`+T(x0-6,y+4,e>=3?(10**(e-3))+" s":(10**e)+" ms",'text-anchor="end"');}
+  for(const x of [...new Set(xs)].sort((a,b)=>a-b))h+=T(X(x),y0+16,fk(x),'text-anchor="middle"');
+  h+=T((x0+x1)/2,y0+34,xl,'text-anchor="middle"');
+  const rows=[];
+  series.forEach((s,k)=>{const d=s.pts.map((p,i)=>`${i?"L":"M"}${X(p[0]).toFixed(1)} ${Y(p[1]).toFixed(1)}`).join(" ");
+   h+=`<path d="${d}" fill="none" stroke="${s.c}" stroke-width="2.4" ${s.dash?'stroke-dasharray="7 4"':""}/>`+s.pts.map(p=>`<circle cx="${X(p[0]).toFixed(1)}" cy="${Y(p[1]).toFixed(1)}" r="4" fill="${s.c}"/>`).join("");
+   if(s.bd){const bp=[];for(let l=lx0+0.3;l<=lx1-0.3+1e-9;l+=0.125)bp.push(2**l);h+=`<path d="${bp.map((x,i)=>`${i?"L":"M"}${X(x).toFixed(1)} ${Y(s.bd(x)*1e3).toFixed(1)}`).join(" ")}" fill="none" stroke="${s.c}" stroke-width="1.6" stroke-dasharray="2 4" opacity=".9"/>`;}
+   rows.push(`<b>${s.lab}</b>: `+s.pts.map(p=>`${fk(p[0])} → ${p[1]>=1000?(p[1]/1000).toFixed(2)+" s":p[1]+" ms"}`+(s.bd?` (${f1(p[1]/(s.bd(p[0])*1e3))}× bound)`:"")).join(", "));});
+  svg.innerHTML=h;
+  info.innerHTML=rows.join("<br>")+(v==="ttft"?"<br>Dotted lines: the best-case bound of (87.6) applied to the work of (87.2), with our measured bandwidth and matmul speed.":v==="tpotb"?"<br>Dotted line: the bound. One sequence or 128, a step costs about the same: the weights are read once per step either way.":"<br>Dotted lines: the bound for grouped attention. Repeating K and V before attention multiplies the cache traffic by 4 and makes long contexts slow.");}
+ seg(vw,draw);draw();
+})();
+
+/* ---------- Figure 4: your GPU's roofline with prefill and decode on it ---------- */
+(function(){
+ const svg=$("#kg-roof-svg");if(!svg)return;const sg=$("#kg-roof-gpu"),sT=$("#kg-roof-t"),sB=$("#kg-roof-b"),sC=$("#kg-roof-c"),info=$("#kg-roof-info");
+ const x0=70,x1=700,y0=300,y1=16,lx0=-0.5,lx1=4.5,ly0=-1.5,ly1=3.2;
+ const X=i=>x0+(x1-x0)*(Math.log10(i)-lx0)/(lx1-lx0),Y=p=>y0-(y0-y1)*(Math.log10(p)-ly0)/(ly1-ly0);
+ const att=(I,g)=>Math.min(g.F,I*g.BW)/1e12;
+ function roof(g,st){const r=g.F/g.BW;const a=10**lx0,b=10**lx1;return `<path d="M${X(a)} ${Y(att(a,g))} L${X(r)} ${Y(att(r,g))} L${X(b)} ${Y(att(b,g))}" fill="none" ${st}/>`;}
+ function draw(){const k=segVal(sg),g=GPU[k],Tp=Math.round(2**+sT.value),b=Math.round(2**+sB.value),c=Math.round(2**+sC.value);
+  $("#kg-roof-tv").value=fi(Tp);$("#kg-roof-bv").value=fi(b);$("#kg-roof-cv").value=fi(c);
+  let h=`<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y0}" stroke="var(--rule)"/><line x1="${x0}" y1="${y0}" x2="${x0}" y2="${y1}" stroke="var(--rule)"/>`;
+  for(let e=0;e<=4;e++)h+=`<line x1="${X(10**e)}" y1="${y0}" x2="${X(10**e)}" y2="${y1}" stroke="var(--rule)" opacity=".45"/>`+T(X(10**e),y0+16,fi(10**e),'text-anchor="middle"');
+  for(let e=-1;e<=3;e++)h+=`<line x1="${x0}" y1="${Y(10**e)}" x2="${x1}" y2="${Y(10**e)}" stroke="var(--rule)" opacity=".45"/>`+T(x0-6,Y(10**e)+4,10**e>=1?fi(10**e):String(10**e),'text-anchor="end"');
+  h+=T((x0+x1)/2,y0+34,"arithmetic intensity I (FLOP per byte of memory traffic)",'text-anchor="middle"')+`<text x="14" y="${(y0+y1)/2}" font-size="12" fill="var(--muted)" transform="rotate(-90 14 ${(y0+y1)/2})" text-anchor="middle">TFLOP/s</text>`;
+  for(const kk in GPU)if(kk!==k)h+=roof(GPU[kk],'stroke="var(--muted)" stroke-width="1.2" stroke-dasharray="5 5" opacity=".6"');
+  h+=roof(g,'stroke="var(--ink)" stroke-width="2.6"');const rd=g.F/g.BW;
+  h+=`<line x1="${X(rd)}" y1="${Y(att(rd,g))}" x2="${X(rd)}" y2="${y0}" stroke="var(--muted)" stroke-dasharray="3 3"/>`+T(X(rd)+4,y0-6,"ridge "+fi(rd));
+  if(k==="m5"){D.sweep.forEach(p=>{const I=2*p[0]*8192*8192/(2*(8192*8192+2*p[0]*8192));h+=`<rect x="${X(I)-3.5}" y="${Y(p[1])-3.5}" width="7" height="7" fill="none" stroke="var(--tc)" stroke-width="1.6"/>`;});
+   D.ttft["1"].forEach(p=>{const w=pre(p[0]);h+=`<circle cx="${X(w.F/w.Q)}" cy="${Y(w.F/(p[1]*1e-3)/1e12)}" r="3.5" fill="none" stroke="var(--q)" stroke-width="1.6"/>`;});
+   D.tpotb.forEach(p=>{const w=dec(p[0],512);h+=`<circle cx="${X(w.F/w.Q)}" cy="${Y(w.F/(p[1]*1e-3)/1e12)}" r="3.5" fill="none" stroke="var(--k)" stroke-width="1.6"/>`;});}
+  const wp=pre(Tp),wd=dec(b,c),Ip=wp.F/wp.Q,Id=wd.F/wd.Q;
+  h+=`<circle cx="${X(Ip)}" cy="${Y(att(Ip,g))}" r="7" fill="var(--q)"/><text x="${X(Ip)+9}" y="${Y(att(Ip,g))-9}" font-size="12.5" fill="var(--q)" font-weight="700">prefill</text>`;
+  h+=`<circle cx="${X(Id)}" cy="${Y(att(Id,g))}" r="7" fill="var(--k)"/><text x="${X(Id)+9}" y="${Y(att(Id,g))+16}" font-size="12.5" fill="var(--k)" font-weight="700">decode</text>`;
+  svg.innerHTML=h;const tp=tm(wp,g),td=tm(wd,g),mem=wd.Q;
+  let t=`<b>${g.n}</b>: peak <b>${f1(g.F/1e12)}</b> TFLOP/s, bandwidth <b>${fi(g.BW/1e9)}</b> GB/s, ridge <b>${fi(rd)}</b> FLOP/byte. `+
+   `Prefill of ${fi(Tp)} tokens: I = <b>${fi(Ip)}</b>, ${bound(wp,g)}-bound, TTFT ≥ <b>${ms(tp*1e3)}</b>. `+
+   `Decode step, batch ${fi(b)}, context ${fi(c)}: I = <b>${f2(Id)}</b>, ${bound(wd,g)}-bound, TPOT ≥ <b>${ms(td*1e3)}</b>, ${fi(b/td)} tokens/s in total; the step reads ${f2(mem/1e9)} GB.`;
+  if(k==="m5")t+=` Squares: our matmul sweep. Open circles: our measured prefill and decode passes, placed at their intensity and achieved FLOP/s.`;
+  info.innerHTML=t;}
+ [sT,sB,sC].forEach(e=>e.addEventListener("input",draw));seg(sg,draw);draw();
+})();
+})();
+</script></body></html>

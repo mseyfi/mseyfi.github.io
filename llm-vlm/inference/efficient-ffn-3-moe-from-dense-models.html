@@ -1,0 +1,552 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Efficient FFN 3: MoE from dense models, and MoE inference · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 96</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="efficient-ffn-3-moe-from-dense-models">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="efficient-ffn-3-moe-from-dense-models" data-session="efficient-ffn-3-moe-from-dense-models" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">96</span><span>Track 5: LLM inference and serving · session 19 of 65</span></div><h1 class="chap-title">Efficient FFN 3: MoE from dense models, and MoE inference</h1><p class="chap-sub">Training a Mixture-of-Experts model from scratch is expensive, so this session shows two ways to build one from a dense model you already have: MoEfication cuts a dense feed-forward network into groups of neurons, and sparse upcycling copies it into many experts and keeps training. Then we serve the result: we count total and active parameters, see why memory must hold every expert, and work out what batching and expert parallelism do to the speed of Mixtral 8x7B and DeepSeek-V3.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions 21 and 29 (the FFN; Mixture of Experts), session 82 (why inference is slow, the roofline); session 95 helps (MoE routing)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why a ReLU feed-forward network is already a sparse mixture of experts, and how MoEfication finds the experts (balanced k-means or a co-activation graph) and builds a router</li><li>How sparse upcycling turns a dense checkpoint into an MoE: copied experts, a new random router, and why the first step can lose most of the FFN output</li><li>What upcycled models cost and gain: about 50% of the dense pre-training cost in the original paper, Qwen1.5-MoE-A2.7B from Qwen-1.8B, and Branch-Train-MiX</li><li>Total vs active parameters with exact counts for Mixtral 8x7B (46.7B / 12.9B), Qwen1.5-MoE-A2.7B (14.3B / 2.7B) and DeepSeek-V3 (671B / 37.6B), and why memory must hold all of them</li><li>How the batch changes MoE decode: the number of experts touched grows fast, so bytes per step rise toward the total, while FLOPs stay at the active count</li><li>Expert parallelism at serving time: two all-to-all exchanges per MoE layer, stragglers from hot experts, and DeepSeek-V3's redundant experts and EP32 / EP320 deployment</li></ul></div></header><style>
+.mx-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.mx-grid input[type=range]{width:100%}
+.mx-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.mx-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+#mx-mf-svg text,#mx-up-svg text,#mx-srv-svg text,#mx-ep-svg text{font-family:var(--sans)}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Mixtral 8x7B has 46.7 billion parameters but uses only 12.9 billion for each token. Its total size is exactly Mistral 7B plus seven more copies of every feed-forward network and a tiny router per layer. This session is about that kind of relation: how to make a Mixture-of-Experts (MoE) model <b>from a dense model</b>, and what it costs to <b>serve</b> one.</p>
+<p>In <a href="../transformers/mixture-of-experts-moe.html">session 29</a> you met the MoE layer: a router sends each token to \(k\) of \(E\) expert feed-forward networks (FFNs). In <a href="../inference/efficient-ffn-2-moe-routing-in-depth.html">session 95</a> you saw how routing is kept balanced. Two practical questions remain, and they are the two halves of this page.</p>
+<ul>
+<li><b>Where do the experts come from?</b> Training a large MoE from scratch is expensive, and most teams already own a good dense checkpoint. Two families of methods reuse it. <b>MoEfication</b> cuts each dense FFN into groups of neurons and adds a router, so the model gets cheaper with no new parameters. <b>Sparse upcycling</b> copies each FFN into many experts and keeps training, so the model gets bigger and better for a fraction of the cost. The efficient-inference survey of Zhou et al. (section 5.1.1) lists both under “expert construction”. [Certain]</li>
+<li><b>What does an MoE cost at serving time?</b> FLOPs follow the <b>active</b> parameters, but memory must hold <b>all</b> parameters, and with a batch of requests almost every expert gets used. So an MoE is cheap in one cost and not in the others. Serving systems answer with large batches and <b>expert parallelism</b>: experts spread over many GPUs. DeepSeek-V3 decodes on 320 GPUs with one expert per GPU. [Certain]</li></ul>
+<p>We use the three costs and the roofline from <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a> throughout: a step takes at least \(\max(F/P,\ Q/B)\), where \(F\) is FLOPs, \(Q\) is bytes moved, \(P\) is peak compute and \(B\) is memory bandwidth.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “What is the difference between total and active parameters, and which one sets memory, latency and throughput?”, “How would you turn a dense checkpoint into an MoE?”, “Why is MoE decode at batch 1 fast but at batch 64 not much faster than a dense model of the same total size?”, “What is expert parallelism and what can go wrong?”. This page gives a formula for each.</aside>
+
+<h2>A dense FFN is already a sum of small experts</h2>
+<p>Start with the FFN of one block, as in <a href="../transformers/the-feed-forward-network-mlp-inside-each.html">session 21</a>. It has \(d_{ff}\) hidden <b>neurons</b>. Neuron \(j\) has an input vector (column \(j\) of \(W_1\)) and an output vector (row \(j\) of \(W_2\)). Write the FFN as a sum over neurons:</p>
+<div class="eq">\[ F(\mathbf{x}) = \sum_{j=1}^{d_{ff}} \sigma\!\left(\mathbf{x}\cdot\mathbf{w}^{(1)}_j + b_j\right)\mathbf{w}^{(2)}_j + \mathbf{b}_2 \tag{96.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{x}\)</dt><dd>the input vector of one token, size \(d\)</dd>
+<dt>\(\mathbf{w}^{(1)}_j,\ b_j\)</dt><dd>the input weights (column \(j\) of \(W_1\)) and the bias of neuron \(j\)</dd>
+<dt>\(\mathbf{w}^{(2)}_j\)</dt><dd>the output weights of neuron \(j\) (row \(j\) of \(W_2\)), size \(d\)</dd>
+<dt>\(\sigma\)</dt><dd>the activation function, ReLU in the models MoEfication studied</dd>
+<dt>\(\mathbf{b}_2\)</dt><dd>the output bias</dd></dl>
+<p>Two facts follow. First, the order of the neurons does not matter: any permutation of the terms gives the same sum. Second, with ReLU, a neuron with a negative pre-activation adds exactly zero. Zhang et al. measured how often that happens: in a fine-tuned T5-Large (700 million parameters), 90% of inputs activate less than 5% of the FFN neurons. [Certain] So most of the work of a dense FFN is multiplying by zero.</p>
+<p>Now cut the \(d_{ff}\) neurons into \(K\) groups of equal size \(d_e = d_{ff}/K\). Group \(i\) is a small FFN on its own, with its own slices of \(W_1\), \(b_1\) and \(W_2\). Because the order does not matter, the dense FFN is the sum of these small FFNs:</p>
+<div class="eq">\[ F(\mathbf{x}) = \sum_{i=1}^{K} E_i(\mathbf{x}) + \mathbf{b}_2, \qquad E_i(\mathbf{x}) = \sigma\!\left(\mathbf{x}W_1^{i} + \mathbf{b}_1^{i}\right)W_2^{i} \tag{96.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(K\)</dt><dd>number of experts we cut the FFN into</dd>
+<dt>\(W_1^{i}\ (d \times d_e),\ \mathbf{b}_1^{i},\ W_2^{i}\ (d_e \times d)\)</dt><dd>the columns of \(W_1\), entries of \(\mathbf{b}_1\) and rows of \(W_2\) that belong to the neurons of group \(i\)</dd>
+<dt>\(E_i\)</dt><dd>expert \(i\): a small FFN with \(d_e\) hidden neurons</dd></dl>
+<p>This is an MoE with every expert switched on. Nothing has changed yet: same parameters, same output, same FLOPs. The saving comes when we run only the few experts that hold the active neurons for this token.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A big office where 4,000 employees read every letter, but for any one letter only a few hundred have anything to say. MoEfication does not hire anyone. It seats people who usually speak up together in the same room, and puts a receptionist at the door who sends each letter to the two or three right rooms.</aside>
+
+<h2>MoEfication: split the neurons, then build a router</h2>
+<p>MoEfication (Zhang et al., 2021) has two phases. [Certain]</p>
+<p><b>Phase 1, expert construction.</b> Choose the groups so that neurons which are active <b>together</b> land in the <b>same</b> expert. Then, for a given token, a few experts cover almost all of its active neurons. The paper tries two ways and a random baseline:</p>
+<ul>
+<li><b>Parameter clustering split.</b> Treat the \(d_{ff}\) input vectors \(\mathbf{w}^{(1)}_j\) as points and run <b>balanced k-means</b> (k-means where every cluster must have the same size). The idea: neurons with similar input vectors fire on similar inputs.</li>
+<li><b>Co-activation graph split.</b> Run the model on training data and count how strongly each pair of neurons is active at the same time. Then cut this graph into \(K\) equal parts with a graph-partitioning tool, keeping strongly linked neurons together.</li>
+<li><b>Random split</b>, the baseline: equal groups with no structure.</li></ul>
+<div class="eq">\[ \text{co-act}(n, m) = \sum_{\mathbf{x}} h_n(\mathbf{x})\, h_m(\mathbf{x})\ \mathbb{1}\!\left[h_n(\mathbf{x}) \gt 0,\ h_m(\mathbf{x}) \gt 0\right] \tag{96.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(h_n(\mathbf{x})\)</dt><dd>pre-activation of neuron \(n\) for input \(\mathbf{x}\)</dd>
+<dt>\(\mathbb{1}[\cdot]\)</dt><dd>1 if both neurons are active (positive) for this input, else 0</dd>
+<dt>\(\text{co-act}(n,m)\)</dt><dd>the weight of the edge between neurons \(n\) and \(m\) in the co-activation graph</dd></dl>
+<p><b>Phase 2, expert selection.</b> For each token, pick \(n\) of the \(K\) experts. The best possible choice (the paper calls it <b>groundtruth selection</b>) is the experts with the largest sum of positive activations, but computing it needs the whole FFN, which is what we want to avoid. So the paper trains a small <b>MLP router</b> that predicts these sums from \(\mathbf{x}\), and also tries a cheap <b>similarity selection</b>: the cosine between \(\mathbf{x}\) and the mean input vector of each expert. The MoEfied layer is</p>
+<div class="eq">\[ F_m(\mathbf{x}) = \sum_{i \in S(\mathbf{x})} E_i(\mathbf{x}) + \mathbf{b}_2, \qquad S(\mathbf{x}) = \text{top-}n \text{ experts by score } s_i(\mathbf{x}) \tag{96.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(S(\mathbf{x})\)</dt><dd>the set of \(n\) experts chosen for this token</dd>
+<dt>\(s_i(\mathbf{x})\)</dt><dd>the score of expert \(i\): the true sum of its positive activations (ideal), a router prediction, or a cosine similarity</dd>
+<dt>\(n/K\)</dt><dd>the fraction of FFN parameters used for this token</dd></dl>
+<p>Note the gate: there is none. Each chosen expert enters with weight 1, because it is a piece of the original sum. If \(n = K\), \(F_m = F\) exactly.</p>
+<p>The results, on T5 and BERT with GLUE and question-answering tasks: MoEfication uses 10% to 30% of the FFN parameters for each input and keeps over 95% of the original performance. With 25% of the FFN parameters it reports 2× faster inference on CPU and 1.2× on GPU. Experts have \(d_e = 32\) neurons, so the T5 models get 64 to 512 experts per layer. [Certain] The GPU gain is small because many small expert matrices use the GPU less well than one big one, and the router itself costs time. [Likely]</p>
+
+<figure class="fig wide" id="mx-mf"><div class="fig-body">
+<div class="controls"><span class="seg" id="mx-mf-split"><button type="button" data-v="clu" aria-pressed="true">Balanced k-means split</button><button type="button" data-v="rnd" aria-pressed="false">Random split</button></span>
+<span class="seg" id="mx-mf-sel"><button type="button" data-v="ideal" aria-pressed="true">Ideal selection</button><button type="button" data-v="sim" aria-pressed="false">Similarity router</button></span></div>
+<div class="mx-grid" style="margin-top:8px">
+<label for="mx-mf-n">Experts used \(n\) of 8</label><input type="range" id="mx-mf-n" min="1" max="8" step="1" value="2"><output id="mx-mf-nv"></output>
+<label for="mx-mf-x">Input token</label><input type="range" id="mx-mf-x" min="0" max="63" step="1" value="0"><output id="mx-mf-xv"></output></div>
+<div class="scroll-x"><svg id="mx-mf-svg" viewBox="0 0 720 300" role="img" aria-label="32 FFN neurons grouped into 8 experts, colored by activation, with the chosen experts outlined"></svg></div>
+<div class="mx-leg"><span style="--c:var(--q)">active neuron (darker = larger)</span><span style="--c:var(--rule)">inactive neuron (ReLU gives 0)</span><span style="--c:var(--k)">chosen expert</span></div>
+<div class="readout" id="mx-mf-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> MoEfication of a toy ReLU FFN (\(d = 8\), \(d_{ff} = 32\), 8 experts of 4 neurons). Each column is one expert; each cell is one neuron, colored by its activation for the chosen input. The data are synthetic and seeded: each neuron mostly reacts to one of 4 “topics”, and each input belongs to one topic.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>With the k-means split, neurons of the same topic share a column, so an input lights up only two columns and \(n = 2\) experts (25% of the FFN) already cover almost all active neurons: the mean error over 64 inputs is small. Switch to the random split: the active neurons spread over all columns, and the same \(n = 2\) leaves most of them out. Switch the router: the similarity router does not see the activations, but here it picks nearly the same experts. At \(n = 8\) the error is exactly 0 for every split, by formula (96.2).</p></details></figure>
+
+<h3>MoEfication for modern LLMs</h3>
+<p>MoEfication relies on exact zeros from ReLU. Most current LLMs use SwiGLU with SiLU, which gives small but non-zero values almost everywhere, so dropping neurons always changes the output a little. [Likely] Later work therefore splits the FFN and then <b>trains</b> the result. LLaMA-MoE splits the FFNs of LLaMA-2 7B into experts, adds gates, and continues pre-training on 200B tokens, giving a model with about 3.5B active parameters. [Certain] At that point MoEfication and upcycling meet: both start from dense weights and both need extra training.</p>
+
+<div class="algo"><div class="algo-h">Algorithm 1: MoEfication of one FFN layer</div><ol>
+<li><b>input:</b> \(W_1, \mathbf{b}_1, W_2, \mathbf{b}_2\); number of experts \(K\); experts used \(n\); a sample of training inputs</li>
+<li>\(d_e \leftarrow d_{ff} / K\)</li>
+<li>\(\text{lab} \leftarrow\) BalancedKMeans(columns of \(W_1\), \(K\), size \(d_e\)) <span class="c">// or: partition the co-activation graph (96.3)</span></li>
+<li>\(P \leftarrow\) permutation that sorts neurons by \(\text{lab}\)</li>
+<li><b>for</b> \(i = 1 \dots K\): \(W_1^{i}, \mathbf{b}_1^{i}, W_2^{i} \leftarrow\) slice \(i\) of \(W_1P,\ \mathbf{b}_1P,\ P^\top W_2\) <span class="c">// formula (96.2), exact</span></li>
+<li>collect targets \(t_i(\mathbf{x}) = \sum \text{ReLU}(\mathbf{x}W_1^{i} + \mathbf{b}_1^{i})\) on the sample</li>
+<li>train a small MLP router \(r(\mathbf{x}) \approx (t_1, \dots, t_K)\)</li>
+<li><b>at inference:</b> \(S \leftarrow\) top-\(n\) of \(r(\mathbf{x})\); <b>return</b> \(\sum_{i \in S} E_i(\mathbf{x}) + \mathbf{b}_2\) <span class="c">// formula (96.4)</span></li></ol></div>
+
+<h2>Sparse upcycling: copy the FFN, then train</h2>
+<p>MoEfication keeps the parameter count and saves FLOPs. Sparse upcycling (Komatsuzaki et al., 2022) does the opposite: it keeps the FLOPs per token roughly fixed and <b>adds</b> parameters, to get a better model than the dense one. [Certain] The recipe:</p>
+<ul>
+<li>Copy every weight of the dense checkpoint: embeddings, attention, norms.</li>
+<li>In the chosen layers, replace the FFN by an MoE layer whose \(E\) experts are all <b>exact copies</b> of that FFN.</li>
+<li>Add a router. The dense model has none, so it starts random: normal with standard deviation 0.02.</li>
+<li>Continue training on the usual data.</li></ul>
+<div class="eq">\[ E_i \leftarrow F_{\text{dense}} \ \ (i = 1, \dots, E), \qquad W_r \sim \mathcal{N}(0,\ 0.02^2) \tag{96.5} \]</div>
+<p>In the paper: half of the MLP layers become MoE layers (every other layer, starting with the second), each with 32 experts. The language encoder and the vision models use Expert Choice routing with capacity factor 2; the language decoder uses top-2 token-choice routing with an auxiliary loss weight of 0.01, to avoid a mismatch between full-batch training and one-token decoding. Reusing the dense optimizer state helped the vision models, not the language models. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A restaurant with one excellent cook. Upcycling hires seven clones of that cook and adds a head waiter who assigns orders. On day one all eight cook the same way. Because each clone now gets different orders, each one slowly gets better at its own kind of dish.</aside>
+<h3>What happens at step 0</h3>
+<p>Since all experts are the same function, the MoE output at the first step is just the FFN output times the total gate weight of the chosen experts:</p>
+<div class="eq">\[ y(\mathbf{x}) = \sum_{i \in \text{top-}k} g_i(\mathbf{x})\, F_{\text{dense}}(\mathbf{x}) = G(\mathbf{x})\, F_{\text{dense}}(\mathbf{x}), \qquad G(\mathbf{x}) = \sum_{i \in \text{top-}k} g_i(\mathbf{x}) \tag{96.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(g_i(\mathbf{x})\)</dt><dd>gate weight of expert \(i\), from the router’s softmax</dd>
+<dt>\(G(\mathbf{x})\)</dt><dd>the total gate weight of the \(k\) chosen experts: the factor by which the FFN output is scaled at step 0</dd></dl>
+<p>If the gates are renormalized over the top-\(k\) (top-\(k\) then softmax, as in Mixtral), \(G = 1\) and the upcycled model starts as the exact dense model. If they are not (softmax over all \(E\), then top-\(k\), as in Switch and GShard), \(G\) can be far below 1. With a near-random router the softmax is close to uniform, so \(G \approx k/E\): for top-2 of 32 that is 0.0625. Router logits are not exactly zero: if the hidden vector has RMS 1 in \(d = 768\), the logits have standard deviation \(0.02\sqrt{768} = 0.55\), and \(G\) is about 0.15 (Figure 2). [Likely, depends on the hidden scale] So at step 0 the FFN contributes only about 15% of its usual output. The attention path is unchanged, so the model does not break, but quality drops. [Likely]</p>
+<p>The paper reports this <b>initial quality drop</b> and recovery with more training: more MoE layers, more experts or more capacity make the drop larger; upcycling the bottom layers hurts most. Normalizing the combine weights helped vision but slightly hurt language (SuperGLUE 79.3 to 78.8). [Certain] So renormalization is not a free win; it changes the training dynamics too.</p>
+<p>Why do identical copies ever become different? Because the router is random, different experts receive different tokens, so they get different gradients and drift apart. Anything that breaks the symmetry helps: the Qwen team reports that adding randomness to the copied weights made the upcycled model converge faster. [Certain]</p>
+
+<figure class="fig" id="mx-up"><div class="fig-body">
+<div class="controls"><span class="seg" id="mx-up-rule"><button type="button" data-v="0" aria-pressed="true">Softmax, then top-k</button><button type="button" data-v="1" aria-pressed="false">Top-k, then renormalize</button></span></div>
+<div class="mx-grid" style="margin-top:8px">
+<label for="mx-up-e">Experts \(E\)</label><input type="range" id="mx-up-e" min="1" max="6" step="1" value="5"><output id="mx-up-ev"></output>
+<label for="mx-up-k">Chosen \(k\)</label><input type="range" id="mx-up-k" min="1" max="8" step="1" value="2"><output id="mx-up-kv"></output>
+<label for="mx-up-s">Logit spread \(\sigma\)</label><input type="range" id="mx-up-s" min="0" max="3" step="0.05" value="0.55"><output id="mx-up-sv"></output></div>
+<div class="scroll-x"><svg id="mx-up-svg" viewBox="0 0 640 230" role="img" aria-label="A dense FFN copied into E experts; bar of the output scale G at step 0"></svg></div>
+<div class="readout" id="mx-up-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Sparse upcycling at step 0. Left: the dense FFN is copied into \(E\) identical experts; \(k\) are chosen. Right: the output scale \(G\) of formula (96.6), averaged over 4,000 random routers whose logits have standard deviation \(\sigma\) (seeded).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>The default is the upcycling paper’s decoder setting: 32 experts, top-2, no renormalization, \(\sigma = 0.55\). The bar shows that the FFN starts at about 15% of its dense output. Set \(\sigma = 0\) to see the exact uniform case \(G = k/E\). Raise \(\sigma\): the router becomes more peaked and \(G\) grows. Click “Top-k, then renormalize”: \(G = 1\) whatever the settings, so the upcycled model starts equal to the dense one. The readout also gives the parameter and FLOP multipliers: parameters grow with \(E\), FLOPs with \(k\).</p></details></figure>
+
+<h3>What upcycling buys</h3>
+<p>The key result: upcycled T5 Base, Large and XL and Vision Transformer Base and Large beat their dense versions on SuperGLUE and ImageNet while using only about 50% of the original dense pre-training cost as extra compute. They also beat MoE models trained from scratch with 100% of that budget. [Certain] Concretely, upcycled T5-Large and T5-Base gained 1.5 to 2 SuperGLUE points over continued dense training with 46% and 55% extra training. [Certain] The paper also notes that, with a very large compute budget, a from-scratch MoE eventually catches up, and then training from scratch may be preferable. [Certain] Upcycling wins when your extra budget is small compared with what the dense model already cost.</p>
+<p>Real examples:</p>
+<ul>
+<li><b>Qwen1.5-MoE-A2.7B</b> was made from Qwen-1.8B by upcycling with <b>fine-grained</b> experts: each FFN is cut into pieces (as in MoEfication), and the pieces become experts. It has 4 shared experts that are always on and 60 routed experts of which 4 are chosen. Its config: routed experts of width 1,408, a shared FFN of width 5,632 \(= 4 \times 1{,}408\), and 24 layers like Qwen-1.8B. Totals: 14.3B parameters, 2.7B active. The team reports 75% lower training cost than Qwen1.5-7B. [Certain]</li>
+<li><b>Mixtral 8x7B</b> has exactly the shape of Mistral 7B with 8 FFNs per layer (\(d = 4096\), 32 layers, FFN width 14,336 in both configs). [Certain] Whether Mistral AI initialized it from Mistral 7B is not stated in the paper. [Speculation]</li>
+<li><b>Branch-Train-MiX</b> (BTX) copies one seed model, trains each copy on its own domain (code, math, world knowledge), then uses their FFNs as the experts of one MoE, averages the other weights, and fine-tunes the router. Sparse upcycling is the special case with no separate domain training. [Certain]</li></ul>
+<p>Compare GLaM, an MoE trained <b>from scratch</b>: 1.2 trillion parameters, 64 experts in every other layer, top-2, so 96.6B (8%) active per token. It used about one third of the energy of GPT-3’s training and half of its inference FLOPs. [Certain] From-scratch training gives the most freedom; upcycling gives the cheapest start.</p>
+
+<div class="algo"><div class="algo-h">Algorithm 2: sparse upcycling</div><ol>
+<li><b>input:</b> dense checkpoint; experts \(E\); top-\(k\); set of layers \(\mathcal{L}\) to convert (e.g. every other layer)</li>
+<li>copy all non-FFN weights (embeddings, attention, norms) <span class="c">// optimizer state: optional</span></li>
+<li><b>for</b> each layer \(\ell\): <b>if</b> \(\ell \in \mathcal{L}\) <b>then</b></li>
+<li class="i1"><b>for</b> \(i = 1 \dots E\): \(E_i^{\ell} \leftarrow\) copy of \(F^{\ell}_{\text{dense}}\) (+ small noise to break symmetry) <span class="c">// formula (96.5)</span></li>
+<li class="i1">\(W_r^{\ell} \sim \mathcal{N}(0, 0.02^2)\) <span class="c">// new router</span></li>
+<li><b>else</b> keep \(F^{\ell}_{\text{dense}}\)</li>
+<li>train with the usual LM loss + load-balancing loss; the paper resumes the dense learning-rate schedule where it left off</li>
+<li>check quality early: the step-0 drop depends on \(G\) (96.6) and on \(|\mathcal{L}|\), \(E\), capacity</li></ol></div>
+
+<h2>Serving cost 1: total vs active parameters</h2>
+<p>Now the MoE exists, upcycled or not, and we want to serve it. Split the parameters into those used by every token (embeddings, attention, norms, routers, shared experts, dense FFN layers) and the routed experts:</p>
+<div class="eq">\[ N_{\text{total}} = N_{\text{other}} + L_{\text{moe}}\, E\, P_e, \qquad N_{\text{active}} = N_{\text{other}} + L_{\text{moe}}\, k\, P_e \tag{96.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N_{\text{other}}\)</dt><dd>parameters every token uses (including always-on shared experts)</dd>
+<dt>\(L_{\text{moe}}\)</dt><dd>number of MoE layers</dd>
+<dt>\(E,\ k\)</dt><dd>routed experts per layer, and how many each token uses</dd>
+<dt>\(P_e\)</dt><dd>parameters of one routed expert: \(3\,d\,d_e\) for a SwiGLU expert (gate, up and down matrices)</dd></dl>
+<p>The three costs from <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a> split cleanly. <b>Memory size</b> follows \(N_{\text{total}}\): every expert must sit in some GPU’s memory, because the next token may need it. <b>FLOPs</b> per token follow \(N_{\text{active}}\): about \(2N_{\text{active}}\). <b>Bytes read</b> per decode step lie in between and depend on the batch, which is the next section.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model (from config.json)</th><th>Routed experts</th><th>\(N_{\text{total}}\)</th><th>\(N_{\text{active}}\)</th><th>Experts’ share of \(N_{\text{total}}\)</th><th>Weights stored</th></tr></thead><tbody>
+<tr><td>Mixtral 8x7B</td><td>8, top-2, 32 MoE layers</td><td>46.70B</td><td>12.88B</td><td>96.6%</td><td>93.4 GB (BF16)</td></tr>
+<tr><td>Qwen1.5-MoE-A2.7B</td><td>60, top-4, + shared FFN, 24 layers</td><td>14.32B</td><td>2.69B</td><td>87.0%</td><td>28.6 GB (BF16)</td></tr>
+<tr><td>DeepSeek-V3</td><td>256, top-8, + 1 shared, 58 MoE layers (first 3 dense)</td><td>671.0B</td><td>37.6B</td><td>97.4%</td><td>671 GB (FP8)</td></tr></tbody></table></div>
+<p>All counts are computed from the public configs and match the papers: Mixtral 47B / 13B, DeepSeek-V3 671B / 37B (without its extra multi-token-prediction module), Qwen 14.3B / 2.7B. [Certain] A Mixtral expert in BF16 is 352 MB; one MoE layer’s 8 experts are 2.8 GB. Note what this means: Mixtral at batch 1 does the FLOPs of a 13B model but needs the memory of a 47B model. The Mixtral paper says so directly: memory cost follows the sparse parameter count, and MoE layers suit batched workloads. [Certain]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>“8x7B” does not mean 56B. Only the FFNs are copied; attention, embeddings and norms are shared. 7.24B (Mistral 7B) plus 7 extra FFN copies per layer (\(7 \times 32 \times 176.2\)M) plus routers gives 46.70B.</aside>
+
+<h2>Serving cost 2: the batch decides how many experts you read</h2>
+<p>At batch 1, a decode step reads \(N_{\text{other}}\) plus the \(k\) chosen experts in each layer: the bytes of the active parameters. That is the MoE dream: a 47B model that decodes as fast as a 13B one. But a serving system decodes a <b>batch</b> of \(b\) sequences per step (see <a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>), and different tokens pick different experts. If routing were uniform and independent, a given expert is missed by one token with probability \(1 - k/E\), so the expected number of distinct experts touched per layer is</p>
+<div class="eq">\[ \bar{E}(b) = E\left(1 - \left(1 - \frac{k}{E}\right)^{b}\right) \tag{96.8} \]</div>
+<p>and the weight bytes read in one decode step are</p>
+<div class="eq">\[ Q(b) = s\left(N_{\text{other,mm}} + L_{\text{moe}}\, \bar{E}(b)\, P_e\right) \tag{96.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(b\)</dt><dd>batch size: sequences that each make one token in this step</dd>
+<dt>\(\bar{E}(b)\)</dt><dd>expected number of different experts used by the batch, in one layer</dd>
+<dt>\(s\)</dt><dd>bytes per weight: 2 for BF16, 1 for FP8</dd>
+<dt>\(N_{\text{other,mm}}\)</dt><dd>always-used parameters that are multiplied (the input embedding is only a lookup, so it is left out)</dd></dl>
+<p>For Mixtral (\(E = 8, k = 2\)): \(\bar{E}(4) = 5.47\), \(\bar{E}(8) = 7.20\), \(\bar{E}(16) = 7.92\). By batch 16 nearly every expert is read in every layer, so the step reads almost all 93 GB, like a dense 47B model. For DeepSeek-V3 (\(E = 256, k = 8\)) it takes longer, but at batch 64 already 222 of 256 experts are touched per layer. Real routing is not uniform (some experts are hot), which lowers \(\bar{E}\) a bit but creates imbalance (later section). [Likely]</p>
+<p>The FLOPs, however, stay at \(2bN_{\text{active}}\). So the arithmetic intensity of the expert matrices is set by the <b>tokens per expert</b>, about \(bk/E\) once all experts are touched:</p>
+<div class="eq">\[ I_{\text{expert}} \approx \frac{2\,(b k / E)}{s}, \qquad b^{*} \approx \frac{E}{k} \cdot \frac{s\, I^{*}}{2} \tag{96.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(bk/E\)</dt><dd>average number of tokens each expert processes in one step</dd>
+<dt>\(I^{*} = P/B\)</dt><dd>the ridge point of the GPU: FLOPs per byte needed to be compute-bound</dd>
+<dt>\(b^{*}\)</dt><dd>batch at which the experts become compute-bound: \(E/k\) times the dense model’s value</dd></dl>
+<p>A dense BF16 model on an H100 reaches the ridge (\(I^{*} = 295\) FLOP/byte) near batch 295 (from <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>). Mixtral needs \(E/k = 4\) times more, about 1,181. DeepSeek-V3 in FP8 (ridge 591 FLOP/byte for dense FP8 on an H100) needs about 9,450 sequences in one step. This is why MoE serving is all about <b>very large batches</b>, gathered across many GPUs. [Certain, as arithmetic]</p>
+<p>In Figure 3 the whole step turns compute-bound a little earlier (about 1,080 sequences for Mixtral, 1,740 for Qwen1.5-MoE and 5,400 for DeepSeek-V3), because the attention and shared weights, which every token uses, reach the ridge first and their FLOPs count too. The experts on their own still sit below the ridge until \(b^{*}\).</p>
+
+<figure class="fig wide" id="mx-srv"><div class="fig-body">
+<div class="controls"><span class="seg" id="mx-srv-m"><button type="button" data-v="mix" aria-pressed="true">Mixtral 8x7B</button><button type="button" data-v="qw" aria-pressed="false">Qwen1.5-MoE-A2.7B</button><button type="button" data-v="ds" aria-pressed="false">DeepSeek-V3</button></span></div>
+<div class="mx-grid" style="margin-top:8px">
+<label for="mx-srv-b">Batch \(b\)</label><input type="range" id="mx-srv-b" min="0" max="13" step="0.25" value="0"><output id="mx-srv-bv"></output></div>
+<div class="scroll-x"><svg id="mx-srv-svg" viewBox="0 0 760 330" role="img" aria-label="Weight bytes read per decode step against batch size, MoE compared with two dense models"></svg></div>
+<div class="mx-leg"><span style="--c:var(--k)">MoE, formula (96.9)</span><span style="--c:var(--q)">dense model of the same active size</span><span style="--c:var(--muted)">dense model of the same total size</span><span style="--c:var(--v)">FLOP time, in the same units</span></div>
+<div class="readout" id="mx-srv-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> One decode step at batch \(b\): weight bytes read (left axis, GB) under uniform routing, for three real MoE models. Hardware, chosen so the weights fit: Mixtral in BF16 on 2 H100 SXM, Qwen1.5-MoE in BF16 on 1 H100, DeepSeek-V3 in FP8 on 16 H100 (bandwidths added, communication and KV cache ignored). Times are roofline lower bounds.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At batch 1 the orange MoE curve sits on the blue “same active size” line: decode is as fast as a small dense model. Move the slider: the orange curve climbs to the grey “same total size” line within a few dozen sequences (later for DeepSeek-V3, which has 256 experts). The green line is the FLOP time converted to the same scale; where it crosses the orange curve, the step turns compute-bound. The readout gives experts touched per layer, tokens per expert, the step time and the total tokens per second.</p></details></figure>
+
+<div class="worked"><div class="wt">Worked example: Mixtral 8x7B decode on 2 H100 SXM (BF16, weights only)</div>
+<p><b>Fit.</b> 93.4 GB of weights on 160 GB of HBM leaves 66.6 GB for the KV cache and activations.</p>
+<p><b>Batch 1.</b> Bytes read: \(2 \times (12.88 - 0.13)\) B \(= 25.5\) GB (the input embedding of 0.13B is a lookup). Bandwidth 6.7 TB/s, so at least 3.81 ms per token, 263 tokens/s. A dense 47B model would need 13.90 ms. MoE wins by 3.6×.</p>
+<p><b>Batch 8.</b> \(\bar{E}(8) = 8(1 - 0.75^8) = 7.20\) experts per layer. Bytes: 84.1 GB, 12.55 ms per step, 637 tokens/s in total. The MoE advantage over a dense 47B model is almost gone in bytes.</p>
+<p><b>Batch 32.</b> All 8 experts read: 93.1 GB, 13.90 ms, 2,302 tokens/s. Same time as a dense 47B model, but the FLOPs (0.41 ms of compute) are 3.6× smaller.</p>
+<p><b>Batch 1,024.</b> Compute time \(2 \times 1024 \times 12.75\text{B} / 1978\) TFLOP/s \(= 13.2\) ms, close to the memory time of 13.9 ms: near the ridge, about 73,700 tokens/s. A dense 47B model would already be compute-bound here at 3.6× the FLOPs, so the MoE gives 3.6× the peak throughput.</p>
+<p><b>Lesson.</b> MoE helps latency at batch 1 (fewer bytes) and throughput at huge batches (fewer FLOPs). In between, it is a 47B model in bytes.</p></div>
+
+<h2>Serving cost 3: expert parallelism and its traffic</h2>
+<p>Large MoEs do not fit one GPU, so the experts must be spread out. Two ways:</p>
+<ul>
+<li><b>Tensor parallelism</b> (<a href="../pretraining/tensor-parallelism-and-sequence-parallelism.html">session 48</a>) cuts every expert matrix across GPUs. Every GPU does a slice of every expert. Simple, but each expert’s already small matrices get even smaller.</li>
+<li><b>Expert parallelism</b> (EP) puts <b>whole experts</b> on different GPUs: with \(G\) GPUs, each holds \(E/G\) experts. Attention usually runs data-parallel (each GPU on its own requests). In each MoE layer, tokens travel to the GPUs that hold their experts and the results travel back: two <b>all-to-all</b> exchanges (<a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">session 43</a>, <a href="../pretraining/pipeline-context-and-expert-parallelism-3d-and.html">session 49</a>).</li></ul>
+<p>The bytes each token sends per MoE layer, if all \(k\) experts are on other GPUs:</p>
+<div class="eq">\[ Q_{\text{a2a}} \approx k\, d\,\left(s_{\text{dispatch}} + s_{\text{combine}}\right) \tag{96.11} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(d\)</dt><dd>hidden size: each copy of a token is one \(d\)-vector</dd>
+<dt>\(s_{\text{dispatch}},\ s_{\text{combine}}\)</dt><dd>bytes per number for sending tokens out and results back</dd></dl>
+<p>Mixtral in BF16: \(2 \times 4096 \times 4 = 32{,}768\) bytes per token per layer, 1 MiB per token over 32 layers. DeepSeek-V3 sends tokens in FP8 and results in BF16 [Certain]: \(8 \times 7168 \times 3 = 172{,}032\) bytes per token per layer, about 10 MB per token over 58 layers. That is an upper bound: DeepSeek-V3 limits each token to experts on at most 4 nodes, which cuts the slow cross-node part. [Certain about the limit; the size of the saving depends on the routing, Likely]</p>
+<p>The other problem is <b>imbalance</b>. Each MoE layer waits for the slowest GPU. If some experts are popular (“hot”), their GPU gets more tokens and everyone else waits:</p>
+<div class="eq">\[ t_{\text{layer}} \propto \max_{g} \ \text{load}_g, \qquad \text{imbalance} = \frac{\max_g \text{load}_g}{\tfrac{1}{G}\sum_g \text{load}_g} \tag{96.12} \]</div>
+<p>Load-balancing losses act during training (<a href="../inference/efficient-ffn-2-moe-routing-in-depth.html">session 95</a>), but live traffic differs from training data. The Mixtral paper also shows that consecutive tokens often go to the same expert in higher layers (61.6% to 67.0% for “first or second choice” at layer 15, against about 46% if random), and warns that this locality can over-subscribe some experts under EP. [Certain]</p>
+<p>DeepSeek-V3’s answer is <b>redundant experts</b>. It watches expert load online and gives the hottest experts a second copy on another GPU; tokens for that expert are split between the copies. In prefill, the unit is 4 nodes with 32 GPUs, attention TP4 with DP8, MoE EP32, and 32 redundant experts (each GPU holds its 8 experts plus 1 redundant one), re-chosen about every 10 minutes. In decode, the unit is 40 nodes with 320 GPUs, MoE EP320: each GPU holds only one expert, and 64 GPUs host the redundant and shared experts. To hide the all-to-all, it overlaps the attention of one micro-batch with the dispatch, MoE and combine of another. [Certain]</p>
+
+<figure class="fig wide" id="mx-ep"><div class="fig-body">
+<div class="controls"><span class="seg" id="mx-ep-red"><button type="button" data-v="0" aria-pressed="true">No redundant experts</button><button type="button" data-v="1" aria-pressed="false">Add up to 8 redundant copies</button></span></div>
+<div class="mx-grid" style="margin-top:8px">
+<label for="mx-ep-a">Skew \(\alpha\) of expert popularity</label><input type="range" id="mx-ep-a" min="0" max="1.2" step="0.05" value="1"><output id="mx-ep-av"></output></div>
+<div class="scroll-x"><svg id="mx-ep-svg" viewBox="0 0 720 300" role="img" aria-label="Token load of 8 GPUs in expert parallelism, with stacked expert loads"></svg></div>
+<div class="mx-leg"><span style="--c:var(--v)">token slots of the GPU’s own experts</span><span style="--c:var(--k)">token slots of a redundant copy</span><span style="--c:var(--muted)">mean load (perfect balance)</span></div>
+<div class="readout" id="mx-ep-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Expert parallelism for one MoE layer: 32 experts on 8 GPUs (4 each), 4,096 tokens, top-2, so 8,192 token slots. Expert popularity follows a power law, \(p \propto \text{rank}^{-\alpha}\), with ranks shuffled by a fixed seed. Loads are expected values. With redundancy on, a greedy rule copies the busiest expert of the busiest GPU to the least-loaded GPU, one copy per GPU at most, while that lowers the peak.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Each bar is one GPU; its segments are its experts. The dashed line is perfect balance (1,024 slots per GPU). The layer takes as long as the tallest bar (formula 96.12). At \(\alpha = 0\) every expert gets the same share and all bars are equal. At \(\alpha = 1\) the hottest expert receives about a quarter of all slots and its GPU does more than twice the average work. Turn on redundant copies: the hot experts are split between two GPUs and the peak falls close to the mean.</p></details></figure>
+
+<h3>Other tricks at serving time</h3>
+<ul>
+<li><b>Offloading for one user.</b> On a single small GPU, keep most experts in CPU memory and copy the needed ones in. Because consecutive tokens often reuse experts, a cache of recently used experts on the GPU helps (Eliseev and Mazur, cited by the Mixtral paper). [Certain] See <a href="../inference/offloading-flexgen-llama-cpp-powerinfer.html">session 130</a>.</li>
+<li><b>Quantize the experts.</b> Experts are 87% to 97% of the bytes (table above), so expert weights are the first place to quantize; DeepSeek-V3 already ships FP8 weights. [Certain]</li>
+<li><b>Separate prefill and decode.</b> Prefill has many tokens per expert (compute-bound); decode has few (memory-bound). DeepSeek-V3 uses different units for the two, which is prefill–decode disaggregation (<a href="../inference/distributed-serving-and-prefill-decode-disaggregation.html">session 137</a>). [Certain]</li>
+<li><b>Grouped GEMM kernels.</b> Run all experts of a layer in one kernel call over variable-size groups of tokens, instead of a loop of small matrix multiplies (MegaBlocks style, see <a href="../transformers/mixture-of-experts-moe.html">session 29</a>). [Certain]</li></ul>
+
+<div class="algo"><div class="algo-h">Algorithm 3: one MoE layer in an expert-parallel decode step</div><ol>
+<li><b>input:</b> on each GPU \(g\): hidden states \(X_g\) of its own requests; expert placement \(\text{host}(e)\) (with redundant copies)</li>
+<li>\(\text{scores} \leftarrow\) router\((X_g)\); \(\text{idx}, w \leftarrow\) top-\(k\)(scores) <span class="c">// local, cheap</span></li>
+<li><b>for</b> each (token, expert \(e\)): pick a copy of \(e\) (the least-loaded host) <span class="c">// redundant experts</span></li>
+<li><b>all-to-all dispatch:</b> send each token copy to its host GPU <span class="c">// FP8 in DeepSeek-V3, formula (96.11)</span></li>
+<li><b>on each GPU:</b> grouped GEMM over its experts with the tokens it received <span class="c">// \(bk/E\) tokens per expert</span></li>
+<li><b>all-to-all combine:</b> send results back to the token’s home GPU</li>
+<li>\(y \leftarrow \sum_j w_j \cdot \text{result}_j\) (+ shared expert output) <span class="c">// layer time ∝ max load, (96.12)</span></li>
+<li>overlap: while micro-batch A is in steps 4 to 6, run attention of micro-batch B</li>
+<li>log per-expert token counts; every few minutes recompute which experts get redundant copies</li></ol></div>
+
+<h2>In code</h2>
+<p>A runnable, deterministic PyTorch script with three parts: MoEfy a small ReLU FFN and measure the error for each number of experts; upcycle a SwiGLU FFN and check the step-0 output with and without renormalization; count Mixtral from its config and apply formula (96.8).</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(<span class="nu">0</span>)
+
+<span class="cm"># ---------- Part 1: MoEfication of a ReLU FFN ----------</span>
+d, dff, k_exp = <span class="nu">16</span>, <span class="nu">64</span>, <span class="nu">8</span>            <span class="cm"># 8 experts of 8 neurons each</span>
+de = dff // k_exp
+topics = F.normalize(torch.randn(<span class="nu">4</span>, d), dim=<span class="nu">1</span>)
+owner = torch.arange(dff) % <span class="nu">4</span>        <span class="cm"># each neuron "belongs" to one topic</span>
+W1 = <span class="nu">2.0</span> * topics[owner].T + <span class="nu">0.3</span> * torch.randn(d, dff)   <span class="cm"># (d, dff)</span>
+b1 = -torch.ones(dff)
+W2 = torch.randn(dff, d) / dff ** <span class="nu">0.5</span>
+b2 = torch.zeros(d)
+<span class="kw2">def</span> ffn(x):                           <span class="cm"># dense FFN, eq. (96.1)</span>
+    <span class="kw2">return</span> F.relu(x @ W1 + b1) @ W2 + b2
+
+<span class="kw2">def</span> balanced_kmeans(V, k, iters=<span class="nu">20</span>):  <span class="cm"># V: (n, d) rows = W1 columns</span>
+    n = V.shape[<span class="nu">0</span>]; size = n // k
+    C = V[torch.randperm(n)[:k]].clone()
+    <span class="kw2">for</span> _ <span class="kw2">in</span> <span class="kw2">range</span>(iters):
+        dist = torch.cdist(V, C)                       <span class="cm"># (n, k)</span>
+        order = dist.flatten().argsort()
+        lab = torch.full((n,), -<span class="nu">1</span>); cnt = torch.zeros(k, dtype=torch.long)
+        <span class="kw2">for</span> idx <span class="kw2">in</span> order.tolist():
+            i, c = divmod(idx, k)
+            <span class="kw2">if</span> lab[i] &lt; <span class="nu">0</span> <span class="kw2">and</span> cnt[c] &lt; size:
+                lab[i] = c; cnt[c] += <span class="nu">1</span>
+        C = torch.stack([V[lab == c].mean(<span class="nu">0</span>) <span class="kw2">for</span> c <span class="kw2">in</span> <span class="kw2">range</span>(k)])
+    <span class="kw2">return</span> lab
+
+<span class="kw2">def</span> split(lab):                       <span class="cm"># eq. (96.2): permute, then cut</span>
+    perm = torch.cat([torch.nonzero(lab == c).flatten() <span class="kw2">for</span> c <span class="kw2">in</span> <span class="kw2">range</span>(k_exp)])
+    <span class="kw2">return</span> (W1[:, perm].reshape(d, k_exp, de), b1[perm].reshape(k_exp, de),
+            W2[perm].reshape(k_exp, de, d))
+
+<span class="kw2">def</span> moefied(x, n, W1e, b1e, W2e):     <span class="cm"># eq. (96.4) with ideal selection</span>
+    a = F.relu(torch.einsum(<span class="st">'bd,dke-&gt;bke'</span>, x, W1e) + b1e)   <span class="cm"># (B, k, de)</span>
+    score = a.sum(-<span class="nu">1</span>)                                     <span class="cm"># sum of positive values</span>
+    keep = torch.zeros_like(score).scatter(<span class="nu">1</span>, score.topk(n, dim=<span class="nu">1</span>).indices, <span class="nu">1.0</span>)
+    <span class="kw2">return</span> torch.einsum(<span class="st">'bke,ked-&gt;bd'</span>, a * keep[..., <span class="kw2">None</span>], W2e) + b2
+
+clustered = split(balanced_kmeans(W1.T, k_exp))
+random_sp = split(torch.randperm(dff) % k_exp)
+x = topics[torch.arange(<span class="nu">256</span>) % <span class="nu">4</span>] + <span class="nu">0.3</span> * torch.randn(<span class="nu">256</span>, d)
+y = ffn(x)
+<span class="kw2">print</span>(<span class="st">"active neurons per input: %.1f of %d"</span> % ((x @ W1 + b1 &gt; <span class="nu">0</span>).float().sum(<span class="nu">1</span>).mean(), dff))
+<span class="kw2">for</span> n <span class="kw2">in</span> [<span class="nu">8</span>, <span class="nu">4</span>, <span class="nu">2</span>, <span class="nu">1</span>]:
+    e_c = ((moefied(x, n, *clustered) - y).norm(dim=<span class="nu">1</span>) / y.norm(dim=<span class="nu">1</span>)).mean()
+    e_r = ((moefied(x, n, *random_sp) - y).norm(dim=<span class="nu">1</span>) / y.norm(dim=<span class="nu">1</span>)).mean()
+    <span class="kw2">print</span>(<span class="st">f"experts {n}/8 ({n/8:.1%} of FFN): rel. error clustered {e_c:.3f}, random {e_r:.3f}"</span>)
+
+<span class="cm"># ---------- Part 2: sparse upcycling of a SwiGLU FFN ----------</span>
+<span class="kw2">class</span> SwiGLU(nn.Module):
+    <span class="kw2">def</span> __init__(s, d, f):
+        <span class="kw2">super</span>().__init__(); s.g = nn.Linear(d, f, bias=<span class="kw2">False</span>)
+        s.u = nn.Linear(d, f, bias=<span class="kw2">False</span>); s.o = nn.Linear(f, d, bias=<span class="kw2">False</span>)
+    <span class="kw2">def</span> forward(s, x): <span class="kw2">return</span> s.o(F.silu(s.g(x)) * s.u(x))
+
+<span class="kw2">class</span> UpcycledMoE(nn.Module):
+    <span class="kw2">def</span> __init__(s, dense, E, k, renorm=<span class="kw2">True</span>):
+        <span class="kw2">super</span>().__init__()
+        d = dense.g.in_features
+        s.experts = nn.ModuleList([SwiGLU(d, dense.g.out_features) <span class="kw2">for</span> _ <span class="kw2">in</span> <span class="kw2">range</span>(E)])
+        <span class="kw2">for</span> e <span class="kw2">in</span> s.experts: e.load_state_dict(dense.state_dict())   <span class="cm"># copy, eq. (96.5)</span>
+        s.router = nn.Linear(d, E, bias=<span class="kw2">False</span>)
+        nn.init.normal_(s.router.weight, std=<span class="nu">0.02</span>)                   <span class="cm"># new, random</span>
+        s.k, s.renorm = k, renorm
+    <span class="kw2">def</span> forward(s, x):
+        p = s.router(x).softmax(-<span class="nu">1</span>)
+        w, idx = p.topk(s.k, dim=-<span class="nu">1</span>)
+        <span class="kw2">if</span> s.renorm: w = w / w.sum(-<span class="nu">1</span>, keepdim=<span class="kw2">True</span>)
+        y = torch.zeros_like(x)
+        <span class="kw2">for</span> j <span class="kw2">in</span> <span class="kw2">range</span>(s.k):
+            <span class="kw2">for</span> e <span class="kw2">in</span> <span class="kw2">range</span>(len(s.experts)):
+                m = idx[:, j] == e
+                <span class="kw2">if</span> m.any(): y[m] += w[m, j, <span class="kw2">None</span>] * s.experts[e](x[m])
+        <span class="kw2">return</span> y
+
+dense = SwiGLU(<span class="nu">64</span>, <span class="nu">256</span>)
+xs = torch.randn(<span class="nu">512</span>, <span class="nu">64</span>)
+<span class="kw2">with</span> torch.no_grad():
+    yd = dense(xs)
+    <span class="kw2">for</span> renorm <span class="kw2">in</span> [<span class="kw2">True</span>, <span class="kw2">False</span>]:
+        moe = UpcycledMoE(dense, E=<span class="nu">8</span>, k=<span class="nu">2</span>, renorm=renorm)
+        ym = moe(xs)
+        ratio = (ym.norm(dim=<span class="nu">1</span>) / yd.norm(dim=<span class="nu">1</span>)).mean()
+        <span class="kw2">print</span>(<span class="st">f"renorm={renorm}: max |moe-dense| = {(ym-yd).abs().max():.2e}, output/dense = {ratio:.3f}"</span>)
+
+<span class="cm"># ---------- Part 3: serving math for Mixtral 8x7B (config.json) ----------</span>
+d, L, V, ff, E, k = <span class="nu">4096</span>, <span class="nu">32</span>, <span class="nu">32000</span>, <span class="nu">14336</span>, <span class="nu">8</span>, <span class="nu">2</span>
+expert = <span class="nu">3</span> * d * ff
+other = <span class="nu">2</span> * V * d + d + L * (<span class="nu">2</span> * d * d + <span class="nu">2</span> * d * <span class="nu">1024</span> + <span class="nu">2</span> * d + d * E)
+total, active = other + L * E * expert, other + L * k * expert
+<span class="kw2">print</span>(<span class="st">f"total {total/1e9:.2f}B  active {active/1e9:.2f}B  BF16 weights {2*total/1e9:.1f} GB"</span>)
+<span class="kw2">for</span> b <span class="kw2">in</span> [<span class="nu">1</span>, <span class="nu">4</span>, <span class="nu">16</span>, <span class="nu">64</span>]:
+    touched = E * (<span class="nu">1</span> - (<span class="nu">1</span> - k / E) ** b)      <span class="cm"># eq. (96.8)</span>
+    <span class="kw2">print</span>(<span class="st">f"batch {b:3d}: experts touched per layer {touched:.2f} of {E}"</span>)
+</pre>
+<p>Output (CPU, PyTorch 2.8):</p>
+<pre class="code">active neurons per input: 22.4 of 64
+experts 8/8 (100.0% of FFN): rel. error clustered 0.000, random 0.000
+experts 4/8 (50.0% of FFN): rel. error clustered 0.039, random 0.458
+experts 2/8 (25.0% of FFN): rel. error clustered 0.225, random 0.698
+experts 1/8 (12.5% of FFN): rel. error clustered 0.641, random 0.837
+renorm=True: max |moe-dense| = 5.96e-08, output/dense = 1.000
+renorm=False: max |moe-dense| = 3.88e-01, output/dense = 0.299
+total 46.70B  active 12.88B  BF16 weights 93.4 GB
+batch   1: experts touched per layer 2.00 of 8
+batch   4: experts touched per layer 5.47 of 8
+batch  16: experts touched per layer 7.92 of 8
+batch  64: experts touched per layer 8.00 of 8</pre>
+<p>Read it: with all 8 experts the MoEfied FFN is exact (formula 96.2). With the k-means split, 4 of 8 experts give only 3.9% error, against 45.8% for a random split: grouping neurons that fire together is what makes MoEfication work. The renormalized upcycled layer equals the dense FFN to float precision; without renormalization its output starts at about 30% of the dense output (8 experts, top-2, small logits, so \(G\) is near \(2/8\)).</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>What is done</th><th>Why it fits</th></tr></thead><tbody>
+<tr><td>Bigger model from an existing dense checkpoint</td><td>Sparse upcycling (Qwen1.5-MoE-A2.7B from Qwen-1.8B; T5 and ViT in the paper)</td><td>Reuses sunk pre-training cost; about 50% extra compute beats dense continuation</td></tr>
+<tr><td>Cheaper inference of an existing ReLU model, no new parameters</td><td>MoEfication with a small router</td><td>10% to 30% of FFN parameters per input, over 95% of quality (T5, BERT)</td></tr>
+<tr><td>Domain experts trained by separate teams</td><td>Branch-Train-MiX: merge their FFNs into one MoE</td><td>Embarrassingly parallel training, then one model with token-level routing</td></tr>
+<tr><td>Open-weight chat models (Mixtral, Qwen MoE, DeepSeek-V3)</td><td>Batched serving with EP or TP, FP8 or INT4 experts</td><td>Fewer FLOPs per token, so high throughput at large batch</td></tr>
+<tr><td>Local single-GPU use of a big MoE</td><td>Expert offloading with an LRU cache of experts</td><td>Batch 1 touches only \(k\) experts per layer; tokens often reuse experts</td></tr>
+<tr><td>Video understanding with a VLM (classification, action recognition, key-moment detection)</td><td>MoE language model behind a vision encoder; long video prefill gives many tokens per expert</td><td>Prefill of thousands of visual tokens is compute-bound, so active-parameter FLOPs are what you pay</td></tr>
+<tr><td>Offline captioning or tagging of a video archive; Video-RAG indexing</td><td>Very large decode batches across an EP group</td><td>Large \(b\) pushes tokens per expert toward the ridge (96.10)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Sizing GPUs by active parameters.</b> Memory must hold every expert: Mixtral needs 93.4 GB in BF16, not 26 GB.</li>
+<li><b>Expecting batch-1 speed at batch 32.</b> By formula (96.8), a batch of 16 touches 7.9 of Mixtral’s 8 experts per layer; bytes per step approach the total.</li>
+<li><b>Thinking upcycling is free.</b> The step-0 output can be a small fraction of the dense one (96.6), and the model needs real extra training (about 50% of the dense budget in the paper) to pay off.</li>
+<li><b>Copying experts without breaking symmetry.</b> Identical experts with the same tokens stay identical. The random router breaks it; small noise on the copies helps more.</li>
+<li><b>MoEfying a SwiGLU model and expecting ReLU results.</b> SiLU gives few exact zeros, so dropping experts always costs accuracy unless you retrain.</li>
+<li><b>Counting “8x7B” as 56B.</b> Only the FFNs are copied; it is 46.7B.</li>
+<li><b>Ignoring the slowest GPU in EP.</b> The layer waits for the busiest GPU (96.12); average load says nothing about time.</li>
+<li><b>Forgetting the all-to-all.</b> Each MoE layer moves about \(k\,d\,(s_d + s_c)\) bytes per token twice across GPUs; on slow links this can exceed the expert compute.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is the difference between total and active parameters, and what does each one determine?<span class="lvl">basic</span></summary><div class="ans">Total parameters are all weights, including every expert; active parameters are those one token uses (shared parts plus \(k\) experts per MoE layer), formula (96.7). Memory size follows the total, FLOPs per token follow the active count, and bytes read per decode step lie in between and grow with the batch. Mixtral 8x7B: 46.7B total, 12.9B active.</div></details>
+<details class="qa"><summary>What is MoEfication, and why does it work on T5 but less well on LLaMA-style models?<span class="lvl">core</span></summary><div class="ans">It rewrites a dense FFN as a sum of neuron groups (exact, by permuting neurons), groups co-active neurons with balanced k-means or a co-activation graph, and trains a router to pick the few groups that hold the active neurons. With ReLU most neurons output exactly 0 (90% of inputs activate under 5% of neurons in T5-Large), so skipping groups loses little: 10% to 30% of FFN parameters keep over 95% of performance. SwiGLU/SiLU outputs are rarely exactly zero, so skipping always loses something; methods like LLaMA-MoE split and then continue pre-training.</div></details>
+<details class="qa"><summary>Describe sparse upcycling step by step.<span class="lvl">basic</span></summary><div class="ans">Take a dense checkpoint, copy all weights, replace the FFN in some layers (every other one in the paper) by an MoE whose experts are copies of that FFN, add a randomly initialized router (std 0.02), and continue training with the LM loss plus a load-balancing loss. Optimizer state can be reused (it helped vision, not language). The paper used 32 experts, Expert Choice in encoders and top-2 in decoders.</div></details>
+<details class="qa"><summary>Why does an upcycled model lose quality at step 0, and how can you avoid it?<span class="lvl">core</span></summary><div class="ans">All experts equal the dense FFN, so the MoE output is \(G(\mathbf{x})\) times the dense FFN output (96.6), where \(G\) is the total gate weight of the chosen experts. With softmax over all experts and then top-\(k\), and a near-uniform random router, \(G \approx k/E\) (0.0625 for top-2 of 32). Renormalizing the top-\(k\) gates makes \(G = 1\) and the start exact. Other factors (more MoE layers, more experts, converting bottom layers) also enlarge the drop, and the paper found renormalization helped vision but slightly hurt language.</div></details>
+<details class="qa"><summary>How do identical expert copies become specialized?<span class="lvl">core</span></summary><div class="ans">The router is random, so each expert receives a different subset of tokens, gets different gradients and drifts apart; the router in turn learns to send tokens to the experts that handle them best. Adding small noise to the copies (reported by the Qwen team to speed convergence), or fine-grained splitting of the FFN into different pieces, breaks the symmetry faster.</div></details>
+<details class="qa"><summary>Estimate the decode time per token of Mixtral 8x7B at batch 1 on 2 H100s.<span class="lvl">core</span></summary><div class="ans">Bytes read ≈ active multiplied parameters × 2 bytes = \(2 \times 12.75\text{B} = 25.5\) GB. Combined bandwidth 6.7 TB/s gives about 3.8 ms per token, about 260 tokens/s, as a lower bound ignoring KV cache and communication. A dense 47B model would need about 13.9 ms.</div></details>
+<details class="qa"><summary>Why is MoE decode at moderate batch sizes not much faster than a dense model of the same total size?<span class="lvl">advanced</span></summary><div class="ans">Different tokens choose different experts. Under uniform routing, the batch touches \(E(1-(1-k/E)^b)\) experts per layer (96.8): for Mixtral, 7.2 of 8 at batch 8. Decode is memory-bound, so step time follows bytes read, which approach the total parameters. FLOPs stay at the active count, so the MoE advantage comes back only when the batch is large enough to be compute-bound: about \(E/k\) times the dense ridge batch (96.10), roughly 1,200 for Mixtral on H100.</div></details>
+<details class="qa"><summary>What is expert parallelism, and what are its two main costs?<span class="lvl">core</span></summary><div class="ans">Whole experts are placed on different GPUs (\(E/G\) each); tokens are sent to the GPUs holding their experts and back, with two all-to-all exchanges per MoE layer. Costs: (1) communication, about \(k\,d\,(s_d+s_c)\) bytes per token per layer (96.11), 32 KiB for Mixtral in BF16; (2) imbalance: the layer waits for the busiest GPU (96.12), and hot experts make that GPU a straggler.</div></details>
+<details class="qa"><summary>How does DeepSeek-V3 deploy its MoE for inference?<span class="lvl">advanced</span></summary><div class="ans">Prefill: units of 4 nodes / 32 GPUs, attention TP4 with SP and DP8, MoE EP32, 32 redundant experts (each GPU has its 8 experts plus one redundant), chosen from online load statistics about every 10 minutes. Decode: 40 nodes / 320 GPUs, EP320 with one expert per GPU, and 64 GPUs for redundant and shared experts. Dispatch is in FP8, combine in BF16; tokens go to at most 4 nodes; attention of one micro-batch overlaps the all-to-all and MoE of another.</div></details>
+<details class="qa"><summary>Upcycling or training an MoE from scratch: how do you choose?<span class="lvl">advanced</span></summary><div class="ans">Upcycle when you have a good dense checkpoint and an extra budget that is small compared with its pre-training cost: the paper shows upcycled models beat both dense continuation and from-scratch MoEs at about 50% extra compute. With a budget close to or above the original cost, a from-scratch MoE catches up and has more freedom (expert sizes, number of layers, router design). Upcycling also locks in the dense shape (width, depth, tokenizer); fine-grained upcycling (Qwen1.5-MoE) or BTX relax some of that.</div></details>
+<details class="qa"><summary>Your Mixtral service has p99 latency spikes only under heavy load. What MoE-specific causes would you check?<span class="lvl">advanced</span></summary><div class="ans">(1) Expert imbalance under EP: hot experts make one GPU the straggler; log per-expert token counts per layer and add redundant copies or rebalance placement. (2) All-to-all congestion across nodes at large batch. (3) KV memory pressure: weights take 93 GB, so the batch is capped and requests queue. (4) Prefill of long prompts mixed into decode batches; consider chunked prefill or separate prefill and decode pools.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A dense FFN has \(d_{ff} = 4096\) neurons, cut into experts of \(d_e = 32\). How many experts are there, and what fraction of FFN FLOPs does a token use if the router picks 32 of them?</li>
+<li>Upcycle with \(E = 16\), top-2, softmax over all experts then top-\(k\), and a router whose logits are all equal. What is \(G\) at step 0? What if the gates are renormalized?</li>
+<li>Using formula (96.7) and the Mixtral table, how many bytes does Mixtral need in INT4 (0.5 bytes per weight, scales ignored)? Does it fit one 80 GB GPU?</li>
+<li>For DeepSeek-V3 (\(E = 256\), \(k = 8\)), compute \(\bar{E}(b)\) for \(b = 1\) and \(b = 32\).</li>
+<li>With formula (96.10), what batch makes Qwen1.5-MoE-A2.7B’s experts compute-bound on one H100 in BF16?</li>
+<li>Use Figure 4 at \(\alpha = 0.6\): what is the imbalance without and with redundant copies? How much faster is the layer with copies?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(4096/32 = 128\) experts; \(32/128 = 25\%\) of the FFN FLOPs (plus the router). 2. Uniform softmax gives each expert \(1/16\), so \(G = 2/16 = 0.125\); with renormalization \(G = 1\). 3. \(46.70\text{B} \times 0.5 = 23.4\) GB; it fits in 80 GB with room for the KV cache. 4. \(\bar{E}(1) = 8\); \(\bar{E}(32) = 256(1 - (248/256)^{32}) = 163.3\) experts per layer. 5. \(b^{*} = (60/4) \times (2 \times 295.2/2) = 15 \times 295.2 \approx 4{,}430\) sequences. 6. 1.51 without copies, 1.11 with them: the layer time falls by \(1.51/1.11 \approx 1.36\times\).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A dense FFN is exactly a sum of neuron groups (96.2). MoEfication groups co-active neurons and adds a router (96.4): 10% to 30% of FFN parameters keep over 95% of quality for ReLU models.</li>
+<li>Sparse upcycling copies the FFN into \(E\) experts and adds a random router (96.5). At step 0 the FFN output is scaled by \(G\) (96.6); renormalized top-\(k\) gates give an exact start. About 50% extra compute beat dense continuation in the paper.</li>
+<li>Memory follows total parameters, FLOPs follow active ones (96.7): Mixtral 46.7B / 12.9B, Qwen1.5-MoE 14.3B / 2.7B, DeepSeek-V3 671B / 37.6B.</li>
+<li>A decode batch touches \(E(1-(1-k/E)^b)\) experts per layer (96.8), so bytes per step rise quickly toward the total; the MoE’s FLOP advantage pays off only at very large batches, about \(E/k\) times the dense ridge batch (96.10).</li>
+<li>Expert parallelism adds two all-to-all exchanges per MoE layer (96.11) and waits for the busiest GPU (96.12); redundant copies of hot experts, as in DeepSeek-V3, cut the straggler effect.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ F(\mathbf{x}) = \sum_{i=1}^{K} E_i(\mathbf{x}) + \mathbf{b}_2, \qquad y_{\text{step 0}} = G(\mathbf{x})\, F_{\text{dense}}(\mathbf{x}) \]</div>
+<div class="eq">\[ N_{\text{total}} = N_{\text{other}} + L_{\text{moe}} E P_e, \qquad N_{\text{active}} = N_{\text{other}} + L_{\text{moe}} k P_e \]</div>
+<div class="eq">\[ \bar{E}(b) = E\left(1 - \left(1 - \tfrac{k}{E}\right)^{b}\right), \qquad b^{*} \approx \frac{E}{k}\cdot\frac{s I^{*}}{2}, \qquad Q_{\text{a2a}} \approx k\,d\,(s_d + s_c) \]</div>
+<h2 class="plain" id="efficient-ffn-3-moe-from-dense-models-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhang et al. (2021). <a href="https://scholar.google.com/scholar?q=&amp;quot;MoEfication: Transformer Feed-forward Layers are Mixtures of Experts&amp;quot;" target="_blank" rel="noopener">MoEfication: Transformer Feed-forward Layers are Mixtures of Experts</a></li><li>Komatsuzaki et al. (2022). <a href="https://arxiv.org/abs/2212.05055" target="_blank" rel="noopener">Sparse Upcycling: Training Mixture-of-Experts from Dense Checkpoints</a></li><li>Jiang et al. (2024). <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">Mixtral of Experts</a></li><li>Du et al. (2021). <a href="https://arxiv.org/abs/2112.06905" target="_blank" rel="noopener">GLaM: Efficient Scaling of Language Models with Mixture-of-Experts</a></li><li>DeepSeek-AI (2024). <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-V3 Technical Report</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Zhang et al. (2021). <a href="https://scholar.google.com/scholar?q=&amp;quot;MoEfication: Transformer Feed-forward Layers are Mixtures of Experts&amp;quot;" target="_blank" rel="noopener">MoEfication: Transformer Feed-forward Layers are Mixtures of Experts</a></li><li>Komatsuzaki et al. (2022). <a href="https://arxiv.org/abs/2212.05055" target="_blank" rel="noopener">Sparse Upcycling: Training Mixture-of-Experts from Dense Checkpoints</a></li><li>Jiang et al. (2024). <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">Mixtral of Experts</a></li><li>Du et al. (2021). <a href="https://arxiv.org/abs/2112.06905" target="_blank" rel="noopener">GLaM: Efficient Scaling of Language Models with Mixture-of-Experts</a></li><li>DeepSeek-AI (2024). <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-V3 Technical Report</a></li><li>Fedus et al. (2021). <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">Switch Transformers</a></li><li>Qwen Team (2024). <a href="https://qwenlm.github.io/blog/qwen-moe/" target="_blank" rel="noopener">Qwen1.5-MoE: Matching 7B Model Performance with 1/3 Activated Parameters (blog)</a></li><li>Sukhbaatar et al. (2024). <a href="https://arxiv.org/abs/2403.07816" target="_blank" rel="noopener">Branch-Train-MiX: Mixing Expert LLMs into a Mixture-of-Experts LLM</a></li><li>Zhu, Qu, Dong, Ruan, Tong, He, Cheng (2024). <a href="https://arxiv.org/abs/2406.16554" target="_blank" rel="noopener">LLaMA-MoE: Building Mixture-of-Experts from LLaMA with Continual Pre-training</a></li><li>Eliseev and Mazur (2023). <a href="https://arxiv.org/abs/2312.17238" target="_blank" rel="noopener">Fast Inference of Mixture-of-Experts Language Models with Offloading</a></li><li>Mistral AI (2023). <a href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json" target="_blank" rel="noopener">Mixtral-8x7B-v0.1: config.json</a></li><li>DeepSeek-AI (2024). <a href="https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/config.json" target="_blank" rel="noopener">DeepSeek-V3: config.json</a></li><li>Dai et al. (2024). <a href="https://arxiv.org/abs/2401.06066" target="_blank" rel="noopener">DeepSeekMoE: Towards Ultimate Expert Specialization in Mixture-of-Experts Language Models</a></li><li>NVIDIA (docs). <a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener">NVIDIA H100 Tensor Core GPU: product specifications</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/efficient-ffn-2-moe-routing-in-depth.html"><small>Previous · session 95</small>Efficient FFN 2: MoE routing in depth</a><a class="next" href="../inference/efficient-attention-1-mqa-gqa-and-mla.html"><small>Next · session 97</small>Efficient attention 1: MQA, GQA and MLA, from the KV-cache view</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const Bk=window.Book;const R=document.querySelector('[data-session="efficient-ffn-3-moe-from-dense-models"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function mul(a){return function(){a|=0;a=a+0x6D2B79F5|0;let t=Math.imul(a^a>>>15,1|a);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const gs=r=>{const u=r(),v=r();return Math.sqrt(-2*Math.log(1-u))*Math.cos(2*Math.PI*v);};
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const fk=v=>Math.round(v).toLocaleString("en-US");
+function ft(s){if(s<1e-3)return(s*1e6).toFixed(1)+" µs";if(s<1)return(s*1e3).toFixed(2)+" ms";return s.toFixed(2)+" s";}
+
+/* ---------- Figure 1: MoEfication of a toy ReLU FFN ---------- */
+(function(){
+ const svg=$("#mx-mf-svg");if(!svg)return;const info=$("#mx-mf-info");
+ const D=8,NF=32,K=8,DE=4,NT=4;const r=mul(7);
+ const U=[];for(let t=0;t<NT;t++){const v=[];for(let i=0;i<D;i++)v.push(gs(r));const n=Math.hypot(...v);U.push(v.map(x=>x/n));}
+ const W1=[];for(let j=0;j<NF;j++){const w=[];for(let i=0;i<D;i++)w.push(2*U[j%NT][i]+0.4*gs(r));W1.push(w);}
+ const B1=-1;
+ const W2=[];for(let j=0;j<NF;j++){const w=[];for(let q=0;q<D;q++)w.push(gs(r)/Math.sqrt(NF));W2.push(w);}
+ const X=[];for(let i=0;i<64;i++){const x=[];for(let q=0;q<D;q++)x.push(U[i%NT][q]+0.3*gs(r));X.push(x);}
+ const d2=(a,b)=>a.reduce((s,v,i)=>s+(v-b[i])**2,0);
+ function bkm(){let C=W1.slice(0,K).map(w=>w.slice());let lab=[];
+  for(let it=0;it<20;it++){const P=[];for(let j=0;j<NF;j++)for(let c=0;c<K;c++)P.push([d2(W1[j],C[c]),j,c]);
+   P.sort((a,b)=>a[0]-b[0]||a[1]-b[1]||a[2]-b[2]);lab=new Array(NF).fill(-1);const cnt=new Array(K).fill(0);
+   for(const[,j,c]of P)if(lab[j]<0&&cnt[c]<DE){lab[j]=c;cnt[c]++;}
+   C=[];for(let c=0;c<K;c++){const m=new Array(D).fill(0);for(let j=0;j<NF;j++)if(lab[j]===c)for(let i=0;i<D;i++)m[i]+=W1[j][i];C.push(m.map(v=>v/DE));}}
+  return lab;}
+ const r2=mul(11);const perm=[...Array(NF).keys()];for(let i=NF-1;i>0;i--){const j=Math.floor(r2()*(i+1));[perm[i],perm[j]]=[perm[j],perm[i]];}
+ const labR=new Array(NF);perm.forEach((j,p)=>labR[j]=Math.floor(p/DE));
+ const LAB={clu:bkm(),rnd:labR};
+ const H=X.map(x=>W1.map(w=>Math.max(0,w.reduce((s,v,i)=>s+v*x[i],0)+B1)));
+ const mean={};for(const k of["clu","rnd"]){mean[k]=[];for(let c=0;c<K;c++){const m=new Array(D).fill(0);for(let j=0;j<NF;j++)if(LAB[k][j]===c)for(let i=0;i<D;i++)m[i]+=W1[j][i];mean[k].push(m.map(v=>v/DE));}}
+ function run(sp,sel,n,xi){const lab=LAB[sp],h=H[xi],x=X[xi];
+  const y=[];for(let q=0;q<D;q++){let s=0;for(let j=0;j<NF;j++)s+=h[j]*W2[j][q];y.push(s);}
+  const sc=[];for(let c=0;c<K;c++){if(sel==="ideal"){let s=0;for(let j=0;j<NF;j++)if(lab[j]===c)s+=h[j];sc.push(s);}
+   else{const m=mean[sp][c];sc.push(m.reduce((s,v,i)=>s+v*x[i],0)/Math.hypot(...m)/Math.hypot(...x));}}
+  const ord=[...Array(K).keys()].sort((a,b)=>sc[b]-sc[a]||a-b);const S=new Set(ord.slice(0,n));
+  const ym=[];for(let q=0;q<D;q++){let s=0;for(let j=0;j<NF;j++)if(S.has(lab[j]))s+=h[j]*W2[j][q];ym.push(s);}
+  const ny=Math.hypot(...y);const err=ny>0?Math.hypot(...ym.map((v,q)=>v-y[q]))/ny:0;
+  const tot=h.reduce((a,b)=>a+b,0);let kept=0;for(let j=0;j<NF;j++)if(S.has(lab[j]))kept+=h[j];
+  return{err,act:h.filter(v=>v>0).length,cov:tot>0?kept/tot:1,S};}
+ let sp="clu",sel="ideal";const sn=$("#mx-mf-n"),sx=$("#mx-mf-x");
+ function draw(){const n=+sn.value,xi=+sx.value;$("#mx-mf-nv").value=n;$("#mx-mf-xv").value="#"+xi+" (topic "+(xi%NT+1)+")";
+  const o=run(sp,sel,n,xi);let me=0,mc=0;for(let i=0;i<64;i++){const a=run(sp,sel,n,i);me+=a.err;mc+=a.cov;}me/=64;mc/=64;
+  const lab=LAB[sp],h=H[xi],hm=Math.max(...H.flat());
+  let g=`<text x="360" y="18" text-anchor="middle" font-size="13" fill="var(--muted)">8 experts (columns) × 4 neurons; label = original neuron index and its topic</text>`;
+  const cw=78,x0=48,y0=40,ch=44;
+  for(let c=0;c<K;c++){const xs=x0+c*(cw+2);const on=o.S.has(c);
+   g+=`<rect x="${xs-3}" y="${y0-5}" width="${cw+6}" height="${4*ch+12}" rx="6" fill="none" stroke="${on?"var(--k)":"var(--rule)"}" stroke-width="${on?3:1}"/>`;
+   const js=[];for(let j=0;j<NF;j++)if(lab[j]===c)js.push(j);
+   js.forEach((j,p)=>{const a=h[j]/hm;const yy=y0+p*ch;
+    g+=`<rect x="${xs}" y="${yy}" width="${cw}" height="${ch-6}" rx="4" fill="${a>0?"var(--q)":"var(--rule)"}" opacity="${a>0?(0.25+0.75*Math.min(1,a)).toFixed(2):0.5}"/><text x="${xs+cw/2}" y="${yy+ch/2}" text-anchor="middle" font-size="12" fill="var(--ink)">n${j} · t${j%NT+1}</text>`;});
+   g+=`<text x="${xs+cw/2}" y="${y0+4*ch+24}" text-anchor="middle" font-size="12.5" fill="${on?"var(--k)":"var(--muted)"}" font-weight="${on?700:500}">E${c+1}${on?" ✓":""}</text>`;}
+  const bw=600*Math.min(1,me);g+=`<text x="${x0}" y="${y0+4*ch+50}" font-size="12.5" fill="var(--ink)">mean error over 64 inputs</text><rect x="${x0+170}" y="${y0+4*ch+38}" width="480" height="14" rx="3" fill="var(--rule)" opacity=".5"/><rect x="${x0+170}" y="${y0+4*ch+38}" width="${(480*Math.min(1,me)).toFixed(1)}" height="14" rx="3" fill="var(--k)"/>`;
+  svg.innerHTML=g;
+  info.innerHTML=`Input #${xi}: <b>${o.act}</b> of 32 neurons active. Chosen experts: ${[...o.S].sort((a,b)=>a-b).map(c=>"E"+(c+1)).join(", ")}; they hold ${(100*o.cov).toFixed(1)}% of the activation mass; output error ${(100*o.err).toFixed(1)}%. Over all 64 inputs with ${n} of 8 experts (${(100*n/8).toFixed(1)}% of the FFN): mean relative error <b>${(100*me).toFixed(1)}%</b>, activation mass covered <b>${(100*mc).toFixed(1)}%</b>.`;
+  svg.dataset.me=me.toFixed(4);}
+ sn.addEventListener("input",draw);sx.addEventListener("input",draw);
+ seg($("#mx-mf-split"),v=>{sp=v;draw();});seg($("#mx-mf-sel"),v=>{sel=v;draw();});draw();
+})();
+
+/* ---------- Figure 2: upcycling at step 0 ---------- */
+(function(){
+ const svg=$("#mx-up-svg");if(!svg)return;const info=$("#mx-up-info");
+ const EV=[2,4,8,16,32,64];const se=$("#mx-up-e"),sk=$("#mx-up-k"),ss=$("#mx-up-s");let ren=false;
+ const cache={};
+ function gate(E,k,sig){if(ren)return 1;const key=E+"|"+k+"|"+sig.toFixed(2);if(key in cache)return cache[key];
+  const r=mul(5);let tot=0;const N=4000;const z=new Array(E);
+  for(let t=0;t<N;t++){let m=-Infinity;for(let i=0;i<E;i++){z[i]=sig*gs(r);if(z[i]>m)m=z[i];}let s=0;for(let i=0;i<E;i++){z[i]=Math.exp(z[i]-m);s+=z[i];}
+   z.sort((a,b)=>b-a);let a=0;for(let i=0;i<k;i++)a+=z[i];tot+=a/s;}
+  return cache[key]=tot/N;}
+ function draw(){const E=EV[+se.value-1];let k=+sk.value;if(k>E){k=E;sk.value=E;}const sig=+ss.value;
+  $("#mx-up-ev").value=E;$("#mx-up-kv").value=k;$("#mx-up-sv").value=sig.toFixed(2);
+  const G=gate(E,k,sig);
+  let g=`<rect x="14" y="80" width="90" height="56" rx="8" fill="var(--v)" opacity=".85"/><text x="59" y="104" text-anchor="middle" font-size="13" fill="#fff" font-weight="700">dense</text><text x="59" y="122" text-anchor="middle" font-size="13" fill="#fff" font-weight="700">FFN</text>`;
+  g+=`<path d="M108 108 H150" stroke="var(--muted)" stroke-width="2" marker-end="url(#mx-up-ar)"/><defs><marker id="mx-up-ar" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs><text x="129" y="98" text-anchor="middle" font-size="12" fill="var(--muted)">copy ×${E}</text>`;
+  const show=Math.min(E,16),cols=4,bw=40,bh=34;
+  for(let i=0;i<show;i++){const cx=160+(i%cols)*(bw+6),cy=20+Math.floor(i/cols)*(bh+8);const on=i<k;
+   g+=`<rect x="${cx}" y="${cy}" width="${bw}" height="${bh}" rx="5" fill="var(--v)" opacity="${on?0.9:0.3}" stroke="${on?"var(--k)":"none"}" stroke-width="3"/><text x="${cx+bw/2}" y="${cy+bh/2+4}" text-anchor="middle" font-size="11" fill="${on?"#fff":"var(--ink)"}">E${i+1}</text>`;}
+  if(E>16)g+=`<text x="252" y="200" text-anchor="middle" font-size="12" fill="var(--muted)">… ${E-16} more copies</text>`;
+  g+=`<text x="252" y="222" text-anchor="middle" font-size="12" fill="var(--muted)">outlined: the ${k} chosen for one token</text>`;
+  const X0=380,W=230;g+=`<text x="${X0}" y="40" font-size="13" fill="var(--ink)" font-weight="700">Output scale at step 0</text>`;
+  g+=`<rect x="${X0}" y="60" width="${W}" height="30" rx="4" fill="var(--rule)" opacity=".5"/><rect x="${X0}" y="60" width="${(W*Math.min(1,G)).toFixed(1)}" height="30" rx="4" fill="var(--k)"/><line x1="${X0+W}" x2="${X0+W}" y1="52" y2="98" stroke="var(--ink)" stroke-dasharray="3 3"/><text x="${X0+W}" y="112" text-anchor="end" font-size="12" fill="var(--muted)">1 = dense output</text>`;
+  g+=`<text x="${X0}" y="140" font-size="22" font-weight="700" fill="var(--k)">G = ${G.toFixed(3)}</text><text x="${X0}" y="164" font-size="12.5" fill="var(--muted)">uniform router would give k/E = ${(k/E).toFixed(3)}</text>`;
+  g+=`<text x="${X0}" y="192" font-size="12.5" fill="var(--ink)">params of the layer: ${E}× · FLOPs per token: ${k}×</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`${E} experts, top-${k}, ${ren?"gates renormalized over the top-k":"softmax over all experts, then top-k"}, logit spread σ = ${sig.toFixed(2)}. At step 0 every expert equals the dense FFN, so the layer outputs <b>G = ${G.toFixed(3)}</b> × the dense FFN output (formula 96.6)${ren?": an exact copy of the dense model.":`; ${(100*(1-G)).toFixed(1)}% of the FFN signal is missing until the router learns.`} The layer stores ${E}× the FFN parameters and spends ${k}× its FLOPs per token.`;
+  svg.dataset.g=G.toFixed(4);}
+ [se,sk,ss].forEach(e=>e.addEventListener("input",draw));seg($("#mx-up-rule"),v=>{ren=v==="1";draw();});draw();
+})();
+
+/* ---------- Figure 3: MoE decode bytes vs batch ---------- */
+(function(){
+ const svg=$("#mx-srv-svg");if(!svg)return;const info=$("#mx-srv-info");const sb=$("#mx-srv-b");
+ /* counts from config.json files (see the table in the text) */
+ const M={
+  mix:{n:"Mixtral 8x7B, BF16, 2× H100",tot:46702792704,act:12879925248,emb:32000*4096,Lm:32,E:8,k:2,pe:176160768,s:2,P:2*989e12,B:2*3.35e12,C:160e9},
+  qw:{n:"Qwen1.5-MoE-A2.7B, BF16, 1× H100",tot:14315784192,act:2689173504,emb:151936*2048,Lm:24,E:60,k:4,pe:8650752,s:2,P:989e12,B:3.35e12,C:80e9},
+  ds:{n:"DeepSeek-V3, FP8, 16× H100",tot:671026419200,act:37552297472,emb:129280*7168,Lm:58,E:256,k:8,pe:44040192,s:1,P:16*1979e12,B:16*3.35e12,C:1280e9}};
+ let mk="mix";
+ function step(m,b){const other=m.tot-m.Lm*m.E*m.pe,omm=other-m.emb,actmm=m.act-m.emb;const tch=m.E*(1-(1-m.k/m.E)**b);
+  const Q=m.s*(omm+m.Lm*tch*m.pe),F=2*b*actmm,tq=Q/m.B,tf=F/m.P;return{tch,Q,F,tq,tf,t:Math.max(tq,tf),tpe:b*m.k/tch,qa:m.s*actmm,qt:m.s*(m.tot-m.emb)};}
+ function draw(){const m=M[mk];const b=Math.round(2**(+sb.value));$("#mx-srv-bv").value=fk(b);const o=step(m,b);
+  const X=lb=>70+lb/13*650;const ymax=o.qt*1.15;const Y=q=>290-q/ymax*265;
+  let g=`<path d="M70 20 V290 H720" fill="none" stroke="var(--muted)"/>`;
+  const raw=ymax/1e9/4,p10=10**Math.floor(Math.log10(raw));const stp=[1,2,2.5,5,10].map(x=>x*p10).find(x=>x>=raw);for(let q=0;q<=ymax/1e9+1e-9;q+=stp){g+=`<line x1="70" x2="720" y1="${Y(q*1e9)}" y2="${Y(q*1e9)}" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="64" y="${Y(q*1e9)+4}" text-anchor="end" font-size="12" fill="var(--muted)">${+q.toFixed(2)}</text>`;}
+  [0,2,4,6,8,10,12].forEach(e=>g+=`<text x="${X(e)}" y="308" text-anchor="middle" font-size="12" fill="var(--muted)">${fk(2**e)}</text>`);
+  g+=`<text x="16" y="155" font-size="12" fill="var(--muted)" transform="rotate(-90 16 155)" text-anchor="middle">GB read per step</text><text x="395" y="326" font-size="12" fill="var(--muted)" text-anchor="middle">batch b (sequences per decode step)</text>`;
+  g+=`<line x1="70" x2="720" y1="${Y(o.qa)}" y2="${Y(o.qa)}" stroke="var(--q)" stroke-width="2.5" stroke-dasharray="7 5"/><line x1="70" x2="720" y1="${Y(o.qt)}" y2="${Y(o.qt)}" stroke="var(--muted)" stroke-width="2.5" stroke-dasharray="7 5"/>`;
+  let p="",pf="";for(let lb=0;lb<=13.001;lb+=0.125){const s=step(m,2**lb);p+=(p?"L":"M")+X(lb).toFixed(1)+" "+Y(s.Q).toFixed(1);const fq=s.tf*m.B;if(fq<=ymax)pf+=(pf?"L":"M")+X(lb).toFixed(1)+" "+Y(fq).toFixed(1);}
+  g+=`<path d="${p}" fill="none" stroke="var(--k)" stroke-width="3"/><path d="${pf}" fill="none" stroke="var(--v)" stroke-width="2.5"/>`;
+  const xb=X(Math.log2(b));g+=`<line x1="${xb}" x2="${xb}" y1="20" y2="290" stroke="var(--muted)" stroke-dasharray="5 4"/><circle cx="${xb}" cy="${Y(o.Q)}" r="6" fill="var(--k)"/>`;
+  g+=`<text x="716" y="${Y(o.qt)-6}" text-anchor="end" font-size="12" fill="var(--muted)">dense, same total: ${(o.qt/1e9).toFixed(1)} GB</text><text x="716" y="${Y(o.qa)-6}" text-anchor="end" font-size="12" fill="var(--q)">dense, same active: ${(o.qa/1e9).toFixed(1)} GB</text>`;
+  svg.innerHTML=g;
+  const bound=o.tf>o.tq?"compute-bound":"memory-bound";
+  info.innerHTML=`<b>${m.n}</b> (weights ${(m.s*m.tot/1e9).toFixed(1)} GB of ${(m.C/1e9).toFixed(0)} GB). Batch <b>${fk(b)}</b>: experts touched per layer <b>${o.tch.toFixed(2)}</b> of ${m.E} (formula 96.8), ${o.tpe.toFixed(2)} tokens per touched expert. Bytes read <b>${(o.Q/1e9).toFixed(2)} GB</b> → ${ft(o.tq)}; FLOPs ${(o.F/1e12).toFixed(2)} TFLOP → ${ft(o.tf)}. Step ≥ <b>${ft(o.t)}</b> (${bound}), about <b>${fk(b/o.t)}</b> tokens/s in total. Dense twins at this batch: same active size ${ft(Math.max(o.qa/m.B,o.tf))}, same total size ${ft(Math.max(o.qt/m.B,o.tf*(m.tot-m.emb)/(m.act-m.emb)))}.`;
+  svg.dataset.q=(o.Q/1e9).toFixed(2);svg.dataset.t=(o.t*1e3).toFixed(2);svg.dataset.tch=o.tch.toFixed(2);}
+ sb.addEventListener("input",draw);seg($("#mx-srv-m"),v=>{mk=v;draw();});draw();
+})();
+
+/* ---------- Figure 4: expert parallelism load ---------- */
+(function(){
+ const svg=$("#mx-ep-svg");if(!svg)return;const info=$("#mx-ep-info");const sa=$("#mx-ep-a");let red=false;
+ const E=32,G=8,T=4096,k=2,per=E/G;
+ const r=mul(3);const rank=[...Array(E).keys()];for(let i=E-1;i>0;i--){const j=Math.floor(r()*(i+1));[rank[i],rank[j]]=[rank[j],rank[i]];}
+ function calc(alpha){const w=rank.map(x=>(x+1)**(-alpha));const sw=w.reduce((a,b)=>a+b,0);const load=w.map(v=>T*k*v/sw);
+  const host=[...Array(E).keys()].map(e=>[Math.floor(e/per)]);
+  const gl=()=>{const g=new Array(G).fill(0);for(let e=0;e<E;e++)for(const h of host[e])g[h]+=load[e]/host[e].length;return g;};
+  let nrep=0;
+  if(red){const used=new Array(G).fill(false);
+   for(let it=0;it<G;it++){const g=gl();let gm=0;for(let h=1;h<G;h++)if(g[h]>g[gm])gm=h;
+    let e=-1;for(let x=0;x<E;x++)if(host[x].includes(gm)&&(e<0||load[x]/host[x].length>load[e]/host[e].length))e=x;
+    const cand=[];for(let h=0;h<G;h++)if(!used[h]&&!host[e].includes(h))cand.push(h);if(!cand.length)break;
+    let hb=cand[0];for(const h of cand)if(g[h]<g[hb])hb=h;host[e].push(hb);const g2=gl();
+    if(Math.max(g2[gm],g2[hb])>=g[gm]-1e-9){host[e].pop();break;}used[hb]=true;nrep++;}}
+  const g=gl();const mx=Math.max(...g),mn=g.reduce((a,b)=>a+b,0)/G;return{load,host,g,mx,mn,imb:mx/mn,hot:Math.max(...load)/(T*k),nrep};}
+ function draw(){const a=+sa.value;$("#mx-ep-av").value=a.toFixed(2);const o=calc(a);
+  const ymax=3000,Y=v=>260-v/ymax*235,bw=60,x0=80;
+  let g=`<path d="M60 20 V260 H710" fill="none" stroke="var(--muted)"/>`;
+  [0,1000,2000,3000].forEach(v=>g+=`<line x1="60" x2="710" y1="${Y(v)}" y2="${Y(v)}" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="54" y="${Y(v)+4}" text-anchor="end" font-size="12" fill="var(--muted)">${fk(v)}</text>`);
+  g+=`<text x="14" y="140" font-size="12" fill="var(--muted)" transform="rotate(-90 14 140)" text-anchor="middle">token slots</text>`;
+  for(let h=0;h<G;h++){const xs=x0+h*80;let acc=0;
+   for(let e=0;e<E;e++){if(!o.host[e].includes(h))continue;const v=o.load[e]/o.host[e].length;const own=o.host[e][0]===h;
+    g+=`<rect x="${xs}" y="${Y(acc+v)}" width="${bw}" height="${Math.max(0.5,Y(acc)-Y(acc+v)).toFixed(1)}" fill="${own?"var(--v)":"var(--k)"}" stroke="var(--card)" stroke-width="1"/>`;
+    if(Y(acc)-Y(acc+v)>14)g+=`<text x="${xs+bw/2}" y="${(Y(acc+v)+Y(acc))/2+4}" text-anchor="middle" font-size="11" fill="#fff">E${e+1}</text>`;acc+=v;}
+   g+=`<text x="${xs+bw/2}" y="276" text-anchor="middle" font-size="12" fill="var(--muted)">GPU ${h}</text><text x="${xs+bw/2}" y="${Y(acc)-5}" text-anchor="middle" font-size="11.5" fill="var(--ink)">${fk(acc)}</text>`;}
+  g+=`<line x1="60" x2="710" y1="${Y(o.mn)}" y2="${Y(o.mn)}" stroke="var(--muted)" stroke-width="2" stroke-dasharray="7 5"/>`;
+  svg.innerHTML=g;
+  info.innerHTML=`α = ${a.toFixed(2)}: the hottest expert gets ${(100*o.hot).toFixed(1)}% of the ${fk(T*k)} token slots. Busiest GPU: <b>${fk(o.mx)}</b> slots against a mean of ${fk(o.mn)}, imbalance <b>${o.imb.toFixed(2)}</b> (formula 96.12): the layer takes ${o.imb.toFixed(2)}× as long as with perfect balance. ${red?`Redundant copies placed: ${o.nrep}.`:"No redundant copies."}`;
+  svg.dataset.imb=o.imb.toFixed(3);}
+ sa.addEventListener("input",draw);seg($("#mx-ep-red"),v=>{red=v==="1";draw();});draw();
+})();
+})();
+</script></body></html>

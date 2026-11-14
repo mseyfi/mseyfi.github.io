@@ -1,0 +1,622 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>serve a VLM and measure · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 200</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="lab-serve-a-vlm-and-measure">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="lab-serve-a-vlm-and-measure" data-session="lab-serve-a-vlm-and-measure" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">200</span><span>Track 7: Vision and VLMs · session 38 of 38</span></div><h1 class="chap-title">serve a VLM and measure</h1><p class="chap-sub">In this lab you serve Qwen2.5-VL-3B-Instruct with vLLM on one NVIDIA L4 and measure how the time to first token grows with the image resolution and with the number of video frames. Then you turn on prefix caching and the multimodal caches, switch the weights to FP8 and INT4, and record speed and quality side by side. A planning model built from the published config tells you what to expect, so you can tell a real effect from a broken measurement.</p><div class="meta-row"><span><b>Time:</b> 4 to 6 hours (mostly hands-on, on a rented GPU)</span><span><b>Level:</b> Intermediate · hands-on lab</span><span><b>Before this:</b> Sessions 196 to 199 (the VLM inference path, quantizing VLMs, serving VLMs, the L4 latency budget) and the serving-benchmark lab (session 142); Python</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How to start a VLM server with vLLM with every multimodal flag written down, and how to read its start-up log</li><li>How to turn an image size or a frame count into image tokens with Qwen2.5-VL’s resize rule, and check the count against the server’s usage field</li><li>How to split TTFT into CPU preprocessing, vision encoder and LLM prefill, and why the encoder is about half of the GPU work in a 3B VLM</li><li>How TTFT grows with resolution and with frames, and where max-model-len and max_pixels set hard limits</li><li>How prefix caching, the processor cache and the encoder cache each remove repeated work, and why the image must come before the question</li><li>What FP8 and INT4 AWQ change in memory, TTFT, TPOT and throughput, and how to measure their quality cost with a paired test</li><li>How to write a results sheet that someone else can reproduce</li></ul></div></header><style>
+[data-session="lab-serve-a-vlm-and-measure"] pre.code,[data-session="lab-serve-a-vlm-and-measure"] code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.sv-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.sv-grid input[type=range]{width:100%;min-width:0}
+.sv-grid output{font:600 14px var(--mono);min-width:6.5em;text-align:right}
+#sv-res-svg text,#sv-vid-svg text,#sv-cache-svg text,#sv-prec-svg text{font-family:var(--sans)}
+.sv-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.sv-leg span::before{content:"";display:inline-block;width:16px;height:12px;border-radius:3px;margin-right:6px;vertical-align:-1px;background:var(--c)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A vision-language model (VLM) server is judged first by how long the user waits before the answer starts: the <b>time to first token</b> (TTFT). For a text model, TTFT is mostly one prefill. For a VLM it is much more: the server must decode and resize the image on the CPU, run a vision encoder on the GPU, and then prefill hundreds or thousands of extra image tokens. Each of these costs grows with the image size and with the number of video frames. In this lab you serve a real small VLM, measure exactly how TTFT grows, and then try the three main tools that make it cheaper: caching, FP8 and INT4.</p>
+<p>The lab uses the whole serving part of <a href="../vision/index.html">Track 7</a>. <a href="../vision/the-vlm-inference-path.html">Session 196</a> followed one request through every stage and counted its cost. <a href="../vision/quantizing-vlms.html">Session 197</a> explained which parts to quantize and why the vision encoder usually stays in 16-bit. <a href="../vision/serving-vlms-vllm-tensorrt-llm-and-the.html">Session 198</a> compared the engines, and <a href="../vision/a-latency-budget-on-an-nvidia-l4.html">Session 199</a> did the latency math on paper for the same GPU we use here. The method comes from <a href="../inference/lab-benchmark-a-serving-system.html">session 142</a>, the text-model version of this lab: write the setup down, predict, measure, change one thing at a time. The next session, <a href="../video/video-as-data.html">session 201</a>, starts the video track, where the frame budget you measure here becomes the central problem.</p>
+<p>The lab has four parts, one for each key point of the session:</p>
+<ol>
+<li>Serve Qwen2.5-VL-3B-Instruct with vLLM on one NVIDIA L4, and check that the server counts image tokens the way you expect.</li>
+<li>Measure TTFT against the image resolution, and against the number of video frames.</li>
+<li>Turn on prefix caching and the multimodal caches, and measure what repeated images cost.</li>
+<li>Switch to FP8 and to INT4 (AWQ) weights, and record speed <i>and</i> quality for each.</li></ol>
+<aside class="note interview side"><span class="nt">Interview tip</span>“Our VLM endpoint has a slow first token. What do you do?” A strong answer measures before it guesses: split TTFT into CPU preprocessing, vision encoder and LLM prefill; count the image tokens per request; check the cache hit rate; and only then pick a fix (fewer pixels, fewer frames, caching, FP8, more CPU workers). This lab gives you the numbers to say that with confidence.</aside>
+<div class="note watch"><span class="nt">What is measured and what is modeled on this page</span>The commands follow the vLLM documentation of November 2026 [Certain for the flags we quote from it]. We did <b>not</b> run vLLM for this page: we had no NVIDIA GPU. The L4 latencies in the figures come from a small planning model (given in full below) that uses the model’s published config, the L4 spec sheet and stated assumptions. It is the “expected result” of the lab, not a measurement. Three things we did measure ourselves, and they are labeled [Certain, our run]: the image-token counts of the Hugging Face processor, its CPU time on one laptop core, and a dry run of the benchmark client against a fake server.</div>
+
+<h2>The setup: one L4, one small VLM, every flag written down</h2>
+<p>A measurement is only useful if someone else can repeat it. So before the first request you write down the GPU, the model, the engine version and every setting that changes what the server does with an image. Do not trust defaults: they change between versions, and for VLMs there are more of them (resize limits, frame sampling, cache sizes).</p>
+<p><b>The GPU.</b> An NVIDIA L4: 24 GB of memory, 300 GB/s of memory bandwidth, 121 TFLOP/s of dense BF16 matrix math and 242 TFLOP/s of dense FP8 [Certain: NVIDIA lists 242 and 485 “with sparsity”; dense is one half]. It supports FP8 tensor-core math (compute capability 8.9) [Certain]. It is a cheap 72 W inference card that most clouds rent.</p>
+<p><b>The model.</b> Qwen2.5-VL-3B-Instruct in BF16. From its <code>config.json</code> [Certain]: a language model with 36 layers, width 2,048, 16 query heads and 2 key-value heads of size 128 (grouped-query attention), a feed-forward width of 11,008, a vocabulary of 151,936 and an output layer that is <i>tied</i> to the input embedding. The vision encoder is a ViT with 32 layers of width 1,280; only layers 7, 15, 23 and 31 use full attention, the others attend inside windows of 112 × 112 pixels. Patches are 14 × 14 pixels, two consecutive video frames form one temporal patch, and a 2 × 2 merger turns four patches into one language-model token. Hugging Face counts 3,754,622,976 parameters; from the shapes we get 668.7 M in the vision tower, 311.2 M in the embedding and 2,774.8 M in the language-model blocks, which adds up exactly [Certain, our count].</p>
+<div class="eq">\[ C_{\text{KV}} = \left\lfloor \frac{u\,M - W - R}{\text{kv}_{\text{tok}}} \right\rfloor, \qquad \text{kv}_{\text{tok}} = 2\,L\,n_{kv}\,d_h\,s \tag{200.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(C_{\text{KV}}\)</dt><dd>tokens of KV cache that fit on the GPU, summed over all running requests</dd>
+<dt>\(u\)</dt><dd>fraction of GPU memory the engine may use (<code>--gpu-memory-utilization</code>)</dd>
+<dt>\(M, W\)</dt><dd>GPU memory and the bytes of the stored weights (vision tower included)</dd>
+<dt>\(R\)</dt><dd>memory for everything else: activations of the largest step, the vision encoder’s activations for the largest image, CUDA graphs; here an assumed 2.0 GB</dd>
+<dt>\(\text{kv}_{\text{tok}}\)</dt><dd>bytes of cache per token: a key and a value (the 2) for each of \(L\) layers and \(n_{kv}\) heads of size \(d_h\), with \(s\) bytes per number</dd></dl>
+<div class="worked"><div class="wt">Worked example: memory of Qwen2.5-VL-3B on an L4</div>
+<p>Weights in BF16: \(3{,}754{,}622{,}976 \times 2 = 7.51\) GB. Cache per token: \(2 \cdot 36 \cdot 2 \cdot 128 \cdot 2 = 36{,}864\) bytes (36 KiB). With \(u = 0.9\) and \(R = 2.0\) GB: \(0.9 \cdot 24 - 7.51 - 2.0 = 12.09\) GB for the cache, so \(C_{\text{KV}} = 327{,}982\) tokens.</p>
+<p>A 1920 × 1080 image becomes 2,691 image tokens (we show why below); with the chat template the prompt has 2,719 tokens, and with 256 output tokens one request needs 2,975 tokens of cache. So about \(\lfloor 327{,}982 / 2{,}975 \rfloor = 110\) such requests fit at once. One 1080p image costs \(2{,}719 \times 36{,}864 = 100\) MB of cache. Compare a 7B LLaVA-1.5 with full multi-head attention, where one 576-token image costs about 300 MB (<a href="../vision/the-vlm-inference-path.html">session 196</a>): the 2 key-value heads of this model make image tokens cheap to <i>store</i>. They are not cheap to <i>compute</i>, as we will see.</p></div>
+<p><b>The engine.</b> Install vLLM in a fresh environment, record its version (<code>pip show vllm</code>), and start the server with every setting written out:</p>
+<pre class="code"><span class="cm"># the baseline: BF16, one image or one video per prompt, NO prefix caching, NO processor cache</span>
+vllm serve Qwen/Qwen2.5-VL-3B-Instruct \
+  --dtype bfloat16 --max-model-len 32768 --gpu-memory-utilization 0.9 \
+  --max-num-seqs 64 --max-num-batched-tokens 8192 \
+  --limit-mm-per-prompt '{"image": 1, "video": 1}' \
+  --disable-prefix-caching --mm-processor-cache-gb 0 \
+  --port 8000</pre>
+<p>What each multimodal flag does, from the engine-argument docs [Certain]. <code>--limit-mm-per-prompt</code> caps the images and videos one prompt may carry; the engine also uses it to size its memory profiling, so a smaller limit leaves more memory for the cache. <code>--mm-processor-cache-gb</code> is the size of a CPU cache that keeps the processed pixels of recent images (default 4 GiB; 0 turns it off). <code>--mm-processor-kwargs</code> passes options to the Hugging Face processor, such as <code>max_pixels</code> (Part 1). <code>--media-io-kwargs '{"video": {"num_frames": 40}}'</code> sets how many frames the server samples when it decodes a video file itself. We turn both caches off for the baseline so that the resolution sweep measures real work; Part 3 turns them on.</p>
+<p>When the server is ready, read its start-up log: the KV-cache size in tokens, the maximum concurrency for 32,768-token requests, and whether the model loaded in the precision you asked for [Likely: the exact wording of the log changes between versions]. Then send one request by hand. The response’s <code>usage.prompt_tokens</code> field is your first check: for the 1920 × 1080 test image and our one-sentence question it should be 2,719.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A photo lab with a counter and a darkroom. At the counter (the CPU) a clerk opens your envelope and trims the photo to a standard size. In the darkroom (the GPU) one machine develops it (the vision encoder) and a second one writes the description (the language model). A bigger photo is slower at every station. If the same photo comes back, a good lab keeps the trimmed copy, the developed copy, and even the first page of the description.</aside>
+
+<h2>How to measure TTFT for one image</h2>
+<p>For this lab the question is “how long does <i>one</i> request wait, as a function of what it carries?”, not “how much load can the server take?”. So send one request at a time, with nothing else running: then TTFT has no queueing time in it, and you see the pure cost of the image. (The load question needs open-loop traffic and is the subject of <a href="../inference/lab-benchmark-a-serving-system.html">session 142</a>; Figure 4 comes back to batching.)</p>
+<p>First predict the token count. Qwen2.5-VL keeps the aspect ratio of the image. Its processor rounds the height and the width to multiples of 28 pixels, then scales the image down if it has more than <code>max_pixels</code> (default 12,845,056) or up if it has fewer than <code>min_pixels</code> (default 3,136) [Certain, from the processor code and config]:</p>
+<div class="eq">\[ H' = 28 \cdot \operatorname{round}\!\left(\tfrac{H}{28}\right), \quad W' = 28 \cdot \operatorname{round}\!\left(\tfrac{W}{28}\right), \qquad N_{\text{tok}} = \left\lceil \tfrac{T}{2} \right\rceil \cdot \frac{H'}{28} \cdot \frac{W'}{28} \tag{200.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(H, W\)</dt><dd>height and width of the image (or of each video frame) that reaches the processor</dd>
+<dt>\(H', W'\)</dt><dd>after resizing: multiples of 28, because a token covers 2 × 2 patches of 14 pixels</dd>
+<dt>\(T\)</dt><dd>number of frames; an image counts as \(T = 1\) (it is repeated to fill one temporal patch); an odd frame count is padded to the next even one</dd>
+<dt>\(N_{\text{tok}}\)</dt><dd>image or video tokens that the language model sees; the vision encoder works on \(4 N_{\text{tok}}\) patches</dd></dl>
+<div class="worked"><div class="wt">Worked example: tokens of a 1920 × 1080 image and of a 32-frame clip</div>
+<p>\(1080 / 28 = 38.57\), rounded to 39, so \(H' = 1{,}092\); \(1920 / 28 = 68.57\), rounded to 69, so \(W' = 1{,}932\). That gives \(39 \times 69 = 2{,}691\) image tokens and \(78 \times 138 = 10{,}764\) patches in the encoder. The chat template adds 28 text tokens (system prompt, roles, the two vision markers and our question), so the prompt has 2,719 tokens.</p>
+<p>A 640 × 360 clip of 32 frames: each frame becomes \(13 \times 23 = 299\) tokens per temporal patch, and 32 frames make 16 temporal patches, so \(16 \times 299 = 4{,}784\) video tokens, and 4,811 prompt tokens with the video template.</p>
+<p>We checked these counts with the Hugging Face processor of the model (transformers 5.23): it returned an image grid of 1 × 78 × 138 and a prompt of 2,719 tokens, and a video grid of 16 × 26 × 46 and a prompt of 4,811 tokens [Certain, our run].</p></div>
+<div class="algo"><div class="algo-h">Algorithm 1: measure TTFT for one image size or one frame count</div><ol>
+<li><b>input:</b> width \(W\), height \(H\), frames \(T\) (0 for an image), repeats \(k\)</li>
+<li>predict \(N_{\text{tok}}\) with (200.2)</li>
+<li><b>for</b> \(j = 0, 1, \dots, k\):</li>
+<li>&nbsp;&nbsp;make a <b>new</b> test image (or \(T\) new frames) with seed \(j\) <span class="c">// new bytes: no cache can hit</span></li>
+<li>&nbsp;&nbsp;encode it as a JPEG in a base64 data URL; build the chat message: media first, then the question</li>
+<li>&nbsp;&nbsp;\(t_0 \leftarrow\) now; send the request with streaming on</li>
+<li>&nbsp;&nbsp;TTFT\(_j \leftarrow\) arrival time of the first text chunk \(- t_0\); read <code>usage.prompt_tokens</code> from the last chunk</li>
+<li>drop request 0 (warm-up); report the median TTFT and the prompt tokens</li>
+<li><b>check:</b> prompt tokens \(= N_{\text{tok}}\) + template tokens; if not, the server resized differently than you think</li></ol></div>
+<p>The last line is the most useful check in the lab. If the server reports fewer tokens than you predicted, something resized the image: a <code>max_pixels</code> setting, a client library, or a different processor version. If it reports more, your frames were not sampled the way you think. Fix this before you measure any time.</p>
+
+<h2>A model to compare against</h2>
+<p>Before you rent the GPU, predict the result. Our planning model splits TTFT into four parts:</p>
+<div class="eq">\[ \text{TTFT} = t_{\text{fix}} + t_{\text{prep}} + \frac{F_{\text{enc}}}{\eta_{\text{enc}}\, F_{\text{peak}}} + \sum_{\text{chunks}} \left[ \max\!\left( \frac{F_c}{\eta_c\, F_{\text{peak}}},\ \frac{Q_c}{\eta_m\, \text{BW}} \right) + t_{\text{oh}} \right] \tag{200.3} \]</div>
+<div class="eq">\[ F_{\text{enc}} = 2 P_{\text{blk}}\, N_p + 4\, d_v\, n_s\, N_s \big( L_{\text{full}}\, N_s + L_{\text{win}}\, w \big), \qquad F_c = 2 P_{\text{LLM}}\, c + 4 L d_a \big( c\,p + \tfrac{c(c+1)}{2} \big) \tag{200.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t_{\text{fix}}\)</dt><dd>fixed cost per request: HTTP, tokenization, scheduling; assumed 10 ms</dd>
+<dt>\(t_{\text{prep}}\)</dt><dd>CPU time to decode the base64 JPEG and run the image processor (resize, normalize, cut patches); 46 ms per megapixel in our run on one laptop core</dd>
+<dt>\(P_{\text{blk}}, N_p\)</dt><dd>matmul weights of the 32 vision blocks (0.630 B, plus the patch embedding) and the number of patches</dd>
+<dt>\(n_s, N_s\)</dt><dd>temporal slices (1 for an image, \(\lceil T/2 \rceil\) for a video) and patches per slice; full attention runs inside each slice, not across the whole video [Certain, from the model code]</dd>
+<dt>\(d_v, L_{\text{full}}, L_{\text{win}}, w\)</dt><dd>encoder width 1,280; 4 full-attention layers; 28 window layers; 64 patches per window (8 × 8)</dd>
+<dt>\(F_c, c, p\)</dt><dd>FLOPs of one prefill chunk of \(c\) tokens (at most 8,192, the token budget) after \(p\) tokens already in the cache</dd>
+<dt>\(P_{\text{LLM}}, d_a\)</dt><dd>matmul weights of the 36 language-model blocks (2.775 B) and the attention width (16 heads × 128 = 2,048)</dd>
+<dt>\(Q_c\)</dt><dd>bytes the chunk reads: the weights once plus the KV cache so far</dd>
+<dt>\(\eta_{\text{enc}}, \eta_c, \eta_m\)</dt><dd>assumed fractions of peak that real kernels reach: 0.4 for the encoder (narrow layers, short windows), 0.6 for the language model, 0.8 for bandwidth</dd>
+<dt>\(t_{\text{oh}}\)</dt><dd>fixed cost of one engine step; assumed 2 ms</dd></dl>
+<p>The model ignores two things on purpose: the merger and the patch embedding are small, and attention to the windows at the image border is a bit cheaper than a full window. We checked the per-layer formula with PyTorch’s FLOP counter on one vision block (code below): for 10,752 patches, a window layer costs 0.427 TFLOP and a full-attention layer 1.015 TFLOP, the same as the formula to three digits [Certain, our run].</p>
+<div class="worked"><div class="wt">Worked example: TTFT of one 1920 × 1080 image on an L4, BF16</div>
+<p><b>Encoder.</b> 10,764 patches. Matmuls: \(2 \times 0.6315 \times 10^9 \times 10{,}764 = 13.59\) TFLOP, plus 0.20 for the merger. Attention: \(4 \cdot 1280 \cdot 10{,}764 \cdot (4 \cdot 10{,}764 + 28 \cdot 64) = 2.47\) TFLOP. Total 16.26 TFLOP; at \(0.4 \times 121\) TFLOP/s that is 336 ms.</p>
+<p><b>Prefill.</b> 2,719 tokens: \(2 \times 2.775 \times 10^9 \times 2{,}719 = 15.09\) TFLOP plus 1.09 TFLOP of attention, 16.18 TFLOP in total; at \(0.6 \times 121\) TFLOP/s, 223 ms, plus 2 ms of step overhead: 225 ms. The weights and the cache are only 6.27 GB, 26 ms at 240 GB/s, so the prefill is compute-bound.</p>
+<p><b>CPU.</b> 2.07 megapixels at 46 ms per megapixel: 95 ms. With the 10 ms fixed cost, <b>TTFT ≈ 666 ms</b>.</p>
+<p>The surprise: the vision encoder costs as many FLOPs as the whole language-model prefill (16.26 against 16.18 TFLOP), and more time, because its kernels are less efficient. The reason is the ratio from <a href="../vision/the-vlm-inference-path.html">session 196</a>: the encoder sees 4 patches per language-model token, and its 0.63 B weights are almost a quarter of the 2.78 B of the language model, so \(4 \times 0.63 / 2.78 \approx 0.9\). In a 3B VLM, the vision tower is not a small add-on.</p></div>
+
+<h2>Part 1: TTFT against image resolution</h2>
+<p>Sweep eight 16:9 sizes from 640 × 360 to 3840 × 2160, five new images each, with the baseline server. The client below does one size per call. Plot TTFT against the prompt tokens that the server reports, not against the pixel count: tokens are what the GPU works on. Figure 1 shows what the planning model predicts for BF16, FP8 and INT4.</p>
+<figure class="fig wide" id="sv-res"><div class="fig-body">
+<div class="controls"><span>Weights</span><span class="seg" id="sv-res-fmt"><button type="button" data-v="bf16" aria-pressed="true">BF16</button><button type="button" data-v="fp8" aria-pressed="false">FP8</button><button type="button" data-v="int4" aria-pressed="false">INT4 AWQ</button></span>
+<label class="sl"><input type="checkbox" id="sv-res-cap"> max_pixels = 1280 × 28 × 28</label></div>
+<div class="sv-grid"><label for="sv-res-s">Image size</label><input type="range" id="sv-res-s" min="0" max="7" step="1" value="4"><output id="sv-res-sv"></output></div>
+<div class="scroll-x"><svg id="sv-res-svg" viewBox="0 0 680 430" role="img" aria-label="Predicted TTFT of Qwen2.5-VL-3B on an L4 split into CPU preprocessing, vision encoder and LLM prefill, for eight image sizes and three weight formats"></svg></div>
+<div class="sv-leg"><span style="--c:var(--muted)">fixed cost</span><span style="--c:var(--k)">CPU preprocessing</span><span style="--c:var(--v)">vision encoder</span><span style="--c:var(--q)">LLM prefill</span></div>
+<div class="readout" id="sv-res-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> TTFT against image size, from the planning model (not measured): Qwen2.5-VL-3B-Instruct on one L4, batch 1, a new image every time (no cache hits), 28 text tokens. The bars split TTFT for the chosen size in all three formats; the lower panel shows TTFT against image tokens for all eight sizes. The checkbox applies the token cap that the model card suggests as a speed setting.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start at 1920 × 1080 in BF16: 2,691 image tokens, CPU 95 ms, encoder 336 ms, prefill 225 ms, TTFT 666 ms; the encoder is 60% of the GPU time. Move to 640 × 360: 299 tokens and 81 ms. Move to 3840 × 2160: 10,549 tokens and 3.31 s. From the smallest to the largest size the tokens grow 35 times and TTFT 41 times: a bit faster than linear, because the four full-attention encoder layers and the prefill attention grow with the square of the length. Switch to FP8: 435 ms at 1080p, because both the encoder and the prefill run on FP8 tensor cores (we assume the vision tower is quantized too; see Part 4). Switch to INT4: 741 ms, slower than BF16, because AWQ leaves the vision tower in BF16 and its 4-bit matmuls are slower in prefill (an assumption). Now tick the <code>max_pixels</code> box: every image above about one megapixel is shrunk to 1,222 tokens, and 4K costs 633 ms instead of 3.31 s.</p></details></figure>
+<h3>What the curves say</h3>
+<ul>
+<li><b>TTFT follows the token count, almost linearly.</b> Twice the pixels means about twice the tokens, twice the encoder work and twice the prefill. The square terms (full attention) start to show above about 5,000 tokens.</li>
+<li><b>The encoder is half of the GPU work at every size.</b> This is special to small VLMs with a large vision tower. For a 72B language model with the same encoder, the encoder would be a few percent.</li>
+<li><b>The CPU is a real part of TTFT.</b> In our run the Hugging Face processor took 12 ms for 640 × 360, 98 ms for 1920 × 1080 and 386 ms for 3840 × 2160 on one core [Certain, our run, an Apple M5 Pro laptop; a cloud vCPU may be slower]. If the API server handles requests one at a time, that time also blocks the next request.</li>
+<li><b>The cheapest fix is fewer pixels.</b> The <code>max_pixels</code> cap cuts the cost of large images by up to 5 times, and it is one flag: <code>--mm-processor-kwargs '{"max_pixels": 1003520}'</code> [Likely: check that your vLLM version forwards it to this processor]. Whether the answers stay good is a quality question: measure it as in Part 4 on your own images, because fine text in documents needs pixels.</li></ul>
+<aside class="note watch side"><span class="nt">Watch out</span>If your measured TTFT for one size has two clusters, one fast and one slow, you are probably hitting a cache: the same image bytes were sent twice and the processor cache or the prefix cache served them. The client below makes new bytes for every request. Also check <code>usage.prompt_tokens</code>: if it does not change between sizes, a client library resized your images before sending them.</aside>
+
+<h2>Part 2: TTFT against the number of video frames</h2>
+<p>Qwen2.5-VL takes a video as a stack of frames. Two consecutive frames are merged into one temporal patch, so a video costs half as many tokens as the same frames sent as separate images [Certain, from <code>temporal_patch_size = 2</code>]. To control the frame count exactly, extract the frames on the client and send them as one <code>video_url</code> of comma-joined base64 JPEGs (<code>data:video/jpeg;base64,...</code>), which the vLLM docs describe for pre-extracted frames [Certain]. If you send a video file instead, the server samples the frames itself, and <code>--media-io-kwargs</code> sets how many.</p>
+<p>Sweep 4, 8, 16, 32, 64 and 128 frames at three frame sizes: 640 × 360, 848 × 480 and 1280 × 720. Two limits will appear. The prompt must fit in <code>--max-model-len</code> (32,768 here) with room for the answer; longer prompts are rejected with an error, not truncated. And the tokens per frame depend on the processor version: our transformers 5.23 processor kept 1280 × 720 frames at full size (1,196 tokens per temporal patch) and printed a warning that a per-frame pixel cap, as in the reference <code>qwen-vl-utils</code> code, will become the default in a later version [Certain, our run]. vLLM may also apply its own limits [Likely]. So again: read <code>usage.prompt_tokens</code>.</p>
+<figure class="fig wide" id="sv-vid"><div class="fig-body">
+<div class="controls"><span>Frame size</span><span class="seg" id="sv-vid-res"><button type="button" data-v="360p" aria-pressed="true">640 × 360</button><button type="button" data-v="480p" aria-pressed="false">848 × 480</button><button type="button" data-v="720p" aria-pressed="false">1280 × 720</button></span></div>
+<div class="sv-grid"><label for="sv-vid-t">Frames sent</label><input type="range" id="sv-vid-t" min="2" max="128" step="2" value="32"><output id="sv-vid-tv"></output></div>
+<div class="scroll-x"><svg id="sv-vid-svg" viewBox="0 0 680 370" role="img" aria-label="Predicted TTFT against the number of video frames for three frame sizes, with the max-model-len limit"></svg></div>
+<div class="readout" id="sv-vid-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> TTFT against video frames, from the planning model (not measured): BF16, batch 1, new frames every time, 27 text tokens, 256 output tokens reserved. The grey dashed part of a curve is rejected by the server, because the prompt plus the answer would be longer than <code>--max-model-len 32768</code>.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>At the default, 32 frames of 640 × 360: 16 temporal patches of 299 tokens, 4,784 video tokens, 169 MiB of KV cache, and a TTFT of 1.29 s, of which 0.34 s is CPU work on 32 frames. Switch to 1280 × 720: the same 32 frames now cost 19,136 tokens and 5.78 s. Move the slider and watch the 720p curve turn grey after 54 frames: 56 frames would need 28 × 1,196 + 27 + 256 = 33,771 tokens. At 848 × 480 the limit is 126 frames, at 640 × 360 it is 216 (beyond the slider). Finally compare 8 frames of 720p with 32 frames of 360p: both are 4,784 tokens and cost about the same (1.31 s and 1.29 s). What counts is frames times pixels, not either one alone.</p></details></figure>
+<p>This is the “budget problem” that the video track starts with in <a href="../video/video-as-data.html">session 201</a>. A 3B model on an L4 needs more than a second of TTFT for 32 small frames, and its context fills up at about 50 frames of 720p. To cover a longer video you must choose: fewer frames (lower fps), smaller frames, or fewer tokens per frame (token merging or pruning, <a href="../vision/visual-token-efficiency.html">session 183</a>). Each choice trades detail in time against detail in space.</p>
+
+<h2>Part 3: prefix caching and the two multimodal caches</h2>
+<p>Real traffic repeats itself. A user asks three questions about the same photo; many users send the same product image; a client retries a request. A vLLM server has three caches that remove this repeated work, and each one removes a different part of TTFT:</p>
+<ul>
+<li><b>Processor cache</b> (CPU, <code>--mm-processor-cache-gb</code>): keeps the processed pixels of recent images, keyed by a hash of the image. A hit skips the resize and normalize step; the server still decodes the upload to compute the hash. In our run, base64 decode, JPEG decode and a SHA-256 of the pixels took 12 ms of the 98 ms that the full processing of a 1080p image took [Certain, our run]. vLLM’s hash function may differ [Likely].</li>
+<li><b>Encoder cache</b> (GPU, always on in the V1 engine): keeps the vision encoder’s output embeddings. The source code says it is shared between requests by the image hash, and that old entries with no running request are evicted only when space is needed [Certain, vLLM source]. A hit skips the encoder. When both of the other caches are off, the engine may not compute content hashes at all, so we assume no sharing in that case [Likely].</li>
+<li><b>Prefix cache</b> (GPU, <code>--enable-prefix-caching</code>): keeps KV blocks of 16 tokens, keyed by a hash of all tokens up to that block <i>and</i> the hashes of the images inside it (<a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>). A hit skips the prefill of those tokens. If every image token is inside the cached prefix, the encoder is not needed either.</li></ul>
+<div class="eq">\[ h = B \left\lfloor \frac{\min(m,\ n - 1)}{B} \right\rfloor, \qquad n_{\text{new}} = n - h, \qquad \text{encoder needed} \iff h \lt e \tag{200.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(m\)</dt><dd>leading tokens of the new prompt that match a cached sequence (same token ids and same image hashes)</dd>
+<dt>\(B\)</dt><dd>block size, 16 tokens; only full blocks are cached, and the last prompt token is always computed (it produces the first logits)</dd>
+<dt>\(h, n_{\text{new}}\)</dt><dd>tokens served from the cache, and tokens that must still be prefilled</dd>
+<dt>\(e\)</dt><dd>position just after the last image token; if the cached prefix ends before \(e\), the image’s embeddings are needed again (from the encoder cache, or by running the encoder)</dd></dl>
+<div class="worked"><div class="wt">Worked example: a second question about the same 1080p image</div>
+<p>We tokenized both prompts with the model’s chat template [Certain, our run]. The image tokens sit at positions 15 to 2,705, the end-of-vision marker at 2,706, and the two prompts match for \(m = 2{,}707\) tokens (up to the question). Then \(h = 16 \lfloor 2{,}707 / 16 \rfloor = 2{,}704\): the last two image tokens fall into a block that is not full, so they are not cached. The server prefills \(2{,}720 - 2{,}704 = 16\) tokens, which takes 28 ms (it is now memory-bound: one read of the weights), and it needs the image embeddings for two tokens, which the encoder cache provides. Without that cache, the whole 336 ms encoder would run again for two tokens.</p>
+<p>If the question comes <i>before</i> the image, the prompts differ right after the user role marker (\(m = 14\)), so \(h = 0\): all 2,720 tokens are prefilled again. Only the processor cache and the encoder cache help.</p></div>
+<div class="algo"><div class="algo-h">Algorithm 2: the caching experiment</div><ol>
+<li>start the server with both caches off; send the six requests of Figure 3 in order, one at a time; record TTFT and <code>prompt_tokens</code></li>
+<li>restart with <code>--enable-prefix-caching</code> only; repeat; then with <code>--mm-processor-cache-gb 4</code> only; then with both</li>
+<li>the repeated image must be the <b>same bytes</b>: send the same base64 string, or give it the same <code>uuid</code> field [Certain: the docs describe an optional uuid per media item]</li>
+<li>after each run, read the hit counters from the server’s <code>/metrics</code> endpoint (prefix-cache queries and hits, multimodal-cache queries and hits) [Likely: metric names change between versions]</li>
+<li>compare each request with the prediction of (200.5); a request that should hit but does not is a bug worth finding: different bytes, a changed template, or an evicted entry</li></ol></div>
+<figure class="fig wide" id="sv-cache"><div class="fig-body">
+<div class="controls"><label class="sl"><input type="checkbox" id="sv-cache-apc" checked> Prefix caching</label><label class="sl"><input type="checkbox" id="sv-cache-pc" checked> Processor cache</label><span style="color:var(--muted);font-size:14px">Encoder cache: always on</span></div>
+<div class="scroll-x"><svg id="sv-cache-svg" viewBox="0 0 680 236" role="img" aria-label="Predicted TTFT of six requests that repeat one image, with and without prefix caching and the processor cache"></svg></div>
+<div class="sv-leg"><span style="--c:var(--muted)">fixed cost</span><span style="--c:var(--k)">CPU preprocessing</span><span style="--c:var(--v)">vision encoder</span><span style="--c:var(--q)">LLM prefill</span></div>
+<div class="readout" id="sv-cache-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Six requests in order, from the planning model (not measured): BF16, batch 1, 1920 × 1080 images, token positions from the real chat template. The dashed box behind each bar is the same request with every cache off. Click a row for its details.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>With both caches on, requests 2, 3 and 6 cost about 50 ms instead of 666 ms: 12 ms of CPU, 28 ms of prefill, 10 ms fixed. Request 4 brings a new image and pays the full 666 ms. Request 5 has the question before the image, so the prefix cache misses; the processor and encoder caches still save 419 ms, and it costs 247 ms. Turn off the processor cache: the hits cost 134 ms, because the CPU work (95 ms) is now the largest part. Turn off the prefix cache too: every request costs about 666 ms, and the six together take 4.00 s instead of 1.73 s. Click request 2 with prefix caching on and read the token counts: 2,704 cached and 16 prefilled, as in the worked example.</p></details></figure>
+<p>Two lessons for prompt design. Put the shared part first: system prompt, then the image, then the question. And keep the bytes identical: a client that re-encodes the JPEG on every turn, or resizes it slightly differently, produces a new hash and misses every cache.</p>
+
+<h2>Part 4: FP8 and INT4, speed and quality</h2>
+<p>Now change the weights. Each change is one experiment, with the same sweeps as Parts 1 and 2, plus a quality check.</p>
+<p><b>FP8.</b> vLLM can quantize a BF16 checkpoint to FP8 when it loads it, with no calibration data. The current docs spell the option <code>--quantization fp8_per_tensor</code>; older versions use <code>--quantization fp8</code> [Certain for the current docs; check <code>vllm serve --help</code>]. In this mode “all Linear modules (except for the final lm_head)” get FP8 weights, and the activations get a dynamic per-tensor scale; the docs warn that latency gains are limited in this mode [Certain]. On the L4 the matmuls run on FP8 tensor cores (W8A8). In the current vLLM code the Qwen2.5-VL vision tower receives the same quantization config as the language model, so its linear layers are probably FP8 too [Likely: check the log]. For the best FP8 speed, use a checkpoint that was quantized offline with static scales.</p>
+<p><b>INT4.</b> Serve the official AWQ checkpoint <code>Qwen/Qwen2.5-VL-3B-Instruct-AWQ</code>. Its config says 4 bits, group size 128, with zero points, and <code>"modules_to_not_convert": ["visual"]</code>: the whole vision tower stays in BF16 [Certain]. vLLM reads the method from the config. Expect decode to be fast (fewer bytes per step) and prefill to be no faster, because the 4-bit weights are unpacked and the math still runs in 16 bits (<a href="../vision/quantizing-vlms.html">session 197</a>).</p>
+<div class="eq">\[ \text{TPOT}(b) = \frac{W_{\text{read}} + b \cdot c \cdot \text{kv}_{\text{tok}}}{\eta_m\, \text{BW}} + t_{\text{oh}}, \qquad \text{throughput}(b) = \frac{b}{\text{TPOT}(b)} \tag{200.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W_{\text{read}}\)</dt><dd>weight bytes one decode step reads: the language-model matmuls in the chosen format, plus the tied 151,936 × 2,048 output layer in BF16 (0.62 GB). The vision tower is not read during decode.</dd>
+<dt>\(b, c\)</dt><dd>requests decoding together, and their average context length</dd>
+<dt>\(\text{TPOT}\)</dt><dd>time per output token for each request; this is a decode-only step, with no prefill mixed in</dd></dl>
+<p>Decode is memory-bound, so (200.6) uses only bytes. In BF16 a step reads 6.17 GB; in FP8 3.40 GB; in INT4 2.06 GB (4 bits plus a 16-bit scale and a 4-bit zero for every 128 weights: 0.52 bytes per weight). At batch 1 this predicts a TPOT of 28.2, 16.6 and 11.0 ms. Figure 4 adds the batch size.</p>
+<figure class="fig wide" id="sv-prec"><div class="fig-body">
+<div class="controls"><span>Workload</span><span class="seg" id="sv-prec-wk"><button type="button" data-v="img" aria-pressed="true">1080p image chat</button><button type="button" data-v="vid" aria-pressed="false">32-frame 360p video</button></span></div>
+<div class="sv-grid"><label for="sv-prec-b">Batch size</label><input type="range" id="sv-prec-b" min="0" max="7" step="1" value="4"><output id="sv-prec-bv"></output></div>
+<div class="scroll-x"><svg id="sv-prec-svg" viewBox="0 0 680 410" role="img" aria-label="Predicted weights, KV capacity, TTFT, TPOT and throughput for BF16, FP8 and INT4 AWQ weights"></svg></div>
+<div class="readout" id="sv-prec-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The three weight formats, from the planning model (not measured): memory with formula (200.1), TTFT at batch 1 with (200.3), and TPOT and throughput of a decode step with (200.6), for requests with 256 output tokens (average context: prompt + 128). When the KV cache cannot hold the chosen batch, the batch is capped at what fits.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At batch 16 with the image workload: TPOT is 34.7 ms in BF16, 23.2 in FP8 and 17.6 in INT4, so throughput is 461, 691 and 909 output tokens per second. INT4 wins decode, but its TTFT (741 ms) is the worst, and FP8 has the best TTFT (435 ms): the two formats help different metrics. Move to batch 128: BF16 is capped at 110 requests by its KV cache, and the three formats come closer (75.8, 72.1 and 66.6 ms), because the KV cache reads, which quantized weights do not shrink, now dominate each step. Switch to the video workload: each request is longer, so BF16 fits only 64 requests, FP8 83 and INT4 86. The memory gain of quantizing a 3B model is small (7.51 GB against 4.07 and 3.40 GB) next to the 24 GB of the L4.</p></details></figure>
+<h3>Quality: measure it on the same questions</h3>
+<p>A faster wrong answer is not a win. The Qwen team reports, for the 3B model, BF16 against AWQ, evaluated with VLMEvalKit [Certain, from the AWQ model card]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Qwen2.5-VL-3B-Instruct</th><th>MMMU val</th><th>DocVQA val</th><th>MMBench dev (en)</th><th>MathVista mini</th></tr></thead><tbody>
+<tr><td>BF16</td><td>51.7</td><td>93.0</td><td>79.8</td><td>61.4</td></tr>
+<tr><td>AWQ (INT4)</td><td>49.1</td><td>91.8</td><td>78.0</td><td>58.8</td></tr>
+<tr><td>Difference</td><td>−2.6</td><td>−1.2</td><td>−1.8</td><td>−2.6</td></tr></tbody></table></div>
+<p>The card gives no FP8 numbers, and these are their numbers, not yours. Run your own check on the task you care about. The script below sends the first 500 ChartQA test questions to each server at temperature 0 and scores them with relaxed accuracy (a number is right if it is within 5% of the answer) [Certain, ChartQA paper]. Because every server answers the <b>same</b> questions, compare them per question, not only by their totals:</p>
+<div class="eq">\[ \hat\Delta = \frac{n_{01} - n_{10}}{n}, \qquad \text{SE}(\hat\Delta) = \frac{1}{n}\sqrt{\,n_{01} + n_{10} - \frac{(n_{01} - n_{10})^2}{n}\,} \tag{200.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n\)</dt><dd>questions, the same for both servers</dd>
+<dt>\(n_{10}, n_{01}\)</dt><dd>questions that the baseline got right and the quantized model wrong, and the other way around (the “flips”)</dd>
+<dt>\(\hat\Delta\)</dt><dd>accuracy of the quantized model minus the baseline; \(\hat\Delta \pm 1.96\,\text{SE}\) is a 95% interval. The exact McNemar test asks whether the flips split 50/50.</dd></dl>
+<div class="worked"><div class="wt">Worked example: reading a small difference (made-up counts, to show the arithmetic)</div>
+<p>Suppose that on 500 questions the quantized model loses 14 that BF16 got right and wins 6 that BF16 got wrong. Then \(\hat\Delta = (6 - 14)/500 = -1.6\) points, \(\text{SE} = \sqrt{20 - 64/500}\,/\,500 = 0.89\) points, and the 95% interval is \([-3.3, +0.1]\). The exact McNemar p-value for 6 against 14 flips is 0.115. So this run cannot tell a 1.6-point loss from noise; it can only say that the loss is probably not larger than about 3 points. To detect a 1-point difference you need many more questions, or a task with more flips. Note that only the 20 flips carry information; the 480 questions that both got right or both got wrong do not.</p></div>
+
+<h2>The code</h2>
+<p>Three short programs. The first is the TTFT client. It uses the standard library and Pillow, speaks the OpenAI chat API that vLLM serves, makes new image bytes for every request, sends media before text, streams the answer, and reads <code>prompt_tokens</code> from the usage chunk at the end.</p>
+<pre class="code"><span class="cm"># bench_vlm.py: TTFT of a VLM server against image size and video frames (OpenAI chat API, streaming)</span>
+<span class="cm"># Needs only the standard library and Pillow. Usage:</span>
+<span class="cm">#   python3 bench_vlm.py URL MODEL image 1920x1080 [REPEATS]</span>
+<span class="cm">#   python3 bench_vlm.py URL MODEL video 640x360 32 [REPEATS]</span>
+import base64, io, json, math, random, statistics, sys, time, urllib.request
+from PIL import Image
+
+def test_image(w, h, seed):
+    """A synthetic photo-like JPEG. A new seed gives new bytes, so no cache can hit."""
+    rnd = random.Random(seed)
+    small = Image.new("RGB", (16, 9))
+    small.putdata([tuple(rnd.randrange(256) for _ in range(3)) for _ in range(16 * 9)])
+    img = small.resize((w, h), Image.BICUBIC)            <span class="cm"># smooth color fields, like a photo</span>
+    buf = io.BytesIO(); img.save(buf, "JPEG", quality=90)
+    return base64.b64encode(buf.getvalue()).decode()
+
+def one_request(url, model, content, max_tokens=32):
+    body = json.dumps({"model": model, "max_tokens": max_tokens, "temperature": 0, "stream": True,
+                       "stream_options": {"include_usage": True},
+                       "messages": [{"role": "user", "content": content}]}).encode()
+    req = urllib.request.Request(url + "/v1/chat/completions", body, {"Content-Type": "application/json"})
+    t0 = time.perf_counter(); t_first = None; times = []; usage = None
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        for line in resp:                                 <span class="cm"># server-sent events: b"data: {...}"</span>
+            line = line.strip()
+            if not line.startswith(b"data: ") or line == b"data: [DONE]":
+                continue
+            ev = json.loads(line[6:])
+            if ev.get("usage"):
+                usage = ev["usage"]
+            if ev.get("choices") and ev["choices"][0]["delta"].get("content"):
+                times.append(time.perf_counter())
+                t_first = t_first or times[-1]
+    tpot = (times[-1] - times[0]) / (len(times) - 1) if len(times) &gt; 1 else float("nan")
+    return t_first - t0, tpot, usage["prompt_tokens"]
+
+def run(url, model, kind, size, frames=0, repeats=5):
+    w, h = map(int, size.split("x")); rows = []
+    for k in range(repeats + 1):                          <span class="cm"># request 0 is a warm-up and is dropped</span>
+        if kind == "image":
+            media = {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + test_image(w, h, k)}}
+        else:                                             <span class="cm"># pre-extracted frames, comma-joined base64 JPEGs</span>
+            fr = ",".join(test_image(w, h, 1000 * k + j) for j in range(frames))
+            media = {"type": "video_url", "video_url": {"url": "data:video/jpeg;base64," + fr}}
+        content = [media, {"type": "text", "text": "Describe this in one sentence."}]
+        rows.append(one_request(url, model, content))
+    rows = rows[1:]
+    ttft = statistics.median(r[0] for r in rows); tpot = statistics.median(r[1] for r in rows)
+    print(json.dumps({"kind": kind, "size": size, "frames": frames, "prompt_tokens": rows[0][2],
+                      "ttft_p50_ms": round(1e3 * ttft, 1), "ttft_max_ms": round(1e3 * max(r[0] for r in rows), 1),
+                      "tpot_p50_ms": round(1e3 * tpot, 2)}))
+
+if __name__ == "__main__":
+    a = sys.argv[1:]
+    if a[2] == "image":
+        run(a[0], a[1], "image", a[3], 0, int(a[4]) if len(a) &gt; 4 else 5)
+    else:
+        run(a[0], a[1], "video", a[3], int(a[4]), int(a[5]) if len(a) &gt; 5 else 5)</pre>
+<p>A shell loop runs the sweeps: <code>for s in 640x360 960x540 1280x720 1600x900 1920x1080 2560x1440 3200x1800 3840x2160; do python3 bench_vlm.py http://localhost:8000 Qwen/Qwen2.5-VL-3B-Instruct image $s; done</code>, and the same with <code>video 640x360 $t</code> for each frame count. We dry-ran the client without a GPU, against a fake server that counts tokens with the Qwen resize rule and waits 20 ms plus 0.05 ms per token. It printed <code>prompt_tokens</code> of 327, 2,719 and 10,577 for 640 × 360, 1920 × 1080 and 3840 × 2160, and 4,811 for 32 frames of 640 × 360: the same counts as the real Hugging Face processor [Certain, our run]. Its TTFTs were about 10 ms above the fake server’s sleep, which is the time the fake server spent parsing the JSON and the JPEG; a real server pays that too, and it belongs in TTFT.</p>
+<p>For a load test with images, vLLM’s own client has a <code>random-mm</code> dataset: for example <code>vllm bench serve --backend openai-chat --endpoint /v1/chat/completions --dataset-name random-mm --random-mm-bucket-config '{(1080, 1920, 1): 1.0}' --random-mm-base-items-per-request 1 --request-rate 2</code>. The bucket keys are (height, width, frames); the docs note that only image sampling is supported for now [Certain].</p>
+<p>The second program is the quality check of Part 4. We tested its scoring and its paired comparison on made-up correctness lists (they print the numbers of the worked example above), but we did not run it against a server.</p>
+<pre class="code"><span class="cm"># quality_vlm.py: the same 500 ChartQA questions against two servers, then a paired comparison</span>
+<span class="cm"># Usage: python3 quality_vlm.py URL MODEL OUT.json      (once per server: BF16, FP8, AWQ)</span>
+<span class="cm">#        python3 quality_vlm.py compare A.json B.json</span>
+import base64, io, json, math, sys, urllib.request
+
+def relaxed_match(pred, gold):                     <span class="cm"># ChartQA: numbers within 5%, else exact (case-insensitive)</span>
+    p, g = pred.strip().rstrip(".%").replace(",", ""), gold.strip().rstrip("%").replace(",", "")
+    try:
+        return abs(float(p) - float(g)) &lt;= 0.05 * abs(float(g))
+    except ValueError:
+        return p.lower() == g.lower()
+
+def ask(url, model, png, question):
+    msg = [{"type": "image_url", "image_url": {"url": "data:image/png;base64," + base64.b64encode(png).decode()}},
+           {"type": "text", "text": question + "\nAnswer with a single word or number."}]
+    body = json.dumps({"model": model, "messages": [{"role": "user", "content": msg}],
+                       "max_tokens": 16, "temperature": 0}).encode()
+    req = urllib.request.Request(url + "/v1/chat/completions", body, {"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=300) as r:
+        return json.loads(r.read())["choices"][0]["message"]["content"]
+
+def evaluate(url, model, out, n=500):
+    from datasets import load_dataset                <span class="cm"># pip install datasets</span>
+    ds = load_dataset("HuggingFaceM4/ChartQA", split="test").select(range(n))
+    rows = []
+    for ex in ds:
+        buf = io.BytesIO(); ex["image"].save(buf, "PNG")
+        pred = ask(url, model, buf.getvalue(), ex["query"])
+        rows.append({"q": ex["query"], "gold": ex["label"][0], "pred": pred, "ok": relaxed_match(pred, ex["label"][0])})
+    json.dump(rows, open(out, "w"), indent=0)
+    print(f"{out}: relaxed accuracy {100 * sum(r['ok'] for r in rows) / n:.1f}% on {n} questions")
+
+def compare(a_file, b_file):                         <span class="cm"># paired: the same questions in the same order</span>
+    a, b = json.load(open(a_file)), json.load(open(b_file)); n = len(a)
+    lost = sum(x["ok"] and not y["ok"] for x, y in zip(a, b))    <span class="cm"># right in A, wrong in B</span>
+    won = sum(y["ok"] and not x["ok"] for x, y in zip(a, b))     <span class="cm"># wrong in A, right in B</span>
+    d = (won - lost) / n; se = math.sqrt(lost + won - (lost - won) ** 2 / n) / n
+    k = min(lost, won); p = min(1.0, 2 * sum(math.comb(lost + won, i) for i in range(k + 1)) / 2 ** (lost + won))
+    print(f"B - A = {100 * d:+.1f} points, 95% CI [{100 * (d - 1.96 * se):+.1f}, {100 * (d + 1.96 * se):+.1f}], "
+          f"flips {lost} lost / {won} won, exact McNemar p = {p:.3f}")
+
+if __name__ == "__main__":
+    compare(*sys.argv[2:4]) if sys.argv[1] == "compare" else evaluate(*sys.argv[1:4])</pre>
+<p>The third program is the planning model behind Figures 1 to 4. It is deterministic and has no dependencies. When you have measurements, fit it: change \(\eta_m\) until TPOT at batch 1 matches, \(\eta_c\) until the TTFT of a tiny image matches (it is mostly prefill), and \(\eta_{\text{enc}}\) until the large images match. If the fitted model then predicts the video sweep too, you understand your server.</p>
+<pre class="code"><span class="cm"># vlm_sim.py: the planning model behind Figures 1 to 4 (Qwen2.5-VL-3B-Instruct on one NVIDIA L4)</span>
+import math
+DV, IV, DEPTH, L_FULL, L_WIN, WIN = 1280, 3420, 32, 4, 28, 64           <span class="cm"># vision_config</span>
+P_BLK = (DV * 3 * DV + DV * DV + 3 * DV * IV) * DEPTH                    <span class="cm"># 0.630 B: qkv, proj, gated MLP</span>
+P_PATCH, P_MERGE = 3 * 2 * 14 * 14 * DV, 5120 * 5120 + 5120 * 2048       <span class="cm"># patch embedding, 2x2 merger</span>
+D, L, H, KVH, DH, V, FF = 2048, 36, 16, 2, 128, 151936, 11008            <span class="cm"># text config</span>
+P_LIN = L * (2 * D * D + 2 * D * KVH * DH + 3 * D * FF)                  <span class="cm"># 2.775 B LLM matmul weights</span>
+P_EMB, P_ALL, P_VIS = V * D, 3_754_622_976, 668_684_288                  <span class="cm"># tied embedding; totals from HF</span>
+KV_TOK = 2 * L * KVH * DH * 2                                            <span class="cm"># 36,864 bytes per token (BF16)</span>
+BW, F16, F8, MEM = 300e9, 121e12, 242e12, 24e9                           <span class="cm"># L4 spec sheet (dense)</span>
+ETA_M, ETA_ENC, T_OH, T_FIX, BUDGET = 0.8, 0.4, 0.002, 0.010, 8192       <span class="cm"># assumptions</span>
+UTIL, RESERVE, PREP_S_PER_MP = 0.9, 2.0e9, 0.046                         <span class="cm"># assumptions; CPU rate from our run</span>
+FMT = {"bf16": (2.0, F16, 0.6, False), "fp8": (1.0, F8, 0.5, True),      <span class="cm"># (bytes/weight, peak, eta, vision in FP8)</span>
+       "int4": (0.5 + 2.5 / 128, F16, 0.45, False)}                      <span class="cm"># AWQ: 4 bits + group-128 scale and zero</span>
+
+def smart_resize(h, w, f=28, mn=3136, mx=12845056):                     <span class="cm"># Qwen2-VL image processor rule</span>
+    hb, wb = round(h / f) * f, round(w / f) * f
+    if hb * wb &gt; mx:
+        b = math.sqrt(h * w / mx); hb, wb = max(f, math.floor(h / b / f) * f), max(f, math.floor(w / b / f) * f)
+    elif hb * wb &lt; mn:
+        b = math.sqrt(mn / (h * w)); hb, wb = math.ceil(h * b / f) * f, math.ceil(w * b / f) * f
+    return hb, wb
+
+def encoder_time(h, w, slices, fmt):                                     <span class="cm"># slices = 1 (image) or ceil(T/2) (video)</span>
+    hb, wb = smart_resize(h, w); per = (hb // 14) * (wb // 14)           <span class="cm"># patches per temporal slice</span>
+    lin = 2 * (P_BLK + P_PATCH) * per * slices + 2 * P_MERGE * per * slices // 4
+    att = slices * 4 * DV * per * (L_FULL * per + L_WIN * WIN)           <span class="cm"># full attention inside each slice</span>
+    return lin / (ETA_ENC * (F8 if FMT[fmt][3] else F16)) + att / (ETA_ENC * F16), slices * per // 4
+
+def w_read(fmt): return P_LIN * FMT[fmt][0] + 2 * P_EMB                  <span class="cm"># bytes per decode step (tied head in BF16)</span>
+
+def prefill_time(n, fmt, past=0):                                        <span class="cm"># chunks of BUDGET tokens</span>
+    s, peak, eta, _ = FMT[fmt]; t = done = 0
+    while done &lt; n:
+        c = min(BUDGET, n - done); p = past + done
+        flops = 2 * P_LIN * c + 4 * L * H * DH * (c * p + c * (c + 1) / 2) + 2 * P_EMB
+        t += max(flops / (eta * peak), (w_read(fmt) + (p + c) * KV_TOK) / (ETA_M * BW)) + T_OH; done += c
+    return t
+
+def ttft(w, h, frames=0, fmt="bf16"):                                    <span class="cm"># frames = 0 means one image</span>
+    slices = math.ceil(frames / 2) if frames else 1
+    t_enc, n_vis = encoder_time(h, w, slices, fmt)
+    n = n_vis + (27 if frames else 28)                                   <span class="cm"># text tokens of the chat template</span>
+    t_prep = PREP_S_PER_MP * w * h * max(frames, 1) / 1e6
+    return n, T_FIX + t_prep + t_enc + prefill_time(n, fmt)
+
+def w_stored(fmt):
+    vis_lin = P_BLK + P_PATCH + P_MERGE; vis_b = 1 if FMT[fmt][3] else 2
+    return P_LIN * FMT[fmt][0] + vis_lin * vis_b + (P_ALL - P_LIN - vis_lin) * 2
+
+def kv_capacity(fmt): return int((UTIL * MEM - w_stored(fmt) - RESERVE) // KV_TOK)
+def tpot(batch, ctx, fmt): return (w_read(fmt) + batch * ctx * KV_TOK) / (ETA_M * BW) + T_OH
+
+if __name__ == "__main__":
+    for w, h in [(640, 360), (1280, 720), (1920, 1080), (3840, 2160)]:
+        print(f"image {w}x{h}: " + ", ".join(f"{f} {1e3 * ttft(w, h, 0, f)[1]:.0f} ms" for f in FMT),
+              f"({ttft(w, h)[0]} prompt tokens)")
+    for T in [8, 32, 64]:
+        n, t = ttft(640, 360, T); print(f"video 640x360, {T} frames: {n} prompt tokens, TTFT {1e3 * t:.0f} ms")
+    for f in FMT:
+        print(f"{f}: weights {w_stored(f) / 1e9:.2f} GB, KV capacity {kv_capacity(f):,} tokens, "
+              f"TPOT batch 1 {1e3 * tpot(1, 2847, f):.1f} ms, batch 16 {1e3 * tpot(16, 2847, f):.1f} ms")</pre>
+<p>Its output:</p>
+<pre class="code">image 640x360: bf16 81 ms, fp8 54 ms, int4 89 ms (327 prompt tokens)
+image 1280x720: bf16 288 ms, fp8 186 ms, int4 320 ms (1224 prompt tokens)
+image 1920x1080: bf16 666 ms, fp8 435 ms, int4 741 ms (2719 prompt tokens)
+image 3840x2160: bf16 3310 ms, fp8 2337 ms, int4 3655 ms (10577 prompt tokens)
+video 640x360, 8 frames: 1223 prompt tokens, TTFT 323 ms
+video 640x360, 32 frames: 4811 prompt tokens, TTFT 1286 ms
+video 640x360, 64 frames: 9595 prompt tokens, TTFT 2652 ms
+bf16: weights 7.51 GB, KV capacity 327,982 tokens, TPOT batch 1 28.2 ms, batch 16 34.7 ms
+fp8: weights 4.07 GB, KV capacity 421,371 tokens, TPOT batch 1 16.6 ms, batch 16 23.2 ms
+int4: weights 3.40 GB, KV capacity 439,408 tokens, TPOT batch 1 11.0 ms, batch 16 17.6 ms</pre>
+<p>Last, the PyTorch check of the encoder formula (200.4). It builds one Qwen2.5-VL vision block with random weights and counts its FLOPs with <code>torch.utils.flop_counter</code>, once with 64-patch windows and once with full attention. It runs on a CPU in a few seconds.</p>
+<pre class="code">import torch, torch.nn as nn, torch.nn.functional as F
+from torch.utils.flop_counter import FlopCounterMode
+torch.manual_seed(0)
+DV, IV, HEADS = 1280, 3420, 16                       <span class="cm"># Qwen2.5-VL vision_config</span>
+class Block(nn.Module):                              <span class="cm"># one vision block: attention + gated SiLU MLP</span>
+    def __init__(s):
+        super().__init__()
+        s.n1, s.n2 = nn.RMSNorm(DV), nn.RMSNorm(DV)
+        s.qkv, s.proj = nn.Linear(DV, 3 * DV), nn.Linear(DV, DV)
+        s.gate, s.up, s.down = nn.Linear(DV, IV), nn.Linear(DV, IV), nn.Linear(IV, DV)
+    def forward(s, x, win):                          <span class="cm"># x: (N, DV); win: patches per attention segment</span>
+        N = x.shape[0]
+        q, k, v = s.qkv(s.n1(x)).view(N // win, win, 3, HEADS, DV // HEADS).permute(2, 0, 3, 1, 4)
+        a = F.scaled_dot_product_attention(q, k, v)  <span class="cm"># attention inside each segment only</span>
+        x = x + s.proj(a.permute(0, 2, 1, 3).reshape(N, DV))
+        h = s.n2(x)
+        return x + s.down(F.silu(s.gate(h)) * s.up(h))
+blk = Block().eval()
+P_LIN = sum(m.weight.numel() for m in blk.modules() if isinstance(m, nn.Linear))
+for N, win, name in [(10752, 64, "window layer"), (10752, 10752, "full-attention layer")]:
+    x = torch.randn(N, DV)
+    with torch.no_grad(), FlopCounterMode(display=False) as fc:
+        blk(x, win)
+    model = 2 * P_LIN * N + 4 * DV * N * win          <span class="cm"># our formula: matmuls + attention</span>
+    print(f"{name:21s} N={N} measured {fc.get_total_flops()/1e12:.3f} TFLOP, formula {model/1e12:.3f} TFLOP")</pre>
+<p>Our output (PyTorch 2.15): <code>window layer N=10752 measured 0.427 TFLOP, formula 0.427 TFLOP</code> and <code>full-attention layer N=10752 measured 1.015 TFLOP, formula 1.015 TFLOP</code> [Certain, our run]. We used 10,752 patches (168 windows of 64) instead of the 10,764 of a 1080p image so that the windows divide evenly.</p>
+
+<h2>The results sheet</h2>
+<p>Fill one row per configuration. The “model” columns are the predictions of this page; the empty columns are yours. A row without the vLLM version and the full command line is not a result.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Configuration</th><th>TTFT 1080p, model</th><th>TTFT 32 × 360p, model</th><th>TPOT batch 1, model</th><th>TTFT 1080p, yours</th><th>TTFT 32 × 360p, yours</th><th>TPOT batch 1, yours</th><th>ChartQA-500, yours</th></tr></thead><tbody>
+<tr><td>BF16, no caches</td><td>666 ms</td><td>1.29 s</td><td>28.2 ms</td><td></td><td></td><td></td><td></td></tr>
+<tr><td>BF16, repeated image, all caches</td><td>50 ms</td><td>n/a</td><td>28.2 ms</td><td></td><td></td><td></td><td>same as BF16</td></tr>
+<tr><td>BF16, <code>max_pixels</code> 1,003,520</td><td>347 ms</td><td>1.29 s</td><td>28.2 ms</td><td></td><td></td><td></td><td></td></tr>
+<tr><td>FP8 (online, per tensor)</td><td>435 ms</td><td>0.87 s</td><td>16.6 ms</td><td></td><td></td><td></td><td></td></tr>
+<tr><td>INT4 AWQ</td><td>741 ms</td><td>1.42 s</td><td>11.0 ms</td><td></td><td></td><td></td><td></td></tr></tbody></table></div>
+<p>The planning model is a sketch with the right shape, good to maybe 30 to 50% before you fit it [Speculation]. The interesting part of the lab is the gap: if FP8 does not lower TTFT on your server, check whether the vision tower was quantized; if INT4 prefill is faster than predicted, your engine uses better 4-bit kernels than we assumed; if a cached request is not fast, the cache did not hit.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Where</th><th>What you measure</th><th>What it decides</th></tr></thead><tbody>
+<tr><td>Chat with photos (assistants, support apps)</td><td>TTFT against resolution; prefix-cache hits on follow-up turns</td><td>The <code>max_pixels</code> cap, client-side resizing, keeping the image before the question</td></tr>
+<tr><td>Document and chart understanding</td><td>Quality against <code>max_pixels</code> on your documents</td><td>How many pixels fine text needs; whether FP8 or INT4 hurts reading accuracy</td></tr>
+<tr><td>Video question answering and Video-RAG</td><td>TTFT and tokens against frames and frame size</td><td>Frames per clip, fps, frame resolution, max-model-len</td></tr>
+<tr><td>Video retrieval and key-moment detection with VLM captions</td><td>Throughput at large batch on short clips</td><td>Cost to caption an archive; INT4 for decode-heavy captioning</td></tr>
+<tr><td>Action recognition and video classification with a VLM</td><td>Accuracy against frames (8, 16, 32)</td><td>The smallest frame budget that keeps accuracy</td></tr>
+<tr><td>E-commerce and catalog tagging (same image, many questions)</td><td>Processor-, encoder- and prefix-cache hit rates</td><td>Prompt layout, stable image bytes or uuids, cache sizes</td></tr>
+<tr><td>Edge and small-GPU deployment</td><td>Memory and TTFT of FP8 and INT4</td><td>Which format fits the device and the latency target</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Measuring the same image again and again with caches on.</b> The second request hits the processor, encoder or prefix cache and looks five to ten times faster. Use new bytes for every timing request, or turn the caches off for the sweeps.</li>
+<li><b>Not checking the token count.</b> A client library, a proxy or a processor version may resize the image. Compare <code>usage.prompt_tokens</code> with formula (200.2) before you trust any time.</li>
+<li><b>Plotting TTFT against pixels or file size.</b> The GPU works on tokens. Two images with the same pixel count but different aspect ratios can round to different token counts; a JPEG’s file size says nothing about its tokens.</li>
+<li><b>Sending frames as separate images.</b> Each image is its own temporal patch, so a frame costs twice as many tokens as inside a video. Send a video when the model supports it.</li>
+<li><b>Forgetting the CPU.</b> Preprocessing a 4K image took 386 ms on one core in our run. Measure the API server’s CPU time, and give it enough cores or workers before blaming the GPU.</li>
+<li><b>Expecting INT4 to fix TTFT.</b> AWQ keeps the vision tower in BF16 and does not speed up compute-bound prefill. It helps decode. Choose the format for the metric you need.</li>
+<li><b>Judging quality from one total.</b> A 1-point change on 500 questions is usually noise. Compare per question (paired), count the flips, and report an interval.</li>
+<li><b>Putting the question before the image.</b> Every follow-up question then misses the prefix cache for all image tokens.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why does TTFT of a VLM grow with the image resolution, and roughly how fast?<span class="lvl">basic</span></summary><div class="ans">Models with native resolution, such as Qwen2.5-VL, turn every 28 × 28 pixels into one language-model token (14-pixel patches, merged 2 × 2). So the token count, the encoder work and the prefill work all grow about linearly with the pixel count, and the attention terms grow with its square. In our planning model for Qwen2.5-VL-3B on an L4, TTFT goes from 81 ms at 640 × 360 (299 tokens) to 666 ms at 1920 × 1080 (2,691 tokens) and 3.31 s at 4K (10,549 tokens): tokens grow 35 times, TTFT 41 times. Models that resize every image to a fixed size (LLaVA-1.5 at 336 × 336) have a flat GPU cost and only the CPU cost grows.</div></details>
+<details class="qa"><summary>In a 3B VLM, why can the vision encoder cost as much as the language-model prefill?<span class="lvl">core</span></summary><div class="ans">Matmul FLOPs are about 2 × parameters × tokens for each part. The encoder processes 4 patches for every language-model token (the 2 × 2 merger), and Qwen2.5-VL’s encoder has 0.63 B matmul weights against 2.78 B in the 3B language model. So encoder over prefill ≈ 4 × 0.63 / 2.78 ≈ 0.9; with its attention terms, the encoder is 16.26 TFLOP for a 1080p image against 16.18 TFLOP for the prefill. The encoder also tends to run at lower efficiency (narrow layers, windowed attention), so it can take more time. For a 72B language model with the same encoder the ratio would be a few percent; the share of the encoder is a property of small VLMs.</div></details>
+<details class="qa"><summary>How do you make sure a TTFT-versus-resolution measurement is correct?<span class="lvl">core</span></summary><div class="ans">Send one request at a time so there is no queueing; drop a warm-up request; use new image bytes for every request (or turn off the processor and prefix caches) so no cache hits; send the media before the text; stream and time the first text chunk; and read <code>usage.prompt_tokens</code> to confirm that the server saw the token count you predicted from the resize rule. Report the median and the spread of several requests per size, and plot against tokens. Record the vLLM version, the full command line and the processor settings (<code>max_pixels</code>), because they change the token count.</div></details>
+<details class="qa"><summary>A colleague says “just send 64 frames of 720p to the model”. What happens on Qwen2.5-VL-3B with max-model-len 32,768?<span class="lvl">core</span></summary><div class="ans">Two frames make one temporal patch, and a 1280 × 720 frame is 1,196 tokens per patch (if the processor does not shrink it), so 64 frames are 32 × 1,196 = 38,272 tokens. That is more than 32,768, so the server rejects the request. The most that fits with 256 output tokens is 54 frames. Even 32 frames would cost 19,136 tokens and about 5.8 s of TTFT on an L4 in our model. Options: fewer frames (lower fps), smaller frames (848 × 480 costs 510 tokens per patch, 640 × 360 costs 299), a per-frame pixel cap, token pruning, or a longer max-model-len if memory allows.</div></details>
+<details class="qa"><summary>What are the processor cache, the encoder cache and the prefix cache in vLLM, and what does each skip?<span class="lvl">core</span></summary><div class="ans">The processor cache is on the CPU: it keeps the processed pixels of recent images by hash and skips the resize and normalize step (decoding the upload and hashing still happen). The encoder cache is on the GPU: it keeps the vision encoder’s output embeddings, shared between requests by image hash, and skips the encoder. The prefix cache keeps KV blocks of 16 tokens keyed by the tokens and the image hashes in them, and skips the prefill of matching blocks; if all image tokens are in the cached prefix, the encoder is not needed at all. In our model for a repeated 1080p image they cut TTFT from 666 ms to about 50 ms together; the processor cache alone gives 247 ms, the prefix cache alone 134 ms.</div></details>
+<details class="qa"><summary>Why should the image come before the question in the prompt?<span class="lvl">basic</span></summary><div class="ans">The prefix cache matches tokens from the start of the prompt. If the layout is system prompt, image, question, then a second question about the same image matches everything up to the question, so only a few tokens are prefilled. If the layout is system prompt, question, image, the prompts differ right after the user marker, so all image tokens are prefilled again (only the encoder cache can still help). In our example the first layout costs 50 ms and the second 247 ms for the same follow-up.</div></details>
+<details class="qa"><summary>FP8 lowers TTFT but INT4 AWQ does not. Why, and which one would you pick?<span class="lvl">advanced</span></summary><div class="ans">TTFT is dominated by the encoder and the prefill, which are compute-bound. FP8 W8A8 runs the matmuls on FP8 tensor cores at twice the BF16 rate on Ada and Hopper GPUs, and vLLM’s online FP8 also quantizes the vision tower’s linear layers, so both parts get faster (666 to 435 ms at 1080p in our model). AWQ stores 4-bit weights but computes in 16 bits after unpacking, and the official checkpoint keeps the whole vision tower in BF16, so prefill does not get faster and can get slower. AWQ reads the fewest bytes per decode step, so it has the lowest TPOT (11.0 against 16.6 and 28.2 ms at batch 1). Pick FP8 for short answers and interactive TTFT, INT4 for long answers or a small memory budget, and decide only after a paired quality check.</div></details>
+<details class="qa"><summary>Quantizing the 3B VLM saves 3 to 4 GB. Why does that change the batch size so little on an L4?<span class="lvl">advanced</span></summary><div class="ans">The weights are only 7.51 GB of the 24 GB in BF16. The KV cache gets what is left after the weights and the reserve: 12.1 GB in BF16, 15.5 GB in FP8, 16.2 GB in INT4. With 36 KiB per token (grouped-query attention with 2 KV heads), that is 328 k, 421 k and 439 k tokens, or 110, 141 and 147 requests of one 1080p image and 256 output tokens. For a 7B or 13B model on the same GPU the weights are most of the memory, and quantization changes the batch much more. At large batch the KV reads, which weight quantization does not shrink, also come to dominate the decode step, so TPOT of the three formats converges.</div></details>
+<details class="qa"><summary>How would you check that INT4 did not hurt quality, and how many questions do you need?<span class="lvl">advanced</span></summary><div class="ans">Run the same questions through both servers at temperature 0, on a task like your product (charts, documents, photos), and compare per question. Count the flips: \(n_{10}\) right in BF16 and wrong in INT4, \(n_{01}\) the other way. The difference is \((n_{01} - n_{10})/n\), with standard error \(\sqrt{n_{01} + n_{10} - (n_{01}-n_{10})^2/n}/n\), and the exact McNemar test checks whether the flips split evenly. With 500 questions and 20 flips the interval is about ±1.7 points, so a 1-point loss is invisible; you need more questions, or a task with more disagreement. The Qwen card reports drops of 1.2 to 2.6 points for the 3B AWQ model on four benchmarks, which is the size of effect you are trying to see.</div></details>
+<details class="qa"><summary>Your measured TTFT for 1080p images is 1.5 s, but the model predicts 0.67 s. Where do you look?<span class="lvl">core</span></summary><div class="ans">First the token count in <code>usage.prompt_tokens</code>: if it is much larger than 2,719, the image was not resized the way you think. Then the CPU: time the API server process; a slow vCPU or a single-threaded processor can add hundreds of milliseconds, and a queue of preprocessing requests adds more. Then the GPU split: profile the encoder and the prefill separately (or compare a text-only prompt of the same length, which has no encoder); a slow encoder often means the wrong attention backend or no CUDA graphs for it. Then the server: is something else running, is the request waiting for a large batch, did the first requests pay for warm-up? Fit the planning model’s efficiencies to small and large images to see which part is off.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Use (200.2) to compute the image tokens and the encoder patches of a 1280 × 960 photo.</li>
+<li>A clip has 48 frames of 848 × 480. How many video tokens does Qwen2.5-VL produce, how much KV cache does the prompt take (27 text tokens), and does it fit in max-model-len 32,768 with 256 output tokens?</li>
+<li>Show that 54 is the largest even number of 1280 × 720 frames that fits in 32,768 tokens with 27 text tokens and 256 output tokens.</li>
+<li>Compute the lowest possible TPOT at batch 1 for the INT4 model (2.064 GB read per step), first at the spec bandwidth, then with \(\eta_m = 0.8\) and 2 ms of overhead.</li>
+<li>In the worked example of Part 3, what would be cached and what prefilled if the block size were 32 instead of 16? Is the encoder needed?</li>
+<li>On 500 questions, FP8 loses 9 questions that BF16 got right and wins 3. Compute the difference, its 95% interval with (200.7), and the exact McNemar p-value.</li>
+<li>Run the lab: the resolution sweep, the frame sweep, the six caching requests and at least one quantized model on a real GPU. Fit the planning model and report where it was wrong.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(960/28 = 34.29 \to 34\), \(H' = 952\); \(1280/28 = 45.71 \to 46\), \(W' = 1{,}288\). Tokens \(34 \times 46 = 1{,}564\); patches \(68 \times 92 = 6{,}256\). (The planning model gives a TTFT of 379 ms in BF16.) 2. Each 848 × 480 frame becomes 840 × 476, so \(17 \times 30 = 510\) tokens per temporal patch; 48 frames are 24 patches, so 12,240 video tokens and a prompt of 12,267 tokens. KV cache \(12{,}267 \times 36{,}864 = 452\) MB (431 MiB). It fits easily: \(12{,}267 + 256 \lt 32{,}768\). 3. Each pair of frames costs 1,196 tokens. \((32{,}768 - 256 - 27)/1{,}196 = 27.2\), so at most 27 pairs, 54 frames (32,292 + 27 + 256 = 32,575 tokens); 56 frames would need 33,771. 4. \(2.064 / 300 = 6.9\) ms at the spec bandwidth; \(2.064 / 240 + 2 = 10.6\) ms with the assumptions (11.0 ms with the KV cache of a 1080p conversation). 5. \(h = 32 \lfloor 2{,}707/32 \rfloor = 2{,}688\), so 32 tokens are prefilled and the last 18 image tokens (positions 2,688 to 2,705) are not cached; the image embeddings are needed again, from the encoder cache if the entry is still there, else the encoder runs (336 ms). Bigger blocks lose more of the prefix. 6. \(\hat\Delta = (3 - 9)/500 = -1.2\) points; \(\text{SE} = \sqrt{12 - 36/500}/500 = 0.69\) points; interval \([-2.6, +0.2]\); McNemar \(p = 2 \sum_{i=0}^{3} \binom{12}{i} / 2^{12} = 2 \cdot 299/4096 = 0.146\). Not significant. 7. Open: compare your numbers with the results sheet.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Write down every multimodal flag (<code>--limit-mm-per-prompt</code>, <code>--mm-processor-kwargs</code>, cache sizes, <code>--max-model-len</code>) and the vLLM version; check <code>usage.prompt_tokens</code> against the resize rule before trusting any time.</li>
+<li>Qwen2.5-VL spends one token per 28 × 28 pixels and one temporal patch per two frames; TTFT grows a bit faster than linearly with tokens. Plot against tokens.</li>
+<li>TTFT = CPU preprocessing + vision encoder + prefill. In a 3B VLM the encoder is about half of the GPU work, and the CPU can be hundreds of milliseconds for large images.</li>
+<li>Video hits hard limits: 32 frames of 720p are 19,136 tokens; the context fills at about 54 frames. Frames times pixels is the budget.</li>
+<li>The processor, encoder and prefix caches remove repeated work; with all three, a repeated 1080p image costs about 50 ms instead of 666 ms in our model. Keep the image before the question and its bytes identical.</li>
+<li>FP8 speeds up the compute-bound TTFT; INT4 AWQ speeds up the memory-bound decode and leaves the vision tower in BF16. Measure quality per question with a paired test.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ N_{\text{tok}} = \left\lceil \tfrac{T}{2} \right\rceil \frac{H'}{28} \frac{W'}{28}, \qquad C_{\text{KV}} = \frac{uM - W - R}{2 L n_{kv} d_h s}, \qquad h = B \left\lfloor \frac{\min(m, n-1)}{B} \right\rfloor \]</div>
+<div class="eq">\[ \text{TTFT} = t_{\text{fix}} + t_{\text{prep}} + \frac{F_{\text{enc}}}{\eta_{\text{enc}} F_{\text{peak}}} + \sum_{\text{chunks}} \max\!\left(\frac{F_c}{\eta_c F_{\text{peak}}}, \frac{Q_c}{\eta_m \text{BW}}\right) \]</div>
+<div class="eq">\[ \text{TPOT}(b) = \frac{W_{\text{read}} + b\,c\,\text{kv}_{\text{tok}}}{\eta_m\,\text{BW}} + t_{\text{oh}}, \qquad \text{SE}(\hat\Delta) = \frac{\sqrt{n_{01} + n_{10} - (n_{01} - n_{10})^2/n}}{n} \]</div>
+<h2 class="plain" id="lab-serve-a-vlm-and-measure-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>vLLM project (docs). <a href="https://docs.vllm.ai/" target="_blank" rel="noopener">vLLM documentation</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Bai et al. (2025). <a href="https://scholar.google.com/scholar?q=&amp;quot;Qwen2.5-VL Technical Report&amp;quot;" target="_blank" rel="noopener">Qwen2.5-VL Technical Report</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Micikevicius et al. (2022). <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">FP8 Formats for Deep Learning</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Qwen Team (2025). <a href="https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct" target="_blank" rel="noopener">Qwen2.5-VL-3B-Instruct model card, config.json and preprocessor_config.json (Hugging Face)</a></li><li>Qwen Team (2025). <a href="https://huggingface.co/Qwen/Qwen2.5-VL-3B-Instruct-AWQ" target="_blank" rel="noopener">Qwen2.5-VL-3B-Instruct-AWQ model card and config.json (Hugging Face)</a></li><li>vLLM project (2026). <a href="https://docs.vllm.ai/en/latest/features/multimodal_inputs.html" target="_blank" rel="noopener">vLLM documentation: Multimodal Inputs</a></li><li>vLLM project (2026). <a href="https://docs.vllm.ai/en/latest/configuration/engine_args.html" target="_blank" rel="noopener">vLLM documentation: Engine Arguments</a></li><li>vLLM project (2026). <a href="https://docs.vllm.ai/en/latest/cli/bench/serve.html" target="_blank" rel="noopener">vllm bench serve: command-line reference (random-mm dataset)</a></li><li>vLLM project (2026). <a href="https://docs.vllm.ai/en/latest/features/quantization/llm_compressor/fp8/" target="_blank" rel="noopener">vLLM documentation: FP8 W8A8 quantization</a></li><li>vLLM project (2026). <a href="https://github.com/vllm-project/vllm/blob/main/vllm/v1/core/encoder_cache_manager.py" target="_blank" rel="noopener">vllm/v1/core/encoder_cache_manager.py (source code)</a></li><li>Hugging Face (2026). <a href="https://github.com/huggingface/transformers/tree/main/src/transformers/models/qwen2_vl" target="_blank" rel="noopener">transformers: Qwen2-VL image and video processors (smart_resize, video_processing_qwen2_vl.py)</a></li><li>NVIDIA (2023). <a href="https://www.nvidia.com/en-us/data-center/l4/" target="_blank" rel="noopener">NVIDIA L4 Tensor Core GPU (product page and specifications)</a></li><li>Masry, Long, Tan, Joty &amp; Hoque (2022). <a href="https://arxiv.org/abs/2203.10244" target="_blank" rel="noopener">ChartQA: A Benchmark for Question Answering about Charts with Visual and Logical Reasoning</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/a-latency-budget-on-an-nvidia-l4.html"><small>Previous · session 199</small>A latency budget on an NVIDIA L4: worked example</a><a class="next" href="../video/video-as-data.html"><small>Next · session 201</small>Video as data</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="lab-serve-a-vlm-and-measure"]');if(!R)return;
+const $=s=>R.querySelector(s);
+/* ---------- the planning model (same code as vlm_sim.py on the page) ---------- */
+/* Qwen2.5-VL-3B-Instruct, from config.json */
+const DV=1280,IV=3420,DEPTH=32,LFULL=4,LWIN=28,WIN=64;
+const P_BLK=(DV*3*DV+DV*DV+3*DV*IV)*DEPTH,P_PATCH=3*2*14*14*DV,P_MERGE=5120*5120+5120*2048;
+const D=2048,L=36,H=16,KVH=2,DH=128,V=151936,FF=11008;
+const P_LIN=L*(D*D+2*D*KVH*DH+D*D+3*D*FF),P_EMB=V*D,P_ALL=3754622976,P_VIS=668684288,KV_TOK=2*L*KVH*DH*2;
+/* NVIDIA L4 spec sheet, and assumptions */
+const BW=300e9,F16=121e12,F8=242e12,MEM=24e9;
+const ETA_M=0.8,T_OH=0.002,T_FIX=0.010,UTIL=0.9,RES=2.0e9,BUDGET=8192,ETA_ENC=0.4,PREP_MS_PER_MP=46.0,REPREP=12/98;
+const FMT={bf16:{lin:2,peak:F16,eta:0.6,vis8:false,name:"BF16"},fp8:{lin:1,peak:F8,eta:0.5,vis8:true,name:"FP8"},int4:{lin:0.5+2.5/128,peak:F16,eta:0.45,vis8:false,name:"INT4 AWQ"}};
+const TEXT_IMG=28,TEXT_VID=27,MAXLEN=32768;
+function pyround(x){const f=Math.floor(x),r=x-f;if(Math.abs(r-0.5)<1e-12)return(f%2===0)?f:f+1;return Math.round(x);}
+function smart(h,w,mn,mx){mn=mn||3136;mx=mx||12845056;const f=28;let hb=pyround(h/f)*f,wb=pyround(w/f)*f;
+ if(hb*wb>mx){const b=Math.sqrt(h*w/mx);hb=Math.max(f,Math.floor(h/b/f)*f);wb=Math.max(f,Math.floor(w/b/f)*f);}
+ else if(hb*wb<mn){const b=Math.sqrt(mn/(h*w));hb=Math.ceil(h*b/f)*f;wb=Math.ceil(w*b/f)*f;}
+ return[hb,wb];}
+function visTok(h,w,t,mx){const s=smart(h,w,3136,mx);const per=(s[0]/14)*(s[1]/14);return{N:t*per/4,Np:t*per,per:per,hb:s[0],wb:s[1]};}
+function encFlops(h,w,t,mx){const v=visTok(h,w,t,mx);const lin=2*(P_BLK+P_PATCH)*v.Np+2*P_MERGE*v.N;const att=t*4*DV*v.per*(LFULL*v.per+LWIN*WIN);return{F:lin+att,lin:lin,att:att};}
+function tEnc(h,w,t,fmt,mx){const e=encFlops(h,w,t,mx),f=FMT[fmt];return f.vis8?e.lin/(ETA_ENC*F8)+e.att/(ETA_ENC*F16):e.F/(ETA_ENC*F16);}
+function wStored(fmt){const f=FMT[fmt],vl=P_BLK+P_PATCH+P_MERGE;const vis=vl*(f.vis8?1:2)+(P_VIS-vl)*2;return P_LIN*f.lin+vis+(P_ALL-P_VIS-P_LIN)*2;}
+function wRead(fmt){return P_LIN*FMT[fmt].lin+2*P_EMB;}
+function prefill(n,fmt,past){past=past||0;const f=FMT[fmt];let t=0,done=0;
+ while(done<n){const c=Math.min(BUDGET,n-done),p=past+done;const F=2*P_LIN*c+4*L*H*DH*(c*p+c*(c+1)/2)+2*P_EMB;const Q=wRead(fmt)+(p+c)*KV_TOK;
+  t+=Math.max(F/(f.eta*f.peak),Q/(ETA_M*BW))+T_OH;done+=c;}
+ return t;}
+function kvCap(fmt){return Math.floor((UTIL*MEM-wStored(fmt)-RES)/KV_TOK);}
+function tpot(b,ctx,fmt){return(wRead(fmt)+b*ctx*KV_TOK)/(ETA_M*BW)+T_OH;}
+function ttftImage(w,h,fmt,mx){const v=visTok(h,w,1,mx),n=v.N+TEXT_IMG;const prep=PREP_MS_PER_MP*w*h/1e6/1e3,enc=tEnc(h,w,1,fmt,mx),pre=prefill(n,fmt);
+ return{N:v.N,Np:v.Np,n:n,hb:v.hb,wb:v.wb,prep:prep,enc:enc,pre:pre,fix:T_FIX,ttft:T_FIX+prep+enc+pre};}
+const RESV={"360p":[640,360],"480p":[848,480],"720p":[1280,720]};
+function ttftVideo(T,res,fmt){fmt=fmt||"bf16";const wh=RESV[res],w=wh[0],h=wh[1],s=Math.ceil(T/2);const v=visTok(h,w,s),n=v.N+TEXT_VID;
+ const prep=PREP_MS_PER_MP*w*h*T/1e6/1e3,enc=tEnc(h,w,s,fmt),pre=prefill(n,fmt);
+ return{N:v.N,n:n,per:v.per/4,slices:s,prep:prep,enc:enc,pre:pre,fix:T_FIX,ttft:T_FIX+prep+enc+pre,kvMiB:n*KV_TOK/1048576,fits:n+256<=MAXLEN};}
+/* the request sequence of Figure 3: [label, image, prompt tokens, match with cached tokens, image start, image end (exclusive)] */
+const SEQ=[["R1  user 1: image A, question 1","A",2719,0,15,2706],["R2  user 2: image A, another question","A",2720,2707,15,2706],
+ ["R3  user 1: follow-up turn","A",2768,2752,15,2706],["R4  user 3: new image B","B",2719,15,15,2706],
+ ["R5  user 4: question before image A","A",2720,14,24,2715],["R6  user 1 retries request 1","A",2719,2719,15,2706]];
+function seq(apc,pc,fmt){fmt=fmt||"bf16";const w=1920,h=1080,seen=new Set(),out=[];const full=PREP_MS_PER_MP*w*h/1e6/1e3;
+ for(const r of SEQ){const n=r[2],m=r[3],e=r[5],img=r[1];const hc=apc?16*Math.floor(Math.min(m,n-1)/16):0;const nw=n-hc;
+  const hitP=pc&&seen.has(img);const prep=full*(hitP?REPREP:1);const needEnc=hc<e;const encHit=(apc||pc)&&seen.has(img);const enc=(needEnc&&!encHit)?tEnc(h,w,1,fmt):0;
+  const pre=prefill(nw,fmt,hc);seen.add(img);
+  out.push({lab:r[0],n:n,cached:hc,nw:nw,prep:prep,enc:enc,pre:pre,fix:T_FIX,ttft:T_FIX+prep+enc+pre,hitP:hitP,needEnc:needEnc,encHit:needEnc&&encHit});}
+ return out;}
+window.__svSim={smart,visTok,encFlops,tEnc,wStored,wRead,prefill,kvCap,tpot,ttftImage,ttftVideo,seq,P_LIN,P_BLK,KV_TOK};
+/* ---------- helpers ---------- */
+const ms=v=>v<1?Math.round(v*1e3)+" ms":v.toFixed(2)+" s";
+const fmtInt=v=>Math.round(v).toLocaleString("en-US");
+const COL={prep:"var(--k)",enc:"var(--v)",pre:"var(--q)",fix:"var(--muted)"};
+function seg(id,cb){const el=$(id);if(!el)return()=>null;const bs=[...el.querySelectorAll("button")];
+ bs.forEach(b=>b.addEventListener("click",()=>{bs.forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb();}));
+ return()=>{const b=bs.find(x=>x.getAttribute("aria-pressed")==="true");return b?b.dataset.v:null;};}
+function stack(x0,y,hgt,scale,r,showLab){let g="",x=x0;for(const k of ["fix","prep","enc","pre"]){const wv=r[k]*scale;if(wv<=0)continue;
+  g+=`<rect x="${x.toFixed(1)}" y="${y}" width="${Math.max(0.6,wv).toFixed(1)}" height="${hgt}" fill="${COL[k]}" opacity="${k==="fix"?0.5:0.85}"/>`;x+=wv;}
+ if(showLab)g+=`<text x="${(x+6).toFixed(1)}" y="${y+hgt/2+4.5}" font-size="12.5" font-weight="700" fill="var(--ink)">${ms(r.ttft)}</text>`;return{g:g,x:x};}
+/* ---------- Figure 1: TTFT against image resolution ---------- */
+(function(){
+ const svg=$("#sv-res-svg");if(!svg)return;const S=$("#sv-res-s"),cap=$("#sv-res-cap"),info=$("#sv-res-info");
+ const SIZES=[[640,360],[960,540],[1280,720],[1600,900],[1920,1080],[2560,1440],[3200,1800],[3840,2160]];
+ const getF=seg("#sv-res-fmt",draw);
+ function draw(){const i=+S.value,wh=SIZES[i],f=getF()||"bf16",mx=cap.checked?1280*28*28:12845056;$("#sv-res-sv").value=wh[0]+" × "+wh[1];
+  const rows=["bf16","fp8","int4"].map(k=>ttftImage(wh[0],wh[1],k,mx));const all={};["bf16","fp8","int4"].forEach(k=>{all[k]=SIZES.map(s=>ttftImage(s[0],s[1],k,mx));});
+  let g="";const X0=110,X1=600;const tmax=Math.max(...rows.map(r=>r.ttft));const sc=(X1-X0)/Math.max(0.1,tmax);
+  g+=`<text x="10" y="20" font-size="13" font-weight="700" fill="var(--ink)">Time to first token at ${wh[0]} × ${wh[1]}: ${fmtInt(rows[0].N)} image tokens (batch 1, no queue)</text>`;
+  ["bf16","fp8","int4"].forEach((k,j)=>{const y=36+j*30;g+=`<text x="${X0-8}" y="${y+15}" text-anchor="end" font-size="12.5" font-weight="${k===f?700:500}" fill="var(--ink)">${FMT[k].name}</text>`;
+   if(k===f)g+=`<rect x="${X0-104}" y="${y-3}" width="${X1-X0+178}" height="26" rx="5" fill="none" stroke="var(--ink)" stroke-width="1" opacity=".35"/>`;
+   g+=stack(X0,y,20,sc,rows[j],true).g;});
+  /* bottom: TTFT vs tokens */
+  const PX0=64,PX1=660,PY0=150,PY1=390,nmax=Math.max(...all.bf16.map(r=>r.N))*1.04,tm=Math.max(...all.int4.map(r=>r.ttft),...all.bf16.map(r=>r.ttft))*1.08;
+  const X=n=>PX0+n/nmax*(PX1-PX0),Y=t=>PY1-t/tm*(PY1-PY0);
+  g+=`<text x="${PX0}" y="${PY0-10}" font-size="12.5" font-weight="700" fill="var(--ink)">TTFT against image tokens, all eight sizes (chosen format solid)</text>`;
+  const st=tm>3?1:(tm>1.2?0.5:0.2);for(let t=0;t<=tm;t+=st){g+=`<line x1="${PX0}" x2="${PX1}" y1="${Y(t).toFixed(1)}" y2="${Y(t).toFixed(1)}" stroke="var(--rule)"/><text x="${PX0-6}" y="${(Y(t)+4).toFixed(1)}" text-anchor="end" font-size="11" fill="var(--muted)">${t===0?"0":(t<1?Math.round(t*1e3)+" ms":t+" s")}</text>`;}
+  const nst=nmax>6000?2000:500;for(let n=0;n<=nmax;n+=nst)g+=`<text x="${X(n).toFixed(1)}" y="${PY1+15}" text-anchor="middle" font-size="11" fill="var(--muted)">${fmtInt(n)}</text>`;
+  g+=`<path d="M${PX0} ${PY0} V${PY1} H${PX1}" fill="none" stroke="var(--muted)"/>`;
+  const LC={bf16:"var(--q)",fp8:"var(--ok)",int4:"var(--k)"};
+  ["bf16","fp8","int4"].forEach(k=>{const pts=all[k].map(r=>X(r.N).toFixed(1)+","+Y(r.ttft).toFixed(1)).join(" ");
+   g+=`<polyline points="${pts}" fill="none" stroke="${LC[k]}" stroke-width="${k===f?2.6:1.4}" ${k===f?"":'stroke-dasharray="5 4"'} />`;
+   if(k===f)all[k].forEach((r,j)=>{g+=`<circle cx="${X(r.N).toFixed(1)}" cy="${Y(r.ttft).toFixed(1)}" r="${j===i?6:3}" fill="${LC[k]}"/>`;});
+   const lr=all[k][all[k].length-1];g+=`<text x="${(X(lr.N)-4).toFixed(1)}" y="${(Y(lr.ttft)-8).toFixed(1)}" text-anchor="end" font-size="11.5" font-weight="700" fill="${LC[k]}">${FMT[k].name}</text>`;});
+  g+=`<text x="${(PX0+PX1)/2}" y="${PY1+34}" text-anchor="middle" font-size="12.5" fill="var(--ink2)">image tokens after the processor (Qwen2.5-VL: one token per 28 × 28 pixels)</text>`;
+  svg.innerHTML=g;
+  const r=rows[["bf16","fp8","int4"].indexOf(f)];
+  info.innerHTML=`<b>${wh[0]} × ${wh[1]}</b> is resized to ${r.wb} × ${r.hb}: <b>${fmtInt(r.Np)} patches</b> in the vision encoder, <b>${fmtInt(r.N)} image tokens</b> in the language model (prompt ${fmtInt(r.n)} tokens). `+
+   `<b>${FMT[f].name}</b>: CPU preprocessing ${ms(r.prep)}, vision encoder ${ms(r.enc)}, LLM prefill ${ms(r.pre)}, fixed ${ms(r.fix)}; <b>TTFT ${ms(r.ttft)}</b>. The encoder is ${Math.round(100*r.enc/(r.enc+r.pre))}% of the GPU time.`+
+   (cap.checked&&r.N<visTok(wh[1],wh[0],1).N?` The <code>max_pixels</code> cap cut the image from ${fmtInt(visTok(wh[1],wh[0],1).N)} to ${fmtInt(r.N)} tokens.`:"");
+  svg.dataset.n=r.N;svg.dataset.ttft=r.ttft.toFixed(4);}
+ S.addEventListener("input",draw);cap.addEventListener("change",draw);draw();})();
+/* ---------- Figure 2: TTFT against the number of video frames ---------- */
+(function(){
+ const svg=$("#sv-vid-svg");if(!svg)return;const S=$("#sv-vid-t"),info=$("#sv-vid-info");const getR=seg("#sv-vid-res",draw);
+ const TS=[];for(let t=2;t<=128;t+=2)TS.push(t);
+ function draw(){const T=+S.value,res=getR()||"360p";$("#sv-vid-tv").value=T+" frames";
+  const cur={};Object.keys(RESV).forEach(k=>{cur[k]=TS.map(t=>ttftVideo(t,k));});const r=ttftVideo(T,res);
+  let g="";const PX0=64,PX1=660,PY0=34,PY1=260,tm=12;const X=t=>PX0+(t-2)/126*(PX1-PX0),Y=v=>PY1-Math.min(v,tm)/tm*(PY1-PY0);
+  g+=`<text x="${PX0}" y="20" font-size="12.5" font-weight="700" fill="var(--ink)">TTFT against frames (BF16, batch 1); grey: prompt longer than --max-model-len 32768</text>`;
+  for(let t=0;t<=tm;t+=2)g+=`<line x1="${PX0}" x2="${PX1}" y1="${Y(t)}" y2="${Y(t)}" stroke="var(--rule)"/><text x="${PX0-6}" y="${Y(t)+4}" text-anchor="end" font-size="11" fill="var(--muted)">${t} s</text>`;
+  [2,16,32,48,64,80,96,112,128].forEach(t=>{g+=`<text x="${X(t).toFixed(1)}" y="${PY1+15}" text-anchor="middle" font-size="11" fill="var(--muted)">${t}</text>`;});
+  g+=`<path d="M${PX0} ${PY0} V${PY1} H${PX1}" fill="none" stroke="var(--muted)"/>`;
+  const LC={"360p":"var(--q)","480p":"var(--v)","720p":"var(--k)"};
+  Object.keys(RESV).forEach(k=>{let ok="",bad="";cur[k].forEach((q,j)=>{const p=X(TS[j]).toFixed(1)+","+Y(q.ttft).toFixed(1);if(q.fits)ok+=p+" ";else bad+=p+" ";});
+   const lastOk=cur[k].filter(q=>q.fits).length;if(bad&&lastOk>0){const q=cur[k][lastOk-1];bad=X(TS[lastOk-1]).toFixed(1)+","+Y(q.ttft).toFixed(1)+" "+bad;}
+   g+=`<polyline points="${ok}" fill="none" stroke="${LC[k]}" stroke-width="${k===res?2.8:1.5}"/>`;if(bad)g+=`<polyline points="${bad}" fill="none" stroke="var(--muted)" stroke-width="1.4" stroke-dasharray="4 4"/>`;
+   const li=Math.max(0,lastOk-1),lq=cur[k][li],nearR=X(TS[li])>PX1-50;g+=`<text x="${(X(TS[li])+(nearR?-4:6)).toFixed(1)}" y="${(Y(lq.ttft)+(nearR?-10:(k==="720p"?-6:12))).toFixed(1)}" text-anchor="${nearR?"end":"start"}" font-size="11.5" font-weight="700" fill="${LC[k]}">${k}</text>`;});
+  g+=`<circle cx="${X(T).toFixed(1)}" cy="${Y(r.ttft).toFixed(1)}" r="6" fill="${r.fits?LC[res]:"var(--bad)"}"/>`;
+  g+=`<text x="${(PX0+PX1)/2}" y="${PY1+33}" text-anchor="middle" font-size="12.5" fill="var(--ink2)">frames sent (two frames make one temporal patch)</text>`;
+  /* token bar */
+  const BY=318,BX0=64,BX1=660,bmax=40000,bx=v=>BX0+Math.min(v,bmax)/bmax*(BX1-BX0);
+  g+=`<text x="${BX0}" y="${BY-10}" font-size="12.5" font-weight="700" fill="var(--ink)">Prompt tokens at ${T} frames, ${res}: ${fmtInt(r.n)} (+256 output)</text>`;
+  g+=`<rect x="${BX0}" y="${BY}" width="${BX1-BX0}" height="18" rx="4" fill="var(--paper2)" stroke="var(--rule)"/>`;
+  g+=`<rect x="${BX0}" y="${BY}" width="${(bx(r.n+256)-BX0).toFixed(1)}" height="18" rx="4" fill="${r.fits?LC[res]:"var(--bad)"}" opacity=".8"/>`;
+  g+=`<line x1="${bx(MAXLEN).toFixed(1)}" x2="${bx(MAXLEN).toFixed(1)}" y1="${BY-4}" y2="${BY+24}" stroke="var(--bad)" stroke-width="2"/><text x="${bx(MAXLEN).toFixed(1)}" y="${BY+38}" text-anchor="middle" font-size="11" fill="var(--bad)">max-model-len 32,768</text>`;
+  [0,10000,20000].forEach(v=>{g+=`<text x="${bx(v).toFixed(1)}" y="${BY+38}" text-anchor="middle" font-size="11" fill="var(--muted)">${fmtInt(v)}</text>`;});
+  svg.innerHTML=g;
+  info.innerHTML=`<b>${T} frames at ${res}</b> → ${r.slices} temporal patches × ${fmtInt(r.per)} tokens = <b>${fmtInt(r.N)} video tokens</b>, prompt ${fmtInt(r.n)} tokens, KV cache ${Math.round(r.kvMiB)} MiB. `+
+   (r.fits?`CPU preprocessing ${ms(r.prep)}, encoder ${ms(r.enc)}, prefill ${ms(r.pre)}: <b>TTFT ${ms(r.ttft)}</b>.`:`<b>Rejected:</b> prompt plus 256 output tokens is longer than <code>--max-model-len 32768</code>; vLLM returns an error instead of an answer. Fewer frames, smaller frames, or a longer max-model-len.`);
+  svg.dataset.n=r.N;svg.dataset.ttft=r.ttft.toFixed(4);svg.dataset.fits=r.fits;}
+ S.addEventListener("input",draw);draw();})();
+/* ---------- Figure 3: prefix caching, processor cache, encoder cache ---------- */
+(function(){
+ const svg=$("#sv-cache-svg");if(!svg)return;const A=$("#sv-cache-apc"),P=$("#sv-cache-pc"),info=$("#sv-cache-info");let sel=1;
+ function draw(){const rs=seq(A.checked,P.checked),base=seq(false,false);let g="";const X0=262,X1=600,sc=(X1-X0)/0.7;
+  g+=`<text x="10" y="18" font-size="12.5" font-weight="700" fill="var(--ink)">TTFT of six requests with a 1920 × 1080 image (BF16, batch 1); click a row</text>`;
+  rs.forEach((r,j)=>{const y=32+j*34;
+   g+=`<g data-row="${j}" style="cursor:pointer"><rect x="4" y="${y-4}" width="672" height="30" rx="5" fill="${j===sel?"var(--paper2)":"transparent"}" stroke="${j===sel?"var(--rule)":"none"}"/>`;
+   g+=`<text x="10" y="${y+15}" font-size="12.5" fill="var(--ink)" font-weight="${j===sel?700:500}">${B.esc(r.lab)}</text>`;
+   g+=`<rect x="${X0}" y="${y+1}" width="${(base[j].ttft*sc).toFixed(1)}" height="20" fill="none" stroke="var(--muted)" stroke-dasharray="3 3"/>`;
+   g+=stack(X0,y+1,20,sc,r,true).g+`</g>`;});
+  svg.innerHTML=g;
+  svg.querySelectorAll("[data-row]").forEach(el=>el.addEventListener("click",()=>{sel=+el.dataset.row;draw();}));
+  const r=rs[sel],b=base[sel];
+  info.innerHTML=`<b>${B.esc(r.lab.replace(/\s+/," "))}</b>: prompt ${fmtInt(r.n)} tokens, <b>${fmtInt(r.cached)} from the prefix cache</b>, ${fmtInt(r.nw)} prefilled (${ms(r.pre)}). `+
+   `CPU: ${r.hitP?"processor-cache hit, only decode and hash ("+ms(r.prep)+")":"full preprocessing ("+ms(r.prep)+")"}. `+
+   `Encoder: ${!r.needEnc?"not needed, every image token is in the cached prefix":(r.encHit?"needed, but found in the encoder cache (same image hash)":"runs ("+ms(r.enc)+")")}. `+
+   `<b>TTFT ${ms(r.ttft)}</b> (dashed box: ${ms(b.ttft)} with no cache at all). Total over six requests: ${ms(rs.reduce((s,x)=>s+x.ttft,0))} against ${ms(base.reduce((s,x)=>s+x.ttft,0))}.`;
+  svg.dataset.ttft=r.ttft.toFixed(4);svg.dataset.cached=r.cached;}
+ A.addEventListener("change",draw);P.addEventListener("change",draw);draw();})();
+/* ---------- Figure 4: BF16, FP8 and INT4 against the batch size ---------- */
+(function(){
+ const svg=$("#sv-prec-svg");if(!svg)return;const S=$("#sv-prec-b"),info=$("#sv-prec-info");const BS=[1,2,4,8,16,32,64,128];
+ const WK={img:{n:2719,lab:"1080p image chat",w:1920,h:1080},vid:{n:4811,lab:"32-frame 360p video"}};const getW=seg("#sv-prec-wk",draw);
+ function draw(){const b=BS[+S.value],wk=WK[getW()||"img"];$("#sv-prec-bv").value=b;const ctx=wk.n+128,per=wk.n+256;
+  const KS=["bf16","fp8","int4"],LC={bf16:"var(--q)",fp8:"var(--ok)",int4:"var(--k)"};
+  const d=KS.map(k=>{const cap=kvCap(k),maxb=Math.floor(cap/per),be=Math.min(b,maxb);const tf=wk.w?ttftImage(wk.w,wk.h,k).ttft:ttftVideo(32,"360p",k).ttft;
+   return{k:k,W:wStored(k)/1e9,cap:cap,maxb:maxb,be:be,tp:tpot(be,ctx,k),thr:be/tpot(be,ctx,k),ttft:tf};});
+  const M=[["Weights in GPU memory","W",v=>v.toFixed(2)+" GB"],["Requests that fit in the KV cache","maxb",v=>fmtInt(v)],["TTFT, batch 1","ttft",v=>ms(v)],["TPOT at batch "+b,"tp",v=>(v*1e3).toFixed(1)+" ms"],["Output tokens per second at batch "+b,"thr",v=>fmtInt(v)]];
+  let g="";const X0=250,X1=560;
+  M.forEach((m,j)=>{const y0=14+j*80,mx=Math.max(...d.map(x=>x[m[1]]));g+=`<text x="10" y="${y0+12}" font-size="12.5" font-weight="700" fill="var(--ink)">${m[0]}</text>`;
+   d.forEach((x,i)=>{const y=y0+20+i*18,wv=(X1-X0)*x[m[1]]/mx;g+=`<text x="${X0-8}" y="${y+11}" text-anchor="end" font-size="12" fill="var(--ink2)">${FMT[x.k].name}</text>`;
+    g+=`<rect x="${X0}" y="${y}" width="${Math.max(1,wv).toFixed(1)}" height="14" rx="3" fill="${LC[x.k]}" opacity=".85"/><text x="${(X0+wv+6).toFixed(1)}" y="${y+11}" font-size="12" font-weight="600" fill="var(--ink)">${m[2](x[m[1]])}${(m[1]==="tp"||m[1]==="thr")&&x.be<b?" (batch "+x.be+")":""}</text>`;});});
+  svg.innerHTML=g;
+  const lim=d.filter(x=>x.be<b).map(x=>FMT[x.k].name);
+  info.innerHTML=`<b>${wk.lab}</b>, ${fmtInt(wk.n)} prompt tokens + 256 output; batch ${b}. TPOT: BF16 ${(d[0].tp*1e3).toFixed(1)} ms, FP8 ${(d[1].tp*1e3).toFixed(1)} ms, INT4 ${(d[2].tp*1e3).toFixed(1)} ms. `+
+   `Throughput: ${fmtInt(d[0].thr)}, ${fmtInt(d[1].thr)} and ${fmtInt(d[2].thr)} output tokens per second. TTFT at batch 1: ${ms(d[0].ttft)}, ${ms(d[1].ttft)}, ${ms(d[2].ttft)}.`+
+   (lim.length?` <b>KV cache full</b> for ${lim.join(", ")}: the batch is capped at the number of requests that fit.`:"");
+  svg.dataset.tp=d.map(x=>(x.tp*1e3).toFixed(2)).join(",");svg.dataset.thr=d.map(x=>Math.round(x.thr)).join(",");}
+ S.addEventListener("input",draw);draw();})();
+})();
+</script></body></html>

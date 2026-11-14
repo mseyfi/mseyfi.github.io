@@ -1,0 +1,598 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Attention operator 2: decode attention, FlashDecoding and FlashDecoding++ · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 125</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="attention-operator-2-decode-attention-flashdecoding-and">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="attention-operator-2-decode-attention-flashdecoding-and" data-session="attention-operator-2-decode-attention-flashdecoding-and" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">125</span><span>Track 5: LLM inference and serving · session 48 of 65</span></div><h1 class="chap-title">Attention operator 2: decode attention, FlashDecoding and FlashDecoding++</h1><p class="chap-sub">During decode each sequence brings only one new query row, so a FlashAttention kernel built for long prompts leaves most of the GPU idle. Flash-Decoding splits the KV cache into chunks, attends to each chunk on its own SM, and merges the parts exactly with log-sum-exp. FlashDecoding++ removes the rescaling between chunks with one fixed scale, and paged-KV kernels read the cache through a block table.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 2 hours, exercises 1 hour)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions 80 (the KV cache), 82 (roofline) and 124 (FlashAttention 1, 2 and 3)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why decode attention is a memory-bound matrix-vector product with about g FLOPs per byte, where g is the GQA group size</li><li>Why one query row gives too few thread blocks to fill 108 SMs, and how that wastes memory bandwidth</li><li>How Flash-Decoding splits the KV sequence, computes partial outputs with their log-sum-exp, and merges them exactly</li><li>How to pick the number of splits: waves, the FlashAttention-2 heuristic, and the cost of the reduce step</li><li>How FlashDecoding++ uses one unified max value to skip rescaling, when it must fall back, and what its flat-GEMM and dataflow ideas are</li><li>How paged-KV kernels find each token through a block table, and how vLLM and FlashAttention combine paging with split-KV</li></ul></div></header><style>
+.fd-lab{font:500 14px var(--sans);color:var(--muted)}
+.fd-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px;justify-content:center}
+.fd-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.fd-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.fd-grid input[type=range]{width:100%}
+[data-session="attention-operator-2-decode-attention-flashdecoding-and"] svg text:not([font-family]){font-family:var(--sans)}
+.fd-ctl{display:flex;flex-wrap:wrap;gap:8px 10px;align-items:center;margin:4px 0 10px}
+.fd-ctl .btn{padding:7px 12px}
+.fd-ctl label{font:500 14px var(--sans);color:var(--muted);display:inline-flex;gap:6px;align-items:center}
+.fd-ctl select{font:600 14px var(--sans);border:1px solid var(--rule);border-radius:8px;background:var(--card);color:var(--ink);padding:5px 6px}
+.fd-ctl input[type=range]{width:150px;max-width:40vw}
+.fd-ctl output{font:600 14px var(--mono);min-width:2.8em}
+.fd-two{display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);gap:12px;margin:10px 0 4px}
+@media(max-width:760px){.fd-two{grid-template-columns:minmax(0,1fr)}}
+.fd-code{font:500 13px/1.5 var(--mono);font-variant-ligatures:none;border:1px solid var(--rule);border-top:3px solid var(--tc);border-radius:4px 4px 10px 10px;background:var(--card);margin:0;padding:6px 0;list-style:none;counter-reset:fdl}
+.fd-code li{counter-increment:fdl;position:relative;padding:2px 10px 2px 34px;white-space:pre-wrap;overflow-wrap:anywhere;transition:background .3s,box-shadow .3s}
+.fd-code li::before{content:counter(fdl);position:absolute;left:8px;width:18px;text-align:right;color:var(--muted);font-size:11.5px;top:3px}
+.fd-code li.on{background:color-mix(in srgb,var(--tc) 18%,transparent);box-shadow:inset 3px 0 0 var(--tc)}
+.fd-code li.hd{font:700 13px var(--sans);color:var(--ink2);padding:4px 10px;counter-increment:none;border-bottom:1px solid var(--rule2)}
+.fd-code li.hd::before{content:none}
+.fd-code .c{color:var(--muted)}
+.fd-fx{font:500 13.5px/1.6 var(--mono);font-variant-ligatures:none;border:1px solid var(--rule);border-top:3px solid var(--q);border-radius:4px 4px 10px 10px;background:var(--card);padding:8px 12px;overflow-wrap:anywhere}
+.fd-fx .h{font:700 13px var(--sans);color:var(--ink2);margin-bottom:4px}
+.fd-fx b{color:var(--q)}
+.fd-fx .bad{color:var(--bad);font-weight:700}
+.fd-fx .ok{color:var(--v);font-weight:700}
+@keyframes fd-pulse{0%,100%{stroke-opacity:1}50%{stroke-opacity:.35}}
+.fd-pulse{animation:fd-pulse 1.1s ease-in-out infinite}
+@media (prefers-reduced-motion: reduce){.fd-pulse{animation:none}}
+[data-session="attention-operator-2-decode-attention-flashdecoding-and"] pre.code,[data-session="attention-operator-2-decode-attention-flashdecoding-and"] code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">When an LLM writes text, each step adds one token. For that step, attention has one new query row per sequence and per head, and it must read the whole KV cache. FlashAttention was built for the opposite case: thousands of query rows. Used as is for decode, it can leave most of the GPU idle while the user waits.</p>
+<p>Recall the two phases from <a href="../inference/the-generation-loop-prefill-and-decode.html">session 78</a>. <b>Prefill</b> processes the whole prompt at once: the query matrix has as many rows as the prompt has tokens. <b>Decode</b> produces one token at a time: the query has one row, and the keys and values of all earlier tokens come from the KV cache (<a href="../inference/the-kv-cache.html">session 80</a>). In <a href="../inference/attention-operator-1-flashattention-1-2-and.html">session 124</a> we saw how FlashAttention computes attention in tiles without writing the full score matrix to memory. It gives each <b>thread block</b> (a group of GPU threads that runs on one streaming multiprocessor, or SM) one tile of query rows. For decode there is only one tile per sequence and head. So the number of thread blocks is just batch size times number of heads.</p>
+<p>An A100 has 108 SMs. [Certain] With batch 1 and the 8 KV heads of Llama 3 8B, a kernel that gives one thread block to each (sequence, KV head) pair starts 8 blocks: 8 of 108 SMs work, 7.4%. The other 100 SMs wait. Long contexts make it worse, because they need so much KV memory that the batch must be small. The Flash-Decoding authors write that with batch size 1, FlashAttention “will use less than 1% of the GPU”. [Certain, Flash-Decoding blog]</p>
+<p>This session shows three fixes that are in every modern inference engine:</p>
+<ul>
+<li><b>Flash-Decoding</b> (Dao, Haziza, Massa, Sizov, 2023): split the KV sequence into chunks, let different SMs attend to different chunks, then merge the partial results exactly with a log-sum-exp.</li>
+<li><b>FlashDecoding++</b> (Hong et al., 2023): use one fixed “unified max value” so the chunks never need to rescale each other; plus faster matrix products for small batches.</li>
+<li><b>Paged-KV attention</b> (vLLM’s PagedAttention, Kwon et al., 2023): read the cache from fixed-size pages through a <b>block table</b>, so memory is not wasted, and combine this with split-KV.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “Why is decode attention memory-bound even with a big batch?”, “How do you merge two partial softmax results?”, “What does Flash-Decoding parallelize over that FlashAttention does not?”, “What does a paged attention kernel do differently?”. Each one is answered with a formula and a number below.</aside>
+
+<h2>Decode attention is a memory-bound matrix-vector product</h2>
+<p>Take one sequence, one KV head and one decode step. The cache holds \(L\) keys and \(L\) values, each a vector of size \(d\). With grouped-query attention (GQA, <a href="../inference/efficient-attention-1-mqa-gqa-and-mla.html">session 97</a>), \(g\) query heads share this KV head, so we have \(g\) query rows. The operation is</p>
+<div class="eq">\[ O = \softmax\!\left( \frac{Q K^\top}{\sqrt{d}} \right) V, \qquad Q \in \R^{g \times d}, \quad K, V \in \R^{L \times d}, \quad O \in \R^{g \times d} \tag{125.1} \]</div>
+<dl class="symbols"><dt>\(L\)</dt><dd>context length: number of tokens already in the cache</dd><dt>\(d\)</dt><dd>head dimension (128 in Llama 2 and Llama 3)</dd><dt>\(g\)</dt><dd>query heads per KV head (1 for normal multi-head attention, 4 for Llama 3 8B)</dd><dt>\(Q, K, V\)</dt><dd>queries of this step, cached keys and cached values</dd></dl>
+<p>With \(g = 1\), \(QK^\top\) is a vector times a matrix (a <b>GEMV</b>), not a matrix times a matrix (a GEMM). Let us count. Computing the scores costs \(2gLd\) FLOPs (one multiply and one add per pair). Applying them to \(V\) costs another \(2gLd\). The kernel must read \(K\) and \(V\): \(2Ld\) numbers of 2 bytes each in FP16 or BF16. Everything else (the query, the output) is tiny. So the <b>arithmetic intensity</b>, FLOPs per byte read from memory, is</p>
+<div class="eq">\[ I = \frac{4 g L d \ \text{FLOPs}}{2 L d \cdot 2 \ \text{bytes}} = g \ \ \frac{\text{FLOP}}{\text{byte}} \tag{125.2} \]</div>
+<p>An A100 80GB (SXM) does 312 TFLOP/s in dense BF16 and reads 2,039 GB/s from HBM. [Certain] Its <b>ridge point</b>, the intensity above which a kernel is limited by compute instead of memory (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>), is \(312 / 2.039 \approx 153\) FLOPs per byte. Decode attention has 1 (MHA) or 4 (Llama 3 8B). It sits far to the left of the ridge: its speed is set only by how fast we can stream the KV cache. A bigger batch does not help here, unlike for the linear layers, because every sequence has its own cache: twice the batch means twice the bytes.</p>
+<div class="worked"><div class="wt">How long does it take just to read the cache?</div>
+<p>Llama 3 8B has 32 layers, 8 KV heads and \(d = 128\). [Certain] One token in the cache costs \(2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes, that is 128 KiB (keys and values, all layers, BF16). A context of 32,768 tokens holds 4 GiB per sequence.</p>
+<p>Each decode step must read all of it once. At 2,039 GB/s this takes at least \(4 \times 2^{30} / 2.039 \times 10^{12} = 2.11\) ms per token, for attention alone, for one sequence. Per layer it is 134 MB and at least 65.8 µs. Llama 2 7B uses full multi-head attention (32 KV heads), so its cache is 4 times larger: 512 KiB per token, 16 GiB at 32k, at least 8.43 ms per token.</p>
+<p>This lower bound assumes the whole HBM bandwidth is used. It is reached only if enough SMs are reading at the same time. That is the real problem of decode attention.</p></div>
+
+<h2>Why one query row leaves the GPU idle</h2>
+<p>An SM can only keep a limited number of memory requests in flight. To use the full bandwidth of HBM, many SMs must issue loads at once. FlashAttention-2 launches a grid of thread blocks over (batch, heads, query tiles). In decode, the query tile count is 1, so the grid has \(B \times H\) blocks. Each block walks over the full context, tile by tile, keeping a running max and a running sum (the online softmax from <a href="../inference/attention-operator-1-flashattention-1-2-and.html">session 124</a>):</p>
+<div class="eq">\[ m_{\text{new}} = \max(m, \tilde m), \qquad \ell \leftarrow e^{m - m_{\text{new}}}\,\ell + e^{\tilde m - m_{\text{new}}}\,\tilde \ell, \qquad \mathbf{o} \leftarrow e^{m - m_{\text{new}}}\,\mathbf{o} + e^{\tilde m - m_{\text{new}}}\,\tilde{\mathbf{o}} \tag{125.3} \]</div>
+<dl class="symbols"><dt>\(m, \ell, \mathbf{o}\)</dt><dd>running max, running sum of exponentials and running (unnormalized) output, over the key tiles seen so far</dd><dt>\(\tilde m, \tilde \ell, \tilde{\mathbf{o}}\)</dt><dd>the same three quantities for the new key tile</dd></dl>
+<p>This loop is sequential: tile 2 needs the max of tile 1. If \(B \times H\) is much smaller than the number of SMs, the loop over a long context runs on a few SMs only, at a few SMs’ worth of bandwidth.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>You must read a 1,000-page book to answer one question. One reader takes all day. Instead, give 10 pages to each of 100 readers. Each writes a short note: “my best answer, and how sure I am”. A final person combines the notes. The combining is cheap; the reading is now 100 times faster. Flash-Decoding is this, with an exact rule for “how sure I am”.</aside>
+
+<h2>Flash-Decoding: split the KV sequence</h2>
+<p>Flash-Decoding adds a new axis of parallel work: the KV sequence itself. It works in three steps. [Certain, Flash-Decoding blog]</p>
+<ol>
+<li><b>Split</b> the keys and values into \(S\) chunks. This needs no GPU work: the chunks are views of the cache tensors.</li>
+<li><b>Attend</b> to each chunk in parallel with a FlashAttention-style kernel. Each chunk writes its partial output and one extra number per query row: the <b>log-sum-exp</b> of its scores.</li>
+<li><b>Reduce</b>: a second small kernel combines the \(S\) partial outputs, weighting each one with its log-sum-exp.</li></ol>
+<p>Now the grid has \(B \times H \times S\) blocks. With \(B = 1\), 8 KV heads and \(S = 24\), that is 192 blocks instead of 8.</p>
+<h3>The math of the merge</h3>
+<p>Write \(s_j = \mathbf{q}^\top \mathbf{k}_j / \sqrt{d}\) for the score of key \(j\), for one query row. Chunk \(p\) holds the key indices \(\mathcal{I}_p\). It computes four things on its own:</p>
+<div class="eq">\[ m_p = \max_{j \in \mathcal{I}_p} s_j, \qquad \ell_p = \sum_{j \in \mathcal{I}_p} e^{s_j - m_p}, \qquad \mathbf{o}_p = \frac{1}{\ell_p} \sum_{j \in \mathcal{I}_p} e^{s_j - m_p}\, \mathbf{v}_j, \qquad \lambda_p = m_p + \log \ell_p \tag{125.4} \]</div>
+<dl class="symbols"><dt>\(m_p\)</dt><dd>largest score in chunk \(p\), subtracted for numerical safety</dd><dt>\(\ell_p\)</dt><dd>sum of the shifted exponentials in chunk \(p\)</dd><dt>\(\mathbf{o}_p\)</dt><dd>the attention output if chunk \(p\) were the whole context (a normalized partial output)</dd><dt>\(\lambda_p\)</dt><dd>the log-sum-exp of chunk \(p\): \(\lambda_p = \log \sum_{j \in \mathcal{I}_p} e^{s_j}\)</dd></dl>
+<p>The reduce step then computes</p>
+<div class="eq">\[ \lambda = \log \sum_{p=1}^{S} e^{\lambda_p}, \qquad \mathbf{o} = \sum_{p=1}^{S} e^{\lambda_p - \lambda}\, \mathbf{o}_p \tag{125.5} \]</div>
+<p>Why is this exact? Because \(e^{\lambda_p} \mathbf{o}_p = \sum_{j \in \mathcal{I}_p} e^{s_j} \mathbf{v}_j\) (the \(m_p\) and \(\ell_p\) cancel). So</p>
+<div class="eq">\[ \mathbf{o} = \frac{\sum_p e^{\lambda_p} \mathbf{o}_p}{\sum_p e^{\lambda_p}} = \frac{\sum_{j=1}^{L} e^{s_j} \mathbf{v}_j}{\sum_{j=1}^{L} e^{s_j}} = \sum_{j=1}^{L} \softmax(\mathbf{s})_j\, \mathbf{v}_j \tag{125.6} \]</div>
+<p>which is plain softmax attention over all \(L\) keys. Nothing is approximated. The weights \(e^{\lambda_p - \lambda}\) are just a softmax over the \(S\) log-sum-exp values, and in code the reduce kernel subtracts \(\max_p \lambda_p\) first, so nothing overflows. FlashAttention-2 stores the partial outputs and log-sum-exps in FP32 buffers of shape (splits, batch, heads, query rows, head dim) and (splits, batch, heads, query rows). [Certain, flash_api.cpp]</p>
+<div class="worked"><div class="wt">A merge by hand (8 keys, 2 chunks)</div>
+<p>Scores \(\mathbf{s} = (1.2, -0.5, 2.0, 0.3 \,|\, 3.1, -1.0, 0.8, 2.4)\) and scalar values \(v = (1, 2, 3, 4 \,|\, 5, 6, 7, 8)\). The bar marks the split.</p>
+<p>Chunk 1: \(m_1 = 2.0\), \(\ell_1 = e^{-0.8} + e^{-2.5} + e^{0} + e^{-1.7} = 1.7141\), \(o_1 = 2.5344\), \(\lambda_1 = 2.0 + \log 1.7141 = 2.5389\).</p>
+<p>Chunk 2: \(m_2 = 3.1\), \(\ell_2 = 1.6134\), \(o_2 = 6.0579\), \(\lambda_2 = 3.5784\).</p>
+<p>Reduce: \(\lambda = \log(e^{2.5389} + e^{3.5784}) = 3.8812\). Weights \(e^{\lambda_1 - \lambda} = 0.2613\) and \(e^{\lambda_2 - \lambda} = 0.7387\) (they sum to 1). Output \(0.2613 \times 2.5344 + 0.7387 \times 6.0579 = 5.1374\).</p>
+<p>Full softmax over all 8 keys gives \(5.1374\) and log-sum-exp \(3.8812\): the same. Note that a plain average of the two partial outputs, \(4.296\), would be wrong; chunk 2 has the larger scores and must count more.</p></div>
+<figure class="fig wide" id="fd-sim"><div class="fig-body">
+<div class="fd-ctl"><button type="button" class="btn primary" id="fd-sim-play">Play</button><button type="button" class="btn" id="fd-sim-prev">Back</button><button type="button" class="btn" id="fd-sim-next">Step</button><button type="button" class="btn" id="fd-sim-reset">Reset</button>
+<label>Speed <select id="fd-sim-spd"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+<label>Splits \(S\) <select id="fd-sim-s"><option value="1">1 (FlashAttention)</option><option value="2" selected>2</option><option value="4">4</option><option value="8">8</option></select></label>
+<label>Tile \(T\) <select id="fd-sim-t"><option value="1">1 key</option><option value="2" selected>2 keys</option><option value="4">4 keys</option></select></label>
+<span class="fd-lab" id="fd-sim-lab"></span></div>
+<div class="scroll-x"><svg id="fd-sim-svg" viewBox="0 0 680 372" role="img" aria-label="Simulation of Flash-Decoding: eight cached keys split into chunks, one thread block per chunk running the online softmax tile by tile, then a reduce kernel that merges the partial results with log-sum-exp weights"></svg></div>
+<div class="fd-two"><ol class="fd-code" id="fd-sim-code">
+<li class="hd">Kernel 1, grid (B, H_kv, S): all blocks p run at the same time</li>
+<li>chunk p ← keys of split p   <span class="c">// a view of the cache, no copy</span></li>
+<li>m ← −∞;  ℓ ← 0;  acc ← 0</li>
+<li>for each tile of T keys in chunk p:</li>
+<li>  s ← q·K_tile / √d;  m̃ ← max(s)</li>
+<li>  m_new ← max(m, m̃);  c ← e^(m − m_new)</li>
+<li>  ℓ ← c·ℓ + Σ e^(s − m_new);  acc ← c·acc + Σ e^(s − m_new)·v;  m ← m_new</li>
+<li>o_p ← acc / ℓ;  λ_p ← m + log ℓ   <span class="c">// FP32 buffer (125.4)</span></li>
+<li class="hd">Kernel 2 (reduce), one block per query row</li>
+<li>λ_max ← max_p λ_p;  Z ← 0;  O ← 0</li>
+<li>for p = 1 … S:  w_p ← e^(λ_p − λ_max);  Z += w_p;  O += w_p·o_p</li>
+<li>o ← O / Z;  λ ← λ_max + log Z   <span class="c">// (125.5)</span></li></ol>
+<div class="fd-fx" id="fd-sim-fx" aria-live="polite"></div></div>
+<div class="fd-leg"><span style="--c:var(--k)">key scores s</span><span style="--c:var(--v)">values v</span><span style="--c:var(--t2)">one color per thread block (chunk)</span><span style="--c:var(--q)">reduce kernel</span></div>
+<div class="readout" id="fd-sim-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Flash-Decoding running on the 8 keys of the worked example (one query row, scalar values). Kernel 1: every thread block walks its own chunk tile by tile with the online softmax (125.3); all blocks move in the same clock step because they run on different SMs. Each block writes \((\mathbf{o}_p, \lambda_p)\) (125.4). Kernel 2 merges them with the log-sum-exp weights (125.5). The code line that runs is highlighted, and the box on the right shows that line with the live numbers. The merged output equals full softmax attention for every \(S\) and \(T\).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Press Play, or Step to go one line at a time (Back goes one line back). Click a thread block card to show its numbers in the formula box. With \(S = 1\) you have plain FlashAttention in decode: one block walks all 8 keys; with tile \(T = 1\) that takes 8 tile steps, and the readout counts them. With \(S = 2\), \(T = 2\) each block needs only 2 tile steps, and you get the numbers of the worked example: \(\lambda_1 = 2.5389\), \(o_1 = 2.5344\), \(\lambda_2 = 3.5784\), \(o_2 = 6.0579\), then \(w_1 = e^{2.5389 - 3.5784} = 0.3536\), \(Z = 1.3536\), and \(o = 5.1374\). Watch line 6: when a new tile has a larger max, the old \(\ell\) and acc are multiplied by \(c \lt 1\) (a <b>rescale</b>); the readout counts rescales. With \(S = 8\) each block holds one key, so \(\ell_p = 1\), \(\lambda_p = s_p\), and the reduce is a softmax over the 8 scores. Every setting ends with \(o = 5.1374\) and \(\lambda = 3.8812\).</p></details></figure>
+
+<h3>The two kernels as pseudo-code</h3>
+<div class="algo"><div class="algo-h">Algorithm 1: Flash-Decoding (split kernel, then reduce kernel)</div><ol>
+<li><b>input:</b> queries \(Q\) of shape \((B, H_q, d)\), KV cache \(K, V\) of shape \((B, L, H_{kv}, d)\), number of splits \(S\)</li>
+<li><b>kernel 1</b>, grid \((B, H_{kv}, S)\): the block for \((b, h, p)\) does</li>
+<li>&nbsp;&nbsp;load the \(g\) query rows of KV head \(h\) <span class="c">// GQA: all query heads of the group share the K, V loads</span></li>
+<li>&nbsp;&nbsp;<b>for</b> each key tile in chunk \(p\) (positions \(p \lceil L/S \rceil\) to \((p+1)\lceil L/S \rceil - 1\)) <b>do</b></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;scores \(\leftarrow Q_h K_{\text{tile}}^\top / \sqrt{d}\); online-softmax update (125.3) of \(m, \ell, \mathbf{o}\)</li>
+<li>&nbsp;&nbsp;write \(\mathbf{o}_p = \mathbf{o} / \ell\) and \(\lambda_p = m + \log \ell\) to FP32 buffers <span class="c">// (125.4)</span></li>
+<li><b>kernel 2</b>, grid \((B, H_q)\): for each query row</li>
+<li>&nbsp;&nbsp;\(\lambda_{\max} \leftarrow \max_p \lambda_p\); \(\;w_p \leftarrow e^{\lambda_p - \lambda_{\max}}\)</li>
+<li>&nbsp;&nbsp;\(\mathbf{o} \leftarrow \sum_p w_p \mathbf{o}_p / \sum_p w_p\) <span class="c">// (125.5); write in BF16</span></li>
+<li>&nbsp;&nbsp;(optional) write \(\lambda = \lambda_{\max} + \log \sum_p w_p\) <span class="c">// useful for later merges, e.g. prefix caches</span></li></ol></div>
+<aside class="note watch side"><span class="nt">Watch out</span>With a variable context length per sequence, some chunks can be empty (no keys). An empty chunk has \(\ell_p = 0\) and \(\lambda_p = -\infty\). The reduce must give it weight 0, not compute \(-\infty - (-\infty)\), which is NaN.</aside>
+
+<h2>How many splits?</h2>
+<p>More splits give more parallel work. But they also cost something: each split writes a partial output in FP32, the reduce kernel must read them all, and there is a second kernel launch. And the GPU runs thread blocks in <b>waves</b>: if it can hold \(N_{\text{slot}}\) blocks at once and you launch a few more than that, the extra blocks run in a second, mostly empty wave.</p>
+<div class="eq">\[ N_{\text{blocks}} = B \cdot H_{kv} \cdot S, \qquad \text{waves} = \left\lceil \frac{N_{\text{blocks}}}{N_{\text{slot}}} \right\rceil, \qquad \text{efficiency} = \frac{N_{\text{blocks}} / N_{\text{slot}}}{\text{waves}} \tag{125.7} \]</div>
+<p>FlashAttention-2 picks \(S\) with exactly this formula. [Certain, flash_api.cpp] If \(B \cdot H \cdot (\text{query tiles})\) already fills 80% of the slots, it uses one split. Otherwise it computes the wave efficiency for every \(S\) up to 128, finds the best one, and returns the <b>smallest</b> \(S\) whose efficiency is at least 85% of the best. It counts two blocks per SM (\(N_{\text{slot}} = 2 \times 108 = 216\) on an A100) and skips values of \(S\) that give the same chunk length as \(S - 1\). For decode with GQA it first moves the \(g\) query heads of a group into the “query rows” dimension, so the grid counts KV heads, and one K, V load serves all \(g\) heads.</p>
+<p>Figure 2 puts these rules in a small cost model. The model is a toy: it assumes each of the 216 slots can stream at most \(1/216\) of the HBM bandwidth, and that the reduce kernel costs 3 µs plus its memory traffic. Real SMs can take more than their share when others are idle, so the real loss at \(S = 1\) is smaller than the toy shows. [Likely] The shape of the curve is the lesson, not the exact microseconds.</p>
+<figure class="fig wide" id="fd-occ"><div class="fig-body">
+<div class="fd-grid">
+<label for="fd-occ-b">Batch \(B\)</label><input type="range" id="fd-occ-b" min="0" max="6" step="1" value="0"><output id="fd-occ-bv"></output>
+<label for="fd-occ-h">KV heads \(H_{kv}\)</label><input type="range" id="fd-occ-h" min="0" max="5" step="1" value="3"><output id="fd-occ-hv"></output>
+<label for="fd-occ-l">Context \(L\)</label><input type="range" id="fd-occ-l" min="10" max="17" step="1" value="15"><output id="fd-occ-lv"></output>
+<label for="fd-occ-s">Splits \(S\)</label><input type="range" id="fd-occ-s" min="1" max="128" step="1" value="1"><output id="fd-occ-sv"></output></div>
+<div class="controls" style="margin-top:8px"><button type="button" class="btn" id="fd-occ-auto">Use the FlashAttention-2 heuristic</button></div>
+<div class="scroll-x"><svg id="fd-occ-svg" viewBox="0 0 660 300" role="img" aria-label="Toy model of decode attention time per layer as a function of the number of KV splits, with the ideal bandwidth-bound time as a line"></svg></div>
+<div class="fd-leg"><span style="--c:var(--q)">selected S</span><span style="--c:var(--k)">other values of S</span><span style="--c:var(--v)">ideal time (dashed line)</span></div>
+<div class="readout" id="fd-occ-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Toy model of one decode attention layer on an A100 (2,039 GB/s, 216 block slots), head dimension 128, 4 query heads per KV head, BF16 cache. Bars: time for each number of splits \(S\) from 1 to 128 (log time scale). Dashed line: the ideal time, all bytes at full bandwidth. The selected \(S\) is highlighted.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>The default is Llama 3 8B shapes at batch 1 and 32k context. With \(S = 1\) there are 8 blocks, 3.7% of the slots are busy, and the toy time is 1,777 µs against an ideal of 65.8 µs. Press the heuristic button: it picks \(S = 24\) (192 blocks, efficiency \(192/216 = 0.89\), which is at least 85% of the best), and the time falls to 77.5 µs. \(S = 27\) fills all 216 slots (69.3 µs). At \(S = 64\) there are 512 blocks in 3 waves, and the time goes up again to 87.3 µs. Now set the batch to 32 and the context to 4,096: 256 blocks already exceed the 80% rule, the heuristic returns 1, and splitting gives little.</p></details></figure>
+<p>Two practical points. First, split-KV matters most for small batches and long contexts: exactly the case of a single user with a long document or a long video. At large batch the grid is already full, and engines turn it off. Second, Flash-Decoding reports up to 8× faster end-to-end decoding for CodeLlama-34B at very long sequences, and attention up to 50× faster than FlashAttention; in their micro-benchmark (A100, batch 1, 16 query heads, 2 KV heads, \(d = 128\)) the attention time stayed almost constant up to 32k tokens. [Certain, Flash-Decoding blog] It shipped in FlashAttention 2.2 and xFormers 0.0.22. [Certain]</p>
+
+<h2>FlashDecoding++: one unified max value</h2>
+<p>Flash-Decoding still has one source of waiting. Inside each chunk, the online softmax (125.3) must rescale its running output each time the max grows. Across chunks, the reduce step must wait for every chunk’s \(\lambda_p\) before it can weight anything. FlashDecoding++ calls this the <b>synchronized partial softmax update</b>. On an A100 with Llama2-7B and input length 1024, its profile shows this update takes 18.8% of the attention time. [Certain, FlashDecoding++ paper]</p>
+<p>The fix starts from a simple fact: the max in a softmax can be replaced by <b>any</b> number \(\varphi\):</p>
+<div class="eq">\[ \softmax(\mathbf{s})_j = \frac{e^{s_j - \varphi}}{\sum_{i} e^{s_i - \varphi}} \quad \text{for every } \varphi \in \R, \qquad \mathbf{o} = \frac{\sum_{p} \mathbf{N}_p}{\sum_{p} D_p}, \quad \mathbf{N}_p = \sum_{j \in \mathcal{I}_p} e^{s_j - \varphi} \mathbf{v}_j, \quad D_p = \sum_{j \in \mathcal{I}_p} e^{s_j - \varphi} \tag{125.8} \]</div>
+<p>We subtract the max only to keep the exponentials in range. If \(\varphi\) is a fixed number known in advance, every chunk can compute \(\mathbf{N}_p\) and \(D_p\) without knowing anything about the other chunks, and the merge is a plain sum, in any order. No rescaling, no max, no waiting: the authors call it an <b>asynchronized softmax</b>.</p>
+<p>The risk is overflow and underflow. We need \(e^{s_j - \varphi}\) to stay representable:</p>
+<div class="eq">\[ a \lt s_j - \varphi \lt b \quad \text{for all } j, \qquad \text{FP32: } b \approx \log(3.4 \times 10^{38}) = 88.7, \qquad \text{FP16: } b = \log 65504 = 11.09 \tag{125.9} \]</div>
+<p>Scores far below \(\varphi\) underflow to 0; that is fine only for tokens whose weight is negligible anyway. FlashDecoding++ picks \(\varphi\) from statistics collected offline. For Llama2-7B more than 99.99% of the softmax inputs lie in \([-16.8, 6.5]\). [Certain, FlashDecoding++ paper] That window is 23.3 wide; \(e^{23.3} \approx 1.3 \times 10^{10}\) fits in FP32 easily but not in FP16, whose largest value is 65,504. When some score of a vector falls outside the safe window, the kernel throws away that vector’s asynchronous result and recomputes it with the normal synchronized method. The paper says this is rare enough to be negligible, from its statistics. For OPT-6.7B the input range is too wide, and the method is not applied. [Certain, FlashDecoding++ paper]</p>
+<figure class="fig" id="fd-umax"><div class="fig-body">
+<div class="fd-grid">
+<label for="fd-umax-mu">Score level \(\mu\) (changes with the input)</label><input type="range" id="fd-umax-mu" min="-110" max="100" step="1" value="0"><output id="fd-umax-muv"></output>
+<label for="fd-umax-phi">Unified max \(\varphi\) (fixed offline)</label><input type="range" id="fd-umax-phi" min="-20" max="40" step="1" value="0"><output id="fd-umax-phiv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="seg" id="fd-umax-f"><button type="button" data-f="fp32" aria-pressed="true">exp in FP32</button><button type="button" data-f="fp16" aria-pressed="false">exp in FP16</button></span></div>
+<div class="scroll-x"><svg id="fd-umax-svg" viewBox="0 0 640 230" role="img" aria-label="The 64 scores minus phi on a number line, with the overflow limit and the underflow region of the chosen format"></svg></div>
+<div class="readout" id="fd-umax-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> The asynchronized softmax (125.8) on 64 scores \(s_j = \mu + 6 \sin(2.399\, j + 0.5)\) with values \(v_j = 1 + \cos(1.3\, j)\). Dots are \(s_j - \varphi\). Each exponential is rounded to the chosen format, the sums are kept in FP32, and the result is compared with exact softmax attention.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>At the start (\(\mu = 0\), \(\varphi = 0\), FP32) all dots are inside the safe zone and the error is about \(2 \times 10^{-7}\) (FP32 sums). Switch to FP16: the error grows to about \(2 \times 10^{-5}\) (FP16 rounding of each exponential) but there is no overflow. Now move \(\mu\) to 8: the largest \(s_j - \varphi\) is 14.0, above \(\log 65504 = 11.09\), so FP16 overflows and the kernel must fall back. In FP32 the same case is fine. Move \(\mu\) to −14 in FP16: no overflow, but 20 of the 64 exponentials round to zero and the error is \(3.4 \times 10^{-5}\); it stays small only because the lost tokens have small weights. In FP32, \(\mu = 90\) overflows, and \(\mu = -105\) loses 35 of 64 tokens with an error of \(2.2 \times 10^{-3}\), about 10,000 times larger than at \(\mu = 0\). The lesson: a unified max works when the score range is narrow and predictable, and the overflow check is not optional.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 2: FlashDecoding++ asynchronized softmax with fallback</div><ol>
+<li><b>offline:</b> run the model on sample data; record the softmax inputs; choose \(\varphi\) and a safe window \((a, b)\) that holds almost all of them (125.9)</li>
+<li><b>input:</b> query row \(\mathbf{q}\), chunks \(\mathcal{I}_1, \dots, \mathcal{I}_S\) of the KV cache</li>
+<li><b>for</b> each chunk \(p\) <b>in parallel do</b></li>
+<li>&nbsp;&nbsp;\(s_j \leftarrow \mathbf{q}^\top \mathbf{k}_j / \sqrt{d}\) for \(j \in \mathcal{I}_p\)</li>
+<li>&nbsp;&nbsp;<b>if</b> some \(s_j - \varphi \notin (a, b)\) <b>then</b> raise the flag “recompute” for this row</li>
+<li>&nbsp;&nbsp;\(\mathbf{N}_p \leftarrow \sum_j e^{s_j - \varphi}\mathbf{v}_j\), \(\;D_p \leftarrow \sum_j e^{s_j - \varphi}\) <span class="c">// no max, no rescale</span></li>
+<li>&nbsp;&nbsp;atomically add \(\mathbf{N}_p\) and \(D_p\) into the row’s accumulators <span class="c">// or write them and sum later</span></li>
+<li><b>if</b> the flag is raised <b>then</b> recompute this row with the synchronized method (125.3)–(125.5)</li>
+<li><b>else</b> \(\mathbf{o} \leftarrow \sum_p \mathbf{N}_p / \sum_p D_p\) <span class="c">// (125.8)</span></li></ol></div>
+<p>Figure 4 runs Algorithm 2 on the same 8 keys as Figure 1, so you can compare the two step by step. Look at what is missing: no running max, no rescale factor \(c\), and no reduce kernel. The blocks add their sums into two global numbers in whatever order they finish.</p>
+<figure class="fig wide" id="fd-async"><div class="fig-body">
+<div class="fd-ctl"><button type="button" class="btn primary" id="fd-async-play">Play</button><button type="button" class="btn" id="fd-async-prev">Back</button><button type="button" class="btn" id="fd-async-next">Step</button><button type="button" class="btn" id="fd-async-reset">Reset</button>
+<label>Speed <select id="fd-async-spd"><option value="0.5">0.5×</option><option value="1" selected>1×</option><option value="2">2×</option><option value="4">4×</option></select></label>
+<label>Splits \(S\) <select id="fd-async-s"><option value="1">1</option><option value="2">2</option><option value="4" selected>4</option><option value="8">8</option></select></label>
+<label>Tile \(T\) <select id="fd-async-t"><option value="1">1 key</option><option value="2" selected>2 keys</option><option value="4">4 keys</option></select></label>
+<label for="fd-async-phi">Unified max \(\varphi\) <input type="range" id="fd-async-phi" min="-10" max="18" step="0.5" value="3"><output id="fd-async-phiv"></output></label>
+<span class="fd-lab" id="fd-async-lab"></span></div>
+<div class="scroll-x"><svg id="fd-async-svg" viewBox="0 0 680 372" role="img" aria-label="Simulation of the FlashDecoding++ asynchronized softmax: each thread block sums exp(s minus phi) times v and exp(s minus phi) for its chunk, without a running max, then adds both sums atomically into two global accumulators"></svg></div>
+<div class="fd-two"><ol class="fd-code" id="fd-async-code">
+<li class="hd">One kernel, grid (B, H_kv, S); φ fixed offline; FP16 window (a, b) = (−16.64, 11.09)</li>
+<li>chunk p ← keys of split p</li>
+<li>n_p ← 0;  d_p ← 0;  flag ← false   <span class="c">// global N = D = 0</span></li>
+<li>for each tile of T keys in chunk p:</li>
+<li>  s ← q·K_tile / √d;  if some s − φ ∉ (a, b): flag ← true</li>
+<li>  e ← fp16(e^(s − φ))   <span class="c">// no max, no rescale</span></li>
+<li>  n_p += Σ e·v;  d_p += Σ e</li>
+<li>atomicAdd(N, n_p);  atomicAdd(D, d_p)   <span class="c">// any order</span></li>
+<li>if flag: recompute the row with Flash-Decoding, else o ← N / D   <span class="c">// (125.8)</span></li></ol>
+<div class="fd-fx" id="fd-async-fx" aria-live="polite"></div></div>
+<div class="fd-leg"><span style="--c:var(--k)">key scores s and e^(s − φ)</span><span style="--c:var(--t2)">one color per thread block</span><span style="--c:var(--q)">global accumulators N, D</span><span style="--c:var(--bad)">outside the safe window</span></div>
+<div class="readout" id="fd-async-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The asynchronized softmax of FlashDecoding++ (Algorithm 2) on the 8 keys of Figure 1. Each exponential \(e^{s_j - \varphi}\) is rounded to FP16, as a half-precision kernel would store it; the sums are kept in FP32. The blocks add their \((n_p, d_p)\) into the global \((N, D)\) in a scrambled order to show that the order does not matter. The last step compares \(N / D\) with exact softmax attention (5.1374).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Press Play or Step. The default \(\varphi = 3\) is a little below the largest score (3.1), so all \(s_j - \varphi\) lie in \([-4, 0.1]\) and the result is \(5.13736\), an error of \(2.4 \times 10^{-5}\) that comes only from FP16 rounding of the exponentials. Compare the tile lines with Figure 1: there is no \(m\), no \(c\), and no reduce kernel. Now move \(\varphi\) to −8: the largest \(s_j - \varphi\) is 11.1, above \(\log 65504 = 11.09\); \(e^{11.1}\) overflows FP16, line 4 raises the flag, and the last line falls back to Flash-Decoding. At \(\varphi = 10\) nothing overflows, but all exponentials are tiny (the largest is 0.001); the smallest ones are FP16 subnormal numbers with fewer significant bits, and the error grows to \(3.8 \times 10^{-4}\). At \(\varphi = 16\) the smallest \(s_j - \varphi\) is −17, below the window, so the flag is raised again.</p></details></figure>
+
+<h3>The other two parts of FlashDecoding++</h3>
+<p>The paper has two more ideas. They are about the linear layers, which we study in <a href="../inference/linear-operators-gemm-gemv-and-flat-gemm.html">session 126</a>; here is the short version.</p>
+<ul>
+<li><b>Flat GEMM with double buffering.</b> In decode, a linear layer multiplies a weight matrix by a matrix with only \(M\) = batch size rows: a “flat” GEMM. Libraries such as cuBLAS and CUTLASS tile \(M\) in blocks of 64, so with a small batch most of each tile is zero padding, and more than 50% of the work is wasted. FlashDecoding++ pads \(M\) only to 8 and uses two shared-memory buffers, so one tile loads while the other computes. [Certain, FlashDecoding++ paper]</li>
+<li><b>Heuristic dataflow.</b> For each weight shape \([N, K]\) it profiles, offline, three implementations: a GEMV on CUDA cores (FastGEMV), its flat GEMM on Tensor Cores, and a normal CUTLASS GEMM. At run time it picks one by comparing \(M\) to two thresholds \(M_1\) and \(M_2\) found by that profiling. [Certain, FlashDecoding++ paper]</li></ul>
+<p>The abstract reports up to 4.86× (NVIDIA) and 2.18× (AMD) speedup over Hugging Face implementations, and an average of 1.37× over state-of-the-art inference engines. [Certain, FlashDecoding++ abstract] These are whole-model numbers, so they mix the three ideas.</p>
+
+<h2>Paged-KV attention kernels</h2>
+<p>So far we assumed the cache of each sequence is one contiguous tensor. Real servers do not do this. Sequences grow by one token per step and finish at unknown times. Reserving the maximum length for each one wastes memory: the vLLM paper measured that only 20.4% to 38.2% of KV-cache memory held real token states in earlier systems. [Certain, vLLM paper] <b>PagedAttention</b> stores the cache in fixed-size <b>pages</b> (vLLM calls them blocks; the default is 16 tokens [Certain]). Each sequence has a <b>block table</b>: a list of page numbers in logical order, like the page table of an operating system. Memory management is the topic of <a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>; here we care about what the attention kernel must do differently.</p>
+<p>To find token \(t\) of sequence \(b\), the kernel computes</p>
+<div class="eq">\[ \text{page} = \mathrm{BT}_b\!\left[ \lfloor t / P \rfloor \right], \qquad \text{slot} = t \bmod P, \qquad \mathbf{k}_t = K_{\text{pool}}[\text{page}, \text{slot}] \tag{125.10} \]</div>
+<dl class="symbols"><dt>\(\mathrm{BT}_b\)</dt><dd>block table of sequence \(b\): logical page index to physical page index</dd><dt>\(P\)</dt><dd>page size in tokens</dd><dt>\(K_{\text{pool}}\)</dt><dd>one big tensor of shape (pages, \(P\), \(H_{kv}\), \(d\)) shared by all sequences; values live in a second pool with the same layout</dd></dl>
+<p>Because softmax attention does not care where the keys are stored, only which keys are in the set, the math is unchanged: the kernel loops over pages instead of over contiguous tiles. The vLLM paper writes the attention as a sum over KV blocks, the same structure as (125.4)–(125.5) with one block per tile. The cost is an extra lookup in the block table and less regular memory access: vLLM measured 20–26% higher attention-kernel latency than FasterTransformer’s contiguous kernel, a cost limited to the attention operator. [Certain, vLLM paper] The pay-off is much more room for sequences, and so larger batches: 2–4× higher throughput at the same latency. [Certain, vLLM abstract]</p>
+<figure class="fig wide" id="fd-page"><div class="fig-body">
+<div class="controls"><span class="seg" id="fd-page-q"><button type="button" data-q="0" aria-pressed="false">Sequence A (45 tokens)</button><button type="button" data-q="1" aria-pressed="true">Sequence B (70 tokens)</button><button type="button" data-q="2" aria-pressed="false">Sequence C (20 tokens)</button></span></div>
+<div class="fd-grid"><label for="fd-page-t">Look up token \(t\)</label><input type="range" id="fd-page-t" min="0" max="69" step="1" value="37"><output id="fd-page-tv"></output></div>
+<div class="scroll-x"><svg id="fd-page-svg" viewBox="0 0 660 345" role="img" aria-label="Logical pages of one sequence mapped through its block table to a pool of 16 physical pages, with split-KV partitions of two pages each"></svg></div>
+<div class="readout" id="fd-page-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> A paged KV cache with page size \(P = 16\) and a pool of 16 physical pages shared by three sequences. The top row is the chosen sequence in logical order; arrows follow its block table into the pool. Colors mark split-KV partitions of 32 tokens (2 pages), as in a partitioned paged-attention kernel.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Sequence B has 70 tokens, so it needs \(\lceil 70/16 \rceil = 5\) pages; its last page holds only 6 tokens, and 10 slots are empty. That is the only waste of paging: less than one page per sequence. With partitions of 32 tokens the kernel launches 3 blocks for B: pages {4, 13}, {0, 9} and {14}. Move the slider: token 37 is in logical page 2, slot 5, and the block table sends it to physical page 0. Switch to sequence C (20 tokens): it needs 2 pages and only one partition, so a split kernel gives it no extra parallelism.</p></details></figure>
+<h3>Paging and splitting together</h3>
+<p>Paging and split-KV fit well: a chunk is just a range of pages. vLLM’s own CUDA kernels (as of v0.6.0) have two versions. V1 gives one block per (sequence, head) and loops over all pages. V2 cuts the context into partitions of 512 tokens, runs one block per partition, and merges with the log-sum-exp rule, exactly Flash-Decoding. The Python wrapper uses V1 when the longest sequence has at most 8,192 tokens and either there is only one partition or sequences × heads is above 512; otherwise V2. [Certain, vLLM v0.6.0 source] FlashAttention-2’s <code>flash_attn_with_kvcache</code> also accepts a block table; in the version we read, the page size must be a multiple of 256 tokens. [Certain, flash_api.cpp] FlashInfer stores the paged cache as a block-sparse matrix and adds load-balanced scheduling for batches with very different lengths. [Certain, FlashInfer abstract]</p>
+<div class="algo"><div class="algo-h">Algorithm 3: paged split-KV decode attention (one block per sequence, KV head and partition)</div><ol>
+<li><b>input:</b> queries, page pools \(K_{\text{pool}}, V_{\text{pool}}\), block tables \(\mathrm{BT}\), lengths \(L_b\), page size \(P\), partition size \(T\) (a multiple of \(P\))</li>
+<li><b>grid:</b> \((b, h, p)\) for \(p = 0, \dots, \lceil L_b / T \rceil - 1\) <span class="c">// blocks past the end exit at once</span></li>
+<li>\(m \leftarrow -\infty\), \(\ell \leftarrow 0\), \(\mathbf{o} \leftarrow \mathbf{0}\)</li>
+<li><b>for</b> logical page \(i\) from \(pT/P\) to \(\min((p+1)T, L_b)/P\) <b>do</b></li>
+<li>&nbsp;&nbsp;\(\text{phys} \leftarrow \mathrm{BT}_b[i]\) <span class="c">// (125.10): one integer load per page</span></li>
+<li>&nbsp;&nbsp;load keys of page phys (mask slots \(\ge L_b\) in the last page); scores; update (125.3); load values; accumulate</li>
+<li>write \(\mathbf{o}/\ell\) and \(m + \log \ell\) for partition \(p\)</li>
+<li><b>reduce kernel:</b> merge the partitions of each row with (125.5); skip the reduce when there is only one partition</li></ol></div>
+
+<h2>The whole thing in PyTorch</h2>
+<p>The code below builds a paged KV cache with scattered pages, runs split-KV decode attention for 1, 2, 4 and 8 splits, runs the unified-max variant with its fallback, and checks everything against PyTorch’s <code>scaled_dot_product_attention</code>. It runs on a CPU in a second; on a GPU the inner loops are what one thread block does.</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+torch.manual_seed(0)
+
+B, Hq, Hkv, d = 2, 8, 2, 64            <span class="cm"># batch, query heads, KV heads (GQA group g = 4), head dim</span>
+g = Hq // Hkv
+P = 16                                 <span class="cm"># tokens per KV page (block)</span>
+lens = torch.tensor([45, 70])          <span class="cm"># current context length of each sequence</span>
+
+<span class="cm"># 1) a paged KV cache: one pool of pages + a block table per sequence</span>
+num_pages = 16
+k_pool = torch.randn(num_pages, P, Hkv, d)
+v_pool = torch.randn(num_pages, P, Hkv, d)
+perm = torch.randperm(num_pages)       <span class="cm"># pages are scattered on purpose</span>
+block_table = [perm[:3].tolist(), perm[3:8].tolist()]   <span class="cm"># ceil(45/16)=3, ceil(70/16)=5 pages</span>
+q = torch.randn(B, Hq, d)              <span class="cm"># decode: ONE new query row per sequence and head</span>
+
+<span class="kw2">def</span> gather_kv(b):
+    <span class="cm">"""Read the pages of sequence b in logical order (a real kernel reads them in place)."""</span>
+    pages = torch.tensor(block_table[b])
+    k = k_pool[pages].reshape(-1, Hkv, d)[: lens[b]]   <span class="cm"># (L, Hkv, d), formula (125.10)</span>
+    v = v_pool[pages].reshape(-1, Hkv, d)[: lens[b]]
+    <span class="kw2">return</span> k, v
+
+<span class="cm"># 2) Flash-Decoding: split the KV sequence, attend to each split, merge with log-sum-exp</span>
+<span class="kw2">def</span> split_attend(qh, k, v):
+    <span class="cm">"""One split: partial output o_p and its log-sum-exp, formula (125.4)."""</span>
+    s = (k @ qh) / math.sqrt(d)                      <span class="cm"># (Ls,) scores</span>
+    m = s.max()
+    p = torch.exp(s - m)
+    l = p.sum()
+    <span class="kw2">return</span> (p @ v) / l, m + torch.log(l)
+
+<span class="kw2">def</span> merge(outs, lses):
+    <span class="cm">"""Reduce step, formula (125.5): weights exp(lse_p - lse)."""</span>
+    lses = torch.stack(lses)
+    w = torch.softmax(lses, dim=0)                   <span class="cm"># = exp(lse_p - logsumexp(lses))</span>
+    <span class="kw2">return</span> (w[:, None] * torch.stack(outs)).sum(0)
+
+<span class="kw2">def</span> flash_decode(q, num_splits):
+    out = torch.empty(B, Hq, d)
+    <span class="kw2">for</span> b <span class="kw2">in</span> range(B):
+        k, v = gather_kv(b)
+        L = k.shape[0]
+        chunk = math.ceil(L / num_splits)
+        <span class="kw2">for</span> h <span class="kw2">in</span> range(Hq):
+            kvh = h // g                             <span class="cm"># GQA: query head h reads KV head h // g</span>
+            outs, lses = [], []
+            <span class="kw2">for</span> start <span class="kw2">in</span> range(0, L, chunk):         <span class="cm"># these splits run in parallel on a GPU</span>
+                o_p, lse_p = split_attend(q[b, h], k[start:start + chunk, kvh], v[start:start + chunk, kvh])
+                outs.append(o_p); lses.append(lse_p)
+            out[b, h] = merge(outs, lses)
+    <span class="kw2">return</span> out
+
+<span class="cm"># 3) FlashDecoding++ idea: one fixed "unified max" phi, no rescaling, plain sums</span>
+<span class="kw2">def</span> unified_max_decode(q, num_splits, phi=6.0, bound=80.0):
+    out = torch.empty(B, Hq, d); fallbacks = 0
+    <span class="kw2">for</span> b <span class="kw2">in</span> range(B):
+        k, v = gather_kv(b); L = k.shape[0]; chunk = math.ceil(L / num_splits)
+        <span class="kw2">for</span> h <span class="kw2">in</span> range(Hq):
+            kvh = h // g; num = torch.zeros(d); den = torch.zeros(())
+            s_all = (k[:, kvh] @ q[b, h]) / math.sqrt(d)
+            <span class="kw2">if</span> (s_all - phi).abs().max() > bound:  <span class="cm"># outside the safe window (125.9): recompute the usual way</span>
+                fallbacks += 1
+                out[b, h] = flash_decode(q, num_splits)[b, h]; <span class="kw2">continue</span>
+            <span class="kw2">for</span> start <span class="kw2">in</span> range(0, L, chunk):
+                p = torch.exp(s_all[start:start + chunk] - phi)   <span class="cm"># no max, no rescale (125.8)</span>
+                num += p @ v[start:start + chunk, kvh]; den += p.sum()
+            out[b, h] = num / den
+    <span class="kw2">return</span> out, fallbacks
+
+<span class="cm"># 4) reference: plain softmax attention with SDPA, one sequence at a time</span>
+ref = torch.empty(B, Hq, d)
+<span class="kw2">for</span> b <span class="kw2">in</span> range(B):
+    k, v = gather_kv(b)
+    kk = k.repeat_interleave(g, dim=1).transpose(0, 1)           <span class="cm"># (Hq, L, d)</span>
+    vv = v.repeat_interleave(g, dim=1).transpose(0, 1)
+    ref[b] = torch.nn.functional.scaled_dot_product_attention(q[b][:, None], kk, vv)[:, 0]
+
+<span class="kw2">for</span> S <span class="kw2">in</span> (1, 2, 4, 8):
+    print(S, (flash_decode(q, S) - ref).abs().max().item())    <span class="cm"># all below 1e-6</span>
+o_u, nfb = unified_max_decode(q, 4)
+print(<span class="st">"unified max:"</span>, (o_u - ref).abs().max().item(), <span class="st">"fallbacks:"</span>, nfb)   <span class="cm"># about 4e-7, 0</span>
+o_big, nfb_big = unified_max_decode(q * 40, 4)                   <span class="cm"># scores 40x larger</span>
+print(<span class="st">"large scores, fallbacks:"</span>, nfb_big, <span class="st">"of"</span>, B * Hq)         <span class="cm"># 13 of 16 rows fall back</span></pre>
+<p>On our machine (PyTorch 2.8, CPU) the four split counts give maximum errors between \(2.4 \times 10^{-7}\) and \(4.2 \times 10^{-7}\): FP32 rounding only. With scores 40 times larger, 13 of the 16 (sequence, head) rows leave the window of ±80 and fall back.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Which kernel idea matters</th><th>Why</th></tr></thead><tbody>
+<tr><td>Chat with one user and a long document (batch 1, 32k–128k context)</td><td>Split-KV (Flash-Decoding), GQA packing</td><td>\(B \times H_{kv}\) is tiny; without splits most SMs are idle while the 4 GiB+ cache is read</td></tr>
+<tr><td>High-throughput serving (vLLM, SGLang, TensorRT-LLM)</td><td>Paged KV with block tables; split-KV only when the grid is not full</td><td>Paging packs many sequences into memory; large batches already fill the GPU [Likely]</td></tr>
+<tr><td>Long-video question answering with a VLM (thousands of visual tokens per clip)</td><td>Split-KV over the long visual prefix, paged cache</td><td>Every answer token must attend over the whole video context; this is the batch-1, long-context case</td></tr>
+<tr><td>Video-RAG and multi-document RAG</td><td>Paged KV plus prefix caching; log-sum-exp merge of cached and new parts</td><td>Shared retrieved chunks can be cached once; (125.5) merges attention over separate KV pieces exactly [Likely]</td></tr>
+<tr><td>Streaming captioning or key-moment alerts on live video</td><td>Paged KV that grows page by page; small-batch decode kernels</td><td>The context grows without a known end, so contiguous allocation does not work</td></tr>
+<tr><td>Speculative decoding verification (<a href="../inference/speculative-decoding-1-the-math.html">session 128</a>)</td><td>Decode kernels with a few query rows (draft length + 1)</td><td>Still far fewer rows than a FlashAttention tile; split-KV and GQA packing apply</td></tr>
+<tr><td>Consumer and AMD GPUs</td><td>FlashDecoding++ (also evaluated on RTX 3090, MI210, RX 7900 XTX)</td><td>Fewer SMs and different tensor-core shapes make the dataflow choice more important [Likely]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Averaging partial outputs.</b> The parts must be weighted by \(e^{\lambda_p - \lambda}\) (125.5). A plain average gave 4.296 instead of 5.1374 in the worked example.</li>
+<li><b>Weighting by \(\ell_p\) alone.</b> \(\ell_p\) is computed after subtracting each chunk’s own max \(m_p\), so sums from different chunks are on different scales. Use \(\lambda_p = m_p + \log \ell_p\).</li>
+<li><b>Storing partial results in BF16.</b> Partial outputs and log-sum-exps are kept in FP32 (as FlashAttention-2 does); rounding each part to BF16 before the merge adds error for nothing.</li>
+<li><b>Empty chunks.</b> With ragged lengths a chunk can contain no keys; \(\lambda_p = -\infty\) must produce weight 0, not NaN.</li>
+<li><b>Splitting when the grid is already full.</b> At large batch, split-KV only adds reduce traffic and a kernel launch. Use a rule such as the 80% test of FlashAttention-2.</li>
+<li><b>Too many splits.</b> Past one full wave, extra splits add a second, mostly empty wave and more partial results (Figure 2 at \(S = 64\)).</li>
+<li><b>A unified max without an overflow check.</b> Scores depend on the input; one unusual prompt can push \(s_j - \varphi\) above 88.7 (FP32) or 11.09 (FP16). The fallback path is part of the algorithm.</li>
+<li><b>Benchmarking decode at short context only.</b> At 512 tokens every kernel looks similar; the differences appear at long context and small batch.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why does FlashAttention-2 use the GPU poorly during decode?<span class="lvl">basic</span></summary><div class="ans">It parallelizes over batch, heads and query tiles. In decode there is one query row per sequence and head, so there is one query tile, and the grid has only batch × heads thread blocks. With batch 1 and 8 KV heads that is 8 blocks on 108 SMs. Each block loops sequentially over the whole context, so only a few SMs pull data from HBM, and the kernel gets a small part of the memory bandwidth it needs.</div></details>
+<details class="qa"><summary>What is the arithmetic intensity of decode attention, and why does batching not raise it?<span class="lvl">core</span></summary><div class="ans">Per KV head and step: \(4gLd\) FLOPs (scores and weighted sum for \(g\) query rows) over \(4Ld\) bytes of BF16 keys and values, so about \(g\) FLOPs per byte: 1 for MHA, 4 for Llama 3 8B. The A100 ridge point is about 153. Batching helps linear layers because many tokens share one weight matrix, but in attention each sequence has its own KV cache, so bytes grow with the batch exactly as FLOPs do. Only sharing K and V across query rows raises it: GQA/MQA, MLA, or several query tokens (speculative verification).</div></details>
+<details class="qa"><summary>Derive the rule to merge two partial attention outputs.<span class="lvl">core</span></summary><div class="ans">Each part stores \(\mathbf{o}_p = \sum_{j \in p} e^{s_j} \mathbf{v}_j / \sum_{j \in p} e^{s_j}\) and \(\lambda_p = \log \sum_{j \in p} e^{s_j}\) (computed stably with its own max). Then \(e^{\lambda_p}\mathbf{o}_p = \sum_{j \in p} e^{s_j}\mathbf{v}_j\). Summing over parts and dividing by \(\sum_p e^{\lambda_p}\) gives exactly full softmax attention. So \(\mathbf{o} = \sum_p w_p \mathbf{o}_p\) with \(w = \softmax(\lambda_1, \dots, \lambda_S)\), and the merged log-sum-exp is \(\log\sum_p e^{\lambda_p}\). The same rule merges attention over a cached prefix and a new suffix, or over KV shards on different GPUs.</div></details>
+<details class="qa"><summary>What extra memory does split-KV need, and in what precision?<span class="lvl">core</span></summary><div class="ans">For each split, batch, head and query row: one output vector of size \(d\) and one log-sum-exp, both in FP32. FlashAttention-2 allocates buffers of shape (splits, B, H, q_len, d) and (splits, B, H, q_len). This is tiny next to the KV cache: for \(S = 24\), 32 query heads and \(d = 128\) it is \(24 \times 32 \times 129 \times 4 \approx 0.4\) MB per sequence and layer, written and read once.</div></details>
+<details class="qa"><summary>How would you choose the number of splits?<span class="lvl">advanced</span></summary><div class="ans">Fill the GPU with about one full wave and no more. FlashAttention-2: if batch × heads × query tiles is already at least 80% of the block slots (2 per SM), use 1 split. Otherwise compute wave efficiency \(n/\lceil n \rceil\) with \(n = B H S / N_{\text{slot}}\) for every eligible \(S \le 128\), and take the smallest \(S\) within 85% of the best. Also keep each chunk long enough (at least a few key tiles) so per-block overhead and the reduce stay small, and remember that a second wave or a near-empty last chunk wastes time.</div></details>
+<details class="qa"><summary>Is Flash-Decoding useful at batch 256?<span class="lvl">core</span></summary><div class="ans">Usually not. With 256 sequences and 8 KV heads the grid already has 2,048 blocks, far more than the 216 slots of an A100, so all SMs stream KV already. Splitting would only add partial-result traffic and a reduce kernel. It helps when \(B \times H_{kv}\) is small compared to the SM count: small batches, few KV heads (GQA, MQA), and long contexts, which are also the cases where attention dominates the step time.</div></details>
+<details class="qa"><summary>Explain FlashDecoding++’s unified max value. When does it fail?<span class="lvl">advanced</span></summary><div class="ans">Softmax is unchanged if we subtract any constant \(\varphi\) instead of the max. If \(\varphi\) is fixed in advance (from offline statistics of the model’s softmax inputs), each chunk computes \(\sum e^{s_j - \varphi}\mathbf{v}_j\) and \(\sum e^{s_j - \varphi}\) independently, and the merge is a plain sum: no rescaling and no waiting for other chunks’ maxima. It fails when some \(s_j - \varphi\) leaves the safe range: overflow above about 88.7 in FP32, or the important scores falling so low that they underflow. The kernel detects this and recomputes that row with the normal synchronized method. For Llama2-7B more than 99.99% of inputs lie in [−16.8, 6.5]; for OPT-6.7B the range is too wide and the method is not used.</div></details>
+<details class="qa"><summary>What does a paged attention kernel do differently from a contiguous one, and what does it cost?<span class="lvl">core</span></summary><div class="ans">It finds keys and values through a block table: page = BT[t / P], slot = t mod P, then reads from a shared pool. The softmax math is the same, done page by page with the online-softmax update. Costs: one extra integer load per page, less regular addressing, masking of the partly filled last page, and constraints that the page size fits the kernel tile (FlashAttention-2 requires a multiple of 256). vLLM measured 20–26% higher attention-kernel latency than FasterTransformer, but gained 2–4× throughput because paging lets many more sequences fit in memory.</div></details>
+<details class="qa"><summary>How does GQA change the decode kernel?<span class="lvl">advanced</span></summary><div class="ans">The \(g\) query heads of a group read the same K and V. A good kernel loads each K, V tile once and multiplies it with all \(g\) query rows, which turns a GEMV into a small GEMM and raises intensity to about \(g\) FLOPs/byte. FlashAttention-2 does this by reshaping \(q\) from (b, 1, H_kv·g, d) to (b, g, H_kv, d) when q_len = 1, so the group becomes the query-row dimension. The grid then counts KV heads, which makes it even smaller, so split-KV becomes more important with GQA.</div></details>
+<details class="qa"><summary>Page size: what are the trade-offs between 16 and 256 tokens?<span class="lvl">advanced</span></summary><div class="ans">Small pages waste less memory (at most \(P - 1\) empty slots per sequence) and share prefixes at a finer grain, but need more block-table entries, more pointer lookups and shorter contiguous reads. Large pages give long contiguous loads that match big kernel tiles, but waste more memory per sequence and make copy-on-write and prefix sharing coarser. vLLM defaults to 16 and found 16 to 128 best on ShareGPT; FlashAttention-2’s paged path requires multiples of 256.</div></details>
+<details class="qa"><summary>Why does FlashDecoding++ also optimize GEMMs if the topic is decode attention?<span class="lvl">core</span></summary><div class="ans">In decode, the linear layers are flat GEMMs with \(M\) = batch rows. Libraries tile \(M\) by 64, so at small batch most of the tensor-core work is padding (over 50% waste). For short and medium contexts the linear layers take most of the step time, so the paper pads \(M\) only to 8, double-buffers loads, and switches between a CUDA-core GEMV, its flat GEMM and CUTLASS according to \(M\) and the weight shape. The end-to-end speedups combine these with the softmax change.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Merge two chunks: chunk 1 has \(\lambda_1 = 1.0\), \(o_1 = 2\); chunk 2 has \(\lambda_2 = 1.0 + \ln 3\), \(o_2 = 6\) (scalar values). What is the merged output?</li>
+<li>Llama 2 7B (32 layers, 32 KV heads, \(d = 128\), BF16), batch 1, context 16,384. How many bytes does one decode step read from the KV cache, and what is the lower bound on its time at 2,039 GB/s?</li>
+<li>With the FlashAttention-2 rule and 216 block slots, does a batch of 4 with 8 KV heads use split-KV? What if the batch is 32?</li>
+<li>In FP16, \(\varphi = 2\). Which is the largest score \(s_j\) that does not overflow \(e^{s_j - \varphi}\)?</li>
+<li>Sequence of 100 tokens, page size 16. How many pages, how many empty slots, and which logical page and slot hold token 50?</li>
+<li>Show that the merge (125.5) is associative: merging (A, B) and then C gives the same result as merging A with (B, C). Why does this matter for GPUs?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. Weights are \(\softmax(1, 1 + \ln 3) = (1/4, 3/4)\), so \(o = 0.25 \times 2 + 0.75 \times 6 = 5\). 2. Per token \(2 \times 32 \times 32 \times 128 \times 2 = 524{,}288\) bytes; times 16,384 = 8 GiB (8,589,934,592 bytes); at least 4.21 ms. 3. Batch 4: \(4 \times 8 = 32\) blocks, below \(0.8 \times 216 = 172.8\), so it splits (the rule returns 6 at 32k context: 192 blocks, efficiency 0.89). Batch 32: 256 blocks, above 172.8, so 1 split. 4. \(s_j - 2 \lt \ln 65504 = 11.09\), so \(s_j \lt 13.09\). 5. \(\lceil 100/16 \rceil = 7\) pages; \(7 \times 16 - 100 = 12\) empty slots; token 50 is in logical page \(\lfloor 50/16 \rfloor = 3\), slot \(50 - 48 = 2\). 6. Each merge keeps \((\lambda, \mathbf{o})\) with \(e^{\lambda}\mathbf{o} = \sum e^{s_j}\mathbf{v}_j\) and \(e^{\lambda} = \sum e^{s_j}\) over the merged keys. Both are plain sums over disjoint key sets, and sums are associative, so any grouping gives the same pair (up to rounding). This means the reduce can be a tree, chunks can finish in any order, and the same rule merges results across GPUs (for example in ring or sequence-parallel attention).</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Decode attention (125.1) has one query row per sequence and head; its intensity is about \(g\) FLOPs per byte (125.2), far below an A100’s ridge of 153, so its speed is the speed of reading the KV cache.</li>
+<li>FlashAttention parallelizes over batch, heads and query tiles; in decode that gives only \(B \times H\) blocks, too few to use all SMs and all of the bandwidth.</li>
+<li>Flash-Decoding adds the KV sequence as a parallel axis: chunks compute \((\mathbf{o}_p, \lambda_p)\) (125.4), and a reduce merges them exactly with log-sum-exp weights (125.5, 125.6).</li>
+<li>The number of splits is a waves problem (125.7): fill about one wave; FlashAttention-2 uses an 80% and 85% rule; at large batch, do not split.</li>
+<li>FlashDecoding++ subtracts one fixed \(\varphi\) (125.8) so chunks never rescale, with a fallback when a score leaves the safe window (125.9); it also tunes flat GEMMs and picks kernels per shape.</li>
+<li>Paged-KV kernels read keys through a block table (125.10); the math is unchanged, the kernel is 20–26% slower in vLLM’s measurement, and serving throughput grows 2–4×.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \lambda_p = m_p + \log \ell_p, \qquad \mathbf{o} = \sum_p e^{\lambda_p - \lambda}\,\mathbf{o}_p, \quad \lambda = \log \sum_p e^{\lambda_p} \]</div>
+<div class="eq">\[ I_{\text{decode}} \approx g \ \tfrac{\text{FLOP}}{\text{byte}}, \qquad N_{\text{blocks}} = B\,H_{kv}\,S, \qquad \mathbf{o} = \frac{\sum_p \sum_{j \in \mathcal{I}_p} e^{s_j - \varphi}\mathbf{v}_j}{\sum_p \sum_{j \in \mathcal{I}_p} e^{s_j - \varphi}} \]</div>
+<h2 class="plain" id="attention-operator-2-decode-attention-flashdecoding-and-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Dao et al. (2023). <a href="https://crfm.stanford.edu/2023/10/12/flashdecoding.html" target="_blank" rel="noopener">Flash-Decoding for long-context inference (blog)</a></li><li>Hong et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;FlashDecoding++: Faster Large Language Model Inference on GPUs&amp;quot;" target="_blank" rel="noopener">FlashDecoding++: Faster Large Language Model Inference on GPUs</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Dao et al. (2023). <a href="https://crfm.stanford.edu/2023/10/12/flashdecoding.html" target="_blank" rel="noopener">Flash-Decoding for long-context inference (blog)</a></li><li>Hong et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;FlashDecoding++: Faster Large Language Model Inference on GPUs&amp;quot;" target="_blank" rel="noopener">FlashDecoding++: Faster Large Language Model Inference on GPUs</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>Dao (2023). <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a></li><li>Shah et al. (2024). <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener">FlashAttention-3: Fast and Accurate Attention with Asynchrony and Low-precision</a></li><li>Ainslie et al. (2023). <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</a></li><li>Ye et al. (2025). <a href="https://arxiv.org/abs/2501.01005" target="_blank" rel="noopener">FlashInfer: Efficient and Customizable Attention Engine for LLM Inference Serving</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/attention-operator-1-flashattention-1-2-and.html"><small>Previous · session 124</small>Attention operator 1: FlashAttention 1, 2 and 3</a><a class="next" href="../inference/linear-operators-gemm-gemv-and-flat-gemm.html"><small>Next · session 126</small>Linear operators: GEMM, GEMV and flat GEMM</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="attention-operator-2-decode-attention-flashdecoding-and"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const T_=(x,y,s,o)=>`<text x="${x}" y="${y}" ${o||""}>${s}</text>`;
+const mn=v=>String(v).replace("-","−");
+const fx=(v,k)=>mn((Math.abs(v)<0.5*Math.pow(10,-k)?0:v).toFixed(k));
+const cm=v=>v.toLocaleString("en-US");
+function segInit(seg,attr,cb){seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+const segVal=(seg,attr)=>{const b=seg.querySelector('button[aria-pressed="true"]');return b?b.dataset[attr]:null;};
+
+/* ---------- Figures 1 and 4: step-by-step simulators (Flash-Decoding and FlashDecoding++) ---------- */
+const SC=[1.2,-0.5,2.0,0.3,3.1,-1.0,0.8,2.4],VV=[1,2,3,4,5,6,7,8];
+const BC=["var(--t2)","var(--t4)","var(--t3)","var(--t9)","var(--t6)","var(--t1)","var(--t8)","var(--t10)"];
+const EXo=(()=>{const m=Math.max(...SC);let z=0,o=0;SC.forEach((x,i)=>{const e=Math.exp(x-m);z+=e;o+=e*VV[i];});return{o:o/z,lam:m+Math.log(z)};})();
+const ff=(x,k)=>x===-Infinity?"−∞":x===Infinity?"+∞":fx(x,k);
+function f16r(x){if(x===0)return 0;if(!isFinite(x))return x;const a=Math.abs(x);if(a>=65520)return Infinity;let e=Math.floor(Math.log2(a));e=Math.max(e,-14);const q=Math.pow(2,e-10);let r=x/q;const fl=Math.floor(r),d=r-fl;r=d>0.5?fl+1:d<0.5?fl:(fl%2===0?fl:fl+1);r*=q;return Math.abs(r)>65504?Infinity:r;}
+const f32=Math.fround;
+const WIN={a:Math.log(Math.pow(2,-24)),b:Math.log(65504)};
+function cloneB(bl){return bl.map(b=>Object.assign({},b,{sc:b.sc.slice(),es:b.es.slice()}));}
+function newBlocks(S){const n=8/S,bl=[];for(let p=0;p<S;p++)bl.push({a:p*n,b:(p+1)*n,c0:-1,c1:-1,done:p*n,sc:[],es:[],m:-Infinity,l:0,acc:0,mPrev:-Infinity,lPrev:0,accPrev:0,mt:null,c:null,sE:0,sEV:0,o:null,lam:null,w:null,n:0,d:0,flag:false,sent:false});return bl;}
+function traceFD(S,T){const n=8/S,nt=Math.ceil(n/T),bl=newBlocks(S),F=[];let resc=0;const red={lmax:null,Z:0,O:0,k:-1,o:null,lam:null};
+ const snap=(ln,o)=>F.push(Object.assign({ln,bl:cloneB(bl),red:Object.assign({},red),resc,nt,S,T},o||{}));
+ snap(1,{t:-1});snap(2,{t:-1});
+ for(let t=0;t<nt;t++){
+  bl.forEach(b=>{b.c0=b.a+t*T;b.c1=Math.min(b.b,b.c0+T);b.sc=SC.slice(b.c0,b.c1);b.mt=Math.max(...b.sc);b.c=null;});snap(4,{t});
+  bl.forEach(b=>{b.mPrev=b.m;b.mn=Math.max(b.m,b.mt);b.c=b.m===-Infinity?0:Math.exp(b.m-b.mn);if(b.l>0&&b.mn>b.m){resc++;b.rs=true;}else b.rs=false;});snap(5,{t});
+  bl.forEach(b=>{b.lPrev=b.l;b.accPrev=b.acc;b.es=b.sc.map(x=>Math.exp(x-b.mn));b.sE=b.es.reduce((a,c)=>a+c,0);b.sEV=b.es.reduce((a,c,i)=>a+c*VV[b.c0+i],0);b.l=b.c*b.l+b.sE;b.acc=b.c*b.acc+b.sEV;b.m=b.mn;b.done=b.c1;});snap(6,{t});}
+ bl.forEach(b=>{b.o=b.acc/b.l;b.lam=b.m+Math.log(b.l);b.c0=b.c1=-1;});snap(7,{t:-1});
+ red.lmax=Math.max(...bl.map(b=>b.lam));snap(8,{t:-1});
+ bl.forEach((b,p)=>{b.w=Math.exp(b.lam-red.lmax);red.Z+=b.w;red.O+=b.w*b.o;red.k=p;snap(9,{t:-1,p});});
+ red.o=red.O/red.Z;red.lam=red.lmax+Math.log(red.Z);snap(10,{t:-1});return F;}
+function orderFor(S){const o=[...Array(S).keys()];let x=7;for(let i=S-1;i>0;i--){x=(x*1103515245+12345)%2147483648;const j=x%(i+1);[o[i],o[j]]=[o[j],o[i]];}if(S===2)return[1,0];return o;}
+function traceFP(S,T,phi){const n=8/S,nt=Math.ceil(n/T),bl=newBlocks(S),F=[];const red={N:0,D:0,arr:[],o:null,flag:false,ov:false};
+ const snap=(ln,o)=>F.push(Object.assign({ln,bl:cloneB(bl),red:Object.assign({},red,{arr:red.arr.slice()}),nt,S,T,phi},o||{}));
+ snap(1,{t:-1});snap(2,{t:-1});
+ for(let t=0;t<nt;t++){
+  bl.forEach(b=>{b.c0=b.a+t*T;b.c1=Math.min(b.b,b.c0+T);b.sc=SC.slice(b.c0,b.c1);b.es=[];b.bad=b.sc.map(x=>!(x-phi>WIN.a&&x-phi<WIN.b));if(b.bad.some(Boolean))b.flag=true;});snap(4,{t});
+  bl.forEach(b=>{b.es=b.sc.map(x=>f16r(Math.exp(x-phi)));});snap(5,{t});
+  bl.forEach(b=>{b.nPrev=b.n;b.dPrev=b.d;b.es.forEach((e,i)=>{b.n=f32(b.n+f32(e*VV[b.c0+i]));b.d=f32(b.d+e);});b.done=b.c1;});snap(6,{t});}
+ bl.forEach(b=>{b.c0=b.c1=-1;});
+ orderFor(S).forEach(p=>{const b=bl[p];red.N=f32(red.N+b.n);red.D=f32(red.D+b.d);red.arr.push(p);b.sent=true;if(b.flag)red.flag=true;snap(7,{t:-1,p});});
+ red.ov=!isFinite(red.D)||!isFinite(red.N);red.o=red.flag?EXo.o:red.N/red.D;snap(8,{t:-1});return F;}
+/* generic player: Play/Pause, Step, Back, Reset, speed */
+function player(pre,build,render){const P={i:0,F:build(),timer:null};const play=$("#"+pre+"-play"),spd=$("#"+pre+"-spd");
+ const stop=()=>{if(P.timer){clearTimeout(P.timer);P.timer=null;}play.textContent="Play";};
+ const go=k=>{P.i=Math.max(0,Math.min(P.F.length-1,k));render(P.F[P.i],P);$("#"+pre+"-prev").disabled=P.i===0;$("#"+pre+"-next").disabled=P.i===P.F.length-1;$("#"+pre+"-lab").textContent=`step ${P.i+1} of ${P.F.length}`;};
+ const tick=()=>{if(P.i>=P.F.length-1){stop();return;}go(P.i+1);P.timer=setTimeout(tick,1150/(+spd.value||1));};
+ play.addEventListener("click",()=>{if(P.timer){stop();return;}if(P.i>=P.F.length-1)go(0);play.textContent="Pause";P.timer=setTimeout(tick,B.reduced?0:250);});
+ $("#"+pre+"-next").addEventListener("click",()=>{stop();go(P.i+1);});$("#"+pre+"-prev").addEventListener("click",()=>{stop();go(P.i-1);});$("#"+pre+"-reset").addEventListener("click",()=>{stop();go(0);});
+ P.rebuild=keep=>{const end=P.i===P.F.length-1;P.F=build();go(keep&&end?P.F.length-1:keep?Math.min(P.i,P.F.length-1):0);};P.redraw=()=>go(P.i);P.stop=stop;go(0);return P;}
+function setLine(ol,ln){let k=0;ol.querySelectorAll("li").forEach(li=>{if(li.classList.contains("hd"))return;k++;li.classList.toggle("on",k===ln||(ln>=4&&ln<=6&&k===3));});}
+/* shared SVG pieces: keys row, chunk brackets, block cards */
+const X0=20,CW=80;
+function keysRow(f,mode){let g="";const curSet=new Set();f.bl.forEach((b,p)=>{for(let j=b.c0;j<b.c1;j++)curSet.add(j);});
+ for(let j=0;j<8;j++){const x=X0+j*CW,p=Math.floor(j/(8/f.S)),b=f.bl[p],col=BC[p];const done=j<b.done,cur=curSet.has(j);
+  g+=`<rect x="${x+3}" y="34" width="${CW-6}" height="${mode==="fp"?74:58}" rx="8" fill="${done?col:"var(--card)"}" fill-opacity="${done?0.16:1}" stroke="${cur?col:"var(--k)"}" stroke-width="${cur?3:1.2}" ${cur?'class="fd-pulse"':""}/>`;
+  g+=T_(x+CW/2,51,"k"+(j+1),'text-anchor="middle" font-size="13" font-weight="700" class="svgt"')+T_(x+CW/2,68,"s = "+fx(SC[j],1),'text-anchor="middle" font-size="12" fill="var(--k)" font-family="var(--mono)"')+T_(x+CW/2,85,"v = "+VV[j],'text-anchor="middle" font-size="12" fill="var(--v)" font-family="var(--mono)"');
+  if(mode==="fp"){const k=j-b.c0;let t="";if(cur&&b.es.length)t="e="+sig(b.es[k]);else if(cur)t="s−φ="+fx(SC[j]-f.phi,2);
+   g+=T_(x+CW/2,101,t,`text-anchor="middle" font-size="11" font-family="var(--mono)" ${cur&&b.bad&&b.bad[k]?'fill="var(--bad)" font-weight="700"':'class="svgm"'}`);}}
+ return g;}
+function sig(e){if(e===Infinity)return"inf";if(e===0)return"0";if(e>=1000)return String(Math.round(e));if(e>=0.01)return e.toFixed(4).slice(0,6);return e.toExponential(1).replace("e-","e−");}
+function brackets(f,y,mode){let g="";f.bl.forEach((b,p)=>{const xa=X0+b.a*CW+4,xb=X0+b.b*CW-4;g+=`<path d="M${xa} ${y} V ${y+7} H ${xb} V ${y}" fill="none" stroke="${BC[p]}" stroke-width="2"/>`+
+  T_((xa+xb)/2,y+21,f.S>=8?"B"+(p+1):f.S>=4?"block "+(p+1):"thread block "+(p+1)+" · SM "+p,`text-anchor="middle" font-size="12" font-weight="700" fill="${BC[p]}"`);});return g;}
+function tileArrows(f,yTop,yCard){let g="";f.bl.forEach((b,p)=>{if(b.c0<0)return;const xm=X0+(b.c0+b.c1)/2*CW,xc=X0+(b.a+b.b)/2*CW;g+=`<path d="M${xm} ${yTop} L ${xc} ${yCard}" stroke="${BC[p]}" stroke-width="2" stroke-dasharray="4 3" marker-end="url(#fd-ah-${p})"/>`;});return g;}
+function defs(){let g="<defs>";BC.forEach((c,p)=>g+=`<marker id="fd-ah-${p}" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L8 4 L0 8 z" fill="${c}"/></marker>`);return g+"</defs>";}
+function card(b,p,f,y,h,lines,focus){const xa=X0+b.a*CW+3,w=(b.b-b.a)*CW-6,cx=xa+w/2;const small=f.S>=8;
+ let g=`<g data-p="${p}" style="cursor:pointer"><rect x="${xa}" y="${y}" width="${w}" height="${h}" rx="9" fill="${BC[p]}" fill-opacity="${focus?0.2:0.09}" stroke="${BC[p]}" stroke-width="${focus?2.8:1.3}"/>`;
+ lines.forEach((t,k)=>g+=T_(cx,y+18+k*(small?15.5:17),B.esc(t[0]),`text-anchor="middle" font-size="${small?10.5:12.5}" font-family="var(--mono)" ${t[1]?'fill="'+t[1]+'" font-weight="700"':'class="svgm"'}`));
+ return g+"</g>";}
+const tileTxt=b=>b.c0<0?"":"SRAM: "+(b.c1-b.c0===1?"k"+(b.c0+1):"k"+(b.c0+1)+"–k"+b.c1);
+const sumStr=(arr,k)=>arr.length===1?fx(arr[0],k):arr.map(x=>fx(x,k)).join(" + ");
+(function(){
+ const svg=$("#fd-sim-svg");if(!svg)return;const fxb=$("#fd-sim-fx"),info=$("#fd-sim-info"),code=$("#fd-sim-code"),IS=$("#fd-sim-s"),IT=$("#fd-sim-t");let focus=0;
+ const TT={1:"Kernel 1: split the KV sequence into chunks",2:"Kernel 1: every block starts its online softmax",4:"Kernel 1: load one tile, compute scores and the tile max",5:"Kernel 1: new running max and rescale factor c",6:"Kernel 1: update ℓ and acc (rescale, then add the tile)",7:"Kernel 1: write the partial result (o_p, λ_p)",8:"Kernel 2: find the largest log-sum-exp",9:"Kernel 2: add one partial result with weight w_p",10:"Kernel 2: final output"};
+ function render(f){const S=f.S,small=S>=8;if(focus>=S)focus=0;const fb=f.bl[focus],P=focus+1;
+  let g=defs()+T_(20,20,TT[f.ln]+(f.t>=0?` (tile step ${f.t+1} of ${f.nt})`:""),'font-size="15" font-weight="700" class="svgt"');
+  g+=keysRow(f,"fd")+brackets(f,98,"fd");
+  f.bl.forEach((b,p)=>{const L=[[tileTxt(b),BC[p]],[(small?"m ":"m = ")+ff(b.m,small?2:3)],[(small?"ℓ ":"ℓ = ")+fx(b.l,4)],[(small?"acc ":"acc = ")+fx(b.acc,small?3:4)]];
+   if(b.o!==null){L.push([(small?"o ":"o_p = ")+fx(b.o,4),"var(--q)"],[(small?"λ ":"λ_p = ")+fx(b.lam,4),"var(--q)"]);}
+   g+=card(b,p,f,132,110,L,p===focus);});
+  // reduce panel
+  const r=f.red;g+=`<line x1="20" y1="252" x2="660" y2="252" stroke="var(--rule)"/>`+T_(20,270,f.ln>=8?"Kernel 2 (reduce): w_p = e^(λ_p − λ_max)"+(r.lmax!==null?",  λ_max = "+fx(r.lmax,4):""):"Kernel 2 (reduce) waits until every block has written (o_p, λ_p)",'font-size="13" font-weight="600" fill="var(--q)"');
+  f.bl.forEach((b,p)=>{const cx=X0+(b.a+b.b)/2*CW,bw=Math.min(44,(b.b-b.a)*CW-24);g+=`<line x1="${cx-bw/2-6}" y1="340" x2="${cx+bw/2+6}" y2="340" stroke="var(--rule)"/>`;
+   if(b.w!==null){const h=50*b.w;g+=`<rect x="${cx-bw/2}" y="${340-h}" width="${bw}" height="${h}" rx="3" fill="var(--q)" fill-opacity="${f.ln===9&&f.p===p?1:0.55}"/>`+T_(cx,340-h-5,(small?"":"w = ")+fx(b.w,4),`text-anchor="middle" font-size="${small?10.5:12}" font-family="var(--mono)" class="svgm"`);}});
+  let sm="";if(f.ln>=9)sm=`Z = ${fx(r.Z,4)} · O = ${fx(r.O,4)}`;if(f.ln===10)sm+=` · o = O/Z = ${fx(r.o,4)} · exact = ${fx(EXo.o,4)}`;
+  g+=T_(20,362,sm,`font-size="13.5" font-family="var(--mono)" ${f.ln===10?'font-weight="700" fill="var(--v)"':'class="svgm"'}`);
+  svg.innerHTML=g;svg.querySelectorAll("g[data-p]").forEach(el=>el.addEventListener("click",()=>{focus=+el.dataset.p;render(f);}));
+  setLine(code,f.ln);
+  // live formula
+  const b=fb;let h=`<div class="h">${f.ln<=7?`Block ${P} (click a card to change)`:"Reduce kernel"}</div>`;
+  if(f.ln===1)h+=`chunk ${P} = keys k${b.a+1}…k${b.b} (${b.b-b.a} keys)<br>grid = B·H_kv·S = 1·1·${S} = <b>${S}</b> block${S>1?"s":""}`;
+  else if(f.ln===2)h+=`m = −∞,  ℓ = 0,  acc = 0`;
+  else if(f.ln===4)h+=`s = (${b.sc.map(x=>fx(x,2)).join(", ")})<br>m̃ = max(s) = <b>${fx(b.mt,2)}</b>`;
+  else if(f.ln===5)h+=`m_new = max(m, m̃) = max(${ff(b.mPrev,2)}, ${fx(b.mt,2)}) = <b>${fx(b.mn,2)}</b><br>c = e^(m − m_new) = e^(${ff(b.mPrev,2)} − ${fx(b.mn,2)}) = <b>${fx(b.c,4)}</b>`+(b.rs?`<br><span class="bad">the max grew: old ℓ and acc are rescaled</span>`:b.c===0?"<br>(first tile: nothing to rescale)":"<br>(max unchanged: c = 1)");
+  else if(f.ln===6)h+=`Σ e^(s − m_new) = ${sumStr(b.es,4)} = ${fx(b.sE,4)}<br>ℓ = c·ℓ + Σ = ${fx(b.c,4)}·${fx(b.lPrev,4)} + ${fx(b.sE,4)} = <b>${fx(b.l,4)}</b><br>acc = c·acc + Σ e·v = ${fx(b.c,4)}·${fx(b.accPrev,4)} + ${fx(b.sEV,4)} = <b>${fx(b.acc,4)}</b><br>m = ${fx(b.m,2)}`;
+  else if(f.ln===7)h+=`o_${P} = acc/ℓ = ${fx(b.acc,4)} / ${fx(b.l,4)} = <b>${fx(b.o,4)}</b><br>λ_${P} = m + log ℓ = ${fx(b.m,2)} + log ${fx(b.l,4)} = <b>${fx(b.lam,4)}</b>`;
+  else if(f.ln===8)h+=`λ_max = max(${f.bl.map(x=>fx(x.lam,4)).join(", ")}) = <b>${fx(r.lmax,4)}</b>`;
+  else if(f.ln===9){const q=f.bl[f.p];h+=`p = ${f.p+1}: w = e^(λ_p − λ_max) = e^(${fx(q.lam,4)} − ${fx(r.lmax,4)}) = <b>${fx(q.w,4)}</b><br>Z += ${fx(q.w,4)} → Z = <b>${fx(r.Z,4)}</b><br>O += ${fx(q.w,4)}·${fx(q.o,4)} → O = <b>${fx(r.O,4)}</b>`;}
+  else if(f.ln===10)h+=`o = O/Z = ${fx(r.O,4)} / ${fx(r.Z,4)} = <b>${fx(r.o,4)}</b><br>λ = λ_max + log Z = ${fx(r.lmax,4)} + log ${fx(r.Z,4)} = <b>${fx(r.lam,4)}</b><br>final weights e^(λ_p − λ) = ${f.bl.map(x=>fx(x.w/r.Z,4)).join(", ")}<br><span class="ok">exact softmax attention: o = ${fx(EXo.o,4)}, λ = ${fx(EXo.lam,4)}</span>`;
+  fxb.innerHTML=h;
+  const tsteps=f.t>=0?f.t+(f.ln===6?1:0):(f.ln>=7?f.nt:0);
+  info.innerHTML=`S = <b>${S}</b> split${S>1?"s":""} → <b>${S} of 108</b> SMs busy · tile steps per block: <b>${f.nt}</b> (one block walking all 8 keys with T = ${f.T} needs ${Math.ceil(8/f.T)}) · tile steps done: ${tsteps} · rescales so far: <b>${f.resc}</b>`+(f.ln===10?` · merged o = <b>${fx(f.red.o,4)}</b>, exact = <b>${fx(EXo.o,4)}</b>`:"");}
+ const PL=player("fd-sim",()=>traceFD(+IS.value,+IT.value),render);
+ [IS,IT].forEach(e=>e.addEventListener("change",()=>{PL.stop();PL.rebuild(false);}));
+})();
+
+(function(){
+ const svg=$("#fd-async-svg");if(!svg)return;const fxb=$("#fd-async-fx"),info=$("#fd-async-info"),code=$("#fd-async-code"),IS=$("#fd-async-s"),IT=$("#fd-async-t"),IP=$("#fd-async-phi");let focus=0;
+ const TT={1:"Split the KV sequence into chunks",2:"Every block starts two plain sums (no max)",4:"Load a tile, compute s − φ, check the safe window",5:"Exponentials e^(s − φ), rounded to FP16",6:"Add the tile to the block sums n_p and d_p",7:"Atomic add into the global N and D (any order)",8:"Final output"};
+ function render(f){const S=f.S,small=S>=8;if(focus>=S)focus=0;const b=f.bl[focus],P=focus+1;$("#fd-async-phiv").textContent=mn(fx(f.phi,1));
+  let g=defs()+T_(20,20,TT[f.ln]+(f.t>=0?` (tile step ${f.t+1} of ${f.nt})`:""),'font-size="15" font-weight="700" class="svgt"');
+  g+=keysRow(f,"fp")+brackets(f,113,"fp");
+  f.bl.forEach((q,p)=>{const L=[[tileTxt(q),BC[p]],[(small?"n ":"n_p = ")+(small?sig(q.n):fx(q.n,4))],[(small?"d ":"d_p = ")+(small?sig(q.d):fx(q.d,4))],[q.flag?(small?"FLAG":"flag: yes"):(small?"ok":"flag: no"),q.flag?"var(--bad)":null]];
+   if(q.sent)L.push([small?"sent":"added to N, D","var(--q)"]);g+=card(q,p,f,146,96,L,p===focus);});
+  const r=f.red;g+=`<line x1="20" y1="252" x2="660" y2="252" stroke="var(--rule)"/>`;
+  [["N = Σ_p n_p",r.N],["D = Σ_p d_p",r.D]].forEach((x,i)=>{const bx=20+i*330;g+=`<rect x="${bx}" y="262" width="310" height="50" rx="9" fill="var(--q-soft)" stroke="var(--q)" stroke-width="${f.ln===7?2.4:1.3}"/>`+T_(bx+12,282,"global "+x[0],'font-size="12.5" font-weight="600" fill="var(--q)"')+T_(bx+12,302,isFinite(x[1])?fx(x[1],6):"inf (overflow)",'font-size="14" font-weight="700" font-family="var(--mono)" class="svgm"');});
+  g+=T_(20,334,r.arr.length?"arrival order: "+r.arr.map(p=>"block "+(p+1)).join(" → "):"no reduce kernel: blocks add their sums as soon as they finish",'font-size="12.5" class="svgs"');
+  if(f.ln===8)g+=T_(20,360,r.flag?`flag raised → fallback to Flash-Decoding: o = ${fx(EXo.o,4)}`:`o = N/D = ${fx(r.o,6)} · exact = ${fx(EXo.o,6)}`,`font-size="13.5" font-weight="700" font-family="var(--mono)" fill="${r.flag?"var(--bad)":"var(--v)"}"`);
+  svg.innerHTML=g;svg.querySelectorAll("g[data-p]").forEach(el=>el.addEventListener("click",()=>{focus=+el.dataset.p;render(f);}));
+  setLine(code,f.ln);
+  let h=`<div class="h">${f.ln<=6?`Block ${P} (click a card to change)`:"Global accumulators"}, φ = ${mn(fx(f.phi,1))}</div>`;
+  if(f.ln===1)h+=`chunk ${P} = keys k${b.a+1}…k${b.b}<br>grid = B·H_kv·S = <b>${S}</b> block${S>1?"s":""}; there is no second kernel`;
+  else if(f.ln===2)h+=`n_${P} = 0,  d_${P} = 0  (no running max m)`;
+  else if(f.ln===4)h+=`s − φ = (${b.sc.map(x=>mn(fx(x-f.phi,2))).join(", ")})<br>window (a, b) = (${mn(fx(WIN.a,2))}, ${fx(WIN.b,2)}): `+(b.bad.some(Boolean)?`<span class="bad">outside → flag</span>`:`<span class="ok">inside</span>`);
+  else if(f.ln===5)h+=b.sc.map((x,i)=>`e^(${mn(fx(x-f.phi,2))}) = ${Math.exp(x-f.phi)>=65520?"<span class=\"bad\">"+fx(Math.exp(x-f.phi),0)+" → inf</span>":fx(Math.exp(x-f.phi),6)+" → fp16 <b>"+sig(b.es[i])+"</b>"}`).join("<br>")+"<br>no max, no rescale factor";
+  else if(f.ln===6)h+=`n_${P} = ${fx(b.nPrev,4)} + ${b.es.map((e,i)=>sig(e)+"·"+VV[b.c0+i]).join(" + ")} = <b>${isFinite(b.n)?fx(b.n,4):"inf"}</b><br>d_${P} = ${fx(b.dPrev,4)} + ${b.es.map(sig).join(" + ")} = <b>${isFinite(b.d)?fx(b.d,4):"inf"}</b>`;
+  else if(f.ln===7){const q=f.bl[f.p];h+=`block ${f.p+1} arrives: N += ${isFinite(q.n)?fx(q.n,4):"inf"} → <b>${isFinite(r.N)?fx(r.N,4):"inf"}</b><br>D += ${isFinite(q.d)?fx(q.d,4):"inf"} → <b>${isFinite(r.D)?fx(r.D,4):"inf"}</b><br>addition is order-free: no block waits for another`;}
+  else if(f.ln===8)h+=r.flag?`<span class="bad">a score left the window, so N/D is not trusted</span><br>recompute with Flash-Decoding (Figure 1): o = <b>${fx(EXo.o,4)}</b>`:`o = N/D = ${fx(r.N,4)} / ${fx(r.D,4)} = <b>${fx(r.o,6)}</b><br><span class="ok">exact: ${fx(EXo.o,6)}</span>, error ${(Math.abs(r.o-EXo.o)).toExponential(1).replace("e-","×10^−")} (FP16 rounding of e)`;
+  fxb.innerHTML=h;
+  const zs=SC.map(x=>x-f.phi);info.innerHTML=`φ = <b>${mn(fx(f.phi,1))}</b> · s − φ ranges over [${mn(fx(Math.min(...zs),2))}, ${mn(fx(Math.max(...zs),2))}], window (${mn(fx(WIN.a,2))}, ${fx(WIN.b,2)}) · rescales: <b>0</b> · reduce kernel: <b>none</b>`+(f.ln===8?(r.flag?` · <b>fallback</b>, o = ${fx(EXo.o,4)}`:` · o = <b>${fx(r.o,6)}</b>, exact ${fx(EXo.o,6)}`):"");}
+ const PL=player("fd-async",()=>traceFP(+IS.value,+IT.value,+IP.value),render);
+ [IS,IT].forEach(e=>e.addEventListener("change",()=>{PL.stop();PL.rebuild(false);}));IP.addEventListener("input",()=>PL.rebuild(true));
+})();
+
+/* ---------- Figure 2: how many splits? toy cost model ---------- */
+(function(){
+ const svg=$("#fd-occ-svg");if(!svg)return;const info=$("#fd-occ-info");
+ const IB=$("#fd-occ-b"),IH=$("#fd-occ-h"),IL=$("#fd-occ-l"),IS=$("#fd-occ-s");
+ const BV=[1,2,4,8,16,32,64],HV=[1,2,4,8,16,32];
+ const BW=2.039e12,SL=216,D=128,G=4,TR=3e-6,SMAX=128;
+ function model(b,h,L,S){const chunk=Math.ceil(L/S);const Se=Math.ceil(L/chunk);const ctas=b*h*Se;const waves=Math.ceil(ctas/SL);
+  const bcta=chunk*D*2*2;const tmain=waves*bcta/(BW/SL);const tred=Se>1?(TR+2*b*h*G*Se*(D+1)*4/BW):0;const ideal=b*h*L*D*4/BW;const t=tmain+tred;
+  return{S:Se,chunk,ctas,waves,busy:Math.min(1,ctas/(waves*SL)),t:t*1e6,ideal:ideal*1e6,eff:ideal/t};}
+ function heur(bh,sms,nb,maxs){if(bh>=0.8*sms)return 1;maxs=Math.min(maxs,sms,nb);const cd=(a,b)=>Math.floor((a+b-1)/b);const el=n=>n===1||cd(nb,n)!==cd(nb,n-1);
+  const eff=[];for(let n=1;n<=maxs;n++){if(!el(n)){eff.push(0);continue;}const w=bh*n/sms;eff.push(w/Math.ceil(w));}const me=Math.max(...eff);
+  for(let n=1;n<=maxs;n++){if(el(n)&&eff[n-1]>=0.85*me)return n;}return 1;}
+ function cur(){return{b:BV[+IB.value],h:HV[+IH.value],L:Math.pow(2,+IL.value),S:+IS.value};}
+ function pick(c){return heur(c.b*c.h,SL,Math.ceil(c.L/128),128);}
+ function draw(){const c=cur();$("#fd-occ-bv").textContent=c.b;$("#fd-occ-hv").textContent=c.h;$("#fd-occ-lv").textContent=cm(c.L);$("#fd-occ-sv").textContent=c.S;
+  const all=[];for(let S=1;S<=SMAX;S++)all.push(model(c.b,c.h,c.L,S));const r=all[c.S-1];const hp=pick(c);
+  const ideal=r.ideal;const tmax=Math.max(...all.map(a=>a.t));const lo=Math.log10(ideal*0.7),hi=Math.log10(tmax*1.3);
+  const X0=70,X1=640,Y0=250,Y1=30,bw=(X1-X0)/SMAX;const Y=t=>Y0-(Math.log10(t)-lo)/(hi-lo)*(Y0-Y1);
+  let g=`<line x1="${X0}" y1="${Y0}" x2="${X1}" y2="${Y0}" stroke="var(--rule)"/><line x1="${X0}" y1="${Y0}" x2="${X0}" y2="${Y1}" stroke="var(--rule)"/>`;
+  for(let e=Math.ceil(lo);e<=Math.floor(hi);e++){const y=Y(Math.pow(10,e));g+=`<line x1="${X0}" y1="${y}" x2="${X1}" y2="${y}" stroke="var(--rule2)"/>`+T_(X0-6,y+4,cm(Math.pow(10,e))+" µs",'text-anchor="end" font-size="11" class="svgs"');}
+  all.forEach((a,i)=>{const x=X0+i*bw;const sel=i===c.S-1;g+=`<rect x="${x+0.5}" y="${Y(a.t)}" width="${Math.max(1,bw-1)}" height="${Y0-Y(a.t)}" fill="${sel?"var(--q)":"var(--k)"}" opacity="${sel?1:0.45}"/>`;});
+  const yi=Y(ideal);g+=`<line x1="${X0}" y1="${yi}" x2="${X1}" y2="${yi}" stroke="var(--v)" stroke-width="2" stroke-dasharray="6 4"/>`;
+  const xh=X0+(hp-0.5)*bw;g+=`<path d="M${xh} ${Y0+4} l-5 9 h10 z" fill="var(--q)"/>`+T_(xh,Y0+26,"FA2 pick "+hp,'text-anchor="middle" font-size="11" fill="var(--q)" font-weight="600"');
+  [1,16,32,64,96,128].forEach(S=>{if(Math.abs(S-hp)>6)g+=T_(X0+(S-0.5)*bw,Y0+16,S,'text-anchor="middle" font-size="11" class="svgs"');});
+  g+=T_(X1,Y0+42,"number of splits S",'text-anchor="end" font-size="11.5" class="svgs"');
+  const xs=X0+(c.S-0.5)*bw;g+=T_(Math.min(Math.max(xs,X0+40),X1-40),Math.max(Y(r.t)-8,Y1+10),fx(r.t,1)+" µs",'text-anchor="middle" font-size="12" font-weight="700" fill="var(--q)"');
+  svg.innerHTML=g;
+  info.innerHTML=`S = <b>${r.S}</b> (chunks of ${cm(r.chunk)} tokens) · blocks <b>${cm(r.ctas)}</b> · waves ${r.waves} · slots busy ${fx(100*r.busy,1)}% · time <b>${fx(r.t,1)} µs</b> · ideal ${fx(r.ideal,1)} µs · efficiency <b>${fx(100*r.eff,1)}%</b> · FlashAttention-2 heuristic: S = <b>${hp}</b>`+(r.S!==c.S?` (S = ${c.S} gives the same chunk length as ${r.S})`:"");}
+ [IB,IH,IL,IS].forEach(e=>e.addEventListener("input",draw));
+ $("#fd-occ-auto").addEventListener("click",()=>{IS.value=pick(cur());draw();});
+ draw();
+})();
+
+/* ---------- Figure 3: unified max value and its safe window ---------- */
+(function(){
+ const svg=$("#fd-umax-svg");if(!svg)return;const info=$("#fd-umax-info"),seg=$("#fd-umax-f");const IM=$("#fd-umax-mu"),IP=$("#fd-umax-phi");
+ const N=64;const f32=Math.fround;
+ function f16(x){if(x===0)return 0;if(!isFinite(x))return x;if(Math.abs(x)>65520)return Infinity;let e=Math.floor(Math.log2(Math.abs(x)));e=Math.max(e,-14);const q=Math.pow(2,e-10);const r=Math.round(x/q)*q;return Math.abs(r)>65504?Infinity:r;}
+ const LIM={fp32:{hi:Math.log(3.4028234663852886e38),lo:Math.log(Math.pow(2,-150)),name:"FP32"},fp16:{hi:Math.log(65504),lo:Math.log(Math.pow(2,-25)),name:"FP16"}};
+ function run(mu,phi,fmt){const s=[],v=[];for(let j=0;j<N;j++){s.push(mu+6*Math.sin(2.399*j+0.5));v.push(1+Math.cos(1.3*j));}
+  const m=Math.max(...s);let z=0,o=0;s.forEach((x,i)=>{const e=Math.exp(x-m);z+=e;o+=e*v[i];});const ex=o/z;
+  const rf=fmt==="fp32"?f32:f16;let num=0,den=0,lost=0,ov=false;const st=[];
+  s.forEach((x,i)=>{const zz=x-phi;const e=zz<700?rf(Math.exp(zz)):Infinity;let k="ok";if(e===Infinity){ov=true;k="ov";}else if(e===0){lost++;k="lost";}st.push(k);num=f32(num+f32(e*v[i]));den=f32(den+e);});
+  const out=(den>0&&!ov)?num/den:NaN;return{s,z:s.map(x=>x-phi),st,ex,out,ov,lost,err:isNaN(out)?NaN:Math.abs(out-ex)};}
+ function draw(){const mu=+IM.value,phi=+IP.value,fmt=segVal(seg,"f")||"fp32";$("#fd-umax-muv").textContent=mn(mu);$("#fd-umax-phiv").textContent=mn(phi);
+  const r=run(mu,phi,fmt),L=LIM[fmt];const zmin=Math.min(...r.z),zmax=Math.max(...r.z);
+  const a=Math.min(zmin,L.lo)-6,b=Math.max(zmax,L.hi)+6;const X0=30,X1=620;const X=t=>X0+(t-a)/(b-a)*(X1-X0);
+  let g=`<rect x="${X(L.hi)}" y="40" width="${X1-X(L.hi)}" height="120" fill="var(--k-soft)"/><rect x="${X0}" y="40" width="${X(L.lo)-X0}" height="120" fill="var(--rule2)"/>`;
+  g+=`<line x1="${X(L.hi)}" y1="36" x2="${X(L.hi)}" y2="164" stroke="var(--k)" stroke-width="2"/>`+T_(X(L.hi)-4,54,"overflow →",'text-anchor="end" font-size="12" fill="var(--k)" font-weight="600"')+T_(X(L.hi)-4,70,"e^x = Inf",'text-anchor="end" font-size="11" fill="var(--k)"');
+  g+=`<line x1="${X(L.lo)}" y1="36" x2="${X(L.lo)}" y2="164" stroke="var(--muted)" stroke-width="2"/>`+T_(X(L.lo)+4,54,"← rounds to 0",'font-size="12" class="svgs" font-weight="600"');
+  g+=T_(X(L.hi),30,fx(L.hi,2),'text-anchor="middle" font-size="11" fill="var(--k)"')+T_(X(L.lo),30,fx(L.lo,2),'text-anchor="middle" font-size="11" class="svgs"');
+  g+=`<line x1="${X0}" y1="170" x2="${X1}" y2="170" stroke="var(--rule)"/>`;
+  const step=(b-a)>120?50:(b-a)>50?20:10;for(let t=Math.ceil(a/step)*step;t<=b;t+=step){g+=`<line x1="${X(t)}" y1="166" x2="${X(t)}" y2="174" stroke="var(--muted)"/>`+T_(X(t),190,mn(t),'text-anchor="middle" font-size="11" class="svgs"');}
+  if(a<0&&b>0)g+=`<line x1="${X(0)}" y1="40" x2="${X(0)}" y2="160" stroke="var(--q)" stroke-dasharray="3 3"/>`+T_(X(0),210,"s − φ = 0",'text-anchor="middle" font-size="11" fill="var(--q)"');
+  r.z.forEach((t,j)=>{const c=r.st[j]==="ov"?"var(--k)":r.st[j]==="lost"?"var(--muted)":"var(--v)";g+=`<circle cx="${X(t)}" cy="${80+(j%8)*9}" r="3.4" fill="${c}"/>`;});
+  g+=T_(X1,224,`axis: s_j − φ, exp rounded to ${L.name}`,'text-anchor="end" font-size="11.5" class="svgs"');
+  svg.innerHTML=g;
+  const e=r.err;const es=isNaN(e)?"":(e===0?"0":e.toExponential(1).replace("e-","×10^−").replace("e+","×10^"));
+  info.innerHTML=`max(s − φ) = <b>${fx(zmax,2)}</b>, min = ${fx(zmin,2)} · overflow: <b>${r.ov?"yes":"no"}</b> · exponentials rounded to 0: <b>${r.lost}</b> of 64 · `+
+   (r.ov?`<b>fallback</b>: this row is recomputed with the synchronized softmax (exact o = ${fx(r.ex,6)})`:`o = ${fx(r.out,6)}, exact ${fx(r.ex,6)} · error <b>${es}</b> · no fallback`);}
+ [IM,IP].forEach(x=>x.addEventListener("input",draw));segInit(seg,"f",draw);draw();
+})();
+
+/* ---------- Figure 5: paged KV cache, block table and partitions ---------- */
+(function(){
+ const svg=$("#fd-page-svg");if(!svg)return;const info=$("#fd-page-info"),seg=$("#fd-page-q"),IT=$("#fd-page-t");
+ const P=16,PART=32;const SEQ=[{n:"A",len:45,bt:[7,2,11]},{n:"B",len:70,bt:[4,13,0,9,14]},{n:"C",len:20,bt:[5,10]}];
+ const owner={};SEQ.forEach((q,i)=>q.bt.forEach((p,k)=>owner[p]={q:i,k}));
+ const PC=["var(--q)","var(--k)","var(--v)"],PS=["var(--q-soft)","var(--k-soft)","var(--v-soft)"];
+ let qi=Number(segVal(seg,"q")||1);
+ function draw(){const q=SEQ[qi];IT.max=q.len-1;if(+IT.value>q.len-1)IT.value=q.len-1;const t=+IT.value;$("#fd-page-tv").textContent=t;
+  const np=q.bt.length,lp=Math.floor(t/P),slot=t%P,phys=q.bt[lp];const ppp=PART/P;
+  const lw=110,lx0=330-np*lw/2;let g=T_(20,22,`Sequence ${q.n}: logical pages (block table [${q.bt.join(", ")}])`,'font-size="14" font-weight="700" class="svgt"');
+  const pos={};for(let c=0;c<16;c++){const r=Math.floor(c/8),col=c%8;pos[c]=[44+col*74,206+r*62];}
+  // arrows first
+  q.bt.forEach((p,i)=>{const x1=lx0+i*lw+lw/2,y1=84,[px,py]=pos[p];const on=i===lp;g+=`<path d="M${x1} ${y1} C ${x1} ${y1+60}, ${px+33} ${py-60}, ${px+33} ${py-2}" fill="none" stroke="${on?"var(--q)":"var(--muted)"}" stroke-width="${on?2.4:1.2}" opacity="${on?1:0.6}"/>`;});
+  q.bt.forEach((p,i)=>{const x=lx0+i*lw,part=Math.floor(i/ppp)%3;const used=Math.min(P,q.len-i*P);
+   g+=`<rect x="${x+4}" y="36" width="${lw-8}" height="48" rx="7" fill="${PS[part]}" stroke="${PC[part]}" stroke-width="1.4"/>`+T_(x+lw/2,52,`logical ${i}`,'text-anchor="middle" font-size="12" font-weight="600" class="svgt"');
+   const cw=(lw-16)/P;for(let k=0;k<P;k++){const isT=i===lp&&k===slot;g+=`<rect x="${x+8+k*cw}" y="60" width="${cw-1}" height="9" fill="${isT?"var(--ink)":k<used?PC[part]:"none"}" stroke="${PC[part]}" stroke-width="0.6" opacity="${k<used||isT?1:0.6}"/>`;}
+   g+=T_(x+lw/2,80,`${used}/16 used`,'text-anchor="middle" font-size="10.5" class="svgs"');});
+  g+=T_(20,186,"physical page pool (shared by all sequences)",'font-size="13" font-weight="600" class="svgs"');
+  for(let c=0;c<16;c++){const [x,y]=pos[c];const o=owner[c];let fill="none",stroke="var(--rule)",lab="free",dash=' stroke-dasharray="4 3"';
+   if(o){dash="";if(o.q===qi){const part=Math.floor(o.k/ppp)%3;fill=PS[part];stroke=PC[part];lab=`${SEQ[o.q].n}, logical ${o.k}`;}else{fill="var(--paper2)";stroke="var(--muted)";lab=`seq ${SEQ[o.q].n}`;}}
+   g+=`<rect x="${x}" y="${y}" width="66" height="46" rx="7" fill="${fill}" stroke="${stroke}" stroke-width="${c===phys?2.6:1.2}"${dash}/>`+T_(x+33,y+19,`page ${c}`,'text-anchor="middle" font-size="12" font-weight="700" class="svgt"')+T_(x+33,y+36,lab,'text-anchor="middle" font-size="10.5" class="svgs"');
+   if(c===phys){g+=T_(x+33,y+60,`slot ${slot}`,'text-anchor="middle" font-size="11" fill="var(--q)" font-weight="700"');}}
+  svg.innerHTML=g;
+  const nparts=Math.ceil(q.len/PART);const groups=[];for(let p=0;p<nparts;p++)groups.push("{"+q.bt.slice(p*ppp,(p+1)*ppp).join(", ")+"}");
+  const last=q.len-(np-1)*P;
+  info.innerHTML=`Sequence ${q.n}: <b>${q.len}</b> tokens → <b>${np}</b> pages, block table [${q.bt.join(", ")}]. Last page: ${last} of 16 slots used (${P-last} empty). Partitions of ${PART} tokens: <b>${nparts}</b> → pages ${groups.join(", ")}. Token <b>${t}</b>: logical page ${lp}, slot ${slot} → <b>physical page ${phys}, slot ${slot}</b>.`;}
+ IT.addEventListener("input",draw);segInit(seg,"q",v=>{qi=Number(v);draw();});draw();
+})();
+})();
+</script></body></html>

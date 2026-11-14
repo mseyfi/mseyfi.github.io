@@ -1,0 +1,459 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>VLM training stages · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 186</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="vlm-training-stages">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="vlm-training-stages" data-session="vlm-training-stages" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">186</span><span>Track 7: Vision and VLMs · session 24 of 38</span></div><h1 class="chap-title">VLM training stages</h1><p class="chap-sub">A vision-language model is built from two trained parts, a vision encoder and an LLM, joined by a new connector with random weights. It is not trained in one go. First only the connector learns to speak the LLM's language; then more parts are unfrozen on large multimodal data; then the model learns to follow instructions; and often a last stage of preference tuning or RL fixes hallucination and reasoning. This session explains each stage with the real recipes of LLaVA-1.5, LLaVA-OneVision, Qwen2-VL, InternVL 2.5, Idefics2, Molmo and MM1, and shows with numbers what to freeze, when, and why.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions on optimization and AdamW (4), the anatomy of a VLM (177), connectors (178) and the case studies (181, 182); SFT and DPO help but are not required</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why VLM training is split into stages: a random connector sends noise into a trained LLM, and big gradients through that noise damage the LLM</li><li>Stage 1 (alignment): train only the projector on image-caption pairs, with a high learning rate; LLaVA-1.5 trains 21.0M of 7.06B weights (0.30%) for about 2,180 steps</li><li>Stage 2 (multimodal pretraining): unfreeze the LLM and often the vision encoder, with smaller learning rates for the encoder, more data, higher resolution and some text-only data</li><li>Stage 3 (instruction tuning) and the optional stage 4 (preference tuning such as DPO and MPO, or RL with verifiable rewards)</li><li>What to freeze, when and why: memory (2 bytes per frozen weight, 16 per trained weight), compute (about 4N instead of 6N FLOPs per token in stage 1), stability, and forgetting</li><li>What the ablations say, including the ones that disagree (Prismatic vs Cambrian-1 on stage 1 and on unfreezing the vision encoder)</li><li>How to write a stage switcher in PyTorch with requires_grad, parameter groups and per-module learning rates</li></ul></div></header><style>
+.vts-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.vts-grid input[type=range]{width:100%;min-width:0}
+.vts-grid output{font-family:var(--mono);font-size:14px;min-width:3.5em;text-align:right}
+.vts-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.vts-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:2px;margin-right:6px;vertical-align:0;background:var(--c);border:1.5px solid var(--b,transparent)}
+.vts-rows{display:grid;grid-template-columns:auto 1fr;gap:8px 12px;align-items:center;font:500 14px var(--sans);margin:6px 0}
+.vts-rows .seg{flex-wrap:wrap}
+.vts-svg text{font-family:var(--sans)}
+.article pre.code,.article code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../vision/lab-build-a-mini-vlm.html">session 185</a> you glued a vision encoder to a small language model with a connector and trained it. It worked, but you had to decide many things on the way: which parts to train, with which learning rate, on which data, and in which order. Real vision-language models (VLMs) answer these questions with a <b>sequence of training stages</b>. This session explains that sequence.</p>
+<p>A VLM is made of three parts (see <a href="../vision/anatomy-of-a-vision-language-model.html">session 177</a>): a <b>vision encoder</b> that turns an image into patch vectors, a <b>connector</b> that maps those vectors into the LLM’s input space, and a <b>language model</b> that reads the visual tokens together with the text. Two of the three parts are already trained, on billions of images and trillions of words. The connector is new and random. If you train everything at once with one learning rate, the random connector sends noise into the LLM, the gradients are large, and the LLM can lose part of what it knew. So almost every recipe starts gently and unfreezes more parts later. [Certain]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “Why does LLaVA train only the projector first?”, “Should you freeze the vision encoder?”, “Why do VLMs mix text-only data into training?”, “What does a preference-tuning stage add to a VLM?”, “How much GPU memory does each stage need?”. All are answered below with numbers you can recompute.</aside>
+<p>The standard plan has three stages and an optional fourth:</p>
+<ol>
+<li><b>Stage 1, alignment:</b> train only the connector (projector) on image–caption pairs.</li>
+<li><b>Stage 2, multimodal pretraining:</b> unfreeze more (the LLM, often the vision encoder) and train on large, mixed data.</li>
+<li><b>Stage 3, instruction tuning:</b> teach the model to follow user requests in a chat format.</li>
+<li><b>Stage 4 (optional), preference tuning or RL:</b> make answers more truthful, less hallucinated, and better at reasoning.</li>
+</ol>
+<p>The names are not fixed. Some papers merge stages 1 and 2, some call stage 2 “stage 1.5”, and some skip stage 1 entirely. The book calls the whole idea the “when” of training, separate from the “how” (supervised, self-supervised, contrastive) [VLM ch. 3]. What stays the same is the logic: <b>which parameters may change, how fast, and on what data</b>. If you fine-tune a VLM for your own product (document reading, video search, a robot), you will make these same decisions, usually with a smaller budget.</p>
+
+<h2>The starting point: two trained parts and one new bridge</h2>
+<p>Let us write the model down. An image \(I\) goes through the vision encoder \(E_\phi\) (weights \(\phi\)) and gives \(N_v\) patch vectors. The connector \(C_\psi\) (weights \(\psi\)) maps each one to the LLM width \(d\). The LLM \(f_\omega\) (weights \(\omega\)) reads the visual tokens followed by the text tokens:</p>
+<div class="eq">\[ \mathbf{h} = \big[\, C_\psi(E_\phi(I))\,;\ \mathrm{Emb}_\omega(x_1), \dots, \mathrm{Emb}_\omega(x_T) \,\big], \qquad p_\theta(x_t \mid I, x_{\lt t}) = \softmax\big(f_\omega(\mathbf{h})_t\big) \tag{186.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\theta = (\phi, \psi, \omega)\)</dt><dd>all weights: vision encoder, connector, LLM</dd>
+<dt>\(C_\psi(E_\phi(I))\)</dt><dd>the visual tokens, \(N_v\) vectors of width \(d\) (576 for LLaVA-1.5 at 336 px, 729 for SigLIP at 384 px)</dd>
+<dt>\(\mathrm{Emb}_\omega(x_t)\)</dt><dd>the embedding of text token \(x_t\); the embedding table is part of the LLM</dd>
+<dt>\([\,\cdot\,;\,\cdot\,]\)</dt><dd>joining the two lists of vectors into one sequence</dd></dl>
+<p>Every stage trains this model with the same basic loss: next-token prediction. But we only want the model to learn to <b>produce</b> the parts it will produce at test time: the caption, or the assistant’s answer. The image tokens, the system prompt and the user’s question are input, not output. So we use a <b>loss mask</b> \(m_t\) (see <a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a>):</p>
+<div class="eq">\[ \mathcal{L}(\theta) = -\frac{1}{\sum_t m_t} \sum_{t=1}^{T} m_t \, \log p_\theta(x_t \mid I, x_{\lt t}), \qquad m_t = \begin{cases} 1 & \text{if } x_t \text{ is a target token} \\ 0 & \text{otherwise} \end{cases} \tag{186.2} \]</div>
+<p>In stage 1 the targets are the caption tokens. In stage 3 they are the assistant’s answers in a multi-turn chat. In PyTorch you set the label of every non-target position to −100, which <code>cross_entropy</code> ignores.</p>
+<p>What changes between stages is <b>which</b> of \(\phi, \psi, \omega\) are updated, with which learning rate. We write this as one rule. For each part \(j\) and stage \(s\) there is a learning rate \(\eta_j^{(s)}\), and \(\eta_j^{(s)} = 0\) means “frozen”:</p>
+<div class="eq">\[ \theta_j \leftarrow \theta_j - \eta_j^{(s)} \cdot \mathrm{AdamW}\big(\nabla_{\theta_j} \mathcal{L}\big), \qquad j \in \{\phi, \psi, \omega\}, \quad \eta_j^{(s)} = 0 \ \Leftrightarrow\ \text{part } j \text{ frozen in stage } s \tag{186.3} \]</div>
+<p>In practice “frozen” is stronger than “learning rate 0”: you set <code>requires_grad = False</code>, so PyTorch does not even compute the gradient, and the optimizer does not keep any state for those weights. This saves both compute and memory, as we will count below.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Two experts who speak different languages: a photographer (the vision encoder) and a writer (the LLM). You hire an interpreter (the connector) who knows neither language yet. First the interpreter practises on simple picture descriptions while the experts wait (stage 1). Then all three work together on harder jobs, and the experts adjust a little (stage 2). Then they learn to serve customers politely (stage 3) and to avoid saying things that are not in the photo (stage 4).</aside>
+
+<h2>Why train in stages?</h2>
+<p>Think about the first training step. The connector is random, so the visual tokens are random vectors. The LLM has never seen such vectors. Its loss on the caption is high, and the gradient is large. Where does that gradient go?</p>
+<p>Gradients flow backward from the loss. To reach the connector, they must pass <b>through</b> the LLM: by the chain rule (see <a href="../foundations/optimization-backprop-adamw.html">session 4</a>),</p>
+<div class="eq">\[ \frac{\partial \mathcal{L}}{\partial \psi} = \frac{\partial \mathcal{L}}{\partial \mathbf{h}_{\text{vis}}} \cdot \frac{\partial \mathbf{h}_{\text{vis}}}{\partial \psi}, \qquad \frac{\partial \mathcal{L}}{\partial \omega} = \text{(nonzero whenever the LLM is trainable)} \tag{186.4} \]</div>
+<p>Here \(\mathbf{h}_{\text{vis}}\) are the visual tokens. The first factor is computed by backpropagating through all LLM layers, even if the LLM is frozen. If the LLM is <b>not</b> frozen, the same large, noisy gradient also updates \(\omega\). The LLM then changes its weights to cope with noise, instead of the connector learning to produce useful vectors. Three bad things can happen:</p>
+<ul>
+<li><b>Forgetting.</b> The LLM’s language skill gets worse (it starts to repeat, or loses knowledge). This is the same <i>catastrophic forgetting</i> as in <a href="../posttraining/forgetting-data-mixing-and-model-merging.html">session 61</a>.</li>
+<li><b>Instability.</b> Loss spikes or divergence. Idefics2 reports that unfreezing everything in their fully autoregressive model “would yield loss divergences”, and they could not fix it even by “aggressively lowering the learning rate or gradually unfreezing” [Certain]. They switched to LoRA for the pretrained parts.</li>
+<li><b>Wasted compute.</b> Billions of LLM weights move to fix a problem that a 21M-parameter connector could fix alone.</li>
+</ul>
+<p>The staged recipe avoids this. Stage 1 freezes everything except the connector, so the only thing that can move is the connector. Once the visual tokens make sense to the LLM, the gradients are smaller and more meaningful, and it is safe to let the LLM and the encoder change, slowly. Figure 1 walks through the stages of one real recipe, LLaVA-OneVision-7B.</p>
+<figure class="fig wide" id="vts-pipe"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="vts-pipe-prev">Back</button><button type="button" class="btn primary" id="vts-pipe-play">Play</button><button type="button" class="btn" id="vts-pipe-next">Next</button><span id="vts-pipe-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="vts-pipe-svg" class="vts-svg" viewBox="0 0 760 290" role="img" aria-label="Vision encoder, connector and LLM, showing which part trains in each stage"></svg></div>
+<div class="vts-leg"><span style="--c:var(--paper2);--b:var(--muted)">frozen</span><span style="--c:var(--k-soft);--b:var(--k)">trains</span><span style="--c:var(--q-soft);--b:var(--q)">new, random weights</span></div>
+<div class="readout" id="vts-pipe-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The training stages of LLaVA-OneVision-7B (SigLIP encoder, 2-layer MLP connector, Qwen2-7B LLM), with the trainable parts, learning rates and data of each stage from Table 1 of the paper. The last step shows an optional preference stage from a different paper (MPO on InternVL2-8B).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Follow the colors. In stage 1 only the connector is orange: 0.25% of the weights learn, with a learning rate 100 times higher than later. From stage 1.5 on, everything is orange, but the vision encoder’s learning rate stays 5 times smaller than the LLM’s. Notice also the grey text in the data box: the number of visual tokens per image grows from 729 to up to 7,290. Cheap, low-resolution data comes first; expensive, high-resolution data comes later, when the model can use it.</p></details></figure>
+
+<h2>Stage 1: alignment (projector only)</h2>
+<p><b>Goal:</b> teach the connector to map vision features into vectors that the frozen LLM already “understands”, so that the LLM, given the visual tokens, can write a caption. Nothing else may change.</p>
+<p><b>Data:</b> simple image–caption pairs. LLaVA-1.5 uses 558K pairs from LAION, CC and SBU, re-captioned by BLIP (the “LCS-558K” set) [Certain]. The prompt is just the image; the target is one sentence. Short targets make this stage cheap.</p>
+<p><b>Trainable:</b> only \(\psi\). In LLaVA-1.5 the connector is a 2-layer MLP from 1024 (CLIP ViT-L/14 width) to 4096 (Vicuna width), so it has \(1024 \cdot 4096 + 4096 + 4096 \cdot 4096 + 4096 = 20{,}979{,}712\) parameters (see <a href="../vision/connectors-projector-q-former-perceiver-resampler-pixel.html">session 178</a>).</p>
+<p><b>Learning rate:</b> high, \(10^{-3}\), with batch 256, one epoch, cosine decay and 3% warmup [Certain]. That is 50 times higher than the \(2\times10^{-5}\) of stage 2. A high rate is safe here because only a small, freshly initialized network moves, and the frozen LLM cannot be damaged. The original LLaVA used \(2\times10^{-3}\) with a linear projector; LLaVA-1.5 halved it for the MLP [Certain].</p>
+<div class="worked"><div class="wt">Worked example: how small is stage 1 for LLaVA-1.5-7B?</div>
+<p>Parameter counts (computed from the model configs): CLIP ViT-L/14-336 vision tower \(303{,}507{,}456\); MLP connector \(20{,}979{,}712\); Vicuna-7B (Llama 2 architecture) \(6{,}738{,}415{,}616\). Total \(7{,}062{,}902{,}784 \approx 7.06\)B.</p>
+<p>Trainable in stage 1: \(20{,}979{,}712 / 7{,}062{,}902{,}784 = 0.30\%\). Steps: \(558{,}000 / 256 = 2{,}179.7\), so about <b>2,180 steps</b>. Stage 2 (665K samples, batch 128) is about <b>5,196 steps</b> and trains \(95.7\%\) of the weights. The paper reports about 6 hours for stage 1 and 20 hours for stage 2 on 8 A100 GPUs [Certain].</p></div>
+<h3>Stage 1 is cheap in memory, but not free in compute</h3>
+<p>Training only 0.3% of the weights does <b>not</b> make each step 300 times cheaper. Let \(N\) be the LLM size. A training step costs about \(2N\) FLOPs per token forward, \(2N\) to compute gradients with respect to activations, and \(2N\) for gradients with respect to weights (the \(6N\) rule of <a href="../foundations/optimization-backprop-adamw.html">session 4</a>). With the LLM frozen, we skip only the weight gradients, but we still need the activation gradients to reach the connector (formula 186.4):</p>
+<div class="eq">\[ \text{FLOPs per token} \approx \underbrace{2N}_{\text{forward}} + \underbrace{2N}_{\text{activation grads}} + \underbrace{0}_{\text{weight grads}} = 4N \quad\text{instead of } 6N \tag{186.5} \]</div>
+<p>So stage 1 costs about \(4/6 = 67\%\) of a full step per token. The vision encoder is cheaper: nothing before it trains, so it needs a forward pass only (you can even pre-compute its features). The large savings are in <b>memory</b>: no gradients and no Adam states for 99.7% of the weights (Figure 3).</p>
+<h3>Is stage 1 needed at all?</h3>
+<p>Papers disagree, and this is a good interview topic.</p>
+<ul>
+<li><b>Prismatic</b> (Karamcheti et al.) trained LLaVA-style models with and without stage 1 and found that <b>skipping it</b> gave equal or better scores while saving 20–25% of training cost [Certain]. They use single-stage training afterwards.</li>
+<li><b>Cambrian-1</b> repeated the test with 0, 0.5M and 1.2M adapter (stage 1) samples and found that “pre-training the connector first enhances model performance and that more adapter data further improves performance” [Certain].</li>
+<li><b>Molmo</b> skips the connector-only stage but keeps its purpose: the connector gets a 10 times higher learning rate than the LLM (\(2\times10^{-4}\) vs \(2\times10^{-5}\)) and a short warmup of 200 steps, against 2,000 steps for the ViT and the LLM [Certain].</li>
+<li><b>InternVL 2.5</b> keeps an “MLP warmup” stage and says it improves training stability [Certain].</li>
+</ul>
+<p>A fair reading: with a small budget and good data the effect is small, and the result depends on the encoder and on how much stage-1 data you have. [Likely] The core idea that survives everywhere is: <b>the new connector must move fast while the pretrained parts move slowly</b>. A separate stage, a higher learning rate, or a shorter warmup are three ways to get that.</p>
+
+<h2>Stage 2: multimodal pretraining (unfreeze more)</h2>
+<p><b>Goal:</b> give the model real visual knowledge: reading text in images (OCR), charts, documents, counting, many objects, long and detailed descriptions, and several images per sequence. A connector alone cannot learn this; the LLM (and often the encoder) must change.</p>
+<p><b>Data:</b> much more and much richer than stage 1. Examples:</p>
+<ul>
+<li>LLaVA-OneVision stage 1.5: 4M “high-quality knowledge” samples, mostly detailed re-captions, OCR and document data [Certain].</li>
+<li>Idefics2: interleaved web documents (OBELICS), image–text pairs and PDF pages, about 1.5B images and 225B text tokens in total [Certain].</li>
+<li>Qwen2-VL: about 600B tokens in its first stage and 800B more in its second, 1.4T in total [Certain].</li>
+<li>MM1: 45% interleaved documents, 45% image–text pairs and 10% text-only, for 200K steps (about 400B tokens) [Certain].</li>
+</ul>
+<p><b>Trainable:</b> the connector and the LLM, and in many recent models the vision encoder too. <b>Resolution</b> usually grows here: Idefics2 goes from 384 px in its first pretraining part to up to 980 px in the second, when PDFs enter the mix, because text must be large enough to read [Certain] (see <a href="../vision/high-resolution-and-native-aspect-ratio.html">session 180</a>).</p>
+<h3>Different learning rates for different parts</h3>
+<p>When several parts train together, they rarely share one learning rate. The rule of thumb: the better a part is already trained, the more carefully it should move. In AdamW you write this with <b>parameter groups</b>:</p>
+<div class="eq">\[ \eta_\phi \ \lt\ \eta_\omega \ \le\ \eta_\psi, \qquad \text{e.g. LLaVA-OneVision: } \eta_\phi = 2\times10^{-6},\ \eta_\omega = \eta_\psi = 1\times10^{-5};\ \ \text{Molmo: } 6\times10^{-6},\ 2\times10^{-5},\ 2\times10^{-4} \tag{186.6} \]</div>
+<p>Why is the vision encoder the most careful? It was trained contrastively on billions of images and its features are general. Next-token loss on a few million samples can easily bend them toward the training set (for example, toward documents) and hurt other skills. A 5 to 10 times smaller rate keeps the features close to where they were. InternVL 2.5 says this directly: a lower learning rate in its ViT stage “to prevent catastrophic forgetting” [Certain]. Molmo goes one step further and clips gradients separately for the ViT, the connector and the LLM [Certain].</p>
+<p>How large should the LLM’s rate be? MM1 fitted the best peak rate against model size on small models and extrapolated:</p>
+<div class="eq">\[ \eta^{*}(N) = \exp\!\big(-0.4214 \,\ln N - 0.5535\big) \tag{186.7} \]</div>
+<p>where \(N\) is the number of (non-embedding) LLM parameters. For \(N = 3\times10^{10}\) this gives \(\eta^* = 2.2\times10^{-5}\), the value used for MM1-30B [Certain]; for \(N = 7\times10^9\) it gives \(4.1\times10^{-5}\). The rate falls as models grow: bigger models need gentler steps. Treat the formula as specific to MM1’s setup, not as a law. [Likely]</p>
+<h3>Keep some text-only data</h3>
+<p>A VLM is still a language model, and users ask it pure-text questions too. If stage 2 sees only image data, the LLM drifts away from its text skills. The fix is to mix text-only samples into the batch. With \(K\) data sources and mixing weights \(w_k\):</p>
+<div class="eq">\[ \mathcal{L}_{\text{mix}} = \sum_{k=1}^{K} w_k\, \mathcal{L}_k, \qquad \sum_k w_k = 1, \qquad \text{e.g. MM1: } w_{\text{interleaved}} = 0.45,\ w_{\text{pairs}} = 0.45,\ w_{\text{text}} = 0.10 \tag{186.8} \]</div>
+<p>MM1 found that interleaved data helps few-shot and text-only scores, while caption data helps zero-shot captioning [Certain]. Qwen2-VL says pure text “continues to play a crucial role” in its second stage, and Idefics2 adds text-only instruction data in SFT [Certain]. You will explore this trade-off in Figure 4.</p>
+<h3>Unfreeze fully, or use LoRA?</h3>
+<p>Two different answers work in practice:</p>
+<ul>
+<li><b>Full unfreezing with small rates</b> (MM1, LLaVA-OneVision, Qwen2-VL, InternVL 2.5). Most of the strongest open models do this. It needs sharded training, because every weight now has gradients and optimizer states.</li>
+<li><b>LoRA on the pretrained parts, full training for the new parts</b> (Idefics2). LoRA (see <a href="../posttraining/lora-and-other-peft-methods.html">session 57</a>) adds small low-rank matrices and trains only those. In their ablation, this added 12.9 points over frozen backbones for the fully autoregressive model, and it was stable where full unfreezing diverged [Certain]. LoRA can be merged back, so it costs nothing at inference.</li>
+</ul>
+<h3>Reuse the trained encoder</h3>
+<p>InternVL 2.5 trains its vision encoder once, with a smaller LLM (stage 1.5), and then plugs it into larger LLMs, which skip that stage. They report that their 78B model saw only about 120B training tokens, against 1.4T for Qwen2-VL [Certain]. Training the encoder is expensive; doing it once and reusing it is a cheap trick worth remembering.</p>
+
+<h2>Stage 3: instruction tuning</h2>
+<p><b>Goal:</b> turn a model that can describe images into an assistant that follows requests: answer a question in one word, give a bounding box, read a table into JSON, compare two images, explain a chart step by step. This is supervised fine-tuning (SFT, see <a href="../posttraining/sft-in-detail.html">session 54</a>) with images.</p>
+<p><b>Data format:</b> multi-turn chats in the model’s chat template (see <a href="../foundations/special-tokens-chat-templates-and-tokenizer-pitfalls.html">session 9</a>). The image appears as a placeholder that is replaced by the visual tokens. The loss mask (186.2) keeps only the assistant’s turns. LLaVA-1.5’s 665K mix is a good small example [Certain]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Source</th><th>Samples</th><th>What it teaches</th></tr></thead><tbody>
+<tr><td>LLaVA conversations (GPT-generated)</td><td>158K</td><td>open chat about an image</td></tr>
+<tr><td>ShareGPT (text only)</td><td>40K</td><td>keeps the language skill</td></tr>
+<tr><td>VQAv2, GQA, OKVQA, A-OKVQA</td><td>83K + 72K + 9K + 66K</td><td>short answers, multiple choice</td></tr>
+<tr><td>OCRVQA, TextCaps</td><td>80K + 22K</td><td>reading text in images</td></tr>
+<tr><td>RefCOCO, Visual Genome</td><td>48K + 86K</td><td>regions and box coordinates</td></tr>
+<tr><td><b>Total</b></td><td><b>665K</b></td><td></td></tr></tbody></table></div>
+<p>Two details from that recipe matter a lot. First, academic VQA data has very short answers, so LLaVA-1.5 adds a <b>format prompt</b> such as “Answer the question using a single word or phrase.” Without it the model learns to answer everything in one word. Molmo does the same with style tags such as “vqa2:” [Certain]. Second, several QA pairs about the same image are merged into one conversation, so the image is encoded once.</p>
+<p><b>Trainable:</b> at least the connector and the LLM. LLaVA-1.5 keeps the encoder frozen; LLaVA-OneVision, MM1 and InternVL 2.5 train everything; Qwen2-VL locks the ViT again in this stage [Certain]. The learning rate is small (\(10^{-5}\) to \(2\times10^{-5}\)), usually one epoch.</p>
+<p><b>Data quality matters more here than anywhere else.</b> The LLM is trainable and it writes the final answer. InternVL 2.5 reports that “even a small amount of noisy data (e.g., a few thousand samples) can lead to abnormal model behavior, like repetitive output” [Certain]. Idefics2 adds a short extra stage (“chatty”, a few hundred steps on long dialogue data) because benchmark-style SFT made its answers too short for real users [Certain]. LLaVA-OneVision ends with a short mixed phase of 1.6M single-image, multi-image and video samples, and that phase is where its video skill comes from [Certain].</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Benchmarks reward short answers; users prefer full answers. A model tuned only on academic VQA data scores well and feels bad to use. Keep some long-form conversation data in SFT, or add a short final chat phase.</aside>
+
+<h2>Stage 4 (optional): preference tuning or RL</h2>
+<p>After SFT the model follows instructions, but two problems remain. It <b>hallucinates</b>: it describes objects that are not in the image, because the LLM’s language prior is strong (see <a href="../applications/hallucination-calibration-and-uncertainty.html">session 156</a>). And its <b>step-by-step reasoning</b> on charts and math is weak: SFT shows it correct answers but never tells it which of its own answers are bad. A fourth stage fixes this with preference data or rewards.</p>
+<p><b>Preference tuning.</b> For each prompt (image plus question), you have a chosen answer \(y_c\) and a rejected answer \(y_r\). DPO (see <a href="../posttraining/dpo-alignment-without-a-separate-reward-model.html">session 68</a>) raises the likelihood of \(y_c\) relative to \(y_r\), compared with a frozen copy \(\pi_0\) of the SFT model:</p>
+<div class="eq">\[ \mathcal{L}_{\text{DPO}} = -\log \sigma\!\left( \beta \log \frac{\pi_\theta(y_c \mid x)}{\pi_0(y_c \mid x)} - \beta \log \frac{\pi_\theta(y_r \mid x)}{\pi_0(y_r \mid x)} \right) \tag{186.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(x\)</dt><dd>the input: image tokens and the question</dd>
+<dt>\(\pi_\theta,\ \pi_0\)</dt><dd>the model being trained and the frozen reference (the SFT model)</dd>
+<dt>\(\beta\)</dt><dd>how strongly the model is kept close to \(\pi_0\); MPO uses 0.1</dd>
+<dt>\(\sigma\)</dt><dd>the sigmoid function</dd></dl>
+<p>Where do the pairs come from? For hallucination, the rejected answer can be the model’s own description and the chosen one a human correction of it (RLHF-V). [Likely] For reasoning, the MPO paper (Wang et al., on InternVL2-8B) builds about 3M pairs (the MMPR set) in two ways: when the true answer is known, chosen answers are sampled answers that reach it and rejected ones are those that do not; when it is not known, the model completes a half-written answer <b>without the image</b>, and that completion is the rejected answer (“Dropout NTP”), since it shows what the model writes when it is not looking [Certain].</p>
+<p>MPO also found that DPO alone did little for chain-of-thought answers, while adding the plain SFT loss helped [Certain]. Its final loss is a mix:</p>
+<div class="eq">\[ \mathcal{L}_{\text{MPO}} = 0.8\, \mathcal{L}_{\text{DPO}} + 0.2\, \mathcal{L}_{\text{BCO}} + 1.0\, \mathcal{L}_{\text{SFT}}(y_c) \tag{186.10} \]</div>
+<p>Here \(\mathcal{L}_{\text{BCO}}\) is a “quality” loss that scores each answer on its own (good or bad), and \(\mathcal{L}_{\text{SFT}}(y_c)\) is formula (186.2) on the chosen answer. All parameters train with learning rate \(5\times10^{-6}\) for one epoch. On MathVista, InternVL2-8B went from 58.3 to 67.0 [Certain].</p>
+<p><b>RL with verifiable rewards.</b> For tasks with checkable answers (math on a figure, counting, a box that must overlap the object, a chart value), you can sample several answers and reward the correct ones with GRPO (see <a href="../posttraining/grpo-and-rl-with-verifiable-rewards-rlvr.html">session 70</a>). Several 2025 VLMs added such a stage for visual reasoning. [Likely] As in text LLMs, this stage uses a very small learning rate and a KL penalty or reference model so the model does not drift far from the SFT model.</p>
+<div class="worked"><div class="wt">Worked example: one DPO loss value</div>
+<p>Suppose, with \(\beta = 0.1\), the trained model makes the chosen answer 2 nats more likely than the reference does (\(\log \pi_\theta/\pi_0 = +2\)) and the rejected answer 1 nat less likely (\(-1\)). The margin is \(0.1 \cdot (2 - (-1)) = 0.3\), and \(\mathcal{L}_{\text{DPO}} = -\log\sigma(0.3) = 0.554\). At the start of training both log-ratios are 0, so the loss is \(-\log\sigma(0) = \ln 2 = 0.693\).</p></div>
+
+<h2>Real recipes side by side</h2>
+<p>Figure 2 puts eight published recipes in one grid. Each row is a stage; each cell says whether the vision encoder, the connector and the LLM train in that stage. The differences are large, and every one of these models is good. There is no single correct recipe, only trade-offs.</p>
+<figure class="fig wide" id="vts-map"><div class="fig-body">
+<div class="controls"><span class="seg" id="vts-map-seg"><button type="button" data-v="llava15" aria-pressed="true">LLaVA-1.5</button><button type="button" data-v="ov" aria-pressed="false">LLaVA-OneVision</button><button type="button" data-v="qwen2vl" aria-pressed="false">Qwen2-VL</button><button type="button" data-v="internvl25" aria-pressed="false">InternVL 2.5</button><button type="button" data-v="idefics2" aria-pressed="false">Idefics2</button><button type="button" data-v="molmo" aria-pressed="false">Molmo</button><button type="button" data-v="mm1" aria-pressed="false">MM1</button><button type="button" data-v="prism" aria-pressed="false">Prismatic</button></span></div>
+<div class="scroll-x"><svg id="vts-map-svg" class="vts-svg" viewBox="0 0 800 174" role="img" aria-label="Grid of training stages and which parts train in each, for the selected model"></svg></div>
+<div class="vts-leg"><span style="--c:var(--paper2);--b:var(--muted)">frozen</span><span style="--c:var(--k-soft);--b:var(--k)">fully trained</span><span style="--c:var(--v-soft);--b:var(--v)">LoRA / DoRA</span><span style="--c:var(--card);--b:var(--rule)">not stated in the paper</span></div>
+<div class="readout" id="vts-map-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Training recipes of eight open VLMs, from their papers (LLaVA-1.5, LLaVA-OneVision, Qwen2-VL, InternVL 2.5, Idefics2, Molmo, MM1, Prismatic). Learning rates are peak values.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Look down the “Vision” column. LLaVA-1.5 and Prismatic never train the encoder; MM1 and Molmo train it from the start; LLaVA-OneVision and InternVL 2.5 start frozen and unfreeze it later; Qwen2-VL trains it first and freezes it at the end. Now look at the “Connector” column of the first row: in most recipes it trains alone in stage 1, but Molmo, MM1 and Idefics2 train it together with everything else and protect the pretrained parts with small learning rates or LoRA instead.</p></details></figure>
+
+<h2>What to freeze, when, and why</h2>
+<p>There are four reasons to freeze a part, and you should be able to name them.</p>
+<ol>
+<li><b>Protection.</b> A random part upstream sends noise; freezing the pretrained parts until it is trained protects them (stage 1).</li>
+<li><b>Memory.</b> A frozen weight needs only its BF16 value (2 bytes). A trained weight with mixed-precision AdamW needs 16 bytes: BF16 weight 2, BF16 gradient 2, FP32 master copy 4, Adam \(m\) 4, Adam \(v\) 4.</li>
+<li><b>Compute.</b> No weight gradients for frozen parts (formula 186.5), and no backward pass at all through parts that sit before every trainable part.</li>
+<li><b>Generality.</b> A part trained on much broader data than yours (the vision encoder, trained on billions of images) can only lose generality on your narrow data.</li>
+</ol>
+<p>And there are two reasons to unfreeze: the frozen part lacks a skill you need (an encoder trained at 224 px cannot read small text in a 1344 px page), or the data is good and large enough to improve it.</p>
+<h3>Memory, by formula</h3>
+<p>Let \(N_{\text{all}}\) be all parameters and \(N_{\text{train}}\) the trainable ones. Before activations:</p>
+<div class="eq">\[ M \approx 2\, N_{\text{all}} + 14\, N_{\text{train}} \ \text{bytes} \tag{186.11} \]</div>
+<p>(2 bytes for every weight, plus 14 more for each trainable one.) For LLaVA-1.5-7B: stage 1 needs \(2 \times 7.06\text{B} + 14 \times 21.0\text{M} = 14.4\) GB; stage 2 needs \(2 \times 7.06\text{B} + 14 \times 6.76\text{B} = 108.8\) GB, more than one 80 GB GPU. This is exactly why LLaVA-1.5 uses DeepSpeed ZeRO-2 for stage 1 and ZeRO-3 (which shards weights, gradients and optimizer states across GPUs) for stage 2 [Certain]. Activation memory comes on top and grows with the number of visual tokens. Try it in Figure 3.</p>
+<figure class="fig" id="vts-mem"><div class="fig-body">
+<div class="vts-rows">
+<span>Model</span><span class="seg" id="vts-mem-model"><button type="button" data-v="7b" aria-pressed="true">LLaVA-1.5-7B</button><button type="button" data-v="13b" aria-pressed="false">LLaVA-1.5-13B</button></span>
+<span>Vision encoder</span><span class="seg" id="vts-mem-vit"><button type="button" data-v="F" aria-pressed="true">Frozen</button><button type="button" data-v="T" aria-pressed="false">Train</button></span>
+<span>Connector</span><span class="seg" id="vts-mem-proj"><button type="button" data-v="F" aria-pressed="false">Frozen</button><button type="button" data-v="T" aria-pressed="true">Train</button></span>
+<span>LLM</span><span class="seg" id="vts-mem-llm"><button type="button" data-v="F" aria-pressed="true">Frozen</button><button type="button" data-v="L" aria-pressed="false">LoRA</button><button type="button" data-v="T" aria-pressed="false">Full</button></span></div>
+<div class="vts-grid"><label for="vts-mem-r">LoRA rank \(r\)</label><input type="range" id="vts-mem-r" min="4" max="128" step="4" value="8"><output id="vts-mem-rv"></output></div>
+<svg id="vts-mem-svg" class="vts-svg" viewBox="0 0 760 196" role="img" aria-label="Stacked bar of training memory in GB: weights, gradients and optimizer states"></svg>
+<div class="vts-leg"><span style="--c:var(--q)">weights, BF16 (all)</span><span style="--c:var(--v)">gradients, BF16 (trainable)</span><span style="--c:var(--k)">FP32 master + Adam m and v (trainable)</span></div>
+<div class="readout" id="vts-mem-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Training memory before activations, from formula (186.11), for LLaVA-1.5-7B and 13B. Parameter counts are computed from the model configs. LoRA is applied to all seven linear layers of every LLM block (q, k, v, o, gate, up, down).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The default is stage 1: only the connector trains, and the bar is almost all blue (frozen BF16 weights, 14.4 GB). Switch the LLM to Full: this is stage 2, and the orange part (optimizer states) dominates, 108.8 GB. Switch to LoRA with rank 8: the LLM gains only 20.0M trainable weights and the total drops to 14.7 GB. That is the memory argument for Idefics2’s LoRA recipe. Training the vision encoder adds about 4.2 GB (14 bytes × 303.5M).</p></details></figure>
+<h3>What the evidence says about the vision encoder</h3>
+<div class="tblw"><table class="tb"><thead><tr><th>Study</th><th>Setting</th><th>Finding</th></tr></thead><tbody>
+<tr><td>Prismatic</td><td>LLaVA-1.5 data (665K), 7B</td><td>Fine-tuning the encoder hurt, most on localization (RefCOCO, OCID-Ref) [Certain]</td></tr>
+<tr><td>Cambrian-1</td><td>23 encoders, 1.2M adapter + 737K SFT</td><td>Unfreezing helped almost everywhere [Certain]</td></tr>
+<tr><td>ShareGPT4V</td><td>1.2M detailed GPT-4V-style captions in pretraining</td><td>Unfreezing the last half of the encoder blocks was best, with a learning rate of \(2\times10^{-5}\) [Certain]</td></tr>
+<tr><td>MM1</td><td>SFT at different resolutions</td><td>Frozen encoder better at low resolution (+2.2 points); unfrozen better at 1344 px (+2.9 points) [Certain]</td></tr>
+<tr><td>Idefics2</td><td>Fully autoregressive, 8B</td><td>Full unfreezing diverged; LoRA on the backbones was stable and +12.9 points over frozen [Certain]</td></tr></tbody></table></div>
+<p>The pattern: unfreezing the encoder helps when (a) the data is large and detailed, (b) the input differs from what the encoder was trained on (higher resolution, documents), and (c) its learning rate is small or it uses LoRA. It hurts when the data is small and noisy. ShareGPT4V puts it simply: earlier works kept the encoder frozen because their captions were low quality, and training on them “might degrade its visual knowledge extraction ability” [Certain].</p>
+<h3>See it in a toy</h3>
+<p>Figure 4 is a toy model small enough to train in your browser, but with the same structure. The “LLM” is a matrix \(W\), pretrained as \(W_0\). The “connector” is a matrix \(P\), started at random. The image task needs the right \(P\) and also a small change of the LLM (\(W_0 \to W_0 + \Delta\)), just as real VLMs need the LLM to learn new skills. We measure two things: the image-task loss, and the <b>drift</b> \(\lVert W - W_0 \rVert^2 / \lVert W_0 \rVert^2\), a stand-in for how much the LLM’s text behavior has changed. The text-only share \(f\) adds the loss \(\lVert W - W_0\rVert^2\) with weight \(f\), like mixing in text data (formula 186.8).</p>
+<figure class="fig" id="vts-toy"><div class="fig-body">
+<div class="controls"><span class="seg" id="vts-toy-seg"><button type="button" data-v="staged" aria-pressed="true">Staged: connector first, then all</button><button type="button" data-v="joint" aria-pressed="false">Joint from step 1</button></span></div>
+<div class="vts-grid">
+<label for="vts-toy-lr">LLM learning rate</label><input type="range" id="vts-toy-lr" min="0.002" max="0.06" step="0.001" value="0.01"><output id="vts-toy-lrv"></output>
+<label for="vts-toy-f">Text-only share \(f\)</label><input type="range" id="vts-toy-f" min="0" max="0.5" step="0.05" value="0"><output id="vts-toy-fv"></output></div>
+<svg id="vts-toy-svg" class="vts-svg" viewBox="0 0 640 326" role="img" aria-label="Image-task loss and LLM drift over 300 training steps for staged and joint training"></svg>
+<div class="vts-leg"><span style="--c:var(--k)">image-task loss</span><span style="--c:var(--q)">LLM drift</span><span style="--c:var(--muted)">the other recipe, for comparison (dashed)</span></div>
+<div class="readout" id="vts-toy-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A toy linear “VLM” (6 × 6 matrices, exact gradient descent, fixed seed) trained for 300 steps. Staged: 150 steps with only the connector (learning rate 0.02), then 150 steps with the LLM unfrozen and the connector rate lowered 10 times. Joint: both train from step 1. The toy shows the mechanism; it does not predict real benchmark numbers.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>With the defaults (LLM rate 0.01, no text data), staged training ends with image loss 0.016 and drift 0.026. Joint training ends with a worse image loss (0.046) and 4.3 times more drift (0.114); its drift peaks at 0.372 early on, when the random connector pushes the LLM around. Raise the LLM rate to 0.06 in joint mode: it diverges in the first steps, as Idefics2 saw at full scale. Staged training stays stable. Then raise the text-only share: drift falls in both recipes, and the image loss rises a little. That is the trade-off of formula (186.8).</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 1: deciding what to train in each stage</div><ol>
+<li><b>input:</b> pretrained encoder \(E_\phi\), pretrained LLM \(f_\omega\), new connector \(C_\psi\), data sources, GPU budget</li>
+<li><b>if</b> \(C_\psi\) is random <b>then</b> train only \(\psi\) on captions with a high rate (stage 1), <b>or</b> give \(\psi\) a 10× higher rate and a short warmup in a joint stage</li>
+<li><b>if</b> the target images differ from the encoder’s training images (resolution, documents, medical, video frames) <b>and</b> there are millions of good samples <b>then</b> unfreeze \(\phi\) with \(\eta_\phi \approx \eta_\omega / 5\), or LoRA</li>
+<li><b>else</b> keep \(\phi\) frozen <span class="c">// cheaper, and safer on small or noisy data</span></li>
+<li><b>if</b> memory \(2N_{\text{all}} + 14N_{\text{train}}\) does not fit <b>then</b> shard (ZeRO-3 / FSDP), or switch \(\omega\) (and \(\phi\)) to LoRA</li>
+<li>mix 5–20% text-only data into every stage that trains \(\omega\) <span class="c">// formula (186.8); exact share is a tuning choice</span></li>
+<li>for SFT, mask all non-answer tokens (186.2) and add format prompts for short-answer data</li>
+<li>after SFT, <b>if</b> hallucination or reasoning is the weak point <b>then</b> add DPO / MPO on preference pairs or RL with verifiable rewards, with a small rate and a reference model</li>
+<li>evaluate text-only benchmarks after every stage to catch forgetting early</li></ol></div>
+
+<h2>Putting it together: a stage switcher in PyTorch</h2>
+<p>All stages share one training loop. Only two things change per stage: which parameters have <code>requires_grad</code>, and the optimizer’s parameter groups with their learning rates.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: one staged training run</div><ol>
+<li><b>input:</b> model \((\phi, \psi, \omega)\), a list of stages, each with a learning rate per part (or “frozen”), data and number of steps</li>
+<li><b>for each</b> stage \(s\) <b>do</b></li>
+<li>&nbsp;&nbsp;for each part \(j\): set <code>requires_grad</code> \(\leftarrow (\eta_j^{(s)} \ne 0)\); put frozen parts with dropout in eval mode</li>
+<li>&nbsp;&nbsp;build a <b>new</b> AdamW with one group per trainable part, learning rate \(\eta_j^{(s)}\) <span class="c">// formula (186.3), (186.6)</span></li>
+<li>&nbsp;&nbsp;build a new warmup + cosine schedule for this stage</li>
+<li>&nbsp;&nbsp;<b>for</b> each batch: build labels with −100 on non-target tokens; loss (186.2); backward; clip; step</li>
+<li>&nbsp;&nbsp;save a checkpoint; evaluate image <b>and</b> text-only benchmarks</li>
+<li><b>end for</b></li></ol></div>
+<p>The code below is a tiny but complete version. The “vision encoder” is an MLP over 16 patch vectors, the “LLM” a 2-layer causal transformer. It runs on a CPU in a few seconds and prints the same numbers every time:</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+V, D, DV, NP = 100, 64, 32, 16          <span class="cm"># vocab, LLM width, vision width, image tokens</span>
+
+<span class="kw2">class</span> TinyVLM(nn.Module):
+    <span class="kw2">def</span> __init__(self):
+        super().__init__()
+        self.vision = nn.Sequential(nn.Linear(48, DV), nn.GELU(), nn.Linear(DV, DV))  <span class="cm"># "pretrained" encoder</span>
+        self.connector = nn.Sequential(nn.Linear(DV, D), nn.GELU(), nn.Linear(D, D))  <span class="cm"># new, random</span>
+        self.embed = nn.Embedding(V, D)
+        layer = nn.TransformerEncoderLayer(D, 4, 4 * D, dropout=0.0, batch_first=True, norm_first=True)
+        self.blocks = nn.TransformerEncoder(layer, 2, enable_nested_tensor=False)
+        self.head = nn.Linear(D, V, bias=False)
+    <span class="kw2">def</span> llm_params(self):
+        <span class="kw2">return</span> [*self.embed.parameters(), *self.blocks.parameters(), *self.head.parameters()]
+    <span class="kw2">def</span> forward(self, patches, ids):
+        img = self.connector(self.vision(patches))                  <span class="cm"># (B, NP, D): visual tokens</span>
+        h = torch.cat([img, self.embed(ids)], dim=1)                <span class="cm"># formula (186.1): image first, then text</span>
+        T = h.size(1)
+        causal = torch.triu(torch.full((T, T), float("-inf")), diagonal=1)
+        h = self.blocks(h, mask=causal)
+        <span class="kw2">return</span> self.head(h[:, NP - 1:-1])                           <span class="cm"># position i predicts text token i</span>
+
+<span class="cm"># which part trains in which stage, and with which learning rate (None = frozen)</span>
+STAGES = {
+    "1-align":    {"vision": None, "connector": 1e-3, "llm": None},
+    "2-pretrain": {"vision": 2e-6, "connector": 1e-5, "llm": 1e-5},
+    "3-sft":      {"vision": None, "connector": 1e-5, "llm": 1e-5},
+}
+
+<span class="kw2">def</span> set_stage(model, stage):
+    parts = {"vision": list(model.vision.parameters()),
+             "connector": list(model.connector.parameters()),
+             "llm": model.llm_params()}
+    groups = []
+    <span class="kw2">for</span> name, params <span class="kw2">in</span> parts.items():
+        lr = STAGES[stage][name]
+        <span class="kw2">for</span> p <span class="kw2">in</span> params:
+            p.requires_grad_(lr <span class="kw2">is not</span> None)                       <span class="cm"># frozen: no gradient, no optimizer state</span>
+        <span class="kw2">if</span> lr <span class="kw2">is not</span> None:
+            groups.append({"params": params, "lr": lr, "name": name})
+    <span class="kw2">return</span> torch.optim.AdamW(groups, betas=(0.9, 0.95), weight_decay=0.0)   <span class="cm"># formula (186.3)</span>
+
+<span class="kw2">def</span> masked_loss(logits, ids, n_prompt):
+    labels = ids.clone()
+    labels[:, :n_prompt] = -100                                     <span class="cm"># formula (186.2): no loss on the prompt</span>
+    <span class="kw2">return</span> F.cross_entropy(logits.reshape(-1, V), labels.reshape(-1), ignore_index=-100)
+
+model = TinyVLM()
+patches = torch.randn(8, NP, 48)
+ids = torch.randint(0, V, (8, 12))
+<span class="kw2">for</span> stage <span class="kw2">in</span> STAGES:
+    opt = set_stage(model, stage)                                   <span class="cm"># a NEW optimizer per stage</span>
+    n_train = sum(p.numel() <span class="kw2">for</span> g <span class="kw2">in</span> opt.param_groups <span class="kw2">for</span> p <span class="kw2">in</span> g["params"])
+    n_all = sum(p.numel() <span class="kw2">for</span> p <span class="kw2">in</span> model.parameters())
+    before = model.vision[0].weight.detach().clone()
+    <span class="kw2">for</span> step <span class="kw2">in</span> range(30):
+        loss = masked_loss(model(patches, ids), ids, n_prompt=4)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        opt.step()
+    moved = (model.vision[0].weight - before).abs().max().item()
+    print(f"{stage:11s} trainable {n_train:6d}/{n_all} ({100*n_train/n_all:4.1f}%)  "
+          f"loss {loss.item():.3f}  vision moved {moved:.1e}")
+<span class="cm"># 1-align     trainable   6272/121664 ( 5.2%)  loss 4.577  vision moved 0.0e+00</span>
+<span class="cm"># 2-pretrain  trainable 121664/121664 (100.0%)  loss 4.493  vision moved 6.2e-05</span>
+<span class="cm"># 3-sft       trainable 119040/121664 (97.8%)  loss 4.412  vision moved 0.0e+00</span></pre>
+<p>The output (PyTorch 2.8, CPU) confirms the mechanics: in stage 1 and stage 3 the vision weights do not move at all, and in stage 2 they move only slightly because of their small rate. The data here is random, so the loss stays near \(\ln 100 = 4.61\); the point is the freezing logic, not the learning. In a real run you would also use a warmup + cosine schedule per stage, gradient clipping, BF16, and real image–text data, and you would put frozen modules with dropout or batch norm in <code>eval()</code> mode.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical staging</th><th>Why</th></tr></thead><tbody>
+<tr><td>Building a general open VLM (LLaVA, Qwen-VL, InternVL families)</td><td>Connector warmup → full pretraining with small encoder rate → SFT → optional DPO / MPO / RL</td><td>The recipes of Figure 2; budget decides how much is unfrozen</td></tr>
+<tr><td>Adapting a VLM to documents, charts, screenshots</td><td>Continue stage 2 at higher resolution with OCR / PDF data, encoder unfrozen at a low rate or with LoRA; then task SFT</td><td>The frozen encoder cannot read small text (MM1: unfreezing helps at 1344 px)</td></tr>
+<tr><td>Video understanding (video QA, captioning, action recognition)</td><td>Start from an image VLM; a short video SFT phase with frames as image tokens, often with the encoder frozen</td><td>LLaVA-OneVision gets its video skill from a 1.6M-sample final mixed phase [Certain]; frozen encoders keep frame features stable [Likely]</td></tr>
+<tr><td>Temporal grounding and key-moment detection in long video</td><td>Freeze the encoder; train the connector and the LLM (often LoRA) on data with timestamps in the answers</td><td>The new skill is in the language side: writing “from 0:42 to 0:51” [Likely]</td></tr>
+<tr><td>Video retrieval and Video-RAG</td><td>Keep the retrieval encoder frozen (CLIP / SigLIP embeddings in the index); fine-tune only the answering VLM</td><td>Changing the encoder would force you to re-embed the whole video index [Likely]</td></tr>
+<tr><td>A small product fine-tune on one GPU (for example, defect inspection)</td><td>Freeze encoder, LoRA on the LLM, train connector; one SFT stage; maybe DPO against hallucinated defects</td><td>Memory (186.11) and small data; a frozen encoder generalizes better [Likely]</td></tr>
+<tr><td>Vision-language-action models for robots</td><td>Start from a trained VLM, then train on robot trajectories with action tokens</td><td>The VLM stages give world knowledge; the last stage adds a new output type (see <a href="../video/agentic-vlms-and-vision-language-action-models.html">session 220</a>) [Likely]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Training everything at once with one high learning rate.</b> A random connector plus a trainable LLM is the classic way to get loss spikes and a model that forgot how to write (Figure 4). Train the connector first, or give each part its own rate.</li>
+<li><b>Reusing the optimizer across stages.</b> Adam’s \(m\) and \(v\) from stage 1 belong to the connector only; parameters added in stage 2 have no state, and the schedule is wrong. Build a new optimizer and schedule per stage.</li>
+<li><b>“Frozen” parts that still change.</b> Setting <code>requires_grad=False</code> does not stop dropout or batch-norm running statistics; and passing frozen weights to the optimizer with weight decay can still shrink them in some setups. Put frozen modules in <code>eval()</code> and leave them out of the optimizer.</li>
+<li><b>No loss mask.</b> Training on the prompt and the image placeholder tokens wastes capacity and teaches the model to generate user questions. Label every non-answer token −100.</li>
+<li><b>Only image data in stages that train the LLM.</b> Text-only benchmarks drop. Mix in text data (MM1 used 10% in pretraining) and check text benchmarks after each stage.</li>
+<li><b>Unfreezing the vision encoder on small or noisy data.</b> Its features get worse, especially for localization (Prismatic). Unfreeze with a 5–10× smaller rate, only with enough good data, or use LoRA.</li>
+<li><b>Short-answer SFT only.</b> The model scores well on VQA benchmarks but answers users in one word. Add format prompts and long-form chat data.</li>
+<li><b>Noisy SFT data.</b> A few thousand bad samples can cause repetition (InternVL 2.5). Filter SFT data harder than pretraining data.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why does LLaVA train only the projector in stage 1?<span class="lvl">basic</span></summary><div class="ans">The projector starts random, so at first the visual tokens are noise. If the LLM were trainable, the large, noisy gradients would change billions of LLM weights to cope with that noise, which risks forgetting and instability. Freezing the encoder and the LLM means only the 21.0M-parameter MLP moves (0.30% of LLaVA-1.5-7B), with a high learning rate of \(10^{-3}\), for about 2,180 steps on 558K captions. After that the visual tokens are in a space the LLM can read, and stage 2 can safely unfreeze the LLM at \(2\times10^{-5}\).</div></details>
+<details class="qa"><summary>If only 0.3% of weights train in stage 1, is each step 300 times cheaper?<span class="lvl">core</span></summary><div class="ans">No. The gradient must still flow backward through the whole frozen LLM to reach the connector, so you still pay for the forward pass (\(2N\) per token) and for activation gradients (\(2N\)); you save only the weight gradients (\(2N\)). That is about \(4N\) instead of \(6N\), 67% of a full step. The vision encoder needs only a forward pass because nothing before it trains. The big savings are in memory: no gradients and no Adam states for frozen weights, 2 bytes instead of 16 per parameter (14.4 GB vs 108.8 GB for LLaVA-1.5-7B before activations).</div></details>
+<details class="qa"><summary>Should you freeze the vision encoder? Give evidence both ways.<span class="lvl">core</span></summary><div class="ans">It depends on data and resolution. Prismatic found that fine-tuning the encoder on LLaVA-1.5’s 665K data hurt, mostly on localization. Cambrian-1, with 1.2M adapter samples, found unfreezing helps almost everywhere. MM1 found frozen was better at low resolution (+2.2) and unfrozen better at 1344 px (+2.9). ShareGPT4V found unfreezing the last half of the encoder helps with high-quality captions. Rule: freeze on small or noisy data and when the input matches the encoder’s pretraining; unfreeze with a 5–10× smaller learning rate (LLaVA-OneVision: \(2\times10^{-6}\) vs \(10^{-5}\)) or LoRA when data is large and the inputs differ (documents, high resolution).</div></details>
+<details class="qa"><summary>What changes from stage 1 to stage 2?<span class="lvl">basic</span></summary><div class="ans">Trainable parts: the LLM, and often the encoder, join the connector. Data: from short captions to millions or billions of richer samples: detailed re-captions, OCR, documents, interleaved web pages, several images per sequence, plus text-only data. Resolution and the number of visual tokens grow (Idefics2 from 384 to 980 px; LLaVA-OneVision from 729 to up to 3,645 tokens per image). Learning rates drop (from \(10^{-3}\) to about \(10^{-5}\)) and differ per part.</div></details>
+<details class="qa"><summary>Why do VLM recipes mix text-only data into multimodal training?<span class="lvl">core</span></summary><div class="ans">Training the LLM only on image-conditioned data shifts its weights toward that distribution and its pure-language skills (knowledge, instruction following, math, code) degrade. Text-only samples keep a loss term that pulls the model toward its original text behavior, as in formula (186.8). MM1 used 10% text-only data in pretraining; LLaVA-1.5 includes 40K ShareGPT conversations in its 665K SFT mix; Idefics2 adds text-only instruction data. You should track text benchmarks after each stage.</div></details>
+<details class="qa"><summary>Idefics2 could not stabilize full unfreezing. What did they do and why does it work?<span class="lvl">advanced</span></summary><div class="ans">They trained the newly initialized parts (Perceiver resampler and MLP) fully and the pretrained backbones through LoRA. LoRA restricts each weight update to a low-rank matrix starting at zero, so the pretrained weights cannot move far or fast, which avoids the divergence, while still adding much more capacity than frozen backbones (+12.9 points in their ablation). It also saves memory, because only the small adapter matrices need gradients and Adam states, and the adapters can be merged after training at no inference cost.</div></details>
+<details class="qa"><summary>Design the SFT stage for a VLM. What makes it work?<span class="lvl">core</span></summary><div class="ans">Multi-turn chats in the model’s chat template, with the image placeholder replaced by visual tokens; loss only on assistant tokens (labels −100 elsewhere); a mix of open conversation, short-answer VQA with explicit format prompts, OCR and document QA, grounding with coordinates, multi-image and video if needed, and some text-only chat. Merge several QA pairs about one image into one conversation. Small learning rate (around \(10^{-5}\)), one epoch, strict quality filtering: a few thousand bad samples can cause repetitive output. Optionally a short final phase of long-form chat so answers are not too short.</div></details>
+<details class="qa"><summary>What does a preference or RL stage add to a VLM after SFT?<span class="lvl">core</span></summary><div class="ans">SFT only shows good answers; it never pushes down the model’s own bad answers. A preference stage (DPO, formula 186.9) uses pairs of chosen and rejected answers for the same image and question, so the model learns what not to say: hallucinated objects (RLHF-V uses human corrections) or wrong reasoning chains. MPO mixes DPO, a quality loss and the SFT loss (0.8 / 0.2 / 1.0) and raised InternVL2-8B on MathVista from 58.3 to 67.0. For checkable tasks, RL with verifiable rewards (GRPO) rewards correct sampled answers. Both use a small learning rate and a reference model to avoid drifting.</div></details>
+<details class="qa"><summary>How can you create rejected answers for VLM preference data without humans?<span class="lvl">advanced</span></summary><div class="ans">If the true answer is known (math, charts, multiple choice), sample many answers and label those that reach it as chosen and the rest as rejected. If it is not known (open captions), MPO’s Dropout NTP truncates a model answer halfway and asks the model to finish it <b>without the image</b>; the completion is likely to contain language-prior hallucinations, so it is used as the rejected answer and the original as the chosen one. Other options: inject wrong objects into a correct caption, or use a stronger model as a judge. [Certain for MPO; Likely for the others]</div></details>
+<details class="qa"><summary>Stage 2 of LLaVA-1.5-7B does not fit on one 80 GB GPU. Why, and what are your options?<span class="lvl">advanced</span></summary><div class="ans">With mixed-precision AdamW, every trained weight costs 16 bytes and every frozen one 2. Stage 2 trains 6.76B of 7.06B weights: \(2 \times 7.06 + 14 \times 6.76 = 108.8\) GB before activations. Options: shard weights, gradients and optimizer states over GPUs (ZeRO-3 / FSDP, as LLaVA-1.5 does with DeepSpeed stage 3); LoRA on the LLM (about 14.7 GB with rank 8); 8-bit optimizers; and activation checkpointing for the activation part, which grows with visual tokens.</div></details>
+<details class="qa"><summary>Prismatic says stage 1 is unnecessary; Cambrian-1 says it helps. How do you reconcile them?<span class="lvl">advanced</span></summary><div class="ans">They tested different conditions. Prismatic used LLaVA-1.5’s data, where the 558K stage-1 captions are short and add little beyond what the 665K SFT data teaches, and mostly CLIP-like encoders. Cambrian-1 used up to 1.2M richer ShareGPT4V captions and many encoders, including self-supervised ones whose features are further from language, where a dedicated alignment phase matters more. The common lesson is that the connector must catch up before the pretrained parts move a lot; a separate stage, a higher connector rate (Molmo), or LoRA on the backbones are all ways to achieve it. [Likely for the explanation]</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>LLaVA-1.5-13B uses the same vision tower (303,507,456), an MLP from 1024 to 5120, and a 13,015,864,320-parameter LLM. Compute the connector size and the trainable fraction in stage 1.</li>
+<li>LLaVA-OneVision-0.5B uses batch 512 in stage 1 on 558K samples for one epoch. How many steps is that?</li>
+<li>Using formula (186.11), how much memory does stage 2 of LLaVA-1.5-13B need (LLM and connector trained, encoder frozen), before activations? Check your answer in Figure 3.</li>
+<li>Use MM1’s formula (186.7) to estimate the peak learning rate for \(N = 10^9\).</li>
+<li>Your VLM was trained with a frozen 384 px encoder. You must now read small text in 1344 px invoices, and you have 2M good document samples. Which stage do you add, and which learning rates do you use?</li>
+<li>In Figure 4, choose joint training with LLM rate 0.03. Read the peak drift with text-only share 0% and with 30%. What does this tell you?</li>
+<li>Compute the DPO loss (186.9) with \(\beta = 0.1\) when \(\log \pi_\theta/\pi_0\) is +1 for the chosen and +1 for the rejected answer. Why does the loss not change from its starting value?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(1024 \cdot 5120 + 5120 + 5120 \cdot 5120 + 5120 = 31{,}467{,}520\). Total \(303{,}507{,}456 + 31{,}467{,}520 + 13{,}015{,}864{,}320 = 13{,}350{,}839{,}296\), so the fraction is \(0.24\%\). 2. \(558{,}000 / 512 = 1{,}089.8\), so about 1,090 steps. 3. \(2 \times 13.35\text{B} + 14 \times (13.016 + 0.031)\text{B} = 26.7 + 182.7 = 209.4\) GB: at least three 80 GB GPUs even with perfect sharding, before activations. 4. \(\exp(-0.4214 \ln 10^9 - 0.5535) = 9.3\times10^{-5}\). 5. A continued stage-2 run at high resolution on the document data, with the encoder unfrozen at a small rate (for example \(2\times10^{-6}\), 5× below the LLM’s \(10^{-5}\)) or LoRA, the positional embeddings interpolated to the new size, and 5–20% of the old data and text-only data mixed in to avoid forgetting; then a short SFT on invoice QA. MM1’s +2.9 points at 1344 px supports unfreezing here. 6. 0.937 at 0% and 0.493 at 30%: text data roughly halves the peak damage but does not remove it; staged training (peak about 0.03) is the stronger fix. 7. Margin \(0.1 \cdot (1 - 1) = 0\), loss \(\ln 2 = 0.693\). Raising both answers by the same amount does not change their difference, and DPO only cares about the difference.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A VLM joins two pretrained parts with a random connector (186.1) and trains them all with masked next-token loss (186.2); stages differ in which parts train and how fast (186.3).</li>
+<li>Stage 1 (alignment) trains only the connector with a high rate: 0.30% of LLaVA-1.5-7B, about 2,180 steps. It saves memory, but compute only drops to about \(4N\) per token (186.5).</li>
+<li>Stage 2 unfreezes the LLM and often the encoder, with per-part rates (encoder 5–10× lower, 186.6), more data, higher resolution and some text-only data (186.8). LoRA is a stable alternative to full unfreezing.</li>
+<li>Stage 3 is SFT on chat data with loss only on answers; data quality and answer format matter most. Stage 4 adds DPO / MPO (186.9, 186.10) or RL against hallucination and for reasoning.</li>
+<li>Freeze for protection, memory (2 vs 16 bytes per weight, 186.11), compute and generality; unfreeze when the part lacks a needed skill and there is enough good data. The ablations disagree, so test on your own data.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \mathcal{L} = -\tfrac{1}{\sum m_t}\sum_t m_t \log p_\theta(x_t \mid I, x_{\lt t}), \quad \theta_j \leftarrow \theta_j - \eta_j^{(s)}\,\mathrm{AdamW}(\nabla_{\theta_j}\mathcal{L}), \quad M \approx 2N_{\text{all}} + 14N_{\text{train}} \]</div>
+<div class="eq">\[ \text{stage-1 FLOPs} \approx 4N, \quad \eta_\phi \lt \eta_\omega \le \eta_\psi, \quad \mathcal{L}_{\text{DPO}} = -\log\sigma\!\Big(\beta\log\tfrac{\pi_\theta(y_c|x)}{\pi_0(y_c|x)} - \beta\log\tfrac{\pi_\theta(y_r|x)}{\pi_0(y_r|x)}\Big) \]</div>
+<h2 class="plain" id="vlm-training-stages-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 3: Vision Language Model Training</li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.03744" target="_blank" rel="noopener">Improved Baselines with Visual Instruction Tuning</a></li><li>Laurençon et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;What matters when building vision-language models?&amp;quot;" target="_blank" rel="noopener">What matters when building vision-language models?</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 3: Vision Language Model Training</li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 5: Post-Training Vision Language Models</li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2304.08485" target="_blank" rel="noopener">Visual Instruction Tuning</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.03744" target="_blank" rel="noopener">Improved Baselines with Visual Instruction Tuning</a></li><li>Laurençon et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;What matters when building vision-language models?&amp;quot;" target="_blank" rel="noopener">What matters when building vision-language models?</a></li><li>Karamcheti, Nair, Balakrishna, Liang, Kollar &amp; Sadigh (2024). <a href="https://arxiv.org/abs/2402.07865" target="_blank" rel="noopener">Prismatic VLMs: Investigating the Design Space of Visually-Conditioned Language Models</a></li><li>Tong et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Cambrian-1: A Fully Open, Vision-Centric Exploration of Multimodal LLMs&amp;quot;" target="_blank" rel="noopener">Cambrian-1: A Fully Open, Vision-Centric Exploration of Multimodal LLMs</a></li><li>Chen et al. (2023). <a href="https://arxiv.org/abs/2311.12793" target="_blank" rel="noopener">ShareGPT4V: Improving Large Multi-Modal Models with Better Captions</a></li><li>McKinzie et al. (2024). <a href="https://arxiv.org/abs/2403.09611" target="_blank" rel="noopener">MM1: Methods, Analysis &amp; Insights from Multimodal LLM Pre-training</a></li><li>Li et al. (2024). <a href="https://arxiv.org/abs/2408.03326" target="_blank" rel="noopener">LLaVA-OneVision: Easy Visual Task Transfer</a></li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Chen et al. (2024). <a href="https://arxiv.org/abs/2412.05271" target="_blank" rel="noopener">Expanding Performance Boundaries of Open-Source Multimodal Models with Model, Data, and Test-Time Scaling (InternVL 2.5)</a></li><li>Deitke et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Molmo and PixMo: Open Weights and Open Data for State-of-the-Art Multimodal Models&amp;quot;" target="_blank" rel="noopener">Molmo and PixMo: Open Weights and Open Data for State-of-the-Art Multimodal Models</a></li><li>Wang et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Enhancing the Reasoning Ability of Multimodal Large Language Models via Mixed Preference Optimization&amp;quot;" target="_blank" rel="noopener">Enhancing the Reasoning Ability of Multimodal Large Language Models via Mixed Preference Optimization</a></li><li>Yu et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;RLHF-V: Towards Trustworthy MLLMs via Behavior Alignment from Fine-grained Correctional Human Feedback&amp;quot;" target="_blank" rel="noopener">RLHF-V: Towards Trustworthy MLLMs via Behavior Alignment from Fine-grained Correctional Human Feedback</a></li><li>Rafailov et al. (2023). <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">Direct Preference Optimization: Your Language Model is Secretly a Reward Model</a></li><li>Hu et al. (2021). <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">LoRA: Low-Rank Adaptation of Large Language Models</a></li><li>Liu et al. (2024). <a href="https://arxiv.org/abs/2402.09353" target="_blank" rel="noopener">DoRA: Weight-Decomposed Low-Rank Adaptation</a></li><li>Laurençon et al. (2023). <a href="https://arxiv.org/abs/2306.16527" target="_blank" rel="noopener">OBELICS: An Open Web-Scale Filtered Dataset of Interleaved Image-Text Documents</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/lab-build-a-mini-vlm.html"><small>Previous · session 185</small>build a mini-VLM</a><a class="next" href="../vision/multimodal-data-at-scale.html"><small>Next · session 187</small>Multimodal data at scale</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="vlm-training-stages"]');if(!R)return;
+const $=s=>R.querySelector(s);const esc=B.esc;
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+function segInit(seg,cb){seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b||!seg.contains(b))return;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const ST={F:{fill:"var(--paper2)",stroke:"var(--muted)",dash:"5 4",lab:"frozen"},T:{fill:"var(--k-soft)",stroke:"var(--k)",dash:"",lab:"trains"},L:{fill:"var(--v-soft)",stroke:"var(--v)",dash:"",lab:"LoRA / DoRA"},N:{fill:"var(--card)",stroke:"var(--rule)",dash:"2 3",lab:"not stated"},R:{fill:"var(--q-soft)",stroke:"var(--q)",dash:"",lab:"new, random"}};
+
+/* ---------- Figure 1: the stage pipeline (stepper) ---------- */
+(function(){
+ const svg=$("#vts-pipe-svg");if(!svg)return;const info=$("#vts-pipe-info");
+ const S=[
+  {t:"Start",m:["F","R","F"],lr:["pretrained","random init","pretrained"],data:"Nothing trained yet",tok:"",info:"The parts before training. The vision encoder (SigLIP in LLaVA-OneVision) and the LLM (Qwen2) are already trained on their own data. The connector (a 2-layer MLP) is new: its weights are random, so the vectors it sends to the LLM are noise. Press Next."},
+  {t:"Stage 1: alignment",m:["F","T","F"],lr:["no gradients","lr 1×10⁻³","no gradients"],data:"558K image–caption pairs (LCS-558K), 1 epoch",tok:"729 tokens per image",info:"<b>Stage 1 (alignment).</b> Only the connector trains: <b>20.0M</b> of about <b>8.0B</b> parameters, that is <b>0.25%</b> (LLaVA-OneVision-7B, Table 1 of the paper). The learning rate is high (10⁻³) because the connector is small and starts from random. The loss is next-token prediction on the caption."},
+  {t:"Stage 1.5 / 2: multimodal pretraining",m:["T","T","T"],lr:["lr 2×10⁻⁶","lr 1×10⁻⁵","lr 1×10⁻⁵"],data:"4M high-quality samples (re-captions, OCR, documents)",tok:"up to 729 × 5 tokens per image",info:"<b>Stage 1.5 (high-quality knowledge).</b> The full model trains, about <b>8.0B</b> parameters. The vision encoder gets a learning rate <b>5 times smaller</b> than the LLM (2×10⁻⁶ vs 1×10⁻⁵), so its features change slowly. Images now use more tiles (AnyRes), up to 5 times more visual tokens."},
+  {t:"Stage 3: instruction tuning",m:["T","T","T"],lr:["lr 2×10⁻⁶","lr 1×10⁻⁵","lr 1×10⁻⁵"],data:"3.2M single-image, then 1.6M image + multi-image + video",tok:"up to 729 × 10 tokens per image",info:"<b>Stage 2 in the paper (visual instruction tuning).</b> Still the full model. First <b>3.2M</b> single-image instructions, then <b>1.6M</b> mixed single-image, multi-image and video samples (the “OneVision” phase). The loss is only on the assistant’s answers. Video skill comes from this short last phase."},
+  {t:"Stage 4 (optional): preference tuning",m:["T","T","T"],lr:["lr 5×10⁻⁶","lr 5×10⁻⁶","lr 5×10⁻⁶"],data:"about 3M preference pairs (MMPR): chosen vs rejected answer",tok:"",info:"<b>Stage 4 (preference optimization), shown with MPO on InternVL2-8B</b>, another model. All parameters train with a small learning rate 5×10⁻⁶ for 1 epoch. The loss mixes DPO (0.8), a quality loss BCO (0.2) and the plain SFT loss on the chosen answer (1.0). MathVista rose from 58.3 to <b>67.0</b>."}];
+ const X=[165,375,595],Wd=[170,150,190];const names=["Vision encoder","Connector","LLM"];
+ function draw(k){const s=S[k];let g=`<defs><marker id="vts-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+  g+=`<text x="380" y="26" text-anchor="middle" font-size="16" font-weight="700" fill="var(--ink)">${esc(s.t)}</text>`;
+  g+=`<rect x="10" y="98" width="44" height="44" rx="6" fill="var(--q-soft)" stroke="var(--q)"/><text x="32" y="125" text-anchor="middle" font-size="12" fill="var(--ink)">img</text>`;
+  g+=`<path d="M56 120 H${X[0]-Wd[0]/2-4}" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vts-ah)"/>`;
+  g+=`<path d="M${X[0]+Wd[0]/2} 120 H${X[1]-Wd[1]/2-4}" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vts-ah)"/><path d="M${X[1]+Wd[1]/2} 120 H${X[2]-Wd[2]/2-4}" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#vts-ah)"/>`;
+  g+=`<text x="${X[2]}" y="196" text-anchor="middle" font-size="12" fill="var(--muted)">text tokens (prompt, caption or answer) also enter here ↑</text>`;
+  names.forEach((n,i)=>{const st=ST[s.m[i]];g+=`<rect x="${X[i]-Wd[i]/2}" y="78" width="${Wd[i]}" height="84" rx="12" fill="${st.fill}" stroke="${st.stroke}" stroke-width="2" ${st.dash?`stroke-dasharray="${st.dash}"`:""}/>`+
+   `<text x="${X[i]}" y="108" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)">${n}</text><text x="${X[i]}" y="130" text-anchor="middle" font-size="12.5" fill="${s.m[i]==="F"?"var(--muted)":"var(--ink2)"}">${s.m[i]==="F"?"🔒 ":""}${esc(st.lab)}</text><text x="${X[i]}" y="150" text-anchor="middle" font-size="12" font-family="var(--mono)" fill="var(--ink2)">${esc(s.lr[i])}</text>`;});
+  g+=`<rect x="40" y="214" width="680" height="64" rx="10" fill="var(--card)" stroke="var(--rule)"/><text x="60" y="240" font-size="13" fill="var(--ink)"><tspan font-weight="700">Data: </tspan>${esc(s.data)}</text><text x="60" y="262" font-size="13" fill="var(--muted)">${esc(s.tok)}</text>`;
+  svg.innerHTML=g;info.innerHTML=s.info;}
+ B.stepper({n:S.length,prev:$("#vts-pipe-prev"),next:$("#vts-pipe-next"),play:$("#vts-pipe-play"),label:$("#vts-pipe-lab"),ms:3600,onStep:draw});
+})();
+
+/* ---------- Figure 2: recipe map ---------- */
+(function(){
+ const svg=$("#vts-map-svg");if(!svg)return;const info=$("#vts-map-info"),seg=$("#vts-map-seg");
+ const M={
+  llava15:{n:"LLaVA-1.5 (2023)",r:[["Stage 1: align","F","T","F","558K captions · lr 1e-3 · batch 256"],["Stage 2: instruction","F","T","T","665K mix · lr 2e-5 · batch 128"]],note:"About 6 hours plus 20 hours on one node of 8 A100 GPUs. The CLIP encoder never trains. Stage 1 uses DeepSpeed ZeRO-2, stage 2 ZeRO-3, because stage 2 trains 95.7% of the weights."},
+  ov:{n:"LLaVA-OneVision (2024)",r:[["Stage 1: align","F","T","F","558K captions · lr 1e-3"],["Stage 1.5: knowledge","T","T","T","4M · ViT 2e-6, rest 1e-5"],["Stage 2a: single image","T","T","T","3.2M instructions"],["Stage 2b: OneVision","T","T","T","1.6M image, multi-image, video"]],note:"After stage 1 everything trains, but the vision encoder always gets a 5 times smaller learning rate. The number of visual tokens grows from 729 to up to 729 × 10 across the stages."},
+  qwen2vl:{n:"Qwen2-VL (2024)",r:[["Stage 1: ViT pretrain","T","N","F","image–text, OCR · ~600B tokens"],["Stage 2: full pretrain","T","T","T","+~800B tokens, interleaved, VQA"],["Stage 3: instruction","F","N","T","instruction data, chat format"]],note:"Stage 1 trains the vision side with a frozen LLM; stage 3 locks the ViT and tunes the LLM. The paper does not list the MLP merger separately; in the released code it is part of the vision module [Likely]. Pretraining sees about 1.4T tokens in total."},
+  internvl25:{n:"InternVL 2.5 (2024)",r:[["Stage 1: MLP warmup","F","T","F","pretrain mix · higher lr · high-res tiles"],["Stage 1.5: ViT (optional)","T","T","F","same data · lower lr"],["Stage 2: full SFT","T","T","T","high-quality instructions · one lr"]],note:"Stage 1.5 is done once with a smaller LLM; the trained InternViT is then reused for bigger LLMs, which skip stage 1.5. The 78B model sees about 120B tokens, against 1.4T for Qwen2-VL. A few thousand noisy SFT samples were enough to cause repetitive outputs."},
+  idefics2:{n:"Idefics2 (2024)",r:[["Pretrain A: ≤ 384 px","L","T","L","70% OBELICS, 30% pairs · lr 1e-4"],["Pretrain B: ≤ 980 px","L","T","L","45% OBELICS, 35% pairs, 20% PDFs"],["SFT","L","T","L","The Cauldron + text-only · DoRA"],["Chatty","N","N","N","a few hundred steps of dialogue"]],note:"No freeze-then-unfreeze: the new parameters (Perceiver + MLP) train fully from the start and both backbones train through LoRA [Likely for the exact split]. Full unfreezing diverged in their ablation, even with a lower learning rate. About 1.5B images and 225B text tokens in pretraining."},
+  molmo:{n:"Molmo (2024)",r:[["Pretrain: dense captions","T","T","T","PixMo-Cap · lr ViT 6e-6, conn 2e-4, LM 2e-5"],["SFT","T","T","T","PixMo + academic mix [Likely all]"]],note:"No connector-only stage. Instead the connector gets a 10 times higher learning rate than the LLM and a short warmup (200 steps against 2,000 for the ViT and LLM), so it catches up fast. The captions are long and human-spoken, not noisy web alt-text."},
+  mm1:{n:"MM1 (2024)",r:[["Pretrain","T","T","T","45% interleaved, 45% pairs, 10% text · ~400B tokens"],["SFT","T","T","T","AdaFactor · lr 1e-5 · batch 256"]],note:"Everything is unfrozen in both stages. In an ablation, a frozen image encoder was better at low resolution (+2.2 points) but an unfrozen one was better at 1344 px (+2.9 points)."},
+  prism:{n:"Prismatic (2024)",r:[["Single stage","F","T","T","665K instruct mix · lr 2e-5 · batch 128"]],note:"Skips stage 1 entirely, saving 20–25% of training cost, with equal or better scores in their setup. Fine-tuning the vision encoder hurt, most on localization tasks such as RefCOCO. Cambrian-1 later found the opposite for both choices with more adapter data (1.2M)."}};
+ function draw(key){const m=M[key];const rows=m.r;const H=70+rows.length*52;svg.setAttribute("viewBox",`0 0 800 ${H}`);
+  let g=`<text x="12" y="30" font-size="13" font-weight="700" fill="var(--ink)">${esc(m.n)}</text>`;["Vision","Connector","LLM"].forEach((c,i)=>g+=`<text x="${245+i*95}" y="54" text-anchor="middle" font-size="12.5" font-weight="700" fill="var(--ink2)">${c}</text>`);
+  g+=`<text x="492" y="54" font-size="12.5" font-weight="700" fill="var(--ink2)">Data and learning rate</text>`;
+  let cnt={F:0,T:0,L:0,N:0};
+  rows.forEach((r,j)=>{const y=66+j*52;g+=`<text x="12" y="${y+27}" font-size="12.5" fill="var(--ink)">${esc(r[0])}</text>`;
+   for(let i=0;i<3;i++){const st=ST[r[1+i]];cnt[r[1+i]]++;g+=`<rect x="${202+i*95}" y="${y+4}" width="86" height="38" rx="8" fill="${st.fill}" stroke="${st.stroke}" stroke-width="1.8" ${st.dash?`stroke-dasharray="${st.dash}"`:""}/><text x="${245+i*95}" y="${y+28}" text-anchor="middle" font-size="11.5" fill="var(--ink2)">${r[1+i]==="F"?"🔒 ":""}${esc(st.lab)}</text>`;}
+   g+=`<text x="492" y="${y+27}" font-size="12" fill="var(--ink2)">${esc(r[4])}</text>`;});
+  svg.innerHTML=g;svg.dataset.cells=JSON.stringify(cnt);
+  info.innerHTML=`<b>${esc(m.n)}</b>: ${rows.length} stage${rows.length>1?"s":""}; cells frozen ${cnt.F}, fully trained ${cnt.T}, LoRA ${cnt.L}${cnt.N?`, not stated ${cnt.N}`:""}. ${esc(m.note)}`;}
+ segInit(seg,draw);draw("llava15");
+})();
+
+/* ---------- Figure 3: memory and trainable parameters ---------- */
+(function(){
+ const svg=$("#vts-mem-svg");if(!svg)return;const info=$("#vts-mem-info");
+ const P={"7b":{n:"LLaVA-1.5-7B",vit:303507456,proj:20979712,llm:6738415616,h:4096,l:32,i:11008},"13b":{n:"LLaVA-1.5-13B",vit:303507456,proj:31467520,llm:13015864320,h:5120,l:40,i:13824}};
+ let model="7b";const mode={vit:"F",proj:"T",llm:"F"};const rk=$("#vts-mem-r");
+ const segs={model:$("#vts-mem-model"),vit:$("#vts-mem-vit"),proj:$("#vts-mem-proj"),llm:$("#vts-mem-llm")};
+ function calc(){const p=P[model],r=+rk.value;const lora=p.l*r*(4*(p.h+p.h)+3*(p.h+p.i));
+  const tot=p.vit+p.proj+p.llm;let tr=0;if(mode.vit==="T")tr+=p.vit;if(mode.proj==="T")tr+=p.proj;let extra=0;
+  if(mode.llm==="T")tr+=p.llm;else if(mode.llm==="L"){tr+=lora;extra=lora;}
+  const wt=2*(tot+extra),gr=2*tr,opt=12*tr;return{p,r,lora,tot,tr,wt,gr,opt,sum:wt+gr+opt};}
+ function draw(){const c=calc();$("#vts-mem-rv").value=c.r;const G=v=>(v/1e9).toFixed(1);
+  const max=Math.max(240e9,c.sum*1.05),X=v=>60+v/max*660;
+  let g=`<path d="M60 30 V150 H725" fill="none" stroke="var(--muted)"/>`;
+  [0,40,80,120,160,200,240,320,400].filter(v=>v*1e9<=max).forEach(v=>g+=`<text x="${X(v*1e9)}" y="168" text-anchor="middle" class="svgs" font-size="12">${v}</text>`);
+  g+=`<text x="392" y="188" text-anchor="middle" class="svgs" font-size="12.5">GB, before activations</text>`;
+  const parts=[["weights (BF16, all)",c.wt,"var(--q)"],["gradients (BF16)",c.gr,"var(--v)"],["FP32 master + Adam m, v",c.opt,"var(--k)"]];let x0=0;
+  parts.forEach(([n,v,col])=>{if(v>0)g+=`<rect x="${X(x0)}" y="60" width="${Math.max(0.5,X(x0+v)-X(x0))}" height="54" fill="${col}" opacity=".85"/>`;x0+=v;});
+  g+=`<line x1="${X(80e9)}" y1="36" x2="${X(80e9)}" y2="150" stroke="var(--bad)" stroke-width="2" stroke-dasharray="5 4"/><text x="${X(80e9)+5}" y="46" font-size="12" fill="var(--bad)">one 80 GB GPU</text>`;
+  g+=`<text x="${Math.min(X(c.sum)+6,640)}" y="92" font-size="13" font-weight="700" fill="var(--ink)">${G(c.sum)} GB</text>`;svg.innerHTML=g;
+  const pct=100*c.tr/c.tot;
+  info.innerHTML=`${c.p.n}: total <b>${(c.tot/1e9).toFixed(2)}B</b> parameters. Trainable <b>${c.tr>=1e9?(c.tr/1e9).toFixed(2)+"B":(c.tr/1e6).toFixed(1)+"M"}</b> (${pct<1?pct.toFixed(2):pct.toFixed(1)}%)${mode.llm==="L"?`, of which LoRA rank ${c.r} on all LLM linear layers adds ${(c.lora/1e6).toFixed(1)}M`:""}. Memory = weights ${G(c.wt)} + gradients ${G(c.gr)} + optimizer ${G(c.opt)} = <b>${G(c.sum)} GB</b> ${c.sum<=80e9?"(fits in one 80 GB GPU before activations)":"(needs sharding such as ZeRO-3 / FSDP, or several GPUs)"}.`;
+  svg.dataset.total=c.sum.toFixed(0);svg.dataset.train=String(c.tr);}
+ segInit(segs.model,v=>{model=v;draw();});["vit","proj","llm"].forEach(k=>segInit(segs[k],v=>{mode[k]=v;draw();}));rk.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 4: toy, staged vs joint ---------- */
+(function(){
+ const svg=$("#vts-toy-svg");if(!svg)return;const info=$("#vts-toy-info"),LW=$("#vts-toy-lr"),TF=$("#vts-toy-f"),seg=$("#vts-toy-seg");let mode="staged";
+ const d=6,r=rng(11);const g=()=>Math.sqrt(-2*Math.log(Math.max(1e-12,r())))*Math.cos(2*Math.PI*r());
+ const mk=(sc,eye)=>Array.from({length:d},(_,i)=>Array.from({length:d},(_,j)=>sc*g()/Math.sqrt(d)+(eye&&i===j?1:0)));
+ const W0=mk(1,1),A=mk(1,0),Dl=mk(0.3,0),P0=mk(3,0);
+ const mm=(a,b)=>a.map(row=>b[0].map((_,j)=>row.reduce((s,v,k)=>s+v*b[k][j],0)));const tr=a=>a[0].map((_,j)=>a.map(row=>row[j]));
+ const add=(a,b,s)=>a.map((row,i)=>row.map((v,j)=>v+s*b[i][j]));const sq=a=>a.reduce((s,row)=>s+row.reduce((t,v)=>t+v*v,0),0);
+ const Wt=add(W0,Dl,1),WtA=mm(Wt,A),nrm=sq(WtA)+sq(Wt),n0=sq(W0);const T1=150,T2=150,lrP=0.02;
+ function run(md,lrW,f){let W=W0.map(r=>r.slice()),P=P0.map(r=>r.slice());const H=[];
+  for(let t=0;t<T1+T2;t++){const E=add(mm(W,P),WtA,-1);const gW=add(add(mm(E,tr(P)),add(W,Wt,-1),1).map(r=>r.map(v=>2*(1-f)*v)),add(W,W0,-1),2*f);const gP=mm(tr(W),E).map(r=>r.map(v=>2*(1-f)*v));
+   if(md==="staged"&&t<T1)P=add(P,gP,-lrP);else if(md==="staged"){P=add(P,gP,-lrP*0.1);W=add(W,gW,-lrW);}else{P=add(P,gP,-lrP);W=add(W,gW,-lrW);}
+   const img=(sq(add(mm(W,P),WtA,-1))+sq(add(W,Wt,-1)))/nrm,txt=sq(add(W,W0,-1))/n0;if(!Number.isFinite(img)||img>1e6)return{H,div:t+1};H.push([img,txt]);}
+  return{H,div:0};}
+ const X=t=>56+t/(T1+T2)*560,YL=v=>20+(1-(Math.log10(Math.max(v,1e-3))+3)/4)*150,YD=v=>210+ (1-Math.min(v,1)/1)*90;
+ function draw(){const lrW=+LW.value,f=+TF.value;$("#vts-toy-lrv").value=lrW.toFixed(3);$("#vts-toy-fv").value=Math.round(f*100)+"%";
+  const res=run(mode,lrW,f),oth=run(mode==="staged"?"joint":"staged",lrW,f);
+  let g=`<path d="M56 20 V170 H616" fill="none" stroke="var(--muted)"/><path d="M56 210 V300 H616" fill="none" stroke="var(--muted)"/>`;
+  [[10,"10"],[1,"1"],[0.1,"0.1"],[0.01,"0.01"],[0.001,"0.001"]].forEach(([v,l])=>g+=`<text x="50" y="${YL(v)+4}" text-anchor="end" class="svgs" font-size="11">${l}</text>`);
+  [[0,"0"],[0.5,"0.5"],[1,"1"]].forEach(([v,l])=>g+=`<text x="50" y="${YD(v)+4}" text-anchor="end" class="svgs" font-size="11">${l}</text>`);
+  g+=`<text x="62" y="16" class="svgs" font-size="12">image-task loss (log scale)</text><text x="62" y="206" class="svgs" font-size="12">LLM drift from its pretrained weights (text damage)</text>`;
+  if(mode==="staged")g+=`<line x1="${X(T1)}" y1="20" x2="${X(T1)}" y2="300" stroke="var(--rule)" stroke-dasharray="4 4"/><text x="${X(T1)+4}" y="${YL(10)+14}" class="svgs" font-size="11.5">stage 2 starts: LLM unfrozen</text>`;
+  [0,100,200,300].forEach(t=>g+=`<text x="${X(t)}" y="316" text-anchor="middle" class="svgs" font-size="11">${t}</text>`);
+  const line=(H,i,Y,col,w,da)=>`<polyline points="${H.map((h,t)=>X(t+1).toFixed(1)+","+Y(h[i]).toFixed(1)).join(" ")}" fill="none" stroke="${col}" stroke-width="${w}" ${da?`stroke-dasharray="${da}"`:""}/>`;
+  g+=line(oth.H,0,YL,"var(--muted)",1.6,"5 4")+line(oth.H,1,YD,"var(--muted)",1.6,"5 4")+line(res.H,0,YL,"var(--k)",2.6)+line(res.H,1,YD,"var(--q)",2.6);
+  svg.innerHTML=g;const L=res.H[res.H.length-1]||[NaN,NaN],pk=Math.max(0,...res.H.map(h=>h[1]));const Lo=oth.H[oth.H.length-1]||[NaN,NaN],pko=Math.max(0,...oth.H.map(h=>h[1]));
+  const nm=m=>m==="staged"?"Staged":"Joint";const om=mode==="staged"?"joint":"staged";
+  const desc=(R0,Lx,p)=>R0.div?`<b style="color:var(--bad)">diverged at step ${R0.div}</b>`:`final image loss <b>${Lx[0].toFixed(3)}</b>, final drift <b>${Lx[1].toFixed(3)}</b>, peak drift <b>${p.toFixed(3)}</b>`;
+  info.innerHTML=`${nm(mode)} (solid): ${desc(res,L,pk)}. ${nm(om)} (dashed grey): ${desc(oth,Lo,pko)}. Drift 0.1 means the LLM weights moved by 10% of their size (squared), so its answers on pure text change.`;
+  svg.dataset.res=JSON.stringify({mode,img:res.div?null:+L[0].toFixed(4),drift:res.div?null:+L[1].toFixed(4),peak:+pk.toFixed(4),div:res.div});}
+ segInit(seg,v=>{mode=v;draw();});[LW,TF].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

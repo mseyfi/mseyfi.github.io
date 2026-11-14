@@ -1,0 +1,487 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Efficient FFN 1: SwiGLU and parameter sharing (ALBERT) · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 94</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="efficient-ffn-1-swiglu-and-parameter-sharing">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="efficient-ffn-1-swiglu-and-parameter-sharing" data-session="efficient-ffn-1-swiglu-and-parameter-sharing" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">94</span><span>Track 5: LLM inference and serving · session 17 of 65</span></div><h1 class="chap-title">Efficient FFN 1: SwiGLU and parameter sharing (ALBERT)</h1><p class="chap-sub">The feed-forward network (FFN) holds most of the weights of a large language model, so it is the first place to look for savings. This session covers two different kinds of saving. SwiGLU makes each FFN weight more useful, which is why model configs have odd hidden sizes near 8d/3. Parameter sharing (ALBERT) and factorized embeddings store fewer weights, but you will see that they do not reduce compute, and only sometimes reduce the bytes moved per token.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 1.5 to 2 hours, exercises 1 to 1.5 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions 21, 25, 33 and 82 (the FFN, counting parameters and FLOPs, ALBERT, the roofline); session 93 helps (where the cost is)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Three different costs of a layer: weights stored, FLOPs per token, and bytes moved per decode step, and why a technique can cut one and leave the others alone</li><li>SwiGLU: what it computes, why it gives better quality per parameter, and how the hidden size 8d/3 and its rounding (11,008, 14,336, 28,672) come out of one equation</li><li>SwiGLU at inference time: fusing the gate and up matrices, the extra activation memory in prefill, tensor parallelism, and why its activations are not sparse</li><li>ALBERT-style cross-layer sharing: one set of block weights applied many times, the ablation numbers, and the two ways to spend the saving (fewer parameters or more depth)</li><li>What sharing saves (memory, checkpoint size, room for the KV cache) and what it does not save (FLOPs, latency, and usually HBM traffic), with MobileLLM as the case where it does cut traffic</li><li>Factorized embeddings (V×E plus E×d) and tied input/output embeddings, and their effect on the output head’s compute and rank</li></ul></div></header><style>
+[data-session="efficient-ffn-1-swiglu-and-parameter-sharing"] pre.code,[data-session="efficient-ffn-1-swiglu-and-parameter-sharing"] code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.ef-grid{display:grid;grid-template-columns:auto minmax(0,1fr) auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.ef-grid input[type=range]{width:100%}
+.ef-grid select{font:500 14px var(--sans);min-width:0;max-width:100%}
+.ef-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.ef-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:2px;margin-right:6px;vertical-align:0;background:var(--c)}
+.ef-k rect{transition:opacity .2s}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">In <a href="../inference/where-the-cost-is-ffn-and-attention.html">session 93</a> we measured where a model’s weights live. The survey by Zhou et al. reports that the FFN holds 63.01% of the parameters of LLaMA-7B and 71.69% of LLaMA-70B. [Certain] So if you want a smaller or cheaper model, the FFN is the first place to look.</p>
+<p>This session covers two very different ideas, and the most important skill is to keep them apart.</p>
+<ul>
+<li><b>Make each weight more useful.</b> SwiGLU changes the FFN’s formula. At the same number of weights it gives a lower loss. Almost every open LLM uses it (Llama, Mistral, Qwen), and it is the reason configs contain odd hidden sizes such as 11,008 or 14,336.</li>
+<li><b>Store fewer weights.</b> ALBERT shares one block’s weights across all layers and shrinks the embedding table with a factorization. Small on-device models such as MobileLLM use related tricks.</li></ul>
+<p>The trap is that “fewer parameters” sounds like “faster”. It is not, in general. A layer has three separate costs: the bytes it <b>stores</b>, the FLOPs it does <b>per token</b>, and the bytes it <b>moves</b> from memory per decoding step (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>). Sharing cuts the first one. It leaves the second one exactly the same, and it usually leaves the third one the same too. We will see the one case where it does not.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Expect: “Why is Llama’s FFN size 11,008?”, “What does SwiGLU cost compared with a GELU FFN?”, “ALBERT has 18 times fewer parameters than BERT-large. Is it 18 times faster?”, “Does weight sharing reduce the KV cache?”. Each has a short, exact answer below.</aside>
+<p>This is the first of three sessions on efficient FFNs. The next two (<a href="../inference/efficient-ffn-2-moe-routing-in-depth.html">session 95</a> and <a href="../inference/efficient-ffn-3-moe-from-dense-models.html">session 96</a>) cover Mixture of Experts, which takes the opposite approach: it stores <b>more</b> FFN weights, but uses only a few of them per token.</p>
+
+<h2>Three costs of one layer</h2>
+<p>Take one weight matrix with \(P\) numbers, stored in a format with \(b\) bytes per number (\(b = 2\) for BF16). A batch of \(B\) tokens goes through it. Then:</p>
+<div class="eq">\[ \text{stored} = b\,P \ \text{bytes}, \qquad \text{compute} = 2\,B\,P \ \text{FLOPs}, \qquad \text{moved} \approx b\,P + (\text{activations}) \ \text{bytes} \tag{94.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P\)</dt><dd>number of weights in the matrix (for a \(d \times d_{\text{ff}}\) matrix, \(P = d\, d_{\text{ff}}\))</dd>
+<dt>\(b\)</dt><dd>bytes per weight: 2 in BF16, 1 in INT8, 0.5 in INT4</dd>
+<dt>\(B\)</dt><dd>tokens processed together in this step (the batch in decode, the prompt length in prefill)</dd>
+<dt>\(2BP\)</dt><dd>one multiply and one add per weight per token</dd>
+<dt>moved</dt><dd>bytes read from GPU memory (HBM). The weights are read once per step, whatever \(B\) is; the activations are small in decode</dd></dl>
+<p>The ratio FLOPs / bytes moved is the <b>arithmetic intensity</b>. In BF16 decode it is about \(2BP / 2P = B\) FLOPs per byte. An H100 SXM can do 989 TFLOP/s but read only 3.35 TB/s, so its ridge point is about 295 FLOPs per byte (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>). Below about 295 tokens per step, the FFN waits for memory, not for math. Keep this in mind: it explains why a technique that adds FLOPs can be free, and why a technique that cuts stored bytes can still be slow.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Technique (this session)</th><th>Stored bytes</th><th>FLOPs per token</th><th>Bytes moved per decode step</th><th>Quality</th></tr></thead><tbody>
+<tr><td>SwiGLU at equal parameters</td><td>same</td><td>same</td><td>same</td><td>better</td></tr>
+<tr><td>Cross-layer sharing, same depth (ALBERT-base)</td><td>much lower</td><td>same</td><td>same, unless the shared block stays in on-chip memory</td><td>lower</td></tr>
+<tr><td>Sharing, more depth at same parameters (MobileLLM-LS)</td><td>same</td><td>higher</td><td>same, if repeats are back to back</td><td>better</td></tr>
+<tr><td>Factorized embedding, input side</td><td>lower</td><td>slightly higher (\(2Ed\))</td><td>lower</td><td>slightly lower</td></tr>
+<tr><td>Factorized, tied output head</td><td>lower</td><td>lower</td><td>lower</td><td>lower; rank is capped at \(E\)</td></tr></tbody></table></div>
+<p>The rest of the session fills in this table with formulas and real numbers.</p>
+
+<h2>SwiGLU: more quality per parameter</h2>
+<h3>The formula</h3>
+<p><a href="../transformers/the-feed-forward-network-mlp-inside-each.html">Session 21</a> introduced the gated FFN. Here is the short version. A plain FFN computes \(\phi(\mathbf{x} W_1) W_2\) with an activation \(\phi\) such as GELU. A <b>gated</b> FFN computes two projections of the input, puts one through an activation, and multiplies them element by element. The SwiGLU FFN (Shazeer, 2020) without biases is:</p>
+<div class="eq">\[ \mathrm{FFN}_{\text{SwiGLU}}(\mathbf{x}) = \Big( \mathrm{SiLU}(\mathbf{x} W_{\text{gate}}) \odot \mathbf{x} W_{\text{up}} \Big)\, W_{\text{down}}, \qquad \mathrm{SiLU}(z) = z\,\sigma(z) \tag{94.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{x} \in \R^{d}\)</dt><dd>one token’s vector (after normalization)</dd>
+<dt>\(W_{\text{gate}}, W_{\text{up}} \in \R^{d \times d_{\text{ff}}}\)</dt><dd>the gate and up projections (<code>gate_proj</code>, <code>up_proj</code> in Hugging Face Llama code)</dd>
+<dt>\(W_{\text{down}} \in \R^{d_{\text{ff}} \times d}\)</dt><dd>the down projection back to width \(d\) (<code>down_proj</code>)</dd>
+<dt>\(\odot\)</dt><dd>element-wise product of two vectors of length \(d_{\text{ff}}\)</dd>
+<dt>\(\sigma\)</dt><dd>the sigmoid function; SiLU is also called Swish</dd></dl>
+<p>Hidden unit \(i\) outputs \(\mathrm{SiLU}(\mathbf{x}\cdot\mathbf{g}_i)\,(\mathbf{x}\cdot\mathbf{u}_i)\): one direction of the input decides how open the unit is, another decides what value passes. A plain unit can only respond to one direction. That extra freedom is the usual explanation for the better quality; the paper itself offers no explanation. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A plain hidden unit is a tap with one handle: how far you open it is also how much water flows. A gated unit has a valve (the gate) and a separate pump (the up projection). The pump sets the value, the valve decides how much of it gets through. Same plumbing budget, more control.</aside>
+<h3>Quality at equal parameters</h3>
+<p>A gated FFN has three matrices instead of two. To compare fairly, Shazeer gave every variant the same number of weights and the same FLOPs, by shrinking the gated hidden size. On T5-base (\(d = 768\)) trained on C4, the held-out log-perplexity (lower is better) was: [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>FFN</th><th>Hidden size</th><th>Weights per FFN</th><th>After 65,536 steps</th><th>After 524,288 steps</th></tr></thead><tbody>
+<tr><td>ReLU (baseline)</td><td>3,072</td><td>4,718,592</td><td>1.997</td><td>1.677</td></tr>
+<tr><td>GELU</td><td>3,072</td><td>4,718,592</td><td>1.983</td><td>1.679</td></tr>
+<tr><td>GEGLU</td><td>2,048</td><td>4,718,592</td><td>1.942</td><td>1.633</td></tr>
+<tr><td>SwiGLU</td><td>2,048</td><td>4,718,592</td><td>1.944</td><td>1.636</td></tr></tbody></table></div>
+<p>Same weights, same FLOPs, about 0.04 lower loss after the long run. The full table is in <a href="../transformers/the-feed-forward-network-mlp-inside-each.html">session 21</a>. The effect also shows up in small modern models: in MobileLLM, switching a 125M model from a plain FFN to SwiGLU raised the average zero-shot reasoning score from 42.6 to 43.9. [Certain] This is what “better quality per parameter” means: for a fixed memory and compute budget you get a better model. It is a <b>free</b> win at inference time, which is why it spread to almost every LLM.</p>
+<h3>Why the hidden size is about 8d/3</h3>
+<p>Suppose the plain FFN you want to match has hidden size \(r d\) (classically \(r = 4\)). Equal weights means:</p>
+<div class="eq">\[ \underbrace{3\, d\, d_{\text{ff}}}_{\text{gated: 3 matrices}} = \underbrace{2\, d\, (r d)}_{\text{plain: 2 matrices}} \quad\Longrightarrow\quad d_{\text{ff}} = \frac{2 r}{3}\, d \;\overset{r = 4}{=}\; \frac{8}{3}\, d \tag{94.3} \]</div>
+<p>Real code then rounds the result to a hardware-friendly size. The Llama reference code takes \(\lfloor 2 \cdot 4d / 3 \rfloor\), optionally multiplies by a factor \(\alpha\), and rounds <b>up</b> to a multiple of \(m\):</p>
+<div class="eq">\[ d_{\text{ff}} = m \left\lceil \frac{\lfloor \alpha \lfloor 8d/3 \rfloor \rfloor}{m} \right\rceil \tag{94.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\alpha\)</dt><dd>an extra width factor chosen by the model designers (1.0 for Llama 2 7B, 1.3 for Llama 3 8B and 70B) [Likely]</dd>
+<dt>\(m\)</dt><dd>the rounding multiple (256, 1,024 or 4,096 in the Llama family), so that matrix shapes split well over tensor cores and GPUs</dd>
+<dt>\(\lfloor\cdot\rfloor, \lceil\cdot\rceil\)</dt><dd>round down, round up</dd></dl>
+<div class="worked"><div class="wt">Worked example: three real hidden sizes</div>
+<p><b>Llama 2 7B</b>, \(d = 4{,}096\), \(\alpha = 1\), \(m = 256\): \(8 \times 4{,}096 / 3 = 10{,}922.7 \to 10{,}922\), rounded up to \(43 \times 256 = 11{,}008\). The SwiGLU FFN has \(3 \times 4{,}096 \times 11{,}008 = 135{,}266{,}304\) weights per layer, only 0.8% more than a plain \(4d\) FFN (\(134{,}217{,}728\)).</p>
+<p><b>Llama 3 8B</b>, \(\alpha = 1.3\), \(m = 1{,}024\): \(\lfloor 1.3 \times 10{,}922 \rfloor = 14{,}198\), rounded up to \(14 \times 1{,}024 = 14{,}336\). Now the FFN has 176,160,768 weights, 31% more than a plain \(4d\) FFN. The model chose to spend extra weights on the FFN.</p>
+<p><b>MobileLLM-125M</b>, \(d = 576\): \(8 \times 576/3 = 1{,}536\) exactly, and its FFN hidden size is 1,536. [Certain]</p>
+<p>All three values match the published configs. [Certain]</p></div>
+<p>Do not assume every SwiGLU model uses 8d/3. The ratio \(d_{\text{ff}}/d\) in real configs (from their <code>config.json</code> files on Hugging Face): [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model</th><th>\(d\)</th><th>\(d_{\text{ff}}\)</th><th>\(d_{\text{ff}}/d\)</th><th>FFN weights vs plain \(4d\)</th></tr></thead><tbody>
+<tr><td>MobileLLM-125M</td><td>576</td><td>1,536</td><td>2.667</td><td>1.00×</td></tr>
+<tr><td>Llama 2 7B</td><td>4,096</td><td>11,008</td><td>2.688</td><td>1.01×</td></tr>
+<tr><td>Llama 3 8B, Mistral 7B</td><td>4,096</td><td>14,336</td><td>3.500</td><td>1.31×</td></tr>
+<tr><td>Llama 3.2 1B</td><td>2,048</td><td>8,192</td><td>4.000</td><td>1.50×</td></tr>
+<tr><td>Qwen2.5 7B</td><td>3,584</td><td>18,944</td><td>5.286</td><td>1.98×</td></tr></tbody></table></div>
+<p>So 8d/3 is the <b>starting point</b> that makes a gated FFN cost the same as a classic one. Newer models often go wider, because grouped-query attention made attention cheaper and the FFN is where extra weights pay off best. [Likely] Use Figure 1 to reproduce these numbers.</p>
+<figure class="fig" id="ef-dff"><div class="fig-body">
+<div class="controls"><span class="seg" id="ef-dff-pre"><button type="button" data-v="l2" aria-pressed="true">Llama 2 7B</button><button type="button" data-v="l3" aria-pressed="false">Llama 3 8B</button><button type="button" data-v="l70" aria-pressed="false">Llama 3 70B</button><button type="button" data-v="mob" aria-pressed="false">MobileLLM-125M</button></span></div>
+<div class="ef-grid">
+<label for="ef-dff-d">Model width \(d\)</label><select id="ef-dff-d"><option>576</option><option>768</option><option>1024</option><option>2048</option><option>3584</option><option selected>4096</option><option>5120</option><option>8192</option></select><span></span>
+<label for="ef-dff-a">Width factor \(\alpha\)</label><input type="range" id="ef-dff-a" min="1" max="2" step="0.05" value="1"><output id="ef-dff-av"></output>
+<label for="ef-dff-m">Round up to a multiple of \(m\)</label><select id="ef-dff-m"><option>1</option><option>64</option><option>128</option><option selected>256</option><option>512</option><option>1024</option><option>2048</option><option>4096</option></select><span></span></div>
+<div class="scroll-x"><svg id="ef-dff-svg" viewBox="0 0 640 210" role="img" aria-label="Weight matrices of a plain FFN and a SwiGLU FFN drawn to scale"></svg></div>
+<div class="ef-leg"><span style="--c:var(--q)">up or gate matrix</span><span style="--c:var(--k)">gate matrix (SwiGLU only)</span><span style="--c:var(--v)">down matrix</span></div>
+<div class="readout" id="ef-dff-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The SwiGLU hidden size from formula (94.4), and the weight matrices of a plain \(4d\) FFN (top) and the SwiGLU FFN (bottom), drawn with area proportional to the number of weights.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Each rectangle is one weight matrix; its length is proportional to its number of weights. With \(\alpha = 1\) and no rounding (\(m = 1\)), the two rows have the same total length: three thinner matrices replace two wider ones, formula (94.3). Click the presets: Llama 2 7B gives 11,008 and the bottom row is 0.8% longer than the top; Llama 3 8B (\(\alpha = 1.3\), \(m = 1{,}024\)) gives 14,336 and the bottom row is 31% longer. The readout also gives the FLOPs per token and the BF16 bytes that one decode step must read for this FFN.</p></details></figure>
+
+<h2>SwiGLU at inference time</h2>
+<p>At equal parameters, SwiGLU has the same FLOPs and the same weight bytes as a plain FFN. But the way you run it matters. Four practical points.</p>
+<h3>1. Fuse the gate and up matrices</h3>
+<p>\(W_{\text{gate}}\) and \(W_{\text{up}}\) read the same input \(\mathbf{x}\). Store them side by side as one \(d \times 2d_{\text{ff}}\) matrix and do <b>one</b> matrix multiplication instead of two. Then compute \(\mathrm{SiLU}(g) \odot u\) in one small element-wise kernel, or inside the matmul’s epilogue (the last stage of the kernel, before it writes the result). Serving engines such as vLLM do exactly this, with a merged <code>gate_up_proj</code> and a fused “SiLU and multiply” kernel. [Likely] One big matmul uses the GPU better than two medium ones, and you launch fewer kernels (<a href="../inference/gpu-kernels-1-cuda-basics-for-ml.html">session 85</a>).</p>
+<div class="algo"><div class="algo-h">Algorithm 1: one SwiGLU FFN, fused, for a batch of B tokens</div><ol>
+<li><b>input:</b> \(X \in \R^{B \times d}\); fused weight \(W_{gu} = [W_{\text{gate}} \,|\, W_{\text{up}}] \in \R^{d \times 2d_{\text{ff}}}\); \(W_{\text{down}} \in \R^{d_{\text{ff}} \times d}\)</li>
+<li>\(Z \leftarrow X W_{gu}\) <span class="c">// one matmul: reads \(2 d\, d_{\text{ff}}\) weights, \(4 B d\, d_{\text{ff}}\) FLOPs</span></li>
+<li>\(G, U \leftarrow\) first and second halves of the columns of \(Z\)</li>
+<li>\(H \leftarrow \mathrm{SiLU}(G) \odot U\) <span class="c">// element-wise; fused into step 2’s epilogue when possible, so G and U never reach HBM</span></li>
+<li>\(Y \leftarrow H W_{\text{down}}\) <span class="c">// reads \(d\, d_{\text{ff}}\) weights, \(2 B d\, d_{\text{ff}}\) FLOPs</span></li>
+<li><b>return</b> \(Y\) <span class="c">// added to the residual stream by the caller</span></li></ol></div>
+<h3>2. More activation memory in prefill</h3>
+<p>A plain FFN keeps one hidden tensor of shape \(B \times d_{\text{ff}}\). Without fusion, SwiGLU keeps <b>two</b> (\(G\) and \(U\)) before it can form \(H\). In decode this is tiny. In prefill it is not: for an 8,192-token chunk of Llama 3 8B in BF16, one \(B \times d_{\text{ff}}\) tensor is \(8{,}192 \times 14{,}336 \times 2 = 235\) MB, and \(G\) plus \(U\) is 470 MB. They are freed after each layer, so this is a peak, not a total. Fusion removes most of it. In training the cost is real, because \(G\) and \(U\) are kept for the backward pass (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>).</p>
+<h3>3. Tensor parallelism works the same way</h3>
+<p>Megatron-style tensor parallelism splits the first FFN matrix by columns and the second by rows, so each GPU computes a slice of the hidden units and one all-reduce combines the outputs. [Certain] For SwiGLU, split \(W_{\text{gate}}\) and \(W_{\text{up}}\) along \(d_{\text{ff}}\) <b>in the same way</b>, so that GPU \(j\) holds matching gate and up columns. Then \(\mathrm{SiLU}(G) \odot U\) is local and there is still one all-reduce per FFN (<a href="../pretraining/tensor-parallelism-and-sequence-parallelism.html">session 48</a>). This is one reason \(d_{\text{ff}}\) is rounded to a multiple of a large power of two: it must divide evenly by the number of GPUs.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>If you fuse gate and up into one matrix and then split it naively into 8 column blocks, GPU 0 gets only gate columns and GPU 7 only up columns. The product is then wrong. Interleave the halves per GPU before splitting, or keep two separate column-parallel matrices.</aside>
+<h3>4. SwiGLU activations are not sparse</h3>
+<p>ReLU sets every negative input to exactly 0. In ReLU FFNs a large fraction of hidden units are exactly zero for a given token, and systems such as PowerInfer use this to skip the matching rows of \(W_{\text{down}}\). SiLU is almost never exactly zero, so SwiGLU models have much less of this natural sparsity. Mirzadeh et al. (“ReLU Strikes Back”) argue for converting models back to ReLU-style activations to get it back, at a small quality cost. [Likely] So SwiGLU wins on quality per parameter, but closes one door for sparsity-based speed-ups. We return to this in the pruning sessions.</p>
+<p>Figure 2 walks through one fused SwiGLU FFN of Llama 3 8B on an H100, kernel by kernel, and shows when it is limited by memory and when by compute.</p>
+<figure class="fig wide" id="ef-dec"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="ef-dec-prev">Back</button><button type="button" class="btn primary" id="ef-dec-play">Play</button><button type="button" class="btn" id="ef-dec-next">Next</button><span id="ef-dec-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="ef-grid">
+<label for="ef-dec-b">Tokens in this step \(B\)</label><input type="range" id="ef-dec-b" min="0" max="13" step="1" value="0"><output id="ef-dec-bv"></output></div>
+<div class="controls" style="margin-top:6px"><label class="sl"><input type="checkbox" id="ef-dec-fuse" checked> Fuse SiLU·multiply into the gate/up matmul</label></div>
+<div class="scroll-x"><svg id="ef-dec-svg" viewBox="0 0 760 250" role="img" aria-label="The kernels of one SwiGLU FFN with their bytes, FLOPs and time"></svg></div>
+<div class="ef-leg"><span style="--c:var(--q)">time to move bytes (at 3.35 TB/s)</span><span style="--c:var(--k)">time to do FLOPs (at 989 TFLOP/s)</span></div>
+<div class="readout" id="ef-dec-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> One SwiGLU FFN layer of Llama 3 8B (\(d = 4{,}096\), \(d_{\text{ff}} = 14{,}336\), BF16) on an H100 SXM, with a simple roofline per kernel: each kernel takes the longer of its memory time and its compute time. \(B\) is the number of tokens processed together: the batch in decode, the chunk length in prefill.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Step through the kernels. At \(B = 1\) (one user, decode) the whole layer reads 352 MB of weights and takes about 105 µs, while the math alone would take 0.36 µs: the layer is memory-bound by a factor of almost 300. Move \(B\) up: the time hardly changes until \(B\) is in the hundreds, because the weights are read once for all \(B\) tokens. Near \(B = 256\) to 512 the two bars cross, close to the ridge point of 295. At prefill sizes (4,096 or 8,192 tokens) turn off fusion: the unfused version writes and reads \(G\) and \(U\) through HBM. At \(B = 8{,}192\) that adds about 940 MB of traffic and about 0.21 ms per layer (2.92 ms becomes 3.13 ms, 7% slower). At \(B = 1\) the difference is invisible.</p></details></figure>
+
+<h2>Cross-layer parameter sharing (ALBERT)</h2>
+<h3>The idea</h3>
+<p>A standard transformer with \(L\) layers has \(L\) different sets of block weights. ALBERT (“A Lite BERT”, Lan et al., 2019) uses <b>one</b> set and applies it \(L\) times: the output of the block is fed back into the same block. <a href="../pretraining/encoders-for-understanding-bert-roberta-albert-and.html">Session 33</a> covered ALBERT as an encoder. Here we look at it as a tool for inference cost. The Universal Transformer (Dehghani et al.) had the same idea earlier: one block, applied repeatedly over depth, with an adaptive number of steps. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A cook who follows twelve different recipe cards in a row needs twelve cards in the drawer. A cook who follows the same card twelve times needs one card. The drawer is much smaller, but the cooking still takes twelve rounds of work.</aside>
+<p>More generally, split the \(L\) layer positions among \(L/k\) unique blocks, each used \(k\) times. Then:</p>
+<div class="eq">\[ P_{\text{stored}} = P_{\text{emb}} + \frac{L}{k}\, P_{\text{block}}, \qquad \text{FLOPs per token} = 2\big(L\, P_{\text{block}} + P_{\text{head}}\big) \ \ (\text{for any } k) \tag{94.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P_{\text{block}}\)</dt><dd>weights of one transformer block: attention, FFN and norms</dd>
+<dt>\(k\)</dt><dd>how many layer positions use each unique block; \(k = 1\) is no sharing, \(k = L\) is ALBERT’s all-shared setting</dd>
+<dt>\(P_{\text{emb}}\)</dt><dd>the embedding table, plus the output head if it is not tied</dd>
+<dt>\(P_{\text{head}}\)</dt><dd>the output projection to the vocabulary; it costs FLOPs even when it is tied to the input table</dd></dl>
+<p>The second formula has no \(k\) in it. That is the whole lesson: every layer position still multiplies the token by a full block of weights. Sharing changes <b>which</b> weights are used, not <b>how many</b> multiplications happen.</p>
+<p>There are two common orders for the repeats. <b>Immediate</b> (block-wise) repeat uses block 0 at positions 0, 1, then block 1 at positions 2, 3, and so on. <b>Repeat-all-over</b> runs the whole stack of unique blocks, then runs it again. ALBERT with \(k = L\) is both at once.</p>
+<h3>What ALBERT found</h3>
+<p>The ALBERT paper tested sharing on an ALBERT-base model (\(L = 12\), \(H = 768\)) with embedding size \(E = 128\). Average of five downstream tasks: [Certain]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Sharing (ALBERT-base, \(E = 128\))</th><th>Parameters</th><th>Avg. score</th></tr></thead><tbody>
+<tr><td>not shared</td><td>89M</td><td>81.6</td></tr>
+<tr><td>attention shared only</td><td>64M</td><td>81.7</td></tr>
+<tr><td>FFN shared only</td><td>38M</td><td>80.2</td></tr>
+<tr><td>all shared</td><td>12M</td><td>80.1</td></tr></tbody></table></div>
+<p>Two lessons. First, sharing the FFN is what hurts; sharing attention cost nothing here. The FFN is where the model stores most of its “knowledge”, so giving every layer the same FFN removes capacity. Second, the paper also tried groups of layers that share within the group, and found that smaller groups give better quality but more parameters. [Certain] It chose all-shared as its default.</p>
+<p>Then ALBERT spent the saving on <b>width</b>. ALBERT-xxlarge has \(H = 4{,}096\) and 12 layers, all shared, with 235M parameters, about 70% of BERT-large’s 334M. It beat BERT-large clearly (average 88.7 vs 85.2). But it trained about 3 times slower: the paper lists its data throughput as 0.3× that of BERT-large. [Certain] With formula (94.5), one ALBERT-xxlarge block has 201,379,840 weights, and it is applied 12 times: about 2.42 billion weights touch every token, against 302 million in BERT-large. Eight times the compute, with fewer stored parameters.</p>
+<div class="worked"><div class="wt">Worked example: ALBERT-xxlarge vs BERT-large, per token</div>
+<p>One encoder layer of width \(H\) with FFN width \(4H\) has \(4(H^2 + H) + 2H \cdot 4H + 4H + H + 4H\) weights, as in <a href="../pretraining/encoders-for-understanding-bert-roberta-albert-and.html">session 33</a>. For \(H = 1{,}024\): 12,596,224. For \(H = 4{,}096\): 201,379,840.</p>
+<p>BERT-large: \(24 \times 12{,}596{,}224 = 302{,}309{,}376\) weights used per token, all different.</p>
+<p>ALBERT-xxlarge: \(12 \times 201{,}379{,}840 = 2{,}416{,}558{,}080\) weights used per token, but only one block stored.</p>
+<p>Ratio: \(2{,}416{,}558{,}080 / 302{,}309{,}376 = 7.99\). The paper’s measured throughput ratio was 3.17× (BERT-large faster), smaller than 8× because the measured time also includes attention over the sequence, the embeddings, and communication, which do not all grow the same way. [Likely]</p></div>
+
+<h2>What sharing saves, and what it does not</h2>
+<h3>What it saves</h3>
+<ul>
+<li><b>Memory for weights</b>, and the size of the checkpoint file you ship. This matters most on phones and small GPUs.</li>
+<li><b>Room for the KV cache.</b> On a serving GPU, every gigabyte not used by weights can hold more KV cache, so more requests can run at once. That raises <b>throughput</b>, even though each request is not faster.</li>
+<li><b>Communication in training</b>: fewer distinct gradients to all-reduce. The ALBERT paper credits part of ALBERT-large’s 1.7× training speed-up over BERT-large to “less communication”. [Certain]</li></ul>
+<h3>What it does not save</h3>
+<ul>
+<li><b>FLOPs.</b> Formula (94.5): same depth, same FLOPs.</li>
+<li><b>The KV cache.</b> Each layer position computes its own keys and values from its own input, so a model with shared weights still stores one K and one V per layer per token. (Sharing the KV cache itself across layers is a different method, cross-layer attention (CLA); see <a href="../inference/efficient-attention-1-mqa-gqa-and-mla.html">session 97</a>.)</li>
+<li><b>Usually, bytes moved per decode step.</b> In decode, each layer position reads its weights from HBM. If the shared block is too big to stay in on-chip memory until it is used again, it is read again, and the traffic is the same as without sharing. One Llama 2 7B block is 202 million weights, 405 MB in BF16. The H100’s L2 cache is about 50 MB. [Likely] So for large models, sharing does not cut decode time.</li></ul>
+<h3>The exception: weights that stay on chip</h3>
+<p>MobileLLM (Liu et al., 2024) studies models under one billion parameters for phones. Its block is small: MobileLLM-125M has 30 layers, \(d = 576\), and about 3.5 million weights per block, 7 MB in FP16. The paper notes that on-chip memory (SRAM) for computing is typically around 20 MB, enough for about one block. [Certain] It therefore repeats each block <b>immediately</b>: block \(j\) runs twice in a row, so the second run finds its weights already on chip and does not read them from DRAM again.</p>
+<p>The model MobileLLM-LS-125M keeps the 125M parameters but doubles the depth to 60 layer positions. That doubles the FLOPs per token. Yet on an iPhone 13, execution went from 15.6 ms to 16.0 ms, a 2.6% overhead, while a 60-layer model with no sharing was 86% slower. [Certain] And quality went up: average zero-shot accuracy 46.3 → 47.0 for 125M, and 51.3 → 52.1 for 350M. [Certain] In the paper’s ablation, repeat-all-over was slightly more accurate (45.2 vs 45.0 for immediate repeat, baseline 44.6), but the authors chose immediate repeat for its cache behavior. [Certain]</p>
+<aside class="note numbers side"><span class="nt">Real numbers</span>This is the memory-bound picture from formula (94.1) working in your favor. Decode on a phone is limited by bytes read, not by FLOPs. MobileLLM adds FLOPs but not bytes, so the extra depth is almost free in time. On a large GPU model, the same trick does not work, because one block does not fit on chip. [Likely]</aside>
+<p>So there are two ways to spend sharing. <b>Same depth, fewer parameters</b> (ALBERT-base): smaller memory, same compute, some quality loss. <b>Same parameters, more depth</b> (ALBERT-xxlarge’s extra width, MobileLLM-LS’s extra depth): better quality, more compute, and time that depends on whether the bytes moved go up.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: a forward pass with cross-layer sharing</div><ol>
+<li><b>input:</b> token vectors \(X\); unique blocks \(\text{blk}_0, \dots, \text{blk}_{U-1}\) with \(U = L/k\); pattern</li>
+<li><b>for</b> \(i = 0, \dots, L - 1\):</li>
+<li class="i1"><b>if</b> pattern = immediate: \(j \leftarrow \lfloor i / k \rfloor\) <span class="c">// 0,0,1,1,…: weights reused while still on chip</span></li>
+<li class="i1"><b>else if</b> pattern = repeat-all-over: \(j \leftarrow i \bmod U\) <span class="c">// 0,1,…,U−1,0,1,…</span></li>
+<li class="i1">\(X \leftarrow \text{blk}_j(X,\ \text{KV cache slot } i)\) <span class="c">// the KV cache is indexed by position i, not by block j</span></li>
+<li><b>return</b> \(X\)</li>
+<li><b>training:</b> the gradient of \(\text{blk}_j\) is the <b>sum</b> of the gradients from all positions that used it (autograd does this)</li></ol></div>
+<p>Figure 3 lets you apply these patterns to real decoder models and see what changes.</p>
+<figure class="fig wide" id="ef-shr"><div class="fig-body">
+<div class="controls"><span class="seg" id="ef-shr-pre"><button type="button" data-v="l2" aria-pressed="true">Llama 2 7B</button><button type="button" data-v="l3" aria-pressed="false">Llama 3 8B</button><button type="button" data-v="mob" aria-pressed="false">MobileLLM-125M</button></span></div>
+<div class="controls"><span class="seg" id="ef-shr-pat"><button type="button" data-v="none" aria-pressed="true">no sharing</button><button type="button" data-v="imm" aria-pressed="false">immediate repeat</button><button type="button" data-v="all" aria-pressed="false">repeat all over</button></span></div>
+<div class="ef-grid">
+<label for="ef-shr-k">Uses per unique block \(k\)</label><select id="ef-shr-k"></select><span></span>
+<label for="ef-shr-g">GPU</label><select id="ef-shr-g"><option value="l4">NVIDIA L4 (24 GB, 300 GB/s, L2 about 48 MB)</option><option value="h100" selected>H100 SXM (80 GB, 3.35 TB/s, L2 about 50 MB)</option></select><span></span></div>
+<div class="scroll-x"><svg id="ef-shr-svg" viewBox="0 0 760 250" role="img" aria-label="Layer positions colored by which unique block they use, and bars for memory, FLOPs and KV cache capacity"></svg></div>
+<div class="readout" id="ef-shr-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Cross-layer sharing applied to real decoder configs (BF16, formula 94.5). Top: each square is one layer position; squares with the same color and number use the same weights. Bottom: stored weights, FLOPs per token and KV-cache capacity, relative to the model without sharing. KV capacity assumes 90% of GPU memory is usable for weights plus KV cache.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Choose Llama 2 7B on the L4 and switch from no sharing to immediate repeat with \(k = 2\). Stored weights fall from 13.48 GB to 7.00 GB, and the KV cache can hold 27,846 tokens instead of 15,493. The FLOPs bar does not move, and neither does the KV cache per token: every position still writes its own K and V. The readout also estimates the weight bytes read per decode step: for Llama, one block (over 400 MB) is far bigger than L2, so the bytes stay the same. Now choose MobileLLM-125M with immediate repeat: one block is 7 MB, so the repeat can be served from on-chip memory, and the bytes read per step drop. Repeat-all-over gives the same memory saving, but never reuses a block right away.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: sharing Llama 2 7B to fit an L4</div>
+<p>Llama 2 7B: 32 blocks of 202,383,360 weights (attention 67,108,864, SwiGLU FFN 135,266,304, two norms 8,192), plus input and output tables of \(32{,}000 \times 4{,}096 = 131{,}072{,}000\) each and a final norm. Total 6,738,415,616, which matches the published 6.74B.</p>
+<p>KV cache per token: \(2 \times 32 \text{ layers} \times 32 \text{ heads} \times 128 \times 2 \text{ bytes} = 524{,}288\) bytes (0.5 MiB).</p>
+<p>On an L4 with 90% of 24 GB usable (21.6 GB): weights take 13.48 GB, leaving 8.12 GB, which is 15,493 tokens of KV cache.</p>
+<p>Share pairs of blocks (\(k = 2\), 16 unique blocks): \(16 \times 202{,}383{,}360 + 2 \times 131{,}072{,}000 + 4{,}096 = 3{,}500{,}281{,}856\) weights, 7.00 GB. Now 14.60 GB is free: 27,846 tokens, 1.8 times more. FLOPs per token stay \(2 \times 6.61 \times 10^9 = 13.2\) GFLOP. This model would of course need to be trained with sharing; you cannot just delete half the blocks of a trained Llama. [Certain]</p></div>
+
+<h2>Factorized and tied embeddings</h2>
+<h3>Factorization (ALBERT)</h3>
+<p>ALBERT’s second idea targets the embedding table. A normal table is \(V \times d\). ALBERT stores a smaller \(V \times E\) table and one \(E \times d\) projection:</p>
+<div class="eq">\[ \underbrace{V \cdot d}_{\text{standard}} \;\longrightarrow\; \underbrace{V \cdot E + E \cdot d}_{\text{factorized}}, \qquad E \ll d \tag{94.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(V\)</dt><dd>vocabulary size (30,000 for ALBERT, 128,256 for Llama 3)</dd>
+<dt>\(E\)</dt><dd>the small embedding size (ALBERT uses \(E = 128\) for all model sizes)</dd>
+<dt>\(d\)</dt><dd>the model width (\(H\) in the ALBERT paper)</dd></dl>
+<p>The product of a \(V \times E\) and an \(E \times d\) matrix has rank at most \(E\), so this is a low-rank version of the full table. The argument: input embeddings only need context-free word meaning, which should need fewer dimensions than the hidden states. In ALBERT’s ablation (ALBERT-base, all-shared) \(E = 128\) was best (average 80.1, against 79.8 at \(E = 768\)), while without sharing larger \(E\) was slightly better (81.7 at 128, 82.3 at 768). [Certain]</p>
+<p>For inference, look at the two ends of the model separately.</p>
+<ul>
+<li><b>Input side.</b> A full table lookup costs zero FLOPs: it just copies one row. The factorized version adds a \(1 \times E\) by \(E \times d\) multiplication, \(2Ed\) FLOPs per token. It saves memory and adds a little compute.</li>
+<li><b>Output side (the LM head).</b> The head maps the final hidden state to \(V\) logits. That is a real matrix multiplication, and with large vocabularies it is a big one. If the head is tied to a factorized table, the cost falls:</li></ul>
+<div class="eq">\[ \text{head FLOPs per token:} \quad 2\, d\, V \;\longrightarrow\; 2\, d\, E + 2\, E\, V, \qquad \operatorname{rank}(\text{logit map}) \le E \tag{94.7} \]</div>
+<div class="worked"><div class="wt">Worked example: the LM head of Llama 3 8B</div>
+<p>\(V = 128{,}256\), \(d = 4{,}096\). The head has \(525{,}336{,}576\) weights and costs \(2 \times 525{,}336{,}576 = 1.05\) GFLOP per token, about 7.0% of the model’s 15.0 GFLOP per token.</p>
+<p>A factorized head with \(E = 512\): \(128{,}256 \times 512 + 512 \times 4{,}096 = 67{,}764{,}224\) weights and \(135{,}528{,}448\) FLOPs, 7.75 times less. But the logits are now produced through a 512-dimensional bottleneck: no matter what the hidden state is, the 128,256 logits must lie in a 512-dimensional subspace. A low-rank output layer limits how sharp and varied the next-token distributions can be (the “softmax bottleneck” argument). [Likely] No major open LLM uses a factorized head today. [Likely]</p></div>
+<h3>Tying: the cheap cousin that is used</h3>
+<p><b>Tied embeddings</b> use the same \(V \times d\) matrix for the input table and the output head (Press and Wolf, 2017). This halves the vocabulary weights without a rank limit. It does not change FLOPs: the head still does \(2dV\) per token. It is common in small models, where the vocabulary is a large share of all weights: Llama 3.2 1B and Qwen2.5 0.5B tie their embeddings; Llama 3 8B and Qwen2.5 7B do not. [Certain] For Llama 3.2 1B the table is \(128{,}256 \times 2{,}048 = 262{,}668{,}288\) weights, 21% of the model’s 1.24B; an untied head would add the same amount again. MobileLLM reports that tying in its 125M model saved about 10 to 12% of the parameters for a 0.2-point drop in average accuracy, which it won back by spending the saved parameters on more layers. [Certain]</p>
+<aside class="note numbers side"><span class="nt">Real numbers</span>In small models with big vocabularies the head is also a big share of the <b>compute</b>. Llama 3.2 1B does about 2.47 GFLOP per token, and the head alone is 0.53 GFLOP of it, 21%. In Llama 3 8B it is 7%. This is why small on-device models care so much about vocabulary size.</aside>
+<figure class="fig" id="ef-fac"><div class="fig-body">
+<div class="controls"><span class="seg" id="ef-fac-pre"><button type="button" data-v="axx" aria-pressed="false">ALBERT-xxlarge</button><button type="button" data-v="l3" aria-pressed="true">Llama 3 8B</button><button type="button" data-v="l32" aria-pressed="false">Llama 3.2 1B</button></span></div>
+<div class="ef-grid">
+<label for="ef-fac-e">Embedding size \(E\)</label><input type="range" id="ef-fac-e" min="0" max="8" step="1" value="8"><output id="ef-fac-ev"></output></div>
+<div class="controls" style="margin-top:6px"><label class="sl"><input type="checkbox" id="ef-fac-tie"> Tie the output head to the input table</label></div>
+<svg id="ef-fac-svg" viewBox="0 0 640 210" role="img" aria-label="Bars of vocabulary weights and output head FLOPs for a factorized embedding"></svg>
+<div class="ef-leg"><span style="--c:var(--q)">input table</span><span style="--c:var(--k)">output head</span><span style="--c:var(--v)">head FLOPs per token</span></div>
+<div class="readout" id="ef-fac-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Factorized embeddings, formulas (94.6) and (94.7). The bars compare vocabulary weights and output-head FLOPs with the standard full-rank, untied layout of the same model. With “tie” on, the head reuses the input table (and, when factorized, the same projection).</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Start at the right end of the slider (\(E = d\), no factorization) with Llama 3 8B: 1.05 billion vocabulary weights and 1.05 GFLOP per token in the head. Tick “tie”: the weights halve, the FLOPs do not move. Now slide \(E\) down to 512: weights and head FLOPs both drop by about 7.75 times, but the readout warns that the logits now have rank at most 512. Click ALBERT-xxlarge and set \(E = 128\): the input table shrinks from 122.9M to 4.4M weights, the setting ALBERT actually used.</p></details></figure>
+
+<h2>Other kinds of sharing, briefly</h2>
+<ul>
+<li><b>Sharing inside a Mixture of Experts.</b> The survey’s section on efficient FFN design mentions MPOE, which decomposes each expert’s FFN matrix so that a large central tensor is shared by all experts and each expert keeps only small extra parts. [Likely] This is sharing applied <b>across experts</b> instead of across layers. MoE itself is the topic of <a href="../inference/efficient-ffn-2-moe-routing-in-depth.html">session 95</a>.</li>
+<li><b>Sharing keys and values.</b> Multi-query and grouped-query attention share K and V across heads; cross-layer attention (CLA) shares them across adjacent layers. These cut the KV cache, which weight sharing does not (<a href="../inference/efficient-attention-1-mqa-gqa-and-mla.html">session 97</a>).</li>
+<li><b>Sharing low-rank adapters.</b> Serving many LoRA fine-tunes of one base model shares the big base weights across tasks (<a href="../posttraining/lora-and-other-peft-methods.html">session 57</a>).</li></ul>
+
+<h2>In code</h2>
+<p>Everything above in one runnable, deterministic script (PyTorch 2.4 or later for <code>nn.RMSNorm</code>). It checks the 8d/3 sizing, shows that the fused SwiGLU equals three separate matrices, counts parameters and FLOPs with PyTorch’s own FLOP counter, and builds a factorized, tied head.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn <span class="kw2">as</span> nn, torch.nn.functional <span class="kw2">as</span> F
+<span class="kw2">from</span> torch.utils.flop_counter <span class="kw2">import</span> FlopCounterMode
+torch.manual_seed(<span class="nu">0</span>)
+
+<span class="cm"># 1) hidden size of a gated FFN with the budget of a plain r*d FFN, formulas (94.3) and (94.4)</span>
+<span class="kw2">def</span> gated_hidden(d, r=<span class="nu">4</span>, mult=<span class="nu">1.0</span>, m=<span class="nu">256</span>):
+    h = int(<span class="nu">2</span> * r * d / <span class="nu">3</span>)
+    h = int(mult * h)
+    <span class="kw2">return</span> m * ((h + m - <span class="nu">1</span>) // m)
+print(gated_hidden(<span class="nu">4096</span>), gated_hidden(<span class="nu">4096</span>, mult=<span class="nu">1.3</span>, m=<span class="nu">1024</span>))   <span class="cm"># 11008 14336</span>
+
+<span class="cm"># 2) SwiGLU (94.2) with gate and up fused into one matrix: one matmul instead of two</span>
+<span class="kw2">class</span> SwiGLU(nn.Module):
+    <span class="kw2">def</span> __init__(self, d, f):
+        super().__init__()
+        self.gate_up = nn.Linear(d, <span class="nu">2</span> * f, bias=<span class="kw2">False</span>)   <span class="cm"># [W_gate | W_up]</span>
+        self.down = nn.Linear(f, d, bias=<span class="kw2">False</span>)
+    <span class="kw2">def</span> forward(self, x):
+        g, u = self.gate_up(x).chunk(<span class="nu">2</span>, dim=-<span class="nu">1</span>)
+        <span class="kw2">return</span> self.down(F.silu(g) * u)
+
+<span class="kw2">class</span> PlainFFN(nn.Module):
+    <span class="kw2">def</span> __init__(self, d, f):
+        super().__init__()
+        self.up = nn.Linear(d, f, bias=<span class="kw2">False</span>); self.down = nn.Linear(f, d, bias=<span class="kw2">False</span>)
+    <span class="kw2">def</span> forward(self, x):
+        <span class="kw2">return</span> self.down(F.gelu(self.up(x)))
+
+<span class="kw2">def</span> n_params(m):
+    <span class="kw2">return</span> sum(p.numel() <span class="kw2">for</span> p <span class="kw2">in</span> m.parameters())   <span class="cm"># a shared tensor is counted once</span>
+<span class="kw2">def</span> flops(m, x):
+    <span class="kw2">with</span> FlopCounterMode(display=<span class="kw2">False</span>) <span class="kw2">as</span> fc:
+        m(x)
+    <span class="kw2">return</span> fc.get_total_flops()
+
+d = <span class="nu">384</span>
+sw, pl = SwiGLU(d, gated_hidden(d)), PlainFFN(d, <span class="nu">4</span> * d)
+x = torch.randn(<span class="nu">8</span>, d)
+print(gated_hidden(d), n_params(sw), n_params(pl))        <span class="cm"># 1024 1179648 1179648</span>
+print(flops(sw, x), flops(pl, x))                         <span class="cm"># 18874368 18874368  (= 2 * 8 tokens * weights)</span>
+
+<span class="cm"># the fused layer gives the same output as three separate matrices</span>
+Wg, Wu = sw.gate_up.weight.chunk(<span class="nu">2</span>, dim=<span class="nu">0</span>)
+ref = (F.silu(x @ Wg.T) * (x @ Wu.T)) @ sw.down.weight.T
+print(torch.allclose(sw(x), ref, atol=<span class="nu">1e-6</span>))              <span class="cm"># True</span>
+
+<span class="cm"># 3) cross-layer sharing, formula (94.5) and Algorithm 2</span>
+<span class="kw2">class</span> Block(nn.Module):
+    <span class="kw2">def</span> __init__(self, d):
+        super().__init__(); self.norm = nn.RMSNorm(d); self.ffn = SwiGLU(d, gated_hidden(d))
+    <span class="kw2">def</span> forward(self, x):
+        <span class="kw2">return</span> x + self.ffn(self.norm(x))
+
+<span class="kw2">class</span> SharedStack(nn.Module):
+    <span class="kw2">def</span> __init__(self, d, L, k, pattern):
+        super().__init__()
+        self.blocks = nn.ModuleList(Block(d) <span class="kw2">for</span> _ <span class="kw2">in</span> range(L // k))      <span class="cm"># L/k unique blocks</span>
+        <span class="kw2">if</span> pattern == <span class="st">"immediate"</span>:  self.order = [i // k <span class="kw2">for</span> i <span class="kw2">in</span> range(L)]        <span class="cm"># 0,0,1,1,...</span>
+        <span class="kw2">elif</span> pattern == <span class="st">"all_over"</span>: self.order = [i % (L // k) <span class="kw2">for</span> i <span class="kw2">in</span> range(L)]   <span class="cm"># 0,1,...,0,1,...</span>
+        <span class="kw2">else</span>:                       self.order = list(range(L))
+    <span class="kw2">def</span> forward(self, x):
+        <span class="kw2">for</span> i <span class="kw2">in</span> self.order:
+            x = self.blocks[i](x)
+        <span class="kw2">return</span> x
+
+<span class="kw2">for</span> pat, k <span class="kw2">in</span> [(<span class="st">"none"</span>, <span class="nu">1</span>), (<span class="st">"immediate"</span>, <span class="nu">2</span>), (<span class="st">"all_over"</span>, <span class="nu">2</span>), (<span class="st">"immediate"</span>, <span class="nu">12</span>)]:
+    m = SharedStack(d, <span class="nu">12</span>, k, pat)
+    print(pat, k, n_params(m), flops(m, x), m.order[:<span class="nu">6</span>])
+<span class="cm"># none 1       14160384 226492416 [0, 1, 2, 3, 4, 5]</span>
+<span class="cm"># immediate 2   7080192 226492416 [0, 0, 1, 1, 2, 2]   half the weights, same FLOPs</span>
+<span class="cm"># all_over 2    7080192 226492416 [0, 1, 2, 3, 4, 5]</span>
+<span class="cm"># immediate 12  1180032 226492416 [0, 0, 0, 0, 0, 0]   ALBERT-style: one block</span>
+
+<span class="cm"># a shared weight receives the SUM of the gradients from every position that used it</span>
+m = SharedStack(d, <span class="nu">12</span>, <span class="nu">12</span>, <span class="st">"immediate"</span>)
+m(x).pow(<span class="nu">2</span>).mean().backward()
+print(m.blocks[<span class="nu">0</span>].ffn.down.weight.grad.norm().item() > <span class="nu">0</span>)  <span class="cm"># True: one tensor, 12 contributions</span>
+
+<span class="cm"># 4) factorized embedding (94.6) with a tied, factorized output head (94.7)</span>
+V, E, D = <span class="nu">32000</span>, <span class="nu">128</span>, <span class="nu">1024</span>
+emb, proj = nn.Embedding(V, E), nn.Linear(E, D, bias=<span class="kw2">False</span>)
+ids = torch.randint(<span class="nu">0</span>, V, (<span class="nu">8</span>,))
+h = proj(emb(ids))                                         <span class="cm"># [8, D]: lookup, then 2*E*D FLOPs per token</span>
+logits = (h @ proj.weight) @ emb.weight.T                  <span class="cm"># [8, V]: 2*D*E + 2*E*V FLOPs per token</span>
+print(h.shape, logits.shape, V * E + E * D, V * D)         <span class="cm"># ... 4227072 32768000</span>
+print(torch.linalg.matrix_rank(proj.weight @ emb.weight.T).item())   <span class="cm"># 128: the logit map has rank E</span></pre>
+<p>Note that <code>flops</code> is identical for all four stacks, and <code>n_params</code> falls with \(k\). That is formula (94.5) measured by PyTorch, not computed by us.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Technique</th><th>Why it is used there</th></tr></thead><tbody>
+<tr><td>Open decoder LLMs (Llama, Mistral, Qwen) and the language half of most VLMs</td><td>SwiGLU FFN, no biases, \(d_{\text{ff}}\) from 8d/3 upward, rounded to a large multiple</td><td>Better quality at the same weights, FLOPs and bytes; free at inference [Certain]</td></tr>
+<tr><td>Serving engines (vLLM and others)</td><td>Fused gate/up matmul, fused SiLU·multiply, gate and up split together under tensor parallelism</td><td>Fewer, larger kernels; less activation traffic in prefill [Likely]</td></tr>
+<tr><td>Small text encoders (ALBERT family) for classification, retrieval and search</td><td>Cross-layer sharing and factorized embeddings</td><td>Small download and memory; compute is not reduced, so use the base or large sizes when latency matters</td></tr>
+<tr><td>On-device LLMs (MobileLLM)</td><td>SwiGLU, tied embeddings, immediate block-wise repeat</td><td>Phones are limited by memory size and memory bandwidth; repeats served from on-chip memory are almost free [Certain]</td></tr>
+<tr><td>Small LLMs with large vocabularies (Llama 3.2 1B, Qwen2.5 0.5B)</td><td>Tied input/output embeddings</td><td>The vocabulary table is about a fifth of the weights [Certain]</td></tr>
+<tr><td>Video on a device: action recognition, key-moment detection or Video-RAG captioning with a small LLM next to a vision encoder</td><td>A small tied-embedding SwiGLU LLM, maybe with block repeat</td><td>The vision encoder and the KV cache of many frame tokens compete for the same memory; weights saved become frame tokens that fit [Speculation]</td></tr>
+<tr><td>Serving many requests on one GPU</td><td>Fewer stored weights (sharing, or more usually quantization)</td><td>Freed memory holds more KV cache, so more requests run at once; per-request latency does not improve [Certain]</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>“Fewer parameters, so faster.”</b> Sharing keeps the FLOPs (formula 94.5). ALBERT-xxlarge has fewer parameters than BERT-large and trains about 3 times slower.</li>
+<li><b>Counting a SwiGLU FFN as two matrices.</b> It has three: \(3\,d\,d_{\text{ff}}\) weights and \(6\,d\,d_{\text{ff}}\) FLOPs per token.</li>
+<li><b>Assuming \(d_{\text{ff}} = 8d/3\) in every SwiGLU model.</b> Llama 3 8B uses 3.5d and Qwen2.5 7B uses 5.29d. Read <code>intermediate_size</code> from the config.</li>
+<li><b>Splitting a fused gate/up matrix naively for tensor parallelism.</b> Each GPU must hold matching gate and up columns.</li>
+<li><b>Expecting weight sharing to shrink the KV cache.</b> Each layer position still writes its own K and V. Use GQA, MLA or cross-layer attention for that.</li>
+<li><b>Expecting weight sharing to cut decode time on a large GPU model.</b> A shared block that does not fit on chip is read from HBM again at every use.</li>
+<li><b>Factorizing the output head to save FLOPs without checking quality.</b> The logits become rank \(E\). Tying is the safer way to save vocabulary memory; it saves weights but not FLOPs.</li>
+<li><b>Deleting or merging layers of a trained model and calling it “sharing”.</b> ALBERT and MobileLLM are <b>trained</b> with sharing. Forcing it on a trained model is a form of pruning and needs recovery training.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is SwiGLU, and what does it cost compared with a GELU FFN?<span class="lvl">basic</span></summary><div class="ans">SwiGLU is \((\mathrm{SiLU}(\mathbf{x}W_{\text{gate}}) \odot \mathbf{x}W_{\text{up}})W_{\text{down}}\) (94.2): a gated FFN with three matrices. For hidden size \(d_{\text{ff}}\) it has \(3d\,d_{\text{ff}}\) weights and \(6d\,d_{\text{ff}}\) FLOPs per token, versus \(2d\,d_{\text{ff}}\) and \(4d\,d_{\text{ff}}\) for a GELU FFN. That is why gated models shrink \(d_{\text{ff}}\) to about \(8d/3\): then both cost the same, and SwiGLU still gives lower loss (1.636 vs 1.679 log-perplexity for GELU in Shazeer’s long run). The small extra element-wise work and, without fusion, one extra hidden tensor in memory are the only practical costs.</div></details>
+<details class="qa"><summary>Derive Llama 2 7B’s FFN size of 11,008.<span class="lvl">core</span></summary><div class="ans">Match a plain \(4d\) FFN: \(3d\,d_{\text{ff}} = 2d \cdot 4d\), so \(d_{\text{ff}} = 8d/3\) (94.3). For \(d = 4{,}096\): 10,922.7, truncated to 10,922, rounded up to a multiple of 256: \(43 \times 256 = 11{,}008\) (94.4). Llama 3 8B multiplies by 1.3 first (14,198) and rounds to a multiple of 1,024: 14,336. Rounding to big powers of two keeps the shapes efficient for tensor cores and divisible across tensor-parallel GPUs.</div></details>
+<details class="qa"><summary>How would you implement SwiGLU efficiently for serving?<span class="lvl">core</span></summary><div class="ans">Concatenate \(W_{\text{gate}}\) and \(W_{\text{up}}\) into one \(d \times 2d_{\text{ff}}\) matrix so one matmul produces both halves; compute \(\mathrm{SiLU}(g)\odot u\) in a fused element-wise kernel or in the matmul epilogue so the two halves never travel through HBM; then do the down projection. Under tensor parallelism, split gate and up along \(d_{\text{ff}}\) consistently (column-parallel), and the down matrix by rows, so there is one all-reduce per FFN. In decode the layer is memory-bound, so the main gain is fewer kernel launches; in prefill fusion also saves hundreds of MB of activation traffic per layer.</div></details>
+<details class="qa"><summary>ALBERT-large has 18M parameters, BERT-large 334M. Is ALBERT-large 18 times faster?<span class="lvl">core</span></summary><div class="ans">No. ALBERT-large has the same depth (24) and width (1,024) as BERT-large and applies its one shared block 24 times, so the FLOPs per token of the encoder layers are the same. The paper measured about 1.7 times higher training throughput, which it attributes to less communication and fewer computations (the embedding part is also smaller). Parameters set memory; depth times width sets compute. ALBERT-xxlarge, with 235M parameters, is about 3 times slower than BERT-large because its shared block is 16 times bigger and is applied 12 times.</div></details>
+<details class="qa"><summary>What does cross-layer weight sharing save at inference, and what does it not save?<span class="lvl">core</span></summary><div class="ans">It saves weight memory and checkpoint size, which on a serving GPU turns into room for more KV cache and so more concurrent requests (higher throughput). It does not save FLOPs (94.5), does not shrink the KV cache (each position computes its own K and V), and usually does not reduce bytes moved per decode step, because a shared block that is too large for on-chip memory is re-read from HBM at each use. So per-token latency is unchanged in the common case.</div></details>
+<details class="qa"><summary>When does weight sharing reduce decode latency? Give an example.<span class="lvl">advanced</span></summary><div class="ans">When the shared weights stay in on-chip memory between uses, so the repeat does not re-read them from DRAM. MobileLLM repeats each block immediately; one block of the 125M model is about 7 MB, under the roughly 20 MB of SRAM the paper assumes. MobileLLM-LS-125M doubles depth (and FLOPs) at the same parameters, and its execution time on an iPhone 13 rose only 2.6% (15.6 to 16.0 ms), while a 60-layer unshared model was 86% slower. Because decode is memory-bound, extra FLOPs without extra bytes are nearly free. For a 7B model, one block is about 400 MB and does not fit in a 50 MB L2, so the trick does not apply.</div></details>
+<details class="qa"><summary>Why did sharing the FFN hurt ALBERT more than sharing attention?<span class="lvl">advanced</span></summary><div class="ans">In ALBERT’s ablation (\(E = 128\)), sharing only attention kept the average at 81.7 (vs 81.6 unshared), while sharing only the FFN dropped it to 80.2. The FFN holds about two thirds of a block’s weights and acts like a key–value memory for features and facts, so forcing all layers to use the same FFN removes most of the model’s capacity. Attention weights mostly define how to route information, and similar routing patterns can be reused across depth. The second point is an interpretation, not a proven fact.</div></details>
+<details class="qa"><summary>Explain ALBERT’s factorized embedding. Would you use it for the LM head of a modern LLM?<span class="lvl">core</span></summary><div class="ans">It replaces the \(V \times d\) table by \(V \times E\) plus \(E \times d\) (94.6), a rank-\(E\) factorization; with \(E = 128\) and \(H = 4{,}096\), ALBERT’s table falls from 122.9M to 4.4M weights. At the input it saves memory and adds \(2Ed\) FLOPs per token. As a tied output head it would also cut the head FLOPs from \(2dV\) to \(2dE + 2EV\) (94.7), 7.75 times less for Llama 3 8B with \(E = 512\). But the logits would be confined to a rank-\(E\) subspace, which limits the expressiveness of the next-token distribution. Modern LLMs instead use full-rank heads, tied in small models (Llama 3.2 1B) and untied in larger ones.</div></details>
+<details class="qa"><summary>A team wants to serve more concurrent users on one 24 GB GPU with a 7B model. They propose retraining it with pairs of shared layers. Evaluate.<span class="lvl">advanced</span></summary><div class="ans">The arithmetic works: for Llama 2 7B, sharing pairs drops BF16 weights from 13.48 GB to 7.00 GB, and with 90% usable memory the KV cache grows from 15,493 to 27,846 tokens, about 1.8 times the concurrent context. But it needs full pretraining with sharing (you cannot just drop blocks), quality will likely fall (ALBERT lost points when sharing FFNs), and per-token latency does not improve. 8-bit or 4-bit weight quantization of the existing model gets a similar or larger memory saving without retraining and also cuts the bytes per decode step, so it is the better first move. [Likely]</div></details>
+<details class="qa"><summary>Does SwiGLU help or hurt activation-sparsity methods?<span class="lvl">advanced</span></summary><div class="ans">It hurts. ReLU FFNs produce many exact zeros in the hidden layer, so a system can predict which hidden units are active and skip the matching rows of the down matrix (PowerInfer, Deja Vu style). SiLU outputs are rarely exactly zero, so SwiGLU models have far less natural sparsity. “ReLU Strikes Back” proposes replacing the activation with ReLU and fine-tuning to recover sparsity at a small quality cost. [Likely] It is a trade: better quality per parameter versus easier sparse inference.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A plain FFN model has \(d = 2{,}048\) and \(d_{\text{ff}} = 4d\). Switch to SwiGLU at equal weights with Llama-style rounding to a multiple of 256. What is \(d_{\text{ff}}\)?</li>
+<li>Llama 2 7B is retrained with repeat-all-over sharing, \(k = 4\). How many weights are stored? How many FLOPs per token in the forward pass (ignore attention over the context)?</li>
+<li>For Llama 3 8B (\(V = 128{,}256\), \(d = 4{,}096\)), compute the weights and FLOPs per token of a factorized, tied head with \(E = 512\), and the reduction factor.</li>
+<li>One Llama 3 8B FFN layer in BF16 is decoded at \(B = 1\) on an H100 (3.35 TB/s). Estimate its time and the time of all 32 FFN layers. Would immediate sharing with \(k = 2\) change it?</li>
+<li>Using the per-layer counts in the worked example, how many weights does each token touch in ALBERT-xxlarge versus BERT-large (encoder layers only)?</li>
+<li>Would MobileLLM’s immediate repeat help a Llama 2 7B on an H100? Compare one block’s size with the L2 cache.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(8 \times 2{,}048/3 = 5{,}461.3 \to 5{,}461\), rounded up to a multiple of 256: \(22 \times 256 = 5{,}632\). 2. 8 unique blocks: \(8 \times 202{,}383{,}360 + 2 \times 131{,}072{,}000 + 4{,}096 = 1{,}881{,}214{,}976\) weights (3.76 GB in BF16). FLOPs are unchanged: \(2 \times (32 \times 202{,}383{,}360 + 131{,}072{,}000 + 4{,}096) \approx 13.2\) GFLOP per token. 3. \(128{,}256 \times 512 + 512 \times 4{,}096 = 67{,}764{,}224\) weights (vs 525,336,576); FLOPs \(2 \times 4{,}096 \times 512 + 2 \times 512 \times 128{,}256 = 135{,}528{,}448\) (vs 1,050,673,152): 7.75 times less. 4. \(3 \times 4{,}096 \times 14{,}336 \times 2 = 352\) MB, so \(352 \times 10^6 / 3.35 \times 10^{12} \approx 105\) µs; 32 layers: about 3.37 ms per token. Sharing would not change it: each use still reads 352 MB of FFN weights, because they do not stay in a 50 MB L2. 5. ALBERT-xxlarge: \(12 \times 201{,}379{,}840 = 2.42\) billion; BERT-large: \(24 \times 12{,}596{,}224 = 0.30\) billion: about 8 times more. 6. No. One block is 202 million weights, about 405 MB in BF16, eight times the 50 MB L2; the repeat would be re-read from HBM. It helps only when a block is a few MB to tens of MB, as in sub-billion models.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Separate three costs (94.1): stored bytes, FLOPs per token, and bytes moved per step. Decode is memory-bound below about 295 tokens per step on an H100.</li>
+<li>SwiGLU (94.2) gives lower loss at the same weights, FLOPs and bytes. Equal budget gives \(d_{\text{ff}} = 8d/3\) (94.3), then designers scale and round (94.4): 11,008, 14,336, 28,672.</li>
+<li>Serve SwiGLU with a fused gate/up matmul and a fused SiLU·multiply; split gate and up together under tensor parallelism. Its activations are not sparse.</li>
+<li>Cross-layer sharing (94.5) divides stored block weights by \(k\) but leaves FLOPs and the KV cache unchanged. It helps latency only when the shared block stays on chip (MobileLLM).</li>
+<li>Factorized embeddings (94.6) save memory; a factorized tied head also saves FLOPs (94.7) but caps the logit rank at \(E\). Tying is the common, safe version in small models.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ d_{\text{ff}} = \tfrac{8}{3}d, \qquad P_{\text{stored}} = P_{\text{emb}} + \tfrac{L}{k}P_{\text{block}}, \qquad \text{FLOPs} = 2(L\,P_{\text{block}} + P_{\text{head}}) \]</div>
+<div class="eq">\[ V d \to V E + E d, \qquad 2dV \to 2dE + 2EV, \qquad \text{intensity}_{\text{decode}} \approx B \ \text{FLOP/byte} \]</div>
+<h2 class="plain" id="efficient-ffn-1-swiglu-and-parameter-sharing-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Shazeer (2020). <a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noopener">GLU Variants Improve Transformer</a></li><li>Lan et al. (2019). <a href="https://arxiv.org/abs/1909.11942" target="_blank" rel="noopener">ALBERT: A Lite BERT for Self-supervised Learning of Language Representations</a></li><li>Shazeer (2020). <a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noopener">GLU Variants Improve Transformer</a></li><li>Lan et al. (2019). <a href="https://arxiv.org/abs/1909.11942" target="_blank" rel="noopener">ALBERT: A Lite BERT for Self-supervised Learning of Language Representations</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Liu, Zhao, Iandola, Lai, Tian, Fedorov, Xiong, Chang, Shi, Krishnamoorthi, Lai, Chandra (2024). <a href="https://arxiv.org/abs/2402.14905" target="_blank" rel="noopener">MobileLLM: Optimizing Sub-billion Parameter Language Models for On-Device Use Cases</a></li><li>Press &amp; Wolf (2017). <a href="https://arxiv.org/abs/1608.05859" target="_blank" rel="noopener">Using the Output Embedding to Improve Language Models</a></li><li>Dehghani, Gouws, Vinyals, Uszkoreit, Kaiser (2019). <a href="https://arxiv.org/abs/1807.03819" target="_blank" rel="noopener">Universal Transformers</a></li><li>Chowdhery et al. (2022). <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">PaLM: Scaling Language Modeling with Pathways</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">Llama 2: Open Foundation and Fine-Tuned Chat Models</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Jiang et al. (2023). <a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Mistral 7B</a></li><li>Shoeybi et al. (2019). <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</a></li><li>Song et al. (2023). <a href="https://arxiv.org/abs/2312.12456" target="_blank" rel="noopener">PowerInfer: Fast Large Language Model Serving with a Consumer-grade GPU</a></li><li>Mirzadeh, Alizadeh, Mehta, Del Mundo, Tuzel, Samei, Rastegari, Farajtabar (2023). <a href="https://arxiv.org/abs/2310.04564" target="_blank" rel="noopener">ReLU Strikes Back: Exploiting Activation Sparsity in Large Language Models</a></li><li>Brandon, Mishra, Nrusimha, Panda, Ragan-Kelley (2024). <a href="https://arxiv.org/abs/2405.12981" target="_blank" rel="noopener">Reducing Transformer Key-Value Cache Size with Cross-Layer Attention</a></li><li>Gao, Liu, Zhao, Lu, Wen (2022). <a href="https://arxiv.org/abs/2203.01104" target="_blank" rel="noopener">Parameter-Efficient Mixture-of-Experts Architecture for Pre-trained Language Models</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/where-the-cost-is-ffn-and-attention.html"><small>Previous · session 93</small>Where the cost is: FFN and attention, by the numbers</a><a class="next" href="../inference/efficient-ffn-2-moe-routing-in-depth.html"><small>Next · session 95</small>Efficient FFN 2: MoE routing in depth</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="efficient-ffn-1-swiglu-and-parameter-sharing"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const C=n=>Math.round(n).toLocaleString("en-US");
+const M=n=>n>=1e9?(n/1e9).toFixed(2)+" B":n>=1e6?(n/1e6).toFixed(1)+" M":C(n);
+const GB=b=>(b/1e9).toFixed(2)+" GB";const MB=b=>(b/1e6).toFixed(1)+" MB";
+const us=t=>t>=1e-3?(t*1e3).toFixed(2)+" ms":(t*1e6).toFixed(t*1e6<10?2:1)+" µs";
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+function setSeg(el,v){el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x.dataset.v===v?"true":"false"));}
+
+/* ---------- Figure 1: SwiGLU hidden size ---------- */
+(function(){
+ const svg=$("#ef-dff-svg");if(!svg)return;const D=$("#ef-dff-d"),A=$("#ef-dff-a"),Mm=$("#ef-dff-m"),info=$("#ef-dff-info"),pre=$("#ef-dff-pre");
+ const P={l2:[4096,1,256],l3:[4096,1.3,1024],l70:[8192,1.3,4096],mob:[576,1,256]};
+ function hidden(d,a,m){let h=Math.floor(8*d/3);h=Math.floor(a*h+1e-9);return m*Math.ceil(h/m);}
+ function draw(){const d=+D.value,a=+A.value,m=+Mm.value;$("#ef-dff-av").value=a.toFixed(2);
+  const f=hidden(d,a,m),plain=8*d*d,gated=3*d*f,mx=Math.max(plain,gated),sc=560/mx;
+  const row=(y,items,lab)=>{let x=70,g=`<text x="62" y="${y+23}" text-anchor="end" class="svgs" font-size="13">${lab}</text>`;
+   items.forEach(([w,c,t])=>{const W=w*sc;g+=`<rect x="${x.toFixed(1)}" y="${y}" width="${Math.max(1,W-3).toFixed(1)}" height="36" rx="5" fill="${c}" opacity=".85"/>`;
+    if(W>80)g+=`<text x="${(x+W/2).toFixed(1)}" y="${y+23}" text-anchor="middle" font-size="12.5" font-family="var(--sans)" fill="var(--paper)" font-weight="700">${t}</text>`;x+=W;});
+   return g+`<text x="${Math.min(x+6,636)}" y="${y+23}" class="svgs" font-size="12.5" text-anchor="${x>560?"end":"start"}">${x>560?"":M(items.reduce((s,v)=>s+v[0],0))}</text>`;};
+  let g=`<text x="70" y="22" class="svgt" font-size="14" font-weight="700">Plain FFN, hidden 4d = ${C(4*d)}</text>`+row(32,[[4*d*d,"var(--q)","W₁ d×4d"],[4*d*d,"var(--v)","W₂ 4d×d"]],"plain");
+  g+=`<text x="70" y="112" class="svgt" font-size="14" font-weight="700">SwiGLU, hidden d_ff = ${C(f)}</text>`+row(122,[[d*f,"var(--k)","gate d×d_ff"],[d*f,"var(--q)","up d×d_ff"],[d*f,"var(--v)","down d_ff×d"]],"SwiGLU");
+  g+=`<line x1="${70+plain*sc}" y1="26" x2="${70+plain*sc}" y2="166" stroke="var(--muted)" stroke-dasharray="4 4"/><text x="${Math.min(70+plain*sc,630)}" y="190" text-anchor="end" class="svgs" font-size="12">plain total = 8d² = ${M(plain)}</text>`;
+  svg.innerHTML=g;
+  const diff=100*(gated/plain-1);
+  info.innerHTML=`d<sub>ff</sub> = ${m}·⌈⌊${a.toFixed(2)}·⌊8·${C(d)}/3⌋⌋ / ${m}⌉ = <b id="ef-dff-out">${C(f)}</b> (${(f/d).toFixed(3)}·d). SwiGLU weights per layer: <b>${C(gated)}</b>, plain 4d FFN: ${C(plain)} (${diff>=0?"+":"−"}${Math.abs(diff).toFixed(1)}%). FLOPs per token: ${M(2*gated)}. BF16 bytes read per decode step for this FFN: ${MB(2*gated)}.`;}
+ seg(pre,v=>{const [d,a,m]=P[v];D.value=String(d);A.value=String(a);Mm.value=String(m);draw();});
+ [D,Mm].forEach(e=>e.addEventListener("change",()=>{setSeg(pre,"");draw();}));A.addEventListener("input",()=>{setSeg(pre,"");draw();});draw();
+})();
+
+/* ---------- Figure 2: one SwiGLU FFN, kernel by kernel ---------- */
+(function(){
+ const svg=$("#ef-dec-svg");if(!svg)return;const Bs=$("#ef-dec-b"),FU=$("#ef-dec-fuse"),info=$("#ef-dec-info");
+ const d=4096,f=14336,FL=989e12,BW=3.35e12,L=32;let step=0;
+ function kernels(Bt,fused){const k1={n:"gate/up matmul",by:2*d*f*2+Bt*d*2+(fused?Bt*f*2:2*Bt*f*2),fl:4*Bt*d*f,
+   t:`One matmul with the fused weight [W<sub>gate</sub> | W<sub>up</sub>] (${C(d)} × ${C(2*f)}): reads ${MB(2*d*f*2)} of weights and the ${C(Bt)} input vectors, does ${M(4*Bt*d*f)}FLOPs. ${fused?"SiLU(G)·U is computed in the epilogue, so only H is written.":"G and U are both written to HBM."}`};
+  const k2={n:"SiLU · multiply",by:fused?0:3*Bt*f*2,fl:0,t:fused?"Fused into the previous kernel: no extra launch and no extra HBM traffic.":`A separate element-wise kernel: reads G and U, writes H, ${MB(3*Bt*f*2)} of traffic. No tensor-core FLOPs.`};
+  const k3={n:"down matmul",by:d*f*2+Bt*f*2+Bt*d*2,fl:2*Bt*d*f,t:`Reads ${MB(d*f*2)} of W<sub>down</sub> and H, writes the ${C(Bt)} output vectors, does ${M(2*Bt*d*f)}FLOPs.`};
+  return [k1,k2,k3].map(k=>Object.assign(k,{tm:k.by/BW,tc:k.fl/FL,tt:Math.max(k.by/BW,k.fl/FL)}));}
+ function draw(){const Bt=2**(+Bs.value),fused=FU.checked;$("#ef-dec-bv").value=C(Bt);const K=kernels(Bt,fused);
+  const tot=K.reduce((s,k)=>s+k.tt,0),by=K.reduce((s,k)=>s+k.by,0),fl=K.reduce((s,k)=>s+k.fl,0),tm=K.reduce((s,k)=>s+k.tm,0),tc=K.reduce((s,k)=>s+k.tc,0);
+  const mx=Math.max(...K.map(k=>Math.max(k.tm,k.tc)));let g="";
+  K.forEach((k,i)=>{const x=20+i*248,on=step===i+1||step===4;g+=`<rect x="${x}" y="10" width="226" height="82" rx="10" fill="${on?"var(--q-soft)":"var(--card)"}" stroke="${on?"var(--q)":"var(--rule)"}" stroke-width="${on?2.2:1.4}"/>`+
+   `<text x="${x+113}" y="32" text-anchor="middle" font-size="14" font-weight="700" fill="var(--ink)" font-family="var(--sans)">${i+1}. ${k.n}</text>`+
+   `<text x="${x+113}" y="54" text-anchor="middle" class="svgs" font-size="12.5">${k.by?MB(k.by)+" moved":"0 bytes (fused)"}</text>`+
+   `<text x="${x+113}" y="74" text-anchor="middle" class="svgs" font-size="12.5">${k.fl?M(k.fl)+"FLOPs":"no matmul FLOPs"}</text>`;
+   if(i<2)g+=`<path d="M${x+228} 51 h16" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#ef-ah)"/>`;
+   const bw=v=>mx>0?Math.max(v>0?1.5:0,206*v/mx):0;
+   g+=`<rect x="${x+10}" y="118" width="${bw(k.tm).toFixed(1)}" height="22" rx="3" fill="var(--q)"/><text x="${x+10}" y="112" class="svgs" font-size="12">memory ${us(k.tm)}</text>`+
+   `<rect x="${x+10}" y="168" width="${bw(k.tc).toFixed(1)}" height="22" rx="3" fill="var(--k)"/><text x="${x+10}" y="162" class="svgs" font-size="12">compute ${us(k.tc)}</text>`+
+   `<text x="${x+10}" y="212" font-size="12.5" font-family="var(--sans)" fill="var(--ink)" font-weight="700">time ${us(k.tt)} · ${k.tt===0?"—":k.tm>=k.tc?"memory-bound":"compute-bound"}</text>`;});
+  g=`<defs><marker id="ef-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`+g+
+   `<text x="380" y="240" text-anchor="middle" class="svgs" font-size="12.5">Layer total: ${us(tot)} · ${MB(by)} moved · ${M(fl)}FLOPs · intensity ${(fl/by).toFixed(1)} FLOP/byte</text>`;
+  svg.innerHTML=g;
+  const txt=[`One SwiGLU FFN of Llama 3 8B, B = ${C(Bt)} token${Bt>1?"s":""}. It has ${C(3*d*f)} weights (${MB(3*d*f*2)} in BF16). Press Next to run it kernel by kernel.`,K[0].t,K[1].t,K[2].t,
+   `Whole layer: <b id="ef-dec-tot">${us(tot)}</b> (memory alone ${us(tm)}, compute alone ${us(tc)}); intensity ${(fl/by).toFixed(1)} FLOP/byte against the H100 ridge of 295. All 32 FFN layers: <b>${us(L*tot)}</b> per step, so ${us(L*tot/Bt)} per token. ${tc>tm?"Compute-bound: more tokens per step no longer come for free.":"Memory-bound: the weights dominate, so adding tokens to the step costs almost nothing."}`];
+  info.innerHTML=txt[step];}
+ B.stepper({n:5,prev:$("#ef-dec-prev"),next:$("#ef-dec-next"),play:$("#ef-dec-play"),label:$("#ef-dec-lab"),ms:2600,onStep:i=>{step=i;draw();}});
+ Bs.addEventListener("input",draw);FU.addEventListener("change",draw);
+})();
+
+/* ---------- Figure 3: cross-layer sharing on real configs ---------- */
+(function(){
+ const svg=$("#ef-shr-svg");if(!svg)return;const pre=$("#ef-shr-pre"),pat=$("#ef-shr-pat"),K=$("#ef-shr-k"),G=$("#ef-shr-g"),info=$("#ef-shr-info");
+ const MD={l2:{n:"Llama 2 7B",L:32,blk:202383360,tab:131072000,tables:2,fin:4096,kv:524288},
+  l3:{n:"Llama 3 8B",L:32,blk:218112000,tab:525336576,tables:2,fin:4096,kv:131072},
+  mob:{n:"MobileLLM-125M",L:30,blk:3540096,tab:18432000,tables:1,fin:576,kv:23040}};
+ const GPU={l4:{n:"L4",mem:24e9,bw:300e9,l2:48e6},h100:{n:"H100 SXM",mem:80e9,bw:3.35e12,l2:50e6}};
+ let model="l2",p="none";
+ function fillK(keep){const L=MD[model].L;const ds=[];for(let k=1;k<=L;k++)if(L%k===0)ds.push(k);const cur=keep||+K.value||1;
+  K.innerHTML=ds.map(k=>`<option value="${k}">${k}${k===1?" (no sharing)":k===L?" (one block, ALBERT style)":` (${L/k} unique blocks)`}</option>`).join("");K.value=String(ds.includes(cur)?cur:2);}
+ function calc(k,pt){const m=MD[model],gp=GPU[G.value],U=m.L/k;const stored=m.tables*m.tab+U*m.blk+m.fin;const flops=2*(m.L*m.blk+m.tab);
+  const free=0.9*gp.mem-2*stored,kvTok=free>0?Math.floor(free/m.kv):0;
+  const reuse=k>1&&(pt==="imm"?2*m.blk<=gp.l2:2*U*m.blk<=gp.l2);
+  const read=2*((reuse?U:m.L)*m.blk+m.tab);return {stored,flops,kvTok,reuse,read,U,t:read/gp.bw};}
+ function draw(){const m=MD[model],gp=GPU[G.value];if(p==="none"){K.value="1";K.disabled=true;}else{K.disabled=false;if(K.value==="1")K.value="2";}
+  const k=+K.value,c=calc(k,p),b=calc(1,"none");
+  const order=Array.from({length:m.L},(_,i)=>p==="imm"?Math.floor(i/k):p==="all"?i%c.U:i);
+  const w=720/m.L;let g=`<text x="20" y="18" class="svgt" font-size="13" font-weight="700">${m.L} layer positions → ${c.U} unique block${c.U>1?"s":""}</text>`;
+  order.forEach((j,i)=>{const x=20+i*w;g+=`<rect x="${(x+1).toFixed(1)}" y="26" width="${(w-2).toFixed(1)}" height="34" rx="4" fill="var(--t${(j%10)+1})" opacity=".85"/>`+(w>=18?`<text x="${(x+w/2).toFixed(1)}" y="48" text-anchor="middle" font-size="${w>30?12:10}" font-family="var(--mono)" fill="var(--paper)" font-weight="700">${j}</text>`:"");});
+  const bars=[["Stored weights (BF16)",2*c.stored,2*b.stored,GB],["FLOPs per token",c.flops,b.flops,v=>(v/1e9).toFixed(2)+" GFLOP"],["KV cache capacity",c.kvTok,b.kvTok,v=>C(v)+" tokens"],["Weight bytes read per decode step",c.read,b.read,GB]];
+  bars.forEach(([lab,v,v0,fm],i)=>{const y=82+i*40,mx=Math.max(v,v0,1),sc=470/mx;
+   g+=`<text x="20" y="${y+10}" class="svgt" font-size="12.5">${lab}</text><text x="20" y="${y+26}" class="svgs" font-size="12">${fm(v)}${v0!==v?` (was ${fm(v0)})`:""}</text>`+
+   `<rect x="270" y="${y}" width="${(v0*sc).toFixed(1)}" height="9" rx="2" fill="var(--rule)"/><rect x="270" y="${y+11}" width="${Math.max(v>0?1.5:0,v*sc).toFixed(1)}" height="11" rx="2" fill="var(--q)"/>`;});
+  svg.innerHTML=g;
+  info.innerHTML=`${m.n} on ${gp.n}, ${p==="none"?"no sharing":p==="imm"?`immediate repeat, k = ${k}`:`repeat all over, k = ${k}`}: stored <b id="ef-shr-st">${GB(2*c.stored)}</b> (${C(c.stored)} weights). FLOPs per token unchanged at ${(c.flops/1e9).toFixed(2)} GFLOP. KV cache per token unchanged at ${C(m.kv)} bytes; capacity <b id="ef-shr-kv">${C(c.kvTok)}</b> tokens (was ${C(b.kvTok)}). One block is ${MB(2*m.blk)}; L2 is about ${MB(gp.l2)}. ${k===1?"":c.reuse?`Best case, the repeat finds its weights still on chip: weight bytes per decode step fall to ${GB(c.read)}, ${us(c.t)} at ${gp.bw>=1e12?(gp.bw/1e12).toFixed(2)+" TB/s":gp.bw/1e9+" GB/s"} instead of ${us(b.t)}. [Speculation for GPUs; measured on a phone by MobileLLM]`:`The ${p==="imm"?"block":"set of unique blocks"} does not fit on chip, so it is read again at every use: ${GB(c.read)} per decode step, ${us(c.t)}, the same as without sharing.`}`;}
+ seg(pre,v=>{model=v;fillK(+K.value);draw();});seg(pat,v=>{p=v;draw();});K.addEventListener("change",draw);G.addEventListener("change",draw);fillK(1);draw();
+})();
+
+/* ---------- Figure 4: factorized and tied embeddings ---------- */
+(function(){
+ const svg=$("#ef-fac-svg");if(!svg)return;const pre=$("#ef-fac-pre"),Es=$("#ef-fac-e"),T=$("#ef-fac-tie"),info=$("#ef-fac-info");
+ const MD={axx:{n:"ALBERT-xxlarge",V:30000,d:4096,tie:true},l3:{n:"Llama 3 8B",V:128256,d:4096,tie:false},l32:{n:"Llama 3.2 1B",V:128256,d:2048,tie:true}};
+ let model="l3",list=[];
+ function setList(){const d=MD[model].d;list=[32,64,128,256,512,1024,2048].filter(e=>e<d).concat([d]);Es.max=String(list.length-1);Es.value=String(list.length-1);}
+ function draw(){const m=MD[model],E=list[+Es.value],full=E===m.d,tie=T.checked,V=m.V,d=m.d;
+  $("#ef-fac-ev").value=full?`${C(E)} (full, no factorization)`:C(E);
+  const inP=full?V*d:V*E+E*d,headP=tie?0:(full?V*d:d*E+E*V),headF=full?2*d*V:2*d*E+2*E*V,inF=full?0:2*E*d;
+  const base=2*V*d,baseF=2*d*V,sc=380/base;
+  let g=`<text x="20" y="22" class="svgt" font-size="13" font-weight="700">Vocabulary weights</text>`+
+   `<rect x="150" y="34" width="${(base*sc).toFixed(1)}" height="10" rx="2" fill="var(--rule)"/><text x="${150+base*sc+8}" y="44" class="svgs" font-size="12">${M(base)}</text>`+
+   `<rect x="150" y="48" width="${Math.max(1.5,inP*sc).toFixed(1)}" height="22" rx="2" fill="var(--q)"/>`+(headP?`<rect x="${(150+inP*sc).toFixed(1)}" y="48" width="${Math.max(1.5,headP*sc).toFixed(1)}" height="22" rx="2" fill="var(--k)"/>`:"")+
+   `<text x="20" y="64" class="svgs" font-size="12.5">this model</text><text x="20" y="44" class="svgs" font-size="12.5">full, untied</text>`+
+   `<text x="${150+(inP+headP)*sc+8}" y="64" class="svgs" font-size="12">${M(inP+headP)}</text>`;
+  const fs=380/baseF;
+  g+=`<text x="20" y="108" class="svgt" font-size="13" font-weight="700">Output-head FLOPs per token</text>`+
+   `<rect x="150" y="120" width="${(baseF*fs).toFixed(1)}" height="10" rx="2" fill="var(--rule)"/><text x="20" y="130" class="svgs" font-size="12.5">full</text><text x="${150+baseF*fs+8}" y="130" class="svgs" font-size="12">${(baseF/1e9).toFixed(3)} G</text>`+
+   `<rect x="150" y="134" width="${Math.max(1.5,headF*fs).toFixed(1)}" height="22" rx="2" fill="var(--v)"/><text x="20" y="150" class="svgs" font-size="12.5">this model</text><text x="${150+headF*fs+8}" y="150" class="svgs" font-size="12">${(headF/1e9).toFixed(3)} G</text>`+
+   `<text x="20" y="190" font-size="13" font-family="var(--sans)" fill="${full?"var(--ink2)":"var(--bad)"}">${full?"Logit map: full rank (up to "+C(d)+")":"Logit map: rank at most E = "+C(E)+" out of "+C(V)+" logits"}</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`${m.n} (V = ${C(V)}, d = ${C(d)}), E = ${full?"d (no factorization)":C(E)}, ${tie?"tied":"untied"}: input table <b id="ef-fac-in">${C(inP)}</b> weights${full?"":` (V·E + E·d)`}, head ${tie?"shares them (0 extra)":C(headP)+" weights"}. Total <b>${C(inP+headP)}</b>, ${base===inP+headP?"the same as full and untied":(base/(inP+headP)).toFixed(2)+"× less than full and untied"}. Head FLOPs per token <b id="ef-fac-fl">${C(headF)}</b>, ${baseF===headF?"the same as 2dV":(baseF/headF).toFixed(2)+"× less than 2dV"}${tie&&full?" (tying alone saves no FLOPs)":""}. Input side: ${full?"a pure lookup, 0 FLOPs":C(inF)+" FLOPs per token for the E→d projection"}.`;}
+ seg(pre,v=>{model=v;T.checked=MD[v].tie;setList();draw();});Es.addEventListener("input",draw);T.addEventListener("change",draw);setList();draw();
+})();
+})();
+</script></body></html>

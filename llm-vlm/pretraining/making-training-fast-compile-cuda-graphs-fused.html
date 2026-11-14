@@ -1,0 +1,509 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Making training fast: compile, CUDA graphs, fused kernels, profiling · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../pretraining/index.html">Pretraining and scale</a><span class="sep">/</span><span>Session 50</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="making-training-fast-compile-cuda-graphs-fused">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="making-training-fast-compile-cuda-graphs-fused" data-session="making-training-fast-compile-cuda-graphs-fused" style="--tc:var(--t3)"><header class="chap-head"><div class="chap-kicker"><span class="num">50</span><span>Track 3: Pretraining and scale · session 20 of 22</span></div><h1 class="chap-title">Making training fast: compile, CUDA graphs, fused kernels, profiling</h1><p class="chap-sub">A training step is thousands of GPU kernels launched from Python. Speed is lost in three places: the CPU cannot launch kernels fast enough, small kernels move the same data in and out of memory again and again, and the GPU waits for data, copies or synchronizations. This session shows the tools that fix each one (torch.compile, CUDA graphs, fused kernels for attention, RMSNorm and cross-entropy) and how to find the problem first by reading a profiler trace.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions 37, 38 and 42 (numbers on GPUs, memory math for training, GPU architecture for ML)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Where training time goes: launch-bound, memory-bound and compute-bound work, and why the step time is roughly the larger of the CPU time and the GPU time</li><li>How torch.compile works: TorchDynamo captures an FX graph with guards, AOTAutograd builds the backward graph, TorchInductor fuses operations into Triton kernels</li><li>Graph breaks and recompiles: what causes them, how to count them, and how to remove them</li><li>CUDA graphs: capture once, replay with one launch; the rules (static shapes, static addresses, no CPU synchronization) and mode="reduce-overhead"</li><li>Fused kernels and why they help: FlashAttention, RMSNorm and SwiGLU fusion, and fused or chunked cross-entropy that never stores the full logits</li><li>How to read a PyTorch profiler or Nsight Systems trace: idle gaps, data-loader stalls, pageable memory copies, hidden synchronizations and exposed communication</li><li>How to estimate the benefit of a fix before you write it, with bytes, launch counts and Amdahl's law</li></ul></div></header><style>
+.mf-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.mf-grid input[type=range]{width:100%}
+.mf-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.mf-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+.mf-fig svg text{font-family:var(--sans)}
+.mf-checks{display:flex;flex-direction:column;gap:4px;font:500 14.5px var(--sans);margin:6px 0}
+.mf-code{font:13.5px/1.55 var(--mono);font-variant-ligatures:none;background:var(--code-bg);border:1px solid var(--rule);border-radius:8px;padding:8px 10px;margin:6px 0;overflow-x:auto;white-space:pre}
+.mf-code .on{background:var(--warn-soft);display:inline-block;min-width:100%}
+.mf-code .off{opacity:.35}
+.mf-seg{cursor:pointer}
+pre.code,code{font-variant-ligatures:none}
+p code,li code,.ans code,label code,td code{overflow-wrap:anywhere;word-break:break-word}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Two teams train the same model on the same GPUs. One reaches 45% of the GPU’s peak arithmetic, the other 20%. The second team pays more than twice as much for the same model. The difference is rarely the model. It is the code around it: how kernels are launched, how often data is moved, and where the GPU sits idle.</p>
+<p>In <a href="../pretraining/gpu-architecture-for-ml.html">session 42</a> you learned the roofline: an operation is either <b>compute-bound</b> (limited by tensor-core FLOPs) or <b>memory-bound</b> (limited by HBM bytes per second). Real training adds a third limit that the roofline does not show: the <b>CPU</b>. PyTorch runs your Python code on the CPU, and every operation becomes one or more <b>kernels</b> (small GPU programs) that the CPU must launch one at a time. If launching takes longer than running, the GPU waits.</p>
+<p>So there are three ways a training step is slow, and each has a standard fix:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Problem</th><th>What you see in a trace</th><th>Standard fix</th></tr></thead><tbody>
+<tr><td><b>Launch-bound</b>: the CPU cannot launch kernels fast enough</td><td>Many tiny kernels with gaps between them; the CPU thread is 100% busy</td><td>CUDA graphs; fewer, bigger kernels (torch.compile); bigger batches</td></tr>
+<tr><td><b>Memory-bound</b>: kernels read and write the same tensor again and again</td><td>Many element-wise kernels (add, mul, norm, activation) that together take a large share of the step</td><td>Kernel fusion: torch.compile, or hand-written fused kernels (FlashAttention, fused RMSNorm, fused cross-entropy)</td></tr>
+<tr><td><b>Starved</b>: the GPU waits for something else</td><td>Large idle blocks on the GPU: data loading, memory copies, <code>.item()</code> synchronizations, communication</td><td>Fix the input pipeline, pinned memory, remove syncs, overlap communication</td></tr></tbody></table></div>
+<aside class="note interview side"><span class="nt">Interview tip</span>Common questions: “What does torch.compile actually do?”, “What is a graph break?”, “When do CUDA graphs help, and what are their limits?”, “Why is FlashAttention faster if it does the same FLOPs?”, “Your GPU utilization is 40%. How do you find out why?”. All are answered below, with numbers.</aside>
+<p>The rule of this session: <b>measure first, then fix</b>. A profiler trace tells you which of the three problems you have. Fixing the wrong one wastes days. This session builds the mental models, then shows the tools, then teaches you to read a trace. The previous session, <a href="../pretraining/pipeline-context-and-expert-parallelism-3d-and.html">session 49</a>, spread one model over many GPUs. This one makes each GPU do its share faster. The next session, <a href="../pretraining/distributed-checkpoints-fault-tolerance-and-mfu.html">session 51</a>, measures the result with MFU.</p>
+
+<h2>A model of the training step: CPU and GPU run side by side</h2>
+<p>A CUDA kernel launch is <b>asynchronous</b>. The CPU puts the kernel into a queue (a <b>CUDA stream</b>) and returns at once, without waiting for the GPU. The GPU takes kernels from the queue and runs them in order. So the CPU and the GPU work at the same time, like two people on a production line.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A chef (the GPU) cooks whatever orders a waiter (the CPU) brings. If dishes take 20 minutes and orders take 1 minute to write, the waiter is far ahead and the chef never waits. If every dish takes 10 seconds, the chef spends most of the time waiting for the next order. Making the chef faster does not help. You need a faster waiter, or one order that lists many dishes at once (a CUDA graph).</aside>
+<p>Let \(n\) be the number of kernels in one step, \(t_L\) the CPU time to launch one kernel (Python, the PyTorch dispatcher and the CUDA driver together), and \(d_i\) the GPU time of kernel \(i\). As long as the queue never fills up, the step time is about the larger of the two workloads:</p>
+<div class="eq">\[ T_{\text{step}} \approx \max\!\Big( n\, t_L,\ \sum_{i=1}^{n} d_i \Big), \qquad U_{\text{GPU}} = \frac{\sum_i d_i}{T_{\text{step}}} \tag{50.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n\, t_L\)</dt><dd>the total CPU time spent launching kernels in one step</dd>
+<dt>\(\sum_i d_i\)</dt><dd>the total time the GPU is really computing</dd>
+<dt>\(U_{\text{GPU}}\)</dt><dd>the fraction of the step the GPU is busy; 1 means no idle gaps</dd></dl>
+<p>This is a simplification: it ignores that a kernel can only start after its launch, and that real kernels have different sizes. Figure 3 simulates the exact version. But it shows the key fact: when the kernels are small (\(d_i \lt t_L\)), the GPU time does not matter; the step is limited by launches. A kernel launch from eager PyTorch costs on the order of a few microseconds to about ten microseconds of CPU time. [Likely] A large matrix multiplication runs for hundreds of microseconds or more, so big models with big batches are rarely launch-bound. Small models, small batches per GPU (common with heavy parallelism), and long chains of element-wise operations are.</p>
+<div class="worked"><div class="wt">Worked example: a launch-bound step</div>
+<p>Assume a step launches \(n = 1{,}000\) kernels, each runs for \(d = 4\ \mu s\) on the GPU, and each launch costs \(t_L = 10\ \mu s\) on the CPU (illustrative numbers). Then \(n t_L = 10\) ms and \(\sum d_i = 4\) ms. By (50.1), the step takes about 10 ms and the GPU is busy \(4/10 = 40\%\) of the time.</p>
+<p>A GPU twice as fast changes nothing: still 10 ms. Removing the launch cost (a CUDA graph, next sections) gives about 4 ms, a 2.5× speedup. Fusing pairs of kernels to halve \(n\) gives \(\max(5, 4) = 5\) ms, 2×, and also less memory traffic.</p></div>
+
+<h2>torch.compile: from Python to fused kernels</h2>
+<p>In <b>eager mode</b> (normal PyTorch), each line of Python runs as soon as it is reached, and each operation launches its own kernel. This is easy to debug but leaves speed on the table: PyTorch never sees more than one operation at a time, so it cannot combine them. <code>torch.compile</code> (PyTorch 2) looks at a whole region of code at once, turns it into a <b>graph</b> of operations, and generates faster code for the graph. The PyTorch 2 paper reports a geometric-mean speedup of 2.27× for inference and 1.41× for training over eager mode, on an NVIDIA A100 across more than 180 real models. [Certain] Your own speedup can be anywhere from none to several times; measure it.</p>
+<p>It has three parts (Figure 1):</p>
+<ol>
+<li><b>TorchDynamo</b> (graph capture). It hooks into CPython’s frame evaluation, reads the <b>bytecode</b> of your function before it runs, and records every PyTorch operation into an <b>FX graph</b> (a simple list of operations and their inputs). Plain Python (loops over a fixed range, if-statements on Python values, attribute lookups) is run during tracing and disappears from the graph. Dynamo also writes <b>guards</b>: cheap checks on the inputs (shapes, dtypes, devices, values of Python numbers) that must be true for the compiled code to be reused.</li>
+<li><b>AOTAutograd</b> (ahead-of-time autograd). It traces the backward pass of the captured graph too, so the compiler sees the forward and the backward together. It then decides which intermediate values to save for backward and which to recompute, trading cheap recomputation of element-wise results for memory.</li>
+<li><b>TorchInductor</b> (the code generator, the default backend). It groups operations, <b>fuses</b> chains of element-wise and reduction operations into single kernels, and writes them in <b>Triton</b> (a Python-like language for GPU kernels) on GPUs, or C++ on CPUs. Large matrix multiplications usually still call cuBLAS, or Triton templates when you ask for autotuning.</li></ol>
+<figure class="fig mf-fig" id="mf-pipe"><div class="fig-body"><div class="scroll-x">
+<svg id="mf-pipe-svg" viewBox="0 0 760 250" role="img" aria-label="The torch.compile stack: Python function, TorchDynamo, FX graph with guards, AOTAutograd, TorchInductor, Triton kernels"></svg></div>
+</div><figcaption><b>Figure 1.</b> The torch.compile stack. Dynamo turns Python bytecode into an FX graph plus guards. AOTAutograd adds the backward graph. Inductor fuses operations and emits Triton kernels. The compiled code is cached and reused while the guards hold.</figcaption></figure>
+<p>The first call of a compiled function is slow: it traces and compiles, which can take seconds to minutes for a large model. Later calls check the guards (microseconds) and run the cached kernels. So torch.compile pays off only when the same code runs many times with the same kind of inputs, which is exactly what a training loop does.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: what happens when you call a compiled function</div><ol>
+<li><b>input:</b> function \(f\), arguments \(a\), cache of (guards, compiled code) pairs for \(f\)</li>
+<li><b>for each</b> cached entry: <b>if</b> all its guards pass on \(a\): <b>return</b> its compiled code run on \(a\) <span class="c">// fast path</span></li>
+<li><b>if</b> the number of entries has reached the recompile limit (8 by default): run \(f\) eagerly and <b>return</b></li>
+<li>Dynamo traces the bytecode of \(f\) on \(a\), recording PyTorch operations into an FX graph and writing guards</li>
+<li><b>if</b> it meets something it cannot trace: end the graph here (<b>graph break</b>), run that piece in plain Python, start a new graph after it</li>
+<li>AOTAutograd builds the joint forward and backward graph; Inductor fuses it and generates kernels</li>
+<li>store (guards, compiled code) in the cache; run it on \(a\)</li></ol></div>
+
+<h2>Graph breaks and recompiles</h2>
+<p>Two things quietly destroy the speedup of torch.compile.</p>
+<p>A <b>graph break</b> happens when Dynamo meets code it cannot put into a graph. It then compiles the part before, runs the problem in normal Python, and starts a new graph after it. Each break means: two smaller graphs (less to fuse), a return to Python (launch overhead again), and sometimes a CPU-GPU synchronization. Typical causes:</p>
+<ul>
+<li><b>Branching on a tensor value</b>: <code>if loss &gt; 0:</code> or <code>if mask.any():</code>. The value is on the GPU and is not known during tracing.</li>
+<li><b>Reading a value to the CPU</b>: <code>.item()</code>, <code>.tolist()</code>, <code>.numpy()</code>. By default <code>.item()</code> is a graph break (the setting <code>capture_scalar_outputs</code> can change this).</li>
+<li><b>Calls Dynamo cannot see into</b>: <code>print</code>, logging, some C extensions and third-party libraries.</li></ul>
+<p>A <b>recompile</b> happens when a guard fails: the input shape, dtype or a Python number changed. Dynamo then compiles again for the new case. Integer and float arguments are treated as constants by default, so passing a changing Python float (for example the learning rate, or a step counter) into a compiled function recompiles every time. For shapes, the default (<code>dynamic=None</code>) is: compile the first call for the exact shape; if a later call has a different size, recompile once with that dimension made <b>dynamic</b> (symbolic), which then works for all sizes. [Certain] After 8 compiles of the same function (the default <code>recompile_limit</code>), Dynamo gives up and runs it eagerly. [Certain]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>A recompile storm is silent. The model trains, just slowly, because every step compiles or falls back to eager. Run with <code>TORCH_LOGS="graph_breaks,recompiles"</code> once, or count breaks with <code>torch._dynamo.explain</code>, before you trust any timing.</aside>
+<p>Figure 2 lets you add these problems to a small forward function and see how many graphs and compiles you get. The counts follow what <code>torch._dynamo.explain</code> and a counting backend report in PyTorch 2.8 for the same patterns (checked by running the code at the end of this session).</p>
+<figure class="fig mf-fig" id="mf-brk"><div class="fig-body">
+<div class="mf-checks">
+<label><input type="checkbox" id="mf-brk-if"> branch on a tensor value (<code>if h.sum() &gt; 0</code>)</label>
+<label><input type="checkbox" id="mf-brk-item"> read a value to the CPU (<code>stats.append(h.abs().max().item())</code>)</label>
+<label><input type="checkbox" id="mf-brk-print"> debug <code>print</code> inside the model</label>
+<label><input type="checkbox" id="mf-brk-dyn"> sequence length changes every step (128, 256, 384, 512)</label>
+<label><input type="checkbox" id="mf-brk-full"> compile with <code>fullgraph=True</code></label></div>
+<div class="mf-code" id="mf-brk-code"></div>
+<div class="scroll-x"><svg id="mf-brk-svg" viewBox="0 0 640 110" role="img" aria-label="The captured graphs and the Python pieces between them"></svg></div>
+<div class="mf-leg"><span style="--c:var(--q)">compiled graph</span><span style="--c:var(--k)">graph break: back to Python</span></div>
+<div class="readout" id="mf-brk-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Graph breaks and recompiles for a small block run for 4 training steps. Each break splits the code into one more graph; each graph is compiled once per distinct guard set.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>With no box ticked, the whole block is one graph, compiled once. Each break you add cuts the code: the blue boxes are separate graphs that Inductor optimizes separately, and each orange cut is a return to Python. Ticking “sequence length changes” makes each graph compile twice: once for length 128 and once more, with a dynamic length, at length 256; lengths 384 and 512 reuse the dynamic version. With <code>fullgraph=True</code>, any break becomes an error at the first call, which is the fastest way to find them.</p></details></figure>
+<p>How to remove the common breaks:</p>
+<ul>
+<li>Replace data-dependent Python branches with tensor operations: <code>torch.where(cond, a, b)</code> computes both sides and selects, with no break.</li>
+<li>Move <code>.item()</code>, printing and logging out of the compiled region. Log a detached tensor every \(k\) steps, outside the model.</li>
+<li>Keep shapes stable: pack sequences to a fixed length (<a href="../transformers/masks-causal-padding-bidirectional-prefix-and-packing.html">session 18</a>), or bucket them into a few fixed lengths, or mark the dimension dynamic from the start with <code>torch._dynamo.mark_dynamic(x, 1)</code>.</li>
+<li>Pass changing numbers as 0-dimensional tensors, not as Python floats.</li>
+<li>For large models, compile each transformer block (<code>block.compile()</code> or <code>torch.compile(block)</code> per layer) instead of the whole model. All blocks have the same code, so the compiled code is reused and compile time drops a lot; this is what torchtitan does. [Likely]</li></ul>
+
+<h2>CUDA graphs: one launch for the whole step</h2>
+<p>torch.compile reduces the number of kernels. A <b>CUDA graph</b> removes the launch cost of the kernels that remain. The idea: run the step once in <b>capture mode</b>. Kernels issued to a capturing stream do not run; they are recorded, with all their arguments, into a graph. After that, one call (<code>cudaGraphLaunch</code>) <b>replays</b> the whole recorded sequence. The replay skips Python, the PyTorch dispatcher and most of the driver work for every kernel. [Certain]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Instead of the waiter bringing the chef one order at a time, the waiter hands over a printed menu card once: “every evening, cook these 1,000 dishes in this order”. Each evening, the waiter only says “card number 1, go”.</aside>
+<p>The price is flexibility. A replay runs the <b>same kernels with the same arguments</b>, and for pointer arguments that means the <b>same memory addresses</b>. [Certain] So:</p>
+<ul>
+<li><b>Static shapes.</b> A new batch shape needs a new capture.</li>
+<li><b>Static memory.</b> Inputs must be copied into the same “static” input tensors before each replay; outputs appear in the same static output tensors. PyTorch gives each graph a private memory pool for its intermediate tensors.</li>
+<li><b>No CPU synchronization inside.</b> No <code>.item()</code>, no printing of tensor values, no data-dependent Python branches, no operations whose output size depends on the data (such as <code>nonzero</code> or boolean indexing).</li>
+<li><b>No CPU-side logic per step inside the graph.</b> Everything the CPU decides (for example a Python learning-rate value) is frozen at capture time, unless it lives in a GPU tensor that you update in place.</li></ul>
+<div class="algo"><div class="algo-h">Algorithm 2: capture and replay a training step with a CUDA graph</div><ol>
+<li><b>input:</b> model, optimizer, static input tensor \(X_s\), static target tensor \(Y_s\)</li>
+<li>warm up: run 3 normal steps on a side stream <span class="c">// lets lazy initialization and the allocator settle</span></li>
+<li>set gradients to None, then <b>begin capture</b> on the stream</li>
+<li>\(\hat Y_s \leftarrow\) model(\(X_s\)); \(L_s \leftarrow\) loss(\(\hat Y_s, Y_s\)); backward(\(L_s\)); optimizer step <span class="c">// recorded, not run</span></li>
+<li><b>end capture</b> \(\rightarrow\) graph \(G\)</li>
+<li><b>for each</b> new batch \((X, Y)\): copy \(X \to X_s\), \(Y \to Y_s\) (in place); replay \(G\) <span class="c">// one launch; gradients are refilled in place, no zero_grad needed</span></li>
+<li>read the loss from \(L_s\) only when you need it (reading it is a sync)</li></ol></div>
+<p>How much does it help? NVIDIA’s MLPerf v1.0 training submissions in PyTorch used CUDA graphs. For Mask R-CNN on 272 GPUs (batch 1 per GPU), the graphed backbone ran in 6 ms instead of 31 ms, and the whole step was about 1.70× faster. For BERT on 4,096 GPUs, the gain was 1.12×. [Certain] The pattern is clear: the gain is largest when per-GPU work is small, which is exactly what strong scaling to many GPUs produces. For a big model with a big per-GPU batch, the GPU is already the bottleneck and a CUDA graph gives little.</p>
+<p>You rarely capture graphs by hand. <code>torch.compile(model, mode="reduce-overhead")</code> uses CUDA graphs for the compiled regions; <code>mode="max-autotune"</code> also enables them on GPU, and <code>"max-autotune-no-cudagraphs"</code> autotunes without them. [Certain] For inference with a KV cache, CUDA graphs are standard for the decode step, because each step is small (<a href="../inference/graph-level-optimization-fusion-cuda-graphs-torch.html">session 127</a>).</p>
+<figure class="fig mf-fig wide" id="mf-tl"><div class="fig-body">
+<div class="mf-grid">
+<label for="mf-tl-b">Work per kernel (batch scale)</label><input type="range" id="mf-tl-b" min="1" max="16" step="1" value="1"><output id="mf-tl-bv"></output>
+<label for="mf-tl-l">CPU launch cost per kernel \(t_L\)</label><input type="range" id="mf-tl-l" min="1" max="20" step="1" value="8"><output id="mf-tl-lv"></output></div>
+<div class="controls" style="margin-top:8px"><span class="seg" id="mf-tl-mode"><button type="button" data-v="eager" aria-pressed="true">Eager: one launch per kernel</button><button type="button" data-v="graph" aria-pressed="false">CUDA graph: one launch</button></span></div>
+<div class="scroll-x"><svg id="mf-tl-svg" viewBox="0 0 760 190" role="img" aria-label="Timeline of CPU launches and GPU kernels"></svg></div>
+<div class="mf-leg"><span style="--c:var(--muted)">CPU: launching a kernel</span><span style="--c:var(--q)">GPU: matrix multiplication</span><span style="--c:var(--v)">GPU: element-wise kernel</span><span style="--c:var(--bad)">GPU idle</span></div>
+<div class="readout" id="mf-tl-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> A simulated block of 60 kernels (10 repeats of: matmul, 2 element-wise, a norm, matmul, element-wise; base durations 6, 2, 2, 3, 6, 2 µs). A kernel starts when its launch is done and the previous kernel has finished. With a CUDA graph there is one launch, then the kernels run back to back. These are model numbers to build intuition, not measurements.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Start at batch scale 1 and launch cost 8 µs. The red marks under the GPU lane are idle time: the GPU has finished and waits for the next launch. Switch to the CUDA graph: the kernels pack tightly and the step is about twice as fast. Now raise the batch scale to 4 or more. The kernels become longer than the launches, the eager timeline also packs tightly, and the CUDA graph gains almost nothing. That is formula (50.1): once \(\sum d_i\) is larger than \(n t_L\), launches are hidden.</p></details></figure>
+
+<h2>Kernel fusion: stop moving the same bytes</h2>
+<p>Most operations in a transformer that are not matrix multiplications are <b>element-wise</b> or small <b>reductions</b>: residual adds, normalization, activation functions, dropout, scaling, masking, softmax. Each one does a handful of FLOPs per element but must read its inputs from HBM and write its output back. They are deeply memory-bound. By the roofline, their time is set by bytes, not FLOPs:</p>
+<div class="eq">\[ t_{\text{kernel}} \approx \max\!\left( \frac{\text{FLOPs}}{P_{\text{peak}}},\ \frac{\text{bytes moved}}{B_{\text{HBM}}} \right) \tag{50.2} \]</div>
+<p><b>Fusion</b> merges a chain of such operations into one kernel. The fused kernel reads the inputs once, keeps the intermediate values in registers or shared memory, and writes only the final output. The FLOPs are the same; the bytes drop. For a chain of memory-bound kernels:</p>
+<div class="eq">\[ S_{\text{fuse}} \approx \frac{\sum_{k} (\text{bytes read}_k + \text{bytes written}_k)}{\text{bytes read once} + \text{bytes written once}} \tag{50.3} \]</div>
+<p>Take RMSNorm (<a href="../transformers/the-residual-stream-and-normalization.html">session 22</a>), used in Llama and most current LLMs:</p>
+<div class="eq">\[ \operatorname{RMSNorm}(\mathbf{x}) = \frac{\mathbf{x}}{\sqrt{\frac{1}{d}\sum_{j=1}^{d} x_j^2 + \epsilon}} \odot \mathbf{g} \tag{50.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{x} \in \R^d\)</dt><dd>one token’s hidden vector (\(d = 4{,}096\) in Llama 3 8B)</dd>
+<dt>\(\epsilon\)</dt><dd>a small constant for safety (\(10^{-5}\) in Llama 3 8B)</dd>
+<dt>\(\mathbf{g}\)</dt><dd>the learned gain vector; \(\odot\) is element-wise multiplication</dd></dl>
+<p>Written with plain PyTorch operations, <code>x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps) * g</code> launches several kernels: <code>pow</code> reads \(x\) and writes \(x^2\); <code>mean</code> reads \(x^2\); the small per-token steps (add \(\epsilon\), rsqrt) touch only one number per token; <code>x * r</code> reads \(x\) and writes a new tensor; <code>* g</code> reads that and writes the output. Counting only the big tensors of \(N = T \cdot d\) elements, that is about \(7N\) element reads and writes. A fused kernel reads \(x\) once and writes \(y\) once: \(2N\). So fusion moves 3.5× fewer bytes.</p>
+<div class="worked"><div class="wt">Worked example: RMSNorm on an H100</div>
+<p>A micro-batch of 4 sequences of 4,096 tokens gives \(T = 16{,}384\) tokens; with \(d = 4{,}096\), \(N = 67{,}108{,}864\) elements, 2 bytes each in BF16.</p>
+<p>Unfused: \(7 \times N \times 2 = 939.5\) MB moved. At the H100’s 3.35 TB/s, that is at least 280 µs. Fused: \(2 \times N \times 2 = 268.4\) MB, at least 80 µs. One RMSNorm saves 200 µs. A Llama-style model has two RMSNorms per layer, and the backward pass has its own memory-bound kernels, so across 32 layers the savings add up to many milliseconds per step. Real eager code often moves even more, because it upcasts to FP32 inside the norm.</p></div>
+<p>Figure 4 does the same count for three common chains. Fusion helps most when a long chain of cheap operations works on the same tensor.</p>
+<figure class="fig mf-fig" id="mf-fuse"><div class="fig-body">
+<div class="controls"><span class="seg" id="mf-fuse-op"><button type="button" data-v="rms" aria-pressed="true">RMSNorm</button><button type="button" data-v="addrms" aria-pressed="false">Residual add + RMSNorm</button><button type="button" data-v="swiglu" aria-pressed="false">SwiGLU activation</button></span></div>
+<div class="mf-grid">
+<label for="mf-fuse-t">Tokens per micro-batch</label><input type="range" id="mf-fuse-t" min="10" max="16" step="1" value="14"><output id="mf-fuse-tv"></output>
+<label for="mf-fuse-d">Hidden size \(d\)</label><input type="range" id="mf-fuse-d" min="0" max="3" step="1" value="2"><output id="mf-fuse-dv"></output></div>
+<svg id="mf-fuse-svg" viewBox="0 0 640 250" role="img" aria-label="Bytes moved by each unfused kernel and by one fused kernel"></svg>
+<div class="mf-leg"><span style="--c:var(--q)">bytes read</span><span style="--c:var(--k)">bytes written</span></div>
+<div class="readout" id="mf-fuse-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> HBM traffic of a chain of element-wise kernels, unfused (one bar per kernel) and fused (one bar). BF16 values, H100 bandwidth 3.35 TB/s. Only tensors with one value per element are counted; per-token values are tiny. For SwiGLU the hidden size is the FFN width.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Each bar is one kernel; its length is the bytes it reads (blue) and writes (orange). The time in the readout is the lower bound bytes ÷ bandwidth from formula (50.2). The ratio does not depend on the sizes, only on the chain: 3.5× for RMSNorm, 2.5× for add + RMSNorm, 1.67× for SwiGLU. The absolute savings grow with tokens × hidden size.</p></details></figure>
+<p>Fusion has a second benefit in training: <b>memory</b>. Each unfused intermediate that autograd needs for the backward pass is stored until the backward reaches it. A fused kernel with its own backward can save only what it needs (for RMSNorm, the input and one number per token) and recompute the rest. That is the same idea as activation checkpointing (<a href="../pretraining/gradient-accumulation-and-gradient-checkpointing.html">session 39</a>), done inside one kernel.</p>
+
+<h2>Three fused kernels every LLM trainer uses</h2>
+<h3>Fused attention (FlashAttention)</h3>
+<p>Plain attention computes the score matrix \(S = QK^\top\), writes it to HBM, reads it back for the softmax, writes \(P\), and reads it again for \(PV\). For a sequence of \(T\) tokens and \(h\) heads the score matrix alone is</p>
+<div class="eq">\[ M_S = B \cdot h \cdot T^2 \cdot b \quad \text{bytes, versus} \quad O(B \cdot h \cdot T \cdot d_h) \ \text{for FlashAttention} \tag{50.5} \]</div>
+<p>where \(B\) is the batch, \(d_h\) the head dimension and \(b\) the bytes per number. With \(h = 32\), \(T = 8{,}192\) and BF16, \(M_S = 4.29\) GB per sequence per layer, and backward needs it again. FlashAttention fuses the whole attention into one kernel: it loads tiles of \(Q\), \(K\), \(V\) into shared memory, computes the softmax <b>online</b> (keeping a running maximum and running sum per row), and never writes \(S\) or \(P\) to HBM. In backward it recomputes the tiles instead of loading a stored \(P\). The FLOPs are about the same (a little more, because of recomputation), but the memory traffic is far lower and the memory is linear in \(T\). The FlashAttention paper reports a 3× speedup on GPT-2 at sequence length 1K, and 15% on BERT-large at length 512 against the MLPerf 1.1 record. [Certain] In PyTorch you get it from <code>F.scaled_dot_product_attention</code>, which picks a fused backend when it can. The algorithm itself is the topic of <a href="../inference/attention-operator-1-flashattention-1-2-and.html">session 124</a>.</p>
+<h3>Fused RMSNorm, RoPE and SwiGLU</h3>
+<p>These are the memory-bound chains of Figure 4. torch.compile fuses them automatically when there are no graph breaks. Libraries also ship hand-written Triton versions with a matching backward. Liger Kernel (from LinkedIn) provides fused RMSNorm, LayerNorm, RoPE, SwiGLU, GeGLU, cross-entropy and fused linear cross-entropy, and reports about 20% higher training throughput and 60% less GPU memory than the Hugging Face implementations of popular LLMs. [Certain]</p>
+<h3>Fused (chunked) cross-entropy</h3>
+<p>The last layer is often the biggest memory problem in training. The output projection turns every token’s hidden vector into \(V\) logits, one per vocabulary entry:</p>
+<div class="eq">\[ M_{\text{logits}} = T \cdot V \cdot b \tag{50.6} \]</div>
+<p>Llama 3 has \(V = 128{,}256\). [Certain] With 8 sequences of 8,192 tokens (\(T = 65{,}536\)) per GPU, the BF16 logits are \(65{,}536 \times 128{,}256 \times 2 = 16.8\) GB. Many implementations upcast logits to FP32 for a stable softmax: another 33.6 GB. And the gradient of the logits has the same size again. A single loss can need more memory than the model’s weights.</p>
+<p>The fix uses one fact about cross-entropy. For one token with logits \(\mathbf{z}\) and target \(y\), the loss is \(\ell = \log \sum_j e^{z_j} - z_y\), and its gradient is</p>
+<div class="eq">\[ \frac{\partial \ell}{\partial \mathbf{z}} = \softmax(\mathbf{z}) - \mathbf{e}_y \tag{50.7} \]</div>
+<p>where \(\mathbf{e}_y\) is the one-hot vector of the target. So the gradient can be computed in the same pass as the loss, right after the softmax, without keeping the logits around. A <b>fused linear cross-entropy</b> kernel does this chunk by chunk: take a chunk of \(C\) tokens, compute their \(C \times V\) logits, the loss, and the gradient with respect to the hidden states and the output weight, then throw the logits away. Peak memory is \(C \cdot V\) instead of \(T \cdot V\). Cut Cross-Entropy goes further and also splits the vocabulary into blocks, merging partial results with the log-sum-exp rule:</p>
+<div class="eq">\[ m = \max(m_a, m_b), \qquad \operatorname{LSE} = m + \log\!\big( s_a e^{m_a - m} + s_b e^{m_b - m} \big) \tag{50.8} \]</div>
+<p>where block \(a\) has maximum logit \(m_a\) and sum \(s_a = \sum_{j \in a} e^{z_j - m_a}\), and likewise for block \(b\). This is the same online-softmax trick FlashAttention uses. For Gemma 2 (2B), the paper reports that the loss computation’s memory falls from 24 GB to 1 MB, and the classifier head’s total training memory from 28 GB to 1 GB. [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 3: chunked (fused) linear cross-entropy, forward and backward in one pass</div><ol>
+<li><b>input:</b> hidden states \(H \in \R^{T \times d}\), output weight \(W \in \R^{V \times d}\), targets \(y\), chunk size \(C\)</li>
+<li>\(L \leftarrow 0\); \(\nabla H \leftarrow 0\); \(\nabla W \leftarrow 0\)</li>
+<li><b>for</b> each chunk \(c\) of \(C\) rows: \(Z_c \leftarrow H_c W^\top\) <span class="c">// C × V logits, computed in FP32</span></li>
+<li>\(\quad P_c \leftarrow \softmax(Z_c)\) row by row; \(L \mathrel{+}= \sum_t (\operatorname{LSE}(Z_{c,t}) - Z_{c,t,y_t})\)</li>
+<li>\(\quad G_c \leftarrow (P_c - \text{onehot}(y_c)) / T\) <span class="c">// formula (50.7)</span></li>
+<li>\(\quad \nabla H_c \leftarrow G_c W\); \(\;\nabla W \mathrel{+}= G_c^\top H_c\); free \(Z_c, P_c, G_c\)</li>
+<li><b>return</b> \(L / T\), and save \(\nabla H, \nabla W\) for the backward call <span class="c">// logits never all in memory</span></li></ol></div>
+<figure class="fig mf-fig" id="mf-ce"><div class="fig-body">
+<div class="controls"><span class="seg" id="mf-ce-v"><button type="button" data-v="32000" aria-pressed="false">V = 32,000 (Llama 2)</button><button type="button" data-v="50257" aria-pressed="false">V = 50,257 (GPT-2)</button><button type="button" data-v="128256" aria-pressed="true">V = 128,256 (Llama 3)</button></span></div>
+<div class="mf-grid">
+<label for="mf-ce-s">Sequences × 8,192 tokens</label><input type="range" id="mf-ce-s" min="1" max="16" step="1" value="8"><output id="mf-ce-sv"></output>
+<label for="mf-ce-c">Chunk size \(C\) (tokens)</label><input type="range" id="mf-ce-c" min="8" max="14" step="1" value="10"><output id="mf-ce-cv"></output></div>
+<svg id="mf-ce-svg" viewBox="0 0 640 210" role="img" aria-label="Memory of logits for the naive and the chunked cross-entropy"></svg>
+<div class="readout" id="mf-ce-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Peak memory of the loss computation on one GPU. Naive: BF16 logits, an FP32 copy for the softmax, and the BF16 logit gradient, all \(T \times V\) (8 bytes per logit). Chunked: one FP32 chunk of \(C \times V\) logits plus its FP32 gradient (8 bytes per logit). The dashed line is 80 GB, the memory of one H100.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Move the number of sequences: the naive bar grows linearly with tokens and crosses the whole GPU memory at about 10 sequences for Llama 3’s vocabulary. The chunked bar does not depend on the number of tokens at all, only on \(C\) and \(V\). Bigger chunks use more memory but fewer, larger matrix multiplications; a few thousand tokens per chunk is a common middle ground. [Likely]</p></details></figure>
+
+<h2>Reading a profiler trace</h2>
+<p>All of the above are fixes. The profiler tells you which one you need. Two tools are standard:</p>
+<ul>
+<li><b>PyTorch profiler</b> (<code>torch.profiler</code>). Records CPU operations and CUDA kernels with their times. <code>prof.key_averages().table()</code> gives a sorted summary; <code>prof.export_chrome_trace("trace.json")</code> writes a timeline you open in Perfetto (ui.perfetto.dev) or chrome://tracing. A <code>schedule(wait, warmup, active)</code> skips the first, unusual steps. Wrap parts of your code in <code>record_function("name")</code> so they show up as labeled blocks.</li>
+<li><b>Nsight Systems</b> (<code>nsys</code>), from NVIDIA. Records the whole process with low overhead: CPU threads, CUDA API calls, kernels, memory copies, NCCL kernels, and your own <b>NVTX</b> ranges (<code>torch.cuda.nvtx.range_push("forward")</code>). Typical use: <code>nsys profile -t cuda,nvtx,osrt -o step python train.py</code>, then open the report in the Nsight Systems GUI.</li></ul>
+<p>A trace is a set of horizontal <b>lanes</b>, one per CPU thread and one per GPU stream, with time going right. Look at it in this order:</p>
+<div class="algo"><div class="algo-h">Algorithm 4: a checklist for reading a training trace</div><ol>
+<li>Skip the first steps (compilation, allocator warmup); look at one steady step from start to end</li>
+<li>Measure GPU busy time: \(U_{\text{GPU}} = \sum\) kernel time \(/\) step time <span class="c">// formula (50.1); below about 80% means there is something to find</span></li>
+<li>Big idle block at the start of the step, CPU in the data loader \(\rightarrow\) input pipeline is too slow: more workers, prefetching</li>
+<li><code>Memcpy HtoD</code> with the word “Pageable”, CPU blocked during it \(\rightarrow\) use <code>pin_memory=True</code> and <code>.to(device, non_blocking=True)</code></li>
+<li>CPU in <code>cudaStreamSynchronize</code> or <code>cudaMemcpy DtoH</code>, then a GPU gap \(\rightarrow\) a hidden sync (<code>.item()</code>, printing, <code>nonzero</code>); remove or do it every \(k\) steps</li>
+<li>Many kernels of a few µs with gaps, CPU lane fully busy \(\rightarrow\) launch-bound: torch.compile, CUDA graphs, larger micro-batch</li>
+<li>Long element-wise and norm kernels between the matmuls \(\rightarrow\) memory-bound: fusion</li>
+<li>NCCL kernels with nothing running beside them on the compute stream \(\rightarrow\) exposed communication: check overlap (DDP buckets, FSDP prefetch)</li>
+<li>Only then look at the biggest kernels (matmuls, attention) and their efficiency</li></ol></div>
+<p>Figure 6 is a toy trace of one training step with all of these problems at once. Turn on the fixes one by one and watch the idle time disappear.</p>
+<figure class="fig mf-fig wide" id="mf-tr"><div class="fig-body">
+<div class="mf-checks">
+<label><input type="checkbox" id="mf-tr-w"> DataLoader with <code>num_workers=8</code> and prefetching</label>
+<label><input type="checkbox" id="mf-tr-p"> <code>pin_memory=True</code> and <code>non_blocking=True</code> copies</label>
+<label><input type="checkbox" id="mf-tr-i"> log the loss every 50 steps, not <code>loss.item()</code> every step</label>
+<label><input type="checkbox" id="mf-tr-c"> <code>torch.compile</code> (fewer, fused kernels)</label>
+<label><input type="checkbox" id="mf-tr-o"> overlap the gradient all-reduce with the backward pass</label></div>
+<div class="scroll-x"><svg id="mf-tr-svg" viewBox="0 0 760 210" role="img" aria-label="Toy profiler trace with CPU, GPU compute and GPU copy or communication lanes"></svg></div>
+<div class="mf-leg"><span style="--c:var(--muted)">CPU work</span><span style="--c:var(--warn)">CPU blocked (waiting)</span><span style="--c:var(--q)">GPU kernels</span><span style="--c:var(--v)">copy / NCCL</span><span style="--c:var(--bad)">GPU compute idle</span></div>
+<div class="readout" id="mf-tr-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 6.</b> A toy trace of one data-parallel training step. The durations are invented to show the patterns, not measured. Click any block to see what it is.</figcaption>
+<details class="howto"><summary>How to read Figure 6</summary><p>With no fix, the GPU compute lane is idle for about half of the step: first while the CPU loads data, then during a blocking pageable copy, then in many small gaps between kernels, then while waiting for the all-reduce, and once more after the <code>.item()</code> sync drains the queue. Each fix removes one red region. Notice that torch.compile alone helps only a little at first, because most idle time is elsewhere. That is why you read the trace before choosing a fix.</p></details></figure>
+<p>To decide whether a fix is worth the work, use <b>Amdahl’s law</b>. If a part that takes a fraction \(p\) of the step becomes \(s\) times faster, the whole step becomes</p>
+<div class="eq">\[ S_{\text{total}} = \frac{1}{(1 - p) + p / s} \tag{50.9} \]</div>
+<p>times faster. If element-wise kernels take 20% of the step and fusion makes them 3× faster, the step gets \(1/(0.8 + 0.2/3) = 1.15\)× faster. Even infinitely fast element-wise kernels give only 1.25×. Spend your effort on the largest \(p\) in the trace.</p>
+<div class="worked"><div class="wt">Worked example: what Amdahl says about the Mask R-CNN result</div>
+<p>The graphed backbone went from 31 ms to 6 ms, saving 25 ms, and the step became 1.70× faster. If nothing else changed, the old step time \(X\) satisfies \(X / (X - 25) = 1.70\), so \(X = 25 \times 1.70 / 0.70 = 60.7\) ms and the new step is about 35.7 ms. The backbone was about half of the step (\(p = 31/60.7 = 0.51\)), with \(s = 31/6 = 5.2\). This is our own back-calculation under that assumption, not a number from the blog post.</p></div>
+
+<h2>PyTorch code</h2>
+<p>The code below runs on a CPU in a few seconds (PyTorch 2.x; tested with 2.8). It checks that a compiled RMSNorm matches eager mode, counts graph breaks and recompiles, verifies that chunked cross-entropy gives the same loss and gradients as the full one, checks formula (50.7), and profiles a few steps.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+
+<span class="cm"># 1) RMSNorm written with plain ops: eager runs several kernels, torch.compile fuses them</span>
+<span class="kw2">def</span> rmsnorm(x, w, eps=1e-5):
+    r = torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)    <span class="cm"># formula (50.4)</span>
+    <span class="kw2">return</span> x * r * w
+x, w = torch.randn(64, 512), torch.ones(512)
+rms_c = torch.compile(rmsnorm)
+print("rmsnorm max diff:", (rms_c(x, w) - rmsnorm(x, w)).abs().max().item())   <span class="cm"># about 5e-7</span>
+
+<span class="cm"># 2) Find graph breaks before you trust the speed-up</span>
+<span class="kw2">def</span> f(x):
+    y = torch.sin(x) * 2
+    <span class="kw2">if</span> y.sum() &gt; 0:          <span class="cm"># branch on a tensor value -&gt; graph break</span>
+        y = y + 1
+    print("step done")       <span class="cm"># print -&gt; graph break</span>
+    <span class="kw2">return</span> torch.cos(y)
+torch._dynamo.reset()
+ex = torch._dynamo.explain(f)(torch.ones(8))
+print("graphs:", ex.graph_count, "breaks:", ex.graph_break_count)           <span class="cm"># 3 graphs, 2 breaks</span>
+
+<span class="cm"># 3) Shape changes: the first new shape recompiles, then Dynamo marks the dim dynamic</span>
+torch._dynamo.reset()
+n_compiles = 0
+<span class="kw2">def</span> counting_backend(gm, example_inputs):
+    <span class="kw2">global</span> n_compiles; n_compiles += 1
+    <span class="kw2">return</span> gm.forward
+g = torch.compile(<span class="kw2">lambda</span> t: torch.relu(t) * 2, backend=counting_backend)
+<span class="kw2">for</span> L <span class="kw2">in</span> [128, 256, 384, 512]:
+    g(torch.randn(L))
+print("compiles for 4 lengths:", n_compiles)                                <span class="cm"># 2</span>
+
+<span class="cm"># 4) Chunked cross-entropy: never hold all T x V logits; same loss, same gradients</span>
+T, d, V = 256, 64, 1000
+h = torch.randn(T, d, requires_grad=True)
+W = (0.05 * torch.randn(V, d)).requires_grad_(True)
+y = torch.randint(0, V, (T,))
+full = F.cross_entropy(h @ W.T, y)
+gh, gW = torch.autograd.grad(full, (h, W))
+<span class="kw2">def</span> chunked_ce(h, W, y, chunk=64):
+    total = h.new_zeros(())
+    <span class="kw2">for</span> s <span class="kw2">in</span> range(0, h.shape[0], chunk):
+        logits = h[s:s + chunk] @ W.T                    <span class="cm"># only chunk x V logits at a time</span>
+        total = total + F.cross_entropy(logits.float(), y[s:s + chunk], reduction="sum")
+    <span class="kw2">return</span> total / h.shape[0]
+ch = chunked_ce(h, W, y)
+ch_gh, ch_gW = torch.autograd.grad(ch, (h, W))
+print("loss diff:", abs(full.item() - ch.item()),
+      "grad diff:", max((gh - ch_gh).abs().max().item(), (gW - ch_gW).abs().max().item()))
+
+<span class="cm"># 5) Formula (50.7): d loss / d logits = (softmax - one_hot) / T</span>
+z = torch.randn(4, 10, requires_grad=True); t = torch.tensor([1, 2, 3, 4])
+gz, = torch.autograd.grad(F.cross_entropy(z, t), z)
+print("softmax - onehot check:", (gz - (z.softmax(-1) - F.one_hot(t, 10)) / 4).abs().max().item())
+
+<span class="cm"># 6) Profile a few steps (CPU here; add ProfilerActivity.CUDA on a GPU)</span>
+<span class="kw2">from</span> torch.profiler <span class="kw2">import</span> profile, ProfilerActivity, record_function, schedule
+model = torch.nn.Sequential(torch.nn.Linear(512, 2048), torch.nn.GELU(), torch.nn.Linear(2048, 512))
+opt = torch.optim.AdamW(model.parameters(), lr=1e-3)
+<span class="kw2">with</span> profile(activities=[ProfilerActivity.CPU],
+             schedule=schedule(wait=1, warmup=1, active=2)) <span class="kw2">as</span> prof:
+    <span class="kw2">for</span> step <span class="kw2">in</span> range(4):
+        <span class="kw2">with</span> record_function("train_step"):
+            loss = model(torch.randn(32, 512)).pow(2).mean()
+            loss.backward(); opt.step(); opt.zero_grad(set_to_none=True)
+        prof.step()                                       <span class="cm"># tell the schedule a step ended</span>
+print(prof.key_averages().table(sort_by="self_cpu_time_total", row_limit=5))
+<span class="cm"># prof.export_chrome_trace("trace.json")  -&gt; open in https://ui.perfetto.dev</span></pre>
+<p>Output: the RMSNorm difference is about \(5 \times 10^{-7}\); <code>graphs: 3 breaks: 2</code>; <code>compiles for 4 lengths: 2</code>; the chunked loss differs by about \(5 \times 10^{-7}\) and the gradients by about \(10^{-8}\); the softmax-minus-one-hot check is about \(10^{-8}\). The profiler table lists <code>aten::mm</code> and <code>aten::addmm</code> on top; its times vary from machine to machine.</p>
+<p>On a GPU, the CUDA graph and reduce-overhead versions look like this (this part needs a CUDA GPU and was not run for this page; the capture pattern follows the PyTorch CUDA graphs blog post):</p>
+<pre class="code"><span class="cm"># needs a CUDA GPU</span>
+model = model.cuda(); opt = torch.optim.SGD(model.parameters(), lr=0.1)
+static_x = torch.randn(32, 512, device="cuda"); static_y = torch.randn(32, 512, device="cuda")
+s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+<span class="kw2">with</span> torch.cuda.stream(s):                        <span class="cm"># warmup on a side stream</span>
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(3):
+        opt.zero_grad(set_to_none=True)
+        F.mse_loss(model(static_x), static_y).backward(); opt.step()
+torch.cuda.current_stream().wait_stream(s)
+graph = torch.cuda.CUDAGraph()
+opt.zero_grad(set_to_none=True)
+<span class="kw2">with</span> torch.cuda.graph(graph):                     <span class="cm"># capture: recorded, not run</span>
+    static_loss = F.mse_loss(model(static_x), static_y)
+    static_loss.backward(); opt.step()
+<span class="kw2">for</span> xb, yb <span class="kw2">in</span> batches:                           <span class="cm"># same shapes every step</span>
+    static_x.copy_(xb); static_y.copy_(yb)       <span class="cm"># new data into the same addresses</span>
+    graph.replay()                               <span class="cm"># one launch: forward + backward + step</span>
+
+<span class="cm"># or let the compiler do it</span>
+fast_model = torch.compile(model, mode="reduce-overhead")</pre>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Main bottleneck</th><th>Typical tools</th></tr></thead><tbody>
+<tr><td>Large LLM pretraining (big micro-batches, long sequences)</td><td>Matmuls and attention; memory for activations and logits; exposed communication</td><td>FlashAttention, per-block torch.compile, fused or chunked cross-entropy, communication overlap (torchtitan, Megatron-LM) [Likely]</td></tr>
+<tr><td>Fine-tuning on a few GPUs with large vocabularies</td><td>Memory of the logits and of activations</td><td>Liger Kernel or similar fused kernels; chunked cross-entropy</td></tr>
+<tr><td>Small models or heavy parallelism (small per-GPU work)</td><td>Launch overhead</td><td>CUDA graphs, <code>mode="reduce-overhead"</code>, fewer kernels</td></tr>
+<tr><td>Video classification and action recognition training</td><td>Often the input pipeline: decoding and resizing video frames on the CPU starves the GPU</td><td>More data-loader workers, GPU video decoding, pinned memory, pre-extracted frames or features [Likely]</td></tr>
+<tr><td>Video retrieval and fingerprinting with contrastive losses</td><td>The \(B \times B\) similarity logits with very large batches, the same memory problem as formula (50.6)</td><td>Chunked or fused contrastive loss, gradient caching [Likely]</td></tr>
+<tr><td>Key-moment detection and segmentation on clips of different lengths</td><td>Recompiles and dynamic shapes</td><td>Bucketing clip lengths, <code>mark_dynamic</code>, padding to a few fixed sizes</td></tr>
+<tr><td>Video-RAG indexing (embedding millions of clips) and LLM decoding</td><td>Small, repeated inference steps: launch-bound</td><td>CUDA graphs, torch.compile, static batch shapes (<a href="../inference/graph-level-optimization-fusion-cuda-graphs-torch.html">session 127</a>)</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Timing without synchronizing.</b> Kernel launches are asynchronous, so <code>time.time()</code> around a GPU call measures only the launch. Call <code>torch.cuda.synchronize()</code> before reading the clock, or use CUDA events, and skip the first (compiling) steps.</li>
+<li><b>Including compile time in the benchmark.</b> The first call can take minutes. Measure steady steps only.</li>
+<li><b>Ignoring graph breaks and recompiles.</b> The model “is compiled” but runs as dozens of small graphs or falls back to eager after 8 recompiles. Check with <code>TORCH_LOGS="graph_breaks,recompiles"</code>.</li>
+<li><b>A hidden sync every step.</b> <code>loss.item()</code>, printing a tensor, <code>if (x &gt; 0).any():</code>, or boolean indexing force the CPU to wait for the GPU and drain the launch queue. Log every \(k\) steps.</li>
+<li><b>Reading CUDA graph outputs after the next replay.</b> The static output tensors are overwritten by every replay. Copy what you need (<code>.clone()</code>) before replaying again.</li>
+<li><b>Fusing the wrong thing.</b> Writing a custom kernel for an operation that is 3% of the step gives at most 3% (Amdahl, formula 50.9). Read the trace first.</li>
+<li><b>Profiling the first steps or too many steps.</b> The first steps include compilation and memory allocation; a long trace is huge and slow to open. Use <code>schedule(wait=…, warmup=…, active=2 or 3)</code>.</li>
+<li><b>Pageable memory for input batches.</b> Without <code>pin_memory=True</code>, the copy to the GPU goes through an extra CPU buffer and <code>non_blocking=True</code> cannot overlap it.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What does torch.compile do, step by step?<span class="lvl">basic</span></summary><div class="ans">TorchDynamo reads the Python bytecode of the function and records the PyTorch operations into an FX graph, with guards on shapes, dtypes and Python values. AOTAutograd traces the backward pass too, giving joint forward and backward graphs and choosing what to save or recompute. TorchInductor fuses element-wise and reduction chains and generates Triton kernels (GPU) or C++ (CPU), calling cuBLAS or autotuned templates for big matmuls. The result is cached and reused while the guards hold. The PyTorch 2 paper reports 1.41× geometric-mean training speedup over eager on an A100 across 180+ models.</div></details>
+<details class="qa"><summary>What is a graph break, what causes it and why does it hurt?<span class="lvl">core</span></summary><div class="ans">Dynamo ends the current graph when it meets code it cannot trace: branching on a tensor value, <code>.item()</code> or <code>.tolist()</code>, <code>print</code>, unsupported libraries. It runs that code in Python and starts a new graph. Each break makes graphs smaller (less fusion), returns to Python (launch overhead), and may force a CPU-GPU sync. Find them with <code>torch._dynamo.explain</code>, <code>TORCH_LOGS="graph_breaks"</code> or <code>fullgraph=True</code>; remove them with <code>torch.where</code>, moving logging outside, and keeping values on the GPU.</div></details>
+<details class="qa"><summary>Why does a compiled model recompile, and what happens after many recompiles?<span class="lvl">core</span></summary><div class="ans">A guard failed: a new shape, dtype, device, or a changed Python int or float (these are treated as constants). With <code>dynamic=None</code>, the first changed size triggers one recompile with that dimension made symbolic, which then covers other sizes. After 8 entries (the default recompile limit) Dynamo stops compiling that function and runs it eagerly, so speed silently drops. Fix: stable shapes (packing, bucketing), <code>mark_dynamic</code>, and passing changing numbers as tensors.</div></details>
+<details class="qa"><summary>When do CUDA graphs help, and what are their restrictions?<span class="lvl">core</span></summary><div class="ans">They help when the step is launch-bound: many short kernels and the CPU cannot keep the GPU queue full, typical for small per-GPU batches, small models, decoding, and strongly scaled training (MLPerf Mask R-CNN gained 1.70×, BERT on 4,096 GPUs 1.12×). A graph replays the same kernels with the same arguments and memory addresses, so it needs static shapes, static input and output buffers, no CPU syncs or data-dependent control flow inside, and no per-step CPU logic unless it lives in GPU tensors. Captured graphs also hold a private memory pool.</div></details>
+<details class="qa"><summary>FlashAttention does about the same FLOPs as standard attention. Why is it faster?<span class="lvl">core</span></summary><div class="ans">Standard attention is memory-bound in its softmax part: it writes the \(T \times T\) scores to HBM, reads them for softmax, writes probabilities, reads them again. FlashAttention fuses everything into one kernel with tiles in shared memory and an online softmax, so the \(T^2\) matrices never go to HBM; backward recomputes them from \(Q, K, V\). Far fewer bytes moved, memory linear in \(T\). The paper reports 3× on GPT-2 at length 1K.</div></details>
+<details class="qa"><summary>Why is the cross-entropy layer a memory problem for LLMs, and how is it fixed?<span class="lvl">core</span></summary><div class="ans">Logits are \(T \times V\): with \(V = 128{,}256\) and 65,536 tokens per GPU, that is 16.8 GB in BF16, plus an FP32 copy and the gradient of the same size. Because \(\partial\ell/\partial z = \softmax(z) - e_y\), the gradient can be computed in the same pass as the loss. Fused linear cross-entropy processes chunks of tokens, computes loss and gradients for each, and discards the logits, so memory is \(C \times V\). Cut Cross-Entropy also blocks the vocabulary and merges with log-sum-exp; it reports 24 GB to 1 MB for the loss of Gemma 2 2B.</div></details>
+<details class="qa"><summary>Your training job shows 40% GPU utilization. How do you find out why?<span class="lvl">core</span></summary><div class="ans">Profile a few steady steps (torch.profiler with a schedule, or nsys with NVTX ranges). On the timeline, find where the GPU compute stream is idle and what the CPU is doing at that moment: data loader (more workers, prefetch), blocking pageable copies (pin memory, non_blocking), <code>cudaStreamSynchronize</code> from <code>.item()</code> (remove syncs), dense tiny kernels with a saturated CPU (launch-bound: compile, CUDA graphs, bigger micro-batch), or NCCL waits (overlap, bucket sizes). Then estimate each fix with Amdahl’s law and start with the biggest.</div></details>
+<details class="qa"><summary>Estimate the time of an unfused vs fused RMSNorm for 16,384 tokens × 4,096 on an H100.<span class="lvl">advanced</span></summary><div class="ans">\(N = 67.1\)M elements, BF16. Unfused: pow (read+write), mean (read), x·r (read+write), ·g (read+write) is about \(7N\) element accesses, 939.5 MB, at least 280 µs at 3.35 TB/s. Fused: read once, write once, \(2N\), 268.4 MB, at least 80 µs. The FLOPs are tiny (a few per element), so bandwidth decides. Ratio 3.5×.</div></details>
+<details class="qa"><summary>What is the difference between mode="default", "reduce-overhead" and "max-autotune" in torch.compile?<span class="lvl">basic</span></summary><div class="ans">Default balances compile time and speed with Inductor fusion. “reduce-overhead” adds CUDA graphs to cut Python and launch overhead, useful for small batches; it costs extra memory for the graph pools and needs static shapes. “max-autotune” benchmarks Triton or template matmul variants to pick the fastest and also enables CUDA graphs on GPU; it compiles much longer. “max-autotune-no-cudagraphs” autotunes without graphs.</div></details>
+<details class="qa"><summary>Fusion saves memory in training, not only time. Explain.<span class="lvl">advanced</span></summary><div class="ans">In eager mode, autograd stores the inputs each operation needs for its backward: a chain of five element-wise ops may store several full-size intermediates. A fused operator with its own backward saves only its inputs (and small per-token statistics such as the RMS) and recomputes the rest during backward, which is cheap for element-wise math. AOTAutograd’s partitioner makes the same save-or-recompute choice automatically in compiled graphs. FlashAttention is the extreme case: it never stores the \(T \times T\) probabilities.</div></details>
+<details class="qa"><summary>Why can a faster GPU fail to speed up a training step?<span class="lvl">advanced</span></summary><div class="ans">If the step is launch-bound, \(T_{\text{step}} \approx n t_L\) (formula 50.1) does not depend on GPU speed; a faster GPU only makes the idle gaps longer. The same holds when the GPU is starved by data loading, syncs or exposed communication. As GPUs get faster, more workloads become CPU- or input-bound, which is why CUDA graphs, fusion and asynchronous input pipelines matter more with each GPU generation.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A step launches 2,400 kernels, each 3 µs on the GPU, and each launch costs 6 µs. Estimate the step time and GPU busy fraction with formula (50.1). What do CUDA graphs give?</li>
+<li>Count the HBM traffic of “residual add + RMSNorm” unfused and fused (in units of \(N\) elements). What is the ratio?</li>
+<li>Llama 2 has \(V = 32{,}000\). How much memory do the BF16 logits of 65,536 tokens take? Compare with Llama 3.</li>
+<li>Chunked cross-entropy with \(C = 1{,}024\) tokens and \(V = 128{,}256\): how big is one FP32 chunk of logits?</li>
+<li>Attention, element-wise kernels and the rest take 30%, 25% and 45% of a step. Fusing the element-wise kernels makes them 2.5× faster. What is the overall speedup? And if attention also becomes 2× faster?</li>
+<li>Rewrite <code>if x.sum() &gt; 0: y = x * 2 else: y = x - 1</code> without a graph break.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(n t_L = 2{,}400 \times 6 = 14.4\) ms, \(\sum d = 7.2\) ms, so the step is about 14.4 ms and the GPU is busy 50%. With one graph launch the step is close to 7.2 ms: about 2×. 2. Unfused: add reads 2N, writes N (3N); RMSNorm 7N; total 10N. Fused: read x and the residual (2N), write the new residual and the normed output (2N): 4N. Ratio 2.5×. 3. \(65{,}536 \times 32{,}000 \times 2 = 4.19\) GB, versus 16.8 GB for Llama 3 (4× larger vocabulary, 4× the memory). 4. \(1{,}024 \times 128{,}256 \times 4 = 525\) MB. 5. \(1/(0.75 + 0.25/2.5)\) \(= 1/0.85 = 1.18\)×. With attention too: \(1/(0.45 + 0.15 + 0.10)\) \(= 1/0.70 = 1.43\)×. 6. <code>y = torch.where(x.sum() &gt; 0, x * 2, x - 1)</code>: both sides are computed and one is selected on the GPU, no Python branch.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>A step is launch-bound, memory-bound or starved. The step time is roughly the larger of CPU launch time and GPU work (50.1); a profiler trace tells you which case you are in.</li>
+<li>torch.compile = Dynamo (bytecode to FX graph plus guards) + AOTAutograd (forward and backward together) + Inductor (fusion, Triton kernels). Graph breaks and recompiles silently remove the gain; count them.</li>
+<li>CUDA graphs replay a captured sequence of kernels with one launch. They need static shapes and addresses and no syncs, and help most when per-GPU work is small (Mask R-CNN 1.70×, BERT 1.12× in MLPerf v1.0).</li>
+<li>Fusion cuts HBM traffic of memory-bound chains (50.2, 50.3): 3.5× for RMSNorm. FlashAttention never writes the \(T^2\) scores (50.5). Fused cross-entropy uses \(\softmax - e_y\) (50.7) to avoid storing \(T \times V\) logits (50.6).</li>
+<li>Read traces in order: steady step, GPU busy fraction, data loader, copies, syncs, launch gaps, element-wise time, exposed communication. Estimate every fix with Amdahl’s law (50.9) first.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ T_{\text{step}} \approx \max\Big(n t_L, \sum_i d_i\Big), \quad t \approx \max\Big(\tfrac{\text{FLOPs}}{P}, \tfrac{\text{bytes}}{B}\Big), \quad \frac{\partial \ell}{\partial \mathbf{z}} = \softmax(\mathbf{z}) - \mathbf{e}_y, \quad S = \frac{1}{(1-p) + p/s} \]</div>
+<h2 class="plain" id="making-training-fast-compile-cuda-graphs-fused-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Ansel et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation&amp;quot;" target="_blank" rel="noopener">PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">CUDA C++ Programming Guide</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li><li>Ansel et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation&amp;quot;" target="_blank" rel="noopener">PyTorch 2: Faster Machine Learning Through Dynamic Python Bytecode Transformation and Graph Compilation</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/docs/stable/generated/torch.compile.html" target="_blank" rel="noopener">torch.compile API reference (modes, fullgraph, dynamic) and the recompilation guide</a></li><li>Nguyen, Carilli, Eryilmaz et al. (NVIDIA and Meta) (2021). <a href="https://pytorch.org/blog/accelerating-pytorch-with-cuda-graphs/" target="_blank" rel="noopener">Accelerating PyTorch with CUDA Graphs (PyTorch blog)</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/cuda/cuda-c-programming-guide/" target="_blank" rel="noopener">CUDA C++ Programming Guide</a></li><li>Dao et al. (2022). <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></li><li>Dao (2023). <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a></li><li>Zhang &amp; Sennrich (2019). <a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noopener">Root Mean Square Layer Normalization</a></li><li>Hsu et al. (2024). <a href="https://arxiv.org/abs/2410.10989" target="_blank" rel="noopener">Liger Kernel: Efficient Triton Kernels for LLM Training</a></li><li>Wijmans et al. (2024). <a href="https://arxiv.org/abs/2411.09009" target="_blank" rel="noopener">Cut Your Losses in Large-Vocabulary Language Models</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/docs/stable/profiler.html" target="_blank" rel="noopener">torch.profiler: PyTorch Profiler API reference</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/nsight-systems/UserGuide/index.html" target="_blank" rel="noopener">Nsight Systems User Guide</a></li><li>Hugging Face (Nanotron team) (2025). <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">The Ultra-Scale Playbook: Training LLMs on GPU Clusters</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../pretraining/pipeline-context-and-expert-parallelism-3d-and.html"><small>Previous · session 49</small>Pipeline, context and expert parallelism; 3D and 4D parallel</a><a class="next" href="../pretraining/distributed-checkpoints-fault-tolerance-and-mfu.html"><small>Next · session 51</small>Distributed checkpoints, fault tolerance and MFU</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="making-training-fast-compile-cuda-graphs-fused"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmt=(v,d)=>v.toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
+function segCtl(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const box=(x,y,w,h,fill,stroke,extra)=>`<rect x="${x.toFixed(1)}" y="${y}" width="${Math.max(0,w).toFixed(1)}" height="${h}" rx="4" fill="${fill}" stroke="${stroke||"none"}" ${extra||""}/>`;
+const txt=(x,y,s,o)=>{o=o||{};return `<text x="${x}" y="${y}" font-size="${o.fs||12}" text-anchor="${o.a||"middle"}" fill="${o.c||"var(--ink)"}" font-weight="${o.w||400}">${s}</text>`;};
+
+/* ---------- Figure 1: the torch.compile stack (static) ---------- */
+(function(){
+ const svg=$("#mf-pipe-svg");if(!svg)return;
+ const S=[["Python function","your model code","(bytecode)"],["TorchDynamo","traces bytecode,","writes guards"],["FX graph","list of torch ops","+ guards"],["AOTAutograd","joint forward and","backward graphs"],["TorchInductor","fuses ops,","plans memory"],["Kernels","Triton (GPU)","C++ (CPU), cuBLAS"]];
+ const cols=["var(--muted)","var(--q)","var(--q)","var(--k)","var(--v)","var(--v)"];
+ let g=`<defs><marker id="mf-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+ const W=106,G=20,x0=8;
+ S.forEach((s,i)=>{const x=x0+i*(W+G);g+=box(x,30,W,84,"var(--card)",cols[i],'stroke-width="2"')+txt(x+W/2,56,s[0],{fs:13,w:700})+txt(x+W/2,78,s[1],{fs:11.5,c:"var(--ink2)"})+txt(x+W/2,95,s[2],{fs:11.5,c:"var(--ink2)"});
+  if(i<S.length-1)g+=`<line x1="${x+W+2}" y1="72" x2="${x+W+G-3}" y2="72" stroke="var(--muted)" stroke-width="1.6" marker-end="url(#mf-ah)"/>`;});
+ g+=`<path d="M${x0+5*(W+G)+W/2} 116 V160 H${x0+W/2} V118" fill="none" stroke="var(--rule)" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#mf-ah)"/>`;
+ g+=txt(380,152,"compiled code is cached; on every later call the guards are checked first",{fs:12,c:"var(--muted)"});
+ g+=box(150,180,210,52,"var(--ok-soft)","var(--ok)")+txt(255,201,"guards pass",{fs:12.5,w:700})+txt(255,220,"run cached kernels (microseconds)",{fs:11.5,c:"var(--ink2)"});
+ g+=box(400,180,210,52,"var(--warn-soft)","var(--warn)")+txt(505,201,"guards fail",{fs:12.5,w:700})+txt(505,220,"recompile (up to 8 times), then eager",{fs:11.5,c:"var(--ink2)"});
+ svg.innerHTML=g;
+})();
+
+/* ---------- Figure 2: graph breaks and recompiles ---------- */
+(function(){
+ const svg=$("#mf-brk-svg");if(!svg)return;const info=$("#mf-brk-info"),code=$("#mf-brk-code");
+ const C={if:$("#mf-brk-if"),item:$("#mf-brk-item"),print:$("#mf-brk-print"),dyn:$("#mf-brk-dyn"),full:$("#mf-brk-full")};
+ const L=[{t:"def block(h):"},{t:"    h = h + attn(norm1(h))"},{k:"if",t:"    if h.sum() > 0: h = h * 0.5"},{k:"item",t:"    stats.append(h.abs().max().item())"},{k:"print",t:"    print(\"block\", h.shape)"},{t:"    h = h + mlp(norm2(h))"},{t:"    return h"}];
+ const why={if:"data-dependent branch",item:".item() to the CPU",print:"print"};
+ function draw(){const on=k=>C[k].checked;
+  code.innerHTML=L.map(l=>`<span class="${l.k?(on(l.k)?"on":"off"):""}">${B.esc(l.t)}</span>`).join("\n");
+  const br=["if","item","print"].filter(on);const k=br.length,G=k+1,comp=on("dyn")?2*G:G;
+  let g="";
+  if(on("full")&&k>0){g+=box(10,25,620,50,"var(--bad-soft)","var(--bad)")+txt(320,47,"fullgraph=True: error at the first call",{fs:13,w:700})+txt(320,66,`torch._dynamo.exc.Unsupported (${B.esc(why[br[0]])})`,{fs:12,c:"var(--ink2)"});
+   svg.innerHTML=g;info.innerHTML=`<b>Compilation fails</b> at the first graph break (${B.esc(why[br[0]])}). This is useful: it shows you exactly where the ${k} break${k>1?"s are":" is"}. Remove ${k>1?"them":"it"} or untick fullgraph.`;return;}
+  const bw=26,w=(620-k*bw)/G;let x=10;
+  const parts=[];let cur=["attn(norm1(h)) + h"];br.forEach(b=>{parts.push(cur);cur=[b==="if"?"h * 0.5 (or not)":"rest"];});parts.push(cur);
+  const labels=[];let names=["add, norm1, attn"];const seq=[...br];
+  for(let i=0;i<G;i++){const first=i===0,last=i===G-1;labels.push(first&&last?"norm1, attn, add, norm2, mlp, add":first?"norm1, attn, add":last?(seq[i-1]==="if"?"mul, norm2, mlp, add":"norm2, mlp, add"):(seq[i-1]==="if"?"mul":"(small)"));}
+  for(let i=0;i<G;i++){g+=box(x,30,w,44,"var(--q-soft)","var(--q)",'stroke-width="1.6"')+txt(x+w/2,50,`graph ${i+1}`,{fs:12.5,w:700})+txt(x+w/2,66,labels[i],{fs:w>150?11.5:10,c:"var(--ink2)"});
+   x+=w;if(i<k){g+=box(x+3,22,bw-6,60,"var(--k-soft)","var(--k)")+txt(x+bw/2,100,why[br[i]].split(" ")[0],{fs:10.5,c:"var(--k)"});x+=bw;}}
+  svg.innerHTML=g;
+  info.innerHTML=`Graphs: <b>${G}</b>. Graph breaks: <b>${k}</b>. Compiles over 4 steps: <b>${comp}</b>${on("dyn")?" (each graph: once for length 128, once more with a dynamic length at 256)":""}. Returns to Python per call: <b>${k}</b>.${k?" Each break means less fusion and more launches"+(on("item")?"; <code>.item()</code> also forces a CPU-GPU sync every call":"")+".":" One graph: Inductor can fuse across the whole block."}`;}
+ Object.values(C).forEach(c=>c.addEventListener("change",draw));draw();
+})();
+
+/* ---------- Figure 3: launch timeline, eager vs CUDA graph ---------- */
+(function(){
+ const svg=$("#mf-tl-svg");if(!svg)return;const Bs=$("#mf-tl-b"),Ls=$("#mf-tl-l"),info=$("#mf-tl-info");let mode="eager";
+ const base=[6,2,2,3,6,2],kind=["mm","ew","ew","ew","mm","ew"],REP=10;
+ function sim(b,L,graph){let e=0,i=0;const ks=[],cpu=[];
+  if(graph)cpu.push([0,L]);
+  for(let r=0;r<REP;r++)base.forEach((d,j)=>{const dd=d*b;let ready;if(graph)ready=L;else{ready=(i+1)*L;cpu.push([i*L,L]);}const s=Math.max(ready,e);ks.push([s,dd,kind[j]]);e=s+dd;i++;});
+  return{T:e,busy:ks.reduce((a,k)=>a+k[1],0),ks,cpu};}
+ function draw(){const b=+Bs.value,L=+Ls.value;$("#mf-tl-bv").value="×"+b;$("#mf-tl-lv").value=L+" µs";
+  const E=sim(b,L,false),Gr=sim(b,L,true),S=mode==="graph"?Gr:E;const Tmax=Math.max(E.T,Gr.T);const X0=78,X=t=>X0+t/Tmax*660;
+  let g=txt(70,52,"CPU",{a:"end",fs:12.5,w:700})+txt(70,112,"GPU",{a:"end",fs:12.5,w:700})+txt(70,152,"idle",{a:"end",fs:11.5,c:"var(--bad)"});
+  g+=`<line x1="${X0}" y1="160" x2="${X(Tmax)}" y2="160" stroke="var(--rule)"/>`;
+  S.cpu.forEach(([s,d])=>g+=box(X(s),36,Math.max(1.2,X(s+d)-X(s)-0.8),24,"var(--muted)","none",'opacity=".55"'));
+  S.ks.forEach(([s,d,k])=>g+=box(X(s),94,Math.max(1,X(s+d)-X(s)-0.4),28,k==="mm"?"var(--q)":"var(--v)"));
+  let prev=0,idle=0;S.ks.forEach(([s,d])=>{if(s-prev>1e-9){g+=box(X(prev),142,X(s)-X(prev),8,"var(--bad)","none",'opacity=".8"');idle+=s-prev;}prev=s+d;});
+  const step=Math.pow(10,Math.floor(Math.log10(Tmax/4)));const tk=Math.ceil(Tmax/4/step)*step;
+  for(let t=0;t<=Tmax+1e-9;t+=tk)g+=`<line x1="${X(t)}" y1="160" x2="${X(t)}" y2="165" stroke="var(--muted)"/>`+txt(X(t),179,fmt(t,0)+" µs",{fs:11,c:"var(--muted)"});
+  if(mode==="graph")g+=txt(X(0)+4,28,"one cudaGraphLaunch",{a:"start",fs:11.5,c:"var(--muted)"});
+  svg.innerHTML=g;
+  const sp=E.T/Gr.T;
+  info.innerHTML=`<b>${mode==="graph"?"CUDA graph":"Eager"}</b>: 60 kernels, ${mode==="graph"?1:60} launch${mode==="graph"?"":"es"}. Step time <b>${fmt(S.T,1)} µs</b>, GPU busy <b>${fmt(100*S.busy/S.T,1)}%</b>, idle ${fmt(idle,1)} µs. GPU work Σd = ${fmt(S.busy,0)} µs; CPU launch work n·t<sub>L</sub> = ${fmt(60*L,0)} µs (eager). CUDA graph speedup over eager at these settings: <b>${fmt(sp,2)}×</b>.`;}
+ segCtl($("#mf-tl-mode"),v=>{mode=v;draw();});[Bs,Ls].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: fusion and HBM bytes ---------- */
+(function(){
+ const svg=$("#mf-fuse-svg");if(!svg)return;const Ts=$("#mf-fuse-t"),Ds=$("#mf-fuse-d"),info=$("#mf-fuse-info");let op="rms";
+ const DS=[1024,2048,4096,8192],BW=3.35e12;
+ const OPS={rms:{k:[["pow  (x²)",1,1],["mean",1,0],["x · r",1,1],["· g",1,1]],f:[1,1]},
+  addrms:{k:[["add  (x + res)",2,1],["pow  (x²)",1,1],["mean",1,0],["x · r",1,1],["· g",1,1]],f:[2,2]},
+  swiglu:{k:[["silu(gate)",1,1],["· up",2,1]],f:[2,1]}};
+ function draw(){const T=Math.pow(2,+Ts.value),d0=DS[+Ds.value],d=op==="swiglu"?d0*3.5:d0,N=T*d,b=2;
+  $("#mf-fuse-tv").value=fmt(T,0);$("#mf-fuse-dv").value=fmt(d0,0)+(op==="swiglu"?` (FFN ${fmt(d,0)})`:"");
+  const o=OPS[op];const ks=o.k.map(([n,r,w])=>[n,r*N*b,w*N*b]);const fu=["one fused kernel",o.f[0]*N*b,o.f[1]*N*b];
+  const tot=ks.reduce((a,k)=>a+k[1]+k[2],0),ft=fu[1]+fu[2];const mx=Math.max(...ks.map(k=>k[1]+k[2]),ft);
+  const X0=170,Wd=440,sc=v=>v/ mx*Wd*0.8;let y=14,g="";
+  g+=txt(10,y+2,"Unfused (eager)",{a:"start",fs:12.5,w:700});y+=12;
+  ks.forEach(([n,r,w])=>{g+=txt(X0-8,y+15,B.esc(n),{a:"end",fs:12})+box(X0,y,sc(r),20,"var(--q)")+box(X0+sc(r),y,sc(w),20,"var(--k)")+txt(X0+sc(r+w)+6,y+15,fmt((r+w)/1e6,1)+" MB",{a:"start",fs:11.5,c:"var(--muted)"});y+=26;});
+  y+=6;g+=txt(10,y+12,"Fused",{a:"start",fs:12.5,w:700});y+=18;
+  g+=txt(X0-8,y+15,fu[0],{a:"end",fs:12})+box(X0,y,sc(fu[1]),20,"var(--q)")+box(X0+sc(fu[1]),y,sc(fu[2]),20,"var(--k)")+txt(X0+sc(ft)+6,y+15,fmt(ft/1e6,1)+" MB",{a:"start",fs:11.5,c:"var(--muted)"});
+  svg.setAttribute("viewBox",`0 0 640 ${y+32}`);svg.innerHTML=g;
+  const ue=tot/(N*b),fe=ft/(N*b);
+  info.innerHTML=`N = ${fmt(T,0)} × ${fmt(d,0)} = ${fmt(N,0)} elements (BF16). Unfused: ${ks.length} kernels, ${ue}N accesses = <b>${fmt(tot/1e6,1)} MB</b>, at least <b>${fmt(tot/BW*1e6,1)} µs</b>. Fused: 1 kernel, ${fe}N = <b>${fmt(ft/1e6,1)} MB</b>, at least <b>${fmt(ft/BW*1e6,1)} µs</b>. Fusion moves <b>${fmt(ue/fe,2)}×</b> fewer bytes and saves ${fmt((tot-ft)/BW*1e6,1)} µs per call.`;}
+ segCtl($("#mf-fuse-op"),v=>{op=v;draw();});[Ts,Ds].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 5: cross-entropy memory ---------- */
+(function(){
+ const svg=$("#mf-ce-svg");if(!svg)return;const Ss=$("#mf-ce-s"),Cs=$("#mf-ce-c"),info=$("#mf-ce-info");let V=128256;
+ function draw(){const s=+Ss.value,C=Math.pow(2,+Cs.value),T=s*8192;$("#mf-ce-sv").value=s+" ("+fmt(T,0)+" tokens)";$("#mf-ce-cv").value=fmt(C,0);
+  const l16=T*V*2,l32=T*V*4,gr=T*V*2,naive=l16+l32+gr,ch=Math.min(C,T)*V*8;const MAXG=140e9,X0=120,W=500,X=v=>X0+Math.min(v,MAXG)/MAXG*W;
+  let g=txt(X0-8,52,"naive",{a:"end",fs:12.5,w:700})+txt(X0-8,122,"chunked",{a:"end",fs:12.5,w:700});
+  g+=box(X0,34,X(l16)-X0,28,"var(--q)")+box(X(l16),34,X(l16+l32)-X(l16),28,"var(--k)")+box(X(l16+l32),34,X(naive)-X(l16+l32),28,"var(--v)");
+  if(naive>MAXG)g+=txt(X0+W-4,54,"off scale →",{a:"end",fs:11.5,c:"var(--on-accent)",w:700});
+  g+=box(X0,104,Math.max(1.5,X(ch)-X0),28,"var(--k)")+txt(Math.max(X(ch),X0+2)+6,123,fmt(ch/1e9,2)+" GB",{a:"start",fs:11.5,c:"var(--muted)"});
+  g+=`<line x1="${X(80e9)}" y1="22" x2="${X(80e9)}" y2="146" stroke="var(--bad)" stroke-width="1.6" stroke-dasharray="5 4"/>`+txt(X(80e9),16,"80 GB (one H100)",{fs:11.5,c:"var(--bad)"});
+  g+=`<line x1="${X0}" y1="150" x2="${X0+W}" y2="150" stroke="var(--rule)"/>`;[0,20,40,60,80,100,120,140].forEach(v=>g+=`<line x1="${X(v*1e9)}" y1="150" x2="${X(v*1e9)}" y2="155" stroke="var(--muted)"/>`+txt(X(v*1e9),169,v+"",{fs:11,c:"var(--muted)"}));
+  g+=txt(X0+W/2,190,"GB",{fs:11.5,c:"var(--muted)"});
+  g+=box(X0,196,10,8,"var(--q)")+txt(X0+14,204,"BF16 logits",{a:"start",fs:11})+box(X0+100,196,10,8,"var(--k)")+txt(X0+114,204,"FP32 logits",{a:"start",fs:11})+box(X0+200,196,10,8,"var(--v)")+txt(X0+214,204,"BF16 logit gradient",{a:"start",fs:11});
+  svg.innerHTML=g;
+  info.innerHTML=`T = ${fmt(T,0)} tokens, V = ${fmt(V,0)}. Naive: BF16 logits ${fmt(l16/1e9,1)} GB + FP32 copy ${fmt(l32/1e9,1)} GB + gradient ${fmt(gr/1e9,1)} GB = <b>${fmt(naive/1e9,1)} GB</b>${naive>80e9?" (does not fit on an 80 GB GPU)":""}. Chunked with C = ${fmt(C,0)}: <b>${fmt(ch/1e9,2)} GB</b>, ${fmt(naive/ch,0)}× less. The loss and gradients are the same.`;}
+ segCtl($("#mf-ce-v"),v=>{V=+v;draw();});[Ss,Cs].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 6: trace doctor ---------- */
+(function(){
+ const svg=$("#mf-tr-svg");if(!svg)return;const info=$("#mf-tr-info");const F={w:$("#mf-tr-w"),p:$("#mf-tr-p"),i:$("#mf-tr-i"),c:$("#mf-tr-c"),o:$("#mf-tr-o")};let items=[],detail="";
+ function build(){const on=k=>F[k].checked;const it=[];let t=0;const add=(lane,s,d,kind,label,desc)=>{if(d>0)it.push({lane,s,d,kind,label,desc});};
+  if(on("w")){add(0,0,1,"cpu","next()","DataLoader: the batch is already prepared by worker processes, so taking it costs about 1 ms.");t=1;}
+  else{add(0,0,30,"cpu","DataLoader (main process)","Data loading in the main process: reading, tokenizing or decoding and collating. The GPU has nothing to do. Fix: num_workers and prefetching.");t=30;}
+  if(on("p")){}
+  else{add(0,t,6,"wait","cudaMemcpy (pageable)","A blocking copy from pageable memory: the CPU waits, and the GPU compute stream waits for the data. Fix: pin_memory=True and .to(device, non_blocking=True).");add(2,t,6,"aux","Memcpy HtoD (Pageable)","The copy itself on the copy engine.");t+=6;}
+  const C=on("c")?52:60,G=on("c")?2:10,n=on("c")?12:24,kd=C/n,gp=G/n;const fs=t;
+  add(0,t,C+G,"cpu","launching forward + backward kernels","The CPU thread is busy launching kernels one by one. With many small kernels it cannot stay ahead, and gaps appear on the GPU.");
+  for(let j=0;j<n;j++){add(1,t+gp,kd,"gpu",j<n/3?"fwd":"bwd",(j<n/3?"Forward":"Backward")+" kernels"+(on("c")?" (compiled: fused, fewer launches)":" (eager: many small element-wise kernels between the matmuls)")+".");t+=gp+kd;}
+  const be=t;
+  if(on("o")){add(2,be-10.5,12,"aux","NCCL all-reduce (bucketed)","Gradient buckets are all-reduced while the backward pass is still running. Only the last bucket is exposed.");t=be+1.5;}
+  else{add(2,be,12,"aux","NCCL all-reduce","All gradients are reduced after the backward pass. The compute stream has nothing to do. Fix: overlap communication with backward (DDP buckets, FSDP prefetch).");add(0,be,12,"cpu","launch optimizer (queued)","");t=be+12;}
+  if(!on("i")){add(0,t,0.6,"wait","loss.item(): sync","loss.item() calls cudaStreamSynchronize: the CPU waits for the GPU, so the launch queue is empty afterwards and the GPU waits while the CPU launches the next kernels.");t+=3;}
+  add(1,t,4,"gpu","optim","AdamW step (foreach kernels).");add(0,t-0.5,4,"cpu","launch optimizer","CPU launches the optimizer kernels.");t+=4;
+  return{it,T:t};}
+ function draw(){const {it,T}=build();items=it;const X0=96,W=636,X=v=>X0+v/140*W;
+  const busy=it.filter(x=>x.lane===1).reduce((a,x)=>a+x.d,0);
+  let g=txt(88,46,"CPU thread",{a:"end",fs:12,w:700})+txt(88,96,"GPU compute",{a:"end",fs:12,w:700})+txt(88,146,"copy / NCCL",{a:"end",fs:12,w:700});
+  const col={cpu:"var(--muted)",wait:"var(--warn)",gpu:"var(--q)",aux:"var(--v)"};
+  it.forEach((x,i)=>{const y=[30,80,130][x.lane];g+=`<g class="mf-seg" data-i="${i}">`+box(X(x.s),y,Math.max(1.5,X(x.s+x.d)-X(x.s)-0.6),26,col[x.kind],"none",x.kind==="cpu"?'opacity=".6"':"")+(X(x.s+x.d)-X(x.s)>70?txt(X(x.s)+(X(x.s+x.d)-X(x.s))/2,y+17,B.esc(x.label.length>26?x.label.slice(0,25)+"…":x.label),{fs:10.5,c:x.kind==="cpu"?"var(--ink)":"var(--on-accent)"}):"")+`</g>`;});
+  const gk=it.filter(x=>x.lane===1).sort((a,b)=>a.s-b.s);let prev=0,idle=0;
+  gk.forEach(x=>{if(x.s-prev>1e-9){g+=box(X(prev),110,X(x.s)-X(prev),6,"var(--bad)","none",'opacity=".85"');idle+=x.s-prev;}prev=x.s+x.d;});
+  g+=`<line x1="${X(T)}" y1="22" x2="${X(T)}" y2="170" stroke="var(--ink)" stroke-dasharray="4 3"/>`+txt(X(T)+(X(T)>700?-4:4),20,"step end",{a:X(T)>700?"end":"start",fs:11,c:"var(--ink2)"});
+  g+=`<line x1="${X0}" y1="172" x2="${X0+W}" y2="172" stroke="var(--rule)"/>`;for(let v=0;v<=140;v+=20)g+=`<line x1="${X(v)}" y1="172" x2="${X(v)}" y2="177" stroke="var(--muted)"/>`+txt(X(v),191,v+" ms",{fs:11,c:"var(--muted)"});
+  svg.innerHTML=g;
+  info.innerHTML=`Step time: <b>${fmt(T,1)} ms</b>; GPU compute busy: <b>${fmt(100*busy/T,1)}%</b> (kernels ${fmt(busy,1)} ms, idle ${fmt(idle,1)} ms). Speedup over the unfixed step (125 ms): <b>${fmt(125/T,2)}×</b>.`+(detail?`<br>${detail}`:"<br>Click a block for details.");}
+ svg.addEventListener("click",e=>{const s=e.target.closest(".mf-seg");if(!s)return;const x=items[+s.dataset.i];if(!x)return;detail=`<b>${B.esc(x.label)}</b> (${fmt(x.d,1)} ms): ${B.esc(x.desc||"")}`;draw();});
+ Object.values(F).forEach(c=>c.addEventListener("change",()=>{detail="";draw();}));draw();
+})();
+})();
+</script></body></html>

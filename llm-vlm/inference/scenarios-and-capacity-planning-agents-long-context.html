@@ -1,0 +1,475 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Scenarios and capacity planning: agents, long context, edge, cost · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 141</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="scenarios-and-capacity-planning-agents-long-context">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="scenarios-and-capacity-planning-agents-long-context" data-session="scenarios-and-capacity-planning-agents-long-context" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">141</span><span>Track 5: LLM inference and serving · session 64 of 65</span></div><h1 class="chap-title">Scenarios and capacity planning: agents, long context, edge, cost</h1><p class="chap-sub">Real traffic is not one chat request. Agents send many calls that repeat the same long prefix, long-context requests make prefill and the KV cache explode, and edge devices have little memory and bandwidth. This session turns a description of the traffic (requests per second, prompt and output lengths, a latency target) into a number of GPUs and a cost per million tokens, and works it out for one 8B model on an L4 and on an H100.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises and code 1 to 2 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions 81, 82 and 133 (metrics, the roofline, the cost model of a server); sessions 134 and 135 (prefix caching, chunked prefill)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why an agent episode of k calls costs about k²/2 prompts without a prefix cache, and only one prompt plus the new tokens with it</li><li>Where the time and memory of long context go: the T² attention term, the crossover length N/(Ld), 128 KiB of KV cache per token, and what sparse attention saves (bandwidth, not capacity)</li><li>A simple upper bound for edge decoding speed: memory bandwidth divided by model size</li><li>A closed-form model of one server under load: TPOT as a function of request rate, and the three limits (bandwidth, compute, KV memory) that set the capacity of one GPU</li><li>How to turn traffic and an SLO into a number of GPUs and a cost per million output tokens</li><li>A worked plan for Llama 3.1 8B on an L4 and an H100: why the L4 cannot meet 50 ms in BF16, why the H100 is cheaper per token at high traffic, and when the L4 wins</li><li>Runnable PyTorch code that checks prefix-cache reuse gives the same logits, and a planner that reproduces the worked example</li></ul></div></header><style>
+.cp-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.cp-grid input[type=range]{width:100%}
+.cp-grid output{font-family:var(--mono);font-size:14px;min-width:5.5em;text-align:right}
+.cp-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.cp-leg span::before{content:"";display:inline-block;width:18px;height:4px;border-radius:2px;margin-right:6px;vertical-align:3px;background:var(--c)}
+table.cp-t{border-collapse:collapse;font:500 14px var(--sans);min-width:560px;width:100%;margin-top:8px}
+table.cp-t th,table.cp-t td{border-bottom:1px solid var(--rule);padding:5px 8px;text-align:right}
+table.cp-t th:first-child,table.cp-t td:first-child{text-align:left}
+table.cp-t td.bad{color:var(--bad)}table.cp-t tr.best td{background:var(--ok-soft)}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">So far we have studied one request at a time, or a uniform stream of chat requests. Real products are messier. A coding agent sends 30 calls that all start with the same 5,000-token system prompt. A legal assistant reads a 100,000-token contract. A phone runs a 3B model on a few GB of memory. And somebody must answer the question every team asks before launch: <b>how many GPUs do we need, and what does one million tokens cost us?</b></p>
+<p>The efficient-inference survey of Zhou et al. ends with exactly these scenarios (its Section 7): agent and multi-model frameworks, which “naturally introduce a new optimization level, i.e., pipeline-level”; long-context models, where self-attention is quadratic in the context length; and edge deployment on devices with very limited resources. [Certain] This session takes each scenario, finds which resource it stresses (compute, memory bandwidth, or memory size), and then builds one capacity plan from traffic to dollars.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>System-design interviews for LLM serving almost always contain a sizing question: “We expect 10 requests per second with 2K-token prompts. How many H100s?” A good answer names the three limits (bandwidth, compute, KV memory), says which one binds, and gives a number with its assumptions. This session gives you a method and the numbers.</aside>
+<p>We use one model throughout, so that every number can be checked: <b>Llama 3.1 8B</b>. From its config: 32 layers, hidden size 4096, 8 KV heads of size 128, maximum context 131,072 tokens. [Certain] As in <a href="../inference/the-serving-stack-and-the-life-of.html">session 133</a>, we count \(N = 8.03 \times 10^9\) parameters, \(M_W = 16.06\) GB of weights in BF16 (8.03 GB in FP8), and \(s_{\text{kv}} = 2 \cdot 32 \cdot 8 \cdot 128 \cdot 2 = 131{,}072\) bytes (128 KiB) of KV cache per token in BF16 (half in FP8). The two GPUs are an <b>L4</b> (24 GB, 300 GB/s, 121 TFLOP/s dense BF16, 242 dense FP8, 72 W) and an <b>H100 SXM</b> (80 GB, 3.35 TB/s, 989 TFLOP/s dense BF16, 1,979 dense FP8). [Certain] We also keep the efficiency assumptions of session 133: matmuls reach \(u = 50\%\) of peak FLOP/s, memory reads reach \(\eta = 80\%\) of peak bandwidth, each step has \(t_0 = 1\) ms of fixed overhead, and 90% of GPU memory is usable. [Likely] These assumptions are rough; measure your own engine (<a href="../inference/lab-benchmark-a-serving-system.html">session 142</a>).</p>
+
+<h2>Scenario 1: agents and multi-model pipelines</h2>
+<p>An <b>agent</b> is a program that calls an LLM in a loop. Each call reads the whole history so far, writes a short output (a thought and a tool call, for example in the ReAct style), then a tool runs (a search, a code interpreter, a test suite), and its result is appended to the history. [Certain] Benchmarks such as SWE-bench, where a model must fix real GitHub issues, are solved this way, with tens of calls per task. [Likely]</p>
+<p>From the server’s point of view, an agent episode is a sequence of requests with three special properties:</p>
+<ol><li><b>Shared prefixes.</b> Call \(i\) contains everything that call \(i-1\) contained, plus a little more. Many episodes also share the same system prompt and tool descriptions.</li>
+<li><b>Sequential dependency.</b> Call \(i+1\) cannot start before call \(i\) and its tool have finished. Latencies add up.</li>
+<li><b>Idle gaps.</b> While a tool runs (often seconds), the request is not in the GPU batch, but its KV cache is worth keeping.</li></ol>
+<aside class="note analogy side"><span class="nt">Analogy</span>An agent is like a lawyer who rereads the whole case file before writing each new sentence of a letter. Without a cache, the reading time grows with every sentence. A prefix cache is a bookmark: she remembers everything up to the last page and only reads the new pages.</aside>
+<h3>How many tokens does an episode prefill?</h3>
+<p>Let the shared prefix (system prompt plus tool list) have \(S\) tokens, the task \(q\) tokens, and let each call write \(o\) tokens and each tool return \(r\) tokens. Then the prompt of call \(i\) (counting from 1) has</p>
+<div class="eq">\[ T_i = S + q + (i - 1)(o + r) \tag{141.1} \]</div>
+<p>tokens. Without any cache, every call prefills its whole prompt. With a prefix cache that keeps the KV of the episode between calls (<a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>), call 1 prefills \(S + q\) and every later call prefills only the new tool result: the output tokens were already written into the cache when they were decoded. Summing over \(k\) calls:</p>
+<div class="eq">\[ \text{no cache: } \sum_{i=1}^{k} T_i = k(S + q) + (o + r)\,\frac{k(k-1)}{2}, \qquad \text{prefix cache: } (S + q) + (k - 1)\, r \tag{141.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(k\)</dt><dd>number of LLM calls in one episode</dd>
+<dt>\(S\), \(q\)</dt><dd>tokens of the shared prefix (system prompt, tool list) and of the user’s task</dd>
+<dt>\(o\), \(r\)</dt><dd>tokens the model writes per call, and tokens a tool returns per call</dd></dl>
+<p>Without a cache the cost grows like \(k^2\); with it, linearly. If the shared prefix \(S\) is also cached across users (the same system prompt for everybody), call 1 only prefills \(q\). The latency of the whole episode is a sum along the chain:</p>
+<div class="eq">\[ E2E_{\text{episode}} = \sum_{i=1}^{k} \text{TTFT}_i \;+\; k\, o \cdot \text{TPOT} \;+\; (k - 1)\, t_{\text{tool}} \tag{141.3} \]</div>
+<div class="worked"><div class="wt">Worked example: a 10-call coding agent on one H100</div>
+<p>Take \(k = 10\), \(S = 3{,}000\), \(q = 200\), \(o = 150\), \(r = 600\). By (141.2), without a cache the episode prefills \(10 \cdot 3{,}200 + 750 \cdot 45 = 65{,}750\) tokens. With an episode cache: \(3{,}200 + 9 \cdot 600 = 8{,}600\) tokens, 7.6 times fewer. With the system prompt cached too: \(200 + 5{,}400 = 5{,}600\).</p>
+<p>Counting attention as well (a chunk of \(n\) new tokens after \(j\) cached ones costs \(2Nn + 4Ld\,n(j + n/2)\) FLOPs, as in <a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>), the prefill work is 1.18 PFLOP without a cache and 0.160 PFLOP with it, 7.4 times less. At \(u = 50\%\) on an H100 that is 2.39 s against 0.32 s of GPU time. The TTFT of the last call falls from 376 ms to 26 ms.</p>
+<p>But look at the latency (141.3) with TPOT = 10 ms and 1 s per tool: decode is \(10 \cdot 150 \cdot 0.01 = 15\) s, tools are 9 s, and the whole episode takes 26.4 s without a cache and 24.3 s with it. <b>The cache is a big saving in GPU cost and a small one in latency</b>; for agents, latency is dominated by decoding and tools.</p>
+<p>The price of keeping the cache: at the end the context holds \(3{,}200 + 1{,}500 + 5{,}400 = 10{,}100\) tokens, which is \(10{,}100 \times 131{,}072\) bytes = 1.32 GB of KV cache per agent. The 55.9 GB left on an H100 after the weights keep only about 42 such agents. Agents are hungry for memory, not for compute.</p></div>
+<figure class="fig" id="cp-agent"><div class="fig-body">
+<div class="controls"><span class="seg" id="cp-agent-mode"><button type="button" data-v="0" aria-pressed="false">No cache</button><button type="button" data-v="1" aria-pressed="true">Cache within the episode</button><button type="button" data-v="2" aria-pressed="false">+ shared system prompt</button></span></div>
+<div class="cp-grid" style="margin-top:8px">
+<label for="cp-agent-k">Calls \(k\)</label><input type="range" id="cp-agent-k" min="1" max="20" step="1" value="10"><output id="cp-agent-kv"></output>
+<label for="cp-agent-s">Shared prefix \(S\)</label><input type="range" id="cp-agent-s" min="0" max="8000" step="250" value="3000"><output id="cp-agent-sv"></output>
+<label for="cp-agent-o">Output per call \(o\)</label><input type="range" id="cp-agent-o" min="20" max="600" step="10" value="150"><output id="cp-agent-ov"></output>
+<label for="cp-agent-r">Tool result \(r\)</label><input type="range" id="cp-agent-r" min="0" max="3000" step="50" value="600"><output id="cp-agent-rv"></output>
+<label for="cp-agent-t">Tool time</label><input type="range" id="cp-agent-t" min="0" max="5" step="0.25" value="1"><output id="cp-agent-tv"></output></div>
+<div class="scroll-x"><svg id="cp-agent-svg" viewBox="0 0 640 250" role="img" aria-label="Prompt length of each call of an agent episode, split into tokens read from the cache and tokens that must be prefilled"></svg></div>
+<div class="cp-leg"><span style="--c:var(--q)">tokens prefilled in this call</span><span style="--c:var(--q-soft)">tokens read from the prefix cache</span><span style="--c:var(--k)">output tokens decoded</span></div>
+<div class="readout" id="cp-agent-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> One agent episode of Llama 3.1 8B on one H100 (BF16, \(u = 50\%\), TPOT fixed at 10 ms, task \(q = 200\) tokens). Each column is one call. The height is the prompt of that call, formula (141.1); the dark part must be prefilled, the light part comes from the cache, and the thin top part is the output.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with “No cache”: the dark (prefilled) columns grow like a staircase and their total area grows like \(k^2\). Switch to “Cache within the episode”: only a thin dark band remains on each column (the tool result). Now raise the number of calls to 20 and the tool result to 2,000 tokens: without a cache the prefill time becomes comparable to the decode time; with a cache it stays small. Watch the KV size of the finished episode: that is the memory you must keep reserved during every tool call.</p></details></figure>
+<h3>Serving agents well</h3>
+<p>Three system ideas follow from the numbers. First, <b>cache-aware routing</b>: send all calls of one episode to the replica that already holds its prefix; a random load balancer destroys the hit rate. SGLang’s RadixAttention was built for these “LLM programs” with many calls and shared prefixes [Certain], and its router balances load by cache hits [Likely]. Second, <b>keep or move the cache during tool calls</b>: keep it in GPU memory with a time limit, or move it to CPU memory or SSD and bring it back. Mooncake, the serving system of the Kimi chatbot, is organized around a large pool of KV cache in CPU memory and SSD across machines. [Certain] Third, <b>run independent work in parallel</b>: several tool calls, or several branches of a plan, can run at the same time (SGLang’s <code>fork</code>, Skeleton-of-Thought in <a href="../inference/output-organization-skeleton-of-thought-apar-sglang.html">session 91</a>); they share the prefix, so they cost little extra prefill.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: serving one agent episode</div><ol>
+<li><b>input:</b> episode id \(e\), shared prefix \(S\), task \(q\), cache time limit \(\tau_{\text{keep}}\)</li>
+<li>pick replica \(R_e\) by longest cached prefix (or a hash of \(e\)); remember it for the episode</li>
+<li><b>for</b> each call \(i = 1, 2, \dots\)</li>
+<li>&nbsp;&nbsp;send the full prompt \(T_i\) to \(R_e\); the engine matches the cached prefix and prefills only the new tokens <span class="c">// formula (141.2)</span></li>
+<li>&nbsp;&nbsp;decode \(o\) tokens; their KV stays in the cache</li>
+<li>&nbsp;&nbsp;<b>if</b> the output is a tool call: pin the cache for at most \(\tau_{\text{keep}}\); if memory is short, offload it to CPU instead of freeing it</li>
+<li>&nbsp;&nbsp;run the tool (in parallel with other tools when they do not depend on each other); append its result to the prompt</li>
+<li>&nbsp;&nbsp;<b>if</b> the output is a final answer: release the cache (keep only the shared prefix)</li></ol></div>
+<h3>Multi-model pipelines</h3>
+<p>Many products are not one model but a chain: a small router or classifier, an embedding model and a reranker for retrieval, the main LLM, a guard model that checks the answer, and sometimes an LLM judge. Two rules organize the cost. <b>Latency adds along the critical path</b>, so a 30 ms guard model before the main call adds 30 ms to TTFT for everybody; run checks in parallel with the main call when you can, or stream the answer and check it in pieces. <b>GPU cost adds over all models</b>, weighted by how often each one runs: a router that sends 70% of easy queries to a small model (a model cascade, <a href="../inference/output-organization-skeleton-of-thought-apar-sglang.html">session 91</a>) can save more than any kernel optimization. Small models in the chain (embedders, rerankers, guards) usually share one GPU, since one of them alone would leave it mostly idle. [Likely]</p>
+
+<h2>Scenario 2: long context</h2>
+<p>Llama 3.1 8B accepts 131,072 tokens. [Certain] What does it cost to use them? Three things change as the context \(T\) grows: prefill compute, KV memory, and the bytes each decode step reads.</p>
+<h3>Prefill: the quadratic term</h3>
+<p>The linear layers cost \(2N\) FLOPs per token. Causal attention adds, per layer, about \(2 d T^2\) FLOPs (the score matrix \(QK^\top\) and the product with \(V\), each \(2dT^2\), halved by the causal mask):</p>
+<div class="eq">\[ F_{\text{prefill}}(T) = 2NT + 2LdT^2, \qquad \text{attention is larger when } T \gt T^{*} = \frac{N}{Ld} \tag{141.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N\)</dt><dd>parameters (8.03 billion)</dd>
+<dt>\(L\), \(d\)</dt><dd>layers (32) and model width (4096); \(L \cdot d = 131{,}072\)</dd>
+<dt>\(T^{*}\)</dt><dd>the context length where attention FLOPs equal the FLOPs of all linear layers</dd></dl>
+<p>For our model \(T^{*} = 8.03 \times 10^9 / 131{,}072 = 61{,}264\) tokens. Below about 8K tokens attention is a small part of prefill (12% at 8,192); at 32K it is 35%; at 128K it is 68%. On an H100 at \(u = 50\%\), the TTFT of a single prompt is 0.30 s at 8K, 1.63 s at 32K and 13.4 s at 128K. On an L4 in FP8 the 128K prefill takes 54.6 s.</p>
+<p>A check against a real measurement: for a 1M-token prompt, formula (141.4) gives \(2.78 \times 10^{17}\) FLOPs. On an A100 (312 TFLOP/s dense BF16) at 50% that is 29.7 minutes. The MInference paper reports that an 8B model takes 30 minutes to prefill 1M tokens on one A100. [Certain] The simple formula is in the right range.</p>
+<h3>Memory: the KV cache per sequence</h3>
+<p>The KV cache of one sequence is \(T \cdot s_{\text{kv}}\). At 128K tokens in BF16 that is 17.2 GB (16 GiB): more than the 16.06 GB of weights. An H100 has room for only 3 such sequences, an L4 with FP8 weights and an FP8 cache for 1. Long context is first a <b>memory-size</b> problem: it kills batching, and without batching each decode step reads all weights for one user.</p>
+<h3>Decode: bytes per step, and what sparse attention saves</h3>
+<p>Each decode step reads the weights once and the KV cache of every sequence in the batch. <b>Sparse attention</b> methods for decoding read only a budget of \(K\) tokens per sequence. Quest, for example, keeps the whole cache in memory but, for each query, loads only the top-\(K\) pages whose keys can matter most; it reports up to 2.23 times faster self-attention. [Certain] With a batch of \(B\) sequences:</p>
+<div class="eq">\[ \underbrace{M_W + B\,T\,s_{\text{kv}}}_{\text{memory held}} \le 0.9\,C, \qquad Q_{\text{step}} = M_W + B \cdot \min(T, K) \cdot s_{\text{kv}} \tag{141.5} \]</div>
+<p>The second formula is the bytes read per step. The first is unchanged: a query-aware method like Quest saves <b>bandwidth, not capacity</b>. Methods that <b>evict</b> tokens (StreamingLLM keeps the first tokens and a recent window; H2O and SnapKV keep the tokens that received the most attention) save capacity too, but a dropped token can never be read again. [Certain] For prefill, MInference finds sparse patterns in each head and reports up to 10 times faster prefill at 1M tokens on an A100. [Certain] Other tools for long context are FP8 or 4-bit KV caches (<a href="../inference/kv-cache-quantization-kivi-and-kvquant.html">session 110</a>), prompt compression (<a href="../inference/prompt-pruning-selective-context-llmlingua-longllmlingua.html">session 88</a>), and context parallelism such as Ring Attention, which spreads one long prefill over several GPUs (<a href="../pretraining/pipeline-context-and-expert-parallelism-3d-and.html">session 49</a>).</p>
+<div class="worked"><div class="wt">Worked example: 128K tokens on an H100</div>
+<p>One sequence: decode step \(= 1 + (16.06 + 17.18)/(0.8 \times 3.35)\) ms \(= 13.4\) ms. With a sparse budget \(K = 4{,}096\): \(1 + (16.06 + 0.54)/2.68 = 7.2\) ms, a 1.9 times speed-up. With the full batch of 3 sequences: 26.2 ms without sparsity and 7.6 ms with it, 3.5 times. The more of the step is KV reading, the more sparse decoding helps.</p></div>
+<figure class="fig" id="cp-long"><div class="fig-body">
+<div class="controls"><span class="seg" id="cp-long-g"><button type="button" data-v="hb" aria-pressed="true">H100, BF16 weights</button><button type="button" data-v="l4f" aria-pressed="false">L4, FP8 weights</button></span>
+<span class="seg" id="cp-long-kvf"><button type="button" data-v="2" aria-pressed="true">KV in BF16</button><button type="button" data-v="1" aria-pressed="false">KV in FP8</button></span>
+<span class="seg" id="cp-long-k"><button type="button" data-v="0" aria-pressed="true">Full attention</button><button type="button" data-v="2048" aria-pressed="false">K = 2,048</button><button type="button" data-v="4096" aria-pressed="false">K = 4,096</button><button type="button" data-v="8192" aria-pressed="false">K = 8,192</button></span></div>
+<div class="cp-grid" style="margin-top:8px">
+<label for="cp-long-t">Context \(T\)</label><input type="range" id="cp-long-t" min="10" max="17" step="0.25" value="15"><output id="cp-long-tv"></output></div>
+<div class="scroll-x"><svg id="cp-long-svg" viewBox="0 0 640 260" role="img" aria-label="Prefill time against context length on a log scale, split into linear layers and attention, and a bar of GPU memory"></svg></div>
+<div class="cp-leg"><span style="--c:var(--q)">prefill time, linear layers only</span><span style="--c:var(--k)">prefill time, with attention</span><span style="--c:var(--v)">KV cache of the sequences that fit</span><span style="--c:var(--muted)">weights</span></div>
+<div class="readout" id="cp-long-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Long context for Llama 3.1 8B. Left: TTFT of one prompt of length \(T\) from formula (141.4), on log axes, with the crossover \(T^{*}\) marked. Right: GPU memory with the largest batch of length-\(T\) sequences that fits (141.5). The readout gives the decode step for that batch, with and without a sparse budget \(K\).</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>On log axes a linear cost is a straight line with slope 1 and a quadratic cost has slope 2. The “with attention” curve leaves the “linear layers only” line near \(T^{*}\) and becomes twice as steep. Move \(T\) from 1K to 128K: TTFT grows by much more than 128 times, and the number of sequences that fit falls from hundreds to a few. Then switch the KV cache to FP8: capacity doubles. Choose a sparse budget: capacity does not change, but the decode step gets shorter once \(T\) is larger than \(K\).</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>A single 128K-token prefill holds the GPU for seconds. In a shared server it delays every other user’s next token unless the scheduler cuts it into chunks (<a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>) or sends it to separate prefill GPUs (<a href="../inference/distributed-serving-and-prefill-decode-disaggregation.html">session 137</a>). Many teams run long-context traffic on its own pool of replicas with its own SLO. [Likely]</aside>
+
+<h2>Scenario 3: edge devices</h2>
+<p>On a laptop or a phone the batch is 1, so every decode step reads all the weights. The memory bandwidth sets a hard upper bound on speed:</p>
+<div class="eq">\[ \text{tokens per second} \;\le\; \frac{\eta \cdot \text{BW}}{M_W} \tag{141.6} \]</div>
+<p>Take a device with 100 GB/s of memory bandwidth (an example value; phones and laptops range widely). Our 8B model in 4-bit weights is about 4.0 GB, so at \(\eta = 0.8\) it runs at most 20 tokens per second; a 3B model in 4 bits (1.5 GB) at most 53. Prefill on the device is compute-bound: at 10 TFLOP/s of usable compute (again an example), a 2,000-token prompt of the 8B model takes \(2 \cdot 8.03 \times 10^9 \cdot 2000 / 10^{13} = 3.2\) s. That is why on-device assistants keep prompts short, cache the system prompt, and use 1B to 3B models. The survey notes that a performance gap still exists between small and large models, and points to cloud–edge collaboration: easy requests on the device, hard ones in the cloud. [Certain] Power matters too: an L4 uses at most 72 W, a phone a few watts. <a href="../inference/hardware-accelerators-and-edge-deployment.html">Session 140</a> covers the runtimes (llama.cpp, MLX) and the hardware.</p>
+
+<h2>From traffic to GPUs</h2>
+<p>Now the main question. A <b>traffic description</b> has four parts: the arrival rate \(\lambda\) (requests per second at peak), the distribution of prompt lengths \(n_{\text{in}}\), the distribution of output lengths \(n_{\text{out}}\), and the latency targets (an SLO such as “p95 TTFT under 1 s and TPOT under 50 ms”, <a href="../inference/scheduling-fcfs-preemption-fairness-and-slos.html">session 136</a>). We use the mean lengths here; later we discuss tails.</p>
+<h3>Work per request</h3>
+<p>Each request needs prefill and decode FLOPs, and it holds KV memory while it runs. With \(\bar L = n_{\text{in}} + n_{\text{out}}/2\), the average context during decoding:</p>
+<div class="eq">\[ C_{\text{req}} = 2N\,(n_{\text{in}} + n_{\text{out}}) + 2Ld\,\big(n_{\text{in}}^2 + 2\, n_{\text{out}}\, \bar L\big) \tag{141.7} \]</div>
+<p>The first term is the linear layers for every token; the second is attention (prefill from (141.4), and \(4Ld\) FLOPs per decoded token per token of context). For \(n_{\text{in}} = 2{,}000\) and \(n_{\text{out}} = 300\): \(C_{\text{req}} = 38.3\) TFLOP, of which prefill is 33.2 TFLOP. Prompts dominate the compute even though decode dominates the wall-clock time.</p>
+<h3>One GPU under load</h3>
+<p>Assume continuous batching with chunked prefill (<a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>): in each step of length \(t\), the GPU decodes one token for each of the \(B\) running requests and also processes a chunk of waiting prompt tokens. In a steady state at rate \(\lambda\) per GPU, Little’s law (<a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>) gives \(B = \lambda\, n_{\text{out}}\, t\): requests decode for \(n_{\text{out}}\) steps each. The FLOPs done in one step are \(\lambda\, t\, C_{\text{req}}\) (one second’s work times the step length). The step costs the larger of its memory time and its compute time, as in (133.4):</p>
+<div class="eq">\[ t = t_0 + \max\!\left( \frac{M_W + B\,\bar L\, s_{\text{kv}}}{\eta\,\text{BW}},\; \frac{\lambda\, t\, C_{\text{req}}}{u\,F} \right) \quad\Longrightarrow\quad \text{TPOT}(\lambda) = \max\!\left( \frac{t_0 + M_W/(\eta\,\text{BW})}{1 - b},\; \frac{t_0}{1 - c} \right) \tag{141.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(b = \lambda\, n_{\text{out}}\, \bar L\, s_{\text{kv}} / (\eta\,\text{BW})\)</dt><dd>the share of each step spent reading KV cache: it grows with load</dd>
+<dt>\(c = \lambda\, C_{\text{req}} / (u F)\)</dt><dd>the compute utilization: the share of the GPU’s usable FLOP/s that the traffic needs</dd>
+<dt>\(t_0 + M_W/(\eta\,\text{BW})\)</dt><dd>the TPOT floor: the time to read the weights once, which no batch size can beat</dd></dl>
+<p>To get the closed form, put \(B = \lambda n_{\text{out}} t\) into the step-time formula. Each branch of the max is then linear in \(t\) and has its own solution, and the larger one is the answer. Three things can stop a GPU, and each gives a limit on \(\lambda\):</p>
+<ul><li><b>Bandwidth</b>: the first branch reaches the TPOT target \(\tau\). This happens early when the TPOT floor is already close to \(\tau\), as on an L4.</li>
+<li><b>Compute</b>: \(c\) approaches 1. Then TPOT shoots up (the step must also carry more and more prompt chunks), which is the sharp knee you saw in session 81.</li>
+<li><b>KV memory</b>: the running requests \(B\) need \(B\,(n_{\text{in}} + n_{\text{out}})\, s_{\text{kv}}\) bytes, which must fit next to the weights.</li></ul>
+<p>The <b>capacity</b> of one GPU for this traffic is the largest rate that respects all three:</p>
+<div class="eq">\[ \mu^{*} = \max\Big\{ \lambda \;:\; \text{TPOT}(\lambda) \le \tau \ \text{ and } \ \lambda\, n_{\text{out}}\, \text{TPOT}(\lambda)\, (n_{\text{in}} + n_{\text{out}})\, s_{\text{kv}} \le 0.9\,C - M_W \Big\} \tag{141.9} \]</div>
+<p>Both conditions get harder as \(\lambda\) grows, so \(\mu^{*}\) is found by bisection in a few microseconds. Then the plan and the price follow:</p>
+<div class="eq">\[ R = \left\lceil \frac{\lambda}{h\, \mu^{*}} \right\rceil, \qquad \$ \text{ per } 10^6 \text{ output tokens} = \frac{R \cdot p}{3600\, \lambda\, n_{\text{out}}} \cdot 10^6 \;\ge\; \frac{p}{3600\, \mu^{*} n_{\text{out}}} \cdot 10^6 \tag{141.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(h\)</dt><dd>headroom: plan each GPU for at most a share \(h\) (for example 0.8) of its capacity, to absorb bursts and long-tail requests</dd>
+<dt>\(R\)</dt><dd>number of GPUs (replicas of the model)</dd>
+<dt>\(p\)</dt><dd>price of one GPU-hour in dollars</dd>
+<dt>right side</dt><dd>the cost at full load (\(\lambda = \mu^{*}\) per GPU): the best this hardware can do for this traffic</dd></dl>
+<figure class="fig" id="cp-knee"><div class="fig-body">
+<div class="controls"><span class="seg" id="cp-knee-g"><button type="button" data-v="l4b" aria-pressed="false">L4 BF16</button><button type="button" data-v="l4f" aria-pressed="false">L4 FP8</button><button type="button" data-v="hb" aria-pressed="true">H100 BF16</button><button type="button" data-v="hf" aria-pressed="false">H100 FP8</button></span></div>
+<div class="cp-grid" style="margin-top:8px">
+<label for="cp-knee-i">Prompt \(n_{\text{in}}\)</label><input type="range" id="cp-knee-i" min="0" max="10" step="1" value="4"><output id="cp-knee-iv"></output>
+<label for="cp-knee-o">Output \(n_{\text{out}}\)</label><input type="range" id="cp-knee-o" min="50" max="2000" step="50" value="300"><output id="cp-knee-ov"></output>
+<label for="cp-knee-s">TPOT target \(\tau\)</label><input type="range" id="cp-knee-s" min="10" max="200" step="5" value="50"><output id="cp-knee-sv"></output></div>
+<div class="scroll-x"><svg id="cp-knee-svg" viewBox="0 0 640 270" role="img" aria-label="TPOT against request rate per GPU, with the TPOT target, the KV memory limit and the capacity marked"></svg></div>
+<div class="cp-leg"><span style="--c:var(--tc)">TPOT from (141.8)</span><span style="--c:var(--bad)">TPOT target τ</span><span style="--c:var(--v)">KV memory full</span><span style="--c:var(--k)">capacity μ*</span></div>
+<div class="readout" id="cp-knee-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> How one GPU behaves under load, from formula (141.8), for Llama 3.1 8B (FP8 means FP8 weights, FP8 math and an FP8 KV cache). The x-axis is requests per second sent to this GPU. Capacity \(\mu^{*}\) (141.9) is where the curve crosses the target or the KV memory runs out, whichever comes first.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The curve starts at the TPOT floor (reading the weights once) and rises slowly while there is spare compute, then turns up sharply where compute runs out. Choose “L4 BF16”: the floor (67.9 ms) is above a 50 ms target, so no load at all is possible; raise the target to 100 ms and a small capacity appears, limited by KV memory. Choose “H100 BF16”: the floor is 7 ms and the curve stays flat until about 12.6 requests per second. Now make the prompt longer: the knee moves left, because each request needs more compute and more memory.</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 2: a capacity plan</div><ol>
+<li><b>input:</b> peak rate \(\lambda\), prompt and output lengths (mean and p95), targets \(\tau_{\text{TPOT}}\) and \(\tau_{\text{TTFT}}\), headroom \(h\), candidate configurations (GPU, weight and KV format), prices \(p\)</li>
+<li><b>for</b> each configuration</li>
+<li>&nbsp;&nbsp;<b>if</b> \(0.9\,C \lt M_W\): reject (weights do not fit; consider a smaller format or tensor parallelism)</li>
+<li>&nbsp;&nbsp;<b>if</b> the TPOT floor \(t_0 + M_W/(\eta\,\text{BW}) \ge \tau_{\text{TPOT}}\): reject <span class="c">// no batch size can help</span></li>
+<li>&nbsp;&nbsp;<b>if</b> the p95 prompt’s prefill time \(F_{\text{prefill}}/(uF) \gt \tau_{\text{TTFT}}\): reject, or plan chunked prefill on more GPUs</li>
+<li>&nbsp;&nbsp;\(\mu^{*} \leftarrow\) bisection on (141.9) <span class="c">// which limit binds: bandwidth, compute or KV</span></li>
+<li>&nbsp;&nbsp;\(R \leftarrow \lceil \lambda / (h \mu^{*}) \rceil\); cost \(\leftarrow R\,p\) per hour, and per million tokens by (141.10)</li>
+<li>pick the cheapest configuration that passes; then <b>measure</b> it with a load test at \(\lambda\) and correct \(u\), \(\eta\), \(t_0\)</li></ol></div>
+
+<h2>Worked example: one model on an L4 and an H100</h2>
+<p>The traffic: a chat assistant with \(\lambda = 8\) requests per second at peak, prompts of 2,000 tokens (system prompt, history and retrieved documents), answers of 300 tokens, and an SLO of TPOT at most 50 ms (20 tokens per second per user, faster than people read). Headroom \(h = 0.8\). For prices we use round <b>example</b> values of $0.80 per hour for an L4 and $3.00 per hour for an H100. These are assumptions for the calculation, not quotes: real prices differ by provider, region and contract, and change often. Put your own prices into Figure 4.</p>
+<div class="worked"><div class="wt">Four configurations, step by step</div>
+<p><b>L4, BF16 weights.</b> The weights fit (16.06 of 21.6 usable GB), but the TPOT floor is \(1 + 16.06/(0.8 \times 0.3) = 67.9\) ms. That is above 50 ms: <b>this configuration cannot meet the SLO at any load</b>. If the product accepted 100 ms, one L4 would carry 0.68 requests per second, limited by KV memory (only 5.5 GB are left for the cache); 15 L4s would be needed.</p>
+<p><b>L4, FP8.</b> The floor halves to 34.5 ms. The bandwidth limit binds: \(\mu^{*} = (1 - 34.46/50) \cdot 0.8 \cdot 300 \times 10^9 / (300 \cdot 2{,}150 \cdot 65{,}536) = 1.76\) requests per second, or 529 output tokens per second. (The compute limit would be 3.1, the KV limit about 6.) Then \(R = \lceil 8 / (0.8 \cdot 1.76) \rceil = \lceil 5.67 \rceil = 6\) GPUs, $4.80 per hour. TTFT is at least 274 ms.</p>
+<p><b>H100, BF16.</b> The floor is 7.0 ms, far below the target. Here compute and memory run out together: at 12.6 requests per second the compute utilization \(c\) reaches 0.98 and the 186 running requests fill the 55.9 GB of KV memory. \(\mu^{*} = 12.64\) requests per second, 3,792 output tokens per second. \(R = \lceil 8 / 10.1 \rceil = 1\) GPU, $3.00 per hour. At the planned load the TPOT is only 9.4 ms with about 22 requests running, and TTFT is at least 67 ms.</p>
+<p><b>H100, FP8.</b> Twice the compute and half the memory per token: \(\mu^{*} = 25.3\) requests per second. Still 1 GPU, now running at 32% of capacity.</p>
+<p><b>Cost per million output tokens</b> at full load (the right side of 141.10): L4 FP8 \(0.80 / (3600 \cdot 529) \times 10^6 = \$0.42\); H100 BF16 $0.22; H100 FP8 $0.11. As planned for 8 requests per second (the left side): L4 FP8 $0.56, H100 BF16 or FP8 $0.35. The H100 costs 3.75 times more per hour but carries 7.2 times more traffic of this kind, so <b>per token the expensive GPU is cheaper</b>.</p>
+<p><b>When the L4 wins.</b> GPUs come in whole units. At low traffic, one L4 ($0.80) is enough where an H100 ($3.00) would be mostly idle: at 0.5 requests per second the cost per million output tokens is $1.48 on the L4 and $5.56 on the H100. With these prices the L4 FP8 plan is cheaper up to about 4.2 requests per second (3 L4s for $2.40 per hour), and the H100 is cheaper above that. The L4 also uses 72 W and fits in small servers. Its users, though, see a TTFT 4 times longer and a TPOT near 45 ms instead of 9.</p>
+<p><b>Long prompts change everything.</b> With 32,000-token prompts and 500-token answers (document QA), one H100 in BF16 carries only 0.60 requests per second, TTFT is at least 1.6 s, and the full-load cost rises to $2.76 per million output tokens, 12.5 times the chat case. The L4 FP8 needs 6.5 s just for one prefill.</p></div>
+<figure class="fig" id="cp-plan"><div class="fig-body">
+<div class="cp-grid">
+<label for="cp-plan-l">Peak rate \(\lambda\) (req/s)</label><input type="range" id="cp-plan-l" min="0.5" max="100" step="0.5" value="8"><output id="cp-plan-lv"></output>
+<label for="cp-plan-i">Prompt \(n_{\text{in}}\)</label><input type="range" id="cp-plan-i" min="0" max="10" step="1" value="4"><output id="cp-plan-iv"></output>
+<label for="cp-plan-o">Output \(n_{\text{out}}\)</label><input type="range" id="cp-plan-o" min="50" max="2000" step="50" value="300"><output id="cp-plan-ov"></output>
+<label for="cp-plan-s">TPOT target \(\tau\) (ms)</label><input type="range" id="cp-plan-s" min="10" max="200" step="5" value="50"><output id="cp-plan-sv"></output>
+<label for="cp-plan-h">Headroom \(h\)</label><input type="range" id="cp-plan-h" min="0.5" max="1" step="0.05" value="0.8"><output id="cp-plan-hv"></output>
+<label for="cp-plan-pl">L4 price ($/h)</label><input type="range" id="cp-plan-pl" min="0.2" max="2" step="0.05" value="0.8"><output id="cp-plan-plv"></output>
+<label for="cp-plan-ph">H100 price ($/h)</label><input type="range" id="cp-plan-ph" min="1" max="10" step="0.25" value="3"><output id="cp-plan-phv"></output></div>
+<div class="scroll-x"><table class="cp-t" id="cp-plan-tab"></table></div>
+<div class="scroll-x"><svg id="cp-plan-svg" viewBox="0 0 640 200" role="img" aria-label="Cost per million output tokens for four configurations, at full load and as planned"></svg></div>
+<div class="cp-leg"><span style="--c:var(--q)">$ per 1M output tokens at full load</span><span style="--c:var(--k)">$ per 1M output tokens as planned (whole GPUs)</span></div>
+<div class="readout" id="cp-plan-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A capacity planner for Llama 3.1 8B, using Algorithm 2 with formulas (141.7) to (141.10). The green row is the cheapest configuration that meets the TPOT target. Prices are example inputs; set your own.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>At the defaults the H100 plan is cheapest. Lower the rate to 2 requests per second: one H100 is mostly idle and the L4 FP8 plan wins. Raise the rate to 50: the H100 wins clearly, and FP8 halves the number of GPUs. Make the prompt 32K: every configuration gets much more expensive, and the L4 drops out on latency. Finally loosen the TPOT target to 100 ms: L4 BF16 becomes possible, and the L4 FP8 capacity roughly doubles.</p></details></figure>
+<h3>What the simple model leaves out</h3>
+<p>Formula (141.8) uses mean lengths and a steady stream. Real traffic has <b>tails</b>: if 5% of prompts are 30K tokens, they take most of the prefill compute and most of the KV memory, so plan with the p95 lengths for memory and check TTFT with the longest prompts. It has <b>bursts</b>, which is what the headroom \(h\) is for (session 81 showed how sharp the knee is). Prefix caching lowers the effective \(n_{\text{in}}\) in (141.7): with a 50% hit rate, chat traffic with long shared system prompts needs much less compute. Speculative decoding lowers TPOT at small batches but helps less when the GPU is already compute-bound (<a href="../inference/speculative-decoding-1-the-math.html">session 128</a>). And a model that does not fit one GPU needs tensor parallelism, which changes \(F\), \(\text{BW}\) and \(C\) (all multiplied by the number of GPUs) and adds communication time (<a href="../inference/distributed-serving-and-prefill-decode-disaggregation.html">session 137</a>). Always end a plan with a load test.</p>
+
+<h2>The code</h2>
+<p>Part 1 runs a small agent episode on a tiny random causal model with a hand-written KV cache, and checks that prefilling only the new tokens gives exactly the same logits as recomputing the whole history. Part 2 is the planner of (141.8) to (141.10); it prints the numbers of the worked example.</p>
+<pre class="code"><span class="kw2">import</span> math, torch
+torch.manual_seed(0)
+torch.set_default_dtype(torch.float64)
+
+<span class="cm"># ---- Part 1: an agent episode on a tiny causal model, with and without a prefix cache ----</span>
+V, D, H, NL = 50, 32, 4, 2
+emb = torch.randn(V, D) * 0.5
+Wqkv = [torch.randn(D, 3 * D) / math.sqrt(D) <span class="kw2">for</span> _ <span class="kw2">in</span> range(NL)]
+Wo = [torch.randn(D, D) / math.sqrt(D) <span class="kw2">for</span> _ <span class="kw2">in</span> range(NL)]
+head = torch.randn(D, V) / math.sqrt(D)
+
+<span class="kw2">def</span> forward(ids, cache=None):
+    <span class="cm">"""Run new tokens `ids` after the tokens already in `cache`. Returns logits and the new cache."""</span>
+    x = emb[ids]                                    <span class="cm"># (n, D)</span>
+    n, past = len(ids), (0 <span class="kw2">if</span> cache <span class="kw2">is</span> None <span class="kw2">else</span> cache[0][0].shape[1])
+    new_cache = []
+    <span class="kw2">for</span> l <span class="kw2">in</span> range(NL):
+        q, k, v = (x @ Wqkv[l]).split(D, dim=-1)
+        q, k, v = (t.view(n, H, D // H).transpose(0, 1) <span class="kw2">for</span> t <span class="kw2">in</span> (q, k, v))
+        <span class="kw2">if</span> cache <span class="kw2">is not</span> None:                       <span class="cm"># reuse the keys and values of earlier tokens</span>
+            k = torch.cat([cache[l][0], k], 1); v = torch.cat([cache[l][1], v], 1)
+        new_cache.append((k, v))
+        s = q @ k.transpose(1, 2) / math.sqrt(D // H)
+        qpos = torch.arange(past, past + n)[:, None]; kpos = torch.arange(past + n)[None, :]
+        s = s.masked_fill(kpos &gt; qpos, float("-inf"))
+        x = x + (torch.softmax(s, -1) @ v).transpose(0, 1).reshape(n, D) @ Wo[l]
+    <span class="kw2">return</span> x @ head, new_cache
+
+g = torch.Generator().manual_seed(1)
+system = torch.randint(0, V, (300,), generator=g)    <span class="cm"># shared system prompt + tool list</span>
+task = torch.randint(0, V, (20,), generator=g)
+k_calls, out_len, obs_len = 6, 15, 60
+
+history, cache = torch.cat([system, task]), None
+cost_full, cost_cached, fed = 0, 0, 0               <span class="cm"># tokens prefilled; tokens already in the cache</span>
+<span class="kw2">for</span> call <span class="kw2">in</span> range(k_calls):
+    <span class="cm"># (a) no cache: prefill the whole history again</span>
+    logits_full, _ = forward(history); cost_full += len(history)
+    <span class="cm"># (b) prefix cache: prefill only the tokens not yet in the cache</span>
+    new = history[fed:]
+    logits_c, cache = forward(new, cache); cost_cached += len(new); fed = len(history)
+    <span class="kw2">assert</span> torch.allclose(logits_full[-1], logits_c[-1], atol=1e-9)
+    <span class="cm"># greedy decode out_len tokens with the cache; decoded tokens stay in it</span>
+    tok = int(logits_c[-1].argmax()); gen = [tok]
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(out_len - 1):
+        lg, cache = forward(torch.tensor([tok]), cache); tok = int(lg[-1].argmax()); gen.append(tok)
+    fed += out_len - 1                              <span class="cm"># the last token has no KV yet</span>
+    obs = torch.randint(0, V, (obs_len,), generator=g)   <span class="cm"># the tool result</span>
+    history = torch.cat([history, torch.tensor(gen), obs])
+print("prefill tokens without cache:", cost_full, " with cache:", cost_cached,
+      f" ratio {cost_full / cost_cached:.2f}x")
+<span class="cm"># prefill tokens without cache: 3045  with cache: 625  ratio 4.87x</span>
+
+<span class="cm"># ---- Part 2: the capacity model (141.7)-(141.10) ----</span>
+N, L, d = 8.03e9, 32, 4096
+GPUS = {"L4 FP8":    dict(F=242e12, BW=300e9,  C=24e9, wb=1, kvb=1, price=0.80),
+        "H100 BF16": dict(F=989e12, BW=3.35e12, C=80e9, wb=2, kvb=2, price=3.00)}
+u, eta, t0, usable = 0.5, 0.8, 1e-3, 0.9
+
+<span class="kw2">def</span> tpot(g, lam, nin, nout):                      <span class="cm"># formula (141.8)</span>
+    s_kv = 2 * L * 8 * 128 * g["kvb"]; Lb = nin + nout / 2
+    C_req = 2 * N * (nin + nout) + 2 * L * d * (nin**2 + 2 * nout * Lb)   <span class="cm"># (141.7)</span>
+    b = lam * nout * Lb * s_kv / (eta * g["BW"]); c = lam * C_req / (u * g["F"])
+    <span class="kw2">if</span> b &gt;= 1 <span class="kw2">or</span> c &gt;= 1: <span class="kw2">return</span> math.inf, s_kv
+    <span class="kw2">return</span> max((t0 + N * g["wb"] / (eta * g["BW"])) / (1 - b), t0 / (1 - c)), s_kv
+
+<span class="kw2">def</span> max_rate(g, nin, nout, tau):                  <span class="cm"># formula (141.9), by bisection</span>
+    free = g["C"] * usable - N * g["wb"]
+    <span class="kw2">def</span> ok(lam):
+        t, s_kv = tpot(g, lam, nin, nout)
+        <span class="kw2">return</span> t &lt;= tau <span class="kw2">and</span> lam * nout * t * (nin + nout) * s_kv &lt;= free
+    lo, hi = 0.0, 1e4
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(100):
+        mid = (lo + hi) / 2; lo, hi = (mid, hi) <span class="kw2">if</span> ok(mid) <span class="kw2">else</span> (lo, mid)
+    <span class="kw2">return</span> lo
+
+lam, nin, nout, tau, headroom = 8, 2000, 300, 0.050, 0.8
+<span class="kw2">for</span> name, g <span class="kw2">in</span> GPUS.items():
+    mu = max_rate(g, nin, nout, tau)
+    R = math.ceil(lam / (headroom * mu))            <span class="cm"># formula (141.10)</span>
+    usd_full = g["price"] / 3600 / (mu * nout) * 1e6
+    print(f"{name:9s}  max {mu:5.2f} req/s per GPU  -&gt; {R} GPU(s), "
+          f"${R * g['price']:.2f}/h, ${usd_full:.2f} per 1M output tokens at full load")
+<span class="cm"># L4 FP8     max  1.76 req/s per GPU  -&gt; 6 GPU(s), $4.80/h, $0.42 per 1M output tokens at full load</span>
+<span class="cm"># H100 BF16  max 12.64 req/s per GPU  -&gt; 1 GPU(s), $3.00/h, $0.22 per 1M output tokens at full load</span></pre>
+<p>In the episode, the cached run prefills the 320-token start once and then \(60 + 1\) tokens per call (the tool result, plus the last generated token, whose KV is written only when it is fed back). That is \(320 + 5 \cdot 61 = 625\) tokens against \(6 \cdot 320 + 75 \cdot 15 = 3{,}045\), exactly formula (141.2) with \(r = 61\). The assertion shows that the cache changes the cost, never the result.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Scenario</th><th>What it stresses</th><th>What helps most</th></tr></thead><tbody>
+<tr><td>Coding and research agents (SWE-bench style, tool loops)</td><td>Prefill of a growing history; KV memory held during tool calls; sequential latency</td><td>Prefix caching with cache-aware routing, KV offload to CPU or SSD, parallel tool calls</td></tr>
+<tr><td>Chat with RAG</td><td>Long prompts (retrieved documents) with short answers: compute in prefill</td><td>Prefix caching of the system prompt, prompt compression, chunked prefill, FP8</td></tr>
+<tr><td>Long-document QA, contract review, codebase questions</td><td>\(T^2\) prefill, KV capacity, low batch</td><td>Separate long-context pool, FP8 KV cache, sparse prefill (MInference) and decode (Quest), context parallelism</td></tr>
+<tr><td>Video understanding and Video-RAG</td><td>Very long visual contexts: for example 10 minutes at 1 frame per second and 196 tokens per frame is 117,600 tokens</td><td>Fewer frames or token merging before the LLM, retrieval of key moments instead of the whole video, then the long-context tools above</td></tr>
+<tr><td>Video retrieval and classification at scale (embeddings, fingerprinting, action recognition)</td><td>Throughput of an encoder, no decode at all</td><td>Large batches, offline scheduling, cheapest GPU per frame; the decode-side limits here do not apply</td></tr>
+<tr><td>On-device assistants</td><td>Memory size and bandwidth at batch 1 (141.6), power</td><td>1B to 3B models in 4-bit, short prompts, cached system prompt, cloud fallback</td></tr>
+<tr><td>Offline batch jobs (nightly summarization, labeling, synthetic data)</td><td>Only cost; no TPOT target</td><td>Largest batch that fits, cheapest $ per token (141.10, right side), spot or idle capacity</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Sizing from tokens per second alone.</b> “The engine does 4,000 tokens/s, we need 2,400, so one GPU” ignores the latency target, the prompt length and the KV memory. Use all three limits (141.9).</li>
+<li><b>Using a GPU whose TPOT floor is above the target.</b> No batch size and no number of replicas can beat \(t_0 + M_W/(\eta\,\text{BW})\). Check the floor first; then quantize the weights or pick a faster GPU.</li>
+<li><b>Planning with mean lengths only.</b> A few very long prompts can take most of the compute and memory. Check p95 and maximum lengths for TTFT and for KV memory.</li>
+<li><b>Random load balancing for agents.</b> It spreads the calls of one episode over replicas and throws away the prefix cache. Route by episode or by longest cached prefix.</li>
+<li><b>Expecting sparse attention to fit more users.</b> Query-aware methods like Quest only cut the bytes read; the full cache still sits in memory. To fit more sequences, compress (FP8, INT4 KV) or evict.</li>
+<li><b>Planning at 100% of capacity.</b> The knee of Figure 3 is sharp; plan with headroom (\(h \approx 0.7\) to 0.8) and autoscale on queue length (<a href="../inference/the-serving-stack-and-the-life-of.html">session 133</a>).</li>
+<li><b>Comparing GPUs by price per hour.</b> Compare by price per million tokens at your traffic and SLO; and remember that GPUs come in whole units, so at low traffic the smaller GPU can win.</li>
+<li><b>Treating the model’s outputs as the only tokens.</b> In agents and RAG, input tokens are often many times the output tokens (44 times in the agent example without a cache), and they dominate compute. Count both.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>An agent makes 10 LLM calls per task. Why can it cost far more than 10 chat requests, and how do you fix it?<span class="lvl">core</span></summary><div class="ans">Each call’s prompt contains the whole history, so without caching the prefill tokens grow like \(k(S+q) + (o+r)k(k-1)/2\) (141.2), quadratic in the number of calls. With a prefix cache that keeps the episode’s KV between calls, each call prefills only the new tool output, so the cost becomes linear. In the example of this session (10 calls, 3,000-token prefix) that is 65,750 versus 8,600 tokens. To make it work in production you need cache-aware routing (same replica for the episode), a policy for keeping or offloading the cache during tool calls, and caching of the shared system prompt across users.</div></details>
+<details class="qa"><summary>At what context length does attention dominate prefill compute for Llama 3.1 8B?<span class="lvl">core</span></summary><div class="ans">Linear layers cost \(2NT\), causal attention about \(2LdT^2\). They are equal at \(T^{*} = N/(Ld) = 8.03 \times 10^9 / (32 \cdot 4096) \approx 61{,}000\) tokens. Below 8K attention is around 12% of prefill FLOPs; at 128K it is about 68%. In practice attention kernels run at lower efficiency than big GEMMs, so the time share of attention is often higher than the FLOP share. [Likely]</div></details>
+<details class="qa"><summary>Does sparse attention let you serve more long-context users at once?<span class="lvl">advanced</span></summary><div class="ans">It depends on the type. Query-aware sparse decoding (Quest) keeps the full KV cache and only reads the top-\(K\) pages per query: it shortens decode steps (less bandwidth) but does not free memory, so the number of sequences that fit is unchanged (141.5). Eviction methods (StreamingLLM, H2O, SnapKV) drop tokens and do free memory, at the risk of losing information that a later question needs. Compression of the cache (FP8, INT4) frees memory without dropping tokens. Sparse prefill (MInference) reduces TTFT, not memory.</div></details>
+<details class="qa"><summary>We expect 8 requests per second, 2K-token prompts, 300-token answers, TPOT ≤ 50 ms, with an 8B model. How many GPUs?<span class="lvl">core</span></summary><div class="ans">Compute the work per request (about 38 TFLOP, mostly prefill) and the KV per request (about 0.3 GB in BF16). For each GPU, check the TPOT floor (weights read time), then find the largest rate where TPOT stays under target and the running batch fits in memory. With the assumptions of this session: one H100 in BF16 carries about 12.6 requests per second (compute and KV run out together), so with 80% headroom one H100 is enough; an L4 in BF16 cannot meet 50 ms at all (floor 68 ms), and in FP8 it carries about 1.8 requests per second, so 6 L4s. Then validate with a load test and correct the efficiency assumptions.</div></details>
+<details class="qa"><summary>Why can an L4 not serve an 8B BF16 model at 50 ms per token, even for one user?<span class="lvl">basic</span></summary><div class="ans">Each decode step must read all 16 GB of weights. At 300 GB/s peak, and about 80% of that in practice, this takes about 67 ms, plus overhead. Batching does not help the per-user TPOT, it only shares that read among users. The fixes are smaller weights (FP8 halves the floor to about 34 ms, INT4 to about 18 ms), a faster GPU, or splitting the model over several GPUs.</div></details>
+<details class="qa"><summary>An H100 costs about four times more per hour than an L4. How can it be cheaper per token?<span class="lvl">core</span></summary><div class="ans">Because it carries more than four times the traffic. It has about 11 times the bandwidth, 8 times the compute and 3.3 times the memory, so it reaches much larger batches before any limit binds. For 2K/300 chat traffic at 50 ms TPOT the model of this session gives 12.6 requests per second on an H100 BF16 against 1.76 on an L4 FP8, 7.2 times more, while the example price ratio is 3.75. Cost per token is price per hour divided by tokens per hour, not price per hour alone.</div></details>
+<details class="qa"><summary>When would you still choose the smaller GPU?<span class="lvl">advanced</span></summary><div class="ans">When traffic is low, because GPUs come in whole units: at 0.5 requests per second one L4 is enough and one H100 would be mostly idle, so the L4 is several times cheaper per token. Also for power- or space-limited sites (an L4 is 72 W), for many small models that each need their own GPU, and for regions where large GPUs are not available. You pay with longer TTFT and TPOT, so the SLO must allow it.</div></details>
+<details class="qa"><summary>Which of bandwidth, compute and KV memory limits a GPU, and when?<span class="lvl">advanced</span></summary><div class="ans">Bandwidth binds when the time to read the weights is already close to the TPOT target, as on an L4: little room is left for KV reads, so the batch stays small. Compute binds when prompts are long and the GPU is fast and large, as on an H100 with 2K prompts: prefill chunks fill the steps and TPOT shoots up near full utilization. KV memory binds with long contexts or long outputs: the running batch \(B = \lambda n_{\text{out}} \text{TPOT}\) times the tokens per request no longer fits. Formula (141.8) shows the first two, and the memory condition in (141.9) the third.</div></details>
+<details class="qa"><summary>How fast can a 7B–8B model decode on a laptop?<span class="lvl">basic</span></summary><div class="ans">At batch 1 every token reads all the weights, so the speed is at most usable bandwidth divided by model size (141.6). In 4-bit an 8B model is about 4 GB; on a device with 100 GB/s at 80% efficiency that is at most 20 tokens per second. Prefill is compute-bound on such devices and can take seconds for a few thousand tokens. That is why on-device models are small and quantized and prompts are kept short.</div></details>
+<details class="qa"><summary>A few users send 100K-token prompts and everybody else’s latency gets worse. What do you do?<span class="lvl">advanced</span></summary><div class="ans">A 100K prefill holds an H100 for many seconds and takes a large part of its KV memory. Options: chunked prefill with a token budget so decodes keep running; a limit on prompt tokens in flight; a separate pool of replicas (or prefill–decode disaggregation) for long-context traffic with its own SLO; FP8 KV cache to fit more; prefix caching if the same document is asked about repeatedly; and sparse prefill or prompt compression to cut the prefill work. Charging long prompts separately is also a product decision.</div></details>
+<details class="qa"><summary>How do the latency and the cost of a multi-model pipeline combine?<span class="lvl">basic</span></summary><div class="ans">Latency adds along the critical path: a router, a retriever, a reranker, the main model and a guard model in sequence each add their time to TTFT, so run independent steps in parallel and keep small models fast. Cost adds over all models, weighted by how often each is called: a router that sends easy requests to a small model can reduce the main model’s load a lot. Small models are often packed together on one GPU.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>An agent episode has \(k = 20\) calls, \(S = 4{,}000\), \(q = 100\), \(o = 100\), \(r = 400\). How many tokens are prefilled without a cache and with an episode cache? What is the ratio?</li>
+<li>Compute \(T^{*}\) for a model with \(N = 70 \times 10^9\), \(L = 80\) and \(d = 8192\). Is attention a large part of prefill at 32K tokens?</li>
+<li>How many 64K-token sequences fit on an H100 next to Llama 3.1 8B in BF16, with a BF16 KV cache? With an FP8 KV cache?</li>
+<li>What is the TPOT floor of Llama 3.1 8B with INT4 weights (0.5 bytes per parameter, ignore scales) on an L4, with the assumptions of this session?</li>
+<li>One GPU costs $2.00 per hour and carries 2,000 output tokens per second at full load. What is the cost per million output tokens? What is it if the traffic only fills 40% of the GPU?</li>
+<li>In Figure 4, find the smallest request rate at which the H100 BF16 plan becomes cheaper than the L4 FP8 plan with the default prices. Explain the result with formula (141.10).</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. No cache: \(20 \cdot 4{,}100 + 500 \cdot 190 = 82{,}000 + 95{,}000 = 177{,}000\). Cache: \(4{,}100 + 19 \cdot 400 = 11{,}700\). Ratio about 15.1: longer episodes gain more. 2. \(T^{*} = 70 \times 10^9 / (80 \cdot 8192) = 106{,}812\) tokens. At 32K, attention FLOPs are \(2LdT^2 = 1.41 \times 10^{15}\) against \(2NT = 4.59 \times 10^{15}\), about 23% of the total: noticeable, but the linear layers still dominate. 3. One 64K sequence holds \(65{,}536 \times 131{,}072\) bytes = 8.59 GB; free memory is \(72 - 16.06 = 55.94\) GB, so 6 sequences; with FP8 (4.29 GB each) 13. 4. \(1 + 4.015/(0.8 \cdot 0.3) = 1 + 16.7 = 17.7\) ms. 5. \(2.00 / (3600 \cdot 2000) \times 10^6 = \$0.28\); at 40% load \(\$0.69\) (divide by 0.4). 6. About 4.5 requests per second (the slider moves in steps of 0.5). Up to about 4.2 requests per second, 3 L4s ($2.40 per hour) are enough; above it 4 L4s cost $3.20, more than one H100 at $3.00, while one H100 lasts until about 10.1 requests per second. The left side of (141.10) is a step function of \(\lambda\), and the steps of the two GPUs cross there.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Agents repeat their history in every call: without a prefix cache prefill grows like \(k^2\) (141.2); with it, linearly. Their latency is mostly decode and tools (141.3); their real cost is KV memory held between calls.</li>
+<li>Long context: attention passes the linear layers at \(T^{*} = N/(Ld)\), about 61K tokens for Llama 3.1 8B (141.4). The KV cache of one 128K sequence (17 GB) is larger than the weights, which kills batching. Query-aware sparse attention saves bandwidth, not capacity (141.5).</li>
+<li>At the edge, decode speed is at most usable bandwidth divided by model size (141.6).</li>
+<li>One GPU under load: TPOT as a function of request rate has a floor (reading the weights) and a sharp knee (compute); KV memory is the third limit (141.8, 141.9).</li>
+<li>Plan with whole GPUs and headroom; compare cost per million tokens, not price per hour (141.10). For 2K/300 chat at 50 ms, the H100 is cheaper per token at high traffic, the L4 at low traffic, and the L4 cannot run the 8B model in BF16 at all.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \textstyle\sum_i T_i = k(S + q) + (o + r)\frac{k(k-1)}{2}, \qquad F_{\text{prefill}} = 2NT + 2LdT^2, \qquad T^{*} = \frac{N}{Ld} \]</div>
+<div class="eq">\[ \text{TPOT}(\lambda) = \max\!\left( \frac{t_0 + M_W/(\eta\,\text{BW})}{1 - b},\; \frac{t_0}{1 - c} \right), \qquad R = \left\lceil \frac{\lambda}{h\,\mu^{*}} \right\rceil, \qquad \frac{\$}{10^6 \text{ tok}} = \frac{R\,p \cdot 10^6}{3600\,\lambda\, n_{\text{out}}} \]</div>
+<h2 class="plain" id="scenarios-and-capacity-planning-agents-long-context-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Miao et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Towards Efficient Generative Large Language Model Serving: A Survey from Algorithms to Systems&amp;quot;" target="_blank" rel="noopener">Towards Efficient Generative Large Language Model Serving: A Survey from Algorithms to Systems</a></li><li>Zheng et al. (2023). <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">SGLang: Efficient Execution of Structured Language Model Programs</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Agrawal et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve&amp;quot;" target="_blank" rel="noopener">Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></li><li>Zhong et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving&amp;quot;" target="_blank" rel="noopener">DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</a></li><li>Zhang et al. (2023). <a href="https://arxiv.org/abs/2306.14048" target="_blank" rel="noopener">H2O: Heavy-Hitter Oracle for Efficient Generative Inference of Large Language Models</a></li><li>Xiao et al. (2023). <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">Efficient Streaming Language Models with Attention Sinks</a></li><li>Liu et al. (2023). <a href="https://arxiv.org/abs/2310.01889" target="_blank" rel="noopener">Ring Attention with Blockwise Transformers for Near-Infinite Context</a></li><li>Jiang, Li, Zhang et al. (2024). <a href="https://arxiv.org/abs/2407.02490" target="_blank" rel="noopener">MInference 1.0: Accelerating Pre-filling for Long-Context LLMs via Dynamic Sparse Attention</a></li><li>Tang, Zhao, Zhu, Xiao, Kasikci, Han (2024). <a href="https://arxiv.org/abs/2406.10774" target="_blank" rel="noopener">Quest: Query-Aware Sparsity for Efficient Long-Context LLM Inference</a></li><li>Li et al. (2024). <a href="https://arxiv.org/abs/2404.14469" target="_blank" rel="noopener">SnapKV: LLM Knows What You are Looking for Before Generation</a></li><li>Qin, Li, He et al. (2024). <a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener">Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</a></li><li>Meta (mirrored by Unsloth on Hugging Face) (2024). <a href="https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct/blob/main/config.json" target="_blank" rel="noopener">Llama 3.1 8B Instruct: config.json</a></li><li>NVIDIA (docs). <a href="https://www.nvidia.com/en-us/data-center/l4/" target="_blank" rel="noopener">NVIDIA L4 Tensor Core GPU: product specifications</a></li><li>NVIDIA (docs). <a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener">NVIDIA H100 Tensor Core GPU: product specifications</a></li><li>NVIDIA (docs). <a href="https://www.nvidia.com/en-us/data-center/a100/" target="_blank" rel="noopener">NVIDIA A100 Tensor Core GPU: product specifications</a></li><li>Yao et al. (2022). <a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">ReAct: Synergizing Reasoning and Acting in Language Models</a></li><li>Jimenez et al. (2023). <a href="https://arxiv.org/abs/2310.06770" target="_blank" rel="noopener">SWE-bench: Can Language Models Resolve Real-World GitHub Issues?</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/hardware-accelerators-and-edge-deployment.html"><small>Previous · session 140</small>Hardware accelerators and edge deployment</a><a class="next" href="../inference/lab-benchmark-a-serving-system.html"><small>Next · session 142</small>benchmark a serving system</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const R=document.querySelector('[data-session="scenarios-and-capacity-planning-agents-long-context"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmt=n=>Math.round(n).toLocaleString("en-US");
+const f1=v=>v.toFixed(1),f2=v=>v.toFixed(2);
+const usd=v=>"$"+(v>=100?v.toFixed(0):v.toFixed(2));
+const msf=s=>{const m=s*1e3;return m>=100?m.toFixed(0)+" ms":m.toFixed(1)+" ms";};
+const secf=s=>s>=1?s.toFixed(s>=10?1:2)+" s":msf(s);
+/* ---------- shared cost model (Llama 3.1 8B) ---------- */
+const NP=8.03e9,NL=32,DM=4096,U=0.5,ETA=0.8,T0=1e-3,USE=0.9;
+const CFG={l4b:{n:"L4 BF16",gpu:"L4",F:121e12,BW:300e9,C:24e9,wb:2,kvb:2},
+ l4f:{n:"L4 FP8",gpu:"L4",F:242e12,BW:300e9,C:24e9,wb:1,kvb:1},
+ hb:{n:"H100 BF16",gpu:"H100",F:989e12,BW:3.35e12,C:80e9,wb:2,kvb:2},
+ hf:{n:"H100 FP8",gpu:"H100",F:1979e12,BW:3.35e12,C:80e9,wb:1,kvb:1}};
+const skv=c=>65536*c.kvb,MW=c=>NP*c.wb,FREE=c=>c.C*USE-MW(c),FLOOR=c=>T0+MW(c)/(ETA*c.BW);
+const creq=(ni,no)=>{const Lb=ni+no/2;return 2*NP*(ni+no)+2*NL*DM*(ni*ni+2*no*Lb);};
+function branches(c,lam,ni,no){const Lb=ni+no/2,b=lam*no*Lb*skv(c)/(ETA*c.BW),cc=lam*creq(ni,no)/(U*c.F);
+ const m=b<1?FLOOR(c)/(1-b):Infinity,k=cc<1?T0/(1-cc):Infinity;return{b,c:cc,m,k,t:Math.max(m,k)};}
+const tpot=(c,lam,ni,no)=>branches(c,lam,ni,no).t;
+const kvUse=(c,lam,ni,no)=>{const t=tpot(c,lam,ni,no);return lam*no*t*(ni+no)*skv(c)/FREE(c);};
+function mu(c,ni,no,tau){
+ if(FREE(c)<=0)return{mu:0,why:"weights do not fit"};
+ if(FLOOR(c)>=tau)return{mu:0,why:"TPOT floor above target"};
+ if(ni+no>131072)return{mu:0,why:"longer than the context window"};
+ const ok=l=>tpot(c,l,ni,no)<=tau&&kvUse(c,l,ni,no)<=1;
+ if(!ok(1e-6))return{mu:0,why:"one request does not fit"};
+ let lo=0,hi=U*c.F/creq(ni,no);
+ for(let i=0;i<90;i++){const m=(lo+hi)/2;if(ok(m))lo=m;else hi=m;}
+ const br=branches(c,lo,ni,no),kv=kvUse(c,lo,ni,no);let lim;
+ if(kv>0.995)lim=br.c>0.95?"compute + KV memory":"KV memory";else lim=br.m>=br.k?"bandwidth":"compute";
+ return{mu:lo,lim,t:br.t,B:lo*no*br.t,c:br.c,b:br.b};}
+const LENS=[128,256,512,1000,2000,4000,8000,16000,32000,64000,128000];
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segv=el=>el.querySelector('button[aria-pressed="true"]').dataset.v;
+
+/* ---------- Figure 1: agent episode ---------- */
+(function(){
+ const svg=$("#cp-agent-svg");if(!svg)return;const info=$("#cp-agent-info"),MODE=$("#cp-agent-mode");
+ const K=$("#cp-agent-k"),S=$("#cp-agent-s"),O=$("#cp-agent-o"),Rr=$("#cp-agent-r"),TT=$("#cp-agent-t");
+ const Q=200,TP=0.010,Fe=989e12*U,SK=131072;
+ const cost=(n,j)=>2*NP*n+4*NL*DM*n*(j+n/2);
+ function episode(k,s,o,r,mode){let tok=0,fl=0;const calls=[];
+  for(let i=0;i<k;i++){const T=s+Q+i*(o+r);let n,j;
+   if(mode===0){n=T;j=0;}else if(mode===1){if(i===0){n=s+Q;j=0;}else{n=r;j=T-r;}}else{if(i===0){n=Q;j=s;}else{n=r;j=T-r;}}
+   const f=cost(n,j);tok+=n;fl+=f;calls.push({T,n,t:f/Fe});}
+  return{tok,fl,calls,pre:fl/Fe};}
+ function draw(){const k=+K.value,s=+S.value,o=+O.value,r=+Rr.value,tt=+TT.value,mode=+segv(MODE);
+  $("#cp-agent-kv").value=k;$("#cp-agent-sv").value=fmt(s);$("#cp-agent-ov").value=o;$("#cp-agent-rv").value=fmt(r);$("#cp-agent-tv").value=tt.toFixed(2)+" s";
+  const E=episode(k,s,o,r,mode),E0=episode(k,s,o,r,0);
+  const top=Math.max(1,s+Q+(k-1)*(o+r)+o),X0=62,W=560,Yb=215,H=190,cw=W/k,bw=Math.max(4,cw*0.7);
+  const Y=v=>Yb-v/top*H;let g=`<line x1="${X0}" y1="${Yb}" x2="${X0+W}" y2="${Yb}" stroke="var(--muted)"/>`;
+  const step=[1000,2000,5000,10000,20000,50000].find(v=>top/v<=5)||100000;
+  for(let v=0;v<=top;v+=step)g+=`<line x1="${X0}" y1="${Y(v)}" x2="${X0+W}" y2="${Y(v)}" stroke="var(--rule)" stroke-width=".6"/><text x="${X0-6}" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11.5">${v>=1000?(v/1000)+"K":v}</text>`;
+  E.calls.forEach((c,i)=>{const x=X0+i*cw+(cw-bw)/2,cached=c.T-c.n;
+   g+=`<rect x="${x.toFixed(1)}" y="${Y(cached).toFixed(1)}" width="${bw.toFixed(1)}" height="${(Yb-Y(cached)).toFixed(1)}" fill="var(--q-soft)" stroke="var(--q)" stroke-width=".6"/>`;
+   g+=`<rect x="${x.toFixed(1)}" y="${Y(c.T).toFixed(1)}" width="${bw.toFixed(1)}" height="${(Y(cached)-Y(c.T)).toFixed(1)}" fill="var(--q)"/>`;
+   g+=`<rect x="${x.toFixed(1)}" y="${Y(c.T+o).toFixed(1)}" width="${bw.toFixed(1)}" height="${(Y(c.T)-Y(c.T+o)).toFixed(1)}" fill="var(--k)"/>`;
+   if(k<=12||i%2===0)g+=`<text x="${(x+bw/2).toFixed(1)}" y="${Yb+15}" text-anchor="middle" class="svgs" font-size="11.5">${i+1}</text>`;});
+  g+=`<text x="${X0+W/2}" y="${Yb+31}" text-anchor="middle" class="svgs" font-size="12">call i</text><text x="14" y="${Yb-H/2}" class="svgs" font-size="12" transform="rotate(-90 14 ${Yb-H/2})" text-anchor="middle">tokens</text>`;
+  svg.innerHTML=g;
+  const dec=k*o*TP,tools=(k-1)*tt,e2e=E.pre+dec+tools,fin=s+Q+k*o+(k-1)*r,kv=fin*SK/1e9,fit=Math.floor(55.94/kv);
+  const cmp=mode===0?`With an episode cache it would be ${fmt(episode(k,s,o,r,1).tok)} tokens.`:`Without a cache: ${fmt(E0.tok)} tokens, ${f1(E0.tok/E.tok)}× more (${f1(E0.fl/E.fl)}× more FLOPs).`;
+  info.innerHTML=`Prefill: <b>${fmt(E.tok)} tokens</b>. ${cmp} Prefill work ${(E.fl/1e15).toFixed(3)} PFLOP = ${secf(E.pre)} of H100 time; TTFT of the last call ${msf(E.calls[k-1].t)}. Episode: prefill ${secf(E.pre)} + decode ${secf(dec)} + tools ${secf(tools)} = <b>${secf(e2e)}</b>. Final context ${fmt(fin)} tokens = <b>${f2(kv)} GB</b> of KV cache; the 55.9 GB free on an H100 hold about ${fit} such episodes.`;}
+ seg(MODE,draw);[K,S,O,Rr,TT].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: long context ---------- */
+(function(){
+ const svg=$("#cp-long-svg");if(!svg)return;const info=$("#cp-long-info"),G=$("#cp-long-g"),KF=$("#cp-long-kvf"),KS=$("#cp-long-k"),TS=$("#cp-long-t");
+ const TSTAR=NP/(NL*DM);
+ function draw(){const c=CFG[segv(G)],kvb=+segv(KF),Kb=+segv(KS),T=Math.round(Math.pow(2,+TS.value));
+  $("#cp-long-tv").value=T>=1024?(T/1024).toFixed(T%1024?1:0)+"K":T;
+  const Fe=c.F*U,lin=t=>2*NP*t/Fe,tot=t=>(2*NP*t+2*NL*DM*t*t)/Fe;
+  const x0=10,x1=17,y0=Math.log10(lin(1024)/2),y1=Math.log10(tot(131072)*2);
+  const PX=56,PW=380,PY=20,PH=190,X=t=>PX+(Math.log2(t)-x0)/(x1-x0)*PW,Y=s=>PY+PH-(Math.log10(s)-y0)/(y1-y0)*PH;
+  let g=`<path d="M${PX} ${PY} V${PY+PH} H${PX+PW}" fill="none" stroke="var(--muted)"/>`;
+  for(let e=Math.ceil(y0);e<=Math.floor(y1);e++){const lab=e<0?(Math.pow(10,e+3)+" ms"):(Math.pow(10,e)+" s");g+=`<line x1="${PX}" y1="${Y(Math.pow(10,e))}" x2="${PX+PW}" y2="${Y(Math.pow(10,e))}" stroke="var(--rule)" stroke-width=".6"/><text x="${PX-5}" y="${Y(Math.pow(10,e))+4}" text-anchor="end" class="svgs" font-size="11">${lab}</text>`;}
+  [10,12,14,16,17].forEach(p=>g+=`<text x="${X(Math.pow(2,p))}" y="${PY+PH+15}" text-anchor="middle" class="svgs" font-size="11">${Math.pow(2,p)/1024}K</text>`);
+  g+=`<text x="${PX+PW/2}" y="${PY+PH+31}" text-anchor="middle" class="svgs" font-size="12">context T (tokens, log scale)</text>`;
+  let a="",bb="";for(let p=x0;p<=x1+1e-9;p+=0.1){const t=Math.pow(2,p);a+=(a?"L":"M")+X(t).toFixed(1)+" "+Y(lin(t)).toFixed(1);bb+=(bb?"L":"M")+X(t).toFixed(1)+" "+Y(tot(t)).toFixed(1);}
+  g+=`<path d="${a}" fill="none" stroke="var(--q)" stroke-width="2.2"/><path d="${bb}" fill="none" stroke="var(--k)" stroke-width="2.6"/>`;
+  g+=`<line x1="${X(TSTAR)}" y1="${PY}" x2="${X(TSTAR)}" y2="${PY+PH}" stroke="var(--muted)" stroke-dasharray="4 4"/><text x="${X(TSTAR)-4}" y="${PY+12}" text-anchor="end" class="svgs" font-size="11">T* = 61K</text>`;
+  g+=`<circle cx="${X(T)}" cy="${Y(tot(T))}" r="6" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;
+  // memory bar
+  const s1=T*65536*kvb,free=FREE(c),nB=Math.max(0,Math.floor(free/s1)),cap=c.C*USE,BX=500,BW=70,MY=PY,MH=PH,yM=v=>MY+MH-v/cap*MH;
+  const wTop=yM(MW(c)),kvTop=yM(MW(c)+nB*s1);
+  g+=`<rect x="${BX}" y="${MY}" width="${BW}" height="${MH}" fill="none" stroke="var(--muted)"/><rect x="${BX}" y="${wTop}" width="${BW}" height="${MY+MH-wTop}" fill="var(--muted)" opacity=".55"/>`;
+  for(let i=0;i<Math.min(nB,60);i++){const yt=yM(MW(c)+(i+1)*s1),yb=yM(MW(c)+i*s1);g+=`<rect x="${BX}" y="${yt.toFixed(1)}" width="${BW}" height="${Math.max(0.5,yb-yt).toFixed(1)}" fill="var(--v)" stroke="var(--card)" stroke-width="${nB>40?0:1}"/>`;}
+  if(nB>60)g+=`<rect x="${BX}" y="${kvTop.toFixed(1)}" width="${BW}" height="${(yM(MW(c)+60*s1)-kvTop).toFixed(1)}" fill="var(--v)"/>`;
+  g+=`<text x="${BX+BW/2}" y="${MY+MH+15}" text-anchor="middle" class="svgs" font-size="11.5">${c.gpu}: ${f1(cap/1e9)} GB usable</text><text x="${BX+BW+6}" y="${(wTop+MY+MH)/2+4}" class="svgs" font-size="11">weights</text><text x="${BX+BW+6}" y="${Math.max(MY+10,(kvTop+wTop)/2+4)}" class="svgs" font-size="11">${nB} seq</text>`;
+  svg.innerHTML=g;
+  const BWe=ETA*c.BW,step=b=>T0+(MW(c)+b*T*65536*kvb)/BWe,stepS=b=>T0+(MW(c)+b*Math.min(T,Kb)*65536*kvb)/BWe,att=2*NL*DM*T*T/(2*NP*T+2*NL*DM*T*T);
+  let dec;if(nB===0)dec=`<b>Not even one sequence fits</b> next to the weights.`;
+  else{dec=`Decode step at batch ${nB}: <b>${msf(step(nB))}</b>`+(nB>1?` (batch 1: ${msf(step(1))})`:"");
+   if(Kb>0)dec+=T>Kb?`; with sparse budget K = ${fmt(Kb)}: <b>${msf(stepS(nB))}</b> (${f1(step(nB)/stepS(nB))}× faster), same memory held.`:`; the sparse budget K = ${fmt(Kb)} is not smaller than T, so it changes nothing.`;else dec+=".";}
+  info.innerHTML=`T = ${fmt(T)} tokens on ${c.n}. TTFT ≥ <b>${secf(tot(T))}</b>; attention is ${(100*att).toFixed(0)}% of prefill FLOPs. KV cache per sequence <b>${f2(s1/1e9)} GB</b>; ${nB} sequence${nB===1?" fits":"s fit"} in the ${f2(free/1e9)} GB left after the weights. ${dec}`;}
+ [G,KF,KS].forEach(e=>seg(e,draw));TS.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: one GPU under load ---------- */
+(function(){
+ const svg=$("#cp-knee-svg");if(!svg)return;const info=$("#cp-knee-info"),G=$("#cp-knee-g"),I=$("#cp-knee-i"),O=$("#cp-knee-o"),S=$("#cp-knee-s");
+ function draw(){const c=CFG[segv(G)],ni=LENS[+I.value],no=+O.value,tau=+S.value/1e3;
+  $("#cp-knee-iv").value=fmt(ni);$("#cp-knee-ov").value=fmt(no);$("#cp-knee-sv").value=S.value+" ms";
+  const Lb=ni+no/2,lc=U*c.F/creq(ni,no),lb=ETA*c.BW/(no*Lb*skv(c)),xmax=Math.min(lc,lb)*1.06,fl=FLOOR(c),ymax=Math.max(2*tau,1.5*fl);
+  const PX=60,PW=560,PY=16,PH=200,X=l=>PX+l/xmax*PW,Y=t=>PY+PH-Math.min(t,ymax)/ymax*PH;
+  let g=`<path d="M${PX} ${PY} V${PY+PH} H${PX+PW}" fill="none" stroke="var(--muted)"/>`;
+  const ys=[0,0.25,0.5,0.75,1].map(f=>f*ymax);ys.forEach(v=>g+=`<line x1="${PX}" y1="${Y(v)}" x2="${PX+PW}" y2="${Y(v)}" stroke="var(--rule)" stroke-width=".6"/><text x="${PX-5}" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11">${(v*1e3).toFixed(0)} ms</text>`);
+  const nice=[0.01,0.02,0.05,0.1,0.2,0.5,1,2,5,10,20,50,100].find(v=>xmax/v<=6)||200;
+  for(let v=0;v<=xmax+1e-12;v+=nice)g+=`<text x="${X(v)}" y="${PY+PH+15}" text-anchor="middle" class="svgs" font-size="11">${+v.toFixed(2)}</text>`;
+  g+=`<text x="${PX+PW/2}" y="${PY+PH+32}" text-anchor="middle" class="svgs" font-size="12">requests per second sent to this GPU</text>`;
+  let d="";for(let i=0;i<=300;i++){const l=xmax*i/300,t=tpot(c,l,ni,no);if(!isFinite(t)||t>ymax){d+=(d?"L":"M")+X(l).toFixed(1)+" "+Y(ymax).toFixed(1);break;}d+=(d?"L":"M")+X(l).toFixed(1)+" "+Y(t).toFixed(1);}
+  g+=`<line x1="${PX}" y1="${Y(tau)}" x2="${PX+PW}" y2="${Y(tau)}" stroke="var(--bad)" stroke-dasharray="6 4" stroke-width="1.6"/>`;
+  // KV limit
+  let lkv=null;if(FREE(c)>0&&kvUse(c,1e-9,ni,no)<=1){let lo=0,hi=xmax;if(kvUse(c,hi,ni,no)>1){for(let i=0;i<70;i++){const m=(lo+hi)/2;if(kvUse(c,m,ni,no)<=1)lo=m;else hi=m;}lkv=lo;}}
+  else if(FREE(c)>0)lkv=0;
+  if(lkv!==null)g+=`<line x1="${X(lkv)}" y1="${PY}" x2="${X(lkv)}" y2="${PY+PH}" stroke="var(--v)" stroke-dasharray="5 4" stroke-width="1.8"/><text x="${X(lkv)+4}" y="${PY+12}" class="svgs" font-size="11">KV full</text>`;
+  g+=`<path d="${d}" fill="none" stroke="var(--tc)" stroke-width="2.8"/>`;
+  const M=mu(c,ni,no,tau);
+  if(M.mu>0)g+=`<line x1="${X(M.mu)}" y1="${PY}" x2="${X(M.mu)}" y2="${PY+PH}" stroke="var(--k)" stroke-width="1.4"/><circle cx="${X(M.mu)}" cy="${Y(M.t)}" r="6" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;
+  svg.innerHTML=g;
+  info.innerHTML=`${c.n}, prompt ${fmt(ni)}, output ${fmt(no)}: TPOT floor <b>${msf(fl)}</b>. `+(M.mu>0?`Capacity <b>μ* = ${f2(M.mu)} requests/s</b> per GPU (${fmt(M.mu*no)} output tokens/s), limited by <b>${M.lim}</b>. At μ*: TPOT ${msf(M.t)}, about ${fmt(M.B)} requests running, compute utilization ${(100*M.c).toFixed(0)}%.`:`<b>No load is possible</b>: ${M.why}.`);}
+ seg(G,draw);[I,O,S].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: capacity planner ---------- */
+(function(){
+ const tab=$("#cp-plan-tab");if(!tab)return;const svg=$("#cp-plan-svg"),info=$("#cp-plan-info");
+ const L=$("#cp-plan-l"),I=$("#cp-plan-i"),O=$("#cp-plan-o"),S=$("#cp-plan-s"),Hh=$("#cp-plan-h"),PL=$("#cp-plan-pl"),PH=$("#cp-plan-ph");
+ function draw(){const lam=+L.value,ni=LENS[+I.value],no=+O.value,tau=+S.value/1e3,h=+Hh.value,pr={L4:+PL.value,H100:+PH.value};
+  $("#cp-plan-lv").value=lam.toFixed(1);$("#cp-plan-iv").value=fmt(ni);$("#cp-plan-ov").value=fmt(no);$("#cp-plan-sv").value=S.value;$("#cp-plan-hv").value=h.toFixed(2);$("#cp-plan-plv").value=f2(pr.L4);$("#cp-plan-phv").value=f2(pr.H100);
+  const rows=Object.keys(CFG).map(k=>{const c=CFG[k],M=mu(c,ni,no,tau),p=pr[c.gpu],ttft=2*NP*ni/(U*c.F)+2*NL*DM*ni*ni/(U*c.F);
+   if(!(M.mu>0))return{k,c,M,p,ttft,ok:false};
+   const Rn=Math.ceil(lam/(h*M.mu)-1e-9);return{k,c,M,p,ttft,ok:true,R:Rn,ph:Rn*p,plan:Rn*p/(3600*lam*no)*1e6,full:p/(3600*M.mu*no)*1e6};});
+  const ok=rows.filter(r=>r.ok);let best=null;ok.forEach(r=>{if(!best||r.ph<best.ph-1e-9||(Math.abs(r.ph-best.ph)<1e-9&&r.full<best.full))best=r;});
+  let t=`<thead><tr><th>Config</th><th>TPOT floor</th><th>μ* (req/s per GPU)</th><th>Limit</th><th>GPUs</th><th>$/h</th><th>$/1M out, planned</th><th>$/1M out, full load</th><th>TTFT ≥</th></tr></thead><tbody>`;
+  rows.forEach(r=>{t+=`<tr${r===best?' class="best"':""}><td>${r.c.n}</td><td>${msf(FLOOR(r.c))}</td>`;
+   if(r.ok)t+=`<td>${f2(r.M.mu)}</td><td>${r.M.lim}</td><td>${r.R}</td><td>${usd(r.ph)}</td><td>${usd(r.plan)}</td><td>${usd(r.full)}</td><td>${secf(r.ttft)}</td></tr>`;
+   else t+=`<td class="bad" colspan="6">not possible: ${r.M.why}</td><td>${secf(r.ttft)}</td></tr>`;});
+  tab.innerHTML=t+"</tbody>";
+  const vmax=Math.max(0.01,...ok.map(r=>Math.max(r.plan,r.full))),X0=110,W=470,Y0=14,rh=44,Xv=v=>X0+v/vmax*W;
+  let g="";rows.forEach((r,i)=>{const y=Y0+i*rh;g+=`<text x="${X0-8}" y="${y+19}" text-anchor="end" class="svgs" font-size="12.5">${r.c.n}</text>`;
+   if(!r.ok){g+=`<text x="${X0+4}" y="${y+19}" class="svgs" font-size="12" fill="var(--bad)">not possible</text>`;return;}
+   g+=`<rect x="${X0}" y="${y+2}" width="${(Xv(r.full)-X0).toFixed(1)}" height="14" fill="var(--q)"/><text x="${Xv(r.full)+4}" y="${y+13}" class="svgs" font-size="11.5">${usd(r.full)}</text>`;
+   g+=`<rect x="${X0}" y="${y+18}" width="${(Xv(r.plan)-X0).toFixed(1)}" height="14" fill="var(--k)"/><text x="${Xv(r.plan)+4}" y="${y+29}" class="svgs" font-size="11.5">${usd(r.plan)}</text>`;});
+  g+=`<line x1="${X0}" y1="${Y0-4}" x2="${X0}" y2="${Y0+4*rh-6}" stroke="var(--muted)"/>`;svg.innerHTML=g;
+  info.innerHTML=best?`Traffic: ${lam.toFixed(1)} requests/s × ${fmt(no)} output tokens = ${fmt(lam*no)} output tokens/s (and ${fmt(lam*ni)} prompt tokens/s). Cheapest plan: <b>${best.R} × ${best.c.n}</b>, <b>${usd(best.ph)}/h</b>, <b>${usd(best.plan)}</b> per 1M output tokens (${usd(best.full)} if the GPUs were fully loaded).`:`No configuration meets a TPOT of ${S.value} ms for this traffic. Loosen the target, shorten the prompts, or split the model over more GPUs.`;}
+ [L,I,O,S,Hh,PL,PH].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

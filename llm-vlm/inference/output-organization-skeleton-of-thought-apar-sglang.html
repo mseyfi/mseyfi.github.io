@@ -1,0 +1,442 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Output organization: Skeleton-of-Thought, APAR, SGLang; model cascades · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 91</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="output-organization-skeleton-of-thought-apar-sglang">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="output-organization-skeleton-of-thought-apar-sglang" data-session="output-organization-skeleton-of-thought-apar-sglang" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">91</span><span>Track 5: LLM inference and serving · session 14 of 65</span></div><h1 class="chap-title">Output organization: Skeleton-of-Thought, APAR, SGLang; model cascades</h1><p class="chap-sub">A decode step for one sequence costs almost the same as a step for five, so a single answer leaves most of the GPU unused. This session shows how to change the shape of the output so independent parts are written at the same time: Skeleton-of-Thought, graph decoding and APAR. It then shows how SGLang shares the KV cache of common prompt prefixes across all these calls, and how a cascade of a small and a big model cuts the average cost of a request.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 2 hours, exercises 1 hour)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions 80, 82 and 84 (the KV cache, why inference is slow, batching basics)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Why a decode step at small batch costs about the same for 1 or 5 sequences, and how to turn that into lower latency for one answer</li><li>Skeleton-of-Thought: the two prompts, the latency formula, and why the longest point and the skeleton limit the speed-up</li><li>When SoT hurts (math, code) and how a router, a dependency graph (SGD) or a trained fork token (APAR) fixes it</li><li>How APAR forks threads that share the parent’s KV prefix, and how to count its decode steps</li><li>SGLang programs and RadixAttention: prefix matching, hit rate, memory saved by sharing, LRU eviction and prefix-aware scheduling</li><li>Model cascades (FrugalGPT): cost and accuracy as a function of one threshold, and why a cascade can beat the big model</li></ul></div></header><style>
+.oo-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px;justify-content:center}
+.oo-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.oo-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.oo-grid input[type=range]{width:100%}
+.oo-lab{font:500 14px var(--sans);color:var(--muted)}
+[data-session="output-organization-skeleton-of-thought-apar-sglang"] pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A chat model that writes a 500-token answer runs the whole network 500 times, one step after the other. Each step makes one token. On a GPU, one step for one user costs almost the same time as one step for five users, because the time goes into reading the weights, not into arithmetic. So when only one user is waiting, most of the GPU’s power sits unused.</p>
+<p><a href="../inference/why-inference-is-slow-three-root-causes.html">Session 82</a> showed this: decoding is <b>memory-bound</b> (its speed is set by how fast the GPU reads memory, not by how fast it computes). <a href="../inference/batching-basics-and-the-latency-throughput-trade.html">Session 84</a> used the free compute to serve <b>more users</b> at the same time. This session asks a different question: can we use the free compute to finish <b>one</b> answer sooner? The idea is to change the <b>shape</b> of the output. If an answer is a list of independent points, the points do not need to wait for each other. We can write them at the same time, as a batch, inside one request.</p>
+<p>The efficient-inference survey calls this <b>output organization</b> (its Section 4.2, part of “data-level” optimization: the model is not changed, only the way we ask for and arrange its output). [Certain] We cover four ideas:</p>
+<ul><li><b>Skeleton-of-Thought (SoT)</b>: ask for a short outline first, then expand all points in parallel. Reported speed-ups reach 2.39× across 12 models. [Certain, SoT paper]</li>
+<li><b>Graph and fork decoding</b>: SGD puts dependent points in a graph; APAR teaches the model to emit a <code>[Fork]</code> token that starts a new parallel thread by itself.</li>
+<li><b>SGLang</b>: a small programming language for LLM calls whose runtime keeps a tree of all cached prefixes (RadixAttention), so the many requests that SoT-style programs create share their common prompt automatically.</li>
+<li><b>Model cascades (FrugalGPT)</b>: a different way to organize work. Try a cheap model first, and call the expensive one only when the cheap answer looks unreliable.</li></ul>
+<aside class="note interview side"><span class="nt">Interview tip</span>Typical questions: “Why can generating the same number of tokens in parallel be faster?”, “When does Skeleton-of-Thought hurt quality?”, “How does SGLang reuse the KV cache across calls?”, “How would you cut API cost by 5× without losing accuracy?”. All four are answered with numbers below.</aside>
+<p>These ideas are in real systems today. SGLang is a widely used open-source serving engine, and prefix caching in the style of RadixAttention exists in most major engines. [Likely] Routing between small and large models (the cascade idea) is a standard way to control the cost of LLM products. [Likely] The previous session, <a href="../inference/rag-as-input-compression-flare-replug-self.html">session 90</a>, made the <b>input</b> shorter. This session makes the <b>output</b> faster to produce and the average request cheaper.</p>
+
+<h2>The cost model: why parallel points are almost free</h2>
+<p>We need one formula for the time of one decode step. In <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a> we saw that, at small batch sizes, a decode step must read all weights once and read the KV cache of every sequence in the batch. The arithmetic is too small to matter. So the step time is about the bytes moved divided by the memory bandwidth:</p>
+<div class="eq">\[ t_{\text{step}}(B, c) \;\approx\; \frac{M_W + B \cdot c \cdot m_{kv}}{\text{BW}} \tag{91.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(B\)</dt><dd>batch size: how many sequences make one token each in this step</dd>
+<dt>\(c\)</dt><dd>how many tokens each sequence already has in the KV cache (its context length)</dd>
+<dt>\(M_W\)</dt><dd>bytes of all model weights (read once per step, shared by the whole batch)</dd>
+<dt>\(m_{kv}\)</dt><dd>bytes of KV cache per token (keys and values of all layers)</dd>
+<dt>\(\text{BW}\)</dt><dd>GPU memory bandwidth in bytes per second</dd></dl>
+<p>The key fact is in the numerator: \(M_W\) is paid once per step, whatever \(B\) is. For Llama 2 7B in 16-bit, \(M_W \approx 13.5\) GB, while one token of KV cache is \(2 \cdot 32 \text{ layers} \cdot 32 \text{ heads} \cdot 128 \cdot 2 \text{ bytes} = 0.5\) MiB (<a href="../inference/the-kv-cache.html">session 80</a>). With 300 tokens of context, five sequences add only about 0.8 GB of cache reads to the 13.5 GB of weights. So a step with \(B = 5\) costs only a few percent more than a step with \(B = 1\), but makes five tokens instead of one. This holds until \(B\) is large enough that compute becomes the limit; that point is often at a batch of 100 or more for a 7B model. [Likely]</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A bus drives from A to B. The trip costs the same fuel with one passenger or with five. If five people want to go to the same place, sending one bus five times is a waste. Normal decoding sends one bus per token. Parallel decoding fills the bus.</aside>
+<p>Normal decoding writes the \(N\) tokens of an answer one after the other, always with \(B = 1\). After the prompt of \(n_q\) tokens is processed (the <b>prefill</b>, time \(T_{\text{pre}}\)), the time is:</p>
+<div class="eq">\[ T_{\text{normal}} = T_{\text{pre}}(n_q) + \sum_{t=0}^{N-1} t_{\text{step}}(1,\, n_q + t) \;\approx\; N \cdot t_{\text{step}}(1) \tag{91.2} \]</div>
+<p>The sum has \(N\) terms, and nothing can make it shorter as long as each token waits for the one before it. This is the <b>sequential dependency</b> of autoregressive decoding. Speculative decoding (<a href="../inference/speculative-decoding-1-the-math.html">session 128</a>) attacks it by guessing several future tokens and checking them together. Output organization attacks it at a higher level: it finds parts of the answer that do not depend on each other at all.</p>
+
+<h2>Skeleton-of-Thought: outline first, then expand in parallel</h2>
+<p>Skeleton-of-Thought (Ning et al., 2023) copies how people write: first a plan, then the details. It needs no training and no change to the model. It is only a change in how we prompt. [Certain]</p>
+<ol><li><b>Skeleton stage.</b> A <b>skeleton prompt</b> asks the model for a short numbered outline only, with each point in about 3 to 5 words, and usually 3 to 10 points. [Certain, SoT paper] Example: “1. Keep a fixed schedule 2. Limit screens at night 3. Watch caffeine 4. Make the room dark”.</li>
+<li><b>Point-expanding stage.</b> For each point \(i\), a <b>point-expanding prompt</b> contains the question, the whole skeleton, and the instruction “continue only point \(i\), in 1 to 2 sentences”. All these prompts are sent at the same time: as parallel API calls for a closed model, or as one batch for an open model on your own GPU.</li>
+<li><b>Join.</b> The expansions are put together in order. The user sees one normal-looking answer.</li></ol>
+<div class="algo"><div class="algo-h">Algorithm 1: Skeleton-of-Thought</div><ol>
+<li><b>input:</b> question \(q\), model \(f\), skeleton template \(P_s\), expansion template \(P_e\)</li>
+<li>\(\text{sk} \leftarrow f(P_s(q))\) <span class="c">// short outline, decoded normally with B = 1</span></li>
+<li>\(\text{points} \leftarrow \text{parse\_numbered\_list}(\text{sk})\) <span class="c">// e.g. 5 short lines</span></li>
+<li><b>if</b> parsing fails or \(|\text{points}| \le 1\): <b>return</b> \(f(q)\) <span class="c">// fall back to a normal answer</span></li>
+<li><b>in parallel for</b> \(i = 1 \dots K\): \(e_i \leftarrow f(P_e(q, \text{sk}, i))\) <span class="c">// one batch of K sequences</span></li>
+<li><b>return</b> \(\text{points}_1 + e_1 + \dots + \text{points}_K + e_K\)</li></ol></div>
+<p>Now the time. The skeleton has \(L_s\) tokens and is decoded with \(B = 1\). Then all \(K\) expansion prompts are prefilled together, and the expansions are decoded together. Point \(i\) has \(L_i\) tokens. The batch shrinks as short points finish: at step \(s\) of the expansion, the batch holds the \(B_s\) points that are still longer than \(s\):</p>
+<div class="eq">\[ T_{\text{SoT}} = \underbrace{T_{\text{pre}}(n_s) + L_s\, t_{\text{step}}(1)}_{\text{skeleton}} + \underbrace{T_{\text{pre}}(K n_e)}_{\text{expansion prefill}} + \underbrace{\sum_{s=0}^{\max_i L_i - 1} t_{\text{step}}(B_s)}_{\text{parallel expansion}}, \qquad B_s = \#\{i : L_i \gt s\} \tag{91.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n_s, n_e\)</dt><dd>prompt lengths of the skeleton request and of one expansion request (question + template, plus the skeleton for \(n_e\))</dd>
+<dt>\(L_s\)</dt><dd>skeleton length in tokens</dd>
+<dt>\(L_i\)</dt><dd>length of the expansion of point \(i\); the answer has \(N = \sum_i L_i\) tokens in total</dd>
+<dt>\(B_s\)</dt><dd>how many points are still being written at expansion step \(s\)</dd></dl>
+<p>If the step time is flat in \(B\) (formula 91.1 at small batch) and prefill is short, the speed-up has a simple form:</p>
+<div class="eq">\[ S = \frac{T_{\text{normal}}}{T_{\text{SoT}}} \;\approx\; \frac{\sum_{i=1}^{K} L_i}{L_s + \max_i L_i} \;\le\; K \tag{91.4} \]</div>
+<p>Three lessons are in this one line. (1) The best case is \(K\) points of equal length and a tiny skeleton: speed-up close to \(K\). (2) The <b>longest</b> point sets the time; one long point ruins the gain. (3) The skeleton is pure extra work done sequentially; a long skeleton eats the gain.</p>
+<div class="worked"><div class="wt">Worked example: SoT for Llama 2 7B on one GPU</div>
+<p>Assume a GPU with 2 TB/s of memory bandwidth and 312 TFLOP/s of 16-bit compute (about an A100), the Llama 2 7B numbers above (\(6.74 \times 10^9\) parameters, 13.5 GB of weights, 0.5 MiB of cache per token), and ideal kernels. One decode step with \(B = 1\) then takes \(13.48 \text{ GB} / 2 \text{ TB/s} = 6.74\) ms. Prefill is computed as \(\max(M_W/\text{BW},\ 2 \cdot 6.74\times10^9 \cdot n / 312\times10^{12})\).</p>
+<p>The question has 50 tokens and the full answer has 500. The skeleton and expansion templates add 150 tokens each, and the skeleton has \(L_s = 30\) tokens.</p>
+<ul><li><b>Normal:</b> 500 steps at \(B = 1\): <b>3,416 ms</b>.</li>
+<li><b>SoT, 5 equal points of 100 tokens:</b> skeleton 212.5 ms, expansion prefill of \(5 \times 230\) tokens 49.7 ms, 100 parallel steps 710.6 ms. Total <b>972.8 ms</b>, speed-up <b>3.51×</b>. Formula (91.4) gives \(500/(30 + 100) = 3.85\); the gap is prefill and the growing KV cache.</li>
+<li><b>SoT, 5 uneven points (60, 80, 100, 120, 140 tokens):</b> the parallel phase now lasts 140 steps: total 1,243.0 ms, speed-up <b>2.75×</b>.</li>
+<li><b>SoT with one point of 500 tokens:</b> 3,655.3 ms, a <b>slow-down</b> (0.93×): the skeleton was wasted work.</li></ul>
+<p>These are ideal lower-bound times from formula (91.1), not measurements. Real kernels are slower, and real SoT answers differ from normal answers in length. The SoT paper measured up to 2.39× on 12 models, above 2× on 8 of them. [Certain, SoT paper]</p></div>
+<figure class="fig wide" id="oo-sot"><div class="fig-body">
+<div class="oo-grid">
+<label for="oo-sot-k">Number of points \(K\)</label><input type="range" id="oo-sot-k" min="1" max="10" step="1" value="5"><output id="oo-sot-kv"></output>
+<label for="oo-sot-m">Mean tokens per point</label><input type="range" id="oo-sot-m" min="20" max="300" step="10" value="100"><output id="oo-sot-mv"></output>
+<label for="oo-sot-u">Unevenness of point lengths</label><input type="range" id="oo-sot-u" min="0" max="0.8" step="0.05" value="0.4"><output id="oo-sot-uv"></output>
+<label for="oo-sot-s">Skeleton length \(L_s\) (tokens)</label><input type="range" id="oo-sot-s" min="10" max="100" step="5" value="30"><output id="oo-sot-sv"></output></div>
+<div class="scroll-x"><svg id="oo-sot-svg" viewBox="0 0 760 330" role="img" aria-label="Timeline of normal decoding and Skeleton-of-Thought decoding"></svg></div>
+<div class="oo-leg"><span style="--c:var(--muted)">normal decoding (B = 1)</span><span style="--c:var(--k)">skeleton (B = 1)</span><span style="--c:var(--rule)">prefill</span><span style="--c:var(--q)">parallel expansion</span></div>
+<div class="readout" id="oo-sot-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The time of one answer with normal decoding (top bar) and with Skeleton-of-Thought (bars below), from formulas (91.1) to (91.3) for Llama 2 7B on a 2 TB/s GPU. Point \(i\) gets length \(\text{mean} \cdot (1 + u(2i/(K-1) - 1))\), so the unevenness \(u\) spreads the lengths around the mean. The total answer length is the same in both cases.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Each blue bar is one point being written. All blue bars start at the same moment and run in one batch; the expansion is finished when the longest bar ends. Move the unevenness to 0 and the speed-up comes close to \(K\) times \(\text{mean}/(\text{mean} + L_s)\). Move it to 0.8 and the longest point decides everything. Set \(K = 1\) to see that SoT then only adds the cost of the skeleton. Increase \(L_s\) to see the sequential skeleton grow. The readout also shows the number of input tokens: SoT sends the question \(K + 1\) times, which costs money with a paid API.</p></details></figure>
+
+<h3>When SoT helps and when it hurts</h3>
+<p>SoT assumes the points are <b>independent</b>: point 3 can be written without seeing the text of point 2. That is true for many “list” questions and false for others. The SoT paper found that SoT works well on knowledge, generic, common-sense, role-play and counterfactual questions, and works badly on math, Fermi estimates, coding and writing. [Certain, SoT paper] In math, step 3 needs the result of step 2, so the steps cannot be written at the same time.</p>
+<p>The fix is a <b>router</b>: a small classifier that decides, per question, whether to use SoT or a normal answer. The paper calls this <b>SoT-R</b> and tries two routers: a prompt to GPT-4, and a fine-tuned RoBERTa model of about 120M parameters. [Certain] The router is cheap compared with the LLM, so it costs almost nothing per request.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>The skeleton prompt sends the question once, and each expansion prompt sends the question <b>and</b> the skeleton again. With \(K = 5\), the input tokens are about 6 times those of one normal call. On your own GPU this is short prefill work. With a paid API, it is real money, and the latency gain must be worth it.</aside>
+
+<h2>Graph decoding: points that depend on each other</h2>
+<p>Pure SoT has two options: all points in parallel, or a normal answer. Many answers are in between. Point 3 may depend on point 1, while point 2 is independent. <b>SGD</b> (Jin et al., first called “Adaptive Skeleton Graph Decoding”, later renamed Plato) asks the model to write the skeleton as a <b>dependency graph</b>: a directed graph without cycles (a DAG), where an edge \(u \to v\) means “\(v\) needs the text of \(u\)”. [Certain] A node is decoded as soon as all of its parents are finished, and its prompt includes the parents’ text. The finish time of each node is:</p>
+<div class="eq">\[ F(v) = \max_{u \in \text{pa}(v)} F(u) \;+\; L_v, \qquad T_{\text{graph}} = \max_v F(v) \tag{91.5} \]</div>
+<p>Here \(\text{pa}(v)\) is the set of parents of \(v\) (the max over an empty set is 0), and \(L_v\) is the number of tokens of node \(v\). \(T_{\text{graph}}\) is the length of the <b>critical path</b>: the longest chain of dependent nodes. It lies between pure SoT (no edges: \(\max_v L_v\)) and normal decoding (a single chain: \(\sum_v L_v\)). The first version of the SGD paper reported a 1.69× speed-up over normal decoding and up to 51% better quality than SoT; the later version reports 68% higher throughput. [Certain, arXiv 2402.12280 v1 and v2] The survey adds that SGD also picks a model size per node, from an estimate of how hard the node is. [Certain, survey Section 4.2]</p>
+<figure class="fig" id="oo-dag"><div class="fig-body">
+<div class="controls"><span class="seg" id="oo-dag-mode"><button type="button" data-v="seq" aria-pressed="false">Normal (one chain)</button><button type="button" data-v="sot" aria-pressed="false">SoT (ignore edges)</button><button type="button" data-v="lvl" aria-pressed="false">Graph, level by level</button><button type="button" data-v="asap" aria-pressed="true">Graph, as soon as ready</button></span></div>
+<div class="scroll-x"><svg id="oo-dag-svg" viewBox="0 0 680 270" role="img" aria-label="Dependency graph of four answer parts and their decode schedule"></svg></div>
+<div class="readout" id="oo-dag-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Four parts of an answer: P1 (60 tokens), P2 (80), P3 (50, needs P1) and P4 (40, needs P1 and P2). Left: the dependency graph. Right: when each part is decoded under each schedule. One column of the timeline is one decode step for all active parts together.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>“Normal” writes everything in one chain: 230 steps. “SoT” starts all four at once: 80 steps, but P3 and P4 are written <b>without</b> the text they need, which is where SoT loses quality. “Level by level” waits until the whole first level (P1 and P2) is done: 130 steps. “As soon as ready” starts P3 the moment P1 ends: 120 steps, the critical path of formula (91.5). Red marks show parts that started before their parents were done.</p></details></figure>
+
+<h2>APAR: let the model fork itself</h2>
+<p>SoT and SGD use prompts and need at least two rounds of calls: one for the skeleton, one for the expansion. <b>APAR</b> (Auto-Parallel Auto-Regressive decoding, Liu et al., 2024) moves the planning <b>into the model</b>. The model is fine-tuned to emit a special control token, <code>[Fork]</code>, at points where the text that follows can be written in parallel. The paper compares it to the <code>fork()</code> system call of an operating system. [Certain]</p>
+<p>How it works:</p>
+<ul><li><b>Training data.</b> Answers with structure (numbered lists, several paragraphs) are turned into a tree of paragraph nodes. Each node has a short <b>root</b> (the first phrase or sentence) and the <b>detail</b> (the rest). The authors built about 16k structured samples from ShareGPT conversations, plus about 9k unstructured ones (code, math) kept as single nodes so the model learns <b>not</b> to fork there. They fine-tuned Vicuna v1.3 7B and 13B. [Certain, APAR paper]</li>
+<li><b>Attention during training.</b> Each node attends only to its ancestors and itself, not to its siblings. So the model learns to write a detail <b>without</b> seeing the other details, which is exactly the situation at inference time.</li>
+<li><b>Inference.</b> When the model samples <code>[Fork]</code> after a root, the engine creates a new sequence that shares the parent’s prefix, appends a forced <code>[Child]</code> token to it, and decodes it in the same batch. The child writes the detail; the parent goes on with the next root. When a thread ends, its KV cache can be freed, because no other thread attends to it. At the end, the tree is read in order to give the final text. [Certain]</li></ul>
+<div class="algo"><div class="algo-h">Algorithm 2: APAR fork decoding (one request)</div><ol>
+<li><b>input:</b> prompt \(p\); <b>state:</b> active threads \(\mathcal{A} \leftarrow \{\text{main}\}\), tree with one node</li>
+<li><b>while</b> \(\mathcal{A}\) is not empty:</li>
+<li>&nbsp;&nbsp;run one decode step for all threads in \(\mathcal{A}\) as one batch <span class="c">// each attends only to its path to the root</span></li>
+<li>&nbsp;&nbsp;<b>for</b> each thread \(s \in \mathcal{A}\) with new token \(x\):</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;<b>if</b> \(x = \texttt{[Fork]}\): create \(s'\) that shares the KV blocks of \(s\); append \(\texttt{[Child]}\) to \(s'\); add \(s'\) to \(\mathcal{A}\) <span class="c">// copy at most one block</span></li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;<b>else if</b> \(x = \texttt{[EOS]}\): remove \(s\) from \(\mathcal{A}\); free its own KV blocks</li>
+<li>&nbsp;&nbsp;&nbsp;&nbsp;<b>else</b>: append \(x\) to the current node of \(s\)</li>
+<li><b>return</b> the tree read in order (root, first child, next sibling)</li></ol></div>
+<p>The number of decode steps is the time at which the last thread ends. If child \(j\) is forked at step \(f_j\) and writes \(L_j\) tokens, and the main thread ends at step \(T_0\):</p>
+<div class="eq">\[ T_{\text{APAR}} = \max\Big( T_0,\ \max_j \big( f_j + L_j \big) \Big) \tag{91.6} \]</div>
+<p>APAR avoids three costs of SoT: no second round of prompts, no repeated question in the input, and no wasted skeleton (the roots <b>are</b> the skeleton, and they stay in the final text). With paged attention (vLLM), a fork copies at most one KV block and shares the rest. [Certain] The reported results: about 2× average speed-up on Vicuna Bench and 1.4× on MT-Bench at batch size 1, up to about 4× and 2.9× when combined with Medusa speculative decoding, and 20–70% higher throughput in a vLLM serving setting, with answer quality within about ±2% of the original model by GPT-4 judgment. [Certain, APAR paper]</p>
+<figure class="fig wide" id="oo-apar"><div class="fig-body">
+<div class="oo-grid"><label for="oo-apar-t">Decode step</label><input type="range" id="oo-apar-t" min="0" max="67" step="1" value="35"><output id="oo-apar-tv"></output></div>
+<div class="controls" style="margin-top:8px"><label class="sl"><input type="checkbox" id="oo-apar-share" checked> Share the parent’s KV blocks (paged attention) instead of copying them</label></div>
+<div class="scroll-x"><svg id="oo-apar-svg" viewBox="0 0 760 250" role="img" aria-label="Threads of an APAR answer over decode steps"></svg></div>
+<div class="oo-leg"><span style="--c:var(--k)">root text (main thread)</span><span style="--c:var(--bad)">[Fork] token</span><span style="--c:var(--q)">detail (child thread)</span><span style="--c:var(--muted)">intro and conclusion</span></div>
+<div class="readout" id="oo-apar-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> One APAR answer with a 20-token question, an intro of 10 tokens, three list items (root of 6 tokens, then <code>[Fork]</code>), and a 12-token conclusion. The three details have 30, 22 and 36 tokens and are written by child threads. Written in one chain, the same 128 tokens need 128 steps.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Each row is one thread; the horizontal axis is the decode step. Move the slider: the main thread writes a root, emits <code>[Fork]</code>, and a child row starts on the next step. During the overlap, several tokens are made per step. The readout counts the KV cache in tokens. With sharing, the cache holds the question, the main thread, and the details of the threads still running. Without sharing (the paper’s plain Transformers version), each child holds its own copy of the parent’s prefix.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: the steps of Figure 3</div>
+<p>The main thread writes \(10 + 3 \times (6 + 1) + 12 = 43\) tokens (the 3 are the <code>[Fork]</code> tokens), so \(T_0 = 43\). The forks happen at steps 17, 24 and 31. The children end at \(17 + 30 = 47\), \(24 + 22 = 46\) and \(31 + 36 = 67\). By formula (91.6), \(T_{\text{APAR}} = \max(43, 47, 46, 67) = 67\) steps for 128 text tokens: a 1.91× reduction in steps. The last child decides the time, just like the longest point in SoT.</p></div>
+
+<h2>SGLang: programs of LLM calls, and sharing their prefixes</h2>
+<aside class="note analogy side"><span class="nt">Analogy</span>A library where people photocopy chapters. Without a cache, every reader copies the book from page 1. With a radix tree, the library keeps the copies already made, arranged like a family tree of “same first pages”. A new reader takes the longest stack that matches their book and copies only the pages after it. When the shelf is full, the library throws away the stack nobody touched for the longest time, starting with the ends of branches.</aside>
+<p>SoT, SGD and agent pipelines all turn one user request into a <b>program</b> of many LLM calls, and these calls share long beginnings: the same system prompt, the same question, the same skeleton. If the engine treats every call as a fresh request, it computes the KV cache of the shared part again and again. <b>SGLang</b> (Zheng et al., 2023) fixes this from both sides. [Certain]</p>
+<ul><li><b>The front end</b> is a small language embedded in Python. A program builds a prompt state with <code>+=</code>, and uses primitives: <code>gen</code> (generate into a named variable, optionally with a regex constraint), <code>select</code> (pick the most likely option from a list), <code>fork</code> and <code>join</code> (make parallel copies of the state, and merge them), and <code>image</code> / <code>video</code> for multimodal input. [Certain, SGLang paper] SoT is a few lines: one <code>gen</code> for the skeleton, a <code>fork</code> into \(K\) copies, one <code>gen</code> per copy.</li>
+<li><b>The runtime</b> keeps every computed KV cache in a <b>radix tree</b> (<b>RadixAttention</b>). A radix tree is a prefix tree in which one edge can hold a whole run of tokens. Every path from the root is a token sequence whose KV cache is in GPU memory. A new request walks down the tree, reuses the KV cache of the longest matching prefix, and only computes the rest.</li></ul>
+<p>How much does sharing save? Let request \(r\) have prompt \(p_r\). Without sharing, prefill computes \(\sum_r |p_r|\) tokens. With a perfect prefix cache, it computes only the tokens that are new to the tree: the size of the union of all prefixes. The <b>cache hit rate</b> is the share of prompt tokens that were reused:</p>
+<div class="eq">\[ h = 1 - \frac{\big|\bigcup_r \text{prefixes}(p_r)\big|}{\sum_r |p_r|} \tag{91.7} \]</div>
+<p>Sharing also saves <b>memory</b>, not only compute. For a fork of \(K\) branches after a shared prefix of \(n_p\) tokens, where branch \(i\) adds \(L_i\) tokens:</p>
+<div class="eq">\[ M_{\text{shared}} = \Big(n_p + \sum_{i=1}^{K} L_i\Big)\, m_{kv}, \qquad M_{\text{copied}} = \Big(K n_p + \sum_{i=1}^{K} L_i\Big)\, m_{kv} \tag{91.8} \]</div>
+<div class="algo"><div class="algo-h">Algorithm 3: RadixAttention for one new request</div><ol>
+<li><b>input:</b> token sequence \(p\); radix tree \(\mathcal{T}\) whose nodes hold KV blocks, a reference count and a last-used time</li>
+<li>\(v, m \leftarrow \text{match\_prefix}(\mathcal{T}, p)\) <span class="c">// deepest node v; m = number of matched tokens (an edge may be split)</span></li>
+<li>increase the reference count of every node on the path to \(v\) <span class="c">// in use: cannot be evicted</span></li>
+<li><b>while</b> free memory \(\lt\) memory for \(|p| - m\) new tokens: evict the least recently used <b>leaf</b> with reference count 0</li>
+<li>prefill only \(p[m:]\), attending to the cached KV of \(p[:m]\); then decode</li>
+<li>insert the new prompt tokens and the generated tokens below \(v\); when the request ends, decrease the reference counts</li></ol></div>
+<p>Evicting leaves first keeps shared ancestors (like a system prompt) alive as long as possible. A node can only be evicted when no running request uses it. [Certain] The scheduler also helps: it orders waiting requests by the length of their matched prefix (longest first), so requests that share a prefix run close together while that prefix is still in the cache. For a batch known in advance and a cache at least as large as the longest request, the paper proves that a depth-first visit of the tree gives the best possible hit rate, and longest-prefix-first matches that order. Online it is only an approximation, and it can starve requests with no match, so real schedulers mix in fairness. [Certain, SGLang paper]</p>
+
+<figure class="fig wide" id="oo-rdx"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="oo-rdx-prev">Back</button><button type="button" class="btn primary" id="oo-rdx-play">Play</button><button type="button" class="btn" id="oo-rdx-next">Next</button><span id="oo-rdx-lab" class="oo-lab"></span></div>
+<div class="scroll-x"><svg id="oo-rdx-svg" viewBox="0 0 780 330" role="img" aria-label="Radix tree of cached prefixes growing as requests arrive"></svg></div>
+<div class="oo-leg"><span style="--c:var(--v)">reused from the cache</span><span style="--c:var(--k)">prompt tokens computed now</span><span style="--c:var(--q)">tokens generated now</span><span style="--c:var(--rule)">cached earlier, not used now</span></div>
+<div class="readout" id="oo-rdx-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> A radix tree of cached KV, built by eight requests to one engine: two few-shot questions with the same 300-token system prompt and 500 tokens of examples, a two-turn chat, and one SoT program (a skeleton, then three point expansions created by <code>fork</code>). Numbers in the boxes are token counts. For clarity, each box is one prompt part; the real tree splits edges at any token.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Press Next to send the next request. Green boxes are the matched prefix: their KV is read from the cache, not computed. Orange boxes are new prompt tokens that prefill must compute. Blue boxes are the answer, which is also added to the tree; that is why the second chat turn reuses the first answer. The readout gives the hit rate of formula (91.7), for this request and for all requests so far.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: what the tree in Figure 4 saves</div>
+<p>The eight requests have \(4{,}084\) prompt tokens in total. With the radix tree, \(3{,}060\) of them are found in the cache, so prefill computes only \(1{,}024\) tokens: a hit rate of \(3{,}060 / 4{,}084 = 74.9\%\). The three SoT point requests each have a 408-token prompt and reuse 400 of those tokens.</p>
+<p>Memory, by formula (91.8), for the three SoT branches of Llama 2 7B: the shared prefix is \(n_p = 300 + 60 + 40 = 400\) tokens, and each branch adds \(8 + 100 = 108\). Shared: \((400 + 324) \times 0.5 \text{ MiB} = 362\) MiB. Copied: \((1{,}200 + 324) \times 0.5 \text{ MiB} = 762\) MiB, more than twice as much.</p></div>
+<p>The SGLang paper reports up to 6.4× higher throughput and up to 3.7× lower latency than other systems (Guidance, vLLM, LMQL) on agent, reasoning, few-shot, JSON, RAG and multi-turn chat workloads, with cache hit rates between 50% and 99%. [Certain, SGLang paper] Two other runtime tricks are worth knowing. A <b>compressed finite-state machine</b> speeds up constrained output such as JSON: when the regex allows only one continuation (like <code>{"name": "</code>), several tokens are added in one step instead of one per step. And <b>API speculative execution</b> lets the first <code>gen</code> call to a closed API run past its stop point, so later fields of a template may already be filled, saving a call. [Certain] The serving side of prefix caching is covered in <a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>.</p>
+
+<h2>Model cascades: try the small model first</h2>
+<p>The methods above make one answer faster. A <b>cascade</b> makes the average answer <b>cheaper</b>. Most requests are easy. A small model answers them correctly; only some need the largest model. FrugalGPT (Chen et al., 2023) studied paid LLM APIs whose prices differed by two orders of magnitude, and proposed the <b>LLM cascade</b>: send the query to a list of models, cheapest first, and stop as soon as an answer is judged reliable. [Certain]</p>
+<p>The judge is a <b>scoring function</b> \(g(q, a) \in [0, 1]\) that estimates how likely answer \(a\) to query \(q\) is correct. In FrugalGPT it is a small DistilBERT regression model, trained on examples of correct and wrong answers, and far cheaper than any of the LLMs. [Certain] Each model \(i\) in the list has a threshold \(\tau_i\). For two models, small (s) and big (b), with prices \(c_s\) and \(c_b\), and the share of queries the small model keeps \(a(\tau) = P(g \ge \tau)\):</p>
+<div class="eq">\[ \E[C](\tau) = c_s + \big(1 - a(\tau)\big)\, c_b \tag{91.9} \]</div>
+<div class="eq">\[ \text{Acc}(\tau) = P\big(g \ge \tau,\ \text{small correct}\big) + P\big(g \lt \tau,\ \text{big correct}\big) \tag{91.10} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\tau\)</dt><dd>the threshold: keep the small answer when its score is at least \(\tau\); raising it sends more queries to the big model</dd>
+<dt>\(a(\tau)\)</dt><dd>acceptance rate: share of queries answered by the small model alone</dd>
+<dt>\(c_s, c_b\)</dt><dd>cost of one call to the small and the big model (the small one is always paid, even when its answer is rejected)</dd></dl>
+<p>With more models, FrugalGPT picks the ordered list \(L\) of APIs and all thresholds to maximize expected answer quality under a budget \(b\):</p>
+<div class="eq">\[ \max_{L,\ \tau}\ \E\big[r(a,\, f_{L_z}(q))\big] \quad \text{s.t.} \quad \E\Big[\sum_{i=1}^{z} c_{L_i}(q)\Big] \le b \tag{91.11} \]</div>
+<p>Here \(z\) is the position in the list where the cascade stops for query \(q\), \(f_{L_z}\) is the model at that position, and \(r\) is the reward (for example 1 if the answer is right). This is a hard mixed-integer problem; the paper prunes candidate lists and uses a fast approximate search. In the experiments the lists have length 3. [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 4: an LLM cascade at inference time</div><ol>
+<li><b>input:</b> query \(q\); models \(f_{L_1}, \dots, f_{L_m}\) from cheap to expensive; thresholds \(\tau_1, \dots, \tau_{m-1}\); scorer \(g\)</li>
+<li><b>for</b> \(i = 1 \dots m - 1\):</li>
+<li>&nbsp;&nbsp;\(a \leftarrow f_{L_i}(q)\); pay \(c_{L_i}\)</li>
+<li>&nbsp;&nbsp;<b>if</b> \(g(q, a) \ge \tau_i\): <b>return</b> \(a\) <span class="c">// reliable enough: stop here</span></li>
+<li><b>return</b> \(f_{L_m}(q)\) <span class="c">// the last model always answers</span></li></ol></div>
+<p>The real example from the paper, on the HEADLINES dataset with a budget one fifth of GPT-4’s cost: ask GPT-J; accept if the score is above 0.96; otherwise ask J1-L; accept if above 0.37; otherwise ask GPT-4. Across datasets, FrugalGPT matched the best single model at 98.3%, 73.3% and 59.2% lower cost (HEADLINES, OVERRULING, COQA), and could also beat GPT-4’s accuracy by up to 4% at the same cost. [Certain, FrugalGPT paper] How can a cascade beat the big model? The small model is sometimes right where the big one is wrong, and a good scorer keeps exactly those answers.</p>
+<figure class="fig" id="oo-cas"><div class="fig-body">
+<div class="oo-grid">
+<label for="oo-cas-t">Threshold \(\tau\)</label><input type="range" id="oo-cas-t" min="0" max="1" step="0.02" value="0.5"><output id="oo-cas-tv"></output>
+<label for="oo-cas-q">Scorer quality</label><input type="range" id="oo-cas-q" min="0" max="5" step="0.5" value="2.5"><output id="oo-cas-qv"></output>
+<label for="oo-cas-r">Price ratio \(c_b / c_s\)</label><input type="range" id="oo-cas-r" min="2" max="50" step="1" value="20"><output id="oo-cas-rv"></output></div>
+<svg id="oo-cas-svg" viewBox="0 0 640 300" role="img" aria-label="Accuracy against cost of a two-model cascade for all thresholds"></svg>
+<div class="oo-leg"><span style="--c:var(--q)">cascade, all thresholds</span><span style="--c:var(--k)">your threshold</span><span style="--c:var(--muted)">small only / big only</span><span style="--c:var(--v)">perfect scorer</span></div>
+<div class="readout" id="oo-cas-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> A simulated two-model cascade on 2,000 synthetic queries (seeded, not a benchmark). Each query has a hidden difficulty; the small model is right on about 69% of queries, the big one on about 93%. The scorer sees whether the small answer is right only through noise; “scorer quality” sets how strong that signal is. Cost is shown as a share of always calling the big model.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>The blue curve shows every threshold from 0 (always keep the small answer, bottom left) to 1 (always escalate, top right, a bit more expensive than the big model alone because the small call is still paid). Good cascades lie toward the top left. Set scorer quality to 0: the scorer is random, and the curve becomes a straight line between the two models, so the cascade buys nothing. At high quality the curve bends up toward the green point of a perfect scorer, which beats the big model alone. Lower the price ratio: when the big model is only 2× more expensive, paying for the small call first is rarely worth it.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: the default point of Figure 5</div>
+<p>With \(\tau = 0.5\) and scorer quality 2.5, the small answer is rejected for 689 of the 2,000 queries (34.45%). With \(c_s = 1\) and \(c_b = 20\), formula (91.9) gives \(\E[C] = 1 + 0.3445 \times 20 = 7.89\), which is \(7.89/20 = 39.4\%\) of the cost of the big model alone. Accuracy is 92.45%, against 93.35% for the big model alone and 68.8% for the small one. Raise \(\tau\) to 0.7: 40.9% of queries escalate, cost 45.9%, accuracy 93.4%, the same as the big model at less than half the price.</p></div>
+<p>The survey places cascades in its model-level section rather than in output organization. [Certain] We put them here because they answer the same engineering question: how to organize the work of one request so that the expensive part is done only where it is needed. The same idea appears in early exit (<a href="../inference/dynamic-inference-early-exit-and-layer-skipping.html">session 121</a>) and in speculative decoding, where a small model drafts and a big one checks.</p>
+
+<h2>Code: shared-prefix parallel expansion and a cascade in PyTorch</h2>
+<p>The code builds a tiny decoder with a KV cache. It prefills a shared prefix <b>once</b>, gives three “point” branches a view of that cache (no copy), decodes them as one batch, and checks that the result is exactly the same as three separate full runs. Then it evaluates a two-model cascade on the same synthetic setting as Figure 5. It runs on a CPU in about a second, with fixed seeds.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+V, D, H = 50, 32, 4                      <span class="cm"># vocab, width, heads</span>
+
+<span class="kw2">class</span> TinyLM(torch.nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.emb = torch.nn.Embedding(V, D); s.pos = torch.nn.Embedding(256, D)
+        s.qkv = torch.nn.Linear(D, 3 * D); s.out = torch.nn.Linear(D, D)
+        s.mlp = torch.nn.Sequential(torch.nn.Linear(D, 4 * D), torch.nn.GELU(), torch.nn.Linear(4 * D, D))
+        s.head = torch.nn.Linear(D, V)
+    <span class="kw2">def</span> forward(s, ids, cache=None):      <span class="cm"># ids (B, T); cache = (K, V), each (B, H, T_old, D/H)</span>
+        B, T = ids.shape
+        t0 = 0 <span class="kw2">if</span> cache <span class="kw2">is</span> None <span class="kw2">else</span> cache[0].shape[2]
+        x = s.emb(ids) + s.pos(torch.arange(t0, t0 + T))
+        q, k, v = s.qkv(x).view(B, T, 3, H, D // H).permute(2, 0, 3, 1, 4)
+        <span class="kw2">if</span> cache <span class="kw2">is not</span> None:
+            k = torch.cat([cache[0], k], 2); v = torch.cat([cache[1], v], 2)
+        mask = torch.ones(T, t0 + T, dtype=torch.bool).tril(t0)   <span class="cm"># causal, shifted by the cache</span>
+        a = F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        x = x + s.out(a.transpose(1, 2).reshape(B, T, D))
+        x = x + s.mlp(x)
+        <span class="kw2">return</span> s.head(x), (k, v)
+
+@torch.no_grad()
+<span class="kw2">def</span> greedy(model, logits, cache, steps):  <span class="cm"># decode `steps` tokens for every row of the batch</span>
+    out = []
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(steps):
+        nxt = logits[:, -1].argmax(-1, keepdim=True); out.append(nxt)
+        logits, cache = model(nxt, cache)
+    <span class="kw2">return</span> torch.cat(out, 1)
+
+model = TinyLM().eval()
+prefix = torch.randint(0, V, (1, 40))     <span class="cm"># system prompt + question + skeleton (shared)</span>
+points = torch.randint(0, V, (3, 4))      <span class="cm"># "expand point i" tokens, one row per point</span>
+
+<span class="kw2">with</span> torch.no_grad():
+    <span class="cm"># 1) SoT expansion with a shared prefix: prefill the prefix ONCE, then share its KV cache</span>
+    _, (k, v) = model(prefix)
+    shared = (k.expand(3, -1, -1, -1), v.expand(3, -1, -1, -1))   <span class="cm"># a view, formula (91.8): no copy</span>
+    logits, cache = model(points, shared)
+    batched = greedy(model, logits, cache, 12)   <span class="cm"># all 3 points decoded together as one batch</span>
+
+    <span class="cm"># 2) the same three expansions, one by one, each with its own full prefill</span>
+    alone = torch.cat([greedy(model, *model(torch.cat([prefix, points[i:i+1]], 1)), 12)
+                       <span class="kw2">for</span> i <span class="kw2">in</span> range(3)])
+
+print(<span class="st">"same tokens:"</span>, torch.equal(batched, alone))                       <span class="cm"># True</span>
+print(<span class="st">"prefill tokens, shared vs not:"</span>, 40 + 3 * 4, <span class="st">"vs"</span>, 3 * (40 + 4))  <span class="cm"># 52 vs 132</span>
+
+<span class="cm"># 3) a two-model cascade, formulas (91.9) and (91.10)</span>
+<span class="kw2">def</span> cascade(score, small_ok, big_ok, tau, c_small=1.0, c_big=20.0):
+    accept = score &gt;= tau
+    acc = torch.where(accept, small_ok, big_ok).float().mean().item()
+    cost = (c_small + (~accept).float().mean().item() * c_big) / c_big
+    <span class="kw2">return</span> acc, cost
+
+g = torch.Generator().manual_seed(0)
+d = torch.rand(2000, generator=g)                                      <span class="cm"># hidden difficulty</span>
+small_ok = torch.rand(2000, generator=g) &lt; torch.sigmoid((0.7 - d) * 10)
+big_ok   = torch.rand(2000, generator=g) &lt; torch.sigmoid((1.0 - d) * 10)
+noise = torch.logit(torch.rand(2000, generator=g))
+score = torch.sigmoid(2.5 * (small_ok.float() * 2 - 1) + noise)           <span class="cm"># a noisy judge</span>
+<span class="kw2">for</span> tau <span class="kw2">in</span> (0.3, 0.5, 0.7):
+    acc, cost = cascade(score, small_ok, big_ok, tau)
+    print(f<span class="st">"tau={tau}: accuracy {acc:.3f}, cost {cost:.3f} of big-only"</span>)
+<span class="cm"># tau=0.3: accuracy 0.901, cost 0.321 | tau=0.5: 0.920, 0.372 | tau=0.7: 0.933, 0.441</span>
+print(f<span class="st">"small only {small_ok.float().mean():.3f}, big only {big_ok.float().mean():.3f}"</span>)  <span class="cm"># 0.698, 0.934</span></pre>
+<p>Two details matter. <code>expand</code> makes a view with stride 0 along the batch, so the prefix KV exists once in memory; the new tokens of each branch are concatenated per row, as a paged engine does with its own blocks. And the output is <b>exactly</b> equal: sharing a prefix changes the cost, never the math. (The synthetic cascade numbers differ slightly from Figure 5 because the random generator is different.)</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Technique</th><th>Why it fits</th></tr></thead><tbody>
+<tr><td>Chat assistant answering “list” questions (tips, pros and cons, comparisons)</td><td>SoT with a router (SoT-R), or an APAR-tuned model</td><td>Points are independent; latency at batch 1 is set by the number of sequential steps</td></tr>
+<tr><td>Agents and tool pipelines with a long system prompt</td><td>SGLang programs; prefix caching (RadixAttention)</td><td>Every call repeats the same thousands of tokens of instructions and tool descriptions</td></tr>
+<tr><td>Few-shot classification of many items</td><td>Shared few-shot prefix in the radix tree; <code>select</code> over the label set</td><td>Hit rates near the top of the 50–99% range; one forward pass scores the options</td></tr>
+<tr><td>Video summarization by chapters</td><td>Skeleton of chapter titles (from shot boundaries), then parallel expansion per chapter</td><td>Chapters can be described independently; the video tokens are the shared prefix</td></tr>
+<tr><td>Video-RAG and video question answering (several questions on one clip)</td><td>Prefix sharing of the encoded video tokens; <code>fork</code> per question</td><td>A clip can be thousands of visual tokens; prefill them once, not once per question [Likely]</td></tr>
+<tr><td>Key-moment detection and captioning of a long broadcast</td><td>Cascade: a small vision-language model screens every segment; a large model only describes the candidates</td><td>Most segments are uneventful; the big model runs on a small share of them</td></tr>
+<tr><td>Content moderation, video classification, and fingerprint-match review</td><td>Cascade with a calibrated scorer and a budget (formula 91.11)</td><td>Cheap decisions for clear cases; expensive review only near the decision boundary</td></tr>
+<tr><td>High-load serving (big batches)</td><td>APAR in vLLM; prefix caching</td><td>Batch is already large, so the gain comes from fewer cached and attended tokens, not from free compute</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Using SoT for every question.</b> On math, code and step-by-step reasoning, points depend on each other and quality drops. Use a router, or a graph method.</li>
+<li><b>Expecting a K-times speed-up.</b> Formula (91.4) is limited by the longest point and by the skeleton. Uneven points and a long skeleton can turn the gain into a loss (Figure 1 with \(K = 1\)).</li>
+<li><b>Forgetting that SoT needs free compute.</b> On a server that already runs a big batch, decoding is closer to compute-bound and the extra branches compete with other users. The latency gain shrinks and throughput does not grow.</li>
+<li><b>Copying the prefix KV for every branch.</b> Without prefix sharing, memory grows with \(K n_p\) (formula 91.8), and the batch of other users that fits shrinks.</li>
+<li><b>Breaking prefix reuse by accident.</b> A timestamp or user name at the <b>start</b> of the system prompt makes every request different from token 1, so the hit rate is 0. Put the fixed parts first and the changing parts last.</li>
+<li><b>Using the LLM’s own confidence as the cascade score without checking calibration.</b> Token probabilities are often over-confident; FrugalGPT trains a separate scorer on labeled answers. Measure accuracy and cost on held-out data at each threshold.</li>
+<li><b>Ignoring the cost of the first call.</b> In a cascade the cheap model is always paid. If most queries escalate, or the price ratio is small, the cascade costs more than the big model alone.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Skeleton-of-Thought generates about as many tokens as a normal answer. Why can it be faster?<span class="lvl">basic</span></summary><div class="ans">At small batch, a decode step is memory-bound: its time is mostly reading the weights once (formula 91.1). A step with 5 sequences costs almost the same as a step with 1 but makes 5 tokens. SoT turns a chain of \(N\) dependent tokens into a short skeleton plus \(K\) chains that run side by side, so the number of sequential steps falls from \(N\) to about \(L_s + \max_i L_i\).</div></details>
+<details class="qa"><summary>When does SoT hurt, and what do you do about it?<span class="lvl">core</span></summary><div class="ans">When points depend on each other (math, coding, Fermi estimates, stories), each expansion is written without the text it needs, and quality drops. Also when the answer is short or has one dominant point, since the skeleton is wasted sequential work. Fixes: a router (SoT-R) that sends only suitable questions to SoT; a dependency graph (SGD) so dependent parts wait for their parents; or a model trained to fork only where it is safe (APAR).</div></details>
+<details class="qa"><summary>Estimate the SoT speed-up for 4 points of 50, 50, 50 and 150 tokens with a 20-token skeleton.<span class="lvl">core</span></summary><div class="ans">By formula (91.4): \(N = 300\), and the sequential steps are \(20 + 150 = 170\), so \(S \approx 300/170 = 1.76\). If the same 300 tokens were split evenly (75 each), \(S \approx 300/95 = 3.16\). The longest point decides; prompts that ask for balanced, short points help.</div></details>
+<details class="qa"><summary>How do SoT and speculative decoding differ? Can you combine them?<span class="lvl">core</span></summary><div class="ans">Speculative decoding keeps the exact output distribution: a draft proposes tokens and the target model verifies them in one pass, so it speeds up each chain. SoT changes the output itself (a different prompt, so a different answer) and runs several chains in parallel. They are independent and can be combined: APAR with Medusa heads reached about 4× on Vicuna Bench versus about 2× for APAR alone.</div></details>
+<details class="qa"><summary>What does APAR change compared with SoT?<span class="lvl">core</span></summary><div class="ans">APAR fine-tunes the model to emit <code>[Fork]</code> where the following text can be parallel; the engine starts a child thread that shares the parent’s KV prefix. There is no separate skeleton call, no re-sent question, and the roots stay in the final text. Training uses a tree attention mask so a node sees only its ancestors, matching inference. The cost is fine-tuning, and it needs engine support for forking.</div></details>
+<details class="qa"><summary>Explain RadixAttention: data structure, matching and eviction.<span class="lvl">core</span></summary><div class="ans">All cached KV is stored as paths in a radix tree over token sequences; edges can hold many tokens. A new request finds its longest matching prefix, reuses that KV, and computes only the rest; its prompt and output are inserted into the tree. Nodes in use by running requests have a reference count above 0 and cannot be evicted. When memory is needed, the least recently used leaf with count 0 is evicted, so shared ancestors live longest. Cached and running tokens share one memory pool.</div></details>
+<details class="qa"><summary>Why does SGLang schedule by longest shared prefix first, and what is the risk?<span class="lvl">advanced</span></summary><div class="ans">Requests that share a prefix should run while that prefix is still cached; ordering by match length approximates a depth-first walk of the tree, which the paper proves gives the best hit rate for an offline batch when the cache holds at least one full request. The risk is starvation: requests with no match keep waiting. Real schedulers add fairness, priorities or aging, and must also respect latency goals.</div></details>
+<details class="qa"><summary>Design a two-model cascade for a classification API. How do you set the threshold?<span class="lvl">core</span></summary><div class="ans">Collect a labeled set; run both models; train a cheap scorer \(g(q, a)\) to predict whether the small answer is right. On held-out data, sweep \(\tau\), computing cost with (91.9) and accuracy with (91.10). Pick the cheapest \(\tau\) that meets the accuracy target (or the most accurate within budget, 91.11). Monitor the escalation rate in production, since a shift in traffic changes both cost and accuracy.</div></details>
+<details class="qa"><summary>How can a cascade be more accurate than the big model alone?<span class="lvl">advanced</span></summary><div class="ans">The two models make different errors. On some queries the small model is right and the big one is wrong. If the scorer keeps the small answer exactly on those, and escalates when the small one is wrong, accuracy is that of “either model right”, above either alone (the green point in Figure 5). FrugalGPT reported up to 4% better accuracy than GPT-4 at the same cost. This needs a scorer that is good, not just confident.</div></details>
+<details class="qa"><summary>Your server already runs batches of 128. Will SoT still lower latency?<span class="lvl">advanced</span></summary><div class="ans">Much less. At large batch, the step is closer to compute-bound and every extra branch takes compute from other users; per-step time rises with \(B\), so formula (91.4) no longer has a flat denominator. SoT also adds prefill and tokens. Overall throughput does not improve and may fall. APAR’s gains at high load come from a different source: fewer cached and attended tokens per thread (children see only their path), which let more requests fit (20–70% higher throughput in its vLLM tests).</div></details>
+<details class="qa"><summary>A team reports a 10% prefix-cache hit rate on a chat product with a 2,000-token system prompt. What do you check?<span class="lvl">advanced</span></summary><div class="ans">Whether the prompt really is identical at the token level: dynamic content (date, user name, request id) placed early breaks every match; different chat templates or tool lists per user also break it. Then whether the cache is evicted before reuse (too little memory, or a load balancer that spreads one user’s turns across many replicas; use cache-aware routing). Also check that turn \(n+1\) re-sends turn \(n\) exactly as it was generated.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>With formula (91.4), compute the ideal SoT speed-up for 6 equal points of 80 tokens and a 40-token skeleton. What happens if one of the points grows to 200 tokens (the others stay at 80)?</li>
+<li>In Figure 2, add an edge P2 → P3. What is the new critical path for “as soon as ready”?</li>
+<li>An APAR answer has a main thread of 30 tokens with forks at steps 8, 15 and 22; the children have 25, 40 and 10 tokens. How many decode steps does it take? How many text tokens are written in total, if the main thread includes 3 fork tokens?</li>
+<li>Ten requests share a 1,500-token prefix and each adds 100 new tokens. Compute the prefill tokens with and without prefix sharing, and the hit rate (91.7).</li>
+<li>A small model costs \$0.2 and a big one \$3 per 1,000 queries’ worth of tokens. The cascade escalates 25% of queries. What is the cost per 1,000 queries and the saving against always using the big model? At what escalation rate does the cascade stop saving money?</li>
+<li>Write an SGLang-style program (pseudo-code) for SoT that uses <code>gen</code>, <code>fork</code> and <code>join</code>. Which part of the KV cache is shared, and which is not?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(N = 480\); \(S \approx 480/(40 + 80) = 4.0\). With one point at 200: \(N = 600\), \(S \approx 600/(40 + 200) = 2.5\). 2. P3 now starts at \(\max(60, 80) = 80\) and ends at 130; P4 still ends at 120, so the critical path is 130 steps. 3. Children end at \(8 + 25 = 33\), \(15 + 40 = 55\), \(22 + 10 = 32\); the main thread ends at 30, so 55 steps. Text tokens: \(30 - 3 + 25 + 40 + 10 = 102\), so 102 sequential steps without APAR: 1.85× fewer steps. 4. Without sharing: \(10 \times 1{,}600 = 16{,}000\). With sharing: \(1{,}500 + 10 \times 100 = 2{,}500\). Hit rate \(1 - 2{,}500/16{,}000 = 84.4\%\). 5. \(0.2 + 0.25 \times 3 = \$0.95\) against \$3: a saving of 68.3%. Break-even: \(0.2 + e \cdot 3 = 3\), so \(e = 93.3\%\). 6. <code>s += question; s += "Skeleton:" + gen("sk", stop="\n\n"); fs = s.fork(K); for i, f in enumerate(fs): f += f"Expand point {i+1}:" + gen("e", max_tokens=128); s.join(fs)</code>. The KV of the question and the skeleton (the state before <code>fork</code>) is shared by all branches through the radix tree; each branch’s instruction and expansion tokens are its own.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>At small batch, a decode step costs about the same for 1 or 5 sequences (91.1). Output organization uses this to cut the number of <b>sequential</b> steps of one answer (91.2, 91.3).</li>
+<li>Skeleton-of-Thought: outline, then parallel expansion. Speed-up \(\approx \sum L_i / (L_s + \max L_i)\) (91.4); up to 2.39× reported on 12 models. Use a router; it hurts on math and code.</li>
+<li>Graph decoding (SGD) runs parts as soon as their parents end; time is the critical path (91.5). APAR trains the model to emit <code>[Fork]</code> and runs children with a shared prefix; time is the last thread’s end (91.6).</li>
+<li>SGLang programs plus RadixAttention reuse KV for every shared prefix: hit rate (91.7), memory saving (91.8), LRU eviction of unused leaves, longest-prefix-first scheduling.</li>
+<li>Cascades (FrugalGPT) send queries to the cheap model first and escalate by a learned score; cost (91.9) and accuracy (91.10) are traded with one threshold, or optimized under a budget (91.11).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ t_{\text{step}}(B) \approx \frac{M_W + B c\, m_{kv}}{\text{BW}}, \qquad S_{\text{SoT}} \approx \frac{\sum_i L_i}{L_s + \max_i L_i}, \qquad F(v) = \max_{u \in \text{pa}(v)} F(u) + L_v \]</div>
+<div class="eq">\[ h = 1 - \frac{|\bigcup_r \text{prefixes}(p_r)|}{\sum_r |p_r|}, \qquad \E[C] = c_s + (1 - a(\tau))\, c_b \]</div>
+<h2 class="plain" id="output-organization-skeleton-of-thought-apar-sglang-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Ning et al. (2023). <a href="https://arxiv.org/abs/2307.15337" target="_blank" rel="noopener">Skeleton-of-Thought: Prompting LLMs for Efficient Parallel Generation</a></li><li>Liu et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;APAR: LLMs Can Do Auto-Parallel Auto-Regressive Decoding&amp;quot;" target="_blank" rel="noopener">APAR: LLMs Can Do Auto-Parallel Auto-Regressive Decoding</a></li><li>Zheng et al. (2023). <a href="https://arxiv.org/abs/2312.07104" target="_blank" rel="noopener">SGLang: Efficient Execution of Structured Language Model Programs</a></li><li>Chen et al. (2023). <a href="https://arxiv.org/abs/2305.05176" target="_blank" rel="noopener">FrugalGPT: How to Use Large Language Models While Reducing Cost and Improving Performance</a></li><li>Jin et al. (2024). <a href="https://arxiv.org/abs/2402.12280" target="_blank" rel="noopener">Adaptive Skeleton Graph Decoding (later version: Plato: Plan to Efficiently Decode for Large Language Model Inference)</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Cai et al. (2024). <a href="https://arxiv.org/abs/2401.10774" target="_blank" rel="noopener">Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/rag-as-input-compression-flare-replug-self.html"><small>Previous · session 90</small>RAG as input compression: FLARE, REPLUG, Self-RAG</a><a class="next" href="../inference/lab-compress-a-long-rag-prompt.html"><small>Next · session 92</small>compress a long RAG prompt</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="output-organization-skeleton-of-thought-apar-sglang"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fmt=(v,d)=>v.toLocaleString("en-US",{minimumFractionDigits:d,maximumFractionDigits:d});
+function rng(s){return function(){s|=0;s=s+0x6D2B79F5|0;let t=Math.imul(s^s>>>15,1|s);t=t+Math.imul(t^t>>>7,61|t)^t;return((t^t>>>14)>>>0)/4294967296;};}
+const txt=(x,y,s,o)=>{o=o||{};return `<text x="${x}" y="${y}" font-size="${o.fs||13}" text-anchor="${o.a||"start"}" fill="${o.c||"var(--ink2)"}" font-family="var(--sans)"${o.w?` font-weight="${o.w}"`:""}>${s}</text>`;};
+
+/* ---------- Figure 1: SoT latency timeline ---------- */
+(function(){
+ const svg=$("#oo-sot-svg");if(!svg)return;const K=$("#oo-sot-k"),Mn=$("#oo-sot-m"),U=$("#oo-sot-u"),Ls=$("#oo-sot-s"),info=$("#oo-sot-info");
+ const P=6.74e9,W=2*P,KV=2*32*32*128*2,BW=2.0e12,F=312e12,Q=50,SKT=150,EXT=150;
+ const tstep=(b,c)=>(W+b*c*KV)/BW, tpre=n=>Math.max(W/BW,2*P*n/F);
+ function lens(k,m,u){if(k===1)return[m];const a=[];for(let i=0;i<k;i++)a.push(Math.round(m*(1+u*(2*i/(k-1)-1))));return a;}
+ function draw(){const k=+K.value,m=+Mn.value,u=+U.value,ls=+Ls.value;$("#oo-sot-kv").value=k;$("#oo-sot-mv").value=m;$("#oo-sot-uv").value=u.toFixed(2);$("#oo-sot-sv").value=ls;
+  const L=lens(k,m,u),N=L.reduce((a,b)=>a+b,0),mx=Math.max(...L);
+  let tn=tpre(Q);for(let t=0;t<N;t++)tn+=tstep(1,Q+t);
+  let ts=tpre(Q+SKT);for(let s=0;s<ls;s++)ts+=tstep(1,Q+SKT+s);
+  const pre=Q+EXT+ls,tp=tpre(k*pre);let te=0;const fin=L.map(()=>0);
+  for(let s=0;s<mx;s++){let b=0;L.forEach(l=>{if(l>s)b++;});te+=tstep(b,pre+s);L.forEach((l,i)=>{if(l===s+1)fin[i]=te;});}
+  const tot=ts+tp+te,sp=tn/tot,est=N/(ls+mx);
+  const T=Math.max(tn,tot),x0=130,wd=610,X=t=>x0+t/T*wd;
+  let g="";const rowH=Math.min(20,190/k);
+  g+=txt(10,38,"Normal",{w:700})+`<rect x="${X(0)}" y="24" width="${X(tn)-X(0)}" height="20" rx="4" fill="var(--muted)" opacity=".75"/>`+txt(Math.min(X(tn)+6,700),39,fmt(tn*1e3,0)+" ms",{fs:12,a:X(tn)>690?"end":"start"});
+  g+=txt(10,78,"SoT skeleton",{w:700})+`<rect x="${X(0)}" y="64" width="${Math.max(1,X(ts)-X(0))}" height="20" rx="4" fill="var(--k)"/>`;
+  g+=`<rect x="${X(ts)}" y="64" width="${Math.max(1.5,X(ts+tp)-X(ts))}" height="20" fill="var(--rule)" stroke="var(--muted)" stroke-width=".6"/>`;
+  L.forEach((l,i)=>{const y=100+i*rowH;g+=txt(10,y+rowH*0.72,"point "+(i+1)+" ("+l+")",{fs:Math.min(12,rowH*0.75)})+`<rect x="${X(ts+tp)}" y="${y}" width="${Math.max(1,X(ts+tp+fin[i])-X(ts+tp))}" height="${rowH-3}" rx="3" fill="var(--q)" opacity="${l===mx?1:0.7}"/>`;});
+  const yb=100+k*rowH+12;g+=`<line x1="${X(tot)}" y1="58" x2="${X(tot)}" y2="${yb-6}" stroke="var(--q)" stroke-dasharray="4 3"/>`+txt(Math.min(X(tot)+6,700),yb-8,"SoT done: "+fmt(tot*1e3,0)+" ms",{fs:12,c:"var(--q)",w:700,a:X(tot)>600?"end":"start"});
+  const step=T>6000?2000:T>3000?1000:T>1500?500:250;g+=`<line x1="${x0}" y1="${yb+6}" x2="${x0+wd}" y2="${yb+6}" stroke="var(--muted)"/>`;
+  for(let t=0;t<=T*1000+1;t+=step){g+=`<line x1="${X(t/1000)}" y1="${yb+6}" x2="${X(t/1000)}" y2="${yb+11}" stroke="var(--muted)"/>`+txt(X(t/1000),yb+24,fmt(t,0),{fs:11,a:"middle",c:"var(--muted)"});}
+  g+=txt(x0+wd,yb+24,"",{});svg.setAttribute("viewBox",`0 0 760 ${yb+32}`);svg.innerHTML=g+txt(x0-8,yb+24,"ms",{fs:11,a:"end",c:"var(--muted)"});
+  const inN=Q,inS=(Q+SKT)+k*pre;
+  info.innerHTML=`Normal: <b>${fmt(tn*1e3,1)} ms</b> for ${N} tokens in ${N} steps. SoT: skeleton ${fmt(ts*1e3,1)} ms + expansion prefill ${fmt(tp*1e3,1)} ms + parallel expansion ${fmt(te*1e3,1)} ms (${mx} steps, longest point) = <b>${fmt(tot*1e3,1)} ms</b>. Speed-up <b>${sp.toFixed(2)}×</b>${sp<1?" (a slow-down)":""}; formula (91.4) estimate ${est.toFixed(2)}×. Input tokens sent: normal ${inN}, SoT ${fmt(inS,0)}.`;}
+ [K,Mn,U,Ls].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: dependency graph schedules ---------- */
+(function(){
+ const svg=$("#oo-dag-svg");if(!svg)return;const seg=$("#oo-dag-mode"),info=$("#oo-dag-info");let mode="asap";
+ const L={1:60,2:80,3:50,4:40},dep={1:[],2:[],3:[1],4:[1,2]},pos={1:[55,70],2:[55,190],3:[175,70],4:[175,190]};
+ function sched(m){const st={},en={};
+  if(m==="seq"){let t=0;[1,2,3,4].forEach(n=>{st[n]=t;t+=L[n];en[n]=t;});}
+  else if(m==="sot"){[1,2,3,4].forEach(n=>{st[n]=0;en[n]=L[n];});}
+  else if(m==="lvl"){const l0=Math.max(L[1],L[2]);st[1]=st[2]=0;en[1]=L[1];en[2]=L[2];st[3]=st[4]=l0;en[3]=l0+L[3];en[4]=l0+L[4];}
+  else{[1,2,3,4].forEach(n=>{st[n]=Math.max(0,...dep[n].map(d=>en[d]));en[n]=st[n]+L[n];});}
+  return{st,en};}
+ function draw(){const {st,en}=sched(mode);const T=Math.max(...Object.values(en));const x0=270,wd=380,X=t=>x0+t/230*wd;
+  let g=`<defs><marker id="oo-ah" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0L10 5L0 10z" fill="var(--muted)"/></marker></defs>`;
+  [[1,3],[1,4],[2,4]].forEach(([u,v])=>{const [a,b]=pos[u],[c,d]=pos[v];const dx=c-a,dy=d-b,l=Math.hypot(dx,dy);g+=`<line x1="${a+dx/l*30}" y1="${b+dy/l*30}" x2="${c-dx/l*32}" y2="${d-dy/l*32}" stroke="var(--muted)" stroke-width="1.8" marker-end="url(#oo-ah)"/>`;});
+  const bad=n=>dep[n].some(d=>en[d]>st[n]);
+  [1,2,3,4].forEach(n=>{const [a,b]=pos[n];g+=`<circle cx="${a}" cy="${b}" r="28" fill="var(--q-soft)" stroke="${bad(n)?"var(--bad)":"var(--q)"}" stroke-width="2"/>`+txt(a,b-2,"P"+n,{a:"middle",w:700,c:"var(--ink)"})+txt(a,b+14,L[n]+" tok",{a:"middle",fs:11,c:"var(--muted)"});});
+  [1,2,3,4].forEach((n,i)=>{const y=34+i*48;g+=txt(x0-8,y+17,"P"+n,{a:"end",w:700})+`<rect x="${X(st[n])}" y="${y}" width="${X(en[n])-X(st[n])}" height="24" rx="4" fill="${bad(n)?"var(--bad)":"var(--q)"}" opacity=".85"/>`+txt(X(en[n])+4,y+17,st[n]+"–"+en[n],{fs:11,c:"var(--muted)"});});
+  g+=`<line x1="${x0}" y1="232" x2="${x0+wd}" y2="232" stroke="var(--muted)"/>`;[0,50,100,150,200].forEach(t=>g+=`<line x1="${X(t)}" y1="232" x2="${X(t)}" y2="237" stroke="var(--muted)"/>`+txt(X(t),250,t,{fs:11,a:"middle",c:"var(--muted)"}));
+  g+=`<line x1="${X(T)}" y1="26" x2="${X(T)}" y2="232" stroke="var(--k)" stroke-dasharray="4 3"/>`+txt(x0+wd/2,266,"decode step",{fs:12,a:"middle",c:"var(--muted)"});svg.innerHTML=g;
+  const early=[1,2,3,4].filter(bad).map(n=>"P"+n);
+  info.innerHTML=`Total: <b>${T} decode steps</b> (normal: 230), so <b>${(230/T).toFixed(2)}×</b> fewer steps. ${early.length?`<b style="color:var(--bad)">${early.join(" and ")} started before their parents finished</b>: they are written without the text they depend on.`:"Every part sees the full text of the parts it depends on."}`;}
+ seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;mode=b.dataset.v;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));draw();});draw();
+})();
+
+/* ---------- Figure 3: APAR threads ---------- */
+(function(){
+ const svg=$("#oo-apar-svg");if(!svg)return;const S=$("#oo-apar-t"),SH=$("#oo-apar-share"),info=$("#oo-apar-info");
+ const PR=20,intro=10,root=6,concl=12,det=[30,22,36];const mainType=[];
+ for(let i=0;i<intro;i++)mainType.push("i");const forks=[];
+ for(let j=0;j<3;j++){for(let i=0;i<root;i++)mainType.push("r");mainType.push("f");forks.push(mainType.length);}
+ for(let i=0;i<concl;i++)mainType.push("i");const T0=mainType.length;const ends=forks.map((f,j)=>f+det[j]);const TEND=Math.max(T0,...ends);
+ const seqTok=intro+3*root+det.reduce((a,b)=>a+b,0)+concl;
+ function kv(t,share){if(t>=TEND)return 0;let k=PR+Math.min(t,T0);forks.forEach((f,j)=>{if(f<=t&&t<ends[j]){k+=1+Math.min(det[j],t-f);if(!share)k+=PR+f;}});return k;}
+ let pk={1:0,0:0};for(let t=0;t<=TEND;t++){pk[1]=Math.max(pk[1],kv(t,true));pk[0]=Math.max(pk[0],kv(t,false));}
+ const x0=110,sc=590/TEND,X=s=>x0+(s-1)*sc;const col={i:"var(--muted)",r:"var(--k)",f:"var(--bad)"};
+ function draw(){const t=+S.value,share=SH.checked;$("#oo-apar-tv").value=t;
+  let g="";const rows=[["main",0]].concat(forks.map((f,j)=>["child "+(j+1),j+1]));
+  rows.forEach(([nm,r])=>{const y=20+r*48;g+=txt(x0-10,y+17,nm,{a:"end",w:700});
+   if(r===0){mainType.forEach((ty,i)=>{const s=i+1;g+=`<rect x="${X(s)+0.5}" y="${y}" width="${Math.max(1,sc-1.2)}" height="24" rx="1.5" fill="${col[ty]}" opacity="${s<=t?1:0.15}"/>`;});}
+   else{const f=forks[r-1],L=det[r-1];g+=`<line x1="${X(f)+sc/2}" y1="44" x2="${X(f)+sc/2}" y2="${y+12}" stroke="var(--bad)" stroke-dasharray="3 3" opacity="${f<=t?1:0.25}"/>`;
+    for(let i=1;i<=L;i++){const s=f+i;g+=`<rect x="${X(s)+0.5}" y="${y}" width="${Math.max(1,sc-1.2)}" height="24" rx="1.5" fill="var(--q)" opacity="${s<=t?1:0.15}"/>`;}
+    g+=txt(X(f+L)+sc+3,y+17,"ends "+(f+L),{fs:11,c:"var(--muted)"});}});
+  g+=txt(X(T0)+sc+3,37,"ends "+T0,{fs:11,c:"var(--muted)"});
+  if(t>0)g+=`<line x1="${X(t)+sc}" y1="12" x2="${X(t)+sc}" y2="214" stroke="var(--ink)" stroke-width="1.5"/>`;
+  [1,10,20,30,40,50,60,67].forEach(s=>g+=txt(X(s)+sc/2,236,s,{fs:11,a:"middle",c:"var(--muted)"}));svg.innerHTML=g;
+  const fk=forks.filter(f=>f<=t).length,mainText=Math.min(t,T0)-fk;const ch=forks.map((f,j)=>Math.max(0,Math.min(det[j],t-f)));const text=mainText+ch.reduce((a,b)=>a+b,0);
+  const act=(t<T0?1:0)+forks.filter((f,j)=>f<=t&&t<ends[j]).length;
+  info.innerHTML=`After step <b>${t}</b> of ${TEND}: ${act} thread${act===1?"":"s"} running, <b>${text}</b> of ${seqTok} text tokens written (one chain would need ${text} steps for them). KV cache now: <b>${kv(t,share)} tokens</b> ${share?"(prefix shared)":"(prefix copied per child)"}; with sharing ${kv(t,true)}, with copies ${kv(t,false)}. Peak over the whole answer: ${pk[1]} shared vs ${pk[0]} copied. Total: ${TEND} steps instead of ${seqTok}, <b>${(seqTok/TEND).toFixed(2)}×</b> fewer.`;}
+ S.addEventListener("input",draw);SH.addEventListener("change",draw);draw();
+})();
+
+/* ---------- Figure 4: radix tree stepper ---------- */
+(function(){
+ const svg=$("#oo-rdx-svg");if(!svg)return;const info=$("#oo-rdx-info");
+ const N={Sys:["system",300,null],Shots:["examples",500,"Sys"],Q1:["Q1",40,"Shots"],A1:["answer 1",60,"Q1"],Q2:["Q2",30,"Shots"],A2:["answer 2",50,"Q2"],
+  U1:["user 1",40,"Sys"],R1:["reply 1",120,"U1"],U2:["user 2",30,"R1"],R2:["reply 2",80,"U2"],SQ:["SoT question",60,"Sys"],Sk:["skeleton",40,"SQ"],
+  P1:["point 1",8,"Sk"],E1:["expand 1",100,"P1"],P2:["point 2",8,"Sk"],E2:["expand 2",100,"P2"],P3:["point 3",8,"Sk"],E3:["expand 3",100,"P3"]};
+ const REQ=[["Few-shot question 1",["Sys","Shots","Q1"],"A1"],["Few-shot question 2",["Sys","Shots","Q2"],"A2"],["Chat, turn 1",["Sys","U1"],"R1"],["Chat, turn 2",["Sys","U1","R1","U2"],"R2"],["SoT skeleton",["Sys","SQ"],"Sk"],["SoT point 1 (fork)",["Sys","SQ","Sk","P1"],"E1"],["SoT point 2 (fork)",["Sys","SQ","Sk","P2"],"E2"],["SoT point 3 (fork)",["Sys","SQ","Sk","P3"],"E3"]];
+ const depth=id=>{let d=0,p=N[id][2];while(p){d++;p=N[p][2];}return d;};const leaves=["A1","A2","R2","E1","E2","E3"];const Y={};
+ leaves.forEach((l,i)=>Y[l]=38+i*52);const kids=id=>Object.keys(N).filter(k=>N[k][2]===id);
+ const yOf=id=>{if(id in Y)return Y[id];const c=kids(id).map(yOf);return Y[id]=c.reduce((a,b)=>a+b,0)/c.length;};Object.keys(N).forEach(yOf);
+ const bw=118,X=id=>12+depth(id)*152;
+ const hist=[];{const tree=new Set();let tot=0,re=0;hist.push({tree:new Set(),cur:{},tot:0,re:0});
+  REQ.forEach(([nm,p,gid])=>{let m=0,c=0,ok=true;const cur={};p.forEach(s=>{if(ok&&tree.has(s)){m+=N[s][1];cur[s]="hit";}else{ok=false;c+=N[s][1];tree.add(s);cur[s]="new";}});tree.add(gid);cur[gid]="gen";tot+=m+c;re+=m;
+   const stored=[...tree].reduce((a,k)=>a+N[k][1],0);hist.push({tree:new Set(tree),cur,nm,m,c,tot,re,stored,gen:N[gid][1]});});}
+ function draw(k){const h=hist[k];let g="";const fill={hit:"var(--v)",new:"var(--k)",gen:"var(--q)"};
+  Object.keys(N).forEach(id=>{const p=N[id][2];if(!p||!h.tree.has(id))return;g+=`<path d="M${X(p)+bw} ${yOf(p)} C ${X(p)+bw+18} ${yOf(p)}, ${X(id)-18} ${yOf(id)}, ${X(id)} ${yOf(id)}" fill="none" stroke="var(--muted)" stroke-width="1.5"/>`;});
+  Object.keys(N).forEach(id=>{if(!h.tree.has(id))return;const st=h.cur[id];const c=st?fill[st]:"var(--rule)";
+   g+=`<rect x="${X(id)}" y="${yOf(id)-17}" width="${bw}" height="34" rx="8" fill="${c}" opacity="${st?0.9:0.55}" stroke="${st?c:"var(--muted)"}" stroke-width="1"/>`+txt(X(id)+bw/2,yOf(id)+5,N[id][0]+" · "+N[id][1],{a:"middle",fs:12.5,w:600,c:st?"#fff":"var(--ink)"});});
+  if(k===0)g+=txt(390,165,"Empty cache. Press Next to send the first request.",{a:"middle",fs:15,c:"var(--muted)"});
+  svg.innerHTML=g;
+  info.innerHTML=k===0?"No request yet. The radix tree is empty.":`Request ${k}, <b>${h.nm}</b>: prompt ${h.m+h.c} tokens, <b>${h.m} reused</b> from the cache, <b>${h.c} computed</b> (hit rate ${(100*h.m/(h.m+h.c)).toFixed(1)}%); then ${h.gen} generated tokens are added to the tree. All requests so far: ${fmt(h.tot,0)} prompt tokens, ${fmt(h.re,0)} reused, ${fmt(h.tot-h.re,0)} computed, hit rate <b>${(100*h.re/h.tot).toFixed(1)}%</b>. Tokens stored in the tree: ${fmt(h.stored,0)}.`;}
+ B.stepper({n:hist.length,prev:$("#oo-rdx-prev"),next:$("#oo-rdx-next"),play:$("#oo-rdx-play"),label:$("#oo-rdx-lab"),ms:2200,onStep:draw});
+})();
+
+/* ---------- Figure 5: two-model cascade ---------- */
+(function(){
+ const svg=$("#oo-cas-svg");if(!svg)return;const Tt=$("#oo-cas-t"),Qq=$("#oo-cas-q"),Rr=$("#oo-cas-r"),info=$("#oo-cas-info");
+ const sig=z=>1/(1+Math.exp(-z));const r=rng(91);const NQ=2000;const cs=[],cb=[],e=[];
+ for(let i=0;i<NQ;i++){const d=r(),u1=r(),u2=r(),u3=r();cs.push(u1<sig((0.7-d)*10));cb.push(u2<sig((1.0-d)*10));e.push(Math.log(u3/(1-u3)));}
+ const accS=cs.filter(Boolean).length/NQ,accB=cb.filter(Boolean).length/NQ;let od=0,oa=0;for(let i=0;i<NQ;i++){if(!cs[i])od++;if(cs[i]||cb[i])oa++;}od/=NQ;oa/=NQ;
+ function run(q,tau,ratio){let acc=0,def=0;for(let i=0;i<NQ;i++){const s=sig(q*(cs[i]?1:-1)+e[i]);if(s>=tau){if(cs[i])acc++;}else{def++;if(cb[i])acc++;}}return{acc:acc/NQ,def:def/NQ,cost:(1+ratio*def/NQ)/ratio};}
+ function draw(){const tau=+Tt.value,q=+Qq.value,ratio=+Rr.value;$("#oo-cas-tv").value=tau.toFixed(2);$("#oo-cas-qv").value=q.toFixed(1);$("#oo-cas-rv").value=ratio+"×";
+  const xm=Math.max(1.1,1+1/ratio+0.05),X=c=>60+c/xm*550,Y=a=>250-(a-0.6)/0.4*225;
+  let g=`<path d="M60 20 V250 H615" fill="none" stroke="var(--muted)"/>`;
+  for(let a=0.6;a<=1.001;a+=0.1)g+=`<line x1="60" y1="${Y(a)}" x2="615" y2="${Y(a)}" stroke="var(--rule)"/>`+txt(54,Y(a)+4,Math.round(a*100)+"%",{a:"end",fs:11,c:"var(--muted)"});
+  for(let c=0;c<=xm+1e-9;c+=0.25)g+=txt(X(c),266,Math.round(c*100)+"%",{a:"middle",fs:11,c:"var(--muted)"});
+  g+=txt(337,288,"cost as a share of always calling the big model",{a:"middle",fs:12,c:"var(--muted)"})+txt(14,14,"accuracy",{fs:12,c:"var(--muted)"});
+  const pts=[];for(let k=0;k<=50;k++){const o=run(q,k/50,ratio);pts.push(X(o.cost).toFixed(1)+","+Y(o.acc).toFixed(1));}
+  g+=`<polyline points="${pts.join(" ")}" fill="none" stroke="var(--q)" stroke-width="2.4"/>`;
+  const oc=(1+ratio*od)/ratio;g+=`<circle cx="${X(1/ratio)}" cy="${Y(accS)}" r="5" fill="var(--muted)"/>`+txt(X(1/ratio)+8,Y(accS)+4,"small only",{fs:12})+`<circle cx="${X(1)}" cy="${Y(accB)}" r="5" fill="var(--muted)"/>`+txt(X(1)+8,Y(accB)+16,"big only",{fs:12})+`<circle cx="${X(oc)}" cy="${Y(oa)}" r="5" fill="var(--v)"/>`+txt(X(oc),Y(oa)-10,"perfect scorer",{fs:12,a:"middle",c:"var(--v)"});
+  const o=run(q,tau,ratio);g+=`<circle cx="${X(o.cost)}" cy="${Y(o.acc)}" r="7" fill="var(--k)" stroke="var(--card)" stroke-width="2"/>`;svg.innerHTML=g;
+  info.innerHTML=`τ = ${tau.toFixed(2)}: <b>${(100*o.def).toFixed(1)}%</b> of queries escalated to the big model. Cost <b>${(100*o.cost).toFixed(1)}%</b> of big-only (formula 91.9: 1 + ${o.def.toFixed(4)} × ${ratio} = ${(1+ratio*o.def).toFixed(2)} units against ${ratio}). Accuracy <b>${(100*o.acc).toFixed(2)}%</b> (small only ${(100*accS).toFixed(2)}%, big only ${(100*accB).toFixed(2)}%, perfect scorer ${(100*oa).toFixed(2)}% at ${(100*oc).toFixed(1)}% cost).${o.acc>=accB&&o.cost<1?" <b>As accurate as the big model, for less.</b>":""}`;}
+ [Tt,Qq,Rr].forEach(x=>x.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>

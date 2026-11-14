@@ -1,0 +1,446 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Where the cost is: FFN and attention, by the numbers · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 93</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="where-the-cost-is-ffn-and-attention">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="where-the-cost-is-ffn-and-attention" data-session="where-the-cost-is-ffn-and-attention" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">93</span><span>Track 5: LLM inference and serving · session 16 of 65</span></div><h1 class="chap-title">Where the cost is: FFN and attention, by the numbers</h1><p class="chap-sub">Before you choose an optimization, you must know which part of the model costs the most. This session splits every transformer layer into its two halves, the feed-forward network (FFN) and attention, and counts each one three ways: parameters, FLOPs per token and bytes read per token. The answer depends on the model size and, even more, on the context length, so short chat, long documents and video need different fixes.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 2 hours, exercises 1 hour)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions 25 and 80 to 82 (counting parameters and FLOPs, the KV cache, inference metrics, why inference is slow)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How to split the parameters of one layer into attention (4d² for MHA, less for GQA) and FFN (3·d·d_ff for SwiGLU)</li><li>Why the survey reports 63.01% (LLaMA-7B) and 71.69% (LLaMA-70B) FFN parameters, and why a count from the 70B config file gives 81.7%</li><li>FLOPs per token: the weight part grows with model size, the attention-score part grows with context length; the crossover is near t = 1.5·d_ff</li><li>Bytes per token in decode: weights are shared by the batch, the KV cache is not; arithmetic intensity B for the FFN and n_h/n_kv for attention</li><li>How to compute the split for your own model from config.json, and check it with a PyTorch FLOP counter</li><li>Which part to optimize first for short chat, long documents and video</li></ul></div></header><style>
+.wc-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px;justify-content:center}
+.wc-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:4px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+.wc-chk{display:inline-flex;align-items:center;gap:8px;font:600 15px var(--sans);color:var(--ink2)}
+.wc-cell{cursor:pointer}
+.wc-cell:hover rect{stroke:var(--ink);stroke-width:1.5}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Every optimization in the rest of this track works on one part of the model. Some make the <b>feed-forward network</b> (FFN) cheaper: mixture of experts, pruning, weight quantization. Others make <b>attention</b> cheaper: GQA, sparse attention, FlashAttention, KV-cache quantization. Before you pick one, you must know where your cost is. If you shrink the part that is only 5% of the work, you gain at most 5%.</p>
+<p>The efficient-inference survey starts its model-level chapter with this question. It reports that “the FFN module accounts for 63.01% of the parameters in the LLaMA-7B model and 71.69% in the LLaMA-70B model”, and that attention “demonstrates quadratic complexity in the input length”. [Certain, survey Section 5.1] These two facts give the plan of this session:</p>
+<ul><li><b>FFN cost grows with model size.</b> The FFN holds most of the weights. Every token must use all of them, whatever the context length.</li>
+<li><b>Attention cost grows with context length.</b> Attention has fewer weights, but each new token compares itself with every earlier token. At long contexts this part takes over.</li></ul>
+<p>We will check the survey’s numbers ourselves (one of them does not match the model’s config file, and we will see why), and then count three kinds of cost, because they give different answers:</p>
+<ul><li><b>Parameters</b>: how much memory the weights need.</li>
+<li><b>FLOPs per token</b>: how much arithmetic. This sets the speed of <b>prefill</b>, the phase that reads the prompt (<a href="../inference/the-generation-loop-prefill-and-decode.html">session 78</a>).</li>
+<li><b>Bytes per token</b>: how much data the GPU must read from its memory. This sets the speed of <b>decode</b>, the phase that writes one token at a time (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>).</li></ul>
+<p><a href="../transformers/counting-parameters-flops-and-memory-of-a.html">Session 25</a> gave the basic formulas for the whole model. Here we split them into the two halves and ask which half wins in which situation. The data-level methods of the previous sessions, ending with <a href="../inference/lab-compress-a-long-rag-prompt.html">session 92</a>, made the <b>input</b> shorter. From now on we change the <b>model</b>, and this session is the map for that work. The next session, <a href="../inference/efficient-ffn-1-swiglu-and-parameter-sharing.html">session 94</a>, starts with the FFN.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A restaurant has two costs. The kitchen equipment (the FFN) is expensive to buy, and its cost depends on the size of the restaurant, not on how long guests stay. The waiter who walks to every table (attention) is cheap for a small room, but each new guest makes every round longer. A small café should save on equipment. A banquet hall with a thousand guests must fix the waiter problem.</aside>
+<p>Interviewers like this topic because it tests whether you can reason with numbers: “What fraction of a 70B model is the FFN?”, “At what context length does attention cost more than the MLP?”, “Your users send 100k-token documents; what do you optimize first?”, “Why does GQA not reduce attention FLOPs?”. By the end you can answer each with a formula and a number for a real model.</p>
+
+<h2>The two halves of a layer</h2>
+<h3>What each half contains</h3>
+<p>A decoder layer of a modern model like Llama has two sub-blocks, each with a normalization before it and a residual connection around it (<a href="../transformers/the-full-transformer-and-its-three-families.html">session 23</a>):</p>
+<ul><li><b>Attention</b>: four weight matrices. \(W^Q\) makes queries, \(W^K\) keys, \(W^V\) values, and \(W^O\) maps the concatenated head outputs back to width \(d\). Between them is the part with <b>no weights</b>: the scores \(QK^\top\), the softmax, and the weighted sum of values.</li>
+<li><b>FFN</b> (also called MLP): with SwiGLU, three matrices. \(W_{\text{gate}}\) and \(W_{\text{up}}\) expand the vector from \(d\) to \(d_{ff}\) numbers, and \(W_{\text{down}}\) brings it back to \(d\) (<a href="../transformers/the-feed-forward-network-mlp-inside-each.html">session 21</a>).</li></ul>
+<p>Count the numbers in these matrices. With \(n_h\) query heads, \(n_{kv}\) key–value heads and head size \(d_h\):</p>
+<div class="eq">\[ P_{\text{attn}} = \underbrace{d \cdot n_h d_h}_{W^Q} + \underbrace{2\, d \cdot n_{kv} d_h}_{W^K,\ W^V} + \underbrace{n_h d_h \cdot d}_{W^O} = 2\, d\, n_h d_h + 2\, d\, n_{kv} d_h \tag{93.1} \]</div>
+<div class="eq">\[ P_{\text{ffn}} = 3\, d\, d_{ff} \ \ \text{(SwiGLU)}, \qquad P_{\text{ffn}} = 2\, d\, d_{ff} \ \ \text{(classic two-matrix MLP)} \tag{93.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(d\)</dt><dd>the model width (<code>hidden_size</code> in the config file)</dd>
+<dt>\(n_h, n_{kv}, d_h\)</dt><dd>query heads, key–value heads and head size. For multi-head attention (MHA) \(n_{kv} = n_h\); with grouped-query attention (GQA) \(n_{kv}\) is smaller.</dd>
+<dt>\(d_{ff}\)</dt><dd>the inner width of the FFN (<code>intermediate_size</code>)</dd>
+<dt>3 and 2</dt><dd>SwiGLU has three matrices (gate, up, down); the original transformer MLP has two (up, down). Biases are left out: Llama models have none.</dd></dl>
+<p>In most models \(n_h d_h = d\). Then MHA gives \(P_{\text{attn}} = 4d^2\). GQA keeps the full \(W^Q\) and \(W^O\) but makes \(W^K\) and \(W^V\) smaller by the group factor \(g = n_h / n_{kv}\), so \(P_{\text{attn}} = (2 + 2/g)\, d^2\).</p>
+<p>The whole model adds the embedding table, the output head (the “LM head”, which turns the last hidden vector into one score per vocabulary token) and the small normalization weights:</p>
+<div class="eq">\[ N = L\,(P_{\text{attn}} + P_{\text{ffn}} + 2d) + c\, V d + d, \qquad c = 2 \text{ (separate head) or } 1 \text{ (tied)} \tag{93.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(L\)</dt><dd>number of layers (<code>num_hidden_layers</code>)</dd>
+<dt>\(V\)</dt><dd>vocabulary size; \(Vd\) numbers for the embedding table and \(Vd\) more for the head, unless <code>tie_word_embeddings</code> is true</dd>
+<dt>\(2d\) and \(d\)</dt><dd>the two RMSNorm weight vectors per layer and the final norm: tiny, but needed for an exact match</dd></dl>
+
+<h3>The FFN share of one layer</h3>
+<p>Divide (93.2) by the sum of (93.1) and (93.2). With \(n_h d_h = d\), write \(r = d_{ff}/d\) for the FFN expansion ratio:</p>
+<div class="eq">\[ \rho_{\text{layer}} = \frac{P_{\text{ffn}}}{P_{\text{attn}} + P_{\text{ffn}}} = \frac{3r}{2 + 2/g + 3r} \tag{93.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\rho_{\text{layer}}\)</dt><dd>the fraction of one layer’s weights that sit in the FFN</dd>
+<dt>\(r\)</dt><dd>the expansion ratio \(d_{ff}/d\): 2.6875 in Llama 2 7B (\(11{,}008/4{,}096\)), 3.5 in Llama 2 70B and Llama 3 (\(28{,}672/8{,}192\), \(14{,}336/4{,}096\))</dd>
+<dt>\(g\)</dt><dd>the GQA group size \(n_h/n_{kv}\): 1 for MHA, 4 for Llama 3 8B, 8 for the 70B models</dd></dl>
+<p>Three cases show the trend. Classic SwiGLU with \(r = 8/3\) and MHA gives \(\rho = 8/12 = 66.7\%\). Llama 2 7B (\(r = 2.6875\), MHA) gives 66.84%. Llama 2 70B (\(r = 3.5\), \(g = 8\)) gives \(10.5 / 12.75 = 82.35\%\). Larger models moved to GQA, which shrinks attention, and to wider FFNs, which grow the FFN. Both push the FFN share up. Mixture of experts (<a href="../transformers/mixture-of-experts-moe.html">session 29</a>) pushes it much further: with \(E\) experts, \(P_{\text{ffn}}\) is multiplied by \(E\).</p>
+<p>Figure 1 draws the seven matrices of one layer at true scale, for six real models.</p>
+<figure class="fig wide" id="wc-par"><div class="fig-body">
+<div class="controls"><span class="seg" id="wc-par-m"><button type="button" data-m="l27" aria-pressed="true">Llama 2 7B</button><button type="button" data-m="l270" aria-pressed="false">Llama 2 70B</button><button type="button" data-m="l38" aria-pressed="false">Llama 3 8B</button><button type="button" data-m="l370" aria-pressed="false">Llama 3 70B</button><button type="button" data-m="q7" aria-pressed="false">Qwen2.5 7B</button><button type="button" data-m="mix" aria-pressed="false">Mixtral 8x7B</button></span></div>
+<div class="controls"><label class="wc-chk"><input type="checkbox" id="wc-par-sv"> count like the survey (all heads as MHA, vocabulary counted 3 times)</label></div>
+<div class="scroll-x"><svg id="wc-par-svg" viewBox="0 0 760 290" role="img" aria-label="The weight matrices of one layer drawn with area proportional to their size, and the parameter split of the whole model"></svg></div>
+<div class="wc-leg"><span style="--c:var(--t1)">attention matrices</span><span style="--c:var(--t5)">FFN matrices</span><span style="--c:var(--t10)">embedding and LM head</span></div>
+<div class="readout" id="wc-par-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Top: the weight matrices of one layer. Every matrix has \(d\) rows, so the width of each box is proportional to its number of parameters. Bottom: the split of the whole model, formula (93.3). Shapes come from each model’s <code>config.json</code> on Hugging Face; the totals match the published sizes (6.74B, 68.98B, 8.03B, 70.55B, 7.62B, 46.70B).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with Llama 2 7B. The four blue boxes (attention) are all the same width, because MHA has \(n_{kv} = n_h\): each is \(4096 \times 4096\). The three teal boxes (FFN) are each \(4096 \times 11{,}008\), so the FFN is about two thirds of the layer. Switch to Llama 2 70B: \(W^K\) and \(W^V\) become thin slivers (8 key–value heads for 64 query heads), and the FFN grows to 82% of the layer. Switch to Llama 3 8B: the FFN share of the layer is 81%, but the bottom bar shows that the large vocabulary (128,256 tokens) puts 13% of the whole model in the embedding and head. Mixtral shows eight stacked copies of the FFN: 96.6% of its weights are experts. Now go back to Llama 2 7B and Llama 2 70B and tick the survey box: you get the survey’s 63.01% and 71.69%.</p></details></figure>
+
+<h2>Checking the survey’s numbers</h2>
+<p>Numbers in a survey are a good start, but an engineer should be able to reproduce them. Let us count Llama 2 7B (LLaMA-7B has the same shapes) and Llama 2 70B from their config files.</p>
+<div class="worked"><div class="wt">Worked example: the FFN share of Llama 2 7B and 70B</div>
+<p><b>Llama 2 7B</b>: \(d = 4096\), \(L = 32\), \(d_{ff} = 11{,}008\), 32 heads (MHA), \(V = 32{,}000\), separate head. [Certain, from config.json]</p>
+<p>Attention per layer: \(4 \times 4096^2 = 67{,}108{,}864\). FFN per layer: \(3 \times 4096 \times 11{,}008 = 135{,}266{,}304\). Times 32 layers: \(2{,}147{,}483{,}648\) and \(4{,}328{,}521{,}728\). Embedding plus head: \(2 \times 32{,}000 \times 4096 = 262{,}144{,}000\). Norms: \(266{,}240\). Total: \(6{,}738{,}415{,}616\), the familiar “6.74B”.</p>
+<p>FFN share: \(4{,}328{,}521{,}728 / 6{,}738{,}415{,}616 = \mathbf{64.24\%}\). Attention: 31.87%. Embedding and head: 3.89%.</p>
+<p><b>Llama 2 70B</b>: \(d = 8192\), \(L = 80\), \(d_{ff} = 28{,}672\), 64 query heads but only 8 key–value heads. [Certain, from config.json] Attention per layer: \(2 \times 8192^2 + 2 \times 8192 \times 1024 = 150{,}994{,}944\). FFN per layer: \(704{,}643{,}072\). Total: 68.98B. FFN share: \(\mathbf{81.73\%}\).</p></div>
+<p>So our count gives 64.24% and 81.73%, while the survey gives 63.01% and 71.69%. The 7B numbers are close; the 70B numbers are 10 points apart. Where does the gap come from? We can reproduce <b>both</b> survey numbers to two decimals with one recipe: count attention as \(4d^2\) per layer (as if the 70B model used MHA, with 64 key–value heads), and count \(Vd\) three times instead of twice. For the 7B model the denominator becomes \(6{,}869{,}221{,}376\) and the share \(63.01\%\); for the 70B model it becomes \(71.69\%\). [Likely: this is our reconstruction; the survey does not show its count, but both numbers match exactly.]</p>
+<p>The lesson is not that the survey is careless. The lesson is that <b>attention design changes the split a lot</b>. GQA cut the attention weights of the 70B model from \(4d^2\) to \(2.25d^2\) per layer. If you ignore it, you overestimate attention by 78% and underestimate the FFN share by 10 points. Always count from the config file of the exact model you serve.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Model</th><th>Attention</th><th>\(d_{ff}/d\)</th><th>Total</th><th>FFN</th><th>Attention</th><th>Embedding + head</th></tr></thead><tbody>
+<tr><td>Llama 2 7B</td><td>MHA, 32 heads</td><td>2.69</td><td>6.74B</td><td>64.2%</td><td>31.9%</td><td>3.9%</td></tr>
+<tr><td>Llama 2 70B</td><td>GQA, 64 / 8</td><td>3.5</td><td>68.98B</td><td>81.7%</td><td>17.5%</td><td>0.8%</td></tr>
+<tr><td>Llama 3 8B</td><td>GQA, 32 / 8</td><td>3.5</td><td>8.03B</td><td>70.2%</td><td>16.7%</td><td>13.1%</td></tr>
+<tr><td>Llama 3 70B</td><td>GQA, 64 / 8</td><td>3.5</td><td>70.55B</td><td>79.9%</td><td>17.1%</td><td>3.0%</td></tr>
+<tr><td>Qwen2.5 7B</td><td>GQA, 28 / 4</td><td>5.29</td><td>7.62B</td><td>74.9%</td><td>10.8%</td><td>14.3%</td></tr>
+<tr><td>Qwen2.5 72B</td><td>GQA, 64 / 8</td><td>3.61</td><td>72.71B</td><td>80.0%</td><td>16.6%</td><td>3.4%</td></tr>
+<tr><td>Mixtral 8x7B</td><td>GQA, 32 / 8, 8 experts</td><td>3.5</td><td>46.70B</td><td>96.6%</td><td>2.9%</td><td>0.6%</td></tr></tbody></table></div>
+<p>[Certain for the shapes, from the config files; the percentages are computed with (93.1) to (93.3).] For Mixtral, each token uses only 2 of the 8 experts, so the <b>active</b> parameters per token are 12.88B, and the FFN is 87.5% of those. The table shows a clear pattern: in every model of 7B or more, the FFN holds between 64% and 97% of the weights. For small models with a large vocabulary (Llama 3 8B, Qwen2.5 7B), the embedding and head are a real third part, more than 13%.</p>
+
+<h2>FLOPs per token: the context term</h2>
+<h3>Two kinds of attention work</h3>
+<p>Parameters tell us about memory. Speed depends on work. A matrix multiply of a vector with a \(m \times n\) matrix costs \(2mn\) FLOPs (one multiply and one add per weight), so every weight costs 2 FLOPs per token (<a href="../transformers/counting-parameters-flops-and-memory-of-a.html">session 25</a>). This is true for the FFN and for the four attention matrices.</p>
+<p>But attention also has work <b>without weights</b>. The token at position \(t\) computes one score with each of the \(t\) keys (\(QK^\top\)), and then a weighted sum of \(t\) values. For one head, each of these costs \(2 d_h t\) FLOPs. Over all heads and layers, the forward FLOPs of one token at position \(t\) are</p>
+<div class="eq">\[ F(t) = \underbrace{2L\, P_{\text{ffn}}}_{\text{FFN}} + \underbrace{2L\, P_{\text{attn}}}_{\text{projections}} + \underbrace{4\, L\, n_h d_h\, t}_{\text{scores and weighted sum}} + \underbrace{2Vd}_{\text{LM head}} \tag{93.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(F(t)\)</dt><dd>forward FLOPs for one token that sits at position \(t\) (it attends to \(t\) tokens, itself included)</dd>
+<dt>\(2L P_{\text{ffn}}\), \(2L P_{\text{attn}}\)</dt><dd>2 FLOPs per weight. These do not depend on \(t\).</dd>
+<dt>\(4 L n_h d_h t\)</dt><dd>\(QK^\top\) (\(2 n_h d_h t\)) plus the weighted sum of values (\(2 n_h d_h t\)), in every layer. This is the only term that grows with context.</dd>
+<dt>\(n_h\), not \(n_{kv}\)</dt><dd>every <b>query</b> head computes its own scores, even when several heads share one key head. GQA does not reduce this term.</dd>
+<dt>\(2Vd\)</dt><dd>the LM head; the embedding lookup costs no FLOPs</dd></dl>
+<p>The softmax and the normalizations add a few FLOPs per score or per number, which we ignore. [Certain that they are small next to the matrix multiplies.]</p>
+
+<h3>The crossover length</h3>
+<p>The first terms of (93.5) are fixed; the score term grows linearly with \(t\). Set the score term equal to the FFN term and solve for \(t\):</p>
+<div class="eq">\[ 4 L\, n_h d_h\, t^{*} = 6 L\, d\, d_{ff} \quad\Longrightarrow\quad t^{*} = \frac{3\, d\, d_{ff}}{2\, n_h d_h} = 1.5\, d_{ff} \ \ \text{ when } n_h d_h = d \tag{93.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t^{*}\)</dt><dd>the position at which one token’s attention scores cost as many FLOPs as its FFN</dd>
+<dt>\(1.5\, d_{ff}\)</dt><dd>the crossover depends only on the FFN width: wider models need longer contexts before attention dominates</dd></dl>
+<p>This is the formula behind the two key sentences of this session. For Llama 2 7B, \(t^* = 1.5 \times 11{,}008 = 16{,}512\). For Llama 3 8B, \(21{,}504\). For the 70B models, \(43{,}008\). Below \(t^*\), the FFN is the biggest single cost; above it, the scores are. If you compare the scores with <b>all</b> weight FLOPs of the layer (FFN plus projections), the crossover moves to \(t = 2d + 1.5 d_{ff}\): 24,704 for Llama 2 7B and 26,624 for Llama 3 8B.</p>
+<div class="worked"><div class="wt">Worked example: Llama 3 8B at 1k, 4k and 32k</div>
+<p>Weight FLOPs per token: FFN \(2 \times 32 \times 176{,}160{,}768 = 11.27\) GFLOPs; attention projections \(2 \times 32 \times 41{,}943{,}040 = 2.68\) GFLOPs; head \(2 \times 128{,}256 \times 4096 = 1.05\) GFLOPs. Together 15.0 GFLOPs.</p>
+<p>Score term: \(4 \times 32 \times 4096 \times t = 524{,}288\, t\) FLOPs. At \(t = 1024\): 0.54 GFLOPs, 3.5% of the total. At \(t = 4096\): 2.15 GFLOPs, 12.5%. At \(t = 32{,}768\): 17.18 GFLOPs, <b>53.4%</b>, more than the FFN (35.0%).</p></div>
+<p>The same rule also explains “FFN cost grows with model size”. Divide the score term by the weight term: roughly \(4 L d t / (2 L \cdot 12 d^2) = t / (6d)\) for a classic layer. At a fixed context, a wider model spends a <b>smaller</b> fraction of its work on attention scores. Big models are FFN-heavy; long contexts are attention-heavy.</p>
+<figure class="fig wide" id="wc-flp"><div class="fig-body">
+<div class="controls"><span class="seg" id="wc-flp-m"><button type="button" data-m="l27" aria-pressed="false">Llama 2 7B</button><button type="button" data-m="l38" aria-pressed="true">Llama 3 8B</button><button type="button" data-m="q7" aria-pressed="false">Qwen2.5 7B</button><button type="button" data-m="l370" aria-pressed="false">Llama 3 70B</button><button type="button" data-m="mix" aria-pressed="false">Mixtral 8x7B</button></span></div>
+<div class="controls"><label class="sl">Position \(t\) <input type="range" id="wc-flp-t" min="7" max="20" step="0.25" value="15"><output id="wc-flp-tv">32,768</output></label></div>
+<div class="scroll-x"><svg id="wc-flp-svg" viewBox="0 0 700 300" role="img" aria-label="Share of FLOPs per token in FFN, attention projections, attention scores and LM head, against context length"></svg></div>
+<div class="wc-leg"><span style="--c:var(--t5)">FFN</span><span style="--c:var(--t1)">attention projections</span><span style="--c:var(--t7)">attention scores and weighted sum</span><span style="--c:var(--t10)">LM head</span></div>
+<div class="readout" id="wc-flp-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> The split of forward FLOPs for one token at position \(t\), formula (93.5), from 128 to about 1 million tokens (log scale). The dashed line marks \(t^*\) of formula (93.6), where scores and FFN cost the same. For Mixtral, only the 2 active experts count.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Each vertical slice adds up to 100%. On the left (short context) the teal FFN band and the blue projection band fill almost everything. Moving right, the magenta score band grows, and it passes the FFN at the dashed line. Move the slider to read exact numbers for one position. Compare models: Llama 3 70B and Mixtral have their crossover at 43,008, twice as far right as the 8B models, because their FFNs are wider. Note that some positions are beyond the trained context of a model (for example 4,096 for Llama 2 7B); the figure still shows the arithmetic.</p></details></figure>
+
+<h3>Prefill: the whole prompt at once</h3>
+<p>Prefill processes \(P\) prompt tokens. Token \(t\) attends to \(t\) tokens (the causal mask hides the future), so we sum (93.5) over \(t = 1, \dots, P\):</p>
+<div class="eq">\[ F_{\text{prefill}}(P) = P \cdot 2L\,(P_{\text{ffn}} + P_{\text{attn}}) \;+\; 2 L\, n_h d_h\, P(P+1) \;+\; 2Vd \tag{93.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>first term</dt><dd>linear in \(P\): every prompt token goes through all weight matrices</dd>
+<dt>second term</dt><dd>quadratic in \(P\): this is the “quadratic complexity in the input length” of the survey. It is \(\sum_t 4 L n_h d_h t\).</dd>
+<dt>\(2Vd\) once</dt><dd>only the last prompt position needs logits; good servers skip the head for the other positions [Likely for vLLM-style servers; a naive loop computes all of them]</dd></dl>
+<p>Doubling a long prompt doubles the first term but multiplies the second by four. For Llama 3 8B, a 100,000-token prompt costs \(4.0 \times 10^{15}\) FLOPs, and 65% of it is the score term. On an H100 (989 dense BF16 TFLOP/s [Certain, NVIDIA spec]) that is at least 4.1 seconds of prefill even at 100% utilization.</p>
+<aside class="note side"><span class="nt">FlashAttention</span>FlashAttention (<a href="../inference/attention-operator-1-flashattention-1-2-and.html">session 124</a>) does not reduce the FLOPs of (93.7). It computes the same scores; it avoids writing the \(P \times P\) score matrix to GPU memory, so it saves memory traffic and memory size. Good kernels also skip the masked upper triangle, which (93.7) already leaves out. [Certain]</aside>
+
+<h2>Bytes per token: what decode reads</h2>
+<h3>Shared weights, private caches</h3>
+<p>In decode, each step makes one new token per sequence. The arithmetic per token is the same as (93.5), but the GPU is not limited by arithmetic. It is limited by how fast it can read data from its memory (HBM) (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>). So in decode we must count <b>bytes</b>, and here the two halves behave very differently:</p>
+<ul><li><b>Weights</b> (FFN and attention projections): read once per step, and that one read serves all \(B\) sequences in the batch.</li>
+<li><b>KV cache</b> (the input of the score term): every sequence has its own cache (<a href="../inference/the-kv-cache.html">session 80</a>), so nothing is shared. A sequence of length \(T\) reads \(s \cdot T\) bytes per step.</li></ul>
+<div class="eq">\[ \beta = \frac{M_W}{B} + s \cdot T, \qquad s = 2 L\, n_{kv} d_h\, b, \qquad \frac{M_W}{B} = s\, T \iff B \cdot T = \frac{M_W}{s} \tag{93.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\beta\)</dt><dd>bytes read from memory per generated token</dd>
+<dt>\(M_W\)</dt><dd>bytes of all weights: \(N \times b\) (2 bytes each in bfloat16)</dd>
+<dt>\(B\)</dt><dd>number of sequences decoded together</dd>
+<dt>\(s\)</dt><dd>KV-cache bytes per token over all layers; \(n_{kv}\), not \(n_h\), appears here</dd>
+<dt>\(T\)</dt><dd>current length of the sequence (prompt plus tokens written so far)</dd>
+<dt>\(M_W / s\)</dt><dd>the “budget” of batch × context at which the cache costs as many bytes as the weights</dd></dl>
+<p>For Llama 3 8B in bfloat16, \(M_W = 16.06\) GB and \(s = 131{,}072\) bytes, so \(M_W / s = 122{,}532\) tokens. One user at 4,096 tokens reads 16.06 GB of weights and 0.54 GB of cache per step: the weights are 96.8% of the traffic, and an H100 at 3.35 TB/s [Certain, NVIDIA spec] needs at least 4.95 ms per step. With 32 users at 4,096 tokens, the caches add up to 17.18 GB: now the cache is 51.7% of the traffic and the step takes at least 9.92 ms. Batching made the weights cheap per token, but it cannot make the cache cheap. (Strictly, a decode step reads only \(B\) rows of the embedding table, so the weight traffic is a little smaller, 15.0 GB for Llama 3 8B; like <a href="../inference/the-kv-cache.html">session 80</a> we keep \(M_W\) = all weights as a simple upper bound.)</p>
+<p>Here GQA matters a lot. It does not change the score FLOPs (\(n_h\) in 93.5), but it divides \(s\) by \(g\) (\(n_{kv}\) in 93.8). Llama 2 7B (MHA) has \(s = 524{,}288\) bytes and \(M_W / s = 25{,}705\): its cache equals its weights already at one user with 25,705 tokens, or 8 users with 3,213 tokens.</p>
+
+<h3>Arithmetic intensity of the two halves</h3>
+<p><b>Arithmetic intensity</b> is FLOPs divided by bytes read. A GPU is busy only when the intensity of the work is above its <b>ridge point</b>, its peak FLOP/s divided by its bandwidth: \(989 / 3.35 \approx 295\) FLOP/byte for an H100 (<a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>, <a href="../inference/runtime-profiling-where-the-time-goes.html">session 123</a>). In decode:</p>
+<div class="eq">\[ I_{\text{weights}} = \frac{2B \text{ FLOPs per weight}}{b \text{ bytes per weight}} = \frac{2B}{b}, \qquad I_{\text{attn}} = \frac{4\, n_h d_h T}{2\, n_{kv} d_h T\, b} = \frac{2g}{b} \tag{93.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(I_{\text{weights}}\)</dt><dd>for the FFN and projections: each weight byte is used once per sequence in the batch. In bfloat16 (\(b = 2\)) this is just \(B\).</dd>
+<dt>\(I_{\text{attn}}\)</dt><dd>for the score term: each cached key and value is used by the \(g\) query heads that share it. In bfloat16 this is \(g\): 1 for MHA, 4 for Llama 3 8B, 8 for the 70B models.</dd>
+<dt>no \(B\) in \(I_{\text{attn}}\)</dt><dd>batching does not help attention in decode, because no two sequences share a cache</dd></dl>
+<p>So in decode the FFN becomes efficient when the batch is large (near \(B \approx 295\) on an H100), but attention stays at an intensity of 1 to 8, far below the ridge, whatever you do with batching. [Certain, from the formula] This is why decode attention has its own kernels (<a href="../inference/attention-operator-2-decode-attention-flashdecoding-and.html">session 125</a>) and why the fixes for attention in decode are about bytes: fewer key–value heads, a smaller cache format, or fewer cached tokens.</p>
+<figure class="fig" id="wc-byt"><div class="fig-body">
+<div class="controls"><span class="seg" id="wc-byt-m"><button type="button" data-m="l27" aria-pressed="false">Llama 2 7B</button><button type="button" data-m="l38" aria-pressed="true">Llama 3 8B</button><button type="button" data-m="q7" aria-pressed="false">Qwen2.5 7B</button><button type="button" data-m="l370" aria-pressed="false">Llama 3 70B</button><button type="button" data-m="mix" aria-pressed="false">Mixtral 8x7B</button></span></div>
+<div class="scroll-x"><svg id="wc-byt-svg" viewBox="0 0 660 330" role="img" aria-label="Grid of batch size against context length; each cell shows the share of decode memory traffic that is KV cache"></svg></div>
+<div class="readout" id="wc-byt-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Decode traffic per step, formula (93.8), all in bfloat16. Each cell is one (batch, context) pair and shows the percentage of bytes that is KV cache; the rest is weights. Click a cell for the details and a lower bound on the step time with 3.35 TB/s of bandwidth. Mixtral counts all expert weights: in a big batch, the tokens together use all experts. [Likely for batches above a few tokens]</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Light cells (left and top) are weight-bound: shrinking the weights (quantization, pruning, fewer experts) is what helps. Dark cells (right and bottom) are cache-bound: GQA, a quantized cache or a shorter context help, and smaller weights barely change the step time. The border between them is the line \(B \cdot T = M_W / s\). Compare Llama 2 7B (MHA) with Llama 3 8B (GQA): the same cell is much darker for Llama 2. Qwen2.5 7B, with only 4 key–value heads, is the lightest of the small models. Llama 3 70B has big weights, so it stays weight-bound longer.</p></details></figure>
+
+<h2>Your workload decides: chat, long documents, video</h2>
+<p>Now combine prefill (FLOPs, formula 93.7) and decode (bytes, formula 93.8) for one request. Four typical workloads on Llama 3 8B give very different pictures. [Certain for the arithmetic; the workloads are illustrative examples.]</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Workload</th><th>Prompt \(P\)</th><th>Output \(N\)</th><th>Prefill: score share of FLOPs</th><th>Decode, \(B = 16\): cache share of bytes</th><th>Main cost</th></tr></thead><tbody>
+<tr><td>Short chat</td><td>500</td><td>300</td><td>0.9%</td><td>7.8%</td><td>FFN and projection weights</td></tr>
+<tr><td>RAG with 8k context</td><td>8,000</td><td>500</td><td>13.1%</td><td>51.9%</td><td>Weights in prefill, half cache in decode</td></tr>
+<tr><td>Long-document QA</td><td>100,000</td><td>500</td><td>65.3%</td><td>92.9%</td><td>Attention in both phases</td></tr>
+<tr><td>Video QA, 10 min at 1 frame/s</td><td>86,500</td><td>200</td><td>61.9%</td><td>91.9%</td><td>Attention in both phases</td></tr></tbody></table></div>
+<p>The video row assumes 600 frames with 144 visual tokens each (86,400 tokens) plus 100 text tokens. Real video LLMs use between tens and hundreds of tokens per frame, so this is an example, not a specific model. [Likely range] For decode we use the average length \(P + N/2\).</p>
+<p>The advice follows directly:</p>
+<ul><li><b>Short chat</b>: almost all cost is the weights, mostly the FFN. Optimize the FFN and the weights: weight quantization (<a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>), mixture of experts (<a href="../inference/efficient-ffn-2-moe-routing-in-depth.html">session 95</a>), structured pruning (<a href="../inference/structured-pruning-llm-pruner-sheared-llama-slicegpt.html">session 115</a>), and bigger batches. Making the attention scores or the cache faster gains less than 10%.</li>
+<li><b>Long documents</b>: attention dominates prefill FLOPs and decode bytes. Optimize attention and the cache: FlashAttention for prefill, GQA or MLA (<a href="../inference/efficient-attention-1-mqa-gqa-and-mla.html">session 97</a>), KV-cache quantization (<a href="../inference/kv-cache-quantization-kivi-and-kvquant.html">session 110</a>), sparse attention (<a href="../inference/sparse-attention-1-static-sparse-transformer-longformer.html">session 116</a>), or a shorter input with prompt compression (<a href="../inference/prompt-pruning-selective-context-llmlingua-longllmlingua.html">session 88</a>).</li>
+<li><b>Video</b>: like long documents, but the long part is visual tokens. The cheapest fix is often to send fewer visual tokens (pooling per frame, picking key frames, retrieving a few clips) before touching the model.</li></ul>
+<figure class="fig wide" id="wc-wl"><div class="fig-body">
+<div class="controls"><span class="seg" id="wc-wl-w"><button type="button" data-w="chat" aria-pressed="true">Short chat</button><button type="button" data-w="rag" aria-pressed="false">RAG 8k</button><button type="button" data-w="doc" aria-pressed="false">Long document</button><button type="button" data-w="vid" aria-pressed="false">Video QA</button></span></div>
+<div class="controls"><span class="seg" id="wc-wl-m"><button type="button" data-m="l27" aria-pressed="false">Llama 2 7B</button><button type="button" data-m="l38" aria-pressed="true">Llama 3 8B</button><button type="button" data-m="q7" aria-pressed="false">Qwen2.5 7B</button><button type="button" data-m="l370" aria-pressed="false">Llama 3 70B</button><button type="button" data-m="mix" aria-pressed="false">Mixtral 8x7B</button></span></div>
+<div class="controls"><label class="sl">Decode batch \(B\) <input type="range" id="wc-wl-b" min="0" max="8" step="1" value="4"><output id="wc-wl-bv">16</output></label></div>
+<div class="scroll-x"><svg id="wc-wl-svg" viewBox="0 0 700 156" role="img" aria-label="Prefill FLOPs split and decode bytes split for one request of the chosen workload"></svg></div>
+<div class="wc-leg"><span style="--c:var(--t5)">FFN</span><span style="--c:var(--t1)">attention projections</span><span style="--c:var(--t7)">attention scores / KV cache</span><span style="--c:var(--t10)">LM head (and embedding)</span></div>
+<div class="readout" id="wc-wl-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> One request of each workload. Top bar: prefill FLOPs, formula (93.7). Bottom bar: decode bytes per generated token at batch \(B\), formula (93.8), with the weight bytes split into FFN, projections and head in proportion to their parameters. The text names the part to optimize first.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Start with short chat on Llama 3 8B: both bars are almost all teal and blue (weights). Raise the batch: the magenta cache part of the bottom bar grows, because the weights are shared and the cache is not, but it stays small. Switch to Long document: the magenta part takes 65% of prefill and over 90% of decode bytes at batch 16. Try Llama 2 7B on the long document: its MHA cache is 4× larger per token, so decode is almost all cache even at batch 1. (Its trained context is only 4,096 tokens; the numbers show what the arithmetic would be.)</p></details></figure>
+
+<h2>Pseudo-code</h2>
+<div class="algo"><div class="algo-h">Algorithm 1: split a model’s cost from its config file</div><ol>
+<li><b>input:</b> <code>config.json</code>; context length \(t\); batch \(B\); bytes per number \(b\)</li>
+<li>read \(d, L, d_{ff}, n_h, n_{kv}, V\); \(d_h \leftarrow\) <code>head_dim</code> if present, else \(d / n_h\); \(E, k \leftarrow\) experts and active experts (1, 1 if dense)</li>
+<li>\(P_{\text{attn}} \leftarrow 2 d n_h d_h + 2 d n_{kv} d_h\) <span class="c">// (93.1); add biases if the model has them</span></li>
+<li>\(P_{\text{ffn}} \leftarrow 3 d d_{ff} E\) (+ router \(dE\)); \(\;P_{\text{ffn}}^{\text{act}} \leftarrow 3 d d_{ff} k\) <span class="c">// (93.2)</span></li>
+<li>\(N \leftarrow L(P_{\text{attn}} + P_{\text{ffn}} + 2d) + cVd + d\) <span class="c">// (93.3), c = 1 if tied</span></li>
+<li><b>params:</b> report \(L P_{\text{ffn}} / N\), \(L P_{\text{attn}} / N\), \(cVd / N\)</li>
+<li><b>FLOPs:</b> \(F_{\text{ffn}} \leftarrow 2 L P_{\text{ffn}}^{\text{act}}\); \(F_{\text{proj}} \leftarrow 2 L P_{\text{attn}}\); \(F_{\text{sc}} \leftarrow 4 L n_h d_h t\); \(F_{\text{head}} \leftarrow 2Vd\) <span class="c">// (93.5)</span></li>
+<li>\(t^* \leftarrow 6 d\, d_{ff} k / (4 n_h d_h)\) <span class="c">// (93.6)</span></li>
+<li><b>bytes:</b> \(M_W \leftarrow N b\); \(s \leftarrow 2 L n_{kv} d_h b\); \(\beta \leftarrow M_W / B + s t\) <span class="c">// (93.8)</span></li>
+<li><b>return</b> the three splits, \(t^*\) and the batch–context budget \(M_W / s\)</li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: choose what to optimize for a workload</div><ol>
+<li><b>input:</b> typical prompt length \(P\), output length \(N\), batch \(B\), and the splits of Algorithm 1</li>
+<li>\(f_{\text{pre}} \leftarrow\) score share of \(F_{\text{prefill}}(P)\) <span class="c">// (93.7)</span></li>
+<li>\(f_{\text{dec}} \leftarrow s(P + N/2) / (M_W / B + s(P + N/2))\) <span class="c">// cache share of decode bytes</span></li>
+<li>\(w \leftarrow\) time share of prefill (measure it, or estimate from FLOPs and bytes)</li>
+<li><b>if</b> \(w f_{\text{pre}} + (1 - w) f_{\text{dec}} \lt 0.2\): <span class="c">// weights dominate</span></li>
+<li class="i1">optimize FFN and weights: quantize weights, MoE, prune FFN, larger batch</li>
+<li><b>else if</b> \(f_{\text{dec}}\) is large: optimize the cache: GQA/MLA, KV quantization, eviction, paging</li>
+<li><b>if</b> \(f_{\text{pre}}\) is large: FlashAttention, sparse or linear attention, prompt compression, fewer visual tokens</li>
+<li><b>always</b> profile afterwards: the shares change after each fix</li></ol></div>
+<p>The threshold 0.2 is a rule of thumb, not a law: it says that if attention is less than a fifth of the cost, attention work can win at most 20%.</p>
+
+<h2>In code: count and check</h2>
+<p>The code builds one tiny Llama-style layer with GQA (8 query heads, 2 key–value heads) and SwiGLU in PyTorch. It counts the parameters of each half from the real tensors and compares them with (93.1) and (93.2). Then it runs one decode step of attention against a cache of \(t - 1\) tokens and one step of the FFN under PyTorch’s <code>FlopCounterMode</code>, and compares the measured FLOPs with (93.5). It is deterministic (fixed seed; the FLOP counts do not depend on the values anyway).</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn <span class="kw2">as</span> nn
+<span class="kw2">from</span> torch.utils.flop_counter <span class="kw2">import</span> FlopCounterMode
+torch.manual_seed(0)
+
+<span class="kw2">class</span> Block(nn.Module):                                  <span class="cm"># one Llama-style layer: GQA + SwiGLU</span>
+    <span class="kw2">def</span> __init__(s, d, n_h, n_kv, d_h, d_ff):
+        super().__init__()
+        s.n_h, s.n_kv, s.d_h = n_h, n_kv, d_h
+        s.wq = nn.Linear(d, n_h * d_h, bias=False); s.wk = nn.Linear(d, n_kv * d_h, bias=False)
+        s.wv = nn.Linear(d, n_kv * d_h, bias=False); s.wo = nn.Linear(n_h * d_h, d, bias=False)
+        s.gate = nn.Linear(d, d_ff, bias=False); s.up = nn.Linear(d, d_ff, bias=False)
+        s.down = nn.Linear(d_ff, d, bias=False)
+    <span class="kw2">def</span> attn(s, x, K, V):                                <span class="cm"># x: (1, d) new token; K, V: (n_kv, t-1, d_h) cache</span>
+        q = s.wq(x).view(s.n_h, 1, s.d_h)
+        K = torch.cat([K, s.wk(x).view(s.n_kv, 1, s.d_h)], 1)       <span class="cm"># append the new key and value:</span>
+        V = torch.cat([V, s.wv(x).view(s.n_kv, 1, s.d_h)], 1)       <span class="cm"># now t rows</span>
+        K = K.repeat_interleave(s.n_h // s.n_kv, 0); V = V.repeat_interleave(s.n_h // s.n_kv, 0)
+        a = torch.softmax(q @ K.transpose(1, 2) / s.d_h**0.5, -1)   <span class="cm"># (n_h, 1, t) scores</span>
+        <span class="kw2">return</span> s.wo((a @ V).reshape(1, -1))
+    <span class="kw2">def</span> ffn(s, x):
+        <span class="kw2">return</span> s.down(nn.functional.silu(s.gate(x)) * s.up(x))
+
+<span class="kw2">def</span> count(mod, names): <span class="kw2">return</span> sum(getattr(mod, n).weight.numel() <span class="kw2">for</span> n <span class="kw2">in</span> names)
+<span class="kw2">def</span> flops(fn):
+    <span class="kw2">with</span> FlopCounterMode(display=False) <span class="kw2">as</span> fc: fn()
+    <span class="kw2">return</span> fc.get_total_flops()
+
+d, n_h, n_kv, d_h, d_ff = 512, 8, 2, 64, 1408            <span class="cm"># tiny model, GQA group size 4</span>
+blk = Block(d, n_h, n_kv, d_h, d_ff)
+P_attn = count(blk, ["wq", "wk", "wv", "wo"]); P_ffn = count(blk, ["gate", "up", "down"])
+print("params  attention", P_attn, "formula", 2*d*n_h*d_h + 2*d*n_kv*d_h)
+print("params  FFN      ", P_ffn,  "formula", 3*d*d_ff, f" FFN share {P_ffn/(P_attn+P_ffn):.1%}")
+
+x = torch.randn(1, d)
+<span class="kw2">for</span> t <span class="kw2">in</span> [256, 1024, 4096, 16384]:
+    K = torch.randn(n_kv, t - 1, d_h); V = torch.randn(n_kv, t - 1, d_h)
+    fa, ff = flops(<span class="kw2">lambda</span>: blk.attn(x, K, V)), flops(<span class="kw2">lambda</span>: blk.ffn(x))
+    proj, score = 2 * P_attn, 4 * n_h * d_h * t                <span class="cm"># formula: projections + QK and AV</span>
+    print(f"t={t:6d}  attention {fa:>10,} (formula {proj+score:>10,})  FFN {ff:>9,}  attention share {fa/(fa+ff):.1%}")
+print("crossover t* where scores = FFN:", 6 * d * d_ff // (4 * n_h * d_h))</pre>
+<p>Output (PyTorch 2.x on CPU):</p>
+<pre class="code">params  attention 655360 formula 655360
+params  FFN       2162688 formula 2162688  FFN share 76.7%
+t=   256  attention  1,835,008 (formula  1,835,008)  FFN 4,325,376  attention share 29.8%
+t=  1024  attention  3,407,872 (formula  3,407,872)  FFN 4,325,376  attention share 44.1%
+t=  4096  attention  9,699,328 (formula  9,699,328)  FFN 4,325,376  attention share 69.2%
+t= 16384  attention 34,865,152 (formula 34,865,152)  FFN 4,325,376  attention share 89.0%
+crossover t* where scores = FFN: 2112</pre>
+<p>The measured FLOPs match (93.5) exactly. The FFN is 76.7% of the weights but its FLOPs stay fixed at 4.33 million, while attention passes it between 1,024 and 4,096 tokens. The crossover is early here (\(t^* = 1.5 \times 1408 = 2112\)) because the model is tiny; for real models it is \(1.5 d_{ff}\), tens of thousands of tokens. Note the counter does not see the softmax; that is the “small terms” we ignored. To apply the same check to a real model, replace the shapes with the values from its config file, or run <code>FlopCounterMode</code> around one forward pass of the Hugging Face model.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Typical lengths</th><th>Where the cost is</th><th>What teams optimize</th></tr></thead><tbody>
+<tr><td>Chat assistants, customer support</td><td>Hundreds to a few thousand tokens</td><td>FFN and projection weights; decode is weight-bound</td><td>Weight quantization, MoE, large continuous batches</td></tr>
+<tr><td>Code completion</td><td>A few thousand tokens of context, short output, low latency</td><td>Weights per step, at small batch</td><td>Small or quantized models, speculative decoding</td></tr>
+<tr><td>RAG and long-document QA</td><td>10k to 128k tokens of prompt</td><td>Attention scores in prefill, KV cache in decode</td><td>FlashAttention, prefix caching, prompt compression, GQA/MLA</td></tr>
+<tr><td>Agents with tool calls</td><td>Long and growing context, many short turns</td><td>Prefill of the growing context; cache memory</td><td>Prefix caching, cache eviction, summarizing old turns</td></tr>
+<tr><td>VLM image QA</td><td>Hundreds of visual tokens per image (576 for LLaVA-1.5)</td><td>Mostly weights for one image; attention for many images</td><td>Visual token pruning or pooling</td></tr>
+<tr><td>Video QA, Video-RAG, key-moment detection</td><td>Thousands to over 100k visual tokens</td><td>Attention in prefill and cache in decode</td><td>Fewer tokens per frame, key-frame selection, clip retrieval before the LLM</td></tr>
+<tr><td>Video classification and action recognition with an LLM head</td><td>Many frames, very short output</td><td>Prefill only; scores grow with frames squared</td><td>Token merging, sparse or windowed attention over frames</td></tr>
+<tr><td>Batch summarization, offline jobs</td><td>Long inputs, large batches</td><td>Compute-bound prefill; scores at long inputs</td><td>Maximize utilization; chunked prefill</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Using one share for all models.</b> “The FFN is two thirds” is true for MHA with \(d_{ff} = 8d/3\). GQA models with wide FFNs are at 80% or more; MoE models above 95%.</li>
+<li><b>Counting GQA attention as \(4d^2\).</b> This is the error that turns 81.7% into 71.7% for Llama 2 70B. Use \(n_{kv}\) for \(W^K\) and \(W^V\).</li>
+<li><b>Thinking GQA reduces attention FLOPs.</b> It reduces the K and V projections and the cache bytes; the score FLOPs still use all \(n_h\) query heads (93.5).</li>
+<li><b>Mixing parameters, FLOPs and bytes.</b> The FFN can be 80% of parameters while attention is 90% of decode bytes. Say which cost you mean.</li>
+<li><b>Forgetting the embedding and head.</b> For small models with large vocabularies (128k to 152k tokens), they are more than 13% of the weights and the head costs FLOPs on every decode step.</li>
+<li><b>Counting MoE total parameters as FLOPs.</b> Mixtral has 46.7B weights but uses about 12.9B per token. Memory follows the total; FLOPs follow the active part.</li>
+<li><b>Believing FlashAttention removes the quadratic cost.</b> It removes the quadratic memory for the score matrix, not the quadratic FLOPs.</li>
+<li><b>Optimizing from the paper, not from the workload.</b> The same model is FFN-bound for chat and attention-bound for long documents. Measure your own length distribution first.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What fraction of a transformer’s parameters is in the FFN, and why?<span class="lvl">basic</span></summary><div class="ans">Per layer, attention with MHA has \(4d^2\) weights (Q, K, V, O) and a SwiGLU FFN has \(3 d\, d_{ff}\). With \(d_{ff} = 8d/3\) that is \(8d^2\), so the FFN is two thirds of each layer. Real models differ: Llama 2 7B is 64.2% FFN over the whole model, Llama 2 70B is 81.7% because GQA shrinks attention to \(2.25 d^2\) and the FFN ratio is 3.5. The survey quotes 63.01% and 71.69%; the second number matches a count that treats the 70B model as MHA.</div></details>
+<details class="qa"><summary>Write the forward FLOPs of one token at position t.<span class="lvl">basic</span></summary><div class="ans">\(F(t) = 2L P_{\text{ffn}} + 2L P_{\text{attn}} + 4 L n_h d_h t + 2Vd\). Every weight costs 2 FLOPs per token. The score term counts \(QK^\top\) and the weighted sum of values, \(2 n_h d_h t\) each, in every layer. Only this term depends on \(t\). Softmax and norms are small extra terms.</div></details>
+<details class="qa"><summary>At what context length does attention cost more FLOPs than the FFN?<span class="lvl">core</span></summary><div class="ans">Set \(4 L n_h d_h t = 6 L d d_{ff}\). With \(n_h d_h = d\), \(t^* = 1.5\, d_{ff}\). For Llama 3 8B (\(d_{ff} = 14{,}336\)) that is 21,504 tokens; for Llama 2 7B 16,512; for 70B models 43,008. Against all weight FLOPs of the layer (FFN plus projections) the crossover is \(2d + 1.5 d_{ff}\), about 26,600 for Llama 3 8B. So most chat is FFN-dominated and long-document work is attention-dominated.</div></details>
+<details class="qa"><summary>Why do people say “FFN cost grows with model size, attention cost grows with context”?<span class="lvl">core</span></summary><div class="ans">The FFN cost per token is \(6 d d_{ff} L\): fixed for a model and proportional to its size, the same at position 10 or 100,000. The score cost is \(4 L n_h d_h t\): it grows linearly per token with the context and quadratically over a whole prompt. The ratio of scores to weights is roughly \(t / (6d)\), so a wider model at the same context spends a smaller share on attention. The crossover \(1.5 d_{ff}\) moves right as models grow.</div></details>
+<details class="qa"><summary>Does GQA reduce attention FLOPs?<span class="lvl">core</span></summary><div class="ans">Only slightly. It reduces the K and V projection weights (\(2 d n_{kv} d_h\) instead of \(2 d n_h d_h\)), but every query head still computes \(t\) scores and a weighted sum of \(t\) values, so the score FLOPs \(4 L n_h d_h t\) do not change. What GQA reduces a lot is the KV cache size and the bytes read per decode step, by the factor \(g = n_h / n_{kv}\). Since decode is memory-bound, that is where the speedup comes from.</div></details>
+<details class="qa"><summary>In decode, why does batching help the FFN but not attention?<span class="lvl">core</span></summary><div class="ans">The FFN weights are the same for all sequences: one read of each weight serves \(B\) tokens, so the arithmetic intensity is about \(2B/b\) FLOPs per byte (\(B\) in bfloat16) and the weight bytes per token are \(M_W / B\). Each sequence has its own KV cache, so its bytes per token stay \(sT\) whatever the batch, and the intensity is \(2g/b\), between 1 and 8 in bfloat16. With a large batch and long contexts, decode becomes cache-bound.</div></details>
+<details class="qa"><summary>Llama 3 8B, bfloat16: at what batch × context does the cache cost as many bytes as the weights?<span class="lvl">core</span></summary><div class="ans">\(M_W = 2 \times 8.03 \times 10^9 = 16.06\) GB. \(s = 2 \times 32 \times 8 \times 128 \times 2 = 131{,}072\) bytes per token. \(B \cdot T = M_W / s = 122{,}532\). So one user at about 122k tokens, 16 users at about 7.7k, or 32 users at about 3.8k tokens. For Llama 2 7B (MHA, \(s = 524{,}288\)) the budget is only 25,705.</div></details>
+<details class="qa"><summary>Your users send 100k-token documents and get 500-token answers. What do you optimize first?<span class="lvl">advanced</span></summary><div class="ans">Count. For Llama 3 8B the prefill is about \(4 \times 10^{15}\) FLOPs, 65% of it attention scores, so at least 4 seconds on one H100. Decode reads about 13 GB of cache per token per user against 16 GB of weights shared by the batch; at batch 16 the cache is 93% of the bytes. So attention dominates both phases. First: reduce the input (better retrieval, prompt compression), cache shared prefixes, use FlashAttention-class kernels and chunked prefill. Then shrink the cache: FP8 KV cache, a model with fewer KV heads or MLA, eviction or sparse attention if quality allows. Weight quantization helps little here.</div></details>
+<details class="qa"><summary>How does MoE change the split?<span class="lvl">advanced</span></summary><div class="ans">MoE replaces one FFN by \(E\) expert FFNs and a router, and each token uses \(k\) of them. Parameters: the FFN share jumps (Mixtral 8x7B: 96.6% of 46.7B). FLOPs per token: only the \(k\) active experts count (Mixtral: 12.9B active, 87.5% FFN), so the crossover \(t^*\) is \(1.5 k d_{ff}\), 43,008 for Mixtral. Bytes: in a big batch, the tokens together touch all experts, so the weight bytes per step are those of the total model, and memory capacity is dominated by experts. MoE makes FFN compute cheap relative to memory, which is why expert offloading and expert parallelism exist.</div></details>
+<details class="qa"><summary>Why is FlashAttention not a fix for the “quadratic complexity” of attention?<span class="lvl">advanced</span></summary><div class="ans">FlashAttention computes exactly the same scores and sums, so the FLOPs stay \(2 L n_h d_h P(P+1)\) for a prompt of \(P\) tokens. It tiles the computation in on-chip memory and never writes the \(P \times P\) score matrix to HBM, so memory size becomes linear in \(P\) and memory traffic drops. Prefill becomes compute-bound and runs near peak, but doubling the prompt still costs about four times the score FLOPs. To reduce the FLOPs you need sparse, windowed or linear attention, or a shorter input.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Qwen2.5 72B has \(d = 8192\), \(d_{ff} = 29{,}568\), 64 query heads and 8 key–value heads of size 128. Compute the FFN share of one layer with (93.4) and the crossover \(t^*\) with (93.6).</li>
+<li>Reproduce the survey’s 63.01% for LLaMA-7B: compute the denominator with attention \(4d^2\) per layer and \(Vd\) counted three times. Then explain in one sentence why the correct count is 64.24%.</li>
+<li>Llama 2 7B in bfloat16 (6.74B parameters, MHA, 32 layers): compute \(s\) and the budget \(M_W / s\). At batch 8, at what context does the cache cost as many bytes as the weights?</li>
+<li>A video model built on Llama 3 8B receives 64 frames with 144 tokens each, plus 100 text tokens. Use (93.7) to compute the share of prefill FLOPs in the score term. Compare with the 600-frame case in the workload table.</li>
+<li>Using (93.9), what is the arithmetic intensity of decode attention for Llama 2 7B and for Llama 3 70B in bfloat16? How far are they from the H100 ridge point of 295 FLOP/byte? Does a larger batch help?</li>
+<li>For Mixtral 8x7B, explain why \(t^* = 43{,}008\) although \(d_{ff} = 14{,}336\), and why its decode at a large batch reads the weights of all 46.7B parameters.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(r = 29{,}568 / 8192 = 3.609\), \(g = 8\): \(\rho = 3r / (2 + 0.25 + 3r) = 10.83 / 13.08 = 82.8\%\). \(t^* = 1.5 \times 29{,}568 = 44{,}352\). 2. FFN: \(32 \times 3 \times 4096 \times 11{,}008 = 4{,}328{,}521{,}728\). Denominator: \(4{,}328{,}521{,}728 + 32 \times 4 \times 4096^2 + 3 \times 32{,}000 \times 4096 = 6{,}869{,}221{,}376\); share 63.01%. The correct count has the vocabulary twice (embedding and head), not three times, and includes the 266,240 norm weights, giving \(6{,}738{,}415{,}616\) and 64.24%. 3. \(s = 2 \times 32 \times 32 \times 128 \times 2 = 524{,}288\) bytes. \(M_W = 13.48\) GB, \(M_W / s = 25{,}705\) tokens; at batch 8, \(T = 3{,}213\), less than its 4,096-token context. 4. \(P = 9{,}316\): score share 14.9% (versus 61.9% at 86,500 tokens). With 9.3 times fewer tokens, the score term is about 86 times smaller (\(9.3^2\)) but the weight term only 9.3 times smaller. 5. \(I_{\text{attn}} = g\): 1 for Llama 2 7B (MHA), 8 for Llama 3 70B. That is 295× and 37× below the ridge. A larger batch does not help, because no two sequences share a cache; only GQA (larger \(g\)), a smaller cache format, or attention that shares a prefix cache across requests raises it. 6. Each token goes through \(k = 2\) experts, so the active FFN FLOPs are \(2 \times 6 d d_{ff}\) per layer and \(t^* = 1.5 \times 2 \times 14{,}336 = 43{,}008\). In a large batch, different tokens pick different experts, so together they touch all 8 experts in every layer, and each step reads all expert weights.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>One layer = attention (\(2 d n_h d_h + 2 d n_{kv} d_h\) weights) + FFN (\(3 d d_{ff}\) with SwiGLU). The FFN holds 64% (Llama 2 7B) to 82% (70B GQA models) of the weights, and over 95% in MoE models.</li>
+<li>The survey’s 63.01% and 71.69% match a count with MHA attention and \(Vd\) three times; from the 70B config file the share is 81.7%. Count from the config of the model you serve.</li>
+<li>FLOPs per token: weights cost 2 FLOPs each, fixed; attention scores cost \(4 L n_h d_h t\), growing with context. The crossover is \(t^* = 1.5 d_{ff}\): about 21k tokens for Llama 3 8B.</li>
+<li>Prefill FLOPs have a term quadratic in the prompt length; FlashAttention saves memory traffic, not these FLOPs.</li>
+<li>Decode bytes: weights are shared by the batch, caches are not. The cache equals the weights when \(B \cdot T = M_W / s\) (122,532 tokens for Llama 3 8B). Attention intensity is \(g\) in bfloat16, whatever the batch.</li>
+<li>Short chat: optimize the FFN and the weights. Long documents and video: optimize attention, the cache and the input length. Measure your workload first.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ P_{\text{attn}} = 2 d\, n_h d_h + 2 d\, n_{kv} d_h, \qquad P_{\text{ffn}} = 3 d\, d_{ff}, \qquad \rho_{\text{layer}} = \frac{3r}{2 + 2/g + 3r} \]</div>
+<div class="eq">\[ F(t) = 2L(P_{\text{ffn}} + P_{\text{attn}}) + 4 L\, n_h d_h\, t + 2Vd, \qquad t^* = 1.5\, d_{ff} \]</div>
+<div class="eq">\[ \beta = \frac{M_W}{B} + s\,T, \qquad s = 2 L\, n_{kv} d_h\, b, \qquad I_{\text{weights}} = \frac{2B}{b}, \quad I_{\text{attn}} = \frac{2g}{b} \]</div>
+<h2 class="plain" id="where-the-cost-is-ffn-and-attention-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Shazeer (2020). <a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noopener">GLU Variants Improve Transformer</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Shazeer (2020). <a href="https://arxiv.org/abs/2002.05202" target="_blank" rel="noopener">GLU Variants Improve Transformer</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2302.13971" target="_blank" rel="noopener">LLaMA: Open and Efficient Foundation Language Models</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">Llama 2: Open Foundation and Fine-Tuned Chat Models</a></li><li>Llama Team, Meta (2024). <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></li><li>Jiang et al. (2024). <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">Mixtral of Experts</a></li><li>Ainslie et al. (2023). <a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">GQA: Training Generalized Multi-Query Transformer Models from Multi-Head Checkpoints</a></li><li>Kaplan et al. (2020). <a href="https://arxiv.org/abs/2001.08361" target="_blank" rel="noopener">Scaling Laws for Neural Language Models</a></li><li>Dao (2023). <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">FlashAttention-2: Faster Attention with Better Parallelism and Work Partitioning</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li><li>Yuan et al. (2024). <a href="https://arxiv.org/abs/2402.16363" target="_blank" rel="noopener">LLM Inference Unveiled: Survey and Roofline Model Insights</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/lab-compress-a-long-rag-prompt.html"><small>Previous · session 92</small>compress a long RAG prompt</a><a class="next" href="../inference/efficient-ffn-1-swiglu-and-parameter-sharing.html"><small>Next · session 94</small>Efficient FFN 1: SwiGLU and parameter sharing (ALBERT)</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="where-the-cost-is-ffn-and-attention"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const comma=n=>Math.round(n).toLocaleString("en-US");
+const pct=(x,k)=>(100*x).toFixed(k==null?1:k)+"%";
+function segInit(seg,attr,cb){seg.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;seg.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+const segVal=(seg,attr)=>{const b=seg.querySelector('button[aria-pressed="true"]');return b?b.dataset[attr]:null;};
+const C={ffn:"var(--t5)",proj:"var(--t1)",sc:"var(--t7)",head:"var(--t10)"};
+/* Shapes from each model's config.json on Hugging Face. dh = 128 for all. */
+const MOD={
+ l27:{n:"Llama 2 7B",d:4096,L:32,ff:11008,nh:32,kv:32,V:32000,E:1,k:1},
+ l270:{n:"Llama 2 70B",d:8192,L:80,ff:28672,nh:64,kv:8,V:32000,E:1,k:1},
+ l38:{n:"Llama 3 8B",d:4096,L:32,ff:14336,nh:32,kv:8,V:128256,E:1,k:1},
+ l370:{n:"Llama 3 70B",d:8192,L:80,ff:28672,nh:64,kv:8,V:128256,E:1,k:1},
+ q7:{n:"Qwen2.5 7B",d:3584,L:28,ff:18944,nh:28,kv:4,V:152064,E:1,k:1,bias:true},
+ mix:{n:"Mixtral 8x7B",d:4096,L:32,ff:14336,nh:32,kv:8,V:32000,E:8,k:2}};
+const DH=128;
+Object.values(MOD).forEach(m=>{const d=m.d;
+ m.pa=2*d*m.nh*DH+2*d*m.kv*DH+(m.bias?(m.nh*DH+2*m.kv*DH):0);           // (93.1), Qwen has q,k,v biases
+ m.pf=3*d*m.ff*m.E+(m.E>1?d*m.E:0);                                     // (93.2) + router
+ m.pfa=3*d*m.ff*m.k+(m.E>1?d*m.E:0);                                    // active FFN per token
+ m.emb=2*m.V*d;m.norm=m.L*2*d+d;
+ m.N=m.L*(m.pa+m.pf)+m.emb+m.norm;                                      // (93.3)
+ m.Fffn=2*m.L*m.pfa;m.Fproj=2*m.L*m.pa;m.Fhead=2*m.V*d;m.cs=4*m.L*m.nh*DH;// (93.5): score FLOPs = cs*t
+ m.tstar=6*d*m.ff*m.k/(4*m.nh*DH);                                      // (93.6)
+ m.s=2*m.L*m.kv*DH*2;m.MW=2*m.N;m.g=m.nh/m.kv;});                       // (93.8), bfloat16
+const BW=3.35e12,PEAK=989e12;
+const G=x=>x>=1e15?(x/1e15).toFixed(2)+" PFLOPs":x>=1e12?(x/1e12).toFixed(2)+" TFLOPs":(x/1e9).toFixed(2)+" GFLOPs";
+const GB=x=>(x/1e9).toFixed(2)+" GB";
+const Mp=x=>x>=1e9?(x/1e9).toFixed(3)+"B":(x/1e6).toFixed(1)+"M";
+
+/* ---------- Figure 1: the matrices of one layer ---------- */
+(function(){
+ const svg=$("#wc-par-svg");if(!svg)return;const info=$("#wc-par-info"),seg=$("#wc-par-m"),sv=$("#wc-par-sv");let key="l27";
+ function draw(){const m=MOD[key],d=m.d,survey=sv.checked;
+  const mats=[["W","Q",m.nh*DH,"a"],["W","K",m.kv*DH,"a"],["W","V",m.kv*DH,"a"],["W","O",m.nh*DH,"a"],["gate","",m.ff*m.E,"f"],["up","",m.ff*m.E,"f"],["down","",m.ff*m.E,"f"]];
+  const gap=5,X0=30,WT=700,units=mats.reduce((a,x)=>a+x[2],0),sc=(WT-gap*6)/units;const y0=62,H=96;
+  let g="",x=X0;const pos=[];
+  mats.forEach(([a,b,w,t],i)=>{const wd=Math.max(1.5,w*sc);pos.push([x,wd]);
+   g+=`<rect x="${x.toFixed(1)}" y="${y0}" width="${wd.toFixed(1)}" height="${H}" rx="3" fill="${t==="a"?C.proj:C.ffn}" fill-opacity="0.8"/>`;
+   if(t==="f"&&m.E>1){for(let e=1;e<m.E;e++){const xx=x+wd*e/m.E;g+=`<line x1="${xx.toFixed(1)}" y1="${y0}" x2="${xx.toFixed(1)}" y2="${y0+H}" stroke="var(--card)" stroke-width="1" stroke-dasharray="3 3"/>`;}}
+   const lab=t==="a"?`W<tspan baseline-shift="sub" font-size="10">${b}</tspan>`:`W<tspan baseline-shift="sub" font-size="10">${a}</tspan>`;
+   if(wd>=34)g+=`<text x="${(x+wd/2).toFixed(1)}" y="${y0+H/2+5}" text-anchor="middle" font-size="13" font-weight="700" fill="var(--card)" font-family="var(--sans)">${lab}</text>`;
+   x+=wd+gap;});
+  const aEnd=pos[3][0]+pos[3][1],fSt=pos[4][0],fEnd=pos[6][0]+pos[6][1];
+  const pa=m.pa,pf=m.pf,lay=pa+pf;
+  g+=`<path d="M${X0} ${y0-8} V${y0-14} H${aEnd.toFixed(1)} V${y0-8}" fill="none" stroke="var(--t1)" stroke-width="1.5"/>`;
+  g+=`<path d="M${fSt.toFixed(1)} ${y0-8} V${y0-14} H${fEnd.toFixed(1)} V${y0-8}" fill="none" stroke="var(--t5)" stroke-width="1.5"/>`;
+  const aTxt=`attention ${Mp(pa)} (${pct(pa/lay)})`,fTxt=`FFN ${Mp(pf)} (${pct(pf/lay)})${m.E>1?", "+m.E+" experts":""}`;
+  const aX=Math.max(X0,Math.min((X0+aEnd)/2,X0+200));
+  g+=`<text x="${aX.toFixed(1)}" y="${y0-20}" text-anchor="${aEnd-X0<240?"start":"middle"}" font-size="13" font-weight="600" class="svgt">${aTxt}</text>`;
+  g+=`<text x="${fEnd.toFixed(1)}" y="${y0-20}" text-anchor="end" font-size="13" font-weight="600" class="svgt">${fTxt}</text>`;
+  g+=`<text x="${X0}" y="${y0+H+20}" font-size="12.5" class="svgs">one layer of ${m.n}: every box has d = ${comma(d)} rows; width ∝ columns ∝ parameters</text>`;
+  // whole model bar
+  let parts,tot;
+  if(survey){parts=[["embedding + head (3Vd)",3*m.V*d,C.head],["attention (4d² per layer)",m.L*4*d*d,C.proj],["FFN",m.L*pf,C.ffn]];}
+  else{parts=[["embedding",m.V*d,C.head],["attention",m.L*pa+m.norm,C.proj],["FFN",m.L*pf,C.ffn],["LM head",m.V*d,C.head]];}
+  tot=parts.reduce((a,p)=>a+p[1],0);const yb=220,hb=34;let xb=X0;
+  g+=`<text x="${X0}" y="${yb-10}" font-size="13" font-weight="600" class="svgt">whole model: ${Mp(tot)} parameters${survey?" (survey-style count)":""}</text>`;
+  parts.forEach(([n,v,c])=>{const w=WT*v/tot;g+=`<rect x="${xb.toFixed(1)}" y="${yb}" width="${Math.max(0.8,w).toFixed(1)}" height="${hb}" fill="${c}" fill-opacity="0.8" stroke="var(--card)" stroke-width="1"/>`;
+   if(w>=60)g+=`<text x="${(xb+w/2).toFixed(1)}" y="${yb+hb/2+5}" text-anchor="middle" font-size="12.5" font-weight="700" fill="var(--card)" font-family="var(--sans)">${n.split(" (")[0]} ${pct(v/tot)}</text>`;
+   xb+=w;});
+  svg.innerHTML=g;
+  const ffnS=m.L*pf/tot;
+  if(survey)info.innerHTML=`<b>${m.n}, survey-style count</b>: attention counted as 4d² per layer, vocabulary as 3·V·d, no norms. Total ${comma(tot)}; FFN share <b>${pct(ffnS,2)}</b>. ${key==="l27"?"This is the survey’s 63.01% for LLaMA-7B.":key==="l270"?"This is the survey’s 71.69% for LLaMA-70B: the count ignores GQA.":"The survey does not give this model; the recipe is shown for comparison."}`;
+  else info.innerHTML=`<b>${m.n}</b>: total <b>${comma(m.N)}</b> parameters. FFN <b>${pct(m.L*pf/m.N,2)}</b>, attention ${pct(m.L*pa/m.N,2)}, embedding + head ${pct(m.emb/m.N,2)}, norms ${pct(m.norm/m.N,3)}. One layer: attention ${comma(pa)}, FFN ${comma(pf)}, so the FFN is ${pct(pf/lay,2)} of a layer.${m.E>1?` Active per token (2 of 8 experts): ${Mp(m.L*(pa+m.pfa)+m.emb+m.norm)}.`:""}`;}
+ segInit(seg,"m",v=>{key=v;draw();});sv.addEventListener("change",draw);draw();
+})();
+
+/* ---------- Figure 2: FLOP split against context ---------- */
+(function(){
+ const svg=$("#wc-flp-svg");if(!svg)return;const info=$("#wc-flp-info"),seg=$("#wc-flp-m"),sl=$("#wc-flp-t"),out=$("#wc-flp-tv");let key="l38";
+ const x0=60,x1=680,y0=20,y1=250,lo=7,hi=20;const X=l=>x0+(l-lo)/(hi-lo)*(x1-x0),Y=f=>y1-f*(y1-y0);
+ function split(m,t){const sc=m.cs*t,F=m.Fffn+m.Fproj+sc+m.Fhead;return{F,ffn:m.Fffn/F,proj:m.Fproj/F,sc:sc/F,head:m.Fhead/F};}
+ function draw(){const m=MOD[key];const lv=+sl.value,t=Math.round(2**lv);out.value=comma(t);
+  const n=120,pts=[];for(let i=0;i<=n;i++){const l=lo+(hi-lo)*i/n;pts.push([l,split(m,2**l)]);}
+  const order=[["ffn",C.ffn],["proj",C.proj],["head",C.head],["sc",C.sc]];let g="";
+  let base=pts.map(()=>0);
+  order.forEach(([k,c])=>{const top=pts.map((p,i)=>base[i]+p[1][k]);
+   let d="M"+pts.map((p,i)=>X(p[0]).toFixed(1)+" "+Y(top[i]).toFixed(1)).join(" L");
+   d+=" L"+pts.slice().reverse().map((p,j)=>X(p[0]).toFixed(1)+" "+Y(base[pts.length-1-j]).toFixed(1)).join(" L")+"Z";
+   g+=`<path d="${d}" fill="${c}" fill-opacity="0.75"/>`;base=top;});
+  [0,0.25,0.5,0.75,1].forEach(f=>g+=`<line x1="${x0}" y1="${Y(f)}" x2="${x1}" y2="${Y(f)}" stroke="var(--rule)" stroke-width="0.8"/><text x="${x0-6}" y="${Y(f)+4}" text-anchor="end" font-size="12" class="svgs">${f*100}%</text>`);
+  [[7,"128"],[10,"1k"],[13,"8k"],[16,"64k"],[19,"512k"]].forEach(([l,s])=>g+=`<text x="${X(l)}" y="${y1+17}" text-anchor="middle" font-size="12" class="svgs">${s}</text>`);
+  g+=`<text x="${(x0+x1)/2}" y="${y1+36}" text-anchor="middle" font-size="12.5" class="svgs">position t (tokens attended to), log scale</text>`;
+  const ls=Math.log2(m.tstar);g+=`<line x1="${X(ls).toFixed(1)}" y1="${y0}" x2="${X(ls).toFixed(1)}" y2="${y1}" stroke="var(--ink)" stroke-width="1.6" stroke-dasharray="6 4"/><text x="${(X(ls)-6).toFixed(1)}" y="${y0+14}" text-anchor="end" font-size="12.5" font-weight="700" class="svgt">t* = ${comma(m.tstar)}</text>`;
+  g+=`<line x1="${X(lv).toFixed(1)}" y1="${y0}" x2="${X(lv).toFixed(1)}" y2="${y1}" stroke="var(--ink)" stroke-width="2.5"/><circle cx="${X(lv).toFixed(1)}" cy="${y1}" r="5" fill="var(--ink)"/>`;
+  svg.innerHTML=g;const s=split(m,t);
+  info.innerHTML=`<b>${m.n}</b> at t = <b>${comma(t)}</b>: ${(s.F/1e9).toFixed(2)} GFLOPs per token. FFN <b>${pct(s.ffn)}</b>, attention projections ${pct(s.proj)}, scores and weighted sum <b>${pct(s.sc)}</b>, LM head ${pct(s.head)}. Crossover t* = 1.5·d<sub>ff</sub>${m.k>1?"·k":""} = <b>${comma(m.tstar)}</b>; at this position the scores cost ${(s.sc/s.ffn).toFixed(2)}× the FFN.`;}
+ segInit(seg,"m",v=>{key=v;draw();});sl.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: decode bytes grid ---------- */
+(function(){
+ const svg=$("#wc-byt-svg");if(!svg)return;const info=$("#wc-byt-info"),seg=$("#wc-byt-m");let key="l38",sel=[5,2];
+ const BS=[1,2,4,8,16,32,64,128,256],TS=[1024,2048,4096,8192,16384,32768,65536,131072];
+ const gx=90,gy=44,cw=60,ch=32;
+ const tl=t=>t>=1024?(t/1024)+"k":t;
+ function share(m,b,t){const kv=b*m.s*t;return kv/(kv+m.MW);}
+ function draw(){const m=MOD[key];let g=`<text x="${gx+BS.length*cw/2}" y="16" text-anchor="middle" font-size="12.5" class="svgs">batch B (sequences decoded together)</text>`;
+  BS.forEach((b,i)=>g+=`<text x="${gx+i*cw+cw/2}" y="36" text-anchor="middle" font-size="12.5" font-weight="600" class="svgt">${b}</text>`);
+  TS.forEach((t,j)=>g+=`<text x="${gx-8}" y="${gy+j*ch+ch/2+5}" text-anchor="end" font-size="12.5" font-weight="600" class="svgt">T = ${tl(t)}</text>`);
+  BS.forEach((b,i)=>TS.forEach((t,j)=>{const f=share(m,b,t);const on=sel[0]===i&&sel[1]===j;
+   g+=`<g class="wc-cell" data-i="${i}" data-j="${j}"><rect x="${gx+i*cw+1}" y="${gy+j*ch+1}" width="${cw-2}" height="${ch-2}" rx="4" fill="var(--t7)" fill-opacity="${(0.06+0.62*f).toFixed(3)}" stroke="${on?"var(--ink)":"var(--rule)"}" stroke-width="${on?2.6:0.8}"/><text x="${gx+i*cw+cw/2}" y="${gy+j*ch+ch/2+5}" text-anchor="middle" font-size="12.5" ${f>=0.5?'font-weight="700"':""} class="svgt">${(100*f).toFixed(f>0.995||f<0.005?1:0)}%</text></g>`;}));
+  g+=`<text x="${gx+BS.length*cw/2}" y="${gy+TS.length*ch+20}" text-anchor="middle" font-size="12.5" class="svgs">cell = share of decode bytes that is KV cache (bold: cache-bound, ≥ 50%)</text>`;
+  svg.innerHTML=g;
+  const b=BS[sel[0]],t=TS[sel[1]],kv=b*m.s*t,tot=kv+m.MW,ts=tot/BW;
+  info.innerHTML=`<b>${m.n}</b>, batch <b>${b}</b>, context <b>${comma(t)}</b>: each step reads weights ${GB(m.MW)} + KV cache ${GB(kv)}. Cache share <b>${pct(kv/tot)}</b>. Step time ≥ <b>${(1e3*ts).toFixed(2)} ms</b>, so at most ${comma(b/ts)} tokens/s for the server and ${comma(1/ts)} per user. Budget M<sub>W</sub>/s = ${comma(m.MW/m.s)} tokens (s = ${comma(m.s)} bytes). Intensity: weights ≈ ${b} FLOP/byte, attention ≈ ${m.g} FLOP/byte (H100 ridge ≈ 295).`;}
+ svg.addEventListener("click",e=>{const c=e.target.closest(".wc-cell");if(!c)return;sel=[+c.dataset.i,+c.dataset.j];draw();});
+ segInit(seg,"m",v=>{key=v;draw();});draw();
+})();
+
+/* ---------- Figure 4: workloads ---------- */
+(function(){
+ const svg=$("#wc-wl-svg");if(!svg)return;const info=$("#wc-wl-info"),sw=$("#wc-wl-w"),sm=$("#wc-wl-m"),sb=$("#wc-wl-b"),ob=$("#wc-wl-bv");
+ const W={chat:{n:"short chat",P:500,N:300},rag:{n:"RAG with 8k context",P:8000,N:500},doc:{n:"long document",P:100000,N:500},vid:{n:"video QA (600 frames × 144 tokens + 100 text)",P:86500,N:200}};
+ let wk="chat",key="l38";
+ function bar(y,lab,parts,g){const x0=170,w=500,tot=parts.reduce((a,p)=>a+p[1],0);let x=x0;
+  g.s+=`<text x="${x0-10}" y="${y+22}" text-anchor="end" font-size="13" font-weight="600" class="svgt">${lab}</text>`;
+  parts.forEach(([n,v,c])=>{const ww=w*v/tot;if(ww<=0)return;g.s+=`<rect x="${x.toFixed(1)}" y="${y}" width="${Math.max(0.8,ww).toFixed(1)}" height="34" fill="${c}" fill-opacity="0.8" stroke="var(--card)" stroke-width="1"/>`;
+   if(ww>=46)g.s+=`<text x="${(x+ww/2).toFixed(1)}" y="${y+22}" text-anchor="middle" font-size="12.5" font-weight="700" fill="var(--card)" font-family="var(--sans)">${pct(v/tot,0)}</text>`;x+=ww;});return tot;}
+ function draw(){const m=MOD[key],w=W[wk],Bt=2**(+sb.value);ob.value=Bt;const P=w.P,N=w.N;
+  const pre=[["FFN",P*m.Fffn,C.ffn],["proj",P*m.Fproj,C.proj],["scores",m.cs/2*P*(P+1),C.sc],["head",m.Fhead,C.head]];  // (93.7)
+  const Tavg=P+N/2;const wb=x=>2*x/Bt;
+  const dec=[["FFN",wb(m.L*m.pf),C.ffn],["proj",wb(m.L*m.pa+m.norm),C.proj],["KV",m.s*Tavg,C.sc],["emb+head",wb(m.emb),C.head]];  // (93.8)
+  const g={s:""};const fp=bar(30,"prefill FLOPs",pre,g);const db=bar(110,"decode bytes / token",dec,g);
+  g.s+=`<text x="170" y="22" font-size="12.5" class="svgs">P = ${comma(P)} prompt tokens: ${G(fp)}</text><text x="170" y="102" font-size="12.5" class="svgs">N = ${comma(N)} output tokens, batch ${Bt}: ${GB(db)} read per generated token</text>`;
+  svg.innerHTML=g.s;
+  const fs=pre[2][1]/fp,fk=dec[2][1]/db;let adv;
+  if(fs<0.2&&fk<0.2)adv="the <b>FFN and the weights</b>: quantize weights, use MoE or pruning, batch more. Faster attention would gain little.";
+  else if(fs>=0.5&&fk>=0.5)adv="<b>attention in both phases</b>: shorten the input (retrieval, compression, fewer visual tokens), FlashAttention and chunked prefill, then shrink the cache (GQA/MLA, FP8 cache, eviction).";
+  else if(fk>=0.5)adv="<b>the KV cache in decode</b>: FP8 or INT4 cache, fewer KV heads, paging and prefix sharing. Prefill is still mostly weights.";
+  else if(fs>=0.5)adv="<b>attention in prefill</b>: FlashAttention, sparse attention or a shorter prompt; decode is still mostly weights.";
+  else adv="<b>mixed</b>: weights are still the largest part, but the cache is significant. Quantize weights and the cache together.";
+  info.innerHTML=`<b>${m.n}, ${w.n}</b>. Prefill ${G(fp)} (≥ ${fp/PEAK>=1?(fp/PEAK).toFixed(2)+" s":(fp/PEAK*1e3).toFixed(1)+" ms"} at 989 TFLOP/s): FFN ${pct(pre[0][1]/fp)}, projections ${pct(pre[1][1]/fp)}, scores <b>${pct(fs)}</b>. Decode at batch ${Bt}: ${GB(db)} per token, KV cache <b>${pct(fk)}</b>. Optimize first: ${adv}`;}
+ segInit(sw,"w",v=>{wk=v;draw();});segInit(sm,"m",v=>{key=v;draw();});sb.addEventListener("input",draw);draw();
+})();
+})();
+</script></body></html>

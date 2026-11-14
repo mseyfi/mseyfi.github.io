@@ -1,0 +1,416 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Where quantization helps: weight-only vs weight–activation · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 104</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="where-quantization-helps-weight-only-vs-weight">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="where-quantization-helps-weight-only-vs-weight" data-session="where-quantization-helps-weight-only-vs-weight" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">104</span><span>Track 5: LLM inference and serving · session 27 of 65</span></div><h1 class="chap-title">Where quantization helps: weight-only vs weight–activation</h1><p class="chap-sub">Quantization does not make every part of inference faster. Weight-only quantization (W4A16, W8A16) makes the weights smaller, so it speeds up decode, which waits for memory. Only weight–activation quantization (W8A8, FP8) makes the arithmetic faster, so only it can speed up prefill. We derive this with a roofline model and check it against the full table of measured AWQ speed-ups on an A100 from the efficient-inference survey.</p><div class="meta-row"><span><b>Time:</b> 2.5 to 3.5 hours (reading 1.5 to 2 hours, exercises 1 to 1.5 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions 82 and 103 (the roofline and why decode is memory-bound; quantization math: scale, zero point, granularity)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>What W4A16, W8A16, W8A8 and FP8 mean, and how the weight-only and weight–activation workflows differ inside one linear layer</li><li>Why decode (GEMV, memory-bound) gains from weight-only quantization and prefill (GEMM, compute-bound) does not</li><li>How to compute the roofline speed-up of each recipe for one layer, including the effective bits of group-wise scales and the batch where the gain ends</li><li>How to read the survey’s measured W4A16 results: about 2.0× to 2.5× in decode at batch 1, much less at batch 16, and 0.75× to 1.32× in prefill</li><li>Why the gain shrinks with batch and context (the KV cache stays FP16) and grows with model size</li><li>How to choose a recipe for chat, RAG, VLM and video workloads, and where W4A8, FP8 and KV-cache quantization fit</li></ul></div></header><style>
+.wq-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.wq-grid input[type=range]{width:100%}
+.wq-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.wq-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+#wq-pipe-svg text,#wq-lay-svg text,#wq-dec-svg text{font-family:var(--sans)}
+.wq-heat{border-collapse:separate;border-spacing:3px;font:600 14px var(--sans);margin:8px auto 0}
+.wq-heat th{font-weight:600;color:var(--muted);padding:4px 6px;text-align:center}
+.wq-heat td{min-width:54px;padding:8px 4px;text-align:center;border-radius:6px;cursor:pointer;color:var(--ink);border:2px solid transparent}
+.wq-heat td.sel{border-color:var(--ink)}
+.wq-heat td.oom{cursor:default;color:var(--muted);background:var(--paper2)}
+.controls .seg{margin:0 8px 6px 0}
+pre.code{font-variant-ligatures:none}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Quantize Llama 2 7B to 4-bit weights with AWQ and serve it on one A100 GPU. Each new token comes about 2.4 times faster. But the prompt is read slightly <b>slower</b> than before. The same quantized model speeds up one phase and slows down the other. This session explains why, and what to do about it.</p>
+<p>In <a href="../inference/quantization-math-scale-zero-point-granularity-and.html">session 103</a> you learned <b>how</b> to quantize a tensor: a scale, a zero point, a granularity, and the error that comes with them. This session asks <b>which</b> tensors to quantize, and why that choice decides where the speed-up appears. There are two main recipes:</p>
+<ul>
+<li><b>Weight-only quantization</b>: store the weights in 4 or 8 bits, keep the activations (the inputs of each layer) in 16 bits, and do the math in 16 bits. Names: <b>W4A16</b>, <b>W8A16</b> (W = weight bits, A = activation bits).</li>
+<li><b>Weight–activation quantization</b>: quantize both the weights and the activations, and do the math in low precision on faster tensor cores. Names: <b>W8A8</b> (INT8) and FP8.</li></ul>
+<p>From <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a> you know the two phases of generation behave very differently. <b>Prefill</b> (reading the prompt) is one big matrix–matrix product (GEMM) per layer, and it is limited by arithmetic: it is <b>compute-bound</b>. <b>Decode</b> (making one token per step) is a matrix–vector product (GEMV) per layer, and it is limited by how fast the weights arrive from memory: it is <b>memory-bound</b>. The main message of this session follows directly: [Certain]</p>
+<ul>
+<li>Weight-only quantization makes the weights smaller, so it speeds up the <b>memory-bound</b> phase: decode.</li>
+<li>Only weight–activation quantization makes the arithmetic faster, so only it can speed up the <b>compute-bound</b> phase: prefill.</li></ul>
+<p>We follow the efficient-inference survey of Zhou et al. (section 5.2.1), which states this rule and tests it: W4A16 with AWQ on LLaMA-2-7B and 13B, on one NVIDIA A100, in two serving frameworks (TensorRT-LLM and LMDeploy), over 5 batch sizes and 5 context lengths. We use their full table in Figure 3, and we check it against a roofline model that you can build yourself.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Very common: “Why does W4A16 speed up decode but not prefill?”, “When would you choose FP8 over INT4?”, “Why does the INT4 speed-up disappear at large batch?”, “What does W4A16 mean?”. All four have short answers with one formula each, below.</aside>
+
+<h2>Two recipes: weight-only and weight–activation</h2>
+<p>Every linear layer computes \(Y = X W^\top\). Here \(X\) holds the activations of the \(m\) tokens that pass through the layer at the same time (\(m\) = batch size in decode, or prompt length times batch in prefill), and \(W\) is the weight matrix. The two recipes quantize different parts of this product.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A factory that receives parts by truck. Weight-only quantization packs the parts tighter, so each truck brings four times more. That helps when the factory is waiting for trucks (decode). Weight–activation quantization buys faster machines that work on smaller parts. That helps when the trucks are not the problem but the machines are (prefill). Packing tighter does nothing for a factory that is already busy; and unpacking costs a little time.</aside>
+<h3>Weight-only (W4A16, W8A16)</h3>
+<p>The weights are quantized <b>once, offline</b>, for example with GPTQ or AWQ (<a href="../inference/weight-ptq-1-from-obq-to-gptq.html">session 106</a>, <a href="../inference/weight-ptq-2-awq-outliers-and-mixed.html">session 107</a>). They are stored as small integers \(q\) plus a scale \(s\) and a zero point \(z\) for each group of \(g\) weights (often \(g = 128\)). At run time the kernel loads the small integers, turns them back into FP16 numbers on the chip, and then does an ordinary FP16 matrix product:</p>
+<div class="eq">\[ \hat W_{ij} = s_{i,G(j)}\,\big(q_{ij} - z_{i,G(j)}\big), \qquad Y = X\,\hat W^\top \ \text{ in FP16} \tag{104.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(q_{ij}\)</dt><dd>the stored integer for weight \(i, j\): 0 to 15 for 4 bits</dd>
+<dt>\(G(j)\)</dt><dd>the group that input column \(j\) belongs to: groups of \(g\) neighbouring columns in the same row share one scale and one zero point</dd>
+<dt>\(s, z\)</dt><dd>the FP16 scale and zero point of that group (from <a href="../inference/quantization-math-scale-zero-point-granularity-and.html">session 103</a>)</dd>
+<dt>\(\hat W\)</dt><dd>the dequantized weights: FP16 numbers close to the original \(W\). They exist only inside the chip, a small tile at a time; they are never written back to memory</dd></dl>
+<p>So the math is <b>unchanged</b>: same FP16 tensor cores, same number of FLOPs, plus a little extra work to dequantize. What changes is the number of bytes read from memory. With 4-bit integers and an FP16 scale and zero for every 128 weights, each weight costs</p>
+<div class="eq">\[ b_{\text{eff}} = b + \frac{b_s + b_z}{g} = 4 + \frac{16 + 16}{128} = 4.25 \ \text{bits} \tag{104.2} \]</div>
+<p>instead of 16. The weights become \(16 / 4.25 = 3.76\) times smaller. [Certain] Smaller groups cost more: \(g = 64\) gives 4.5 bits.</p>
+<h3>Weight–activation (W8A8, FP8)</h3>
+<p>Here the activations are quantized too. The weights are still quantized offline (INT8 with one scale per output channel, for example). But the activations change with every input, so they must be quantized <b>online</b>, before each matrix product, usually with one scale per token. Then the product runs on low-precision tensor cores, which accumulate in INT32 (for INT8) and rescale once at the end:</p>
+<div class="eq">\[ Y_{tn} \approx s^{x}_{t}\, s^{w}_{n} \sum_{j} X^{q}_{tj}\, W^{q}_{nj}, \qquad X^{q}_{tj} = \mathrm{round}\!\left(\frac{X_{tj}}{s^{x}_{t}}\right) \tag{104.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(X^{q}, W^{q}\)</dt><dd>INT8 activations and weights (−127 to 127)</dd>
+<dt>\(s^{x}_{t}\)</dt><dd>scale of token \(t\): computed at run time, \(\max_j |X_{tj}| / 127\)</dd>
+<dt>\(s^{w}_{n}\)</dt><dd>scale of output channel \(n\): fixed offline</dd>
+<dt>\(\sum_j\)</dt><dd>the integer dot product, done by INT8 tensor cores and summed in INT32, so no overflow</dd></dl>
+<p>The scales factor out of the sum because one scale belongs to a row of \(X\) and one to a row of \(W\). That is why per-token and per-channel scales are the standard choice: finer groups along \(j\) would break the single integer sum. [Certain] The hard part is accuracy: activations of LLMs have large outliers in a few channels, so naive INT8 activations lose accuracy; LLM.int8() and SmoothQuant were built to fix this (<a href="../inference/weight-activation-quantization-llm-int8-smoothquant-zeroquant.html">session 108</a>). The survey’s Figure 9 draws the two workflows side by side; Figure 1 below follows the same idea.</p>
+
+<figure class="fig wide" id="wq-pipe"><div class="fig-body">
+<div class="controls"><span class="seg" id="wq-pipe-m"><button type="button" data-m="1" aria-pressed="true">decode: m = 1</button><button type="button" data-m="2048" aria-pressed="false">prefill: m = 2,048</button></span>
+<button type="button" class="btn" id="wq-pipe-prev">Back</button><button type="button" class="btn primary" id="wq-pipe-play">Play</button><button type="button" class="btn" id="wq-pipe-next">Next</button><span id="wq-pipe-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="wq-pipe-svg" viewBox="0 0 760 300" role="img" aria-label="The two quantization workflows, stage by stage, for one linear layer"></svg></div>
+<div class="readout" id="wq-pipe-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The two workflows for one linear layer of Llama 2 7B (the MLP up-projection, \(4096 \to 11008\)), on an A100. Top: weight-only W4A16 (formula 104.1). Bottom: weight–activation W8A8 (formula 104.3). Each step shows where the data is, in which format, and how many bytes move. The last step gives roofline times (formula 104.5).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Step through the five stages. The highlighted box is the current stage; FP16 data is drawn in the query colour, low-bit data in the value colour. Watch two things: the bytes read in the “load” stage (23.95 MB for W4A16, 45.1 MB for W8A8, against 90.2 MB in FP16), and the tensor cores used in the “multiply” stage (FP16 for W4A16, INT8 for W8A8). Switch between \(m = 1\) and \(m = 2048\) and look at the last stage: which recipe wins depends on \(m\).</p></details></figure>
+<div class="algo"><div class="algo-h">Algorithm 1: weight-only linear layer (W4A16), one call</div><ol>
+<li><b>offline, once:</b> for each row of \(W\) and each group of \(g = 128\) columns, compute \(s, z\); store \(q = \mathrm{clip}(\mathrm{round}(W/s) + z, 0, 15)\), two values per byte</li>
+<li><b>input:</b> FP16 activations \(X\) (\(m \times k\)), packed \(q\), FP16 \(s, z\)</li>
+<li><b>for</b> each output tile of \(Y\) (in parallel over thread blocks) <b>do</b></li>
+<li class="i1"><b>for</b> each slice of \(k\) <b>do</b></li>
+<li class="i1">&nbsp;&nbsp;load a tile of packed \(q\) and its \(s, z\) from HBM <span class="c">// 4.25 bits per weight: the saving</span></li>
+<li class="i1">&nbsp;&nbsp;unpack and compute \(\hat W = s\,(q - z)\) in registers <span class="c">// extra work on CUDA cores</span></li>
+<li class="i1">&nbsp;&nbsp;accumulate \(X_{\text{tile}} \hat W_{\text{tile}}^\top\) on FP16 tensor cores, FP32 accumulator</li>
+<li class="i1">write the FP16 output tile</li>
+<li><b>return</b> \(Y\) <span class="c">// same FLOPs as FP16; 3.76× fewer weight bytes</span></li></ol></div>
+<div class="algo"><div class="algo-h">Algorithm 2: weight–activation linear layer (W8A8), one call</div><ol>
+<li><b>offline, once:</b> \(s^w_n = \max_j |W_{nj}| / 127\); \(W^q = \mathrm{round}(W / s^w)\) as INT8</li>
+<li><b>input:</b> FP16 activations \(X\) (\(m \times k\))</li>
+<li>\(s^x_t \leftarrow \max_j |X_{tj}| / 127\) for every token \(t\) <span class="c">// online, every call; often fused into the previous kernel</span></li>
+<li>\(X^q \leftarrow \mathrm{round}(X / s^x)\) as INT8</li>
+<li>\(A \leftarrow X^q (W^q)^\top\) on INT8 tensor cores, INT32 accumulator <span class="c">// 2× the FP16 rate on A100 and H100</span></li>
+<li>\(Y \leftarrow A \odot (s^x (s^w)^\top)\) in FP16 <span class="c">// one rescale per output, fused into the GEMM epilogue</span></li>
+<li><b>return</b> \(Y\) <span class="c">// half the weight bytes and twice the math speed</span></li></ol></div>
+
+<h2>One linear layer on the roofline</h2>
+<p>Now make the rule exact. Take one linear layer with input size \(k\), output size \(n\), and \(m\) tokens. Count its FLOPs and its bytes moved from memory (HBM):</p>
+<div class="eq">\[ F = 2\,m\,k\,n, \qquad Q = \frac{b_w}{8}\,k\,n \;+\; \frac{b_a}{8}\,m\,k \;+\; 2\,m\,n \tag{104.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(F\)</dt><dd>FLOPs: one multiply and one add for each weight and each token</dd>
+<dt>\(Q\)</dt><dd>bytes: weights read once, activations read, FP16 outputs written</dd>
+<dt>\(b_w, b_a\)</dt><dd>bits per weight (16, 8.25 or 4.25 with group scales, 8 with per-channel scales) and bits per activation (16 or 8)</dd>
+<dt>\(m, k, n\)</dt><dd>tokens in the product, input size, output size</dd></dl>
+<p>As in <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>, the step takes at least the larger of compute time and memory time:</p>
+<div class="eq">\[ t \;\ge\; \max\!\left(\frac{F}{P_{\text{fmt}}},\ \frac{Q}{B}\right) \tag{104.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(P_{\text{fmt}}\)</dt><dd>dense tensor-core speed for the math format. A100: 312 TFLOP/s in FP16, 624 TOPS in INT8. H100 SXM: 989 TFLOP/s in BF16/FP16, 1,979 TFLOP/s in FP8</dd>
+<dt>\(B\)</dt><dd>memory bandwidth: 2,039 GB/s on the A100 80 GB SXM, 3.35 TB/s on the H100 SXM</dd></dl>
+<p>The A100 and H100 numbers are from NVIDIA’s product pages; the pages list “with sparsity” values that are twice these dense ones. [Certain] When \(m\) is much smaller than \(k\) and \(n\), the weight bytes dominate \(Q\), and the arithmetic intensity (FLOPs per byte) is</p>
+<div class="eq">\[ I \approx \frac{2\,m\,k\,n}{\tfrac{b_w}{8}\,k\,n} = \frac{16\,m}{b_w} \tag{104.6} \]</div>
+<p>The layer is memory-bound while \(I\) is below the ridge point \(P/B\) of the GPU (153 FLOP/byte for FP16 on an A100). In FP16 (\(b_w = 16\)), \(I = m\): the layer is memory-bound until \(m \approx 153\). Now compare the recipes. Write \(m^\ast = P_{16}/B\) for the FP16 ridge. Ignoring activation bytes, the speed-ups over FP16 are</p>
+<div class="eq">\[ S_{\text{W-only}}(m) = \frac{\max(m,\ m^\ast)}{\max\!\big(m,\ m^\ast\, b_{\text{eff}}/16\big)}, \qquad S_{\text{W8A8}}(m) = \frac{P_{8}}{P_{16}} = 2 \tag{104.7} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(m^\ast\)</dt><dd>the token count where FP16 becomes compute-bound: 153 on an A100, 295 on an H100</dd>
+<dt>\(m^\ast b_{\text{eff}}/16\)</dt><dd>where W4A16 becomes compute-bound: 40.6 tokens on an A100, 78.4 on an H100</dd>
+<dt>\(P_8 / P_{16}\)</dt><dd>the speed ratio of 8-bit and 16-bit tensor cores: 2 on both GPUs</dd></dl>
+<p>Read the left formula in three parts. For small \(m\) (decode), \(S = 16/b_{\text{eff}} = 3.76\): all the gain of the smaller weights. Between \(m^\ast b_{\text{eff}}/16\) and \(m^\ast\) it falls, because W4A16 has already hit the compute roof while FP16 has not. Above \(m^\ast\) (prefill) it is exactly 1: both run the same FP16 math at the same speed. W8A8 is different: it halves the bytes <b>and</b> doubles the math speed, so it gives 2× in both regimes. [Certain, as a roofline bound]</p>
+<p>The roofline ignores one thing: the dequantization in Algorithm 1 is extra work on the general-purpose CUDA cores. In the memory-bound regime it hides behind the memory wait. In the compute-bound regime it adds to the time, so the real speed-up of W4A16 in prefill is <b>below</b> 1. The QServe paper reports dequantization overheads of 20% to 90% of runtime for existing INT4 kernels in large-batch serving. [Certain] Figure 2 lets you add such an overhead.</p>
+<figure class="fig wide" id="wq-lay"><div class="fig-body">
+<div class="controls"><span class="seg" id="wq-lay-hw"><button type="button" data-h="a100" aria-pressed="true">A100</button><button type="button" data-h="h100" aria-pressed="false">H100 SXM</button></span></div>
+<div class="wq-grid" style="margin-top:8px">
+<label for="wq-lay-m">Tokens \(m\) in the product</label><input type="range" id="wq-lay-m" min="0" max="14" step="0.25" value="0"><output id="wq-lay-mv"></output>
+<label for="wq-lay-o">Dequantization cost (% of FP16 math)</label><input type="range" id="wq-lay-o" min="0" max="40" step="1" value="0"><output id="wq-lay-ov"></output></div>
+<div class="scroll-x"><svg id="wq-lay-svg" viewBox="0 0 760 340" role="img" aria-label="Speed-up over FP16 of W4A16, W8A16 and W8A8 against the number of tokens in the matrix product"></svg></div>
+<div class="wq-leg"><span style="--c:var(--q)">W4A16 (4.25 bits)</span><span style="--c:var(--v)">W8A16 (8.25 bits)</span><span style="--c:var(--k)">W8A8 (INT8 on A100, FP8 on H100)</span></div>
+<div class="readout" id="wq-lay-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Roofline speed-up over FP16 for one \(4096 \to 11008\) linear layer (formulas 104.4 and 104.5, with activation and output bytes included), against the number of tokens \(m\) on a log axis. The shaded left band is where decode batches usually live; the right band is prefill.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>Start at \(m = 1\): W4A16 is at 3.76×, W8A16 at 1.94×, W8A8 at 2×. Move right. The W4A16 curve stays high until about 32 tokens, then falls and reaches 1.0 near the FP16 ridge (153 on the A100). From there on, only W8A8 still gives a speed-up. Now raise the dequantization cost: the right part of the weight-only curves drops below 1, which is what the survey measured in prefill. The left part does not move, because there the dequantization hides behind the memory wait. Switch to the H100: its ridge is higher (295), so weight-only helps up to larger batches.</p></details></figure>
+<aside class="note watch side"><span class="nt">Watch out</span>“Decode is memory-bound” is true for the weight matrices at small batch. At batch 64 or 128, a decode GEMM on an A100 is no longer deep in the memory-bound regime, and W4A16 gains much less there. The MARLIN kernel paper reports close to the full 4-bit speed-up up to batch 16 to 32, and a gradually smaller one up to batch 64 to 128. [Certain]</aside>
+
+<h2>What the survey measured</h2>
+<p>The survey tested exactly this. LLaMA-2-7B and LLaMA-2-13B, weights quantized to 4 bits with AWQ (W4A16), one NVIDIA A100, served by TensorRT-LLM and by LMDeploy. For each batch size \(B \in \{1, 2, 4, 8, 16\}\) and context length \(\in \{128, 256, 512, 1024, 2048\}\), it reports three speed-ups over FP16: prefill latency, decode latency and end-to-end latency (their Table IV). [Certain] Figure 3 shows all 98 measured cells (two are out of memory).</p>
+<figure class="fig wide" id="wq-tab"><div class="fig-body">
+<div class="controls"><span class="seg" id="wq-tab-f"><button type="button" data-v="TRT" aria-pressed="true">TensorRT-LLM</button><button type="button" data-v="LMD" aria-pressed="false">LMDeploy</button></span><span class="seg" id="wq-tab-mo"><button type="button" data-v="7B" aria-pressed="true">LLaMA-2-7B</button><button type="button" data-v="13B" aria-pressed="false">LLaMA-2-13B</button></span><span class="seg" id="wq-tab-ph"><button type="button" data-v="0" aria-pressed="false">prefill</button><button type="button" data-v="1" aria-pressed="true">decode</button><button type="button" data-v="2" aria-pressed="false">end-to-end</button></span></div>
+<div class="scroll-x"><table class="wq-heat" id="wq-tab-grid"></table></div>
+<div class="readout" id="wq-tab-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Measured W4A16 (AWQ) speed-ups over FP16 on one A100, from Table IV of Zhou et al. (2024). Rows: batch size; columns: context length. Green cells are faster than FP16, red cells slower; darker means a larger effect. Click a cell for all three numbers.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>In the decode view, the top-left corner (batch 1, context 128) is the darkest green and the colour fades toward the bottom right: the gain shrinks as batch and context grow. Switch to prefill: almost every cell is red (slower than FP16). The only green prefill cells sit in the first column (context 128) at batch 1 or 2, where even prefill is small enough to be memory-bound. Switch to 13B: the decode greens are darker. The readout summarises the grid you are viewing.</p></details></figure>
+<p>Four observations, in the survey’s own order:</p>
+<ol>
+<li><b>Decode speeds up a lot.</b> At batch 1 the decode speed-up is 2.00× to 2.40× (TensorRT-LLM, 7B), 1.92× to 2.11× (LMDeploy, 7B), 1.94× to 2.51× and 2.01× to 2.34× for 13B. The end-to-end latency follows decode, because decode takes most of the time. [Certain]</li>
+<li><b>Prefill does not speed up and often slows down.</b> Prefill speed-ups range from 0.75× to 1.32×; 92 of the 98 cells are below 1. The survey gives two reasons: prefill is compute-bound, and dequantizing the weights adds work. [Certain]</li>
+<li><b>The gain shrinks as batch and context grow.</b> At batch 16, the decode speed-up of the 7B model drops to 1.16× to 1.43× (TensorRT-LLM) and 1.28× to 1.92× (LMDeploy). [Certain]</li>
+<li><b>Bigger models gain more.</b> Averaged over the same cells, decode speed-up is 1.71× (7B) against 1.94× (13B) in TensorRT-LLM, and 1.88× against 2.04× in LMDeploy; 13B wins in 46 of 48 matched cells. [Certain, computed from the table]</li></ol>
+<p>The six prefill cells at or above 1.0 are all at context 128 and batch 1 or 2: 1.06 and 1.24 (TensorRT-LLM, batch 1), 1.30, 1.03, 1.32, 1.06 (LMDeploy). Our roofline predicts this: a 128-token prefill of LLaMA-2-7B at batch 1 needs 5.43 ms of FP16 math but 6.51 ms to read the FP16 weights, so it is still memory-bound, and W4A16 should give about 1.20×. At batch 2 the math doubles to about 10.9 ms, the pass becomes compute-bound, and the bound is 1.00×. [Certain, as a roofline bound]</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Read the table with care. In both frameworks, the 7B rows for batch 8 and batch 16 are identical in every cell, and in TensorRT-LLM the 13B decode numbers for batch 1 and 2 are identical too. Real measurements rarely repeat to two decimals in five columns, so these rows are probably copy errors in the paper. [Likely] The trends above hold without them.</aside>
+
+<h2>Why the gain shrinks, and why bigger models gain more</h2>
+<p>One linear layer is not the whole decode step. A decode step also reads the KV cache: the stored keys and values of every past token of every sequence (<a href="../inference/the-kv-cache.html">session 80</a>). W4A16 shrinks the weights but <b>not</b> the KV cache, which stays FP16. For a memory-bound decode step of a model with \(N_{\text{lin}}\) weights in quantized layers and \(N_{\text{head}}\) weights in the output head (often kept in FP16), the ideal speed-up is</p>
+<div class="eq">\[ S_{\text{dec}} = \frac{2\,N_{\text{lin}} + 2\,N_{\text{head}} + B\,c\,\text{kv}_{\text{tok}}}{\tfrac{b_{\text{eff}}}{8}\,N_{\text{lin}} + 2\,N_{\text{head}} + B\,c\,\text{kv}_{\text{tok}}}, \qquad \text{kv}_{\text{tok}} = 2\,L\,H_{kv}\,d_h \cdot 2 \tag{104.8} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(B, c\)</dt><dd>batch size and context length (tokens already in each sequence’s cache)</dd>
+<dt>\(\text{kv}_{\text{tok}}\)</dt><dd>KV-cache bytes per token in FP16: keys and values, all \(L\) layers, \(H_{kv}\) KV heads of size \(d_h\)</dd>
+<dt>numerator, denominator</dt><dd>bytes read in one step in FP16 and in W4A16. The KV term is the same in both, so it pulls the ratio toward 1</dd></dl>
+<p>This explains the survey’s observations 3 and 4. The KV term grows with \(B \cdot c\), so the speed-up falls with both batch and context. And at larger \(B\), the compute term also grows (formula 104.7), which caps the gain further. A bigger model has more weight bytes per byte of KV cache: LLaMA-2-7B reads 13.2 GB of weights per step and 0.5 MiB of KV per token (both use plain multi-head attention, \(H_{kv} = 32\) and 40); LLaMA-2-13B reads 25.7 GB and 0.78 MiB. So its weights equal the KV cache of about 25,200 tokens for 7B and 31,400 tokens for 13B: the 13B weights stay dominant longer, and the speed-up stays higher. [Certain, from the configs]</p>
+<figure class="fig wide" id="wq-dec"><div class="fig-body">
+<div class="controls"><span class="seg" id="wq-dec-mo"><button type="button" data-v="7B" aria-pressed="true">LLaMA-2-7B</button><button type="button" data-v="13B" aria-pressed="false">LLaMA-2-13B</button></span></div>
+<div class="wq-grid" style="margin-top:8px">
+<label for="wq-dec-b">Batch \(B\)</label><input type="range" id="wq-dec-b" min="0" max="6" step="1" value="0"><output id="wq-dec-bv"></output>
+<label for="wq-dec-c">Context \(c\)</label><input type="range" id="wq-dec-c" min="7" max="12" step="1" value="7"><output id="wq-dec-cv"></output></div>
+<div class="scroll-x"><svg id="wq-dec-svg" viewBox="0 0 760 250" role="img" aria-label="Bytes and time of one decode step in FP16 and in W4A16"></svg></div>
+<div class="wq-leg"><span style="--c:var(--v)">weights</span><span style="--c:var(--k)">KV cache (FP16 in both)</span><span style="--c:var(--q)">compute time</span></div>
+<div class="readout" id="wq-dec-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> One decode step of LLaMA-2 on an A100 80 GB SXM: bytes read in FP16 and in W4A16 (formula 104.8), with the compute time drawn as a line. The readout compares the roofline speed-up with the speed-ups the survey measured at the same batch and context.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>Each bar is one decode step, drawn as time (bytes divided by bandwidth). The green part is weights, the orange part KV cache. At batch 1, context 128, the FP16 bar is almost all green and W4A16 removes most of it: 3.52× in theory. Raise the batch and the context: the orange part, which W4A16 does not shrink, takes over, and the ratio falls. The measured numbers are always lower than the bound (between 44% and 88% of it over the survey grid, median 65%), because real kernels do not reach full bandwidth and parts of the step (attention, normalization, sampling, kernel launches) do not shrink with the weights. The trend, however, is the same.</p></details></figure>
+
+<h2>Worked example: LLaMA-2-7B on an A100</h2>
+<div class="worked"><div class="wt">W4A16 against FP16, LLaMA-2-7B, A100 80 GB SXM (312 TFLOP/s FP16, 2,039 GB/s)</div>
+<p><b>Shapes.</b> From the model’s <code>config.json</code>: \(d = 4096\), MLP width 11,008, \(L = 32\) layers, 32 heads with 32 KV heads, vocabulary 32,000, embeddings not tied. The 7 projections of all layers hold \(N_{\text{lin}} = 32 \times (4 \cdot 4096^2 + 3 \cdot 4096 \cdot 11008) = 6{,}476{,}005{,}376\) weights; the output head holds \(N_{\text{head}} = 131{,}072{,}000\). All parameters: 6,738,415,616, which is 13.48 GB in FP16. [Certain]</p>
+<p><b>Weights read per decode step.</b> FP16: \(2 \times (6.476 + 0.131) \times 10^9 = 13.21\) GB. W4A16 with \(g = 128\) (head kept in FP16): \(6.476 \times 10^9 \times 4.25 / 8 + 0.262 \times 10^9 = 3.70\) GB.</p>
+<p><b>Decode, batch 1, context 128.</b> KV cache: \(128 \times 524{,}288\) bytes = 0.067 GB. FP16 step: \((13.21 + 0.07) / 2039 = 6.51\) ms. W4A16 step: \((3.70 + 0.07) / 2039 = 1.85\) ms. Compute is only 0.043 ms, so both steps are memory-bound. Bound on the speed-up: \(6.51 / 1.85 = 3.52\times\). Measured: 2.40× (TensorRT-LLM) and 2.11× (LMDeploy), that is 68% and 60% of the bound.</p>
+<p><b>Decode, batch 16, context 2048.</b> KV cache: \(16 \times 2048 \times 524{,}288\) bytes = 17.18 GB, more than the FP16 weights. FP16 step 14.91 ms, W4A16 step 10.24 ms: bound 1.46×. Measured: 1.16× and 1.28×.</p>
+<p><b>Prefill, batch 1, context 2048.</b> FLOPs: \(2 \times 6.607 \times 10^9 \times 2048 + 2 \times 32 \times 4096 \times 2048^2 = 28.2\) TFLOP, so 90.3 ms of FP16 math against 7.0 ms of memory traffic. Compute-bound; W4A16 does the same FP16 math, so the bound is 1.00×. Measured: 0.91× and 0.94×: with the dequantization, speed is 6% to 9% lower than FP16.</p>
+<p><b>What W8A8 would give.</b> INT8 tensor cores run at 624 TOPS, twice FP16. The same prefill would need at least 45.1 ms of math: a bound of 2.0×. In decode at batch 1, 8-bit per-channel weights make the step read \(6.48 + 0.26 + 0.07 = 6.81\) GB: a bound of \(13.28 / 6.81 = 1.95\times\), less than W4A16’s 3.52×. So for this model: INT4 weight-only for latency-critical decode, 8-bit weight–activation for prefill-heavy or large-batch work.</p></div>
+<p>The survey also shows that the end-to-end speed-up tracks decode (2.37× at batch 1, context 128, TensorRT-LLM, 7B). That is because generating many tokens takes far longer than reading the prompt. For a workload with long prompts and short answers (classification, retrieval reranking, a VLM reading many image tokens and answering “yes”), prefill dominates, and W4A16 can make the request slower overall. [Likely]</p>
+
+<h2>Beyond the two recipes</h2>
+<p>Real systems mix the ideas. Here is the map; the details come in the next sessions.</p>
+<ul>
+<li><b>FP8 (W8A8 in floating point).</b> On H100-class GPUs, FP8 tensor cores run at twice the BF16 rate (1,979 against 989 TFLOP/s dense). FP8 keeps an exponent, so outliers in activations hurt less than with INT8; ZeroQuant-FP found FP formats better than INT for activations. [Certain] It is a common default for serving on Hopper GPUs. [Likely] The formats themselves are in <a href="../inference/number-formats-int8-int4-fp8-fp4-nf4.html">session 105</a>.</li>
+<li><b>W4A8.</b> 4-bit weights for decode bandwidth plus 8-bit activations for prefill math. QServe (W4A8KV4) reports 1.2× higher maximum serving throughput for Llama-3-8B and 2.4× for Qwen1.5-72B on an A100, compared with TensorRT-LLM. [Certain, as reported by the authors] The catch is that the 4-bit weights must be converted to 8 bits inside the GEMM cheaply, without slowing the tensor cores.</li>
+<li><b>W4A4 and lower.</b> 4-bit tensor cores (on A100, and FP4 on newer GPUs) double the math speed again, but 4-bit activations are hard to keep accurate; Atom and rotation methods (<a href="../inference/rotations-against-outliers-quip-quip-quarot-spinquant.html">session 109</a>) try. [Likely]</li>
+<li><b>KV-cache quantization.</b> Formula (104.8) shows that at large \(B \cdot c\) the KV cache, not the weights, dominates decode bytes. Quantizing the cache (KIVI, KVQuant) attacks that term directly (<a href="../inference/kv-cache-quantization-kivi-and-kvquant.html">session 110</a>). [Certain]</li>
+<li><b>Memory size.</b> Even when W4A16 gives no speed-up, it frees memory. LLaMA-2-7B drops from 13.48 GB to about 3.97 GB of stored weights, leaving room for a larger batch or a longer context, which raises throughput (<a href="../inference/batching-basics-and-the-latency-throughput-trade.html">session 84</a>). AWQ’s TinyChat uses this to run Llama-2-70B on mobile GPUs. [Certain]</li></ul>
+<div class="algo"><div class="algo-h">Algorithm 3: choosing a quantization recipe</div><ol>
+<li><b>input:</b> workload (prompt length \(T\), answer length \(n\), batch \(B\)), GPU (\(P_{16}, P_8, B_{\text{mem}}\), memory size), accuracy budget</li>
+<li><b>if</b> the FP16 model does not fit in GPU memory <b>then</b> use weight-only INT4 first <span class="c">// memory size beats everything</span></li>
+<li>estimate prefill time \(t_p\) and total decode time \(t_d\) with formula (104.5)</li>
+<li><b>if</b> \(t_d \gg t_p\) and \(B\) is small (below about \(m^\ast b_{\text{eff}}/16\)) <b>then</b> weight-only W4A16 <span class="c">// chat, agents, long answers</span></li>
+<li><b>else if</b> \(t_p\) dominates or \(B\) is large <b>then</b> W8A8: FP8 on Hopper or newer, INT8 with SmoothQuant on Ampere <span class="c">// RAG, long prompts, big batches</span></li>
+<li><b>else</b> consider W4A8 kernels (QServe-style), or W8A8 plus KV-cache quantization</li>
+<li><b>if</b> \(B\,c\,\text{kv}_{\text{tok}} \gt\) weight bytes <b>then</b> add KV-cache quantization <span class="c">// formula (104.8)</span></li>
+<li>check accuracy on your task, then measure prefill and decode separately <span class="c">// never trust one end-to-end number</span></li></ol></div>
+
+<h2>In code</h2>
+<p>The script quantizes one \(4096 \times 4096\) layer both ways and checks the output error, then evaluates the roofline of a \(4096 \to 11008\) layer on an A100 for several \(m\). It needs only PyTorch on a CPU and is deterministic (seed 0). The dequantization here makes a full FP16 copy of the weights; real kernels (Marlin, AWQ, TensorRT-LLM) dequantize small tiles inside the GEMM instead, or there would be no memory saving at all.</p>
+<pre class="code"><span class="kw2">import</span> torch
+torch.manual_seed(<span class="nu">0</span>)
+
+<span class="cm"># ---- 1) Weight-only W4A16: 4-bit weights, groups of 128, FP16 scale and zero per group ----</span>
+<span class="kw2">def</span> quant_w4(W, g=<span class="nu">128</span>):                      <span class="cm"># W: (out, in)</span>
+    o, i = W.shape
+    Wg = W.reshape(o, i // g, g)
+    lo, hi = Wg.amin(-<span class="nu">1</span>, keepdim=<span class="kw2">True</span>), Wg.amax(-<span class="nu">1</span>, keepdim=<span class="kw2">True</span>)
+    s = (hi - lo).clamp(min=<span class="nu">1e-8</span>) / <span class="nu">15</span>        <span class="cm"># 16 levels: 0..15</span>
+    z = torch.round(-lo / s)                  <span class="cm"># integer zero point</span>
+    q = torch.clamp(torch.round(Wg / s) + z, <span class="nu">0</span>, <span class="nu">15</span>).to(torch.uint8)
+    packed = q[..., <span class="nu">0</span>::<span class="nu">2</span>] | (q[..., <span class="nu">1</span>::<span class="nu">2</span>] &lt;&lt; <span class="nu">4</span>)   <span class="cm"># two 4-bit values per byte</span>
+    <span class="kw2">return</span> packed, s.half(), z.half()
+
+<span class="kw2">def</span> dequant_w4(packed, s, z):
+    q = torch.stack([packed &amp; <span class="nu">15</span>, packed &gt;&gt; <span class="nu">4</span>], -<span class="nu">1</span>).flatten(-<span class="nu">2</span>).float()
+    <span class="kw2">return</span> ((q - z.float()) * s.float()).flatten(<span class="nu">1</span>)  <span class="cm"># back to (out, in)</span>
+
+<span class="cm"># ---- 2) Weight-activation W8A8: per-token activation scale, per-channel weight scale ----</span>
+<span class="kw2">def</span> quant_sym8(t, dim):
+    s = t.abs().amax(dim=dim, keepdim=<span class="kw2">True</span>).clamp(min=<span class="nu">1e-8</span>) / <span class="nu">127</span>
+    <span class="kw2">return</span> torch.clamp(torch.round(t / s), -<span class="nu">127</span>, <span class="nu">127</span>).to(torch.int8), s
+
+<span class="kw2">def</span> linear_w8a8(X, W):
+    Xq, sx = quant_sym8(X, dim=<span class="nu">1</span>)            <span class="cm"># online, every forward: one scale per token</span>
+    Wq, sw = quant_sym8(W, dim=<span class="nu">1</span>)            <span class="cm"># offline: one scale per output channel</span>
+    acc = Xq.to(torch.int32) @ Wq.to(torch.int32).T   <span class="cm"># integer matmul, int32 accumulate</span>
+    <span class="kw2">return</span> acc.float() * sx * sw.T           <span class="cm"># rescale the output once</span>
+
+d_in, d_out = <span class="nu">4096</span>, <span class="nu">4096</span>
+W = torch.randn(d_out, d_in) * <span class="nu">0.02</span>
+X = torch.randn(<span class="nu">8</span>, d_in)
+Y = X @ W.T
+
+packed, s, z = quant_w4(W)
+Y_w4 = X @ dequant_w4(packed, s, z).T       <span class="cm"># real kernels dequantize inside the GEMM</span>
+Y_w8a8 = linear_w8a8(X, W)
+rel = <span class="kw2">lambda</span> A: ((A - Y).norm() / Y.norm()).item()
+bytes_fp16 = W.numel() * <span class="nu">2</span>
+bytes_w4 = packed.numel() + s.numel() * <span class="nu">2</span> + z.numel() * <span class="nu">2</span>
+print(<span class="st">f"W4A16 rel. error {rel(Y_w4):.4f}  weight bytes {bytes_w4/2**20:.2f} MiB vs {bytes_fp16/2**20:.0f} MiB"</span>
+      <span class="st">f"  ({bytes_fp16/bytes_w4:.2f}x smaller, {8*bytes_w4/W.numel():.2f} bits/weight)"</span>)
+print(<span class="st">f"W8A8  rel. error {rel(Y_w8a8):.4f}"</span>)
+
+<span class="cm"># ---- 3) Roofline estimate for one linear layer: time = max(FLOPs / P, bytes / BW) ----</span>
+<span class="kw2">def</span> layer_time(m, k, n, wbits, P, BW, abytes=<span class="nu">2</span>):
+    flops = <span class="nu">2</span> * m * k * n
+    bytes_ = k * n * wbits / <span class="nu">8</span> + abytes * m * k + <span class="nu">2</span> * m * n
+    <span class="kw2">return</span> max(flops / P, bytes_ / BW)
+
+P16, P8, BW = <span class="nu">312e12</span>, <span class="nu">624e12</span>, <span class="nu">2.039e12</span>      <span class="cm"># A100 SXM: dense FP16 and INT8 tensor cores, HBM</span>
+<span class="kw2">for</span> m <span class="kw2">in</span> [<span class="nu">1</span>, <span class="nu">16</span>, <span class="nu">64</span>, <span class="nu">256</span>, <span class="nu">2048</span>]:            <span class="cm"># tokens in the matmul: decode batch or prompt length</span>
+    t16 = layer_time(m, <span class="nu">4096</span>, <span class="nu">11008</span>, <span class="nu">16</span>, P16, BW)
+    tw4 = layer_time(m, <span class="nu">4096</span>, <span class="nu">11008</span>, <span class="nu">4.25</span>, P16, BW)   <span class="cm"># W4A16 still does FP16 math</span>
+    tw8a8 = layer_time(m, <span class="nu">4096</span>, <span class="nu">11008</span>, <span class="nu">8</span>, P8, BW, abytes=<span class="nu">1</span>)
+    print(<span class="st">f"m={m:5d}  W4A16 speedup {t16/tw4:4.2f}   W8A8 speedup {t16/tw8a8:4.2f}"</span>)
+
+<span class="cm"># W4A16 rel. error 0.1001  weight bytes 8.50 MiB vs 32 MiB  (3.76x smaller, 4.25 bits/weight)</span>
+<span class="cm"># W8A8  rel. error 0.0124</span>
+<span class="cm"># m=    1  W4A16 speedup 3.76   W8A8 speedup 2.00</span>
+<span class="cm"># m=   16  W4A16 speedup 3.71   W8A8 speedup 1.99</span>
+<span class="cm"># m=   64  W4A16 speedup 2.44   W8A8 speedup 1.97</span>
+<span class="cm"># m=  256  W4A16 speedup 1.00   W8A8 speedup 2.00</span>
+<span class="cm"># m= 2048  W4A16 speedup 1.00   W8A8 speedup 2.00</span>
+</pre>
+<p>Two notes on the output. The W4A16 error of 10% is large because these are random Gaussian weights quantized by plain rounding: real weights quantized with GPTQ or AWQ keep perplexity close to FP16 even when the per-layer error looks like this. And the roofline part reproduces the shape of Figure 2: 3.76× for weight-only at \(m = 1\), falling to 1.00× by \(m = 256\), while W8A8 stays near 2×.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Setting</th><th>Phase that dominates</th><th>Typical choice</th></tr></thead><tbody>
+<tr><td>Local or single-user chat (llama.cpp, laptops, one GPU)</td><td>Decode at batch 1: memory-bound</td><td>Weight-only 4-bit (GPTQ, AWQ, GGUF formats); also needed just to fit in memory</td></tr>
+<tr><td>Cloud chat serving at high load</td><td>Decode at large batch, plus many prefills</td><td>FP8 W8A8 on H100; W4A8 or W4A16 with Marlin-style kernels at moderate batch; KV-cache quantization</td></tr>
+<tr><td>RAG and long-document QA</td><td>Prefill of long prompts: compute-bound</td><td>W8A8 / FP8; weight-only helps little for TTFT</td></tr>
+<tr><td>Classification, reranking, embedding models</td><td>Prefill only (one forward pass, no decode)</td><td>W8A8 / FP8, or INT8 with SmoothQuant</td></tr>
+<tr><td>VLM video understanding (classification, action recognition, key-moment detection)</td><td>Prefill of thousands of visual tokens, short answers</td><td>FP8 or INT8 activations for the LLM and the vision encoder; fewer visual tokens matter even more</td></tr>
+<tr><td>Dense video captioning, long video summaries</td><td>Decode of long answers after a long visual prefill</td><td>Mixed: FP8 for prefill speed; weight-only 4-bit helps the decode part at small batch</td></tr>
+<tr><td>Video-RAG over long recordings</td><td>Prefill of retrieved clips plus a large KV cache</td><td>W8A8 plus KV-cache quantization; weight-only to free memory for the cache</td></tr>
+<tr><td>Edge and phones</td><td>Decode, and memory size first</td><td>4-bit (or lower) weight-only; INT8 activations where the NPU supports it</td></tr></tbody></table></div>
+<p>The book’s chapter on efficient VLMs (Noyan et al., chapter 7) treats quantization as one of the main tools for deploying VLMs; the rule of this page tells you which variant fits which part of a VLM pipeline. A vision encoder processes all image patches in one pass, so it behaves like prefill. [Certain]</p>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Expecting W4A16 to cut time to first token.</b> Prefill is compute-bound and the math is still FP16. The survey measured 0.75× to 1.32×, mostly below 1.</li>
+<li><b>Quoting the ideal 3.76× (or 4×) as the decode speed-up.</b> The survey measured 1.9× to 2.5× at batch 1. The KV cache, attention, normalization, sampling and launch overheads do not shrink with the weights.</li>
+<li><b>Benchmarking at batch 1 only.</b> A W4A16 model that is 2.4× faster at batch 1 can be only 1.2× faster at batch 16, and slower at batch 128. Measure at the batch you will serve.</li>
+<li><b>Reporting one end-to-end number.</b> Measure prefill and decode separately (TTFT and TPOT, <a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>); the two can move in opposite directions.</li>
+<li><b>Dequantizing the whole matrix into memory.</b> A kernel that writes \(\hat W\) back to HBM reads and writes more bytes than FP16. The dequantization must happen tile by tile inside the matrix product.</li>
+<li><b>Using per-group scales for activations in W8A8.</b> Scales along the summed dimension do not factor out of the integer sum (formula 104.3). Use per-token scales for activations and per-channel scales for weights, or a kernel built for groups.</li>
+<li><b>Forgetting the hardware.</b> INT8 W8A8 needs INT8 tensor cores (A100, H100); FP8 needs Hopper or newer. On a GPU without fast low-precision math, W8A8 gives no compute gain.</li>
+<li><b>Ignoring accuracy of activations.</b> Weight-only INT4 is usually easier to keep accurate than INT8 activations, because LLM activations have large outlier channels. This is why weight-only methods came first.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What do W4A16 and W8A8 mean?<span class="lvl">basic</span></summary><div class="ans">W is the number of bits for weights, A for activations. W4A16: 4-bit weights (plus group scales), 16-bit activations, 16-bit math after dequantization. W8A8: both 8-bit, and the matrix product runs on 8-bit tensor cores with 32-bit accumulation. W4A16 is weight-only quantization; W8A8 is weight–activation quantization.</div></details>
+<details class="qa"><summary>Why does weight-only quantization speed up decode?<span class="lvl">basic</span></summary><div class="ans">Decode processes one token per sequence, so each linear layer is a matrix–vector product with about 1 FLOP per byte of FP16 weights. The A100 can do about 153 FLOPs per byte of bandwidth, so the step waits for memory. Fewer bits per weight means fewer bytes to read: 4.25 bits instead of 16 gives up to 3.76× in theory. The dequantization runs while the chip would otherwise wait.</div></details>
+<details class="qa"><summary>Why does W4A16 not speed up prefill, and why can it slow it down?<span class="lvl">core</span></summary><div class="ans">Prefill multiplies the weights by thousands of tokens at once, so its intensity is far above the ridge point: it is compute-bound. W4A16 does the same FP16 math, so the compute time is unchanged; and the dequantization adds work on the CUDA cores. The survey measured 0.75× to 1.32× in prefill, with 92 of 98 cells below 1.</div></details>
+<details class="qa"><summary>Which kind of quantization speeds up prefill, and by how much at most?<span class="lvl">core</span></summary><div class="ans">Weight–activation quantization: W8A8 in INT8 or FP8. It lets the product run on 8-bit tensor cores, which are twice as fast as 16-bit ones on the A100 (624 vs 312) and the H100 (1,979 vs 989 for FP8 vs BF16). So the roofline bound is 2× in the compute-bound regime. W4A4 could give another 2× on hardware with 4-bit math, but accuracy is hard.</div></details>
+<details class="qa"><summary>Derive the batch size where W4A16 stops helping a decode GEMM on an A100.<span class="lvl">advanced</span></summary><div class="ans">Intensity with \(b\)-bit weights is about \(16m/b\). FP16 is compute-bound when \(m \gt P/B = 312/2.039 \approx 153\). W4A16 with 4.25 bits becomes compute-bound at \(m = 153 \times 4.25/16 \approx 41\). Below 41 the speed-up is about 3.76×; between 41 and 153 it falls as \(153/m\); above 153 it is 1 (or below, with dequantization cost). On an H100 the numbers are 295 and 78.</div></details>
+<details class="qa"><summary>The decode speed-up of W4A16 drops from 2.4× at batch 1 to about 1.2× at batch 16 with long contexts. Why?<span class="lvl">core</span></summary><div class="ans">Two reasons. The KV cache is read per sequence, stays FP16, and grows with batch × context; for LLaMA-2-7B at batch 16 and context 2048 it is 17.2 GB, more than the 13.2 GB of FP16 weights, so shrinking the weights changes total bytes much less (bound 1.46×). And the larger batch moves the weight GEMMs toward the compute roof, where weight-only gives nothing.</div></details>
+<details class="qa"><summary>Why do bigger models gain more from weight-only quantization?<span class="lvl">core</span></summary><div class="ans">Their weight bytes are larger compared with everything else in the step: KV cache, attention, normalization and launch overheads. LLaMA-2-13B’s weights equal the KV cache of about 31,400 tokens, against 25,200 for 7B, so weights dominate longer. In the survey, 13B gained more than 7B in 46 of 48 matched decode cells.</div></details>
+<details class="qa"><summary>Why are W8A8 scales per token for activations and per channel for weights?<span class="lvl">advanced</span></summary><div class="ans">The INT8 GEMM computes \(\sum_j X^q_{tj} W^q_{nj}\) in one integer sum over \(j\). A scale that depends on \(t\) or on \(n\) (but not on \(j\)) can be pulled out and applied once to the output. A scale that changes along \(j\) cannot, so the sum would have to be split. Per-token scales also follow the large range differences between tokens; outlier channels need tricks like SmoothQuant that move the difficulty from activations to weights.</div></details>
+<details class="qa"><summary>A team quantizes their RAG service to INT4 weight-only and sees TTFT get worse. What do you suggest?<span class="lvl">advanced</span></summary><div class="ans">RAG prompts are long, so TTFT is a compute-bound prefill, and W4A16 adds dequantization work to unchanged FP16 math. Options: FP8 W8A8 on Hopper (or INT8 with SmoothQuant on Ampere) to speed up prefill math; W4A8 kernels to keep small weights and fast math; prefix caching and prompt compression to cut prefill work. Keep INT4 only if memory is the problem. Then measure TTFT and TPOT separately.</div></details>
+<details class="qa"><summary>Can weight-only quantization raise throughput even when it gives no speed-up per step?<span class="lvl">advanced</span></summary><div class="ans">Yes. It frees memory: LLaMA-2-7B weights go from 13.5 GB to about 4.0 GB. The freed memory holds more KV cache, so the server can run a larger batch or longer contexts, and throughput (tokens per second over all users) rises. In the survey, LLaMA-2-13B at batch 16 and context 2048 ran out of memory; a 40 GB card would explain this, since FP16 weights (26.0 GB) plus the KV cache (26.8 GB) exceed it [Speculation about the card].</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>With 4-bit weights, an FP16 scale and no zero point, what is \(b_{\text{eff}}\) for \(g = 128\) and for \(g = 32\)? What is the ideal decode speed-up of each over FP16?</li>
+<li>On an H100 SXM (989 TFLOP/s BF16, 3.35 TB/s), up to what \(m\) is a W4A16 (4.25-bit) GEMM memory-bound? Up to what \(m\) is a BF16 GEMM memory-bound?</li>
+<li>Use formula (104.8): what is the ideal W4A16 decode speed-up of LLaMA-2-13B at batch 1 and context 2048? Compare with the survey (TensorRT-LLM 1.94×, LMDeploy 2.01×).</li>
+<li>For LLaMA-2-7B, at what batch × context product does the FP16 KV cache equal the FP16 weights read per step?</li>
+<li>A W8A16 model (8 bits, per-channel scales) on an A100: what is the roofline speed-up of a decode GEMM at \(m = 1\), and of a prefill GEMM at \(m = 2048\)? And for W8A8?</li>
+<li>Use Figure 3: in LMDeploy, 7B, which batch size first shows a decode speed-up below 1.5× at context 2048?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(4 + 16/128 = 4.125\) bits, \(16/4.125 = 3.88\times\); \(4 + 16/32 = 4.5\) bits, \(3.56\times\). Smaller groups help accuracy and cost bandwidth. 2. Ridge \(989/3.35 = 295\) FLOP/byte. W4A16: memory-bound for \(m \lt 295 \times 4.25/16 = 78\). BF16: for \(m \lt 295\). 3. Weights 25.70 GB FP16 and 7.07 GB W4A16; KV \(2048 \times 819{,}200\) bytes = 1.68 GB. Bound \((25.70 + 1.68)/(7.07 + 1.68) = 3.13\times\). The measured values are about 62% to 64% of it. 4. \(13.21 \times 10^9 / 524{,}288 \approx 25{,}200\) tokens, for example batch 16 at context about 1,575, or batch 12 at 2,100. 5. W8A16 at \(m = 1\): \(16/8 = 2\times\) (minus a little for activations). At \(m = 2048\): 1×, compute-bound with FP16 math. W8A8: about 2× in both. 6. Batch 8 (1.28×); batch 4 is 1.64×.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Weight-only quantization (W4A16, W8A16) makes weights smaller but keeps FP16 math. It helps memory-bound work: decode at small batch. Bound: \(16/b_{\text{eff}}\), 3.76× for 4-bit with groups of 128.</li>
+<li>Weight–activation quantization (W8A8, FP8) also makes the math faster, so it is the only one of the two that speeds up compute-bound prefill: about 2× on A100 (INT8) and H100 (FP8).</li>
+<li>The survey (A100, AWQ W4A16): decode 1.9× to 2.5× faster at batch 1; at batch 16 down to 1.16× to 1.43× for 7B in TensorRT-LLM; prefill 0.75× to 1.32×, below 1 in 92 of 98 cells.</li>
+<li>The gain shrinks as batch and context grow (KV cache stays FP16, GEMMs move toward the compute roof) and grows with model size (weights dominate the bytes longer).</li>
+<li>Always measure prefill and decode separately, at the batch you will serve; weight-only quantization also frees memory, which can raise throughput even without a per-step speed-up.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ b_{\text{eff}} = b + \frac{b_s + b_z}{g}, \qquad t \ge \max\!\left(\frac{2mkn}{P_{\text{fmt}}}, \frac{Q}{B}\right), \qquad I \approx \frac{16\,m}{b_w} \]</div>
+<div class="eq">\[ S_{\text{W-only}} = \frac{\max(m, m^\ast)}{\max(m, m^\ast b_{\text{eff}}/16)}, \qquad S_{\text{W8A8}} = \frac{P_8}{P_{16}}, \qquad S_{\text{dec}} = \frac{Q_{16}(\text{weights}) + Q_{\text{KV}}}{Q_{q}(\text{weights}) + Q_{\text{KV}}} \]</div>
+<h2 class="plain" id="where-quantization-helps-weight-only-vs-weight-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Frantar et al. (2022). <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">GPTQ: Accurate Post-Training Quantization for Generative Pre-trained Transformers</a></li><li>Xiao et al. (2022). <a href="https://arxiv.org/abs/2211.10438" target="_blank" rel="noopener">SmoothQuant: Accurate and Efficient Post-Training Quantization for Large Language Models</a></li><li>Dettmers et al. (2022). <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">LLM.int8(): 8-bit Matrix Multiplication for Transformers at Scale</a></li><li>Micikevicius et al. (2022). <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">FP8 Formats for Deep Learning</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li><li>Frantar, Castro, Chen, Hoefler, Alistarh (2024). <a href="https://arxiv.org/abs/2408.11743" target="_blank" rel="noopener">MARLIN: Mixed-Precision Auto-Regressive Parallel Inference on Large Language Models</a></li><li>Lin, Tang, Yang, Zhang, Xiao, Gan, Han (2024). <a href="https://arxiv.org/abs/2405.04532" target="_blank" rel="noopener">QServe: W4A8KV4 Quantization and System Co-design for Efficient LLM Serving</a></li><li>Wu, Yao, He (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;ZeroQuant-FP: A Leap Forward in LLMs Post-Training W4A8 Quantization Using Floating-Point Formats&amp;quot;" target="_blank" rel="noopener">ZeroQuant-FP: A Leap Forward in LLMs Post-Training W4A8 Quantization Using Floating-Point Formats</a></li><li>Zhao et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;Atom: Low-bit Quantization for Efficient and Accurate LLM Serving&amp;quot;" target="_blank" rel="noopener">Atom: Low-bit Quantization for Efficient and Accurate LLM Serving</a></li><li>Liu et al. (2024). <a href="https://arxiv.org/abs/2402.02750" target="_blank" rel="noopener">KIVI: A Tuning-Free Asymmetric 2bit Quantization for KV Cache</a></li><li>Touvron et al. (2023). <a href="https://arxiv.org/abs/2307.09288" target="_blank" rel="noopener">Llama 2: Open Foundation and Fine-Tuned Chat Models</a></li><li>Meta (mirrored by NousResearch on Hugging Face) (2023). <a href="https://huggingface.co/NousResearch/Llama-2-7b-hf/blob/main/config.json" target="_blank" rel="noopener">Llama-2-7b-hf: config.json</a></li><li>NVIDIA (docs). <a href="https://www.nvidia.com/en-us/data-center/a100/" target="_blank" rel="noopener">NVIDIA A100 Tensor Core GPU: product specifications</a></li><li>NVIDIA (docs). <a href="https://www.nvidia.com/en-us/data-center/h100/" target="_blank" rel="noopener">NVIDIA H100 Tensor Core GPU: product specifications</a></li><li>NVIDIA (code). <a href="https://github.com/NVIDIA/TensorRT-LLM" target="_blank" rel="noopener">TensorRT-LLM</a></li><li>InternLM team (code). <a href="https://github.com/InternLM/lmdeploy" target="_blank" rel="noopener">LMDeploy: a toolkit for compressing, deploying and serving LLMs</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/quantization-math-scale-zero-point-granularity-and.html"><small>Previous · session 103</small>Quantization math: scale, zero point, granularity and error</a><a class="next" href="../inference/number-formats-int8-int4-fp8-fp4-nf4.html"><small>Next · session 105</small>Number formats: INT8, INT4, FP8, FP4, NF4 and microscaling</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const Bk=window.Book;const R=document.querySelector('[data-session="where-quantization-helps-weight-only-vs-weight"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const GP={a100:{n:"A100",P16:312e12,P8:624e12,B:2.039e12},h100:{n:"H100 SXM",P16:989e12,P8:1979e12,B:3.35e12}};
+const K=4096,N=11008;
+/* one linear layer: m tokens, k->n, wb bits per weight, ab bytes per activation, ov = extra compute fraction (dequant) */
+function lay(m,wb,P,B,ab,ov){const F=2*m*K*N,Q=K*N*wb/8+(ab||2)*m*K+2*m*N;const tc=F/P*(1+(ov||0)),tm=Q/B;return{t:Math.max(tc,tm),tc,tm,bound:tc>tm?"compute":"memory"};}
+function ft(s){if(s<1e-3)return(s*1e6).toFixed(1)+" µs";if(s<1)return(s*1e3).toFixed(2)+" ms";return s.toFixed(2)+" s";}
+const fk=v=>Math.round(v).toLocaleString("en-US");
+function seg(el,attr,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+
+/* ---------- Figure 1: the two workflows ---------- */
+(function(){
+ const svg=$("#wq-pipe-svg");if(!svg)return;const info=$("#wq-pipe-info");let m=1,cur=0;
+ const A=GP.a100;
+ const WO=[["Offline (once)","FP16 W → INT4","+ FP16 s, z per 128"],["Load from HBM","packed INT4 + s, z","23.95 MB"],["Dequantize on chip","Ŵ = s(q − z)","FP16 tile, CUDA cores"],["Multiply","FP16 tensor cores","312 TFLOP/s"],["Output","FP16 Y","no rescale needed"]];
+ const WA=[["Offline (once)","FP16 W → INT8","+ scale per channel"],["Load from HBM","INT8 W: 45.1 MB","+ activations X"],["Quantize X online","per-token scale","FP16 → INT8"],["Multiply","INT8 tensor cores","624 TOPS, INT32 acc."],["Output","Y = acc · sₓ · s_w","→ FP16"]];
+ const low=[[1,1,0,0,0],[1,1,1,1,0]];
+ function lane(rows,y,lowbits,title){let h=`<text x="10" y="${y-10}" font-size="13" font-weight="700" fill="var(--ink)">${title}</text>`;
+  rows.forEach((r,i)=>{const x=10+i*150,act=i===cur,col=lowbits[i]?"var(--v)":"var(--q)";
+   h+=`<rect x="${x}" y="${y}" width="138" height="78" rx="8" fill="${act?"var(--hl)":"var(--card)"}" stroke="${col}" stroke-width="${act?3.2:1.6}"/>`;
+   h+=`<text x="${x+69}" y="${y+22}" text-anchor="middle" font-size="12.5" font-weight="700" fill="var(--ink)">${r[0]}</text><text x="${x+69}" y="${y+42}" text-anchor="middle" font-size="12" fill="var(--ink2)">${r[1]}</text><text x="${x+69}" y="${y+60}" text-anchor="middle" font-size="11.5" fill="var(--muted)">${r[2]}</text>`;
+   if(i<4)h+=`<path d="M${x+140} ${y+39} L${x+149} ${y+39}" stroke="var(--muted)" stroke-width="1.6"/><path d="M${x+145} ${y+35} L${x+149} ${y+39} L${x+145} ${y+43}" fill="none" stroke="var(--muted)" stroke-width="1.6"/>`;});return h;}
+ function draw(k){cur=k;
+  let h=lane(WO,32,low[0],"Weight-only (W4A16)")+lane(WA,176,low[1],"Weight–activation (W8A8)");
+  h+=`<text x="750" y="290" text-anchor="end" font-size="11.5" fill="var(--muted)">green border: low-bit data · red border: FP16 data</text>`;
+  svg.innerHTML=h;
+  const x16=m*K*2,y16=m*N*2;
+  const t16=lay(m,16,A.P16,A.B),t4=lay(m,4.25,A.P16,A.B),t8=lay(m,8,A.P8,A.B,1);
+  const fb=b=>b>=1e6?(b/1e6).toFixed(2)+" MB":(b/1e3).toFixed(1)+" KB";
+  const T=[
+   `Offline, once per model. FP16 weights of this layer: ${fb(K*N*2)}. W4A16 stores 4-bit integers plus an FP16 scale and zero per 128 weights: ${fb(K*N*4.25/8)} (4.25 bits per weight, 3.76× smaller). W8A8 stores INT8 weights plus one scale per output channel: ${fb(K*N)} + ${fb(N*2)}.`,
+   `Every call reads the weights from HBM. W4A16 reads ${fb(K*N*4.25/8)}, W8A8 reads ${fb(K*N)}, FP16 would read ${fb(K*N*2)}. The activations for m = ${fk(m)} tokens are ${fb(x16)} in FP16 (${fb(x16/2)} in INT8). ${m===1?"At m = 1 the weights are 99.99% of the bytes.":"At m = 2,048 the activations are no longer tiny, but the step is limited by math anyway."}`,
+   `W4A16 turns each loaded tile back into FP16 inside the chip (formula 104.1). This costs instructions on the CUDA cores, not memory traffic. W8A8 instead quantizes the activations: one scale per token, max|x|/127, then rounding to INT8. This must happen online, at every call, because activations change with the input.`,
+   `The product. W4A16 runs on FP16 tensor cores at 312 TFLOP/s: the same speed and the same ${(2*m*K*N/1e9).toFixed(m===1?3:1)} GFLOP as FP16. W8A8 runs on INT8 tensor cores at 624 TOPS: twice the speed, with INT32 accumulation so the integer sums do not overflow.`,
+   `Roofline times on an A100 for m = ${fk(m)}: FP16 ${ft(t16.t)} (${t16.bound}-bound), W4A16 ${ft(t4.t)} (${t4.bound}-bound), W8A8 ${ft(t8.t)} (${t8.bound}-bound). Speed-ups over FP16: <b>W4A16 ${(t16.t/t4.t).toFixed(2)}×</b>, <b>W8A8 ${(t16.t/t8.t).toFixed(2)}×</b>. ${m===1?"In decode the smaller weights win.":"In prefill only the faster math helps; W4A16 is at best equal, and slower in practice because of the dequantization."}`];
+  info.innerHTML=T[k];}
+ const stp=Bk.stepper({n:5,prev:$("#wq-pipe-prev"),next:$("#wq-pipe-next"),play:$("#wq-pipe-play"),label:$("#wq-pipe-lab"),ms:2800,onStep:draw});
+ seg($("#wq-pipe-m"),"m",v=>{m=+v;draw(stp.i);});
+})();
+
+/* ---------- Figure 2: one layer, speed-up against m ---------- */
+(function(){
+ const svg=$("#wq-lay-svg");if(!svg)return;const sM=$("#wq-lay-m"),sO=$("#wq-lay-o"),info=$("#wq-lay-info");let hw="a100";
+ const X=lm=>70+lm/14*670,Y=s=>300-s/4*270;
+ function sp(g,m,ov){const t16=lay(m,16,g.P16,g.B);return{w4:t16.t/lay(m,4.25,g.P16,g.B,2,ov).t,w8:t16.t/lay(m,8.25,g.P16,g.B,2,ov).t,a8:t16.t/lay(m,8,g.P8,g.B,1).t,t16};}
+ function draw(){const g=GP[hw],m=Math.round(2**(+sM.value)),ov=(+sO.value)/100;$("#wq-lay-mv").value=fk(m);$("#wq-lay-ov").value=sO.value+"%";
+  let h=`<rect x="${X(0)}" y="30" width="${X(6)-X(0)}" height="270" fill="var(--v)" opacity=".07"/><rect x="${X(9)}" y="30" width="${X(14)-X(9)}" height="270" fill="var(--q)" opacity=".07"/>`;
+  h+=`<text x="${X(3)}" y="46" text-anchor="middle" font-size="12" fill="var(--muted)">decode batches</text><text x="${X(11.5)}" y="46" text-anchor="middle" font-size="12" fill="var(--muted)">prefill</text>`;
+  h+=`<path d="M70 30 V300 H740" fill="none" stroke="var(--muted)"/>`;
+  [0,1,2,3,4].forEach(s=>h+=`<line x1="70" x2="740" y1="${Y(s)}" y2="${Y(s)}" stroke="var(--rule)" stroke-dasharray="3 4"/><text x="62" y="${Y(s)+4}" text-anchor="end" font-size="12" fill="var(--muted)">${s}×</text>`);
+  h+=`<line x1="70" x2="740" y1="${Y(1)}" y2="${Y(1)}" stroke="var(--muted)" stroke-width="1.4"/>`;
+  [0,2,4,6,8,10,12,14].forEach(e=>h+=`<text x="${X(e)}" y="318" text-anchor="middle" font-size="12" fill="var(--muted)">${fk(2**e)}</text>`);
+  h+=`<text x="16" y="165" font-size="12" fill="var(--muted)" transform="rotate(-90 16 165)" text-anchor="middle">speed-up over FP16</text><text x="405" y="336" font-size="12" fill="var(--muted)" text-anchor="middle">tokens m in the matrix product (log scale)</text>`;
+  const ms=g.P16/g.B;h+=`<line x1="${X(Math.log2(ms))}" x2="${X(Math.log2(ms))}" y1="30" y2="300" stroke="var(--muted)" stroke-dasharray="2 4"/><text x="${X(Math.log2(ms))+5}" y="${Y(3.6)}" font-size="11.5" fill="var(--muted)">FP16 ridge m* = ${Math.round(ms)}</text>`;
+  const curve=(key,col)=>{let p="";for(let lm=0;lm<=14.001;lm+=0.0625){const v=Math.min(4,sp(g,2**lm,ov)[key]);p+=(p?"L":"M")+X(lm).toFixed(1)+" "+Y(v).toFixed(1);}return`<path d="${p}" fill="none" stroke="${col}" stroke-width="3"/>`;};
+  h+=curve("a8","var(--k)")+curve("w8","var(--v)")+curve("w4","var(--q)");
+  const r=sp(g,m,ov),lm=Math.log2(m);
+  h+=`<line x1="${X(lm)}" x2="${X(lm)}" y1="30" y2="300" stroke="var(--ink)" stroke-width="1.2" stroke-dasharray="5 4"/>`;
+  [["w4","var(--q)"],["w8","var(--v)"],["a8","var(--k)"]].forEach(([k2,c])=>h+=`<circle cx="${X(lm)}" cy="${Y(Math.min(4,r[k2]))}" r="5.5" fill="${c}" stroke="var(--paper)" stroke-width="1.5"/>`);
+  svg.innerHTML=h;
+  const t4=lay(m,4.25,g.P16,g.B,2,ov),t8=lay(m,8,g.P8,g.B,1);
+  info.innerHTML=`${g.n}, m = <b>${fk(m)}</b>${ov?", dequantization cost "+sO.value+"%":""}: FP16 layer ${ft(r.t16.t)} (${r.t16.bound}-bound). Speed-up <b>W4A16 ${r.w4.toFixed(2)}×</b> (${t4.bound}-bound), W8A16 ${r.w8.toFixed(2)}×, <b>W8A8 ${r.a8.toFixed(2)}×</b> (${t8.bound}-bound). W4A16 becomes compute-bound above m ≈ ${(ms*4.25/16).toFixed(1)}; FP16 above m* ≈ ${Math.round(ms)}.`;}
+ [sM,sO].forEach(e=>e.addEventListener("input",draw));seg($("#wq-lay-hw"),"h",v=>{hw=v;draw();});draw();
+})();
+
+/* ---------- survey Table IV (Zhou et al. 2024): [prefill, decode, end-to-end] speed-ups ---------- */
+const TAB={"TRT":{"7B":{"1":[[1.06,2.4,2.37],[0.9,2.38,2.34],[0.92,2.3,2.28],[0.88,2.19,2.17],[0.91,2.0,1.98]],"2":[[0.88,2.1,2.05],[0.91,2.07,2.04],[0.89,2.01,1.98],[0.91,1.92,1.89],[0.88,1.78,1.76]],"4":[[0.92,1.72,1.67],[0.89,1.67,1.64],[0.9,1.61,1.58],[0.87,1.53,1.51],[0.84,1.42,1.4]],"8":[[0.91,1.43,1.36],[0.88,1.38,1.33],[0.83,1.33,1.28],[0.77,1.25,1.21],[0.78,1.16,1.14]],"16":[[0.91,1.43,1.36],[0.88,1.38,1.33],[0.83,1.33,1.28],[0.77,1.25,1.21],[0.78,1.16,1.14]]},"13B":{"1":[[1.24,2.51,2.5],[0.89,2.45,2.47],[0.94,2.34,2.42],[0.9,2.18,2.32],[0.83,1.94,2.16]],"2":[[0.9,2.51,2.5],[0.95,2.45,2.47],[0.9,2.34,2.42],[0.83,2.18,2.32],[0.8,1.94,2.16]],"4":[[0.96,1.8,1.76],[0.91,1.78,1.74],[0.83,1.73,1.69],[0.8,1.65,1.62],[0.83,1.54,1.52]],"8":[[0.91,1.86,1.77],[0.83,1.81,1.73],[0.8,1.73,1.66],[0.82,1.62,1.56],[0.75,1.46,1.41]],"16":[[0.84,1.84,1.69],[0.81,1.77,1.63],[0.82,1.63,1.53],[0.78,1.46,1.39],null]}},"LMD":{"7B":{"1":[[1.3,2.11,2.09],[0.94,2.07,2.05],[0.9,2.03,2.02],[0.88,1.97,1.96],[0.94,1.92,1.91]],"2":[[1.03,2.24,2.2],[0.9,2.19,2.15],[0.88,2.11,2.08],[0.93,1.97,1.95],[0.85,1.78,1.76]],"4":[[0.9,2.18,2.1],[0.87,2.12,2.05],[0.93,2.01,1.96],[0.92,1.86,1.83],[0.92,1.64,1.62]],"8":[[0.92,1.92,1.77],[0.91,1.82,1.71],[0.92,1.65,1.57],[0.93,1.45,1.41],[0.94,1.28,1.26]],"16":[[0.92,1.92,1.77],[0.91,1.82,1.71],[0.92,1.65,1.57],[0.93,1.45,1.41],[0.94,1.28,1.26]]},"13B":{"1":[[1.32,2.34,2.32],[0.94,2.31,2.28],[0.92,2.22,2.2],[0.94,2.15,2.13],[0.94,2.01,1.99]],"2":[[1.06,2.42,2.36],[0.92,2.37,2.32],[0.94,2.29,2.25],[0.94,2.15,2.12],[0.95,1.95,1.93]],"4":[[0.93,2.36,2.26],[0.94,2.29,2.21],[0.94,2.18,2.12],[0.95,2.01,1.97],[0.96,1.78,1.75]],"8":[[0.92,2.24,2.1],[0.93,1.93,2.02],[0.94,1.81,1.89],[0.94,1.65,1.71],[0.95,1.45,1.49]],"16":[[0.93,2.02,1.85],[0.94,1.9,1.76],[0.94,1.73,1.63],[0.95,1.5,1.45],null]}}};
+const BS=["1","2","4","8","16"],CS=[128,256,512,1024,2048],FW={TRT:"TensorRT-LLM",LMD:"LMDeploy"},PH=["prefill","decode","end-to-end"];
+
+/* ---------- Figure 3: measured table explorer ---------- */
+(function(){
+ const tab=$("#wq-tab-grid");if(!tab)return;const info=$("#wq-tab-info");let f="TRT",mo="7B",ph=1,sb=0,sc=0;
+ function bg(v){if(v>=1){const p=Math.min(72,8+(v-1)/1.5*64);return`color-mix(in srgb, var(--ok) ${p.toFixed(0)}%, transparent)`;}const p=Math.min(72,8+(1-v)/0.25*64);return`color-mix(in srgb, var(--bad) ${p.toFixed(0)}%, transparent)`;}
+ function draw(){const G=TAB[f][mo];
+  let h=`<thead><tr><th>B \\ context</th>${CS.map(c=>`<th>${c}</th>`).join("")}</tr></thead><tbody>`;
+  BS.forEach((b,i)=>{h+=`<tr><th>${b}</th>`;CS.forEach((c,j)=>{const v=G[b][j];h+=v?`<td data-i="${i}" data-j="${j}" class="${i===sb&&j===sc?"sel":""}" style="background:${bg(v[ph])}">${v[ph].toFixed(2)}</td>`:`<td class="oom">OOM</td>`;});h+=`</tr>`;});
+  tab.innerHTML=h+`</tbody>`;
+  const all=[];BS.forEach(b=>G[b].forEach(v=>{if(v)all.push(v[ph]);}));const mn=Math.min(...all),mx=Math.max(...all),lo=all.filter(v=>v<1).length;
+  const v=G[BS[sb]][sc];
+  const cell=v?`Batch ${BS[sb]}, context ${CS[sc]}: prefill <b>${v[0].toFixed(2)}×</b>, decode <b>${v[1].toFixed(2)}×</b>, end-to-end <b>${v[2].toFixed(2)}×</b>.`:`Batch ${BS[sb]}, context ${CS[sc]}: out of memory.`;
+  info.innerHTML=`${cell}<br>${FW[f]}, LLaMA-2-${mo}, ${PH[ph]}: range ${mn.toFixed(2)}× to ${mx.toFixed(2)}× over ${all.length} cells; ${lo} below 1.00×.`;}
+ tab.addEventListener("click",e=>{const td=e.target.closest("td[data-i]");if(!td)return;sb=+td.dataset.i;sc=+td.dataset.j;draw();});
+ seg($("#wq-tab-f"),"v",v=>{f=v;draw();});seg($("#wq-tab-mo"),"v",v=>{mo=v;draw();});seg($("#wq-tab-ph"),"v",v=>{ph=+v;draw();});draw();
+})();
+
+/* ---------- Figure 4: whole decode step, roofline vs measured ---------- */
+(function(){
+ const svg=$("#wq-dec-svg");if(!svg)return;const sB=$("#wq-dec-b"),sC=$("#wq-dec-c"),info=$("#wq-dec-info");let mo="7B";
+ const A=GP.a100;
+ const CF={"7B":{d:4096,f:11008,L:32,V:32000},"13B":{d:5120,f:13824,L:40,V:32000}};
+ function model(m){const c=CF[m],lin=c.L*(4*c.d*c.d+3*c.d*c.f),head=c.V*c.d,tot=lin+2*head+c.L*2*c.d+c.d,kv=2*c.L*c.d*2;return{c,lin,head,tot,kv};}
+ function step(M,B,ctx,bits){const wb=M.lin*bits/8+M.head*2,kvb=M.kv*B*ctx,F=2*(M.lin+M.head)*B+4*M.c.L*M.c.d*ctx*B;const tw=wb/A.B,tk=kvb/A.B,tc=F/A.P16;return{wb,kvb,tw,tk,tc,t:Math.max(tw+tk,tc)};}
+ function draw(){const B=2**(+sB.value),ctx=2**(+sC.value);$("#wq-dec-bv").value=B;$("#wq-dec-cv").value=fk(ctx);
+  const M=model(mo),a=step(M,B,ctx,16),q=step(M,B,ctx,4.25),S=a.t/q.t;
+  const x0=120,w=600,sc=w/Math.max(a.t,q.t);
+  let h=`<text x="10" y="20" font-size="12" fill="var(--muted)">time of one decode step (bytes ÷ ${A.B/1e9} GB/s), A100</text>`;
+  [[a,"FP16",50],[q,"W4A16",130]].forEach(([r,nm,y])=>{const ww=r.tw*sc,kw=r.tk*sc;
+   h+=`<text x="10" y="${y+24}" font-size="13" font-weight="700" fill="var(--ink)">${nm}</text><text x="10" y="${y+42}" font-size="11.5" fill="var(--muted)">${ft(r.t)}</text>`;
+   h+=`<rect x="${x0}" y="${y}" width="${Math.max(ww,1.5)}" height="40" rx="4" fill="var(--v)"/><rect x="${x0+ww}" y="${y}" width="${Math.max(kw,1.5)}" height="40" fill="var(--k)"/>`;
+   if(ww>90)h+=`<text x="${x0+8}" y="${y+25}" font-size="12" fill="#fff" font-weight="700">weights ${(r.wb/1e9).toFixed(2)} GB</text>`;
+   if(kw>90)h+=`<text x="${x0+ww+8}" y="${y+25}" font-size="12" fill="#fff" font-weight="700">KV ${(r.kvb/1e9).toFixed(2)} GB</text>`;
+   const cx=x0+r.tc*sc;h+=`<line x1="${cx}" x2="${cx}" y1="${y-6}" y2="${y+46}" stroke="var(--q)" stroke-width="3"/>`;});
+  h+=`<text x="${x0}" y="215" font-size="12" fill="var(--muted)">red line: compute time of the step (FP16 math in both)</text><text x="${x0+w}" y="240" text-anchor="end" font-size="13" font-weight="700" fill="var(--ink)">roofline speed-up ${S.toFixed(2)}×</text>`;
+  svg.innerHTML=h;
+  const need16=M.tot*2+M.kv*B*ctx,need4=(M.lin*4.25/8+(M.tot-M.lin)*2)+M.kv*B*ctx;
+  const bi=BS.indexOf(String(B)),ci=CS.indexOf(ctx);let meas="";
+  if(bi>=0&&ci>=0){const t=TAB.TRT[mo][String(B)][ci],l=TAB.LMD[mo][String(B)][ci];
+   meas=t?`Survey, measured decode speed-up: TensorRT-LLM <b>${t[1].toFixed(2)}×</b> (${(100*t[1]/S).toFixed(0)}% of the bound), LMDeploy <b>${l[1].toFixed(2)}×</b> (${(100*l[1]/S).toFixed(0)}%).`:`Survey: out of memory at this setting.`;}
+  else meas=`The survey did not measure this setting (it used batch 1 to 16 and context 128 to 2,048).`;
+  info.innerHTML=`LLaMA-2-${mo}, batch <b>${B}</b>, context <b>${fk(ctx)}</b>: FP16 step ≥ ${ft(a.t)}, W4A16 step ≥ ${ft(q.t)} (${q.t>q.tw+q.tk?"compute":"memory"}-bound); bound on the speed-up <b>${S.toFixed(2)}×</b>. KV cache ${(a.kvb/1e9).toFixed(2)} GB vs FP16 weights ${(a.wb/1e9).toFixed(2)} GB.<br>${meas}<br>Memory: FP16 ${(need16/1e9).toFixed(1)} GB, W4A16 ${(need4/1e9).toFixed(1)} GB (weights + KV) → FP16 ${need16<=40e9?"fits":"does not fit"} in 40 GB, ${need16<=80e9?"fits":"does not fit"} in 80 GB.`;}
+ [sB,sC].forEach(e=>e.addEventListener("input",draw));seg($("#wq-dec-mo"),"v",v=>{mo=v;draw();});draw();
+})();
+})();
+</script></body></html>

@@ -1,0 +1,637 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>profile, fuse and speculate · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 132</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="lab-profile-fuse-and-speculate">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="lab-profile-fuse-and-speculate" data-session="lab-profile-fuse-and-speculate" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">132</span><span>Track 5: LLM inference and serving · session 55 of 65</span></div><h1 class="chap-title">profile, fuse and speculate</h1><p class="chap-sub">In this lab you take one real model, Qwen2.5-1.5B-Instruct, and make its decoding faster in three steps. You profile one decode step and find that hundreds of tiny kernels and the CPU that launches them cost a large part of the time. You fuse the residual add with RMSNorm into one kernel and measure the gain. Then you run speculative decoding with a small draft model and with an EAGLE-style head that you train yourself, and you measure the acceptance rate and the tokens per second at batch 1, 4 and 16.</p><div class="meta-row"><span><b>Time:</b> 4 to 5 hours of reading and hands-on work, plus about 2 hours of laptop GPU time (head training and measurements)</span><span><b>Level:</b> Intermediate · hands-on lab</span><span><b>Before this:</b> Sessions 87 (KV-cached generation lab), 123 (runtime profiling), 127 (graph-level optimization), 128 and 129 (speculative decoding); PyTorch and a little Triton</span></div><div class="learn"><h3>What you will learn</h3><ul><li>How to profile one decode step: the operator table, the count of small kernels, issue time against GPU time, and the Nsight Systems commands for an NVIDIA GPU</li><li>How to estimate the bytes of an unfused residual add + RMSNorm (42 bytes per element in eager PyTorch) against a fused kernel (8 bytes), and why fusion helps even more at batch 1, where launches dominate</li><li>How to write the fused kernel in Triton (and in Metal, which is what we ran), test it bit for bit against the eager code, and measure it alone and inside the model</li><li>How to run greedy speculative decoding in a batch where each row accepts a different number of tokens, using a validity mask over the KV cache</li><li>How to train a small EAGLE-style draft head on the target model's own features, and how it compares with a separate small draft model</li><li>How to measure acceptance rate, accepted length and tokens per second at batch 1, 4 and 16, and explain with a cost model why the gain shrinks as the batch grows</li><li>Why the speculative output must equal plain greedy decoding in FP32, and why it can differ in BF16</li></ul></div></header><style>
+[data-session="lab-profile-fuse-and-speculate"] pre.code,[data-session="lab-profile-fuse-and-speculate"] code{font-variant-ligatures:none;font-feature-settings:"liga" 0,"calt" 0}
+.pf-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.pf-grid input[type=range]{width:100%;min-width:0}
+.pf-grid output{font:600 14px var(--mono);min-width:4.5em;text-align:right}
+.pf-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.pf-leg span::before{content:"";display:inline-block;width:18px;height:10px;border-radius:3px;margin-right:6px;vertical-align:0;background:var(--c)}
+#pf-tl-svg text,#pf-fu-svg text,#pf-sp-svg text,#pf-mo-svg text{font-family:var(--sans)}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">The last ten sessions gave you many ways to make decoding faster: read a profile, fuse small kernels, launch a whole step at once, and guess several tokens with a cheap model. Each idea comes with a promise, such as “fusion saves memory traffic” or “speculation gives 2 to 3 times”. In this lab you test the promises on one real model and one real machine. You profile one decode step, write one fused kernel and measure it, and run speculative decoding with two kinds of drafts at three batch sizes. At the end you can say, with your own numbers, which trick helped, by how much, and why.</p>
+<p>The lab connects four sessions. <a href="../inference/runtime-profiling-where-the-time-goes.html">Session 123</a> taught you to read an operator table and an Nsight Systems trace. <a href="../inference/graph-level-optimization-fusion-cuda-graphs-torch.html">Session 127</a> explained fusion and CUDA graphs. <a href="../inference/speculative-decoding-1-the-math.html">Session 128</a> derived the acceptance rate and the speed-up formula, and <a href="../inference/speculative-decoding-2-drafts-and-verification-medusa.html">Session 129</a> showed the kinds of drafts, including EAGLE. <a href="../inference/tensorrt-and-tensorrt-llm-in-depth.html">Session 131</a> showed how a production engine packs all of this together. Here you do each step by hand, so that nothing is a black box.</p>
+<p>The work has four parts, one per key point of the session:</p>
+<ol>
+<li>Profile one decode step and find where the time goes.</li>
+<li>Fuse the residual add and RMSNorm into one kernel, check it, and measure it alone and inside the model.</li>
+<li>Run speculative decoding with a small draft model and with an EAGLE-style head that you train.</li>
+<li>Measure the acceptance rate and the tokens per second at batch 1, 4 and 16.</li></ol>
+<aside class="note interview side"><span class="nt">Interview tip</span>“You have one week to make a model’s decoding faster. What do you do?” A strong answer follows this lab: profile first and name the top time sinks; remove launch overhead (fusion, CUDA graphs) because it is cheap and always helps; then try speculation, but measure the acceptance rate on <i>your</i> traffic and at <i>your</i> batch size, because the gain at batch 16 can be much smaller than at batch 1.</aside>
+<p><b>Our machine and what we could not run.</b> All numbers come from one laptop: an Apple M5 Pro (20-core GPU, 48 GB of unified memory), PyTorch 2.8 with the MPS back-end and Hugging Face transformers 4.57, in BF16. Other jobs shared the GPU while we measured, so our times are noisy; we report the best of several repeats unless we say otherwise. Two tools of the key points need an NVIDIA GPU: Nsight Systems and Triton. For both we give the exact CUDA commands and code, marked [not run by us]. On our machine we used the closest equivalents: the PyTorch profiler, and the same fused kernel written in Metal (Apple’s GPU language) through <code>torch.mps.compile_shader</code>. The method and the byte counts are the same on any GPU; the absolute numbers are not.</p>
+
+<h2>The lab models</h2>
+<p>The <b>target</b> (the model whose output we want) is <b>Qwen2.5-1.5B-Instruct</b>. The <b>draft model</b> is <b>Qwen2.5-0.5B-Instruct</b>: same tokenizer, same chat format, about a third of the bytes. Their shapes, from each model’s config.json [Certain]:</p>
+<div class="tblw"><table class="tb"><thead><tr><th></th><th>Qwen2.5-1.5B-Instruct (target)</th><th>Qwen2.5-0.5B-Instruct (draft)</th></tr></thead><tbody>
+<tr><td>layers \(L\), width \(d\)</td><td>28, 1,536</td><td>24, 896</td></tr>
+<tr><td>query heads, KV heads, head size</td><td>12, 2, 128</td><td>14, 2, 64</td></tr>
+<tr><td>FFN width (SwiGLU)</td><td>8,960</td><td>4,864</td></tr>
+<tr><td>vocabulary, tied output layer</td><td>151,936, yes</td><td>151,936, yes</td></tr>
+<tr><td>parameters (PyTorch count)</td><td>1,543,714,304 (3.09 GB in BF16)</td><td>494,032,768 (0.99 GB)</td></tr>
+<tr><td>KV cache per token</td><td>28,672 bytes</td><td>12,288 bytes</td></tr></tbody></table></div>
+<p>The third draft is a small network that you train in Part 3: an <b>EAGLE-style head</b>, one transformer layer of the target’s shape plus a projection, 51.5 million parameters. It reuses the target’s embedding and output layer.</p>
+<div class="worked"><div class="wt">Worked example: the best possible decode step</div>
+<p>A decode step makes one token per sequence. It must read every weight once: 3.09 GB. On our machine a large copy reaches about 233 GB/s (measured in <a href="../inference/lab-kv-cached-generation-metrics-and-your.html">session 87</a>, same laptop). So one step at batch 1 cannot take less than \(3.087 / 233 = 13.2\) ms, and the fastest possible decoding is about 75 tokens per second. A context of 512 tokens adds \(512 \times 28{,}672 = 14.7\) MB of cache, which is less than 0.5% of the weights. So at batch 1 the bytes are the weights, and the bound is 13.2 ms. Keep this number in mind: every measurement below is compared with it.</p></div>
+<div class="eq">\[ t_{\text{step}} \;\ge\; \frac{s\,N + b\,c\,\text{kv}_{\text{tok}}}{\text{BW}} \tag{132.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N, s\)</dt><dd>number of weights (1.54 billion) and bytes per number (2 for BF16)</dd>
+<dt>\(b, c\)</dt><dd>sequences in the batch and tokens already in each one’s cache</dd>
+<dt>\(\text{kv}_{\text{tok}}\)</dt><dd>bytes of keys and values per token: \(2 \cdot L \cdot n_{kv} \cdot d_h \cdot s\), which is \(2 \cdot 28 \cdot 2 \cdot 128 \cdot 2\) \(= 28{,}672\)</dd>
+<dt>\(\text{BW}\)</dt><dd>memory bandwidth you can really reach (measured, not the spec sheet)</dd></dl>
+
+<h2>Part 1: profile one decode step</h2>
+<p>A <b>profile</b> is a record of what ran and how long it took. For one decode step you want three things: how many GPU operations (kernels) the step launches, how long the CPU needs to issue them, and how long the GPU needs to run them. If the CPU needs longer than the GPU, the GPU waits between kernels and the step is <b>launch-bound</b> (<a href="../inference/runtime-profiling-where-the-time-goes.html">session 123</a>).</p>
+<div class="algo"><div class="algo-h">Algorithm 1: profile one decode step</div><ol>
+<li><b>input:</b> model, a prompt of \(c\) tokens, batch \(b\)</li>
+<li>prefill the prompt once; keep the cache; remember its length \(c\)</li>
+<li><b>define</b> step(): crop the cache back to \(c\); run the model on one new token; take the argmax <span class="c">// the same work every time</span></li>
+<li>run step() 3 times <span class="c">// warm-up: allocation, kernel choice, shader compilation</span></li>
+<li><b>repeat</b> 15 times: \(t_0\); step(); \(t_1\) <span class="c">// issue time: the CPU is done</span>; copy the token to the CPU; \(t_2\) <span class="c">// step time: the GPU is done</span></li>
+<li>report min and median of \(t_2 - t_0\), and the median of \(t_1 - t_0\)</li>
+<li>run step() once under the profiler; count the operations by name <span class="c">// what is launched, and how often</span></li></ol></div>
+<p>The trick in line 3 matters: a decode step changes the cache, so a timing loop that calls the model again and again would measure longer and longer contexts. Cropping the cache back gives the same step every time.</p>
+
+<h3>What the profile shows</h3>
+<p>We profiled one eager step at batch 1 (our own forward pass with the eager norms, which runs the same operations as the Hugging Face model; see Part 2) with a 512-token context. The PyTorch profiler lists <b>1,324</b> operations that do real work (we counted the lowest-level <code>aten::</code> calls and left out those that only make a view of a tensor or allocate memory) [Certain, our run]. The largest groups:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Operations</th><th>Count per step</th><th>Where they come from</th></tr></thead><tbody>
+<tr><td>matrix multiplies (<code>aten::linear</code>)</td><td>197</td><td>7 per layer (q, k, v, o, gate, up, down) × 28, plus the output layer</td></tr>
+<tr><td>multiplies and adds (<code>aten::mul</code>, <code>aten::add</code>)</td><td>254 and 112</td><td>RMSNorm, the residual stream, RoPE, the SwiGLU product</td></tr>
+<tr><td>type casts (<code>aten::copy_</code>)</td><td>234</td><td>mostly the casts of RMSNorm, which works in FP32 (BF16 → FP32 and back, 57 norms per step); after fusion 66 remain</td></tr>
+<tr><td>concatenations (<code>aten::cat</code>)</td><td>113</td><td>RoPE’s “rotate half” and the cache append (the cache grows by concatenation)</td></tr>
+<tr><td><code>pow</code>, <code>mean</code>, <code>rsqrt</code></td><td>57 each</td><td>one of each per RMSNorm: 2 per layer + the final norm = 57</td></tr>
+<tr><td>attention (<code>scaled_dot_product_attention</code>)</td><td>28</td><td>one per layer</td></tr></tbody></table></div>
+<p>So only about 15% of the operations are the matrix multiplies that read the weights. The rest are small element-wise operations on a vector of 1,536 numbers. Each of them moves only a few kilobytes, but each one costs a launch: the CPU must run Python, dispatch the operator and send a command to the GPU.</p>
+<div class="worked"><div class="wt">Worked example: our measured step, against the bound</div>
+<p>Batch 1, context 512, eager: the step took <b>29.9 ms</b> (best of 15; median 30.2 ms). The CPU needed <b>12.0 ms</b> just to issue it. The bound (132.1) is 13.2 ms. So we are at 2.3× the bound. The issue time alone is 0.9× the bound, about 9 µs of CPU time for each of the 1,324 operations: even with an infinitely fast GPU, this step could not take less than 12.0 ms. [Certain, our run]</p>
+<p>At batch 16 the step took <b>76.5 ms</b>, for 16 tokens. The bound grows only a little (16 caches of 512 tokens add 0.23 GB), so batching is still almost free; but the gap to the bound tells you that much of the step is overhead, not memory traffic.</p></div>
+<p>The profiler has a limit you must know. On MPS (and on CUDA with only CPU activities on) it measures CPU time per operator. When the CPU must wait for the GPU, for example in the copy of the token to the CPU, that wait is charged to whatever operator is waiting. In our table, <code>aten::copy_</code> had the largest “self CPU time” for exactly this reason, not because type casts are slow. A CPU-side table tells you <i>how many</i> operations there are; only a GPU timeline tells you <i>when</i> the GPU was busy. That is what Nsight Systems is for.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Never read the top line of a CPU-only profile as “the slowest kernel”. A synchronizing operation (a copy to the CPU, <code>.item()</code>, printing a tensor) collects all the GPU time that was still in the queue.</aside>
+
+<h3>On an NVIDIA GPU: Nsight Systems</h3>
+<p>On a CUDA machine, wrap the step in an NVTX range (a named time span that shows up in the trace) and record it with <code>nsys</code>. [not run by us]</p>
+<pre class="code"># profile_step.py: the same step() as above, marked for Nsight Systems (CUDA only)
+import torch
+for i in range(20):
+    if i == 10: torch.cuda.cudart().cudaProfilerStart()      # skip the warm-up steps
+    torch.cuda.nvtx.range_push(f"decode step {i}")
+    tok = step(); tok.cpu()
+    torch.cuda.nvtx.range_pop()
+torch.cuda.cudart().cudaProfilerStop()
+
+# shell: record CUDA API calls, kernels and NVTX ranges, only between Start and Stop
+#   nsys profile -t cuda,nvtx,osrt --capture-range=cudaProfilerApi -o step python profile_step.py
+#   nsys stats --report cuda_gpu_kern_sum step.nsys-rep     # time per kernel name
+#   nsys stats --report cuda_api_sum step.nsys-rep          # time in cudaLaunchKernel etc.</pre>
+<p>In the trace, read the GPU row of one step: the sum of kernel times against the length of the NVTX range. Their ratio is the GPU utilization of the step. If the CUDA API row is solid and the GPU row has gaps, the step is launch-bound, as ours is.</p>
+
+<figure class="fig wide" id="pf-tl"><div class="fig-body">
+<div class="controls"><span>Code</span><span class="seg" id="pf-tl-mode"><button type="button" data-v="eager" aria-pressed="true">eager</button><button type="button" data-v="fused" aria-pressed="false">fused add + RMSNorm</button><button type="button" data-v="graph" aria-pressed="false">fused + one graph launch</button></span><span>Batch</span><span class="seg" id="pf-tl-b"><button type="button" data-v="1" aria-pressed="true">1</button><button type="button" data-v="16" aria-pressed="false">16</button></span></div>
+<div class="pf-grid">
+<label for="pf-tl-l">CPU time to issue one kernel</label><input type="range" id="pf-tl-l" min="2" max="30" step="1" value="12"><output id="pf-tl-lv"></output>
+<label for="pf-tl-f">Shortest GPU time of a kernel</label><input type="range" id="pf-tl-f" min="1" max="10" step="1" value="4"><output id="pf-tl-fv"></output></div>
+<div class="scroll-x"><svg id="pf-tl-svg" viewBox="0 0 710 200" role="img" aria-label="A timeline model of one decode step: the CPU issues kernels, the GPU runs them, and a bar shows how much of the whole step the GPU is busy"></svg></div>
+<div class="pf-leg"><span style="--c:var(--bad)">CPU issues a kernel</span><span style="--c:var(--q)">matmul</span><span style="--c:var(--k)">attention</span><span style="--c:var(--v)">norm and residual</span><span style="--c:var(--muted)">other small kernels</span></div>
+<div class="readout" id="pf-tl-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> A timeline model (not a trace) of one decode step of Qwen2.5-1.5B with a 512-token context. Every kernel is listed with its bytes; its GPU time is the larger of bytes / 233 GB/s and a fixed shortest time. The CPU issues one kernel at a time; a kernel starts when it has been issued and the previous one is done. The top rows zoom into the first 1.5 layers; the bottom bar is the whole step. The readout adds our measured step times.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Start with “eager” at batch 1 and an issue cost of 12 µs: the step has about 1,130 kernels, the CPU needs about 14 ms to issue them, the GPU is busy for about 17 ms, and the GPU row has gaps wherever several tiny kernels follow each other. Raise the issue cost to 25 µs: the step becomes launch-bound and grows to about 30 ms. Now press “fused add + RMSNorm”: about 450 kernels disappear, and the step gets shorter. Press “fused + one graph launch”: the CPU issues the whole step at once (this is what a CUDA graph does), the gaps close, and the step is set by the GPU alone. Switch to batch 16: the matmuls take about the same time (the weights are shared by all rows) and only attention grows, because it reads 16 caches, so the overhead stays a large part of the step.</p></details></figure>
+<p>The model of Figure 1 is simple: real issue costs differ by operator, and real GPU kernels overlap a little. But it explains the two numbers we measured: a step far above the bandwidth bound, and an issue time of the same size as the step. It also tells you what to do. Make fewer kernels (fusion, Part 2), or issue them all at once (a CUDA graph or <code>torch.compile(mode="reduce-overhead")</code>, from <a href="../inference/graph-level-optimization-fusion-cuda-graphs-torch.html">session 127</a>). The second is not available on MPS, so in this lab we do the first.</p>
+
+<h2>Part 2: fuse the residual add and RMSNorm</h2>
+<p>Every layer of a pre-norm transformer does this twice: add the output of a sub-layer to the residual stream, then normalize the result for the next sub-layer (<a href="../transformers/the-residual-stream-and-normalization.html">session 22</a>):</p>
+<div class="eq">\[ \mathbf{h} = \mathbf{x} + \mathbf{r}, \qquad \mathbf{y} = \mathbf{w} \odot \frac{\mathbf{h}}{\sqrt{\tfrac{1}{d}\sum_{j=1}^{d} h_j^2 + \epsilon}} \tag{132.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{x}\)</dt><dd>output of the attention or FFN sub-layer, one row of \(d = 1{,}536\) numbers per token</dd>
+<dt>\(\mathbf{r}, \mathbf{h}\)</dt><dd>the residual stream before and after the add; \(\mathbf{h}\) is kept for the next residual add</dd>
+<dt>\(\mathbf{w}, \epsilon\)</dt><dd>the learned scale of RMSNorm and a small constant (\(10^{-6}\) in Qwen2.5)</dd>
+<dt>\(\mathbf{y}\)</dt><dd>the normalized input to the next sub-layer</dd></dl>
+<p>In eager PyTorch this is nine kernels, because each line of the Hugging Face code is a separate operation: the add, a cast to FP32, <code>pow</code>, <code>mean</code>, the add of \(\epsilon\), <code>rsqrt</code>, a multiply, a cast back to BF16, and the multiply by \(\mathbf{w}\). Each kernel reads its inputs from memory and writes its output back. A fused kernel reads \(\mathbf{x}\) and \(\mathbf{r}\) once and writes \(\mathbf{h}\) and \(\mathbf{y}\) once.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>Nine workers on a line, each takes the box from the shelf, does one small thing, and puts it back on the shelf for the next. A fused kernel is one worker who takes the box once, does all nine things at the bench, and puts it back once. The work at the bench is the same; the walks to the shelf are gone.</aside>
+<div class="eq">\[ Q_{\text{eager}} = \underbrace{(6 + 6 + 8 + 4 + 8 + 6 + 4)}_{42}\; n\,d \ \text{bytes}, \qquad Q_{\text{fused}} = (2 + 2 + 2 + 2)\; n\,d = 8\,n\,d \ \text{bytes} \tag{132.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n\)</dt><dd>tokens in the pass (the batch at decode, the prompt length at prefill)</dd>
+<dt>42</dt><dd>bytes per number for the eager kernels: add (read 2+2, write 2), cast to FP32 (read 2, write 4), pow (4+4), mean (read 4), multiply by the inverse root (4+4), cast to BF16 (4+2), multiply by \(\mathbf{w}\) (2+2); the tiny per-row kernels for \(\epsilon\) and the root are left out</dd>
+<dt>8</dt><dd>bytes per number fused: read \(\mathbf{x}\) and \(\mathbf{r}\), write \(\mathbf{h}\) and \(\mathbf{y}\), all BF16</dd></dl>
+<p>So fusion should cut the bytes by \(42/8 = 5.25\) times. At decode with batch 1, the bytes are tiny (\(8 \times 1{,}536 = 12\) kB), so the time is the fixed cost of the kernels, and fusion turns nine fixed costs into one.</p>
+<div class="algo"><div class="algo-h">Algorithm 2: fused residual add + RMSNorm (one program per row)</div><ol>
+<li><b>input:</b> \(\mathbf{x}, \mathbf{r}\) of shape \((n, d)\) in BF16; \(\mathbf{w}\) of size \(d\); \(\epsilon\)</li>
+<li><b>for each</b> row \(i\) in parallel: <span class="c">// one GPU program (Triton) or threadgroup (Metal) per token</span></li>
+<li>&nbsp;&nbsp;load \(\mathbf{x}_i, \mathbf{r}_i\); \(\;\mathbf{h}_i \leftarrow \text{bf16}(\mathbf{x}_i + \mathbf{r}_i)\) <span class="c">// round like eager does</span></li>
+<li>&nbsp;&nbsp;store \(\mathbf{h}_i\) into \(\mathbf{r}_i\) <span class="c">// the new residual, in place</span></li>
+<li>&nbsp;&nbsp;\(\sigma \leftarrow \sum_j h_{ij}^2\) in FP32, reduced over the row; \(\;\rho \leftarrow 1/\sqrt{\sigma/d + \epsilon}\)</li>
+<li>&nbsp;&nbsp;\(\mathbf{y}_i \leftarrow \text{bf16}\big(\mathbf{w} \odot \text{bf16}(\mathbf{h}_i \rho)\big)\) <span class="c">// the same two roundings as eager</span></li>
+<li>&nbsp;&nbsp;store \(\mathbf{y}_i\)</li></ol></div>
+<p>The two roundings in line 6 are there on purpose. Hugging Face casts the normalized vector to BF16 before it multiplies by \(\mathbf{w}\). If the kernel skipped that rounding, its output would be slightly <i>more</i> accurate, but it would not match the eager model bit for bit, and you would lose the simplest test you have.</p>
+
+<h3>The Triton kernel</h3>
+<p>This is the kernel in Triton, for an NVIDIA GPU (the language is in <a href="../inference/gpu-kernels-2-write-kernels-in-the.html">session 86</a>). One program handles one row; <code>BLOCK</code> is the row size rounded up to a power of two, so the whole row of 1,536 numbers sits in registers. [not run by us: it needs a CUDA GPU]</p>
+<pre class="code"># fused_add_rmsnorm.py (Triton, CUDA)
+import torch, triton, triton.language as tl
+
+@triton.jit
+def add_rmsnorm_kernel(X, R, W, Y, stride, D, eps, BLOCK: tl.constexpr):
+    row = tl.program_id(0)
+    cols = tl.arange(0, BLOCK)
+    m = cols &lt; D
+    x = tl.load(X + row * stride + cols, mask=m, other=0.0).to(tl.float32)
+    r = tl.load(R + row * stride + cols, mask=m, other=0.0).to(tl.float32)
+    h = (x + r).to(tl.bfloat16)                        # residual add, rounded like eager
+    tl.store(R + row * stride + cols, h, mask=m)       # new residual stream, in place
+    hf = h.to(tl.float32)
+    inv = tl.rsqrt(tl.sum(hf * hf, axis=0) / D + eps)  # one reduction over the row
+    w = tl.load(W + cols, mask=m, other=0.0).to(tl.float32)
+    y = (hf * inv).to(tl.bfloat16).to(tl.float32) * w
+    tl.store(Y + row * stride + cols, y.to(tl.bfloat16), mask=m)
+
+def add_rmsnorm(x, r, w, eps=1e-6):
+    """h = x + r (written into r), y = RMSNorm(h) * w. x, r: (..., D) contiguous BF16."""
+    D = x.shape[-1]; x2, r2 = x.view(-1, D), r.view(-1, D)
+    y = torch.empty_like(x2)
+    BLOCK = triton.next_power_of_2(D)
+    add_rmsnorm_kernel[(x2.shape[0],)](x2, r2, w, y, x2.stride(0), D, eps,
+                                       BLOCK=BLOCK, num_warps=4 if BLOCK &lt;= 2048 else 8)
+    return r, y.view_as(x)</pre>
+<p>On our machine we ran the same algorithm as a Metal kernel. The only differences are the language and the reduction: Metal adds up the row with <code>simd_sum</code> over groups of 32 threads and a small shared array, where Triton’s <code>tl.sum</code> does it for you. The full Metal source is in “The lab code” below.</p>
+
+<h3>Test, then measure</h3>
+<p>Test first. For 1 to 16,384 rows of random BF16 numbers, the fused kernel’s new residual \(\mathbf{h}\) was equal bit for bit to eager PyTorch. The output \(\mathbf{y}\) was equal bit for bit up to 256 rows; at 16,384 rows, 84 of 25.2 million numbers differed by one BF16 step (the two codes compute the reciprocal square root in slightly different ways). [Certain, our run] Then measure each version alone, with the timer of <a href="../inference/lab-kv-cached-generation-metrics-and-your.html">session 87</a> (warm-up, 50 calls, one synchronize, best of 5):</p>
+
+<figure class="fig wide" id="pf-fu"><div class="fig-body">
+<div class="pf-grid">
+<label for="pf-fu-n">Rows (tokens) \(n\)</label><input type="range" id="pf-fu-n" min="0" max="4" step="1" value="0"><output id="pf-fu-nv"></output></div>
+<div class="scroll-x"><svg id="pf-fu-svg" viewBox="0 0 710 226" role="img" aria-label="Bytes moved by the nine eager kernels and by the fused kernel, and the measured time of each version"></svg></div>
+<div class="pf-leg"><span style="--c:var(--k)">eager kernels (alternating shades)</span><span style="--c:var(--q)">fused kernel</span></div>
+<div class="readout" id="pf-fu-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Residual add + RMSNorm with \(d = 1{,}536\) in BF16. Top: the bytes of each eager kernel and of the fused kernel, from (132.3). Bottom: our measured time per call (Apple M5 Pro, MPS), for the five sizes we measured. The readout also gives <code>torch.compile</code>, which fuses the same code automatically.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>At \(n = 1\) (decode, batch 1) the bars of bytes are tiny, but eager takes 122 µs and fused 17 µs: the cost is nine kernel launches against one. Move to 256 rows: still mostly fixed cost. At 4,096 and 16,384 rows (a long prefill) the bytes matter: the fused kernel moves 201 MB in 843 µs, about 239 GB/s, which is our machine’s copy bandwidth. Eager is 8.0 times slower, more than the 5.25 times of the byte count, because its small reductions and casts do not reach full bandwidth either. <code>torch.compile</code> comes within 4% of the hand-written kernel at the largest size (874 against 843 µs), but is slower at small sizes.</p></details></figure>
+
+<h3>Inside the model</h3>
+<p>A kernel that is 7 times faster alone does not make the model 7 times faster. To measure the effect on the whole step, we wrote the model’s forward pass ourselves (about 25 lines, using the Hugging Face layers) so that each residual add is fused with the norm that follows it. One step then has 56 fused kernels instead of 56 × 9 = 504 small ones. First we checked in FP32 that our forward pass (with the eager norms) gives exactly the same final features as the Hugging Face forward pass [Certain, our run]; in BF16 they differ a little, see the “Watch out” in Part 3. Then we timed one decode step (context 512, Algorithm 1):</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Batch</th><th>eager step</th><th>fused step</th><th>gain</th><th>bound (132.1)</th></tr></thead><tbody>
+<tr><td>1</td><td>29.9 ms</td><td>25.7 ms</td><td>14%</td><td>13.2 ms</td></tr>
+<tr><td>4</td><td>39.5 ms</td><td>35.8 ms</td><td>10%</td><td>13.5 ms</td></tr>
+<tr><td>16</td><td>76.5 ms</td><td>71.7 ms</td><td>6%</td><td>14.3 ms</td></tr></tbody></table></div>
+<p>[Certain, our run; best of 15 steps] Fusion removed 504 of the 1,324 operations of a step (the count fell to 820), the issue time fell from 12.0 to 8.7 ms, and the step from 29.9 to 25.7 ms at batch 1. The gain is real but far from the 7× of the kernel alone, because the nine small kernels were only a part of the step. In percent the gain shrinks with the batch, because the matmuls and attention take longer while the norm kernels stay small.</p>
+<aside class="note numbers side"><span class="nt">Numbers</span>Production engines fuse much more than this one pair: QKV projections into one matmul, RoPE into attention, SwiGLU’s activation and product into one kernel, and the whole step into a CUDA graph (<a href="../inference/tensorrt-and-tensorrt-llm-in-depth.html">session 131</a>). The same method applies to each: count the kernels and bytes it removes, test it bit for bit or with a tolerance, measure it alone, and then measure it in the step.</aside>
+
+<h2>Part 3: speculative decoding with two kinds of drafts</h2>
+<p>Decode is memory-bound: a pass over 5 tokens reads the same 3.09 GB of weights as a pass over 1 token. Speculative decoding (<a href="../inference/speculative-decoding-1-the-math.html">session 128</a>) uses this. A cheap <b>drafter</b> guesses \(k\) tokens; the target checks all of them in one pass. With greedy decoding the check is simple: accept the guesses up to the first one that differs from the target’s own argmax, then add one token from the target (the <b>bonus</b> token). So every round makes between 1 and \(k + 1\) tokens, and the output is exactly what plain greedy decoding of the target would make.</p>
+<div class="algo"><div class="algo-h">Algorithm 3: greedy speculative decoding, one round, batch \(b\)</div><ol>
+<li><b>input:</b> the pending token \(g\) of each row (made by the target, not yet in its cache); draft length \(k\)</li>
+<li>drafter: \(d_1, \dots, d_k\) <span class="c">// k cheap passes, one token each</span></li>
+<li>target: one pass over \([g, d_1, \dots, d_k]\) \(\rightarrow\) greedy tokens \(G_0, \dots, G_k\) <span class="c">// G_j is the target's choice after d_j</span></li>
+<li><b>for each</b> row: \(n \leftarrow\) the number of leading \(j\) with \(d_j = G_{j-1}\) <span class="c">// accepted guesses, 0 to k</span></li>
+<li>&nbsp;&nbsp;output \(d_1, \dots, d_n\) and the bonus \(G_n\) <span class="c">// n + 1 new tokens</span></li>
+<li>&nbsp;&nbsp;mark the cache slots of \(d_{n+1}, \dots, d_k\) as invalid in the target’s and the drafter’s masks</li>
+<li>&nbsp;&nbsp;\(g \leftarrow G_n\)</li></ol></div>
+<p>Line 6 is how the lab handles a batch. Each row accepts a different number of guesses, so after one round the rows have different lengths. Instead of moving data, we keep a boolean <b>validity mask</b> over the KV cache: rejected slots stay in memory but are masked out of attention, and each token’s position (for RoPE) is the count of valid slots before it. The cache grows by \(k + 1\) slots per round for every row; that is a little wasted memory, but no copying. Production engines use paged caches instead (<a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>); the idea of “keep, but do not attend” is the same.</p>
+<aside class="note watch side"><span class="nt">Watch out</span>A simpler batch rule, “all rows accept the minimum \(n\) of the batch”, is correct but wastes work: with 16 rows the minimum is often 0. Per-row acceptance is what makes speculation worth trying at batch 16 at all.</aside>
+
+<h3>Draft 1: a small model</h3>
+<p>Qwen2.5-0.5B-Instruct runs Algorithm 3 directly. It keeps its own KV cache. In each round its first pass re-reads the guesses that were accepted and the bonus token (so its cache matches the target’s text), and its other \(k - 1\) passes are single tokens. One draft step reads 0.99 GB, about a third of the target.</p>
+
+<h3>Draft 2: an EAGLE-style head</h3>
+<p>EAGLE (Li et al., 2024) does not use a separate small model. It trains a small head that predicts the target’s <b>next feature</b>: the last hidden vector before the output layer. Its input at position \(t\) is the target’s feature at \(t-1\) and the embedding of the token at \(t\), joined, projected from \(2d\) to \(d\) by a linear layer, and passed through one transformer decoder layer. The output goes through the target’s own output layer to give a token. [Certain] Features carry much more information than tokens, so a one-layer head can guess well.</p>
+<div class="eq">\[ \hat{\mathbf{f}}_t = \text{Layer}\big(\mathbf{W}_{fc}\,[\mathbf{f}_{t-1};\ \mathbf{e}(x_t)]\big), \qquad \mathcal{L} = \text{SmoothL1}\big(\hat{\mathbf{f}}_t, \mathbf{f}_t\big) + 0.1 \cdot \text{CE}\big(\mathbf{W}_{out}\hat{\mathbf{f}}_t,\ x_{t+1}\big) \tag{132.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\mathbf{f}_t\)</dt><dd>the target’s final hidden vector at position \(t\) (after the last norm); the target’s next-token logits are \(\mathbf{W}_{out}\mathbf{f}_t\)</dd>
+<dt>\(\mathbf{e}(x_t)\)</dt><dd>the target’s embedding of token \(x_t\) (frozen, shared)</dd>
+<dt>\(\mathbf{W}_{fc}\)</dt><dd>the trained projection from \(2d = 3{,}072\) to \(d = 1{,}536\)</dd>
+<dt>Layer</dt><dd>one trained decoder layer with the target’s shape (attention with its own small KV cache, SwiGLU FFN)</dd>
+<dt>SmoothL1, CE</dt><dd>a regression loss on the feature and a cross-entropy loss on the token; EAGLE weights them 1 and 0.1 [Certain]</dd></dl>
+<p>When drafting, the head feeds its own predicted feature \(\hat{\mathbf{f}}\) back in, step after step. After verification, the target gives true features for every accepted token, and the head re-reads those in its first pass of the next round. To make the head robust to its own small errors, EAGLE adds uniform noise in \([-0.1, 0.1]\) to the input features during training [Certain]; we did the same.</p>
+<div class="algo"><div class="algo-h">Algorithm 4: train an EAGLE-style head</div><ol>
+<li><b>data:</b> 2,048 GSM8K training questions with their reference answers, plus the target’s own greedy answers (160 tokens) to 1,024 other training questions, all in the target’s chat format <span class="c">// 3,072 sequences</span></li>
+<li>run the target once over each sequence <b>with the same forward pass that will serve it</b>; store \(\mathbf{f}_1, \dots, \mathbf{f}_T\) in BF16 <span class="c">// 683,011 tokens, about 2.1 GB</span></li>
+<li>initialize the head’s decoder layer and final norm from the target’s last layer and final norm <span class="c">// right feature scale from step 0</span></li>
+<li><b>for</b> 4 epochs, batches of 8 sequences:</li>
+<li>&nbsp;&nbsp;inputs \([\mathbf{f}_{t-1} + \text{noise};\ \mathbf{e}(x_t)]\), targets \(\mathbf{f}_t\) and \(x_{t+1}\)</li>
+<li>&nbsp;&nbsp;loss (132.4), with the cross-entropy on 1,024 random positions per batch <span class="c">// the 151,936-wide output layer is the costly part</span></li>
+<li>&nbsp;&nbsp;AdamW, learning rate \(5 \times 10^{-4}\) with warm-up and cosine decay, gradient clipping at 0.5</li></ol></div>
+<p>Feature extraction and training took about 40 minutes on our (very busy) laptop. At the end the head’s top-1 token accuracy on training batches was about 0.75 (one step ahead, with true input features). [Certain, our run] This is a toy version of EAGLE: the paper trains on a fixed dialogue dataset (ShareGPT, 68,000 dialogues) for 1 to 2 days on 4 A100 GPUs with a learning rate of \(3 \times 10^{-5}\), and drafts a tree of guesses instead of one chain [Certain]. Our head sees two kinds of text: human-written GSM8K answers (short, with calculations written as <code>&lt;&lt;48/2=24&gt;&gt;</code>) and the target’s own answers, which are longer explanations and are what the head must guess at test time. The test questions below are not in either training set. Testing on other kinds of text (chat, code) would lower the acceptance rate [Likely].</p>
+<aside class="note watch side"><span class="nt">Watch out</span>Train the head on the features that your serving code produces. Our first full head was trained on features from the Hugging Face call <code>tg.model(...)</code> and then served with our own forward pass (fused kernel, validity mask). In FP32 the two give identical features. In BF16 on MPS they do not: against FP32, the mean absolute error of the final features was 2.09 for the Hugging Face call (attention without a mask) and 0.37 for our pass (attention with an explicit mask) [Certain, our run]. That head reached α = 0.21 at batch 1; the same training on our own features reached 0.34 [Certain, our run]. We did not find the root cause; the two calls probably use different attention kernels [Likely].</aside>
+<aside class="note watch side"><span class="nt">Watch out</span>Decode a few training examples before you train. An even earlier try generated the target’s answers with Hugging Face <code>generate()</code> in batches of 64 with left padding (MPS, BF16): 2,016 of the 2,048 answers were one repeated “!” (token 0) [Certain, our run]. A head trained on them reached 92% training accuracy and α = 0.10. We regenerated the answers with our own loop (Algorithm 3 without a drafter), which gave normal text.</aside>
+<aside class="note analogy side"><span class="nt">Analogy</span>A small draft model is a junior colleague who read the same books and guesses your next words from the text so far. The EAGLE head is an assistant who watches your face while you talk: it sees your “thoughts” (the features), not only your words, so a much smaller assistant can guess as well.</aside>
+
+<h3>The correctness test</h3>
+<p>Greedy speculation must give exactly the same tokens as plain greedy decoding. We tested this in FP32 (4 prompts, 64 tokens, draft model, \(k = 4\)): all 256 tokens were equal. [Certain, our run] In BF16 they are not always equal: at batch 1, 10 of the 16 rows of the draft-model run were identical to plain decoding over all 128 tokens, and 81% of all token positions matched (EAGLE-style head: 11 of 16 rows, 78%). [Certain, our run] The reason is the one from <a href="../inference/lab-kv-cached-generation-metrics-and-your.html">session 87</a>: the verification pass works on 5 tokens at a time and plain decoding on 1, so the matrix multiplies add numbers in a different order, and BF16 can flip a near-tie. After one flip, the two texts go different ways. Test the logic in FP32; in BF16, compare logits with a tolerance.</p>
+
+<h2>Part 4: acceptance and tokens per second at batch 1, 4 and 16</h2>
+<p>Two numbers describe a drafter. The <b>acceptance rate</b> \(\hat\alpha\) is the fraction of all guesses that the target accepted. The <b>accepted length</b> \(\tau\) is the average number of tokens a row gets per target pass (accepted guesses plus the bonus).</p>
+<div class="eq">\[ \hat\alpha = \frac{\sum_{\text{rounds, rows}} n}{k \cdot \#(\text{rounds, rows})}, \qquad \tau = \overline{n + 1}, \qquad \tau(\alpha, k) = \frac{1 - \alpha^{k+1}}{1 - \alpha} \ \text{ if each guess is accepted with probability } \alpha \tag{132.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(n\)</dt><dd>accepted guesses of one row in one round (0 to \(k\))</dd>
+<dt>\(\tau(\alpha, k)\)</dt><dd>the expected tokens per round from <a href="../inference/speculative-decoding-1-the-math.html">session 128</a>, if every guess is accepted independently with probability \(\alpha\)</dd></dl>
+<p>The speed-up is the accepted length times the time of one plain step, divided by the time of one round:</p>
+<div class="eq">\[ S = \frac{\tau \cdot t_1(b)}{k\, t_d(b) + t_v(b, k+1)} \tag{132.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t_1(b)\)</dt><dd>one plain target step for \(b\) rows</dd>
+<dt>\(t_d(b)\)</dt><dd>one drafter step; \(c = t_d / t_1\) is the cost ratio of <a href="../inference/speculative-decoding-1-the-math.html">session 128</a></dd>
+<dt>\(t_v(b, k+1)\)</dt><dd>one target pass over \(k + 1\) tokens per row: close to \(t_1\) while the pass is memory-bound, larger once it is not</dd></dl>
+<p>The test: the first 16 questions of the GSM8K test set, in Qwen’s chat format, 128 new tokens per question, greedy, \(k = 4\), all with the fused forward pass. Batch 1 runs the 16 questions one by one, batch 4 in 4 groups, batch 16 in one group. Each group runs all four methods back to back, twice, and we keep the faster run of each, because other jobs shared our GPU. Tokens per second counts all rows and includes the prefill. Rows keep going after an end-of-text token, so that every row makes exactly 128 tokens.</p>
+<figure class="fig wide" id="pf-sp"><div class="fig-body">
+<div class="controls"><span>Show</span><span class="seg" id="pf-sp-view"><button type="button" data-v="tps" aria-pressed="true">tokens per second</button><button type="button" data-v="sp" aria-pressed="false">speed-up</button><button type="button" data-v="tau" aria-pressed="false">accepted length τ</button></span></div>
+<div class="scroll-x"><svg id="pf-sp-svg" viewBox="0 0 710 260" role="img" aria-label="Measured tokens per second, speed-up and accepted length of plain decoding, a draft model and an EAGLE-style head at batch 1, 4 and 16"></svg></div>
+<div class="pf-leg"><span style="--c:var(--muted)">plain, eager norms</span><span style="--c:var(--v)">plain, fused norms</span><span style="--c:var(--k)">draft model (0.5B)</span><span style="--c:var(--q)">EAGLE-style head</span></div>
+<div class="readout" id="pf-sp-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Our measurements: Qwen2.5-1.5B-Instruct on 16 GSM8K test questions, 128 greedy tokens each, \(k = 4\), Apple M5 Pro, BF16. Each bar is the sum over the 16 questions of the faster of two runs.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>Start with “tokens per second”. At batch 1 both drafters beat plain decoding: the draft model by 1.22× and the EAGLE-style head by 1.27×. At batch 4 and 16 both are slower than plain decoding (0.86× and 0.91× for the draft model, 0.85× and 0.81× for the head). Compare also the first two bars of each group: the fused norms help plain decoding at every batch, by 4% to 14% in this noisy run. Switch to “accepted length τ”: τ hardly depends on the batch, because acceptance is a property of the text and the drafter, not of the hardware. Switch to “speed-up”: the gain falls with the batch even though τ stays the same. Figure 4 explains why.</p></details></figure>
+<h3>What the numbers say</h3>
+<ul><li><b>The draft model guesses well but is not cheap.</b> It reached α = 0.78 and τ = 4.14 out of 5 possible. But one draft step took 15.0 ms, 0.58 of a target step (25.9 ms), not the 0.32 that its bytes suggest (0.99 against 3.09 GB): at batch 1 both models are launch-bound, and the draft has 24 layers against 28. So the gain at batch 1 was only 1.22×. [Certain, our run]</li><li><b>The EAGLE-style head guesses worse but is very cheap.</b> α = 0.34 and τ = 2.38, but one head step took 3.1 ms (0.12 of a target step), so it was the faster drafter at batch 1: 1.27×. Its acceptance falls fast along the chain: α = 0.63 with one guess per round, 0.20 with eight. [Certain, our run]</li><li><b>Acceptance hardly depends on the batch.</b> τ of the draft model was 4.14, 4.09 and 4.12 at batch 1, 4 and 16. Acceptance is a property of the text and the drafter. [Certain, our run]</li><li><b>At batch 4 and 16, speculation lost.</b> Plain decoding uses the spare compute by batching: from batch 1 to 16 it went from 15.5 to 308.7 tokens per second. Speculation then fights three costs: the 5-token verification pass costs 1.14× a 1-token step at batch 4 and 1.15× at batch 16; a group runs until its slowest row is done (the counted tokens per row and round fell from 4.09 to 3.61 for the draft model and from 2.31 to 1.80 for the head); and each round has fixed CPU bookkeeping [Likely].</li><li><b>The numbers are noisy.</b> Other jobs shared our GPU. Read the ratios inside one batch size, which were measured back to back, more than the absolute tokens per second.</li></ul>
+<figure class="fig wide" id="pf-mo"><div class="fig-body">
+<div class="controls"><span>Drafter</span><span class="seg" id="pf-mo-kind"><button type="button" data-v="eagle" aria-pressed="true">EAGLE-style head</button><button type="button" data-v="model" aria-pressed="false">draft model</button></span><span>Batch</span><span class="seg" id="pf-mo-b"><button type="button" data-v="1" aria-pressed="true">1</button><button type="button" data-v="4" aria-pressed="false">4</button><button type="button" data-v="16" aria-pressed="false">16</button></span></div>
+<div class="pf-grid"><label for="pf-mo-a">Acceptance rate \(\alpha\)</label><input type="range" id="pf-mo-a" min="30" max="95" step="1" value="70"><output id="pf-mo-av"></output></div>
+<div class="scroll-x"><svg id="pf-mo-svg" viewBox="0 0 710 260" role="img" aria-label="Predicted speed-up against draft length from formula 132.6 with measured component times, and measured speed-ups at batch 1"></svg></div>
+<div class="readout" id="pf-mo-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The cost model (132.6) with our measured component times: one target step, one target pass over 5 tokens, and one drafter step, each at a 300-token context and the chosen batch (best of three timing runs). \(\tau\) comes from (132.5), with every guess accepted independently with probability \(\alpha\). The verification time for other \(k\) is interpolated linearly from the 1-token and 5-token passes (an assumption). The square is the speed-up we measured at \(k = 4\) in Figure 3.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The slider starts at the acceptance rate we measured at \(k = 4\). At batch 1 the curve is highest at small \(k\) and falls as \(k\) grows: with these drafter costs, each extra guess costs more than the tokens it adds. Both squares lie above the curve at batch 1. For the draft model, the formula with \(\alpha = 0.78\) gives \(\tau = 3.26\), but we measured 4.14: acceptances are not independent; they come in runs, on easy stretches of text. Now switch to batch 4 and 16. The curve hardly moves, because our component times grow together (a 5-token pass costs 1.14 to 1.15 times a 1-token step), but the squares fall below 1. The readout shows the cost the model leaves out: a group runs until its slowest row is done, so each row gets fewer counted tokens per round than its own \(\tau\). Each round also has fixed bookkeeping on the CPU. Move the slider to see which \(\alpha\) would make longer drafts worth it.</p></details></figure>
+<div class="worked"><div class="wt">Worked example: predict the batch-1 speed-up from three timings</div>
+<p>Batch 1, draft model, \(k = 4\). We measured \(t_1 = 25.9\) ms, \(t_v = 26.1\) ms (5 tokens cost the same as 1) and \(t_d = 15.0\) ms, so \(c = 0.58\). With the measured \(\tau = 4.14\), (132.6) gives \(S = 4.14 \times 25.9 / (4 \times 15.0 + 26.1) = 1.24\). We measured 1.22×: close. For the EAGLE-style head, \(t_d = 3.1\) ms and \(\tau = 2.38\) give \(S = 1.60\), but we measured only 1.27×. The formula leaves out the costs of each round: the drafter’s first pass reads up to 5 tokens, and the CPU must read the accepted counts before it can start the next round, which empties the GPU queue [Likely]. With a cheap drafter these fixed costs are a large part of the round.</p></div>
+
+<h2>The lab code</h2>
+<p>Three files. <code>lab.py</code> holds the fused kernel and our forward pass with a validity mask; <code>spec.py</code> holds the drafters and the generation loop; the training script for the head follows the same pattern and is listed after them. We ran exactly this code on our machine. [Certain] It needs PyTorch 2.8 with MPS (for the Metal kernel; on CUDA, replace <code>addnorm_fused</code> by the Triton <code>add_rmsnorm</code> above) and transformers 4.57; other versions of transformers may change the layer call signatures.</p>
+<pre class="code"># lab.py: Qwen2 forward pass with fused add + RMSNorm and a KV-validity mask (PyTorch 2.8, MPS)
+import time, torch
+from transformers import AutoModelForCausalLM, DynamicCache
+dev = "mps"; sync = torch.mps.synchronize
+
+SRC = r'''
+#include &lt;metal_stdlib&gt;
+using namespace metal;
+kernel void add_rmsnorm(device const bfloat* x [[buffer(0)]], device bfloat* r [[buffer(1)]],
+    device const bfloat* w [[buffer(2)]], device bfloat* y [[buffer(3)]],
+    constant uint&amp; D [[buffer(4)]], constant float&amp; eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
+    uint nt [[threads_per_threadgroup]], uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+  threadgroup float part[32];
+  float acc = 0.0f;
+  device const bfloat* xr = x + row * D; device bfloat* rr = r + row * D;
+  for (uint i = tid; i &lt; D; i += nt) {
+    bfloat h = bfloat(float(xr[i]) + float(rr[i]));    // residual add, rounded like eager
+    rr[i] = h; float hf = float(h); acc += hf * hf;      // new residual, in place
+  }
+  acc = simd_sum(acc);                                   // reduce 32 lanes
+  if (lane == 0) part[sg] = acc;
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  if (sg == 0) { float v = lane &lt; (nt + 31) / 32 ? part[lane] : 0.0f; v = simd_sum(v); if (lane == 0) part[0] = v; }
+  threadgroup_barrier(mem_flags::mem_threadgroup);
+  float inv = rsqrt(part[0] / float(D) + eps);
+  for (uint i = tid; i &lt; D; i += nt) y[row * D + i] = bfloat(float(bfloat(float(rr[i]) * inv)) * float(w[i]));
+}
+'''
+lib = torch.mps.compile_shader(SRC)
+
+def addnorm_eager(x, r, w, eps):          # what Hugging Face does: 9 kernels
+    h = x + r
+    hf = h.to(torch.float32)
+    hf = hf * torch.rsqrt(hf.pow(2).mean(-1, keepdim=True) + eps)
+    return h, w * hf.to(x.dtype)
+
+def addnorm_fused(x, r, w, eps):          # 1 kernel: h is written into r
+    D = x.shape[-1]; x2 = x.reshape(-1, D).contiguous(); r2 = r.reshape(-1, D).contiguous()
+    y = torch.empty_like(x2)
+    lib.add_rmsnorm(x2, r2, w, y, D, eps, threads=x2.shape[0] * 256, group_size=256)
+    return r2.view(x.shape), y.view(x.shape)
+
+def load(name):
+    return AutoModelForCausalLM.from_pretrained(name, dtype=torch.bfloat16).to(dev).eval()
+
+def mask4d(am, T):                        # am: (B, Ltot) bool validity; the last T columns are new
+    Lt = am.shape[1]; q = torch.arange(Lt - T, Lt, device=am.device); k = torch.arange(Lt, device=am.device)
+    m = (k[None, :] &lt;= q[:, None])[None] &amp; am[:, None, :]          # causal and valid
+    m = m | (k[None, None, :] == q[None, :, None])                  # a slot always sees itself
+    return m[:, None]                                               # (B, 1, T, Ltot), True = attend
+
+def positions(am, T):                     # RoPE position = number of valid slots before
+    return (am.long().cumsum(-1) - 1).clamp(min=0)[:, -T:]
+
+@torch.no_grad()
+def run_layers(M, layers, x, past, am, fused, final_w):
+    T = x.shape[1]; L0 = past.get_seq_length()
+    cp = torch.arange(L0, L0 + T, device=x.device); mask = mask4d(am, T)
+    pe = M.rotary_emb(x, positions(am, T))
+    an = addnorm_fused if fused else addnorm_eager; eps = M.config.rms_norm_eps
+    r = x; h = layers[0].input_layernorm(x)
+    for i, lyr in enumerate(layers):
+        a, _ = lyr.self_attn(hidden_states=h, attention_mask=mask, past_key_values=past,
+                             cache_position=cp, position_embeddings=pe)
+        r, h = an(a, r, lyr.post_attention_layernorm.weight, eps)               # add + norm
+        f = lyr.mlp(h)
+        nxt = layers[i + 1].input_layernorm.weight if i + 1 &lt; len(layers) else final_w
+        r, h = an(f, r, nxt, eps)                                                # add + next norm
+    return h                              # final normalized hidden states (B, T, d)
+
+def fwd(m, ids, past, am, fused):
+    return run_layers(m.model, m.model.layers, m.model.embed_tokens(ids), past, am, fused, m.model.norm.weight)
+
+def bench(f, warmup=3, reps=10):          # best and median wall time, GPU queue drained
+    for _ in range(warmup): f()
+    sync(); ts = []
+    for _ in range(reps):
+        t = time.perf_counter(); f(); sync(); ts.append(time.perf_counter() - t)
+    ts.sort(); return ts[0], ts[len(ts) // 2]</pre>
+<pre class="code"># spec.py: drafters and greedy (speculative) generation with per-row acceptance
+import copy, time, torch, torch.nn as nn
+from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer, Qwen2RMSNorm, Qwen2RotaryEmbedding
+from lab import *
+
+class Head(nn.Module):                    # EAGLE-style: [f_(t-1); e(x_t)] -> fc -> one decoder layer -> f_t
+    def __init__(s, cfg):
+        super().__init__(); c = copy.deepcopy(cfg); c.num_hidden_layers = 1; s.config = c
+        s.fc = nn.Linear(2 * c.hidden_size, c.hidden_size, bias=False)
+        s.layers = nn.ModuleList([Qwen2DecoderLayer(c, 0)])
+        s.norm = Qwen2RMSNorm(c.hidden_size, c.rms_norm_eps); s.rotary_emb = Qwen2RotaryEmbedding(c)
+    def inp(s, feat, emb): return s.fc(torch.cat([feat, emb], -1))
+
+class Drafter:
+    """kind = "model" (a small LM) or "eagle" (a Head). Keeps its own KV cache and validity mask."""
+    def __init__(s, kind, net, target, fused): s.kind, s.net, s.t, s.fused = kind, net, target, fused
+    def _run(s, X, F, v):
+        s.am = torch.cat([s.am, v], 1)
+        if s.kind == "model":
+            h = fwd(s.net, X, s.past, s.am, s.fused); return h, s.net.lm_head(h)
+        x = s.net.inp(F, s.t.model.embed_tokens(X))
+        h = run_layers(s.net, s.net.layers, x, s.past, s.am, s.fused, s.net.norm.weight)
+        return h, s.t.lm_head(h)                         # the target's own output layer
+    def start(s, ids, am, g, H):                        # prompt (+ target features H) and first token g
+        s.past = DynamicCache(); s.am = am[:, :0]; s.steps = []
+        one = am[:, :1] | True
+        if s.kind == "model": X, v, F = torch.cat([ids, g[:, None]], 1), torch.cat([am, one], 1), None
+        else: X, v, F = torch.cat([ids[:, 1:], g[:, None]], 1), torch.cat([am[:, 1:], one], 1), H
+        return s.first(X, F, v)
+    def first(s, X, F, v):                              # re-read accepted tokens + bonus (width k+1)
+        if s.steps: s.am[:, s.steps] = False; s.steps = []          # forget last round's guesses
+        h, lg = s._run(X, F, v)
+        idx = (v.long() * torch.arange(1, v.shape[1] + 1, device=v.device)).argmax(1)   # last valid slot
+        ar = torch.arange(X.shape[0], device=X.device)
+        return lg[ar, idx].argmax(-1), h[ar, idx][:, None]
+    def step(s, tok, fh):                               # one more guess
+        s.steps.append(s.am.shape[1])
+        h, lg = s._run(tok[:, None], fh, torch.ones_like(tok[:, None], dtype=torch.bool))
+        return lg[:, -1].argmax(-1), h[:, -1:]
+
+def left_pad(seqs, pad):
+    P = max(map(len, seqs))
+    ids = torch.tensor([[pad] * (P - len(x)) + x for x in seqs], device=dev)
+    am = torch.tensor([[False] * (P - len(x)) + [True] * len(x) for x in seqs], device=dev)
+    return ids, am
+
+@torch.no_grad()
+def generate(target, seqs, N, drafter=None, k=4, fused=True, pad=151643):
+    ids, am = left_pad(seqs, pad); B = ids.shape[0]; sync(); t0 = time.perf_counter()
+    past = DynamicCache(); H = fwd(target, ids, past, am, fused)
+    g = target.lm_head(H[:, -1]).argmax(-1); out = [[x] for x in g.tolist()]; acc = []
+    if drafter is None:                                 # plain greedy decoding
+        while min(map(len, out)) &lt; N:
+            am = torch.cat([am, am[:, :1] | True], 1)
+            g = target.lm_head(fwd(target, g[:, None], past, am, fused)[:, -1]).argmax(-1)
+            for b, x in enumerate(g.tolist()): out[b].append(x)
+        sync(); return torch.tensor([o[:N] for o in out]), dict(time=time.perf_counter() - t0)
+    d, fh = drafter.start(ids, am, g, H)
+    while min(map(len, out)) &lt; N:
+        D = [d]
+        for _ in range(k - 1):
+            d, fh = drafter.step(d, fh); D.append(d)
+        D = torch.stack(D, 1)                                        # (B, k) guesses
+        V = torch.cat([g[:, None], D], 1); am = torch.cat([am, V &gt; -1], 1)
+        H = fwd(target, V, past, am, fused); G = target.lm_head(H).argmax(-1)   # one verify pass
+        n = (D == G[:, :k]).long().cumprod(1).sum(1)                  # accepted guesses per row
+        bonus = G.gather(1, n[:, None])[:, 0]
+        j = torch.arange(k + 1, device=dev)
+        am[:, -k - 1:] = j[None] &lt;= n[:, None]                       # rejected slots: masked out
+        for b, (nb, Db, bb) in enumerate(zip(n.tolist(), D.tolist(), bonus.tolist())):
+            if len(out[b]) &lt; N: acc.append(nb)
+            out[b] += Db[:nb] + [bb]
+        X = torch.cat([D, D[:, :1]], 1).scatter(1, n[:, None], bonus[:, None])
+        d, fh = drafter.first(X, H, j[None] &lt;= n[:, None]); g = bonus
+    sync(); a = torch.tensor(acc, dtype=torch.float)
+    return torch.tensor([o[:N] for o in out]), dict(time=time.perf_counter() - t0,
+        alpha=(a.sum() / (k * len(a))).item(), tau=(a + 1).mean().item())
+
+if __name__ == "__main__":
+    import json
+    from transformers import AutoTokenizer
+    T = "Qwen/Qwen2.5-1.5B-Instruct"; tok = AutoTokenizer.from_pretrained(T)
+    tg, dm = load(T), load("Qwen/Qwen2.5-0.5B-Instruct")
+    qs = ["Janet has 3 apples and buys 5 more. She eats 2. How many apples does she have?",
+          "A train travels 60 km per hour for 2.5 hours. How far does it go?"]
+    seqs = [tok.apply_chat_template([{"role": "user", "content": q}], add_generation_prompt=True) for q in qs]
+    a, s0 = generate(tg, seqs, 128)                                   # plain greedy
+    b, s1 = generate(tg, seqs, 128, Drafter("model", dm, tg, True), k=4)
+    print(f"plain {2 * 128 / s0['time']:.0f} tok/s; draft model {2 * 128 / s1['time']:.0f} tok/s, "
+          f"alpha {s1['alpha']:.2f}, tau {s1['tau']:.2f}, same tokens {(a == b).float().mean():.3f}")</pre>
+<p>The training script for the head (Algorithm 4) uses the same <code>Head</code>. Its setup and one batch:</p>
+<pre class="code"># train_eagle.py (setup): features from our own forward pass, head started from the target's last layer
+feats = [fwd(tg, torch.tensor([q], device=dev), DynamicCache(), torch.ones(1, len(q), dtype=torch.bool, device=dev), True)[0].cpu()
+         for q in seqs]                                        # not tg.model(...): see "Watch out" in Part 3
+head = Head(tg.config).to(dev, torch.float32)
+for p in head.parameters():
+    if p.dim() > 1: torch.nn.init.normal_(p, std=0.02)
+head.layers[0].load_state_dict(tg.model.layers[-1].state_dict()); head.norm.weight.data.copy_(tg.model.norm.weight.float())
+# train_eagle.py (core, one batch): X tokens x_t, Fin features f_(t-1), Ft features f_t, Y next tokens x_(t+1)
+Fin = Fin + (torch.rand_like(Fin) - 0.5) * 0.2                 # uniform noise in [-0.1, 0.1]
+x = head.inp(Fin, E[X].float())                                # E: the target's embedding matrix
+pos = torch.arange(Lm, device=dev)[None].expand(BS, -1)
+mask = torch.ones(Lm, Lm, device=dev, dtype=torch.bool).tril()[None, None]
+h = head.norm(head.layers[0](x, attention_mask=mask, position_embeddings=head.rotary_emb(x, pos), position_ids=pos))
+lreg = (F.smooth_l1_loss(h, Ft, reduction="none").mean(-1) * Mk).sum() / Mk.sum()   # Mk: real tokens
+sel = (Y &gt;= 0).view(-1).nonzero()[:, 0]
+sel = sel[torch.randperm(len(sel), generator=g)[:1024].to(dev)]  # CE on 1,024 positions
+lcls = F.cross_entropy((h.reshape(-1, h.shape[-1])[sel].bfloat16() @ W.T).float(), Y.view(-1)[sel])
+loss = lreg + 0.1 * lcls                                       # formula (132.4)
+opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(head.parameters(), 0.5); opt.step(); sched.step()</pre>
+<p>Things to try next: on a CUDA GPU, wrap the decode step in a CUDA graph and see how much of the gap to the bound disappears; fuse RoPE into the attention call; draft a small tree of guesses instead of one chain (EAGLE’s default) and measure how much \(\tau\) grows; test the head on non-math prompts and watch \(\hat\alpha\) drop.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Where</th><th>What from this lab</th><th>What it decides</th></tr></thead><tbody>
+<tr><td>Serving engines (vLLM, SGLang, TensorRT-LLM)</td><td>Fused norm kernels, CUDA graphs for decode, speculative decoding with draft models and EAGLE heads [Certain]</td><td>Which features to turn on for a given model, batch size and traffic</td></tr>
+<tr><td>Performance work on a new model</td><td>Algorithm 1: step time, issue time, operation counts; the ratio to the bound (132.1)</td><td>Whether to fix launches, kernels or bytes first</td></tr>
+<tr><td>Kernel libraries (for example vLLM’s custom ops, FlashInfer) [Likely]</td><td>Fused add + RMSNorm and similar kernels, tested against eager code</td><td>How much a kernel saves alone and in a full step</td></tr>
+<tr><td>Interactive chat at batch 1 (laptops, phones, a single user)</td><td>Speculative decoding with a small drafter</td><td>The largest latency gain is at low batch, where the GPU has spare compute</td></tr>
+<tr><td>High-throughput batch serving</td><td>Acceptance and speed-up measured at your real batch size (Figure 4)</td><td>Whether speculation still pays, and with which \(k\); often a smaller \(k\) at larger batch</td></tr>
+<tr><td>Long-output tasks: code, math, video captioning and dense video description</td><td>EAGLE-style heads trained on the target’s own outputs for that domain</td><td>Predictable outputs (code, structured captions, timestamps in key-moment lists) give high acceptance</td></tr>
+<tr><td>Vision-language models</td><td>The same drafters over the language model; the image or video tokens are only in the prefill</td><td>Decode speed of answers in video question answering and Video-RAG pipelines</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Timing a decode step that changes the cache.</b> Each call adds a token, so you measure longer and longer contexts. Crop the cache back before every timed call, or use a static cache.</li>
+<li><b>Reading a CPU-only profile as GPU time.</b> The operator that synchronizes collects the waiting time. Count operations with the profiler; time the GPU with a trace (Nsight Systems) or with events.</li>
+<li><b>Measuring a fused kernel only alone.</b> 7× faster alone was 14% faster in the step. Always measure the end-to-end step too.</li>
+<li><b>Skipping the bit-for-bit test.</b> Write the fused kernel to reproduce eager’s roundings first; only then make it “more accurate”, and switch to a tolerance test.</li>
+<li><b>Testing speculative decoding for equal tokens in BF16.</b> Near-ties flip. Test exact equality in FP32; in BF16, compare logits with a tolerance.</li>
+<li><b>Using “the minimum acceptance of the batch” for every row.</b> Correct, but at batch 16 the minimum is often 0, and speculation looks useless. Accept per row and mask rejected cache slots.</li>
+<li><b>Reporting acceptance from one prompt type.</b> Our head is trained and tested on math answers. Acceptance depends on the text: measure it on traffic like yours.</li>
+<li><b>Assuming the batch-1 speed-up holds at batch 16.</b> The verification pass over \(b(k+1)\) tokens stops being free as the batch grows (Figure 4). Measure the speed-up at the batch you serve.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Your decode step takes twice the bandwidth bound. How do you find out why?<span class="lvl">core</span></summary><div class="ans">Compute the bound first: weight bytes plus cache bytes divided by the measured bandwidth (132.1). Then measure the step correctly (warm-up, fixed context by cropping the cache, synchronize, repeat) and also the issue time, the time until the CPU has queued all kernels. If the issue time is close to the step time, the step is launch-bound: count the operations in a profiler (ours had about 1,324 per step) and reduce them with fusion or a CUDA graph. If the GPU is busy all the time, look at the long kernels in an Nsight Systems trace: matrix-vector products that do not reach full bandwidth, attention that copies the cache, hidden syncs such as <code>.item()</code>.</div></details>
+<details class="qa"><summary>Why can a CPU-side profiler table mislead you about GPU time?<span class="lvl">basic</span></summary><div class="ans">GPU work is asynchronous: the CPU queues a kernel and moves on. A CPU-side profiler measures how long each operator call took on the CPU. When an operator has to wait for the GPU, for example a copy of the result to the CPU, all the waiting time is charged to that operator. In our profile, a type-cast operation (<code>aten::copy_</code>) had the most self CPU time for this reason. Use the table to count calls, and use a GPU timeline (Nsight Systems, or the profiler with CUDA activities) to see kernel durations and gaps.</div></details>
+<details class="qa"><summary>How many bytes does an unfused residual add + RMSNorm move, and how many does a fused kernel move?<span class="lvl">core</span></summary><div class="ans">In eager PyTorch with BF16 inputs and an FP32 norm, about 42 bytes per element: the add (6), the cast to FP32 (6), pow (8), mean (4), the multiply by the inverse root (8), the cast back (6) and the multiply by the weight (4). A fused kernel reads the input and the residual and writes the new residual and the output: 8 bytes per element. So fusion cuts traffic by 5.25×. At decode the bytes are tiny and the gain comes from launching one kernel instead of nine; at prefill the gain follows the bytes. We measured 7.2× alone at one row and 8.0× at 16,384 rows.</div></details>
+<details class="qa"><summary>Why did your fused kernel make the whole decode step only a little faster?<span class="lvl">core</span></summary><div class="ans">Because add + RMSNorm is a small part of the step. The step also has 197 matmuls that read 3.09 GB of weights, attention, RoPE, cache appends and many other small kernels. Fusion removed 504 of 1,324 operations and saved 4.3 ms at batch 1 (14%). Amdahl’s law applies: the speed-up of the whole is limited by the part you did not change. The remaining launch overhead needs more fusion or a CUDA graph, and the remaining memory time needs fewer bytes (quantization).</div></details>
+<details class="qa"><summary>How do you test that a fused kernel is correct?<span class="lvl">basic</span></summary><div class="ans">Write it to follow the eager code’s rounding steps exactly (in our case: round the sum to BF16, compute the norm in FP32, round the normalized value to BF16 before the weight multiply), then compare bit for bit on random inputs of many sizes, including sizes that are not a multiple of the block. Check both outputs (the new residual and the normalized value). Then run the whole model and check that the generated tokens are the same. If you later change the rounding for accuracy, switch to a tolerance test of a few BF16 steps.</div></details>
+<details class="qa"><summary>Speculative decoding with greedy acceptance: is the output exactly the same as plain greedy decoding?<span class="lvl">basic</span></summary><div class="ans">In exact arithmetic yes: every output token is the target’s argmax given the tokens before it, whether it came from an accepted guess or from the bonus. In our FP32 test all 256 tokens matched. In BF16 the verification pass computes the logits of 5 positions at once, with different matrix shapes and summation order than a 1-token step, so a near-tie can flip and the texts diverge. That is a numerical effect, not a bug, and production engines have the same behavior.</div></details>
+<details class="qa"><summary>How does an EAGLE head differ from a small draft model, and why can it be better?<span class="lvl">core</span></summary><div class="ans">A draft model is a separate language model that sees only tokens. An EAGLE head is one transformer layer that sees the target’s own last hidden features plus the next token’s embedding, predicts the next feature, and uses the target’s output layer to get a token. The features contain what the target “is about to say”, so a much smaller network can match the target’s choices. It also needs no separate tokenizer or pretraining, only training on target features. Costs: it must be trained for each target model, and it needs the target’s features, so it lives inside the serving engine. In our lab the head (51.5 million parameters plus the shared output layer) reached α = 0.34 and τ = 2.38, against 0.78 and 4.14 for the 0.5B draft model, yet it was slightly faster at batch 1 (1.27× against 1.22×), because one head step costs 3.1 ms against 15.0 ms. With far more training data, as in the paper, its acceptance would rise [Likely].</div></details>
+<details class="qa"><summary>Why does the speed-up of speculative decoding shrink at larger batch, even when the acceptance rate stays the same?<span class="lvl">advanced</span></summary><div class="ans">The speed-up is \(\tau t_1 / (k t_d + t_v)\) (132.6). At batch 1 a decode step is memory-bound, so verifying 5 tokens costs about the same as 1, and \(t_v \approx t_1\). At larger batch the verification pass processes \(b(k+1)\) tokens; once that crosses the hardware’s ridge (or the kernels stop being memory-bound), \(t_v\) grows with the tokens. Plain decoding already used the spare compute by batching. In our measurements the 5-token pass cost 1.01× a 1-token step at batch 1 and 1.15× at batch 16. Draft steps also grow with the batch. So the same \(\tau\) buys less time. In our lab a second effect was even larger: a batch runs until its slowest row is done, so the counted tokens per round fall below the average \(\tau\) (for the draft model, from 4.09 at batch 1 to 3.61 at batch 4). Continuous batching, where finished requests leave and new ones join, reduces this waste in real engines [Likely].</div></details>
+<details class="qa"><summary>How do you handle different numbers of accepted tokens per row in a batch?<span class="lvl">advanced</span></summary><div class="ans">Options: (1) accept the minimum of the batch for all rows: simple, correct, wasteful; (2) keep the rejected KV slots in memory but mask them out of attention, with RoPE positions taken from the count of valid slots, as in this lab: no copying, a little wasted memory; (3) a paged KV cache, where each row owns its blocks and the engine frees or overwrites rejected slots: the production solution in vLLM-style engines. In every case the drafter’s cache must also be corrected, because its guesses after the first rejection are now wrong context.</div></details>
+<details class="qa"><summary>How would you choose the draft length \(k\)?<span class="lvl">core</span></summary><div class="ans">Measure \(\alpha\) on representative traffic, measure \(t_1\), \(t_d\) and the verification time for a few \(k\) at your batch size, and maximize (132.6). The tokens per round \((1 - \alpha^{k+1})/(1 - \alpha)\) saturate, while the cost grows linearly in \(k\), so the best \(k\) is small when \(\alpha\) is low or the drafter is expensive, and larger when \(\alpha\) is high and the drafter is cheap. At larger batch the best \(k\) usually drops. Engines often adapt \(k\) per request or use draft trees with a confidence threshold (EAGLE-2).</div></details>
+<details class="qa"><summary>Your offline benchmark shows a 2× speed-up from speculation, but production shows 1.1×. What could explain it?<span class="lvl">advanced</span></summary><div class="ans">Different text: the drafter was tuned or measured on easy, predictable prompts, and real traffic has lower acceptance. Sampling: with temperature above 0, acceptance drops compared with greedy. Batch size: production runs at large batch, where verification is no longer free (Figure 4). Extra overheads: the drafter’s launches, the bookkeeping of variable accepted lengths, and memory for the drafter’s KV cache, which reduces the batch the engine can hold. Measure acceptance and step times on production traffic and at production batch.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Use (132.1) to compute the decode bound of Qwen2.5-0.5B (0.99 GB) on our machine (233 GB/s). If one draft step took 3 times that bound, what cost ratio \(c\) would it have against a target step of 25.7 ms?</li>
+<li>With (132.3), how many bytes do the eager and the fused add + RMSNorm move in one decode step at batch 16 (56 fused pairs, \(d = 1{,}536\))? Compare with the 3.09 GB of weights. What does this tell you about where the fusion gain at decode comes from?</li>
+<li>With \(\alpha = 0.7\), compute \(\tau\) from (132.5) for \(k = 2, 4, 8\). How many extra tokens per round does going from 4 to 8 guesses buy?</li>
+<li>At batch 1, suppose \(t_1 = 27\) ms, \(t_v = 29\) ms for 5 tokens, and a drafter step costs 9 ms. With \(\tau = 3.5\) and \(k = 4\), what speed-up does (132.6) predict? What if the drafter step cost 3 ms?</li>
+<li>The batch-16 verification pass handles \(16 \times 5 = 80\) tokens. Using the ridge of our machine (about 125 FLOP per byte, from <a href="../inference/lab-kv-cached-generation-metrics-and-your.html">session 87</a>) and the fact that a pass of \(n\) tokens has intensity about \(n\) FLOP per byte in BF16, is this pass memory-bound or compute-bound in theory? Why can the measured cost still grow?</li>
+<li>Run the lab on your own GPU. Report the eager and fused step times at batch 1, \(\hat\alpha\) and \(\tau\) for the draft model, and the speed-up at batch 1 and 16. On a CUDA GPU, add a CUDA graph and report the new step time.</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(0.988 / 233 = 4.24\) ms; three times that is 12.7 ms, so \(c = 12.7 / 25.7 = 0.50\). (We measured 15.0 ms for a draft step, \(c = 0.58\) against our 25.9 ms target step: the draft model is far from its bound.) 2. Eager: \(42 \times 16 \times 1{,}536 \times 56 = 57.8\) MB; fused: \(8 \times 16 \times 1{,}536 \times 56 = 11.0\) MB. That is 1.9% and 0.36% of the 3.09 GB of weights, so the bytes saved are tiny; the gain at decode comes from launching 56 kernels instead of 504. 3. \(\tau(0.7, 2) = 2.19\), \(\tau(0.7, 4) = 2.77\), \(\tau(0.7, 8) = 3.20\): four more guesses buy only 0.43 tokens per round. 4. \(S = 3.5 \times 27 / (4 \times 9 + 29) = 94.5 / 65 = 1.45\); with a 3 ms drafter \(S = 94.5 / 41 = 2.30\). 5. 80 FLOP per byte is below the ridge of about 125, so in theory the pass is still memory-bound. It still costs more than a 1-token pass because the small kernels and attention scale with the tokens, the matmul kernels for 80 rows do not run at full bandwidth, and the output layer writes 80 rows of 151,936 logits. 6. Your own numbers; compare the ratios (fused against eager, speculative against plain) with ours, not the absolute times.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Profile before you optimize: time one decode step at a fixed context (crop the cache), measure its issue time, and count its operations. Ours had about 1,324 operations and took 2.3× the bandwidth bound at batch 1.</li>
+<li>A CPU-side profiler counts operations; only a GPU timeline (Nsight Systems on NVIDIA) shows when the GPU is busy. Synchronizing operations collect the waiting time.</li>
+<li>Eager residual add + RMSNorm is 9 kernels and about 42 bytes per element; fused, it is 1 kernel and 8 bytes. Alone it was 7 to 8× faster; in the whole step it saved 14% at batch 1.</li>
+<li>Write a fused kernel to match eager’s roundings, test it bit for bit, measure it alone, then measure the step.</li>
+<li>Greedy speculative decoding gives the target’s exact greedy output (in FP32). Per-row acceptance with a validity mask over the KV cache makes it work in a batch.</li>
+<li>On our machine speculation paid only at batch 1: 1.22× with a 0.5B draft model and 1.27× with a small EAGLE-style head (cheaper steps beat higher acceptance). At batch 4 and 16 it was slower than plain decoding. Train a head on the features your serving code produces, and measure at the batch you serve.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ t_{\text{step}} \ge \frac{sN + bc\,\text{kv}_{\text{tok}}}{\text{BW}}, \qquad Q_{\text{eager}} \approx 42\,nd, \qquad Q_{\text{fused}} = 8\,nd \]</div>
+<div class="eq">\[ \tau(\alpha, k) = \frac{1 - \alpha^{k+1}}{1 - \alpha}, \qquad S = \frac{\tau\, t_1}{k\, t_d + t_v} \]</div>
+<div class="eq">\[ \mathcal{L}_{\text{EAGLE}} = \text{SmoothL1}(\hat{\mathbf{f}}_t, \mathbf{f}_t) + 0.1\,\text{CE}(\mathbf{W}_{out}\hat{\mathbf{f}}_t, x_{t+1}) \]</div>
+<h2 class="plain" id="lab-profile-fuse-and-speculate-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>OpenAI and community (docs). <a href="https://triton-lang.org/" target="_blank" rel="noopener">Triton language documentation</a></li><li>Leviathan et al. (2022). <a href="https://arxiv.org/abs/2211.17192" target="_blank" rel="noopener">Fast Inference from Transformers via Speculative Decoding</a></li><li>Li et al. (2024). <a href="https://arxiv.org/abs/2401.15077" target="_blank" rel="noopener">EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty</a></li><li>Chen et al. (2023). <a href="https://arxiv.org/abs/2302.01318" target="_blank" rel="noopener">Accelerating Large Language Model Decoding with Speculative Sampling</a></li><li>Tillet et al. (2019). <a href="https://scholar.google.com/scholar?q=&amp;quot;Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations&amp;quot;" target="_blank" rel="noopener">Triton: An Intermediate Language and Compiler for Tiled Neural Network Computations</a></li><li>Zhang &amp; Sennrich (2019). <a href="https://arxiv.org/abs/1910.07467" target="_blank" rel="noopener">Root Mean Square Layer Normalization</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Cai et al. (2024). <a href="https://arxiv.org/abs/2401.10774" target="_blank" rel="noopener">Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads</a></li><li>Qwen Team (2024). <a href="https://arxiv.org/abs/2412.15115" target="_blank" rel="noopener">Qwen2.5 Technical Report</a></li><li>Li, Wei, Zhang, Zhang (2024). <a href="https://arxiv.org/abs/2406.16858" target="_blank" rel="noopener">EAGLE-2: Faster Inference of Language Models with Dynamic Draft Trees</a></li><li>Li et al. (2025). <a href="https://arxiv.org/abs/2503.01840" target="_blank" rel="noopener">EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test</a></li><li>NVIDIA (docs). <a href="https://docs.nvidia.com/nsight-systems/UserGuide/index.html" target="_blank" rel="noopener">Nsight Systems User Guide</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/docs/stable/profiler.html" target="_blank" rel="noopener">torch.profiler (documentation)</a></li><li>PyTorch (docs). <a href="https://docs.pytorch.org/docs/stable/generated/torch.mps.compile_shader.html" target="_blank" rel="noopener">torch.mps.compile_shader (documentation)</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/tensorrt-and-tensorrt-llm-in-depth.html"><small>Previous · session 131</small>TensorRT and TensorRT-LLM in depth</a><a class="next" href="../inference/the-serving-stack-and-the-life-of.html"><small>Next · session 133</small>The serving stack and the life of a request</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const R=document.querySelector('[data-session="lab-profile-fuse-and-speculate"]');if(!R)return;
+const $=s=>R.querySelector(s);
+/* ---------- measured on our machine (Apple M5 Pro, PyTorch 2.8 MPS, BF16, Qwen2.5-1.5B-Instruct; best of repeats) ---------- */
+const D=/*DATA*/{"prof":{"1,0":{"best":29.95,"issue":11.98},"1,1":{"best":25.67,"issue":8.7},"4,0":{"best":39.54,"issue":13.17},"4,1":{"best":35.76,"issue":9.74},"16,0":{"best":76.52,"issue":13.63},"16,1":{"best":71.74,"issue":9.91}},"fuse":{"1":{"eager":122.23,"fused":16.86,"comp":20.69,"eqh":true,"dy":0.0,"exact":1.0},"16":{"eager":154.2,"fused":16.43,"comp":20.4,"eqh":true,"dy":0.0,"exact":1.0},"256":{"eager":176.13,"fused":10.7,"comp":23.73,"eqh":true,"dy":0.0,"exact":1.0},"4096":{"eager":1688.73,"fused":166.0,"comp":222.74,"eqh":true,"dy":0.0078125,"exact":0.9999990463256836},"16384":{"eager":6708.1,"fused":842.66,"comp":873.92,"eqh":true,"dy":0.03125,"exact":0.9999966621398926}},"ev":{"base,1":{"tps":15.4868},"base_eager,1":{"tps":14.9008},"model,1":{"tps":18.9402,"match":0.8096,"rows_equal":0.625,"alpha":0.7842,"tau":4.1366},"eagle,1":{"tps":19.64,"match":0.7837,"rows_equal":0.6875,"alpha":0.3442,"tau":2.3767},"base,4":{"tps":120.2496},"base_eager,4":{"tps":105.0405},"model,4":{"tps":103.1499,"match":0.709,"rows_equal":0.625,"alpha":0.7716,"tau":4.0865},"eagle,4":{"tps":102.3945,"match":0.7749,"rows_equal":0.6875,"alpha":0.3389,"tau":2.3556},"base,16":{"tps":308.7033},"base_eager,16":{"tps":275.2177},"model,16":{"tps":281.9494,"match":0.8379,"rows_equal":0.625,"alpha":0.7799,"tau":4.1198},"eagle,16":{"tps":251.1466,"match":0.9922,"rows_equal":0.875,"alpha":0.3316,"tau":2.3265},"k1,model":{"alpha":0.8758},"k2,model":{"alpha":0.7999},"k3,model":{"alpha":0.7653},"k4,model":{"alpha":0.7273},"k6,model":{"alpha":0.6364},"k8,model":{"alpha":0.6035},"k1,eagle":{"alpha":0.6273},"k2,eagle":{"alpha":0.4964},"k3,eagle":{"alpha":0.4138},"k4,eagle":{"alpha":0.338},"k6,eagle":{"alpha":0.2609},"k8,eagle":{"alpha":0.201},"t,target,1,1":25.91,"t,target,1,5":26.06,"t,draft,1,1":15.03,"t,draft,1,5":15.92,"t,head,1,1":3.11,"t,target,4,1":31.12,"t,target,4,5":35.36,"t,draft,4,1":17.91,"t,draft,4,5":20.02,"t,head,4,1":3.39,"t,target,16,1":51.87,"t,target,16,5":59.41,"t,draft,16,1":28.75,"t,draft,16,5":32.91,"t,head,16,1":4.22},"rounds":{"model,1":31.3125,"model,4":35.5,"model,16":34.0,"eagle,1":55.375,"eagle,4":64.0,"eagle,16":71.0}}/*END*/;
+const f0=v=>Math.round(v).toLocaleString("en-US"),f1=v=>v.toFixed(1),f2=v=>v.toFixed(2);
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const segVal=el=>el.querySelector('button[aria-pressed="true"]').dataset.v;
+const T=(x,y,s,a)=>`<text x="${x}" y="${y}" font-size="12" fill="var(--muted)" ${a||""}>${s}</text>`;
+const BW=233e9; /* measured copy bandwidth of this machine (session 87) */
+
+/* ---------- the decode step of Qwen2.5-1.5B as a list of kernels (batch b, context c) ---------- */
+const M={d:1536,L:28,h:12,kv:2,dh:128,ff:8960,V:151936};
+function kernels(b,c,fused){
+ const d=M.d,kvd=M.kv*M.dh,ks=[],s=2,act=b*d*s;
+ const lin=(n,i,o)=>ks.push({n,t:"lin",q:i*o*s+b*(i+o)*s});
+ const ew=(n,q)=>ks.push({n,t:"ew",q});
+ const norm=(withAdd)=>{if(fused&&withAdd){ks.push({n:"add+RMSNorm (fused)",t:"norm",q:4*act});return;}
+  if(withAdd)ks.push({n:"residual add",t:"norm",q:3*act});
+  [["to FP32",3],["pow",4],["mean",2],["add eps",0],["rsqrt",0],["mul",4],["to BF16",3],["mul weight",2]].forEach(([n,m])=>ks.push({n,t:"norm",q:Math.max(m*act,64)}));};
+ ks.push({n:"embedding",t:"ew",q:act});
+ for(let l=0;l<M.L;l++){
+  norm(l>0);
+  lin("q proj",d,d);lin("k proj",d,kvd);lin("v proj",d,kvd);
+  for(const z of ["q","k"]){const a=z==="q"?b*d*s:b*kvd*s;["neg","cat","mul cos","mul sin","add"].forEach(n=>ew("RoPE "+z+" "+n,2*a));}
+  const cache=b*c*kvd*s;ew("cache cat K",2*cache);ew("cache cat V",2*cache);
+  ks.push({n:"attention",t:"att",q:2*cache+2*b*d*s});
+  lin("o proj",d,d);norm(true);
+  lin("gate proj",d,M.ff);lin("up proj",d,M.ff);ew("silu",2*b*M.ff*s);ew("mul",3*b*M.ff*s);lin("down proj",M.ff,d);}
+ norm(true);lin("LM head",d,M.V);ew("argmax",b*M.V*s);
+ return ks;}
+
+/* ---------- Figure 1: a timeline model of one decode step ---------- */
+(function(){
+ const svg=$("#pf-tl-svg");if(!svg||!D.prof)return;const sm=$("#pf-tl-mode"),sl=$("#pf-tl-l"),sf=$("#pf-tl-f"),sb=$("#pf-tl-b"),info=$("#pf-tl-info");
+ const col={lin:"var(--q)",att:"var(--k)",norm:"var(--v)",ew:"var(--muted)"};
+ function draw(){const mode=segVal(sm),b=+segVal(sb),tL=+sl.value,fl=+sf.value;$("#pf-tl-lv").value=tL+" µs";$("#pf-tl-fv").value=fl+" µs";
+  const ks=kernels(b,512,mode!=="eager");const n=ks.length;
+  let cpu=0,ge=0;const ev=[];
+  for(const k of ks){const dur=Math.max(fl,k.q/BW*1e6);let st;
+   if(mode==="graph"){st=ge;}else{cpu+=tL;st=Math.max(cpu,ge);}
+   ge=st+dur;ev.push({k,st,dur,iss:cpu});}
+  if(mode==="graph")cpu=tL*3;
+  const busy=ev.reduce((a,e)=>a+e.dur,0),step=Math.max(ge,cpu);
+  /* draw the first 1.5 layers zoomed, and a whole-step bar */
+  const x0=86,x1=700;const lastI=ks.findIndex((k,i)=>i>2&&k.n==="gate proj"&&i>45);const zEnd=ev[Math.min(n-1,lastI>0?lastI:60)];
+  const span=Math.max(zEnd.st+zEnd.dur,mode==="graph"?0:zEnd.iss)*1.02;const X=t=>x0+(x1-x0)*t/span;
+  let h=T(6,46,"CPU issues")+T(6,96,"GPU runs")+T(6,168,"whole step");
+  if(mode!=="graph")ev.forEach(e=>{if(e.iss-tL>span)return;h+=`<rect x="${X(e.iss-tL).toFixed(1)}" y="32" width="${Math.max(0.6,X(tL)-X(0)-0.6).toFixed(1)}" height="20" fill="var(--bad)" opacity=".55"/>`;});
+  else h+=`<rect x="${X(0)}" y="32" width="${Math.max(2,X(cpu)-X(0)).toFixed(1)}" height="20" fill="var(--bad)" opacity=".55"/>`+T(X(cpu)+6,46,"one graph launch");
+  ev.forEach(e=>{if(e.st>span)return;h+=`<rect x="${X(e.st).toFixed(1)}" y="82" width="${Math.max(0.6,Math.min(X(e.st+e.dur),x1)-X(e.st)-0.4).toFixed(1)}" height="20" fill="${col[e.k.t]}"/>`;});
+  h+=`<line x1="${x0}" y1="112" x2="${x1}" y2="112" stroke="var(--rule)"/>`+T(x0,126,"0")+T(x1,126,f2(span/1000)+" ms (about 1.5 layers of 28)",'text-anchor="end"');
+  const S=t=>x0+(x1-x0)*t/Math.max(step,1);
+  h+=`<rect x="${x0}" y="152" width="${x1-x0}" height="22" fill="var(--rule)" opacity=".5"/>`;
+  let acc=0;["lin","att","norm","ew"].forEach(t=>{const v=ev.filter(e=>e.k.t===t).reduce((a,e)=>a+e.dur,0);h+=`<rect x="${S(acc).toFixed(1)}" y="152" width="${Math.max(0,S(acc+v)-S(acc)).toFixed(1)}" height="22" fill="${col[t]}"/>`;acc+=v;});
+  h+=T(x1,192,"GPU busy "+f1(busy/1000)+" ms of "+f1(step/1000)+" ms; the grey rest is idle time",'text-anchor="end"');
+  svg.innerHTML=h;
+  const cnt=t=>ks.filter(k=>k.t===t).length,bytes=ks.reduce((a,k)=>a+k.q,0);
+  const meas=D.prof[b+","+(mode==="eager"?0:1)];
+  info.innerHTML=`<b>${f0(n)}</b> kernels (${cnt("lin")} matmuls, ${cnt("att")} attention, ${cnt("norm")} norm and residual, ${cnt("ew")} other small ones). Bytes moved: <b>${f2(bytes/1e9)}</b> GB, so the bandwidth bound is <b>${f1(bytes/BW*1e3)}</b> ms. Model: CPU issue <b>${f1(cpu/1000)}</b> ms, GPU busy <b>${f1(busy/1000)}</b> ms, step <b>${f1(step/1000)}</b> ms, GPU idle <b>${Math.round(100*(1-busy/step))}%</b>. `+(cpu>busy?"The CPU is the slower side: the step is <b>launch-bound</b>.":"The GPU is the slower side: the step is <b>GPU-bound</b>.")+
+   (meas?` Measured on our machine at batch ${b} (${mode==="graph"?"we have no CUDA graphs on MPS; this is the fused code":mode==="eager"?"eager":"fused"}): step <b>${f1(meas.best)}</b> ms, issue time <b>${f1(meas.issue)}</b> ms.`:"");}
+ [sl,sf].forEach(e=>e.addEventListener("input",draw));seg(sm,draw);seg(sb,draw);draw();
+})();
+
+/* ---------- Figure 2: bytes and time of residual add + RMSNorm, eager vs fused ---------- */
+(function(){
+ const svg=$("#pf-fu-svg");if(!svg||!D.fuse)return;const sn=$("#pf-fu-n"),info=$("#pf-fu-info");
+ const E=[["add",6],["to FP32",6],["pow",8],["mean",4],["add eps",0],["rsqrt",0],["mul",8],["to BF16",6],["mul weight",4]];
+ const Ns=Object.keys(D.fuse).map(Number).sort((a,b)=>a-b);
+ function draw(){const N=Ns[+sn.value],d=1536;$("#pf-fu-nv").value=f0(N);
+  const per=N*d;const eb=E.reduce((a,e)=>a+e[1],0)*per,fb=8*per;const m=D.fuse[N];
+  const x0=110,x1=700,mx=eb*1.05;const X=v=>x0+(x1-x0)*v/mx;
+  let h=T(6,44,"eager: 9 kernels")+T(6,104,"fused: 1 kernel");let acc=0;
+  E.forEach(([n,b],i)=>{const v=b*per;const w=Math.max(b?1:0,X(acc+v)-X(acc));h+=`<rect x="${X(acc).toFixed(1)}" y="28" width="${w.toFixed(1)}" height="26" fill="${i%2?"var(--v)":"var(--k)"}" opacity="${b?0.85:0.3}"/>`;if(w>34)h+=`<text x="${(X(acc)+w/2).toFixed(1)}" y="45" text-anchor="middle" font-size="11" fill="var(--paper)">${n}</text>`;acc+=v;});
+  h+=`<rect x="${x0}" y="88" width="${(X(fb)-x0).toFixed(1)}" height="26" fill="var(--q)"/>`+`<text x="${X(fb)+6}" y="105" font-size="12" fill="var(--q)">read x, r; write h, y</text>`;
+  h+=`<line x1="${x0}" y1="130" x2="${x1}" y2="130" stroke="var(--rule)"/>`+T(x0,146,"0")+T(x1,146,"bytes moved: "+(eb>=1e9?f2(eb/1e9)+" GB":eb>=1e6?f1(eb/1e6)+" MB":f1(eb/1e3)+" kB")+" (eager)",'text-anchor="end"');
+  /* measured times as two bars */
+  const tm=Math.max(m.eager,m.fused)*1.05,Y=v=>x0+(x1-x0)*v/tm;
+  h+=T(6,184,"measured eager")+T(6,214,"measured fused");
+  h+=`<rect x="${x0}" y="170" width="${(Y(m.eager)-x0).toFixed(1)}" height="20" fill="var(--k)"/><rect x="${x0}" y="200" width="${Math.max(1,Y(m.fused)-x0).toFixed(1)}" height="20" fill="var(--q)"/>`;
+  h+=`<text x="${Math.min(Y(m.eager)+6,x1-60)}" y="185" font-size="12" fill="var(--ink)">${f1(m.eager)} µs</text><text x="${Y(m.fused)+6}" y="215" font-size="12" fill="var(--ink)">${f1(m.fused)} µs</text>`;
+  svg.innerHTML=h;
+  const bf=fb/BW*1e6,be=eb/BW*1e6;
+  info.innerHTML=`${f0(N)} tokens × 1,536 numbers in BF16. Bytes: eager <b>${(eb/1e6).toFixed(eb<1e6?3:1)}</b> MB, fused <b>${(fb/1e6).toFixed(fb<1e6?3:1)}</b> MB, ratio <b>5.25×</b>. Bandwidth bound at 233 GB/s: eager ${be<1?be.toFixed(2):f1(be)} µs, fused ${bf<1?bf.toFixed(2):f1(bf)} µs. Measured: eager <b>${f1(m.eager)}</b> µs, fused <b>${f1(m.fused)}</b> µs (speed-up <b>${f1(m.eager/m.fused)}×</b>), torch.compile <b>${f1(m.comp)}</b> µs. Fused kernel speed: <b>${f0(fb/(m.fused*1e-6)/1e9)}</b> GB/s. `+
+   (N<=16?"At this size the bytes are tiny: the time is the fixed cost of each kernel, and fusion removes 8 of 9 kernels.":N<=256?"The data fits in on-chip caches; the time is still mostly fixed costs.":"Now the bytes matter: the time follows the bytes moved, and eager also pays for FP32 temporaries.")+` Outputs: residual equal bit for bit; normalized output ${m.exact>=1?"equal bit for bit":`different in ${f0((1-m.exact)*per)} of ${f0(per)} numbers (largest difference ${m.dy})`}.`;}
+ sn.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 3: measured speculative decoding at batch 1, 4 and 16 ---------- */
+(function(){
+ const svg=$("#pf-sp-svg");if(!svg||!D.ev)return;const sv=$("#pf-sp-view"),info=$("#pf-sp-info");
+ const meth=[["base_eager","plain greedy, eager norms","var(--muted)"],["base","plain greedy, fused norms","var(--v)"],["model","draft model 0.5B, k = 4","var(--k)"],["eagle","EAGLE-style head, k = 4","var(--q)"]];
+ function draw(){const v=segVal(sv);const Bs=[1,4,16];const x0=70,x1=700,y0=230,y1=20;
+  let mx=0;Bs.forEach(B=>meth.forEach(m=>{const r=D.ev[m[0]+","+B];if(r)mx=Math.max(mx,v==="tps"?r.tps:v==="tau"?(r.tau||1):r.tps/D.ev["base,"+B].tps);}));mx*=1.12;
+  const Y=x=>y0-(y0-y1)*x/mx;let h=`<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y0}" stroke="var(--rule)"/><line x1="${x0}" y1="${y0}" x2="${x0}" y2="${y1}" stroke="var(--rule)"/>`;
+  const step=mx>100?Math.pow(10,Math.floor(Math.log10(mx/2))):mx>4?1:0.5;
+  for(let t=0;t<=mx;t+=step){if(mx/step>12&&Math.round(t/step)%2)continue;h+=`<line x1="${x0}" y1="${Y(t)}" x2="${x1}" y2="${Y(t)}" stroke="var(--rule)" opacity=".45"/>`+T(x0-6,Y(t)+4,v==="tps"?f0(t):f1(t),'text-anchor="end"');}
+  const gw=(x1-x0)/3,bw=gw/6;const rows=[];
+  Bs.forEach((B,i)=>{const gx=x0+gw*i+bw;h+=T(gx+bw*2,y0+18,"batch "+B,'text-anchor="middle"');
+   meth.forEach((m,j)=>{const r=D.ev[m[0]+","+B];if(!r)return;let val=v==="tps"?r.tps:v==="tau"?(r.tau||1):r.tps/D.ev["base,"+B].tps;
+    h+=`<rect x="${(gx+j*bw).toFixed(1)}" y="${Y(val).toFixed(1)}" width="${(bw-3).toFixed(1)}" height="${(y0-Y(val)).toFixed(1)}" fill="${m[2]}"/>`+`<text x="${(gx+j*bw+bw/2-1.5).toFixed(1)}" y="${(Y(val)-4).toFixed(1)}" text-anchor="middle" font-size="10.5" fill="var(--ink)">${v==="tps"?(val<100?f1(val):f0(val)):f2(val)}</text>`;});
+   const b=D.ev["base,"+B],dm=D.ev["model,"+B],eg=D.ev["eagle,"+B];
+   const fT=v=>v<100?f1(v):f0(v);rows.push(`<b>Batch ${B}</b>: plain ${fT(b.tps)} tokens/s (eager norms ${fT(D.ev["base_eager,"+B].tps)}); draft model α = ${f2(dm.alpha)}, τ = ${f2(dm.tau)}, ${fT(dm.tps)} tokens/s (<b>${f2(dm.tps/b.tps)}×</b>); EAGLE-style α = ${f2(eg.alpha)}, τ = ${f2(eg.tau)}, ${fT(eg.tps)} tokens/s (<b>${f2(eg.tps/b.tps)}×</b>).`);});
+  h+=`<text x="14" y="${(y0+y1)/2}" font-size="12" fill="var(--muted)" transform="rotate(-90 14 ${(y0+y1)/2})" text-anchor="middle">${v==="tps"?"tokens per second (all rows)":v==="tau"?"tokens per target pass (τ)":"speed-up over plain greedy (fused)"}</text>`;
+  svg.innerHTML=h;info.innerHTML=rows.join("<br>");}
+ seg(sv,draw);draw();
+})();
+
+/* ---------- Figure 4: cost model of the speed-up, with measured component times ---------- */
+(function(){
+ const svg=$("#pf-mo-svg");if(!svg||!D.ev)return;const sk=$("#pf-mo-kind"),sb=$("#pf-mo-b"),sa=$("#pf-mo-a"),info=$("#pf-mo-info");
+ const tau=(a,k)=>a>=0.9999?k+1:(1-Math.pow(a,k+1))/(1-a);
+ let lastKind="";
+ function draw(){const kind=segVal(sk),B=+segVal(sb);
+  if(kind!==lastKind){sa.value=Math.round(100*D.ev[kind+",1"].alpha);lastKind=kind;}
+  const a=+sa.value/100;$("#pf-mo-av").value=a.toFixed(2);
+  const t1=D.ev["t,target,"+B+",1"],tv=D.ev["t,target,"+B+",5"],td=D.ev["t,"+(kind==="model"?"draft":"head")+","+B+",1"];
+  /* verification cost of k+1 tokens: linear interpolation between the measured 1- and 5-token passes */
+  const tver=k=>t1+(tv-t1)*k/4;
+  const S=k=>tau(a,k)*t1/(k*td+tver(k));
+  const ks=[1,2,3,4,5,6,7,8];const x0=60,x1=700,y0=220,y1=18;const ms4=D.ev[kind+","+B].tps/D.ev["base,"+B].tps,meas=[ms4];const mx=Math.max(2,...ks.map(S),...meas)*1.15;
+  const X=k=>x0+(x1-x0)*(k-1)/7,Y=s=>y0-(y0-y1)*s/mx;
+  let h=`<line x1="${x0}" y1="${y0}" x2="${x1}" y2="${y0}" stroke="var(--rule)"/><line x1="${x0}" y1="${y0}" x2="${x0}" y2="${y1}" stroke="var(--rule)"/>`;
+  for(let s=0;s<=mx;s+=0.5)h+=`<line x1="${x0}" y1="${Y(s)}" x2="${x1}" y2="${Y(s)}" stroke="var(--rule)" opacity="${s===1?1:.4}" ${s===1?'stroke-dasharray="5 4"':""}/>`+T(x0-6,Y(s)+4,f1(s),'text-anchor="end"');
+  ks.forEach(k=>h+=T(X(k),y0+16,String(k),'text-anchor="middle"'));
+  h+=T((x0+x1)/2,y0+34,"draft length k (guesses per round)",'text-anchor="middle"')+`<text x="14" y="${(y0+y1)/2}" font-size="12" fill="var(--muted)" transform="rotate(-90 14 ${(y0+y1)/2})" text-anchor="middle">speed-up</text>`;
+  h+=`<path d="${ks.map((k,i)=>`${i?"L":"M"}${X(k).toFixed(1)} ${Y(S(k)).toFixed(1)}`).join(" ")}" fill="none" stroke="var(--q)" stroke-width="2.4"/>`+ks.map(k=>`<circle cx="${X(k)}" cy="${Y(S(k))}" r="3.5" fill="var(--q)"/>`).join("");
+  h+=`<rect x="${X(4)-5}" y="${Y(ms4)-5}" width="10" height="10" fill="none" stroke="var(--k)" stroke-width="2"/>`+T(X(4)+10,Y(ms4)+4,"measured "+f2(ms4)+"×");
+  const rr=D.rounds[kind+","+B],ev=D.ev[kind+","+B];
+  let ms=` Square: our measured speed-up at k = 4 and this batch, <b>${f2(ms4)}×</b> (measured τ = ${f2(ev.tau)}; ${B===1?`each prompt needed ${f1(rr)} rounds on average for 128 tokens, ${f2(128/rr)} tokens per round`:`each group needed ${f1(rr)} rounds, so each row got only ${f2(128/rr)} counted tokens per round, because the group runs until its slowest row is done`}).`;
+  ms+=" Measured α at batch 1 for k = 1, 2, 3, 4, 6, 8: "+[1,2,3,4,6,8].map(k=>f2(D.ev["k"+k+","+kind].alpha)).join(", ")+".";
+  svg.innerHTML=h;let best=1;ks.forEach(k=>{if(S(k)>S(best))best=k;});
+  info.innerHTML=`Batch <b>${B}</b>, ${kind==="model"?"draft model":"EAGLE-style head"}. Measured times: one target step <b>${f1(t1)}</b> ms, one target pass over 5 tokens <b>${f1(tv)}</b> ms (×${f2(tv/t1)}), one draft step <b>${f1(td)}</b> ms (c = ${f2(td/t1)}). With α = ${a.toFixed(2)} the model (132.6) predicts the best k = <b>${best}</b>, speed-up <b>${f2(S(best))}×</b>; at k = 4 it predicts <b>${f2(S(4))}×</b>, τ = ${f2(tau(a,4))}.`+ms;}
+ sa.addEventListener("input",draw);seg(sk,draw);seg(sb,draw);draw();
+})();
+})();
+</script></body></html>

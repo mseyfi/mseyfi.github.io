@@ -1,0 +1,615 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>Distributed serving and prefill–decode disaggregation · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../inference/index.html">LLM inference and serving</a><span class="sep">/</span><span>Session 137</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="distributed-serving-and-prefill-decode-disaggregation">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="distributed-serving-and-prefill-decode-disaggregation" data-session="distributed-serving-and-prefill-decode-disaggregation" style="--tc:var(--t5)"><header class="chap-head"><div class="chap-kicker"><span class="num">137</span><span>Track 5: LLM inference and serving · session 60 of 65</span></div><h1 class="chap-title">Distributed serving and prefill–decode disaggregation</h1><p class="chap-sub">A large model is served by many GPUs at once. This session shows how tensor and pipeline parallelism split one model for serving, why the two phases of generation (prefill and decode) fight when they share a GPU, and how Splitwise, DistServe and TetriInfer give each phase its own GPUs and move the KV cache between them. It ends with SpotServe, which serves on cheap cloud GPUs that can be taken away at any time.</p><div class="meta-row"><span><b>Time:</b> 3 to 4 hours (reading 2 hours, exercises 1 to 2 hours)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> The generation loop: prefill and decode (session 78), The KV cache (session 80), Collective communication (session 43), Batching and scheduling (sessions 135 and 136)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>Tensor-parallel and pipeline-parallel serving: what each costs per token, and why tensor parallelism inside a node is the default for latency</li><li>Why prefill and decode interfere on one GPU, measured as stalls in time per output token</li><li>Goodput, the queueing view of TTFT from DistServe, and how to choose the ratio of prefill GPUs to decode GPUs</li><li>Splitwise, DistServe and TetriInfer: what each one adds (cheaper hardware for decode, placement search, chunked prefill and length prediction)</li><li>How large the KV cache is, how long it takes to move, and why layer-wise transfer hides most of the cost</li><li>SpotServe: re-planning the parallel layout when a spot instance is taken away, device mapping as bipartite matching, and token-level recovery</li><li>When disaggregation helps and when it does not</li></ul></div></header><style>
+.pd-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.pd-grid input[type=range]{width:100%}
+.pd-grid output{font:600 14px var(--mono);min-width:64px;text-align:right}
+.pd-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.pd-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+[data-session="distributed-serving-and-prefill-decode-disaggregation"] svg text{font-family:var(--sans)}
+.pd-tbl td,.pd-tbl th{font:500 14px var(--mono);padding:4px 8px;text-align:right;border-bottom:1px solid var(--rule2)}
+.pd-tbl th{font:700 13px var(--sans);color:var(--muted)}
+.pd-tbl td:first-child,.pd-tbl th:first-child{text-align:left}
+.pd-tbl tr.best td{color:var(--good,var(--tc));font-weight:700}
+.pd-tbl tr.naive td{text-decoration:underline dotted}
+.pd-inst{cursor:pointer}
+pre.code,code{font-variant-ligatures:none}
+.article p code,.article li code,.article td code{overflow-wrap:anywhere}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">Llama 3.1 70B in BF16 is 141 GB of weights. One H100 has 80 GB. So the smallest way to serve it at full precision is already a small distributed system: at least two GPUs that must talk to each other for every token. Big chat services use thousands of GPUs, and the way those GPUs are grouped decides the cost per token and the latency users feel.</p>
+<p>This session answers three questions that come up in every serving design review and in many interviews:</p>
+<ul>
+<li><b>How do we split one model over several GPUs for serving?</b> Tensor parallelism and pipeline parallelism, which you met for training in <a href="../pretraining/tensor-parallelism-and-sequence-parallelism.html">session 48</a> and <a href="../pretraining/pipeline-context-and-expert-parallelism-3d-and.html">session 49</a>, behave differently at inference time. Tensor parallelism makes each token faster. Pipeline parallelism does not; it only adds capacity.</li>
+<li><b>Should the two phases of generation share GPUs?</b> Prefill (reading the prompt) is compute-bound; decode (writing one token at a time) is memory-bound (<a href="../inference/the-generation-loop-prefill-and-decode.html">session 78</a>). When they share a GPU, a long prefill stalls every running decode. Splitwise (Patel et al., 2023), DistServe (Zhong et al., 2024) and TetriInfer (Hu et al., 2024) put them on <b>different</b> GPUs. This is called <b>prefill–decode disaggregation</b>, or <b>PD disaggregation</b>. [Certain]</li>
+<li><b>What does it cost to move the KV cache, and can we serve on cheap GPUs that may disappear?</b> After prefill, the KV cache must travel to the decode GPU. And cloud providers sell spare GPUs (spot instances) at large discounts but can take them back with little warning. SpotServe (Miao et al., 2023) serves LLMs on such GPUs. [Certain]</li></ul>
+<p>The efficient-inference survey of Zhou et al. lists these systems under serving-system optimization, as “distributed systems”. [Certain] The ideas are now in production: Moonshot AI’s Kimi service runs on Mooncake, a disaggregated design, and DeepSeek-V3 is deployed with separate prefill and decode units (32 GPUs per prefill unit, 320 GPUs per decode unit). [Certain] vLLM, SGLang, TensorRT-LLM and NVIDIA Dynamo all offer disaggregated serving. [Likely]</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>Expect: “TP or PP for serving a 70B model, and why?”, “What is PD disaggregation and when does it help?”, “How big is the KV cache you must move, and how long does it take?”, “What is goodput?”, “How would you serve on spot GPUs?”. Each one is answered below with a formula and numbers.</aside>
+
+<h2>Two phases that want different machines</h2>
+<p>Recall the two phases (<a href="../inference/the-generation-loop-prefill-and-decode.html">session 78</a>, <a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>):</p>
+<ul>
+<li><b>Prefill</b> runs the whole prompt (\(s\) tokens) through the model at once. It does about \(2N\) FLOPs per token for \(N\) weights, so it is a large matrix multiply. It is <b>compute-bound</b>: the GPU’s arithmetic units are the limit. It produces the first output token and the KV cache of the prompt. Its latency is the <b>time to first token (TTFT)</b>.</li>
+<li><b>Decode</b> makes one token per step for every running request. Each step reads all weights and the KV cache of every request in the batch, but does little arithmetic per byte. It is <b>memory-bound</b>. Its speed is the <b>time per output token (TPOT)</b>, also called inter-token latency (ITL).</li></ul>
+<p>The two phases also like different settings. Prefill wants many GPUs per request to cut TTFT, and gains little from batching (one long prompt already fills the GPU). Decode wants big batches, because the weights are read once per step for the whole batch, and a lot of memory for the KV cache. Splitwise measured both on real GPUs: prompt throughput stops growing above about 2,048 batched tokens, while token throughput keeps growing with batch size up to 64, where memory runs out; and capping a DGX-H100’s power from 700 W to 350 W hurts prompt latency a lot but token latency almost not at all. [Certain]</p>
+<h3>Interference</h3>
+<p>Modern servers use <b>continuous batching</b> (<a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">session 135</a>): new requests join the running batch at any step. With the simplest policy, when a new prompt arrives the next step runs its prefill, and all decoding requests wait for it. A 2,048-token prefill of Llama 3.1 8B takes about 69 ms on an H100 (at an assumed 50% of peak FLOPs), while a decode step takes about 5 to 6 ms. So every new prompt makes every running user see a pause of more than 10 decode steps. TetriInfer measured this kind of <b>interference</b>: one heavy prefill in the batch made a light decode step 5× slower, and decode slowed prefill up to about 2.5×. [Certain]</p>
+<p>Chunked prefill (<a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">session 135</a>, Sarathi-Serve) softens this by cutting the prompt into chunks and mixing a chunk into each decode step. Disaggregation removes it: prefill GPUs only prefill, decode GPUs only decode. Figure 1 compares two GPUs used both ways.</p>
+<figure class="fig wide" id="pd-int"><div class="fig-body">
+<div class="pd-grid">
+<label for="pd-int-r">Arrival rate (requests/s)</label><input type="range" id="pd-int-r" min="1" max="16" step="1" value="4"><output id="pd-int-rv"></output>
+<label for="pd-int-s">Prompt length (tokens)</label><input type="range" id="pd-int-s" min="256" max="8192" step="256" value="2048"><output id="pd-int-sv"></output></div>
+<div class="scroll-x"><svg id="pd-int-svg" viewBox="0 0 760 300" role="img" aria-label="Timelines of two GPUs, colocated and disaggregated, showing prefill and decode steps"></svg></div>
+<div class="pd-leg"><span style="--c:var(--k)">prefill step</span><span style="--c:var(--q)">decode step</span><span style="--c:var(--rule)">idle</span></div>
+<div class="readout" id="pd-int-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> Two H100 GPUs serving Llama 3.1 8B in BF16, either colocated (each GPU does prefill and decode for half of the requests) or disaggregated (one prefill GPU and one decode GPU). Requests arrive evenly spaced, each generates 128 tokens. The timelines show the first 0.6 s. Our cost model: prefill at 50% of the 989 TFLOP/s peak; a decode step reads all weights and the batch’s KV cache at 3.35 TB/s; the KV cache moves to the decode GPU at 50 GB/s.</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Each bar is one step of a GPU. In the colocated rows, the wide orange-red bars are prefills; every decode on that GPU waits for them. Look at the readout: the <b>average</b> TPOT is almost the same in both designs, but the <b>worst gap</b> between two tokens of one user is about 74 ms colocated and about 14 ms disaggregated. In the disaggregated design the worst gap is between the first and the second token: the KV cache must travel (5.4 ms here) and the request then waits for the next decode step to start. Now raise the prompt length to 8,192 at 4 requests/s: the single prefill GPU needs 0.30 s per prompt, which is more than the 0.25 s between arrivals, so its queue grows and TTFT explodes. The colocated design shares the prefill work over both GPUs and survives. Disaggregation needs the right <b>ratio</b> of prefill to decode GPUs; that is the subject of Figure 4.</p></details></figure>
+<aside class="note analogy side"><span class="nt">Analogy</span>A restaurant kitchen has one stove. Some orders are big catering trays (prefill: a lot of work at once), most are small plates that must go out every few minutes (decode). If the same cook does both, every catering tray makes all the small-plate customers wait. Disaggregation gives the trays their own cook. The new problem: you must pick how many cooks of each kind to hire, and carry the half-finished food (the KV cache) from one station to the other.</aside>
+
+<h2>Spreading one model over many GPUs</h2>
+<p>Before we separate the phases, we need the tools to put one copy of the model on several GPUs. Inside a model copy there are two main ways; across copies there is the trivial third one.</p>
+<ul>
+<li><b>Data parallelism (replicas).</b> Copy the whole model to several GPU groups and send each request to one copy. No communication between copies. It adds throughput, not speed per request.</li>
+<li><b>Tensor parallelism (TP).</b> Split every weight matrix over \(t\) GPUs, as in Megatron-LM (<a href="../pretraining/tensor-parallelism-and-sequence-parallelism.html">session 48</a>). Each GPU holds \(1/t\) of every layer and computes \(1/t\) of every matrix multiply. After the attention block and after the MLP block, the partial results are summed with an <b>all-reduce</b> (<a href="../pretraining/collective-communication-all-reduce-reduce-scatter-all.html">session 43</a>): two all-reduces per layer. [Certain]</li>
+<li><b>Pipeline parallelism (PP).</b> Give each of \(p\) GPUs a consecutive group of layers (a <b>stage</b>). A token’s hidden state flows from stage to stage with point-to-point sends. Communication is small, so PP works even over slow links between machines.</li></ul>
+<p>In decode, a step is memory-bound, so its time is about “bytes read divided by memory bandwidth”. TP divides the bytes per GPU by \(t\) and adds communication:</p>
+<div class="eq">\[ t_{\text{step}}^{\text{TP}} \approx \frac{W + B\,c\,\kappa}{t \cdot B_{\text{hbm}}} \;+\; 2L\left(\alpha + \frac{2(t-1)}{t}\cdot\frac{B\,h\,b}{B_{\text{link}}}\right) \tag{137.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(W\)</dt><dd>bytes of all weights (141 GB for Llama 3.1 70B in BF16)</dd>
+<dt>\(B, c\)</dt><dd>number of sequences in the batch, and their average context length (tokens)</dd>
+<dt>\(\kappa\)</dt><dd>KV-cache bytes per token for the whole model (equation 137.6 below; 320 KiB for Llama 3.1 70B)</dd>
+<dt>\(t\)</dt><dd>tensor-parallel degree (number of GPUs that share each layer)</dd>
+<dt>\(B_{\text{hbm}}\)</dt><dd>memory bandwidth of one GPU (3.35 TB/s for an H100 SXM)</dd>
+<dt>\(L, h, b\)</dt><dd>number of layers, hidden size, bytes per number (2 for BF16)</dd>
+<dt>\(\alpha\)</dt><dd>fixed start-up time of one all-reduce (a few microseconds; we assume 10 µs inside a node)</dd>
+<dt>\(B_{\text{link}}\)</dt><dd>bandwidth of the GPU-to-GPU link per direction (about 450 GB/s for H100 NVLink, about 50 GB/s for a 400 Gb/s InfiniBand port)</dd></dl>
+<p>The first term is the useful work. The second term is the price of TP: \(2L = 160\) all-reduces per token for a 70B model. Each one moves only \(B \cdot h \cdot 2\) bytes (16 KB per sequence), so at small batches the start-up time \(\alpha\) dominates: \(160 \times 10\) µs = 1.6 ms per token, whatever the batch. That is fine inside a node with NVLink, and bad across nodes, where \(\alpha\) is larger and the link 9× slower.</p>
+<p>PP has no all-reduce, but it does not make one token faster: the token must pass through all \(p\) stages one after the other. If \(B\) sequences are split into \(p\) micro-batches so that all stages stay busy, each GPU reads its weights once per micro-batch, so for the same \(B\) the weights are read \(p\) times more often than with TP. In the memory-bound regime PP therefore gives about \(p\) times lower throughput than TP for the same number of sequences; it catches up only when the micro-batches are large enough to be compute-bound. Figure 2 lets you check this.</p>
+<figure class="fig wide" id="pd-par"><div class="fig-body">
+<div class="controls"><span class="seg" id="pd-par-c"><button type="button" data-v="2,1" aria-pressed="false">TP2</button><button type="button" data-v="4,1" aria-pressed="false">TP4</button><button type="button" data-v="8,1" aria-pressed="true">TP8</button><button type="button" data-v="1,8" aria-pressed="false">PP8</button><button type="button" data-v="2,4" aria-pressed="false">TP2×PP4</button><button type="button" data-v="8,2" aria-pressed="false">TP8×PP2 (2 nodes)</button><button type="button" data-v="16,1" aria-pressed="false">TP16 (2 nodes)</button></span></div>
+<div class="pd-grid">
+<label for="pd-par-b">Sequences in flight \(B\)</label><input type="range" id="pd-par-b" min="1" max="512" step="1" value="32"><output id="pd-par-bv"></output>
+<label for="pd-par-x">Context per sequence \(c\)</label><input type="range" id="pd-par-x" min="512" max="16384" step="512" value="4096"><output id="pd-par-xv"></output></div>
+<div class="scroll-x"><svg id="pd-par-svg" viewBox="0 0 760 230" role="img" aria-label="GPU layout of the chosen parallel configuration, memory per GPU and time per token"></svg></div>
+<div class="pd-leg"><span style="--c:var(--q)">reading weights and KV (or compute, if larger)</span><span style="--c:var(--k)">all-reduce (TP)</span><span style="--c:var(--v)">stage-to-stage sends (PP)</span></div>
+<div class="readout" id="pd-par-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> Decode of Llama 3.1 70B (BF16) on H100 GPUs with 8 GPUs per node. The time per token follows equation 137.1 for TP; for PP, a token passes \(p\) stages and each stage works on \(B/p\) sequences. Assumptions: 50% of peak FLOPs when compute-bound, 72 GB usable per GPU, all-reduce start-up 10 µs inside a node and 20 µs across nodes, 450 GB/s NVLink and 50 GB/s InfiniBand per GPU.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>The top row shows the GPUs, colored by pipeline stage. The bars show the time per token and its parts. Start with TP8 at \(B = 32\): about 8.8 ms per token, of which 1.9 ms is all-reduce. Click PP8: same 8 GPUs, same memory per GPU, but about 44 ms per token and 5× lower throughput. Click TP2: the weights alone take 70.6 GB of each GPU’s 72, so even a few sequences of 4,096 tokens do not fit (the memory bar turns red); only \(B = 1\) fits. Click TP16 (2 nodes): the all-reduces now cross InfiniBand; at \(B = 256\) they cost more than the useful work, and TP8×PP2 over the same 16 GPUs is much better. This is the usual rule: <b>TP inside a node, PP (or replicas) across nodes</b>. [Likely]</p></details></figure>
+<h3>Parallelism and queueing: the DistServe view of TTFT</h3>
+<p>For prefill there is one more effect: requests wait in a queue. DistServe models a prefill instance as a queue with random (Poisson) arrivals at rate \(R\) and a fixed service time \(D\) per request (an <b>M/D/1 queue</b>). Its average TTFT is the service time plus the average waiting time: [Certain]</p>
+<div class="eq">\[ \overline{\text{TTFT}}_{1} = D + \frac{R D^2}{2(1 - R D)} \tag{137.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(D\)</dt><dd>time to prefill one request on one GPU</dd>
+<dt>\(R\)</dt><dd>arrival rate of requests (per second); the queue is stable only if \(R D \lt 1\)</dd></dl>
+<p>Now give the instance a second GPU. With 2-stage pipeline parallelism (“inter-op” in the paper) each stage needs \(D/2\), a request still needs \(D\) in total, but two requests can be in flight. With 2-way tensor parallelism (“intra-op”) one request takes \(D/K\), where \(1 \lt K \lt 2\) is the real speed-up (communication makes it less than 2). DistServe derives: [Certain]</p>
+<div class="eq">\[ \overline{\text{TTFT}}_{\text{inter}} = D + \frac{R D^2}{4(2 - R D)}, \qquad \overline{\text{TTFT}}_{\text{intra}} = \frac{D}{K} + \frac{R D^2}{2K(K - R D)} \tag{137.3} \]</div>
+<p>At low load, waiting is small, and TP wins because it shortens \(D\). At high load, waiting dominates, and PP wins because it can accept up to \(2/D\) requests per second while TP accepts only \(K/D\). The best choice depends on the traffic, not only on the model. Figure 3 draws the three curves.</p>
+<figure class="fig" id="pd-q"><div class="fig-body">
+<div class="pd-grid">
+<label for="pd-q-d">Prefill time \(D\) (ms)</label><input type="range" id="pd-q-d" min="20" max="500" step="10" value="100"><output id="pd-q-dv"></output>
+<label for="pd-q-k">TP speed-up \(K\)</label><input type="range" id="pd-q-k" min="1.1" max="1.95" step="0.05" value="1.6"><output id="pd-q-kv"></output>
+<label for="pd-q-r">Arrival rate \(R\) (req/s)</label><input type="range" id="pd-q-r" min="0.5" max="19.5" step="0.5" value="8"><output id="pd-q-rv"></output></div>
+<svg id="pd-q-svg" viewBox="0 0 640 290" role="img" aria-label="Average TTFT against arrival rate for one GPU, two GPUs with pipeline parallelism and two GPUs with tensor parallelism"></svg>
+<div class="pd-leg"><span style="--c:var(--muted)">1 GPU (137.2)</span><span style="--c:var(--v)">2 GPUs, pipeline (inter-op)</span><span style="--c:var(--q)">2 GPUs, tensor (intra-op)</span></div>
+<div class="readout" id="pd-q-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Average TTFT of one prefill instance as a function of the arrival rate, from DistServe’s queueing formulas 137.2 and 137.3. Each curve goes to infinity at its capacity: \(1/D\), \(K/D\) and \(2/D\).</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>With \(D = 100\) ms and \(K = 1.6\): at \(R = 2\) req/s, TP gives 67 ms and PP 103 ms, so TP wins. At \(R = 8\), TP gives 94 ms and PP 117 ms. Move \(R\) up: the TP curve shoots up near \(K/D = 16\) req/s while PP survives until 20. The crossing point moves left when \(K\) is small (poor TP scaling). Real arrivals are bursty, so real queues are worse than M/D/1, but the shape is the same.</p></details></figure>
+
+<h2>Disaggregation: prefill GPUs and decode GPUs</h2>
+<p>In a <b>colocated</b> system (vLLM’s default, for example), every GPU group runs both phases. In a <b>disaggregated</b> system there are two pools. A request first goes to a <b>prefill instance</b>, which computes the prompt’s KV cache and the first token. Then the KV cache is sent to a <b>decode instance</b>, which generates the rest. Each pool can use its own parallelism, batch size and even its own GPU type.</p>
+<div class="algo"><div class="algo-h">Algorithm 1: the life of a request with PD disaggregation</div><ol>
+<li><b>input:</b> a request (prompt of \(s\) tokens, output limit); a prefill pool and a decode pool</li>
+<li>router picks a prefill instance <span class="c">// least loaded, or the one with the longest cached prefix</span></li>
+<li>router (or the prefill instance) picks a decode instance and <b>reserves KV memory</b> for \(s\) + expected output tokens</li>
+<li>prefill instance runs the prompt; after each layer \(\ell\), it starts sending that layer’s KV blocks to the decode instance <span class="c">// layer-wise transfer, overlapped with layer \(\ell+1\)</span></li>
+<li>prefill instance samples the first token and streams it to the user <span class="c">// TTFT ends here</span></li>
+<li>when all KV blocks have arrived, the decode instance adds the request to its running batch</li>
+<li>decode instance generates tokens until end-of-sequence; frees the KV blocks <span class="c">// TPOT is set here only</span></li></ol></div>
+<p>Two properties make this attractive. First, no interference: a decode step never waits for a prefill. Second, <b>independent tuning</b>: you can give prefill high TP to cut TTFT and give decode a big batch to raise throughput. The vLLM documentation lists exactly these two benefits and adds a warning: “Disaggregated prefill DOES NOT improve throughput.” [Certain] The gain is in meeting latency targets, and that needs a better metric than raw throughput.</p>
+<h3>Goodput</h3>
+<p>A service has a <b>service-level objective (SLO)</b>, for example “TTFT under 0.25 s and TPOT under 0.1 s for 90% of requests”. DistServe defines <b>per-GPU goodput</b> as “the maximum request rate that can be served adhering to the SLO attainment goal (say, 90%) for each GPU provisioned”. [Certain] Throughput counts every finished request; goodput counts only requests served fast enough, divided by the number of GPUs.</p>
+<p>With \(n_P\) prefill instances that can each serve \(r_P\) requests/s within the TTFT target, and \(n_D\) decode instances that can each serve \(r_D\) within the TPOT target, the system serves</p>
+<div class="eq">\[ \text{goodput per GPU} = \frac{\min(n_P\, r_P,\; n_D\, r_D)}{n_P\, g_P + n_D\, g_D}, \qquad \text{best ratio: } \frac{n_P}{n_D} \approx \frac{r_D}{r_P} \tag{137.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(r_P, r_D\)</dt><dd>goodput of one prefill instance and one decode instance (requests/s that meet their own SLO)</dd>
+<dt>\(g_P, g_D\)</dt><dd>GPUs per prefill instance and per decode instance</dd>
+<dt>\(\min\)</dt><dd>the slower pool sets the rate: requests cannot leave decode faster than they enter it</dd></dl>
+<div class="worked"><div class="wt">Worked example: the DistServe motivating case</div>
+<p>DistServe’s first experiment: a 13B model on one A100 80 GB, prompts of 512 tokens, 64 output tokens. A colocated GPU meets the SLOs up to about 1.6 requests/s. A GPU that only prefills reaches 5.6 requests/s; a GPU that only decodes reaches 10. [Certain]</p>
+<p>With 2 prefill GPUs and 1 decode GPU: \(\min(2 \times 5.6,\ 1 \times 10) = \min(11.2,\ 10) = 10\) requests/s on 3 GPUs, which is 3.33 requests/s per GPU, or \(3.33 / 1.6 = 2.1\times\) the colocated system. The ratio rule gives \(n_P / n_D \approx 10 / 5.6 = 1.8\), and 2:1 is the closest small integer ratio.</p></div>
+<figure class="fig" id="pd-ratio"><div class="fig-body">
+<div class="pd-grid">
+<label for="pd-ratio-np">Prefill GPUs \(n_P\)</label><input type="range" id="pd-ratio-np" min="1" max="8" step="1" value="2"><output id="pd-ratio-npv"></output>
+<label for="pd-ratio-nd">Decode GPUs \(n_D\)</label><input type="range" id="pd-ratio-nd" min="1" max="8" step="1" value="1"><output id="pd-ratio-ndv"></output>
+<label for="pd-ratio-rp">\(r_P\) per prefill GPU</label><input type="range" id="pd-ratio-rp" min="0.5" max="20" step="0.1" value="5.6"><output id="pd-ratio-rpv"></output>
+<label for="pd-ratio-rd">\(r_D\) per decode GPU</label><input type="range" id="pd-ratio-rd" min="0.5" max="30" step="0.1" value="10"><output id="pd-ratio-rdv"></output>
+<label for="pd-ratio-co">Colocated, per GPU</label><input type="range" id="pd-ratio-co" min="0.2" max="10" step="0.1" value="1.6"><output id="pd-ratio-cov"></output></div>
+<svg id="pd-ratio-svg" viewBox="0 0 640 210" role="img" aria-label="Capacity of the prefill pool and the decode pool and the resulting goodput per GPU"></svg>
+<div class="readout" id="pd-ratio-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> Choosing the prefill-to-decode ratio with equation 137.4. The defaults are DistServe’s measured single-GPU rates for a 13B model (512-token prompts, 64 output tokens). The slower pool is the bottleneck; the other pool’s extra capacity is wasted.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The two upper bars are the capacities of the two pools; the shorter one, outlined, sets the system rate. The lower bars compare goodput per GPU with the colocated system. With 2 prefill and 1 decode GPU you get 3.33 per GPU. Try 1:1: the prefill pool (5.6) limits, 2.8 per GPU. Try 3:1: decode limits at 10, 2.5 per GPU. With more GPUs you can get closer to the ideal ratio 1.79: the readout finds 7:4 (ratio 1.75), with 3.56 per GPU. Now model a workload with long prompts: lower \(r_P\) to 2. The best ratio moves to 5:1. Workloads change during the day, which is why Splitwise keeps a flexible mixed pool and TetriInfer can flip an instance between roles.</p></details></figure>
+
+<h3>Splitwise: cheaper GPUs for decode</h3>
+<p>Splitwise (Patel et al., 2023) starts from a hardware observation: decode does not need the newest GPU. Its Table I compares one DGX-A100 and one DGX-H100 machine (8 GPUs each): the H100 machine has 3.43× the compute but only 1.64× the memory bandwidth, the same 80 GB per GPU, 1.75× the power and 2.16× the cost per hour ($38 versus $17.6). [Certain] Decode is memory-bound, so it gains only the 1.64×, at 2.16× the price.</p>
+<p>Splitwise keeps three pools: a <b>prompt pool</b>, a <b>token pool</b>, and a <b>mixed pool</b> that grows and shrinks with load and runs normal mixed batching when one of the queues gets long. [Certain] It studies four cluster designs: Splitwise-AA (A100 for both phases), Splitwise-HH (H100 for both), Splitwise-HA (H100 for prompts, A100 for tokens), and Splitwise-HHcap (H100 for both, with the token machines power-capped). [Certain] The KV cache moves over InfiniBand with MSCCL++ one-sided writes; small prompts are sent after prefill, large ones layer by layer during prefill. [Certain] Its headline result: 1.4× higher throughput at 20% lower cost, or 2.35× more throughput at the same cost and power budget, compared with current designs. [Certain]</p>
+<h3>DistServe: search for the best placement</h3>
+<p>DistServe (Zhong et al., OSDI 2024) treats disaggregation as an optimization problem: for a given model, workload and SLO, choose the parallelism of each phase (TP and PP degrees), the number of instances of each, and where to put them in the cluster, to maximize per-GPU goodput. [Certain]</p>
+<div class="algo"><div class="algo-h">Algorithm 2: DistServe placement for clusters with fast cross-node links (after Zhong et al., Algorithm 1)</div><ol>
+<li><b>input:</b> model, GPUs per node, SLOs, a sample of the workload, the target request rate \(\lambda\)</li>
+<li><b>for</b> each prefill config (intra-op degree, inter-op degree) that fits in memory <b>do</b></li>
+<li>&nbsp;&nbsp;simulate the workload and binary-search the highest rate that meets the TTFT SLO; divide by its GPUs <span class="c">// per-GPU goodput of this config</span></li>
+<li><b>for</b> each decode config <b>do</b> the same with the TPOT SLO</li>
+<li>keep the best prefill config and the best decode config <span class="c">// they are chosen independently</span></li>
+<li>replicate each until its pool can carry \(\lambda\): \(n_P = \lceil \lambda / r_P \rceil\), \(n_D = \lceil \lambda / r_D \rceil\)</li></ol></div>
+<p>The search is cheap: under 1.3 minutes in the largest setting of the paper. [Certain] A second algorithm handles clusters with <b>slow</b> links between nodes (25 Gbps in their testbed): it forces the prefill and decode parts of the same pipeline stage onto the same node, so that the KV cache moves over NVLink instead of the network. [Certain] We will see why in the KV-transfer section. DistServe reports that it can serve 7.4× more requests, or meet 12.6× tighter SLOs, than vLLM and DeepSpeed-MII while keeping more than 90% of requests within the latency limits, on OPT-13B to OPT-175B with chatbot, code-completion and summarization workloads. [Certain]</p>
+<h3>TetriInfer: chunks, predicted lengths and flipping roles</h3>
+<p>TetriInfer (Hu et al., 2024) adds three ideas to disaggregation. [Certain]</p>
+<ul>
+<li><b>Fixed-size chunked prefill.</b> Prompts are cut and merged into chunks of exactly ChunkSize tokens (512 for OPT-13B on their V100 testbed), padding the last chunk, so each prefill step keeps the accelerator just at its saturation point.</li>
+<li><b>A length predictor and two-level scheduling.</b> A small model (OPT-125M, fine-tuned as a classifier) predicts the output length of each request in buckets of 200 tokens, with 74.9% accuracy. A global scheduler sends prompts to the least-loaded prefill instance; the prefill side then picks a decode instance with power-of-two random choice among those with enough predicted free memory, so heavy decodes do not pile up on one instance.</li>
+<li><b>Instance flip.</b> Prefill and decode are only roles. An idle instance can switch roles in about 5 to 7 ms (plus draining time), with no model reload.</li></ul>
+<p>The abstract reports up to 97% lower average TTFT, 47% lower average job completion time and 38% fewer resources than vLLM. These are the best case, a workload with light prefills and heavy decodes; for a mixed workload the paper reports 85%, 50% and 21%, and for heavy prefills with heavy decodes vLLM was 14% better in performance per dollar. [Certain] The prototype emulates the network transfer time instead of moving data over a real link. [Certain] So read TetriInfer as a study of scheduling, not of KV transport.</p>
+<h3>In production: Mooncake and DeepSeek-V3</h3>
+<p><b>Mooncake</b> (Moonshot AI) is the serving platform of the Kimi chatbot. It separates prefill and decode clusters and uses the spare CPU memory and SSDs of the GPU servers as a large distributed KV-cache store, with a scheduler built around where KV caches already are, and early rejection of requests when overloaded. It reports that real Kimi traffic got 75% more requests served. [Certain] <b>DeepSeek-V3</b> runs prefill on units of 4 nodes (32 GPUs: attention with TP4 and sequence parallelism plus 8-way data parallelism, experts with 32-way expert parallelism) and decode on units of 40 nodes (320 GPUs, 320-way expert parallelism). [Certain] For a mixture-of-experts model the two phases want very different expert layouts, which is another reason to separate them (<a href="../inference/efficient-ffn-3-moe-from-dense-models.html">session 96</a>).</p>
+
+<h2>Moving the KV cache</h2>
+<p>Disaggregation has a price that colocation does not have: the KV cache of every prompt must cross from the prefill GPUs to the decode GPUs. How large is it? Per token, every layer stores one key and one value vector per KV head (<a href="../inference/the-kv-cache.html">session 80</a>):</p>
+<div class="eq">\[ \kappa = 2 \cdot L \cdot n_{\text{kv}} \cdot d_h \cdot b \ \ \text{bytes per token}, \qquad M_{\text{KV}} = s \cdot \kappa \tag{137.5} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(2\)</dt><dd>one key and one value</dd>
+<dt>\(L, n_{\text{kv}}, d_h\)</dt><dd>layers, KV heads, head dimension</dd>
+<dt>\(b\)</dt><dd>bytes per number: 2 for BF16, 1 for FP8</dd>
+<dt>\(s\)</dt><dd>prompt length in tokens; \(M_{\text{KV}}\) is the bytes to move for one request</dd></dl>
+<div class="tblw"><table class="tb"><thead><tr><th>Model (attention type)</th><th>\(L\), KV heads × dim</th><th>\(\kappa\) in BF16</th><th>4,096-token prompt</th></tr></thead><tbody>
+<tr><td>Llama 3.1 8B (GQA)</td><td>32, 8 × 128</td><td>128 KiB</td><td>0.54 GB</td></tr>
+<tr><td>Llama 3.1 70B (GQA)</td><td>80, 8 × 128</td><td>320 KiB</td><td>1.34 GB</td></tr>
+<tr><td>OPT-66B (MHA)</td><td>64, 72 × 128</td><td>2.25 MiB</td><td>9.66 GB</td></tr>
+<tr><td>DeepSeek-V3 (MLA, 512 + 64 per layer)</td><td>61, one 576-wide latent</td><td>68.6 KiB</td><td>0.29 GB</td></tr></tbody></table></div>
+<p>The configurations are from the models’ config files. DistServe gives the same kind of number for OPT-66B: a 512-token request has about 1.13 GB of KV cache (we get \(512 \times 2.25\) MiB = 1.125 GiB), so 10 requests/s need about 11.3 GB/s, roughly 90 Gbps, of bandwidth between the pools. [Certain] Grouped-query attention, MLA (<a href="../transformers/attention-variants-1-mha-mqa-gqa-mla.html">session 26</a>) and KV quantization (<a href="../inference/kv-cache-quantization-kivi-and-kvquant.html">session 110</a>) shrink this a lot.</p>
+<p>The time to move it is \(t_x = M_{\text{KV}} / B_{\text{net}}\). The useful comparison is with the prefill time \(t_p\). Ignoring the attention part of prefill FLOPs, both grow linearly with \(s\), so their ratio does not depend on the prompt length:</p>
+<div class="eq">\[ \frac{t_x}{t_p} \approx \frac{s\,\kappa / B_{\text{net}}}{2 N s / F_{\text{eff}}} = \frac{\kappa\, F_{\text{eff}}}{2 N\, B_{\text{net}}} \tag{137.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(B_{\text{net}}\)</dt><dd>total bandwidth between the prefill instance and the decode instance</dd>
+<dt>\(N\)</dt><dd>number of weights; prefill does about \(2N\) FLOPs per prompt token</dd>
+<dt>\(F_{\text{eff}}\)</dt><dd>FLOP/s that the prefill instance really achieves (all its GPUs together)</dd></dl>
+<p>For Llama 3.1 70B on 8 H100s at 50% of peak (\(F_{\text{eff}} = 3.96 \times 10^{15}\)) and 8 × 400 Gb/s InfiniBand (\(B_{\text{net}} = 400\) GB/s), one prompt token takes 35.7 µs of prefill and 0.82 µs of transfer: the transfer is about 2.3% of the prefill. A faster GPU makes the ratio worse (larger \(F_{\text{eff}}\)); a bigger model with GQA makes it better (larger \(N\), same \(\kappa\)).</p>
+<h3>Hide the transfer behind the prefill</h3>
+<p>The KV cache of layer \(\ell\) is final as soon as layer \(\ell\) finishes. So the prefill instance can send layer \(\ell\) while it computes layer \(\ell + 1\). Splitwise calls this <b>layer-wise</b> transfer, versus <b>serialized</b> transfer after the whole prefill. [Certain] If each layer takes \(t_p / L\) to compute and \(t_x / L\) to send, and the link sends one layer at a time, the delay added after the prefill ends is</p>
+<div class="eq">\[ \Delta_{\text{serial}} = t_x, \qquad \Delta_{\text{layer}} = \max\!\left( \frac{t_x}{L},\ \ t_x - \frac{L-1}{L}\, t_p \right) \tag{137.7} \]</div>
+<p>When \(t_x \le t_p\), only the last layer’s transfer remains: the delay shrinks by a factor \(L\). When the link is too slow (\(t_x \gt t_p\)), the transfer cannot keep up and most of it shows. Splitwise measured an added end-to-end latency of 0.8% with its layer-wise scheme (up to 3% with serialized transfer for large prompts), and DistServe found the transfer below 0.1% of total latency for OPT-175B, with 95% of transfers under 30 ms. [Certain]</p>
+<div class="worked"><div class="wt">Worked example: Llama 3.1 70B, a 4,096-token prompt</div>
+<p>KV cache: \(4096 \times 327{,}680 = 1.34\) GB. Prefill on 8 H100s at 50% of peak: \((2 \times 70.55 \times 10^9 \times 4096 + 2 \times 80 \times 4096^2 \times 8192) / 3.96 \times 10^{15} = 0.152\) s.</p>
+<p>Over 400 GB/s (8 InfiniBand ports): \(t_x = 3.36\) ms, 2.2% of the prefill. Layer-wise, the added delay is \(3.36 / 80 = 0.042\) ms. Over one 400 Gb/s port (50 GB/s): \(t_x = 26.8\) ms serialized, 0.34 ms layer-wise. Over a 25 Gb/s network (3.125 GB/s, the cross-node speed of the DistServe testbed): \(t_x = 429\) ms, more than the whole prefill; even layer-wise, \(429 - 0.9875 \times 152 = 280\) ms is added. That is why DistServe’s second algorithm keeps the KV transfer inside a node on such clusters.</p></div>
+<figure class="fig wide" id="pd-kv"><div class="fig-body">
+<div class="controls"><span class="seg" id="pd-kv-m"><button type="button" data-v="8b" aria-pressed="false">Llama 3.1 8B (1 GPU)</button><button type="button" data-v="70b" aria-pressed="true">Llama 3.1 70B (8 GPUs)</button><button type="button" data-v="opt" aria-pressed="false">OPT-66B, MHA (8 GPUs)</button></span>
+<span class="seg" id="pd-kv-t"><button type="button" data-v="2" aria-pressed="true">KV in BF16</button><button type="button" data-v="1" aria-pressed="false">KV in FP8</button></span>
+<span class="seg" id="pd-kv-o"><button type="button" data-v="layer" aria-pressed="true">Layer-wise</button><button type="button" data-v="serial" aria-pressed="false">Serialized</button></span></div>
+<div class="controls"><span class="seg" id="pd-kv-l"><button type="button" data-v="1800" aria-pressed="false">NVLink, same node (1,800 GB/s)</button><button type="button" data-v="400" aria-pressed="true">8 × 400 Gb/s IB (400 GB/s)</button><button type="button" data-v="50" aria-pressed="false">1 × 400 Gb/s (50 GB/s)</button><button type="button" data-v="12.5" aria-pressed="false">100 Gb/s Ethernet</button><button type="button" data-v="3.125" aria-pressed="false">25 Gb/s</button></span></div>
+<div class="pd-grid">
+<label for="pd-kv-s">Prompt length \(s\)</label><input type="range" id="pd-kv-s" min="256" max="32768" step="256" value="4096"><output id="pd-kv-sv"></output></div>
+<div class="scroll-x"><svg id="pd-kv-svg" viewBox="0 0 760 200" role="img" aria-label="Timeline of prefill layers and KV transfer of each layer"></svg></div>
+<div class="pd-leg"><span style="--c:var(--k)">prefill, one block per layer</span><span style="--c:var(--v)">KV transfer of a layer</span><span style="--c:var(--bad)">delay added after prefill</span></div>
+<div class="readout" id="pd-kv-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Prefill and KV-cache transfer on a time axis, from equations 137.5 to 137.7. The prefill instance has 1 GPU for 8B and 8 GPUs for the other models, at 50% of the H100’s BF16 peak. The 1,800 GB/s option assumes 4 GPU pairs in one node, each pair on 450 GB/s NVLink.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>The top row is the prefill, one block per layer. The row below shows when each layer’s KV is on the wire. In layer-wise mode each transfer starts when its layer is done, so with a fast link the transfers finish just after the prefill. Switch to 25 Gb/s: the transfers fall behind and pile up after the prefill (red). Switch to OPT-66B: multi-head attention makes the KV cache 7× larger than Llama 3.1 70B’s, so even 50 GB/s is not enough to hide it. FP8 halves every transfer. Change \(s\): the ratio \(t_x / t_p\) barely moves at first (equation 137.6) and then falls slowly, because attention FLOPs grow like \(s^2\).</p></details></figure>
+<h3>Practical details of KV transport</h3>
+<ul>
+<li><b>Paged layout.</b> Serving engines store the KV cache in fixed-size blocks scattered in memory (<a href="../inference/memory-management-pagedattention-prefix-caching-radixattention.html">session 134</a>). The transfer must gather many small blocks, so engines use RDMA (direct GPU-to-GPU writes over InfiniBand or RoCE, without the CPU) and batch the blocks. vLLM moves KV with pluggable “connectors”, for example NixlConnector and MooncakeConnector. [Certain]</li>
+<li><b>Different parallelism on each side.</b> If prefill uses TP8 and decode TP4, each decode GPU must receive the KV heads of two prefill GPUs. The mapping of heads to GPUs must be planned. [Likely]</li>
+<li><b>Admission control.</b> The decode instance must have free memory for the incoming KV cache and the future tokens before the transfer starts (step 3 of Algorithm 1); otherwise the request waits on the prefill side, holding memory there. [Likely]</li>
+<li><b>Prefix caching across the cluster.</b> If the KV cache of a common prefix (a system prompt, a long document) already sits on some machine, routing the request there skips part of the prefill. Mooncake and Dynamo route by KV-cache overlap for this reason. [Certain]</li></ul>
+<aside class="note watch side"><span class="nt">Watch out</span>The ratio in equation 137.6 is per token, so “KV transfer is cheap” is true only with a fast network and a GQA or MLA model. An old MHA model on 25 Gbps Ethernet, or very fast prefill hardware with a slow network, can make the transfer the bottleneck.</aside>
+
+<h2>Serving on cheap spot instances: SpotServe</h2>
+<p>Clouds rent out spare GPUs as <b>spot</b> (or preemptible) instances at up to 90% below the on-demand price. The catch: the provider can take an instance back at any time, after a short <b>grace period</b> (SpotServe uses 30 seconds; AWS documents a two-minute notice). [Certain for the paper; Likely for the AWS detail] For training, a preemption costs a restart from the last checkpoint (<a href="../pretraining/distributed-checkpoints-fault-tolerance-and-mfu.html">session 51</a>). For serving, it is harder: requests are running right now, and the model may be split over the instance that disappears.</p>
+<p>SpotServe (Miao et al., 2023) handles this with three parts. [Certain]</p>
+<ul>
+<li><b>Parallelization controller.</b> When instances are lost or gained, or the request rate changes, it picks a new configuration \(C = (D, P, M, B)\): data-parallel degree, pipeline degree, tensor degree and maximum batch size. It minimizes the request latency subject to throughput at least the expected arrival rate; if no configuration can keep up, it maximizes throughput; ties go to fewer instances.</li>
+<li><b>Device mapper.</b> A new configuration has “positions” (which pipeline stage, which tensor slice). Which surviving instance should take which position? The one that already holds most of the needed weights and KV cache. This is a <b>bipartite matching</b> problem, solved with the Kuhn–Munkres (Hungarian) algorithm.</li>
+<li><b>Migration planner and stateful recovery.</b> It moves the missing weights and KV cache, front layers first, so the pipeline can restart early. Progress is committed per <b>token</b>, not per request, so an interrupted request continues from its last generated token instead of starting over. During the grace period, a just-in-time rule decides how many more decode steps to run before migrating.</li></ul>
+<p>Formally, with surviving instances \(i\) and new positions \(j\), let \(u_{ij}\) be the bytes of weights and KV cache that instance \(i\) already has for position \(j\). The device mapper solves</p>
+<div class="eq">\[ \pi^\star = \argmax_{\pi \text{ one-to-one}} \sum_{i} u_{i,\pi(i)}, \qquad \text{bytes to move} = \sum_j \text{need}_j - \sum_i u_{i,\pi^\star(i)} \tag{137.8} \]</div>
+<p>and the just-in-time rule for a preemption runs the largest number of decode steps \(S\) that still leaves time to migrate:</p>
+<div class="eq">\[ S = \left\lfloor \frac{T_{\text{grace}} - T_{\text{mig}}}{t_{\text{step}}} \right\rfloor \tag{137.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\pi\)</dt><dd>an assignment of instances to positions (each position gets at most one instance)</dd>
+<dt>\(u_{ij}\)</dt><dd>reusable bytes if instance \(i\) takes position \(j\) (layers it already holds that the position needs)</dd>
+<dt>\(T_{\text{grace}}, T_{\text{mig}}, t_{\text{step}}\)</dt><dd>grace period, estimated migration time, time of one decode step</dd></dl>
+<div class="algo"><div class="algo-h">Algorithm 3: what SpotServe does on a preemption notice</div><ol>
+<li><b>input:</b> current config, the instance that will be preempted, \(T_{\text{grace}}\)</li>
+<li>controller: choose the new config \((D, P, M, B)\) for the surviving instances <span class="c">// latency model + arrival-rate estimate</span></li>
+<li>device mapper: build the reuse matrix \(u_{ij}\) and solve the matching (137.8) with Kuhn–Munkres <span class="c">// \(O(n^3)\)</span></li>
+<li>estimate \(T_{\text{mig}}\) from the bytes to move; keep decoding for \(S\) steps (137.9) <span class="c">// tokens are committed one by one</span></li>
+<li>migrate weights and KV cache, front layers first; switch to the new config</li>
+<li>resume every interrupted request from its last committed token</li></ol></div>
+<p>The paper evaluates OPT-6.7B, GPT-20B and LLaMA-30B on AWS g4dn.12xlarge instances (4 T4 GPUs each) with a real 12-hour spot availability trace. It reports 2.4× to 9.1× lower P99 latency than the best existing baselines, and 54% lower cost than using only on-demand instances. [Certain] Figure 6 shows the device-mapping step on a small example.</p>
+<figure class="fig" id="pd-spot"><div class="fig-body">
+<div class="controls"><span class="seg" id="pd-spot-p"><button type="button" data-v="3" aria-pressed="true">New config: 1 pipeline × 3 stages</button><button type="button" data-v="2" aria-pressed="false">New config: 1 pipeline × 2 stages (+1 idle)</button></span></div>
+<div class="scroll-x"><svg id="pd-spot-svg" viewBox="0 0 640 230" role="img" aria-label="Four spot instances with their layers; click one to preempt it"></svg></div>
+<div class="tblw"><table class="tb pd-tbl" id="pd-spot-tbl"></table></div>
+<div class="readout" id="pd-spot-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 6.</b> Device mapping after a preemption. A 48-layer model (40 GB in FP16, 0.83 GB per layer) runs on 4 instances as 2 pipelines × 2 stages of 24 layers. Click an instance to preempt it. The table lists every assignment of the 3 survivors to the new positions; the matching of equation 137.8 picks the one with the most reused layers. Assumption: missing layers load at 6.25 GB/s (a 50 Gb/s network).</figcaption>
+<details class="howto"><summary>How to read Figure 6</summary><p>Each box is an instance (4 GPUs) with the layers it holds. Preempt instance #1 (pipeline A, layers 0–23). With 3 stages of 16 layers, the naive rule “survivors in id order take stages in order” (dotted row) puts #2, which holds layers 24–47, on stage 0 (layers 0–15): it must load everything. Naive reuses 24 layers and must load 24 (20 GB, 3.2 s). The best matching reuses 40 and loads only 8 (6.7 GB, 1.07 s), leaving more of the 30 s grace period for decoding. Preempt #2 instead: here the naive order happens to be optimal. Switch to 2 stages: no weights need to move at all, but one instance is idle; the controller weighs this against the latency of each config.</p></details></figure>
+
+<h2>PyTorch: hand the KV cache from a prefill worker to a decode worker</h2>
+<p>The code below builds a small GQA transformer and runs generation twice. First colocated: one model does prefill and decode. Then disaggregated: a “prefill worker” runs the prompt and pushes each layer’s KV cache through a hook as soon as that layer finishes (layer-wise transfer, as in Algorithm 1); a separate “decode worker” with its own copy of the weights receives the KV cache and continues. With the same sampling seed, both give exactly the same tokens, and the bytes sent match equation 137.5. Everything runs on the CPU and is deterministic.</p>
+<pre class="code"><span class="kw2">import</span> torch, torch.nn.functional <span class="kw2">as</span> F
+torch.manual_seed(0)
+V, d, L, nh, nkv = 1000, 256, 4, 8, 2                 <span class="cm"># vocab, width, layers, query heads, KV heads (GQA)</span>
+hd = d // nh
+
+<span class="kw2">class</span> Layer(torch.nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__()
+        s.q = torch.nn.Linear(d, nh * hd, bias=<span class="kw2">False</span>); s.kv = torch.nn.Linear(d, 2 * nkv * hd, bias=<span class="kw2">False</span>)
+        s.o = torch.nn.Linear(d, d, bias=<span class="kw2">False</span>); s.ff = torch.nn.Sequential(torch.nn.Linear(d, 4 * d), torch.nn.GELU(), torch.nn.Linear(4 * d, d))
+        s.n1, s.n2 = torch.nn.LayerNorm(d), torch.nn.LayerNorm(d)
+    <span class="kw2">def</span> forward(s, x, cache):                         <span class="cm"># x: (T, d); cache: dict with "k", "v" of shape (nkv, t, hd)</span>
+        T, h = x.shape[0], s.n1(x)
+        q = s.q(h).view(T, nh, hd).transpose(0, 1)
+        k, v = s.kv(h).view(T, 2, nkv, hd).permute(1, 2, 0, 3)
+        <span class="kw2">if</span> "k" <span class="kw2">in</span> cache: k, v = torch.cat([cache["k"], k], 1), torch.cat([cache["v"], v], 1)
+        cache["k"], cache["v"] = k, v
+        k, v = k.repeat_interleave(nh // nkv, 0), v.repeat_interleave(nh // nkv, 0)
+        a = F.scaled_dot_product_attention(q, k, v, is_causal=(T > 1))   <span class="cm"># causal only in prefill</span>
+        x = x + s.o(a.transpose(0, 1).reshape(T, d))
+        <span class="kw2">return</span> x + s.ff(s.n2(x))
+
+<span class="kw2">class</span> Model(torch.nn.Module):
+    <span class="kw2">def</span> __init__(s):
+        super().__init__(); s.emb = torch.nn.Embedding(V, d); s.layers = torch.nn.ModuleList(Layer() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L))
+        s.nf, s.head = torch.nn.LayerNorm(d), torch.nn.Linear(d, V, bias=<span class="kw2">False</span>)
+    <span class="kw2">def</span> forward(s, ids, caches, on_layer_done=<span class="kw2">None</span>):
+        x = s.emb(ids)
+        <span class="kw2">for</span> i, layer <span class="kw2">in</span> enumerate(s.layers):
+            x = layer(x, caches[i])
+            <span class="kw2">if</span> on_layer_done: on_layer_done(i, caches[i])  <span class="cm"># hook: push this layer's KV as soon as it exists</span>
+        <span class="kw2">return</span> s.head(s.nf(x[-1]))                         <span class="cm"># logits of the last position</span>
+
+model = Model().eval()
+prompt = torch.randint(0, V, (300,))
+
+<span class="kw2">def</span> sample(logits, g):                                  <span class="cm"># same seed on both paths, so same draws</span>
+    <span class="kw2">return</span> torch.multinomial(F.softmax(logits, -1), 1, generator=g)[0]
+
+@torch.no_grad()
+<span class="kw2">def</span> colocated(n_new):                                   <span class="cm"># one GPU does prefill and decode</span>
+    g = torch.Generator().manual_seed(1)
+    caches = [dict() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)]; out = []; tok = sample(model(prompt, caches), g)
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(n_new):
+        out.append(tok.item()); tok = sample(model(tok.view(1), caches), g)
+    <span class="kw2">return</span> out
+
+@torch.no_grad()
+<span class="kw2">def</span> disaggregated(n_new):
+    prefill_worker = model                              <span class="cm"># in real life: another GPU with its own weight copy</span>
+    decode_worker = Model().eval(); decode_worker.load_state_dict(model.state_dict())
+    link = []                                           <span class="cm"># stands in for NVLink / RDMA; we count the bytes</span>
+    <span class="kw2">def</span> send(i, c):                                     <span class="cm"># layer-wise transfer (Splitwise, DistServe)</span>
+        link.append((i, c["k"].clone(), c["v"].clone()))
+    g = torch.Generator().manual_seed(1)
+    first = sample(prefill_worker(prompt, [dict() <span class="kw2">for</span> _ <span class="kw2">in</span> range(L)], on_layer_done=send), g)
+    sent = sum(k.numel() * k.element_size() + v.numel() * v.element_size() <span class="kw2">for</span> _, k, v <span class="kw2">in</span> link)
+    caches = [dict(k=k, v=v) <span class="kw2">for</span> _, k, v <span class="kw2">in</span> sorted(link, key=<span class="kw2">lambda</span> t: t[0])]   <span class="cm"># decode side receives</span>
+    out, tok = [], first
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(n_new):
+        out.append(tok.item()); tok = sample(decode_worker(tok.view(1), caches), g)
+    <span class="kw2">return</span> out, sent
+
+a = colocated(20)
+b, sent = disaggregated(20)
+print("same tokens:", a == b)
+print("first tokens:", a[:8])
+formula = 2 * L * nkv * hd * 4 * len(prompt)            <span class="cm"># 2 (K and V) x layers x KV heads x head dim x 4 bytes (FP32) x tokens</span>
+print(f"KV bytes sent: {sent:,}  formula: {formula:,}  per token: {sent // len(prompt):,}")</pre>
+<p>Output (PyTorch 2.8 on CPU):</p>
+<pre class="code">same tokens: True
+first tokens: [510, 164, 118, 375, 325, 2, 297, 923]
+KV bytes sent: 614,400  formula: 614,400  per token: 2,048</pre>
+<p>Read it like this. The KV cache is the <b>complete state</b> of a request after prefill: with it and the weights, any GPU can continue the generation and get the same result. That is why disaggregation and migration (SpotServe) work at all. The per-token size, 2,048 bytes here, is \(2 \times 4 \times 2 \times 32 \times 4\) (FP32), equation 137.5. In a real system the <code>send</code> hook becomes an RDMA write of paged KV blocks, and the decode side must not start until the last layer has arrived.</p>
+<p>A planner in the style of DistServe’s Algorithm 2, in plain Python. It uses our cost model (not the paper’s simulator) for Llama 3.1 70B on H100s, the M/D/1 formula 137.2 for TTFT, and a memory-bound decode step for TPOT. It finds the goodput of each TP degree for each phase, then the best pair and the ratio of instances (equation 137.4):</p>
+<pre class="code"><span class="kw2">import</span> math
+P, L, d, KV_TOK = 70.55e9, 80, 8192, 327_680        <span class="cm"># Llama 3.1 70B, BF16 KV bytes per token</span>
+FLOPS, HBM, MEM, MFU = 989e12, 3.35e12, 80e9, 0.5   <span class="cm"># one H100 SXM; MFU is our assumption</span>
+S_IN, S_OUT = 2048, 512                              <span class="cm"># prompt and output length of the workload</span>
+SLO_TTFT, SLO_TPOT = 0.5, 0.040                      <span class="cm"># seconds (average TTFT, per-token time)</span>
+TP_EFF = {1: 1.0, 2: 0.95, 4: 0.90, 8: 0.85}         <span class="cm"># assumed scaling efficiency of tensor parallelism</span>
+
+<span class="kw2">def</span> prefill_time(tp):                                <span class="cm"># D in equation 137.2</span>
+    flops = 2 * P * S_IN + 2 * L * S_IN ** 2 * d
+    <span class="kw2">return</span> flops / (tp * FLOPS * MFU * TP_EFF[tp])
+
+<span class="kw2">def</span> prefill_goodput(tp):                             <span class="cm"># max rate R with D + R D^2 / (2(1 - R D)) <= SLO</span>
+    D = prefill_time(tp)
+    <span class="kw2">if</span> D > SLO_TTFT: <span class="kw2">return</span> 0.0
+    lo, hi = 0.0, 1 / D
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(60):
+        R = (lo + hi) / 2
+        lo, hi = (R, hi) <span class="kw2">if</span> D + R * D * D / (2 * (1 - R * D)) <= SLO_TTFT <span class="kw2">else</span> (lo, R)
+    <span class="kw2">return</span> lo
+
+<span class="kw2">def</span> decode_goodput(tp):                              <span class="cm"># largest batch that meets TPOT and fits in memory</span>
+    best = 0.0
+    <span class="kw2">for</span> b <span class="kw2">in</span> range(1, 1025):
+        kv = b * (S_IN + S_OUT / 2) * KV_TOK         <span class="cm"># average context during decoding</span>
+        <span class="kw2">if</span> (2 * P + kv) / tp > 0.9 * MEM: <span class="kw2">break</span>
+        t = max((2 * P + kv) / (tp * HBM), 2 * P * b / (tp * FLOPS * MFU)) / TP_EFF[tp]
+        <span class="kw2">if</span> t <= SLO_TPOT: best = b / (S_OUT * t)    <span class="cm"># finished requests per second</span>
+    <span class="kw2">return</span> best
+
+print(" TP | prefill D(s)  req/s | decode req/s")
+<span class="kw2">for</span> tp <span class="kw2">in</span> (2, 4, 8):
+    print(f" {tp:2d} | {prefill_time(tp):7.3f} {prefill_goodput(tp):7.2f} | {decode_goodput(tp):8.2f}")
+
+best = <span class="kw2">None</span>
+<span class="kw2">for</span> tp_p <span class="kw2">in</span> (2, 4, 8):
+    <span class="kw2">for</span> tp_d <span class="kw2">in</span> (2, 4, 8):
+        rp, rd = prefill_goodput(tp_p), decode_goodput(tp_d)
+        <span class="kw2">if</span> rp == 0 <span class="kw2">or</span> rd == 0: <span class="kw2">continue</span>
+        per_gpu = 1 / (tp_p / rp + tp_d / rd)        <span class="cm"># fluid model: GPUs needed per req/s, inverted</span>
+        <span class="kw2">if</span> best <span class="kw2">is</span> <span class="kw2">None</span> <span class="kw2">or</span> per_gpu > best[0]: best = (per_gpu, tp_p, tp_d, rd / rp)
+g, tp_p, tp_d, ratio = best
+print(f"best: prefill TP{tp_p}, decode TP{tp_d}, {ratio:.2f} prefill instances per decode instance, {g:.3f} req/s per GPU")</pre>
+<p>Output:</p>
+<pre class="code"> TP | prefill D(s)  req/s | decode req/s
+  2 |   0.313    1.73 |     0.26
+  4 |   0.165    4.85 |    15.89
+  8 |   0.088   10.32 |    44.49
+best: prefill TP8, decode TP8, 4.31 prefill instances per decode instance, 1.047 req/s per GPU</pre>
+<p>Three lessons. Decode on TP2 is useless here: the 141 GB of weights leave almost no room for KV cache in 2 × 72 GB, so the batch stays tiny. Prefill goodput grows faster than linearly with TP (1.73 → 4.85 → 10.32 req/s), because a shorter \(D\) also shortens the queue (equation 137.2). And with 2,048-token prompts and 512 output tokens, we need about 4 prefill instances per decode instance: the ratio is a property of the workload, so it must be re-planned when the traffic changes.</p>
+
+<h2>Disaggregate or not?</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Situation</th><th>Better choice</th><th>Why</th></tr></thead><tbody>
+<tr><td>Strict TPOT target (voice, streaming chat) with long prompts</td><td>Disaggregate</td><td>Prefills never stall decodes (Figure 1)</td></tr>
+<tr><td>Short prompts, small cluster, one node</td><td>Colocate with chunked prefill</td><td>Little interference; no transfer, no ratio to tune</td></tr>
+<tr><td>Traffic mix changes quickly</td><td>Colocate, or disaggregate with role flipping / a mixed pool</td><td>A fixed P:D ratio is wrong most of the day (Figure 4)</td></tr>
+<tr><td>Slow network between nodes, MHA model</td><td>Colocate, or keep each P–D pair inside one node</td><td>KV transfer can exceed the prefill time (equation 137.6, Figure 5)</td></tr>
+<tr><td>Older and newer GPU generations available</td><td>Disaggregate: new GPUs for prefill, old ones for decode</td><td>Decode is memory-bound and gains little from more FLOPs (Splitwise)</td></tr>
+<tr><td>Huge MoE model at scale</td><td>Disaggregate</td><td>Each phase wants a different expert-parallel layout (DeepSeek-V3)</td></tr></tbody></table></div>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>What is distributed</th><th>Notes</th></tr></thead><tbody>
+<tr><td>Large chat services (Kimi, DeepSeek)</td><td>Separate prefill and decode clusters, KV store or KV transfer over RDMA</td><td>Mooncake; DeepSeek-V3’s 32-GPU prefill and 320-GPU decode units [Certain]</td></tr>
+<tr><td>Open-source serving engines</td><td>TP inside a node, PP or replicas across nodes; optional PD disaggregation</td><td>vLLM (experimental connectors), SGLang, TensorRT-LLM, Dynamo [Likely]</td></tr>
+<tr><td>Long-document RAG and code assistants</td><td>Many prefill GPUs per decode GPU</td><td>Long prompts, short answers: \(r_P\) is small, so the ratio \(n_P / n_D\) is large</td></tr>
+<tr><td>Video question answering and Video-RAG with a VLM</td><td>Prefill pool also runs the vision encoder over frames; decode pool writes the answer</td><td>Thousands of visual tokens per clip make prefill heavy and the KV cache large, so the transfer cost (137.5) matters; frame tokens of a shared video can be cached and reused</td></tr>
+<tr><td>Live video captioning or key-moment alerts</td><td>Decode pool with strict TPOT; prefill of each new clip on separate GPUs</td><td>New clips arrive all the time; colocated prefills would stall the running captions</td></tr>
+<tr><td>Offline batch jobs (labeling, video classification at scale, synthetic data)</td><td>Spot instances, replicas, large batches</td><td>Latency is loose, so preemptions are cheap to absorb; SpotServe-style token-level recovery avoids redoing work</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Expecting disaggregation to raise throughput.</b> It improves goodput under latency targets. If you only care about raw tokens per second, a colocated system with large batches is often as good or better; vLLM’s documentation says so directly.</li>
+<li><b>Using pipeline parallelism to cut latency.</b> A token still passes through every stage. PP adds capacity and works over slow links; for decode latency, use TP inside a node (Figure 2).</li>
+<li><b>Running TP across nodes.</b> Two all-reduces per layer over InfiniBand cost more than the useful work at large batches. Keep TP groups inside the NVLink domain.</li>
+<li><b>Fixing the prefill-to-decode ratio once.</b> The best ratio is \(r_D / r_P\), and both depend on prompt and output lengths, which change with the time of day and the product. Re-plan, flip roles, or keep a mixed pool.</li>
+<li><b>Ignoring the KV transfer on slow networks.</b> Check \(t_x / t_p\) with equation 137.6 before you design. For MHA models or 25 Gbps links, place prefill and decode in the same node.</li>
+<li><b>Sending the KV cache only after the prefill.</b> Serialized transfer adds \(t_x\) to the second token. Layer-wise transfer hides all but \(t_x / L\) when the link is fast enough.</li>
+<li><b>Reporting average TPOT only.</b> Interference shows in the tail: the worst gap between tokens, or P99 TPOT. Averages can look equal while users see pauses (Figure 1).</li>
+<li><b>Treating a spot preemption like a crash.</b> There is a grace period, and the KV cache is the state of the request. Commit tokens, migrate state, and remap devices to reuse what survivors already hold.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>What is prefill–decode disaggregation, and what problem does it solve?<span class="lvl">basic</span></summary><div class="ans">It runs the two phases of generation on different GPU instances: prefill instances process prompts and produce the KV cache and the first token; decode instances receive the KV cache and generate the rest. It solves interference (a long prefill in the same batch stalls all decodes, hurting TPOT, and decodes slow prefills, hurting TTFT) and coupling (one parallel config and batch size must serve both phases). After the split, each pool can use its own TP degree, batch size and even GPU type. The costs are the KV transfer and the need to balance the two pools.</div></details>
+<details class="qa"><summary>Why are prefill and decode so different on a GPU?<span class="lvl">basic</span></summary><div class="ans">Prefill processes \(s\) tokens per weight read, so its arithmetic intensity is high and it is compute-bound; a single long prompt fills the GPU, and batching more prompts helps little (Splitwise saw no gain past about 2,048 batched tokens). Decode processes one token per sequence per weight read, so it is memory-bound; it gets better with larger batches until memory for the KV cache runs out. Prefill is sensitive to compute and power; decode to memory bandwidth and capacity.</div></details>
+<details class="qa"><summary>You serve Llama 3.1 70B in BF16 on H100s. TP or PP? How many GPUs?<span class="lvl">core</span></summary><div class="ans">Weights are 141 GB, so at least 2 GPUs, but TP2 leaves almost no room for KV cache. TP4 or TP8 inside one NVLink node is the usual choice: equation 137.1 shows the step time falls almost as \(1/t\), with about \(2L\alpha = 1.6\) ms of all-reduce overhead per token. PP8 on the same 8 GPUs gives the same memory per GPU but about 5× the time per token at 32 sequences, because each token crosses 8 stages and each GPU rereads its weights per micro-batch. Use replicas (data parallelism) or PP across nodes, TP within.</div></details>
+<details class="qa"><summary>Define goodput. Why is it better than throughput for serving?<span class="lvl">core</span></summary><div class="ans">DistServe’s per-GPU goodput is the highest request rate at which a target share of requests (say 90%) meets both the TTFT and TPOT SLOs, divided by the number of GPUs. Throughput counts requests that finish, even if they were too slow to be useful. Goodput penalizes interference and queueing, and dividing by GPUs makes designs with different sizes comparable; it is the quantity a cost-per-useful-request business cares about.</div></details>
+<details class="qa"><summary>How do you choose the number of prefill and decode instances?<span class="lvl">core</span></summary><div class="ans">Measure or simulate the goodput of one prefill instance \(r_P\) (rate meeting TTFT) and one decode instance \(r_D\) (rate meeting TPOT) for the workload. The system rate is \(\min(n_P r_P, n_D r_D)\), so balance them: \(n_P / n_D \approx r_D / r_P\). Example from DistServe: \(r_P = 5.6\), \(r_D = 10\) req/s per GPU gives 2:1 and 3.33 req/s per GPU versus 1.6 colocated. Long prompts lower \(r_P\) and raise the needed ratio; long outputs lower \(r_D\). Re-plan when the mix changes, or use role flipping (TetriInfer) or a mixed pool (Splitwise).</div></details>
+<details class="qa"><summary>Estimate the KV-cache transfer for a 4,096-token prompt on Llama 3.1 70B. Is it a problem?<span class="lvl">core</span></summary><div class="ans">\(\kappa = 2 \times 80 \times 8 \times 128 \times 2 = 327{,}680\) bytes per token, so 1.34 GB. Over 8 × 400 Gb/s InfiniBand (400 GB/s) that is 3.4 ms, against a prefill of about 0.15 s on 8 H100s at 50% of peak: about 2%. Sent layer by layer during the prefill, only about \(3.4/80 = 0.04\) ms remains. Over 25 Gb/s it would be 0.43 s, more than the prefill, so on slow networks keep each prefill–decode pair inside one node.</div></details>
+<details class="qa"><summary>Why does the ratio of transfer time to prefill time not depend on prompt length?<span class="lvl">advanced</span></summary><div class="ans">Both are linear in \(s\) (ignoring attention): KV bytes are \(s \kappa\) and prefill FLOPs are about \(2Ns\). So \(t_x/t_p = \kappa F_{\text{eff}} / (2 N B_{\text{net}})\), equation 137.6. It falls slowly for very long prompts because attention FLOPs grow like \(s^2\). It grows with faster GPUs (\(F_{\text{eff}}\)) and with larger KV per weight (MHA instead of GQA or MLA), and falls with faster networks.</div></details>
+<details class="qa"><summary>For a prefill instance, when is 2-way tensor parallelism better than 2-way pipeline parallelism?<span class="lvl">advanced</span></summary><div class="ans">DistServe’s M/D/1 analysis: TP gives \(D/K + RD^2/(2K(K-RD))\), PP gives \(D + RD^2/(4(2-RD))\), where \(K \lt 2\) is the TP speed-up. At low arrival rates, the execution time dominates, and TP wins because it shortens \(D\). At high rates, queueing dominates, and PP wins because its capacity is \(2/D\) instead of \(K/D\). So the best prefill parallelism depends on load and on how well TP scales.</div></details>
+<details class="qa"><summary>What does Splitwise add beyond splitting the phases?<span class="lvl">core</span></summary><div class="ans">Hardware heterogeneity and power: since decode is memory-bound, it can run on cheaper or power-capped machines. A DGX-H100 has 3.43× the compute of a DGX-A100 but 1.64× the memory bandwidth and 2.16× the cost; token-phase latency barely changes when power is capped by half. Splitwise-HA uses H100 for prompts and A100 for tokens. It also keeps a mixed pool for load spikes and uses layer-wise KV transfer over InfiniBand. Result: 1.4× throughput at 20% lower cost, or 2.35× throughput at equal cost and power.</div></details>
+<details class="qa"><summary>What is TetriInfer’s approach, and what would you check before trusting its numbers?<span class="lvl">advanced</span></summary><div class="ans">Fixed-size chunked prefill (512 tokens) to keep prefill at saturation; disaggregated prefill and decode instances; a small OPT-125M classifier that predicts output length in 200-token buckets (74.9% accuracy) so that decode placement avoids hotspots (power-of-two choice); and instances that flip roles in milliseconds. Check: the headline 97%/47%/38% is the best workload (light prefill, heavy decode), and vLLM wins on heavy-prefill-heavy-decode; the testbed is 4 V100s with an emulated network (no real KV transfer); and length predictors trained on one dataset may fail on another.</div></details>
+<details class="qa"><summary>How would you serve an LLM on spot GPUs? What does SpotServe do?<span class="lvl">advanced</span></summary><div class="ans">Use the grace period and treat the KV cache as the request state. SpotServe re-plans the parallel configuration \((D, P, M, B)\) when instances come and go, choosing the lowest latency that keeps up with the arrival rate. A device mapper solves a bipartite matching (Kuhn–Munkres) between surviving instances and new positions to maximize reused weights and KV cache, so less data moves. It commits progress per token, decides with a just-in-time rule how many decode steps fit before migrating, and migrates front layers first. It reports 2.4–9.1× lower P99 latency than baselines and 54% lower cost than on-demand only.</div></details>
+<details class="qa"><summary>Design question: a chat API with 4,000-token prompts, 300-token answers, TTFT under 1 s and TPOT under 50 ms. Sketch the serving layout.<span class="lvl">advanced</span></summary><div class="ans">Pick the model and its memory (weights + KV per token from 137.5). Inside each node, use TP4 or TP8. Long prompts and strict TPOT point to disaggregation: prefill instances with high TP for low TTFT, decode instances with big batches. Compute \(r_P\) from the prefill time and the queueing formula (137.2) for the 1 s TTFT, \(r_D\) from the largest batch whose step time stays under 50 ms and fits in memory, then set \(n_P / n_D \approx r_D / r_P\) and size for peak traffic with headroom. Check the KV transfer with 137.6 for your network and send it layer by layer. Add prefix-aware routing for shared system prompts, autoscaling or role flipping, and monitor P99 TTFT and TPOT, not averages.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>Compute \(\kappa\) (equation 137.5) for Llama 3.1 8B with an FP8 KV cache, and the bytes for a 10,000-token prompt.</li>
+<li>With DistServe’s rates \(r_P = 5.6\) and \(r_D = 10\) req/s per GPU, what is the goodput per GPU for 3 prefill and 2 decode GPUs? Is it better than 2:1?</li>
+<li>Use equation 137.2 with \(D = 0.2\) s. At which arrival rate does the average TTFT reach 0.5 s?</li>
+<li>In equation 137.7, take \(L = 80\), \(t_p = 150\) ms and \(t_x = 100\) ms. What is the added delay, serialized and layer-wise? Repeat for \(t_x = 300\) ms.</li>
+<li>In Figure 2’s model, why does TP8×PP2 beat TP16 at \(B = 256\)? Name the term of equation 137.1 that grows.</li>
+<li>SpotServe: with a 30 s grace period, an estimated migration time of 3.2 s and a decode step of 0.25 s, how many steps does the just-in-time rule allow (137.9)?</li>
+<li>A team says: “disaggregation doubled our throughput”. What would you ask?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. \(2 \times 32 \times 8 \times 128 \times 1 = 65{,}536\) bytes (64 KiB) per token; \(10{,}000 \times 65{,}536 = 0.66\) GB. 2. \(\min(3 \times 5.6, 2 \times 10) = \min(16.8, 20) = 16.8\) req/s over 5 GPUs = 3.36 per GPU, slightly better than 3.33 for 2:1 (the ratio 1.5 is closer to the ideal 1.79). 3. Solve \(0.2 + 0.04R / (2(1 - 0.2R)) = 0.5\): \(0.02R = 0.3(1 - 0.2R)\), so \(0.08R = 0.3\), \(R = 3.75\) req/s (capacity is 5). 4. Serialized: 100 ms. Layer-wise: \(\max(100/80,\ 100 - 0.9875 \times 150) = \max(1.25, -48.1) = 1.25\) ms. For 300 ms: serialized 300 ms; layer-wise \(\max(3.75,\ 300 - 148.1) = 151.9\) ms. 5. In TP16 the all-reduce term \(2L(\alpha + 2(t-1)/t \cdot Bhb/B_{\text{link}})\) uses the 50 GB/s InfiniBand link and grows with \(B\): about 28 ms per token in the model, more than the 9 ms of useful work. TP8×PP2 keeps the all-reduces on NVLink and sends only one small hidden state per micro-batch across nodes. 6. \(\lfloor (30 - 3.2)/0.25 \rfloor = \lfloor 107.2 \rfloor = 107\) steps. 7. Throughput at what latency? Compare goodput under the same TTFT and TPOT SLOs, the same number and type of GPUs, the same workload (prompt and output lengths, burstiness), and against a strong colocated baseline with chunked prefill and tuned batch size; also ask how the P:D ratio was chosen and whether it held all day.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>For serving, tensor parallelism makes each token faster at the cost of \(2L\) all-reduces per token (137.1); keep it inside the NVLink domain. Pipeline parallelism adds capacity, not speed; use it, or replicas, across nodes.</li>
+<li>Prefill is compute-bound and decode is memory-bound. On a shared GPU, prefills stall decodes; disaggregation removes this interference and lets each phase pick its own parallelism, batch and hardware.</li>
+<li>Measure designs by per-GPU goodput under SLOs, not raw throughput. Balance the pools: \(n_P / n_D \approx r_D / r_P\) (137.4); the ratio depends on the workload. Queueing (137.2, 137.3) decides whether TP or PP is better for prefill.</li>
+<li>Splitwise adds cheaper or power-capped GPUs for decode; DistServe searches placements for goodput (7.4× more requests or 12.6× tighter SLOs); TetriInfer adds fixed-size chunks, length prediction and role flipping.</li>
+<li>The KV cache is \(2 L n_{\text{kv}} d_h b\) bytes per token (137.5); its transfer time relative to prefill is \(\kappa F_{\text{eff}} / (2 N B_{\text{net}})\) (137.6), about 2% for Llama 3.1 70B on 400 GB/s, and layer-wise sending hides most of it (137.7).</li>
+<li>Spot GPUs are cheap but can vanish. SpotServe re-plans the config, maps devices with a bipartite matching to reuse state (137.8), commits tokens one by one and uses the grace period (137.9).</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ \overline{\text{TTFT}} = D + \frac{RD^2}{2(1-RD)}, \quad \frac{n_P}{n_D} \approx \frac{r_D}{r_P}, \quad \kappa = 2 L n_{\text{kv}} d_h b, \quad \frac{t_x}{t_p} \approx \frac{\kappa F_{\text{eff}}}{2 N B_{\text{net}}} \]</div>
+<h2 class="plain" id="distributed-serving-and-prefill-decode-disaggregation-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Patel et al. (2023). <a href="https://arxiv.org/abs/2311.18677" target="_blank" rel="noopener">Splitwise: Efficient Generative LLM Inference Using Phase Splitting</a></li><li>Zhong et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving&amp;quot;" target="_blank" rel="noopener">DistServe: Disaggregating Prefill and Decoding for Goodput-optimized Large Language Model Serving</a></li><li>Hu et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Inference without Interference: Disaggregate LLM Inference for Mixed Downstream Workloads (TetriInfer)&amp;quot;" target="_blank" rel="noopener">Inference without Interference: Disaggregate LLM Inference for Mixed Downstream Workloads (TetriInfer)</a></li><li>Miao et al. (2023). <a href="https://scholar.google.com/scholar?q=&amp;quot;SpotServe: Serving Generative Large Language Models on Preemptible Instances&amp;quot;" target="_blank" rel="noopener">SpotServe: Serving Generative Large Language Models on Preemptible Instances</a></li><li>Zhou, Ning, Hong et al. (2024). <a href="https://arxiv.org/abs/2404.14294" target="_blank" rel="noopener">A Survey on Efficient Inference for Large Language Models</a></li><li>Agrawal et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve&amp;quot;" target="_blank" rel="noopener">Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Shoeybi et al. (2019). <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">Megatron-LM: Training Multi-Billion Parameter Language Models Using Model Parallelism</a></li><li>Qin, Li, He et al. (2024). <a href="https://arxiv.org/abs/2407.00079" target="_blank" rel="noopener">Mooncake: A KVCache-centric Disaggregated Architecture for LLM Serving</a></li><li>DeepSeek-AI (2024). <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-V3 Technical Report</a></li><li>vLLM project (2025). <a href="https://docs.vllm.ai/en/latest/features/disagg_prefill.html" target="_blank" rel="noopener">vLLM documentation: Disaggregated Prefilling (experimental)</a></li><li>NVIDIA (2025). <a href="https://github.com/ai-dynamo/dynamo" target="_blank" rel="noopener">NVIDIA Dynamo: a datacenter-scale distributed inference serving framework</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../inference/scheduling-fcfs-preemption-fairness-and-slos.html"><small>Previous · session 136</small>Scheduling: FCFS, preemption, fairness and SLOs</a><a class="next" href="../inference/vllm-internals.html"><small>Next · session 138</small>vLLM internals</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const R=document.querySelector('[data-session="distributed-serving-and-prefill-decode-disaggregation"]');if(!R)return;
+const $=s=>R.querySelector(s);
+const fx=(v,d)=>Number(v).toFixed(d);
+const ms=v=>v<1e-3?fx(v*1e6,0)+" µs":v<1?fx(v*1e3,v<0.01?2:1)+" ms":fx(v,2)+" s";
+function seg(el,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset.v);});}
+const PEAK=989e12,MFU=0.5,HBM=3.35e12;
+
+/* ---------- Figure 1: interference, colocated vs disaggregated ---------- */
+(function(){
+ const svg=$("#pd-int-svg");if(!svg)return;const Rr=$("#pd-int-r"),S=$("#pd-int-s"),info=$("#pd-int-info");
+ const P=8.03e9,L=32,d=4096,KV=131072,F=PEAK*MFU,NOUT=128,T=4.0,WIN=0.6;
+ const tpre=(tok,sq)=>(2*P*tok+2*L*sq*d)/F;
+ const tdec=(b,ctx)=>Math.max((2*P+ctx*KV)/HBM,2*P*b/F);
+ function sim(rate,s,mode){
+  const n=Math.floor(T*rate+1e-9);const reqs=[];for(let k=0;k<n;k++)reqs.push({a:k/rate,first:null,done:null,gen:0,last:null,gap:0});
+  const lanes=[[],[]];
+  function step(act,t,blocks,s){let ctx=0;act.forEach(r=>ctx+=s+r.gen);const dt=tdec(act.length,ctx);if(t<WIN)blocks.push([t,t+dt,"d"]);t+=dt;
+   for(let i=act.length-1;i>=0;i--){const r=act[i];r.gap=Math.max(r.gap,t-r.last);r.last=t;r.gen++;if(r.gen>=NOUT){r.done=t;act.splice(i,1);}}return t;}
+  if(mode==="co"){
+   for(let g=0;g<2;g++){const wait=reqs.filter((r,i)=>i%2===g);const act=[];let t=0;let guard=0;
+    while((wait.length||act.length)&&guard++<200000){
+     const ready=wait.filter(r=>r.a<=t);
+     if(ready.length){const dt=tpre(s*ready.length,s*s*ready.length);if(t<WIN)lanes[g].push([t,t+dt,"p"]);t+=dt;
+      ready.forEach(r=>{wait.splice(wait.indexOf(r),1);r.first=t;r.last=t;r.gen=1;act.push(r);});continue;}
+     if(!act.length){t=Math.min(...wait.map(r=>r.a));continue;}
+     t=step(act,t,lanes[g],s);}}
+  }else{
+   let t=0;reqs.forEach(r=>{const t0=Math.max(t,r.a);t=t0+tpre(s,s*s);if(t0<WIN)lanes[0].push([t0,t,"p"]);r.first=t;r.ready=t+s*KV/50e9;});
+   const pend=reqs.slice().sort((a,b)=>a.ready-b.ready);const act=[];t=0;let guard=0;
+   while((pend.length||act.length)&&guard++<200000){
+    while(pend.length&&pend[0].ready<=t){const r=pend.shift();r.last=r.first;r.gen=1;act.push(r);}
+    if(!act.length){t=pend[0].ready;continue;}
+    t=step(act,t,lanes[1],s);}
+  }
+  let tt=0,tp=0,gap=0;reqs.forEach(r=>{tt+=r.first-r.a;tp+=(r.done-r.first)/(NOUT-1);gap=Math.max(gap,r.gap);});
+  return{ttft:tt/n,tpot:tp/n,gap,lanes,util:rate*tpre(s,s*s)};}
+ function lane(blocks,y,label){const X=v=>130+v/WIN*610;let g=`<text x="122" y="${y+17}" text-anchor="end" font-size="12.5" fill="var(--ink2)">${label}</text><rect x="130" y="${y}" width="610" height="26" fill="var(--rule)" opacity=".35" rx="3"/>`;
+  blocks.forEach(([a,b,k])=>{if(a>=WIN)return;const x0=X(a),x1=X(Math.min(b,WIN));g+=`<rect x="${x0.toFixed(2)}" y="${y}" width="${Math.max(0.6,x1-x0-0.6).toFixed(2)}" height="26" fill="${k==="p"?"var(--k)":"var(--q)"}" opacity="${k==="p"?0.9:0.75}"/>`;});return g;}
+ function draw(){const rate=+Rr.value,s=+S.value;$("#pd-int-rv").value=rate;$("#pd-int-sv").value=s;
+  const co=sim(rate,s,"co"),di=sim(rate,s,"dis");
+  let g=`<text x="10" y="20" font-size="13.5" font-weight="700" fill="var(--ink)">Colocated: each GPU prefills and decodes</text>`;
+  g+=lane(co.lanes[0],30,"GPU 1")+lane(co.lanes[1],62,"GPU 2");
+  g+=`<text x="10" y="128" font-size="13.5" font-weight="700" fill="var(--ink)">Disaggregated: one prefill GPU, one decode GPU</text>`;
+  g+=lane(di.lanes[0],138,"prefill GPU")+lane(di.lanes[1],170,"decode GPU");
+  const X=v=>130+v/WIN*610;[0,0.1,0.2,0.3,0.4,0.5,0.6].forEach(v=>{g+=`<line x1="${X(v)}" y1="200" x2="${X(v)}" y2="206" stroke="var(--muted)"/><text x="${X(v)}" y="220" text-anchor="middle" font-size="11.5" class="svgs">${fx(v,1)} s</text>`;});
+  const bw=v=>Math.min(1,v/Math.max(co.gap,di.gap))*360;
+  g+=`<text x="10" y="250" font-size="12.5" fill="var(--ink2)">worst gap between two tokens</text><rect x="230" y="238" width="${bw(co.gap).toFixed(1)}" height="14" fill="var(--k)" opacity=".8"/><text x="${(236+bw(co.gap)).toFixed(1)}" y="250" font-size="12" fill="var(--ink)">colocated ${ms(co.gap)}</text>`;
+  g+=`<rect x="230" y="262" width="${bw(di.gap).toFixed(1)}" height="14" fill="var(--q)" opacity=".8"/><text x="${(236+bw(di.gap)).toFixed(1)}" y="274" font-size="12" fill="var(--ink)">disaggregated ${ms(di.gap)}</text>`;
+  svg.innerHTML=g;
+  const over=di.util>1;
+  info.innerHTML=`Prefill of one ${s.toLocaleString("en-US")}-token prompt: <b>${ms(tpre(s,s*s))}</b>; a decode step: about ${ms(tdec(8,8*(s+64)))}. <b>Colocated</b>: average TTFT ${ms(co.ttft)}, average TPOT ${ms(co.tpot)}, worst gap <b>${ms(co.gap)}</b>. <b>Disaggregated</b>: average TTFT ${ms(di.ttft)}, average TPOT ${ms(di.tpot)}, worst gap <b>${ms(di.gap)}</b>. The prefill GPU is busy ${fx(100*Math.min(di.util,9.99),0)}% of the time${over?` — <b style="color:var(--bad)">overloaded: its queue grows and TTFT explodes</b>`:""}.`;
+  R.dataset.pdInt=[co.gap,di.gap,co.ttft,di.ttft].map(v=>fx(v*1e3,1)).join(",");}
+ [Rr,S].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 2: TP vs PP serving ---------- */
+(function(){
+ const svg=$("#pd-par-svg");if(!svg)return;const Bs=$("#pd-par-b"),Cs=$("#pd-par-x"),info=$("#pd-par-info");
+ const P=70.553706496e9,W=2*P,L=80,H=8192,KV=327680,F=PEAK*MFU,CAP=72;let t=8,p=1;
+ function model(t,p,B,c){const N=t*p,mb=B/p;const mem=(W/N+mb*c*KV/N)/HBM,comp=2*(P/N)*mb/F;
+  const intra=t<=8,Bt=intra?450e9:50e9,at=intra?10e-6:20e-6;const ar=t>1?2*(L/p)*(at+2*(t-1)/t*mb*H*2/Bt):0;
+  const ts=Math.max(mem,comp)+ar;const cross=N>8,Bp=cross?50e9:450e9,ap=cross?20e-6:10e-6;const p2p=p>1?ap+mb*H*2/Bp:0;
+  const lat=p*ts+(p-1)*p2p;return{N,work:p*Math.max(mem,comp),bound:comp>mem?"compute":"memory",ar:p*ar,pp:(p-1)*p2p,lat,thr:B/lat,gpu:(W+B*c*KV)/N/1e9};}
+ function draw(){const B=+Bs.value,c=+Cs.value;$("#pd-par-bv").value=B;$("#pd-par-xv").value=c;
+  const m=model(t,p,B,c);let g="";
+  /* GPU layout */
+  g+=`<text x="10" y="18" font-size="12.5" class="svgs">GPUs (color = pipeline stage; dashed box = one 8-GPU node)</text>`;
+  const cols=["var(--q)","var(--k)","var(--v)","var(--bad)","var(--q)","var(--k)","var(--v)","var(--bad)"];
+  for(let i=0;i<m.N;i++){const st=Math.floor(i/t),x=14+i*45+(i>=8?14:0);g+=`<rect x="${x}" y="28" width="39" height="30" rx="5" fill="${cols[st%8]}" opacity="${0.35+0.5*((st%2)?0.6:1)}"/><text x="${x+19.5}" y="47" text-anchor="middle" font-size="11" fill="var(--ink)">${p>1?"S"+(st+1):"TP"}</text>`;}
+  g+=`<rect x="8" y="23" width="${Math.min(8,m.N)*45+2}" height="40" rx="7" fill="none" stroke="var(--muted)" stroke-dasharray="4 4"/>`;
+  if(m.N>8)g+=`<rect x="${8+8*45+14}" y="23" width="${(m.N-8)*45+2}" height="40" rx="7" fill="none" stroke="var(--muted)" stroke-dasharray="4 4"/>`;
+  /* memory */
+  const MX=v=>14+Math.min(v,160)/160*560;
+  g+=`<text x="10" y="86" font-size="12.5" class="svgs">memory per GPU (GB): weights + KV cache</text><rect x="14" y="92" width="${(MX(m.gpu)-14).toFixed(1)}" height="18" fill="${m.gpu<=CAP?"var(--q)":"var(--bad)"}" opacity=".8"/>`;
+  g+=`<line x1="${MX(CAP)}" y1="88" x2="${MX(CAP)}" y2="114" stroke="var(--bad)" stroke-width="2"/><text x="${MX(CAP)+4}" y="124" font-size="11" fill="var(--bad)">72 GB usable</text><text x="${Math.min(600,MX(m.gpu)+6).toFixed(1)}" y="106" font-size="12.5" font-weight="700" fill="${m.gpu<=CAP?"var(--ink)":"var(--bad)"}">${fx(m.gpu,1)}${m.gpu<=CAP?"":" — does not fit"}</text>`;
+  /* time */
+  const tmax=Math.max(0.05,m.lat*1.15),TX=v=>14+v/tmax*620;
+  g+=`<text x="10" y="150" font-size="12.5" class="svgs">time per token for one sequence (ms)</text>`;
+  g+=`<rect x="14" y="156" width="${(TX(m.work)-14).toFixed(1)}" height="22" fill="var(--q)" opacity=".85"/><rect x="${TX(m.work).toFixed(1)}" y="156" width="${(TX(m.work+m.ar)-TX(m.work)).toFixed(1)}" height="22" fill="var(--k)"/><rect x="${TX(m.work+m.ar).toFixed(1)}" y="156" width="${(TX(m.lat)-TX(m.work+m.ar)).toFixed(1)}" height="22" fill="var(--v)"/>`;
+  g+=`<text x="${Math.min(660,TX(m.lat)+6).toFixed(1)}" y="172" font-size="12.5" font-weight="700" fill="var(--ink)">${fx(m.lat*1e3,2)}</text>`;
+  [0,0.25,0.5,0.75,1].forEach(f=>{g+=`<text x="${TX(f*tmax)}" y="198" font-size="11" text-anchor="middle" class="svgs">${fx(f*tmax*1e3,1)}</text>`;});
+  svg.innerHTML=g;
+  const name=p>1?(t>1?`TP${t}×PP${p}`:`PP${p}`):`TP${t}`;
+  info.innerHTML=`<b>${name}</b> on ${m.N} GPUs, ${B} sequence${B>1?"s":""} of ${c.toLocaleString("en-US")} tokens: ${fx(m.gpu,1)} GB per GPU${m.gpu<=CAP?"":` (<b style="color:var(--bad)">over the 72 GB limit</b>)`}. Time per token <b>${fx(m.lat*1e3,2)} ms</b> = ${fx(m.work*1e3,2)} ms ${m.bound}-bound work + ${fx(m.ar*1e3,2)} ms all-reduce + ${fx(m.pp*1e3,2)} ms stage-to-stage sends. Each sequence gets ${fx(1/m.lat,1)} tokens/s; all together <b>${Math.round(m.thr).toLocaleString("en-US")} tokens/s</b>.`;
+  R.dataset.pdPar=[fx(m.lat*1e3,2),Math.round(m.thr),fx(m.gpu,1)].join(",");}
+ seg($("#pd-par-c"),v=>{[t,p]=v.split(",").map(Number);draw();});
+ [Bs,Cs].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: DistServe queueing ---------- */
+(function(){
+ const svg=$("#pd-q-svg");if(!svg)return;const Ds=$("#pd-q-d"),Ks=$("#pd-q-k"),Rs=$("#pd-q-r"),info=$("#pd-q-info");
+ const f1=(R,D)=>R*D<1?D+R*D*D/(2*(1-R*D)):Infinity;
+ const fi=(R,D)=>R*D<2?D+R*D*D/(4*(2-R*D)):Infinity;
+ const ft=(R,D,K)=>R*D<K?D/K+R*D*D/(2*K*(K-R*D)):Infinity;
+ function draw(){const D=+Ds.value/1000,K=+Ks.value;const rmax=2/D;Rs.max=String(Math.floor(rmax*10-1)/10);Rs.step=rmax>8?"0.5":"0.1";if(+Rs.value>+Rs.max)Rs.value=Rs.max;const r=+Rs.value;
+  $("#pd-q-dv").value=fx(D*1000,0)+" ms";$("#pd-q-kv").value=fx(K,2);$("#pd-q-rv").value=fx(r,1);
+  const ymax=5*D,X=v=>60+v/rmax*540,Y=v=>250-Math.min(v,ymax)/ymax*220;
+  let g=`<path d="M60 30 V250 H600" fill="none" stroke="var(--muted)"/>`;
+  for(let i=0;i<=5;i++){const v=i*ymax/5;g+=`<text x="54" y="${Y(v)+4}" text-anchor="end" font-size="11" class="svgs">${fx(v*1000,0)}</text>`;}
+  for(let i=0;i<=4;i++){const v=i*rmax/4;g+=`<text x="${X(v)}" y="266" text-anchor="middle" font-size="11" class="svgs">${fx(v,1)}</text>`;}
+  g+=`<text x="330" y="284" text-anchor="middle" font-size="12" class="svgs">arrival rate R (requests/s)</text><text x="14" y="140" font-size="12" class="svgs" transform="rotate(-90 14 140)" text-anchor="middle">average TTFT (ms)</text>`;
+  const curve=(f,c,dash)=>{let pts=[];for(let i=0;i<=300;i++){const v=i/300*rmax,y=f(v);if(!isFinite(y)||y>ymax*1.02)break;pts.push(X(v).toFixed(1)+","+Y(y).toFixed(1));}return`<polyline points="${pts.join(" ")}" fill="none" stroke="${c}" stroke-width="2.6" ${dash?'stroke-dasharray="6 4"':""}/>`;};
+  g+=curve(v=>f1(v,D),"var(--muted)",true)+curve(v=>fi(v,D),"var(--v)")+curve(v=>ft(v,D,K),"var(--q)");
+  [[1/D,"var(--muted)"],[K/D,"var(--q)"],[2/D,"var(--v)"]].forEach(([c,col])=>{if(c<=rmax+1e-9)g+=`<line x1="${X(c)}" y1="30" x2="${X(c)}" y2="250" stroke="${col}" stroke-width="1" stroke-dasharray="2 4"/>`;});
+  g+=`<line x1="${X(r)}" y1="30" x2="${X(r)}" y2="250" stroke="var(--ink2)" stroke-dasharray="3 3"/>`;
+  [[f1(r,D),"var(--muted)"],[fi(r,D),"var(--v)"],[ft(r,D,K),"var(--q)"]].forEach(([y,c])=>{if(isFinite(y)&&y<=ymax)g+=`<circle cx="${X(r)}" cy="${Y(y)}" r="5" fill="${c}"/>`;});
+  svg.innerHTML=g;
+  const s1=f1(r,D),si=fi(r,D),st=ft(r,D,K),f=v=>isFinite(v)?`<b>${fx(v*1000,1)} ms</b>`:`<b style="color:var(--bad)">unstable</b>`;
+  const best=Math.min(si,st);const w=!isFinite(best)?"neither":(st<si?"tensor (intra-op)":"pipeline (inter-op)");
+  info.innerHTML=`At R = ${fx(r,1)} req/s: one GPU ${f(s1)}, 2 GPUs pipeline ${f(si)}, 2 GPUs tensor ${f(st)}. Better here: <b>${w}</b>. Capacities: 1 GPU ${fx(1/D,1)}, tensor ${fx(K/D,1)}, pipeline ${fx(2/D,1)} req/s.`;
+  R.dataset.pdQ=[s1,si,st].map(v=>isFinite(v)?fx(v*1000,1):"inf").join(",");}
+ [Ds,Ks,Rs].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 4: P:D ratio ---------- */
+(function(){
+ const svg=$("#pd-ratio-svg");if(!svg)return;const ids=["np","nd","rp","rd","co"],E={};ids.forEach(k=>E[k]=$("#pd-ratio-"+k));const info=$("#pd-ratio-info");
+ function draw(){const np=+E.np.value,nd=+E.nd.value,rp=+E.rp.value,rd=+E.rd.value,co=+E.co.value;
+  E.np.nextElementSibling.value=np;E.nd.nextElementSibling.value=nd;E.rp.nextElementSibling.value=fx(rp,1);E.rd.nextElementSibling.value=fx(rd,1);E.co.nextElementSibling.value=fx(co,1);
+  const cp=np*rp,cd=nd*rd,sys=Math.min(cp,cd),pg=sys/(np+nd);
+  let bestR=null;for(let a=1;a<=8;a++)for(let b=1;b<=8;b++){const v=Math.min(a*rp,b*rd)/(a+b);if(!bestR||v>bestR[0]+1e-12)bestR=[v,a,b];}
+  const cmax=Math.max(cp,cd,1),X=v=>170+v/cmax*340;let g="";
+  const bar=(y,lab,v,c,bott)=>`<text x="160" y="${y+15}" text-anchor="end" font-size="12.5" fill="var(--ink2)">${lab}</text><rect x="170" y="${y}" width="${(X(v)-170).toFixed(1)}" height="20" fill="${c}" opacity=".8" ${bott?'stroke="var(--ink)" stroke-width="2.5"':""}/><text x="${(X(v)+6).toFixed(1)}" y="${y+15}" font-size="12.5" font-weight="${bott?700:400}" fill="var(--ink)">${fx(v,1)} req/s${bott?" (bottleneck)":""}</text>`;
+  g+=`<text x="10" y="18" font-size="12.5" class="svgs">pool capacity</text>`;
+  g+=bar(26,`prefill: ${np} × ${fx(rp,1)}`,cp,"var(--k)",cp<=cd)+bar(54,`decode: ${nd} × ${fx(rd,1)}`,cd,"var(--q)",cd<cp);
+  const gm=Math.max(pg,co,bestR[0]),GX=v=>170+v/gm*360;
+  g+=`<text x="10" y="106" font-size="12.5" class="svgs">goodput per GPU</text>`;
+  const gb=(y,lab,v,c)=>`<text x="160" y="${y+15}" text-anchor="end" font-size="12.5" fill="var(--ink2)">${lab}</text><rect x="170" y="${y}" width="${(GX(v)-170).toFixed(1)}" height="20" fill="${c}" opacity=".85"/><text x="${(GX(v)+6).toFixed(1)}" y="${y+15}" font-size="12.5" font-weight="700" fill="var(--ink)">${fx(v,2)}</text>`;
+  g+=gb(114,`this split (${np}:${nd})`,pg,"var(--v)")+gb(142,"colocated",co,"var(--muted)")+gb(170,`best split (${bestR[1]}:${bestR[2]})`,bestR[0],"var(--v)");
+  svg.innerHTML=g;
+  info.innerHTML=`System rate = min(${fx(cp,1)}, ${fx(cd,1)}) = <b>${fx(sys,1)} req/s</b> on ${np+nd} GPUs = <b>${fx(pg,2)} req/s per GPU</b>, ${fx(pg/co,2)}× the colocated ${fx(co,1)}. Ideal ratio  n<sub>P</sub>/n<sub>D</sub> = r<sub>D</sub>/r<sub>P</sub> = ${fx(rd/rp,2)}; the best split with up to 8 GPUs per pool is ${bestR[1]}:${bestR[2]} (${fx(bestR[0],2)} per GPU). ${cp<cd?`Decode capacity ${fx(cd-cp,1)} req/s is idle.`:cd<cp?`Prefill capacity ${fx(cp-cd,1)} req/s is idle.`:"Both pools are fully used."}`;
+  R.dataset.pdRatio=[fx(pg,2),bestR[1]+":"+bestR[2]].join(",");}
+ ids.forEach(k=>E[k].addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 5: KV transfer timeline ---------- */
+(function(){
+ const svg=$("#pd-kv-svg");if(!svg)return;const S=$("#pd-kv-s"),info=$("#pd-kv-info");
+ const M={"8b":{n:"Llama 3.1 8B",P:8.03e9,L:32,d:4096,kvh:8,hd:128,g:1},"70b":{n:"Llama 3.1 70B",P:70.55e9,L:80,d:8192,kvh:8,hd:128,g:8},"opt":{n:"OPT-66B",P:65.7e9,L:64,d:9216,kvh:72,hd:128,g:8}};
+ let mk="70b",bytes=2,mode="layer",bw=400;
+ function draw(){const m=M[mk],s=+S.value;$("#pd-kv-sv").value=s;
+  const kappa=2*m.L*m.kvh*m.hd*bytes,MKV=s*kappa,tp=(2*m.P*s+2*m.L*s*s*m.d)/(m.g*PEAK*MFU),tx=MKV/(bw*1e9);
+  const tl=tp/m.L,xl=tx/m.L;const xs=[];let end=0;
+  if(mode==="layer"){for(let i=1;i<=m.L;i++){const st=Math.max(i*tl,end);end=st+xl;xs.push([st,end]);}}else{end=tp;for(let i=1;i<=m.L;i++){const st=end;end=st+xl;xs.push([st,end]);}}
+  const extra=end-tp,total=end,X=v=>110+v/(total*1.04)*630;
+  let g=`<text x="102" y="42" text-anchor="end" font-size="12.5" fill="var(--ink2)">prefill</text><text x="102" y="86" text-anchor="end" font-size="12.5" fill="var(--ink2)">KV on wire</text>`;
+  for(let i=0;i<m.L;i++){const a=X(i*tl),b=X((i+1)*tl);g+=`<rect x="${a.toFixed(2)}" y="26" width="${Math.max(0.5,b-a-0.4).toFixed(2)}" height="26" fill="var(--k)" opacity="${i%2?0.75:0.95}"/>`;}
+  xs.forEach(([a,b],i)=>{g+=`<rect x="${X(a).toFixed(2)}" y="70" width="${Math.max(0.5,X(b)-X(a)-0.3).toFixed(2)}" height="26" fill="var(--v)" opacity="${i%2?0.7:0.95}"/>`;});
+  if(extra>0)g+=`<rect x="${X(tp).toFixed(1)}" y="104" width="${Math.max(1.5,X(total)-X(tp)).toFixed(1)}" height="10" fill="var(--bad)"/><text x="${X(total).toFixed(1)}" y="130" text-anchor="end" font-size="12" fill="var(--bad)">+${ms(extra)} after prefill</text>`;
+  g+=`<line x1="${X(tp)}" y1="18" x2="${X(tp)}" y2="118" stroke="var(--ink2)" stroke-dasharray="3 3"/><text x="${X(tp)}" y="14" text-anchor="middle" font-size="11.5" fill="var(--ink2)">prefill ends</text>`;
+  [0,0.25,0.5,0.75,1].forEach(f=>{const v=f*total*1.04;g+=`<text x="${X(v)}" y="160" text-anchor="${f===1?"end":f===0?"start":"middle"}" font-size="11" class="svgs">${f===0?"0":ms(v)}</text>`;});
+  g+=`<text x="110" y="186" font-size="12" class="svgs">${m.L} layers; KV per token κ = ${(kappa/1024).toLocaleString("en-US",{maximumFractionDigits:1})} KiB</text>`;
+  svg.innerHTML=g;
+  R.dataset.pdKv=[fx(MKV/1e9,3),fx(tp*1e3,1),fx(tx*1e3,2),fx(extra*1e3,3)].join(",");
+  info.innerHTML=`${m.n}, ${s.toLocaleString("en-US")} tokens: KV cache <b>${fx(MKV/1e9,2)} GB</b>. Prefill on ${m.g} GPU${m.g>1?"s":""}: <b>${ms(tp)}</b>. Transfer at ${bw} GB/s: <b>${ms(tx)}</b> (${fx(100*tx/tp,1)}% of the prefill). ${mode==="layer"?"Layer-wise":"Serialized"}: the decode side can start <b>${ms(Math.max(0,extra))}</b> after the prefill ends${mode==="layer"?` (serialized would add ${ms(tx)})`:""}.`;}
+ seg($("#pd-kv-m"),v=>{mk=v;draw();});seg($("#pd-kv-t"),v=>{bytes=+v;draw();});seg($("#pd-kv-o"),v=>{mode=v;draw();});seg($("#pd-kv-l"),v=>{bw=+v;draw();});
+ S.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 6: SpotServe device mapping ---------- */
+(function(){
+ const svg=$("#pd-spot-svg");if(!svg)return;const tbl=$("#pd-spot-tbl"),info=$("#pd-spot-info");
+ const INST={1:["A",0,24],2:["A",24,48],3:["B",0,24],4:["B",24,48]},GBL=40/48,NET=6.25,GRACE=30;let pre=1,P=3;
+ const ov=(a0,a1,b0,b1)=>Math.max(0,Math.min(a1,b1)-Math.max(a0,b0));
+ const perms=a=>a.length<=1?[a]:a.flatMap((x,i)=>perms(a.slice(0,i).concat(a.slice(i+1))).map(r=>[x].concat(r)));
+ function positions(){return P===3?[["S1",0,16],["S2",16,32],["S3",32,48]]:[["S1",0,24],["S2",24,48],["idle",0,0]];}
+ function draw(){const pos=positions(),sv=[1,2,3,4].filter(i=>i!==pre);
+  const rows=perms(sv).map(pm=>{let reuse=0,need=0;pm.forEach((i,k)=>{const[,a,b]=INST[i],[,c,d]=pos[k];reuse+=ov(a,b,c,d);need+=d-c;});return{pm,reuse,load:need-reuse};});
+  const naive=rows.find(r=>r.pm.join()===sv.join());let best=rows[0];rows.forEach(r=>{if(r.reuse>best.reuse)best=r;});if(naive.reuse===best.reuse)best=naive;
+  /* svg */
+  let g=`<text x="10" y="18" font-size="12.5" class="svgs">before: 2 pipelines (A, B) × 2 stages. Click an instance to preempt it.</text>`;
+  [1,2,3,4].forEach((i,k)=>{const[pl,a,b]=INST[i],x=14+k*155,gone=i===pre;
+   g+=`<g class="pd-inst" data-i="${i}" tabindex="0" role="button" aria-label="Preempt instance ${i}"><rect x="${x}" y="28" width="140" height="52" rx="8" fill="${gone?"var(--bad)":"var(--q)"}" opacity="${gone?0.25:0.22}" stroke="${gone?"var(--bad)":"var(--q)"}" stroke-width="2"/><text x="${x+70}" y="48" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">#${i} · pipeline ${pl}</text><text x="${x+70}" y="68" text-anchor="middle" font-size="12" fill="${gone?"var(--bad)":"var(--ink2)"}">${gone?"preempted":"layers "+a+"–"+(b-1)}</text></g>`;});
+  g+=`<text x="10" y="118" font-size="12.5" class="svgs">after (best matching): ${P===3?"1 pipeline × 3 stages of 16 layers":"1 pipeline × 2 stages of 24 layers, one instance idle"}</text>`;
+  pos.forEach(([nm,c,d],k)=>{const x=14+k*205,i=best.pm[k],[,a,b]=INST[i],r=ov(a,b,c,d),need=d-c;
+   g+=`<rect x="${x}" y="128" width="190" height="62" rx="8" fill="var(--v)" opacity=".18" stroke="var(--v)" stroke-width="1.6"/><text x="${x+95}" y="148" text-anchor="middle" font-size="13" font-weight="700" fill="var(--ink)">${nm==="idle"?"idle":nm+": layers "+c+"–"+(d-1)}</text><text x="${x+95}" y="166" text-anchor="middle" font-size="12" fill="var(--ink2)">← instance #${i}</text><text x="${x+95}" y="183" text-anchor="middle" font-size="12" fill="${need-r>0?"var(--bad)":"var(--ink2)"}">${nm==="idle"?"no work":"reuses "+r+", loads "+(need-r)}</text>`;});
+  g+=`<text x="10" y="218" font-size="12" class="svgs">0.83 GB per layer (40 GB / 48 layers), loaded at ${NET} GB/s</text>`;
+  svg.innerHTML=g;
+  svg.querySelectorAll(".pd-inst").forEach(el=>{const go=()=>{pre=+el.dataset.i;draw();};el.addEventListener("click",go);el.addEventListener("keydown",e=>{if(e.key==="Enter"||e.key===" "){e.preventDefault();go();}});});
+  /* table */
+  let h=`<thead><tr><th>assignment (${pos.map(p=>p[0]).join(", ")})</th><th>layers reused</th><th>layers to load</th><th>GB</th><th>load time</th></tr></thead><tbody>`;
+  rows.forEach(r=>{const cls=(r===best?"best":"")+(r===naive?" naive":"");h+=`<tr class="${cls.trim()}"><td>${r.pm.map(i=>"#"+i).join(", ")}${r===naive?" (naive)":""}${r===best?" ✓ best":""}</td><td>${r.reuse}</td><td>${r.load}</td><td>${fx(r.load*GBL,2)}</td><td>${fx(r.load*GBL/NET,2)} s</td></tr>`;});
+  tbl.innerHTML=h+"</tbody>";
+  const tb=best.load*GBL/NET,tn=naive.load*GBL/NET;
+  info.innerHTML=`Instance #${pre} is preempted. Naive mapping loads <b>${naive.load} layers</b> (${fx(naive.load*GBL,2)} GB, ${fx(tn,2)} s); the matching of equation 137.8 loads <b>${best.load}</b> (${fx(best.load*GBL,2)} GB, ${fx(tb,2)} s). Of the ${GRACE} s grace period, <b>${fx(GRACE-tb,2)} s</b> are left for decode steps before the switch (equation 137.9).`;
+  R.dataset.pdSpot=[naive.load,best.load,fx(tb,2)].join(",");}
+ seg($("#pd-spot-p"),v=>{P=+v;draw();});draw();
+})();
+})();
+</script></body></html>

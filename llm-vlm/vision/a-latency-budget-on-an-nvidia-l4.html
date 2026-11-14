@@ -1,0 +1,544 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover"><script async src="https://www.googletagmanager.com/gtag/js?id=G-53VVZJP7VJ"></script><script>window["ga-disable-G-53VVZJP7VJ"]=navigator.doNotTrack==="1"||window.doNotTrack==="1";window.dataLayer=window.dataLayer||[];function gtag(){dataLayer.push(arguments);}gtag("js",new Date());gtag("config","G-53VVZJP7VJ");</script><title>A latency budget on an NVIDIA L4: worked example · LLM and VLM course</title><link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin><link href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&family=Source+Serif+4:ital,opsz,wght@0,8..60,400..700;1,8..60,400..700&display=swap" rel="stylesheet"><link rel="stylesheet" href="../assets/book.css?v=a58121b2"><script src="../assets/book.js?v=a58121b2"></script></head><body><header class="topbar"><div class="topbar-in"><a class="brand" href="../index.html"><svg viewBox="0 0 32 32" aria-hidden="true"><rect x="3" y="5" width="26" height="6" rx="3" fill="var(--t1)"/><rect x="3" y="13" width="20" height="6" rx="3" fill="var(--t5)"/><rect x="3" y="21" width="14" height="6" rx="3" fill="var(--t7)"/></svg><span>LLM &amp; VLM course</span></a><nav class="crumbs" aria-label="Breadcrumb"><span class="sep">/</span><a href="../vision/index.html">Vision and VLMs</a><span class="sep">/</span><span>Session 199</span></nav><span class="tb-sp"></span><button type="button" class="ibtn toc-btn">Contents</button><a class="ibtn" href="/">Blog</a><button type="button" class="ibtn" data-theme-toggle aria-label="Switch light or dark theme">◐</button></div><div class="readbar"></div></header><div class="layout"><aside class="toc" aria-label="Contents"><h4>In this session</h4><ol class="toc-list"></ol><div class="done-box"><button type="button" class="btn" data-done="a-latency-budget-on-an-nvidia-l4">Mark this session as done</button></div></aside><main class="book-main"><article class="article" data-slug="a-latency-budget-on-an-nvidia-l4" data-session="a-latency-budget-on-an-nvidia-l4" style="--tc:var(--t7)"><header class="chap-head"><div class="chap-kicker"><span class="num">199</span><span>Track 7: Vision and VLMs · session 37 of 38</span></div><h1 class="chap-title">A latency budget on an NVIDIA L4: worked example</h1><p class="chap-sub">Can a 7B vision-language model answer photo questions in under 4 seconds on one NVIDIA L4? This session answers with a pencil: count the visual tokens, estimate the vision encoder, prefill and decode with the roofline, then choose resolution, frames, quantization and batch size to meet the budget. It ends by showing how one real measurement corrects the estimate.</p><div class="meta-row"><span><b>Time:</b> 2 to 3 hours (reading 1.5 hours, exercises 1 hour)</span><span><b>Level:</b> Intermediate</span><span><b>Before this:</b> Sessions on inference metrics (81), the roofline (82), batching (84, 135), the VLM inference path (196) and quantizing VLMs (197)</span></div><div class="learn"><h3>What you will learn</h3><ul><li>The inputs of a VLM latency budget: resized image size, frames, visual tokens, prompt and output length, load and targets</li><li>How to count Qwen2-VL visual tokens and estimate the vision encoder and prefill FLOPs, including the quadratic attention terms</li><li>Why the encoder and prefill are compute-bound and decode is bandwidth-bound on an L4, with TTFT, TPOT and end-to-end estimates</li><li>Which knob moves which term: resolution and frames, 4-bit weights against FP8, output length, and batch size</li><li>A closed-loop batching model to choose the batch size and the number of GPUs for a peak load</li><li>How to measure TTFT and TPOT, compute the implied efficiencies and re-plan</li></ul></div></header><style>
+.lb-grid{display:grid;grid-template-columns:auto 1fr auto;gap:6px 12px;align-items:center;font:500 15px var(--sans)}
+.lb-grid input[type=range]{width:100%}
+.lb-grid output{min-width:4.2em;text-align:right;font:500 14px var(--mono)}
+.lb-ctl{display:flex;flex-wrap:wrap;gap:8px 14px;align-items:center;font:500 14px var(--sans);color:var(--ink2);margin-bottom:8px}
+.lb-leg{display:flex;flex-wrap:wrap;gap:6px 18px;font:500 14px var(--sans);color:var(--ink2);margin-top:6px}
+.lb-leg span::before{content:"";display:inline-block;width:14px;height:14px;border-radius:3px;margin-right:6px;vertical-align:-2px;background:var(--c)}
+pre.code{font-variant-ligatures:none}
+@media (max-width:520px){.lb-grid{grid-template-columns:1fr auto}.lb-grid label{grid-column:1 / -1}}
+</style>
+
+<h2>Why this matters</h2>
+<p class="lead">A product manager asks: “Can we answer photo questions with a 7B vision-language model on one NVIDIA L4, in under 4 seconds?” You could rent the GPU, install a server and try. Or you could answer in ten minutes with a pencil. This session does the pencil version, one step at a time, with real numbers from the model’s config and the GPU’s datasheet. Then it shows how to check the pencil against a real measurement.</p>
+<aside class="note interview side"><span class="nt">Interview tip</span>System-design interviews for ML roles often contain this exact question: “Here is a model, a GPU and a latency target. Will it work? What would you change?” The interviewer wants a budget: numbers for each stage, the bottleneck of each stage, and the knob that moves it. A clear rough estimate beats a vague “it depends”.</aside>
+<p>A <b>latency budget</b> is a target time for one request, split into parts. Each part gets an estimate. If the sum is over the target, you change something and estimate again. This is how serving teams plan GPU purchases and choose model settings before they write code. [Likely]</p>
+<p>The previous sessions gave us all the pieces. <a href="../vision/the-vlm-inference-path.html">Session 196</a> followed one request through the vision encoder, the connector, prefill and decode. <a href="../vision/quantizing-vlms.html">Session 197</a> showed that the vision encoder and prefill are limited by compute, while decode is limited by memory bandwidth. <a href="../vision/serving-vlms-vllm-tensorrt-llm-and-the.html">Session 198</a> put a model behind a server such as vLLM. Here we join them into one calculation for one cheap GPU. In the next session, <a href="../vision/lab-serve-a-vlm-and-measure.html">session 200</a>, you run the server and measure the real numbers.</p>
+<p>Why the <b>L4</b>? It is a small, low-power data-center GPU (72 W, one slot) that is common in clouds for inference. It has a lot of compute for its price but little memory bandwidth. That makes the difference between compute-bound and bandwidth-bound stages very clear, so it is a good GPU for learning to budget.</p>
+
+<h2>The inputs: what you must know before you estimate</h2>
+<p>Write down six numbers before you compute anything. Most estimation mistakes come from a wrong input, not from wrong math.</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Input</th><th>Our example</th><th>Why it matters</th></tr></thead><tbody>
+<tr><td>Image size (after the model’s resize)</td><td>1280×960 photo, resized to 1288×952</td><td>sets the number of patches, so the encoder and prefill cost</td></tr>
+<tr><td>Number of images or video frames</td><td>1 image</td><td>multiplies the visual tokens</td></tr>
+<tr><td>Visual tokens</td><td>1,564</td><td>the LLM sees these in prefill; they also fill the KV cache</td></tr>
+<tr><td>Prompt text tokens</td><td>60 (system prompt, chat template, question)</td><td>small next to the image here</td></tr>
+<tr><td>Output tokens</td><td>128</td><td>each one is a full decode step</td></tr>
+<tr><td>Concurrency and load</td><td>2 requests per second at peak</td><td>sets the batch size and the number of GPUs</td></tr></tbody></table></div>
+<p>And the targets. We use a common pair of metrics (see <a href="../inference/inference-metrics-latency-memory-and-throughput.html">session 81</a>):</p>
+<ul>
+<li><b>TTFT</b> (time to first token): from the moment the request arrives until the first output token. The user sees “the model has started”. Target: <b>at most 1.0 s</b>, even in a burst.</li>
+<li><b>E2E</b> (end-to-end latency): until the last token. Target: <b>at most 4.0 s</b> for a 128-token answer.</li>
+<li><b>TPOT</b> (time per output token): the average time between output tokens after the first. It is not a target here, but E2E depends on it.</li></ul>
+
+<h3>The hardware: an NVIDIA L4</h3>
+<p>From NVIDIA’s datasheet [Certain]: 24 GB of memory, 300 GB/s memory bandwidth, 121 TFLOP/s for dense BF16 or FP16 on the tensor cores and 242 TFLOP/s for dense FP8. (The datasheet prints 242 and 485, which assume 2:4 sparsity; dense numbers are half of that.) The L4 is an Ada Lovelace GPU, so it has FP8 tensor cores, and vLLM supports FP8 W8A8 on it. [Certain]</p>
+<p>Nobody reaches the peak. We use two <b>efficiency factors</b>: \(\eta_c\), the fraction of peak compute that real kernels reach, and \(\eta_m\), the fraction of peak bandwidth. We start with \(\eta_c = 0.5\) and \(\eta_m = 0.8\). These are assumptions, not measurements. [Likely] Large matrix multiplies often reach 50–70% of peak and memory-bound kernels 70–90%; the L4’s low power limit may lower the compute number further. Section “Check the estimate” shows how to replace them with your own measured values.</p>
+<aside class="note numbers side"><span class="nt">Numbers</span>Effective L4 rates with our factors: \(0.5 \times 121 = 60.5\) TFLOP/s in BF16, 121 TFLOP/s in FP8, and \(0.8 \times 300 = 240\) GB/s. Ridge point (peak compute over peak bandwidth): \(121 / 0.3 = 403\) FLOPs per byte in BF16.</aside>
+
+<h3>The model: Qwen2-VL-7B-Instruct</h3>
+<p>We use the same model as in <a href="../vision/quantizing-vlms.html">session 197</a>. From its config.json [Certain]: the LLM has 28 layers, width 3,584, MLP width 18,944, 28 query heads and 4 KV heads of size 128, and a vocabulary of 152,064. The vision encoder is a ViT with 32 layers of width 1,280, patch size 14, and a merger that joins 2×2 patches into one token. For video it also joins 2 frames into one (temporal patch size 2). Counting the weights from these numbers:</p>
+<ul>
+<li>LLM linear layers: \(N_{\text{lin}} = 6.525\) B weights. Output layer (lm_head): \(N_{\text{head}} = 0.545\) B. Input embedding: another 0.545 B (not tied).</li>
+<li>Vision encoder linear layers: \(N_v = 0.631\) B. Merger: 0.045 B.</li>
+<li>KV cache: \(2 \times 28 \times 4 \times 128 \times 2 = 57{,}344\) bytes per token in BF16.</li></ul>
+
+<h2>Step 1: from pixels to visual tokens</h2>
+<p>Qwen2-VL first resizes each image so that both sides are multiples of 28 (patch 14 times merge 2). It rounds each side to the nearest multiple, within a minimum and maximum pixel count. [Certain] Then it cuts the image into 14×14 patches and the merger joins each 2×2 block into one visual token:</p>
+<div class="eq">\[ n_{p} \;=\; G \cdot \frac{H'}{14} \cdot \frac{W'}{14}, \qquad n_{\text{vis}} \;=\; \frac{n_p}{4}, \qquad G = \begin{cases} 1 & \text{one image} \\ F/2 & \text{video of } F \text{ frames} \end{cases} \tag{199.1} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(H', W'\)</dt><dd>height and width after the resize, both multiples of 28</dd>
+<dt>\(n_p\)</dt><dd>number of patches the vision encoder processes</dd>
+<dt>\(n_{\text{vis}}\)</dt><dd>number of visual tokens the LLM sees, after the 2×2 merge</dd>
+<dt>\(G\)</dt><dd>number of temporal groups. Two video frames become one group, so a 32-frame video gives 16 groups</dd></dl>
+<p>For our photo: 1280×960 becomes 1288×952 (46 and 34 blocks of 28). So \(n_p = 92 \times 68 = 6{,}256\) patches and \(n_{\text{vis}} = 1{,}564\) visual tokens. With 60 text tokens, the prompt has \(T = 1{,}624\) tokens. The image is 96% of the prompt. This is normal for VLMs, and it is why image size is the first knob of a VLM budget.</p>
+<aside class="note analogy side"><span class="nt">Analogy</span>A latency budget is like a travel plan for a trip with a fixed arrival time. You split the trip into legs (taxi, train, walk), estimate each leg from its distance and speed, and add them up. If you arrive too late, you do not “make everything faster”. You find the longest leg and change that leg: a faster train, or a closer hotel.</aside>
+
+<h2>Step 2: estimate each stage with the roofline</h2>
+<p>Every stage does some arithmetic and reads some bytes. Its time is at least the larger of the two limits (the <b>roofline</b> model, see <a href="../inference/why-inference-is-slow-three-root-causes.html">session 82</a>):</p>
+<div class="eq">\[ t_{\text{stage}} \;\approx\; \max\!\left( \frac{F}{\eta_c\, P},\; \frac{Q}{\eta_m\, B_w} \right) \tag{199.2} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(F\)</dt><dd>floating-point operations (FLOPs) of the stage</dd>
+<dt>\(Q\)</dt><dd>bytes the stage reads from GPU memory: weights, and the KV cache in the LLM</dd>
+<dt>\(P,\ B_w\)</dt><dd>peak compute (121 TFLOP/s in BF16) and peak bandwidth (300 GB/s) of the L4</dd>
+<dt>\(\eta_c,\ \eta_m\)</dt><dd>efficiency factors: the fraction of each peak that real kernels reach</dd></dl>
+
+<h3>The vision encoder</h3>
+<p>A linear layer with \(N\) weights costs \(2N\) FLOPs per token (one multiply and one add per weight). Attention adds a term that grows with the square of the sequence length. In the Qwen2-VL encoder, each temporal group attends only to its own patches (the code builds one attention segment per group). [Certain] So:</p>
+<div class="eq">\[ F_{\text{enc}} \;\approx\; 2\, N_v\, n_p \;+\; 4\, L_v\, d_v\, G \left(\frac{n_p}{G}\right)^{2} \tag{199.3} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(N_v\)</dt><dd>weights in the encoder’s linear layers: 0.631 B</dd>
+<dt>\(L_v,\ d_v\)</dt><dd>encoder layers (32) and width (1,280)</dd>
+<dt>\(4 L_v d_v (\cdot)^2\)</dt><dd>attention scores \(QK^\top\) and the weighted sum with \(V\): 2 FLOPs each per pair of patches per channel, in every layer</dd></dl>
+<p>For our photo: linear \(2 \times 0.631\text{ B} \times 6{,}256 = 7.89\) TFLOP, attention \(4 \times 32 \times 1{,}280 \times 6{,}256^2 = 6.41\) TFLOP, merger 0.14 TFLOP. Total 14.44 TFLOP. At 60.5 TFLOP/s: <b>239 ms</b>. The encoder reads only 1.35 GB of weights (5.6 ms), so it is compute-bound by a factor of about 40. Note the attention term: it grows with \(n_p^2\), so doubling both sides of the image multiplies it by 16.</p>
+
+<h3>Prefill</h3>
+<p>Prefill runs all \(T\) prompt tokens through the LLM in one pass:</p>
+<div class="eq">\[ F_{\text{pre}} \;\approx\; 2\, N_{\text{lin}}\, T \;+\; 2\, L\, d\, T^{2} \;+\; 2\, N_{\text{head}} \tag{199.4} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(T\)</dt><dd>prompt length in tokens: visual tokens plus text tokens</dd>
+<dt>\(L,\ d\)</dt><dd>LLM layers (28) and width (3,584)</dd>
+<dt>\(2 L d T^2\)</dt><dd>causal attention: like the encoder term, but each token only looks back, so half the pairs</dd>
+<dt>\(2 N_{\text{head}}\)</dt><dd>the lm_head runs only for the last prompt token, to produce the first output token</dd></dl>
+<p>For \(T = 1{,}624\): linear 21.19 TFLOP, attention 0.53 TFLOP, total 21.72 TFLOP. At 60.5 TFLOP/s: <b>359 ms</b>. Compute-bound again: the 14.1 GB of weights take 59 ms to read. Here attention is small, because the LLM is wide and the prompt is short.</p>
+<p>So the first token appears after:</p>
+<div class="eq">\[ \text{TTFT} \;\approx\; t_{\text{enc}} + t_{\text{pre}} \;=\; 239 + 359 \;=\; 598 \text{ ms} \tag{199.5} \]</div>
+<p>(We leave out the image download, JPEG decoding and resize on the CPU, and the network. They are real, so measure them; see the last section.)</p>
+
+<h3>Decode</h3>
+<p>Each new token needs one pass through the LLM. At batch size \(b\), the step reads all weights once and the KV cache of every request, and does \(2N\) FLOPs per weight for each of the \(b\) tokens:</p>
+<div class="eq">\[ \text{TPOT}(b) \;\approx\; \max\!\left( \frac{b \left(2 N_{\text{lin}} + 2 N_{\text{head}} + 4 L d \bar T\right)}{\eta_c\, P},\; \frac{\tfrac{\beta}{8} N_{\text{lin}} + 2 N_{\text{head}} + b\, k\, \bar T}{\eta_m\, B_w} \right) \tag{199.6} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\beta\)</dt><dd>bits per LLM linear weight: 16 in BF16, 8 in FP8, 4.25 for 4-bit AWQ with group size 128 (the scales add 0.25 bit)</dd>
+<dt>\(2 N_{\text{head}}\)</dt><dd>bytes of the lm_head, kept in BF16</dd>
+<dt>\(k\)</dt><dd>KV-cache bytes per token: 57,344 for this model</dd>
+<dt>\(\bar T\)</dt><dd>average context length during decode: the prompt plus half the output, \(1{,}624 + 64 = 1{,}688\)</dd></dl>
+<p>In BF16 at \(b = 1\): the step reads \(14.14 + 0.10 = 14.24\) GB, so <b>59.3 ms per token</b>. The compute side is only 0.24 ms. Decode is bandwidth-bound by a factor of about 250. The whole answer:</p>
+<div class="eq">\[ \text{E2E} \;\approx\; \text{TTFT} + N_{\text{out}} \cdot \text{TPOT} \;=\; 0.60 + 128 \times 0.0593 \;=\; 8.19 \text{ s} \tag{199.7} \]</div>
+<p>Over the 4.0 s target by a factor of two. And 93% of the time is decode. The image, which looked like the big cost, is not the problem here.</p>
+
+<figure class="fig wide" id="lb-tl"><div class="fig-body">
+<div class="controls"><button type="button" class="btn" id="lb-tl-prev">Back</button><button type="button" class="btn primary" id="lb-tl-play">Play</button><button type="button" class="btn" id="lb-tl-next">Next</button><span id="lb-tl-lab" style="font:500 14px var(--sans);color:var(--muted)"></span></div>
+<div class="scroll-x"><svg id="lb-tl-svg" viewBox="0 0 640 230" role="img" aria-label="Timeline of one request on an L4: encoder, prefill and decode, against the TTFT and end-to-end targets"></svg></div>
+<div class="lb-leg"><span style="--c:var(--k)">vision encoder</span><span style="--c:var(--q)">prefill</span><span style="--c:var(--v)">decode (128 tokens)</span></div>
+<div class="readout" id="lb-tl-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 1.</b> The worked example as a timeline. One request to Qwen2-VL-7B on one L4: a 1280×960 photo, 60 text tokens, 128 output tokens, batch size 1, with \(\eta_c = 0.5\) and \(\eta_m = 0.8\). Each step adds one stage or applies one change. All bars are estimates from formulas (199.2)–(199.7).</figcaption>
+<details class="howto"><summary>How to read Figure 1</summary><p>Time runs from left to right. The two dashed lines are the targets: TTFT at 1.0 s and E2E at 4.0 s. Steps 1–3 build the BF16 estimate: the first token comes at 0.60 s (fine), but the answer ends at 8.19 s. Step 4 switches the LLM weights to 4-bit: only the green decode bar shrinks, to 3.08 s in total. Step 5 lowers the image to 896×672: now the orange (encoder) and dark red (prefill) bars shrink, and the total is 2.73 s. Each change moves the stage it targets, and only that stage.</p></details></figure>
+
+<h2>Step 3: choose the knobs</h2>
+<p>Now we have four knobs. Each one acts on a different term of the budget:</p>
+<div class="tblw"><table class="tb"><thead><tr><th>Knob</th><th>Moves</th><th>Effect in our example</th><th>Cost</th></tr></thead><tbody>
+<tr><td>Image resolution</td><td>encoder (\(\propto n_p\) and \(n_p^2\)), prefill (\(\propto T\)), KV cache</td><td>1288×952 → 896×672: TTFT 598 → 272 ms</td><td>small text and small objects get harder to read [Likely]</td></tr>
+<tr><td>Number of frames (video)</td><td>same as resolution, times \(G\)</td><td>32 frames at 448×448: 4,096 visual tokens, TTFT 1.35 s</td><td>short events can fall between frames</td></tr>
+<tr><td>LLM weight precision</td><td>decode bytes; FP8 also doubles prefill compute</td><td>BF16 → 4-bit: TPOT 59.3 → 19.4 ms</td><td>a small quality risk; test it (<a href="../vision/quantizing-vlms.html">session 197</a>)</td></tr>
+<tr><td>Batch size</td><td>throughput; adds waiting time per request</td><td>see Step 4</td><td>each request waits for the others’ prefill</td></tr>
+<tr><td>Output length</td><td>number of decode steps</td><td>128 → 96 tokens: E2E 2.73 → 2.11 s</td><td>shorter answers; set by the prompt or <code>max_tokens</code></td></tr></tbody></table></div>
+<p>The precision options behave very differently on the L4, and this is the most useful lesson of the whole page:</p>
+<ul>
+<li><b>4-bit weights, 16-bit activations (W4A16, e.g. AWQ).</b> Decode reads 4.25 bits per weight: 4.56 GB per step instead of 14.14 GB, so TPOT drops from 59.3 to 19.4 ms. The multiplications still run in FP16, so prefill does not get faster. (Real 4-bit kernels can even make prefill a little slower, because they also unpack the weights. [Likely])</li>
+<li><b>FP8 weights and activations (W8A8).</b> Decode reads 1 byte per weight: 7.62 GB, so TPOT is 32.1 ms. But the tensor cores run FP8 at twice the BF16 rate, so the LLM part of prefill halves: 359 → 184 ms.</li>
+<li>So: <b>W4A16 wins when decode dominates</b> (long answers, few images). <b>FP8 wins when prefill dominates</b> (many images, video, long documents, short answers). With our 128-token answers, W4A16 is the right choice.</li></ul>
+<p>Our first plan: 4-bit LLM weights (vision encoder stays BF16), images resized to 896×672. That gives \(n_{\text{vis}} = 32 \times 24 = 768\) tokens, \(T = 828\), \(F_{\text{enc}} = 5.49\) TFLOP (91 ms), \(F_{\text{pre}} = 10.94\) TFLOP (181 ms), TTFT 272 ms, TPOT 19.2 ms, E2E <b>2.73 s</b>. It passes, for one user at a time. Try the knobs in Figure 2.</p>
+
+<figure class="fig wide" id="lb-plan"><div class="fig-body">
+<div class="lb-ctl"><span>Model</span><span class="seg" id="lb-plan-model"><button type="button" data-m="7B" aria-pressed="true">Qwen2-VL-7B</button><button type="button" data-m="2B" aria-pressed="false">Qwen2-VL-2B</button></span></div>
+<div class="lb-ctl"><span>LLM weights</span><span class="seg" id="lb-plan-prec"><button type="button" data-p="bf16" aria-pressed="true">BF16</button><button type="button" data-p="fp8" aria-pressed="false">FP8 W8A8</button><button type="button" data-p="w4" aria-pressed="false">4-bit W4A16</button></span></div>
+<div class="lb-grid">
+<label for="lb-plan-res">Long side of each image or frame (4:3)</label><input type="range" id="lb-plan-res" min="0" max="10" step="1" value="7"><output id="lb-plan-resv"></output>
+<label for="lb-plan-fr">Images: 1 photo, or video frames</label><input type="range" id="lb-plan-fr" min="0" max="6" step="1" value="0"><output id="lb-plan-frv"></output>
+<label for="lb-plan-txt">Prompt text tokens</label><input type="range" id="lb-plan-txt" min="20" max="1000" step="20" value="60"><output id="lb-plan-txtv"></output>
+<label for="lb-plan-out">Output tokens</label><input type="range" id="lb-plan-out" min="16" max="512" step="16" value="128"><output id="lb-plan-outv"></output>
+<label for="lb-plan-b">Concurrent requests b</label><input type="range" id="lb-plan-b" min="1" max="16" step="1" value="1"><output id="lb-plan-bv"></output></div>
+<div class="scroll-x"><svg id="lb-plan-svg" viewBox="0 0 640 250" role="img" aria-label="Estimated time and memory of a request on an L4, against the targets"></svg></div>
+<div class="readout" id="lb-plan-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 2.</b> A budget calculator for an L4 (formulas 199.1–199.11), with \(\eta_c = 0.5\), \(\eta_m = 0.8\). The vision encoder always runs in BF16. Images keep a 4:3 shape; video frames are square. With \(b \gt 1\), the bars show the closed-loop model of Step 4: each request also waits for the prefills of the other \(b - 1\) requests. Memory is weights plus the KV cache at the end of all \(b\) answers, against 90% of 24 GB.</figcaption>
+<details class="howto"><summary>How to read Figure 2</summary><p>The top bar is the time of one request, split into encoder (orange), prefill (dark red) and decode (green); the dashed lines are the 1.0 s TTFT and 4.0 s E2E targets. The bottom bar is GPU memory. Start at the defaults (BF16, 1288×952): 8.19 s. Click 4-bit: 3.08 s. Lower the resolution to 896: 2.73 s. Then set the long side to 448 and choose 32 frames (square 448×448 frames): TTFT jumps over 1 s, because 4,096 visual tokens must be encoded and prefilled; now click FP8 and see TTFT fall to 0.90 s while decode gets slower. Try the 2B model too: its decode is fast, and the encoder (the same 0.63 B ViT) becomes the largest part of TTFT.</p></details></figure>
+
+<div class="worked"><div class="wt">Worked example: the same photo on Qwen2-VL-2B</div>
+<p>The 2B model has the same vision encoder, so \(t_{\text{enc}}\) is still 238 ms at 1288×952. Its LLM is much smaller: width 1,536, MLP width 8,960, 2 KV heads, tied embeddings. So \(N_{\text{lin}} = 1.310\) B and \(N_{\text{head}} = 0.233\) B. Prefill: 4.48 TFLOP, 74 ms. TTFT = 312 ms. Decode in BF16: \(2 \times (1.310 + 0.233) = 3.09\) GB plus 0.05 GB of KV per step, so 13.1 ms per token. E2E = \(0.31 + 128 \times 0.0131 = 1.98\) s, even in BF16 and at full resolution. For a small VLM, the vision encoder is 76% of TTFT. This is why small VLMs try hard to cut visual tokens or use smaller encoders (<a href="../vision/visual-token-efficiency.html">session 183</a>).</p></div>
+
+<div class="algo"><div class="algo-h">Algorithm 1: a latency budget for one VLM request</div><ol>
+<li><b>input:</b> model config, GPU peaks \(P, B_w\), factors \(\eta_c, \eta_m\), image size, frames, text tokens, output tokens, targets</li>
+<li>resize as the model does; \(n_p, n_{\text{vis}} \leftarrow\) formula (199.1); \(T \leftarrow n_{\text{vis}} + n_{\text{text}}\)</li>
+<li>\(t_{\text{enc}} \leftarrow \max(F_{\text{enc}}/\eta_c P,\ Q_{\text{enc}}/\eta_m B_w)\) <span class="c">// (199.3); compute-bound</span></li>
+<li>\(t_{\text{pre}} \leftarrow \max(F_{\text{pre}}/\eta_c P,\ Q_{\text{pre}}/\eta_m B_w)\) <span class="c">// (199.4); use the FP8 rate for FP8 layers</span></li>
+<li>\(\text{TPOT} \leftarrow\) formula (199.6) at the planned batch size <span class="c">// bandwidth-bound at small b</span></li>
+<li>\(\text{TTFT} \leftarrow t_{\text{enc}} + t_{\text{pre}}\); \(\text{E2E} \leftarrow \text{TTFT} + N_{\text{out}}\,\text{TPOT}\)</li>
+<li>check memory: weights + KV cache \(\le\) usable memory (199.9)</li>
+<li><b>while</b> a target fails: find the largest term; apply the knob for that term (resolution or frames for encoder and prefill; precision or output length for decode; FP8 for compute-bound prefill); go to step 2</li>
+<li><b>return</b> the plan and its estimated TTFT, TPOT, E2E and memory</li></ol></div>
+
+<h2>Step 4: batch size, throughput and the number of GPUs</h2>
+<p>One request at a time wastes the GPU. During decode at \(b = 1\), the tensor cores are idle more than 99% of the time, waiting for weights. If 3 requests decode together, the GPU reads the weights once for all 3. So the step costs almost the same, and we get 3 tokens instead of 1. Figure 3 shows this on the L4’s roofline. The arithmetic intensity (FLOPs per byte read) of a decode step is about:</p>
+<div class="eq">\[ I_{\text{dec}}(b) \;\approx\; \frac{2\, b\, N}{\tfrac{\beta}{8} N + b\, k\, \bar T} \;\;\xrightarrow{\;k \bar T \,\ll\, N\;}\;\; \frac{16\, b}{\beta} \tag{199.8} \]</div>
+<p>Decode becomes compute-bound only when \(I_{\text{dec}}\) passes the ridge point of 403. For BF16 weights (\(\beta = 16\)), that needs \(b \approx 403\); for 4-bit weights, \(b \approx 107\), ignoring the KV cache. Long before that, the KV-cache term in the denominator grows and holds the intensity down. So for a VLM on an L4, decode is bandwidth-bound at every batch size you will use.</p>
+
+<figure class="fig" id="lb-roof"><div class="fig-body">
+<div class="lb-ctl"><span>LLM weights</span><span class="seg" id="lb-roof-prec"><button type="button" data-p="bf16" aria-pressed="true">BF16</button><button type="button" data-p="fp8" aria-pressed="false">FP8</button><button type="button" data-p="w4" aria-pressed="false">4-bit</button></span></div>
+<div class="lb-grid"><label for="lb-roof-b">Decode batch size b</label><input type="range" id="lb-roof-b" min="0" max="9" step="1" value="0"><output id="lb-roof-bv"></output></div>
+<div class="scroll-x"><svg id="lb-roof-svg" viewBox="0 0 640 330" role="img" aria-label="Roofline of the L4 with the encoder, prefill and decode of a Qwen2-VL-7B request"></svg></div>
+<div class="readout" id="lb-roof-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 3.</b> Roofline of the L4 (log–log), at peak: attainable FLOP/s = min(\(P\), \(I \cdot B_w\)). Points: the vision encoder and prefill of the 896×672 plan, and one decode step of Qwen2-VL-7B at batch size \(b\) (context \(\bar T = 892\) tokens per request). The FP8 roof (242 TFLOP/s) is drawn for the FP8 setting.</figcaption>
+<details class="howto"><summary>How to read Figure 3</summary><p>The sloped line is the bandwidth limit, the flat line the compute limit; they meet at the ridge point (403 FLOPs per byte in BF16). A point left of the ridge is bandwidth-bound: moving it right (more FLOPs per byte) makes it faster in FLOP/s. The encoder and prefill sit far to the right: compute-bound. Decode at \(b = 1\) sits at intensity 1.0 in BF16 (3.1 with 4-bit weights). Raise \(b\): the decode point moves up the slope, so the GPU does more useful work per second, but even at \(b = 256\) it stays left of the ridge.</p></details></figure>
+
+<p>What does batching cost each user? With continuous batching (<a href="../inference/batching-continuous-batching-chunked-prefill-split-fuse.html">session 135</a>), a new request’s prefill runs between decode steps, and while it runs, everyone else’s decode waits. A simple model is a <b>closed loop</b>: \(b\) requests are always in flight, and each one, during its life, sees the prefill of all \(b\) requests (its own and the others’) and all \(N_{\text{out}}\) shared decode steps:</p>
+<div class="eq">\[ \text{E2E}(b) \;\approx\; b\, t_{\text{pf}} + N_{\text{out}}\, \text{TPOT}(b), \qquad X(b) \;=\; \frac{b}{\text{E2E}(b)}, \qquad \text{TTFT}_{\text{burst}} \;\approx\; b\, t_{\text{pf}} \tag{199.9} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(t_{\text{pf}}\)</dt><dd>GPU time for the encoder plus prefill of one request: the TTFT at \(b = 1\)</dd>
+<dt>\(X(b)\)</dt><dd>throughput: finished requests per second on one GPU</dd>
+<dt>\(\text{TTFT}_{\text{burst}}\)</dt><dd>worst case: \(b\) requests arrive at the same moment, and the last one waits for all prefills</dd></dl>
+<p>This is a rough, pessimistic model. [Likely] Chunked prefill (Sarathi-Serve) mixes prefill pieces into decode steps, and because decode leaves the tensor cores mostly idle, part of the prefill work hides there. Real E2E at \(b \gt 1\) is often somewhat better. But the model has the right shape, and it is easy to compute. The number of GPUs for a peak load \(\lambda\) is then:</p>
+<div class="eq">\[ n_{\text{GPU}} \;=\; \left\lceil \frac{\lambda}{X(b^{*})} \right\rceil, \qquad b^{*} = \max\{\, b : \text{E2E}(b) \le 4\text{ s},\ \text{TTFT}_{\text{burst}}(b) \le 1\text{ s},\ \text{memory fits} \,\} \tag{199.10} \]</div>
+
+<figure class="fig" id="lb-batch"><div class="fig-body">
+<div class="lb-ctl"><span>Plan</span><span class="seg" id="lb-batch-plan"><button type="button" data-k="w4-896" aria-pressed="true">4-bit, 896×672</button><button type="button" data-k="w4-1288" aria-pressed="false">4-bit, 1288×952</button><button type="button" data-k="fp8-896" aria-pressed="false">FP8, 896×672</button><button type="button" data-k="bf16-896" aria-pressed="false">BF16, 896×672</button></span></div>
+<div class="lb-grid"><label for="lb-batch-lam">Peak load λ (requests per second)</label><input type="range" id="lb-batch-lam" min="0.5" max="10" step="0.5" value="2"><output id="lb-batch-lamv"></output></div>
+<div class="scroll-x"><svg id="lb-batch-svg" viewBox="0 0 640 300" role="img" aria-label="End-to-end latency, burst TTFT and throughput against batch size on one L4"></svg></div>
+<div class="lb-leg"><span style="--c:var(--v)">E2E(b)</span><span style="--c:var(--q)">TTFT in a burst</span><span style="--c:var(--k)">throughput X(b), right axis</span></div>
+<div class="readout" id="lb-batch-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 4.</b> The closed-loop model (199.9) for Qwen2-VL-7B on one L4, 60 text tokens and 128 output tokens, \(\eta_c = 0.5\), \(\eta_m = 0.8\). Filled dots meet both targets. The readout picks \(b^{*}\) with formula (199.10) and the number of L4s for the chosen peak load.</figcaption>
+<details class="howto"><summary>How to read Figure 4</summary><p>The green line (E2E) and the dark red line (burst TTFT) rise with \(b\); the dashed lines are their targets (4 s and 1 s). The orange bars are throughput, which rises with \(b\) because decode steps are shared. The best batch size is the largest one where both lines are under their targets. For the default plan, \(b^{*} = 3\): E2E 3.33 s, burst TTFT 0.81 s, 0.90 requests per second per L4, so 3 L4s for 2 requests per second. Here the TTFT target, not E2E, stops the batch from growing. Switch to 1288×952 and the prefill is so long that only \(b = 1\) fits, which needs 7 L4s.</p></details></figure>
+
+<div class="worked"><div class="wt">Worked example: how many L4s for 2 requests per second?</div>
+<p>Plan: 4-bit LLM, 896×672 images, so \(t_{\text{pf}} = 0.272\) s. TPOT grows slowly with \(b\), because only the KV cache adds bytes: 19.20 ms at \(b = 1\), 19.63 ms at \(b = 3\), 19.84 ms at \(b = 4\).</p>
+<ul>
+<li>\(b = 3\): E2E \(= 3 \times 0.272 + 128 \times 0.01963 = 3.33\) s (pass); burst TTFT \(= 0.81\) s (pass); \(X = 3 / 3.33 = 0.90\) requests per second.</li>
+<li>\(b = 4\): E2E 3.63 s (pass), but burst TTFT \(= 1.09\) s (fail).</li>
+<li>So \(b^{*} = 3\), and \(n_{\text{GPU}} = \lceil 2 / 0.90 \rceil = 3\) L4s.</li></ul>
+<p>Memory is not the limit here. Weights: \(3.47\) GB (4-bit LLM) + \(2.18\) GB (embedding and lm_head in BF16) + \(1.35\) GB (vision) = 7.00 GB. KV cache per request at the end of the answer: \((828 + 128) \times 57{,}344 = 0.055\) GB. With 21.6 GB usable, about 266 requests would fit. It is a different story for long video: a 64-frame request at 448×448 has 8,192 visual tokens and needs 0.48 GB of KV, so a BF16 model (16.6 GB of weights) fits only 10 such requests.</p></div>
+
+<div class="eq">\[ M \;=\; \underbrace{\sum_{c} \tfrac{\beta_c}{8} N_c}_{\text{weights}} \;+\; b\, k\, (T + N_{\text{out}}) \;\le\; 0.9 \times 24 \text{ GB} \tag{199.11} \]</div>
+<p>The factor 0.9 is vLLM’s default <code>gpu_memory_utilization</code>; the rest is left for activations, the CUDA context and fragmentation. [Likely] vLLM also reserves activation memory for the largest batch it profiles, so the real KV capacity is a bit smaller than this formula says.</p>
+
+<h2>Step 5: check the estimate with a real measurement</h2>
+<p>An estimate is a hypothesis. You test it with one measurement, and then you use the measurement to fix the two numbers you guessed: \(\eta_c\) and \(\eta_m\). Measure TTFT and TPOT for one request at \(b = 1\), with the exact plan (same resolution, same precision, same prompt). Then:</p>
+<div class="eq">\[ \hat\eta_c \;=\; \frac{F_{\text{enc}} + F_{\text{pre}}}{P \cdot \text{TTFT}_{\text{meas}}}, \qquad \hat\eta_m \;=\; \frac{Q_{\text{dec}}}{B_w \cdot \text{TPOT}_{\text{meas}}} \tag{199.12} \]</div>
+<dl class="symbols"><span class="st">Read the symbols</span>
+<dt>\(\hat\eta_c\)</dt><dd>measured compute efficiency of the encoder plus prefill (valid because both are compute-bound)</dd>
+<dt>\(\hat\eta_m\)</dt><dd>measured bandwidth efficiency of a decode step (valid because decode is bandwidth-bound)</dd>
+<dt>\(Q_{\text{dec}}\)</dt><dd>bytes per decode step: 4.61 GB for the 4-bit plan at \(\bar T = 892\)</dd></dl>
+<p>Then put \(\hat\eta_c\) and \(\hat\eta_m\) back into formulas (199.2)–(199.10) and redo the plan. If one measured number is far from every reasonable efficiency (for example \(\hat\eta_m = 0.2\)), the model of that stage is wrong, not just the factor: look for a missing cost.</p>
+<div class="worked"><div class="wt">Worked example: re-planning after a measurement</div>
+<p>The numbers in this box are <b>made-up example inputs</b> to show the arithmetic, not a real L4 measurement. Suppose the lab measures TTFT = 420 ms and TPOT = 24.0 ms for the 4-bit, 896×672 plan at \(b = 1\).</p>
+<ul>
+<li>\(\hat\eta_c = 16.43\text{ TFLOP} / (121\text{ TFLOP/s} \times 0.420\text{ s}) = 0.32\) (we assumed 0.5).</li>
+<li>\(\hat\eta_m = 4.61\text{ GB} / (300\text{ GB/s} \times 0.0240\text{ s}) = 0.64\) (we assumed 0.8).</li>
+<li>New E2E at \(b = 1\): \(0.42 + 128 \times 0.024 = 3.49\) s. At \(b = 2\): burst TTFT 0.84 s and E2E 3.95 s, both pass. At \(b = 3\): burst TTFT 1.26 s, fail.</li>
+<li>So \(b^{*} = 2\), \(X = 0.507\) requests per second, and the plan now needs \(\lceil 2 / 0.507 \rceil = 4\) L4s instead of 3.</li></ul>
+<p>One measurement changed the purchase by one GPU. That is why you always measure before you commit.</p></div>
+
+<figure class="fig" id="lb-cal"><div class="fig-body">
+<div class="lb-grid">
+<label for="lb-cal-ttft">Measured TTFT (ms)</label><input type="range" id="lb-cal-ttft" min="150" max="1200" step="10" value="420"><output id="lb-cal-ttftv"></output>
+<label for="lb-cal-tpot">Measured TPOT (ms)</label><input type="range" id="lb-cal-tpot" min="10" max="60" step="0.5" value="24"><output id="lb-cal-tpotv"></output></div>
+<div class="scroll-x"><svg id="lb-cal-svg" viewBox="0 0 640 230" role="img" aria-label="Estimated against measured TTFT and TPOT, implied efficiencies and the new plan"></svg></div>
+<div class="readout" id="lb-cal-info" aria-live="polite"></div>
+</div><figcaption><b>Figure 5.</b> Calibrating the budget (formula 199.12) for the plan “Qwen2-VL-7B, 4-bit LLM, 896×672, 128 output tokens” on one L4. Move the sliders to the numbers you measure; the default values are the made-up example of the box above. The readout re-plans with formulas (199.9) and (199.10) for a peak load of 2 requests per second.</figcaption>
+<details class="howto"><summary>How to read Figure 5</summary><p>Each pair of bars compares the estimate with \(\eta_c = 0.5\), \(\eta_m = 0.8\) (grey) and your measurement (colored). The text below the bars shows the efficiency each measurement implies. Values between about 0.3 and 0.9 are plausible; outside that range, suspect a missing cost (CPU preprocessing, a slow kernel, a wrong precision) rather than a slow GPU. The last line is the new plan: \(b^{*}\), E2E and the number of L4s. Move TTFT up to 600 ms and watch \(b^{*}\) fall to 1.</p></details></figure>
+
+<h3>How to measure, and what usually differs</h3>
+<p>Two rules make the measurement useful. First, measure the same thing you estimated: one request, \(b = 1\), fixed resolution and output length (set <code>max_tokens</code> and ignore the end-of-sequence token, so every run writes exactly 128 tokens). Second, measure each part separately, so you know which estimate was wrong. The next session, <a href="../vision/lab-serve-a-vlm-and-measure.html">session 200</a>, does this with vLLM’s benchmark tool, which reports TTFT, TPOT and their percentiles. [Likely] The code below shows the idea with plain PyTorch.</p>
+<p>Where the estimate and the measurement usually differ:</p>
+<ul>
+<li><b>CPU preprocessing.</b> JPEG decoding, resizing and normalizing a large photo run on the CPU, before the GPU sees anything. They add directly to TTFT. Measure them alone.</li>
+<li><b>Lower compute efficiency for small or odd shapes.</b> 768 tokens is a small matrix multiply for a 72 W GPU; \(\eta_c\) for the encoder and for prefill can be quite different. Time them separately.</li>
+<li><b>Kernel launch overhead in decode.</b> A decode step launches hundreds of small kernels. Without CUDA graphs, launch time can be a large part of a 20 ms step. [Likely] vLLM uses CUDA graphs for decode by default. [Likely]</li>
+<li><b>Warm-up and clocks.</b> The first request compiles kernels and allocates memory. Run a few warm-up requests and report the median of many.</li>
+<li><b>Mixed precision you did not plan.</b> A 4-bit checkpoint whose vision tower is BF16 is expected; one whose lm_head is also 4-bit, or whose KV cache is FP8, changes \(Q_{\text{dec}}\).</li></ul>
+
+<div class="algo"><div class="algo-h">Algorithm 2: measure, calibrate and re-plan</div><ol>
+<li><b>input:</b> a running server or model with the planned settings; the estimate of Algorithm 1</li>
+<li>run 5 warm-up requests; discard them</li>
+<li><b>for</b> 30 requests at \(b = 1\): record CPU preprocessing time, TTFT and the time of each later token</li>
+<li>take medians: \(\text{TTFT}_{\text{meas}}\) (GPU part only), \(\text{TPOT}_{\text{meas}}\)</li>
+<li>\(\hat\eta_c, \hat\eta_m \leftarrow\) formula (199.12) <span class="c">// sanity check: both between about 0.3 and 0.9</span></li>
+<li>redo Algorithm 1 and formula (199.10) with \(\hat\eta_c, \hat\eta_m\) and the measured CPU time</li>
+<li>run a load test at the chosen \(b^{*}\) and peak load; compare p50 and p95 E2E with the targets <span class="c">// the closed-loop model is only a first guess</span></li>
+<li><b>return</b> the calibrated plan and the number of GPUs</li></ol></div>
+
+<p>The runnable code below has two parts. Part 1 is the budget estimator of this page in plain Python; it prints the numbers of the worked examples and runs anywhere. Part 2 measures the two peaks your own GPU actually reaches (a large BF16 matrix multiply and a large memory copy), which gives you a first \(\eta_c\) and \(\eta_m\) before you even load a model. On a machine without a CUDA GPU it runs on the CPU, so the printed numbers are only meaningful on the GPU you plan to use.</p>
+<pre class="code"><span class="kw2">import</span> math, time, torch
+
+<span class="cm"># ---------- Part 1: the budget estimator (formulas 199.1-199.10) ----------</span>
+P16, P8, BW = 121e12, 242e12, 300e9          <span class="cm"># NVIDIA L4: dense BF16, dense FP8, bytes/s</span>
+VIS = dict(L=32, d=1280, lin=32 * (1280*3840 + 1280*1280 + 2*1280*5120) + 3*2*14*14*1280)
+LLM = dict(L=28, d=3584, ff=18944, kvh=4, hd=128, vocab=152064)   <span class="cm"># Qwen2-VL-7B config.json</span>
+d, L = LLM[<span class="st">"d"</span>], LLM[<span class="st">"L"</span>]
+N_LIN = L * (2*d*d + 2*d*LLM[<span class="st">"kvh"</span>]*LLM[<span class="st">"hd"</span>] + 3*d*LLM[<span class="st">"ff"</span>])
+N_HEAD = LLM[<span class="st">"vocab"</span>] * d
+N_MER = 5120*5120 + 5120*d
+KV = 2 * L * LLM[<span class="st">"kvh"</span>] * LLM[<span class="st">"hd"</span>] * 2                <span class="cm"># bytes per token</span>
+BITS = {<span class="st">"bf16"</span>: 16, <span class="st">"fp8"</span>: 8, <span class="st">"w4"</span>: 4.25}
+
+<span class="kw2">def</span> resize(h, w, f=28):
+    <span class="kw2">return</span> max(f, round(h / f) * f), max(f, round(w / f) * f)
+
+<span class="kw2">def</span> budget(h, w, frames=1, n_text=60, n_out=128, prec=<span class="st">"bf16"</span>, b=1, ec=0.5, em=0.8):
+    H, W = resize(h, w)
+    G = frames // 2 <span class="kw2">if</span> frames &gt; 1 <span class="kw2">else</span> 1
+    per = (H // 14) * (W // 14)                <span class="cm"># patches per temporal group</span>
+    n_p = G * per; n_vis = n_p // 4; T = n_vis + n_text           <span class="cm"># (199.1)</span>
+    F_enc = 2*VIS[<span class="st">"lin"</span>]*n_p + 4*VIS[<span class="st">"L"</span>]*VIS[<span class="st">"d"</span>]*G*per**2 + 2*N_MER*n_vis   <span class="cm"># (199.3)</span>
+    t_enc = max(F_enc / (ec*P16), 2*(VIS[<span class="st">"lin"</span>] + N_MER) / (em*BW))
+    P = P8 <span class="kw2">if</span> prec == <span class="st">"fp8"</span> <span class="kw2">else</span> P16
+    w_bytes = BITS[prec] / 8 * N_LIN + 2 * N_HEAD
+    t_pre = max(2*N_LIN*T / (ec*P) + (2*L*d*T*T + 2*N_HEAD) / (ec*P16),
+                (w_bytes + KV*T) / (em*BW))                         <span class="cm"># (199.4)</span>
+    Tb = T + n_out / 2
+    tpot = max(b*2*N_LIN / (ec*P) + b*(2*N_HEAD + 4*L*d*Tb) / (ec*P16),
+               (w_bytes + b*KV*Tb) / (em*BW))                       <span class="cm"># (199.6)</span>
+    t_pf = t_enc + t_pre
+    e2e = b * t_pf + n_out * tpot                                   <span class="cm"># (199.9)</span>
+    <span class="kw2">return</span> dict(n_vis=n_vis, T=T, t_enc=t_enc, t_pre=t_pre, ttft=t_pf, tpot=tpot,
+                e2e=e2e, burst=b * t_pf, X=b / e2e)
+
+<span class="kw2">def</span> plan(lam=2.0, ttft_max=1.0, e2e_max=4.0, **kw):
+    best = None
+    <span class="kw2">for</span> b <span class="kw2">in</span> range(1, 65):
+        r = budget(b=b, **kw)
+        <span class="kw2">if</span> r[<span class="st">"e2e"</span>] &lt;= e2e_max <span class="kw2">and</span> r[<span class="st">"burst"</span>] &lt;= ttft_max:
+            best = (b, r)
+    <span class="kw2">if</span> best <span class="kw2">is</span> None:
+        <span class="kw2">return</span> None
+    b, r = best
+    <span class="kw2">return</span> b, round(r[<span class="st">"e2e"</span>], 2), round(r[<span class="st">"X"</span>], 3), math.ceil(lam / r[<span class="st">"X"</span>])  <span class="cm"># (199.10)</span>
+
+<span class="kw2">for</span> name, kw <span class="kw2">in</span> [(<span class="st">"BF16 1288x952"</span>, dict(h=1280, w=960)),
+                 (<span class="st">"4-bit 1288x952"</span>, dict(h=1280, w=960, prec=<span class="st">"w4"</span>)),
+                 (<span class="st">"4-bit 896x672"</span>, dict(h=896, w=672, prec=<span class="st">"w4"</span>))]:
+    r = budget(**kw)
+    print(f<span class="st">"{name:15s} vis={r['n_vis']:5d} TTFT={r['ttft']*1e3:6.1f} ms "</span>
+          f<span class="st">"TPOT={r['tpot']*1e3:5.1f} ms E2E={r['e2e']:5.2f} s  plan(b*, E2E, X, GPUs)={plan(**kw)}"</span>)
+<span class="cm"># BF16 1288x952   vis= 1564 TTFT= 597.8 ms TPOT= 59.3 ms E2E= 8.19 s  plan(b*, E2E, X, GPUs)=None</span>
+<span class="cm"># 4-bit 1288x952  vis= 1564 TTFT= 597.8 ms TPOT= 19.4 ms E2E= 3.08 s  plan(b*, E2E, X, GPUs)=(1, 3.08, 0.325, 7)</span>
+<span class="cm"># 4-bit 896x672   vis=  768 TTFT= 271.6 ms TPOT= 19.2 ms E2E= 2.73 s  plan(b*, E2E, X, GPUs)=(3, 3.33, 0.902, 3)</span>
+
+<span class="cm"># ---------- Part 2: what does YOUR GPU reach? (first guess for eta_c, eta_m) ----------</span>
+<span class="kw2">def</span> timed(fn, reps=20):
+    sync = torch.cuda.synchronize <span class="kw2">if</span> torch.cuda.is_available() <span class="kw2">else</span> (<span class="kw2">lambda</span>: None)
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(3):                  <span class="cm"># warm-up</span>
+        fn()
+    sync(); t0 = time.perf_counter()
+    <span class="kw2">for</span> _ <span class="kw2">in</span> range(reps):
+        fn()
+    sync()
+    <span class="kw2">return</span> (time.perf_counter() - t0) / reps
+
+torch.manual_seed(0)
+dev = <span class="st">"cuda"</span> <span class="kw2">if</span> torch.cuda.is_available() <span class="kw2">else</span> <span class="st">"cpu"</span>
+n = 4096 <span class="kw2">if</span> dev == <span class="st">"cuda"</span> <span class="kw2">else</span> 1024
+dt = torch.bfloat16 <span class="kw2">if</span> dev == <span class="st">"cuda"</span> <span class="kw2">else</span> torch.float32   <span class="cm"># BF16 matmul is slow on many CPUs</span>
+a = torch.randn(n, n, device=dev, dtype=dt)
+bm = torch.randn(n, n, device=dev, dtype=dt)
+t_mm = timed(<span class="kw2">lambda</span>: a @ bm)
+x = torch.zeros(256 * 2**20 // 2, device=dev, dtype=torch.bfloat16)   <span class="cm"># 256 MB</span>
+y = torch.empty_like(x)
+t_cp = timed(<span class="kw2">lambda</span>: y.copy_(x))
+flops = 2 * n**3 / t_mm
+bw = 2 * x.numel() * x.element_size() / t_cp    <span class="cm"># a copy reads and writes</span>
+print(f<span class="st">"{dev}: matmul {flops/1e12:.1f} TFLOP/s, copy {bw/1e9:.0f} GB/s"</span>)
+<span class="kw2">if</span> dev == <span class="st">"cuda"</span>:
+    print(f<span class="st">"if this is an L4: eta_c ~ {flops/P16:.2f}, eta_m ~ {bw/BW:.2f}"</span>)</pre>
+<p>Part 1 prints exactly the numbers used on this page (they are shown as comments). Part 2 gives upper bounds for \(\eta_c\) and \(\eta_m\): a single large, square matrix multiply is the best case for the tensor cores, and the encoder and prefill shapes reach less. For the full check, time the real model: for example, with Hugging Face <code>transformers</code>, time <code>generate</code> with <code>max_new_tokens=1</code> (TTFT) and with <code>max_new_tokens=129, min_new_tokens=129</code>; the difference divided by 128 is TPOT. Synchronize the GPU before reading the clock.</p>
+
+<h2>Where this is used</h2>
+<div class="tblw"><table class="tb"><thead><tr><th>Application</th><th>What dominates the budget</th><th>First knob to try</th></tr></thead><tbody>
+<tr><td>Photo or screenshot question answering (chat)</td><td>decode, for answers of 100+ tokens</td><td>4-bit LLM weights; shorter answers</td></tr>
+<tr><td>Document and invoice extraction</td><td>encoder and prefill (high resolution for small text), short JSON output</td><td>FP8 for prefill; crop to the useful region instead of lowering resolution</td></tr>
+<tr><td>Video question answering and Video-RAG</td><td>visual tokens from many frames: encoder, prefill and KV memory</td><td>fewer frames, lower frame resolution, token merging; FP8</td></tr>
+<tr><td>Key-moment detection on live video</td><td>steady encoder load per second of video, plus a strict TTFT</td><td>frame rate and resolution per stream; streams per GPU from the encoder cost</td></tr>
+<tr><td>Video classification and action recognition with a VLM</td><td>encoder and prefill; outputs are a few tokens</td><td>frames and resolution; FP8; decode hardly matters</td></tr>
+<tr><td>Video retrieval and fingerprinting (encoder only)</td><td>the vision encoder alone, compute-bound</td><td>batch many frames; INT8 or FP8 encoder; no decode at all</td></tr>
+<tr><td>Capacity planning and cost per request</td><td>throughput \(X(b^{*})\)</td><td>formula (199.10): GPUs = load / throughput</td></tr></tbody></table></div>
+
+<h2>Common mistakes</h2>
+<ul>
+<li><b>Using the sparsity number from the datasheet.</b> The L4’s “242 TFLOPS BF16” assumes 2:4 sparse weights. Dense models get at most 121.</li>
+<li><b>Counting visual tokens from the original image.</b> The model resizes first. 1280×960 becomes 1288×952 in Qwen2-VL; other models tile or pad, and the count can change a lot (<a href="../vision/high-resolution-and-native-aspect-ratio.html">session 180</a>).</li>
+<li><b>Forgetting that the encoder’s attention is quadratic.</b> At 6,256 patches, attention is 44% of the encoder FLOPs. Doubling both image sides gives 4× the linear cost but 16× the attention cost.</li>
+<li><b>Quantizing to speed up TTFT with 4-bit weights.</b> W4A16 makes decode faster, not prefill. For a prefill-heavy request, use FP8 (W8A8) or fewer visual tokens.</li>
+<li><b>Reporting TPOT from a run that stopped early.</b> If the model emits the end-of-sequence token after 20 tokens, your “128-token” E2E is wrong. Force a fixed output length when you benchmark.</li>
+<li><b>Budgeting with \(b = 1\) and serving with \(b = 16\).</b> At higher batch, each request waits for others’ prefill (199.9). Check TTFT in a burst, not only alone.</li>
+<li><b>Ignoring CPU time.</b> Image download, decoding and resizing are not in the GPU roofline but are in the user’s TTFT.</li>
+<li><b>Trusting the estimate without a measurement.</b> The efficiency factors are guesses until you measure them (199.12); in the example, one measurement changed the plan from 3 to 4 GPUs.</li></ul>
+
+<h2>Interview questions</h2>
+<details class="qa"><summary>Why is decode bandwidth-bound and prefill compute-bound, using numbers?<span class="lvl">basic</span></summary><div class="ans">A linear layer does 2 FLOPs per weight per token. Prefill pushes \(T\) tokens through each weight it reads, so its intensity is about \(2T/2 = T\) FLOPs per byte in BF16: with 828 tokens, about 828, above the L4’s ridge of \(121/0.3 = 403\). Decode at batch 1 pushes one token per weight: about 1 FLOP per byte, far below the ridge. So decode time is bytes divided by bandwidth: 14.1 GB / 240 GB/s = 59 ms per token for Qwen2-VL-7B in BF16.</div></details>
+<details class="qa"><summary>Estimate TTFT for Qwen2-VL-7B on an L4 with one 1280×960 photo.<span class="lvl">core</span></summary><div class="ans">Resize to 1288×952: 6,256 patches, 1,564 visual tokens, plus 60 text tokens = 1,624. Encoder: \(2 \times 0.631\text{ B} \times 6{,}256 = 7.9\) TFLOP of linear layers plus 6.4 TFLOP of attention, about 14.4 TFLOP. Prefill: \(2 \times 6.525\text{ B} \times 1{,}624 = 21.2\) TFLOP plus a little attention, 21.7 TFLOP. At 50% of 121 TFLOP/s: 239 + 359 ≈ 600 ms, plus CPU preprocessing. Both stages are compute-bound, so the estimate depends on \(\eta_c\), which I would measure.</div></details>
+<details class="qa"><summary>The E2E target is missed by 2×. Which knob do you turn first?<span class="lvl">core</span></summary><div class="ans">The one that acts on the largest term. In our example decode is 93% of 8.2 s, so I cut decode bytes: 4-bit weight-only quantization of the LLM gives 14.1 → 4.6 GB per step and 59 → 19 ms per token, and E2E drops to 3.1 s. Lowering the resolution would only cut the 0.6 s TTFT part. If the request were prefill-heavy (video, short output), I would cut visual tokens or use FP8 instead.</div></details>
+<details class="qa"><summary>FP8 or 4-bit AWQ on an L4: which is faster?<span class="lvl">core</span></summary><div class="ans">It depends on which stage dominates. 4-bit AWQ reads 4.25 bits per weight in decode (19.4 ms per token for the 7B model, against 32.1 ms with FP8), but it computes in FP16, so prefill is not faster. FP8 W8A8 uses the FP8 tensor cores at 242 TFLOP/s dense, so the LLM part of prefill halves (359 → 184 ms in the example). Long answers: AWQ. Many images, video or short answers: FP8. The L4 is an Ada GPU, so it has FP8 tensor cores; an A100 does not.</div></details>
+<details class="qa"><summary>How do you choose the batch size for a latency target?<span class="lvl">core</span></summary><div class="ans">Throughput rises with batch because decode reads the weights once for all requests: TPOT goes only from 19.2 to 19.8 ms between \(b = 1\) and 4, while tokens per step grow 4×. But each request now waits for the other requests’ prefills. With the closed-loop model, E2E(b) ≈ \(b\,t_{\text{pf}} + N_{\text{out}}\,\text{TPOT}(b)\) and the burst TTFT ≈ \(b\,t_{\text{pf}}\). I pick the largest \(b\) that meets both targets and fits in memory, then GPUs = ⌈load / throughput⌉. In the example, \(b^{*} = 3\), 0.90 requests per second, 3 L4s for 2 requests per second. Then I confirm with a load test, because chunked prefill usually does somewhat better than this model.</div></details>
+<details class="qa"><summary>Why is the vision encoder a bigger share of TTFT for a 2B VLM than for a 7B one?<span class="lvl">basic</span></summary><div class="ans">Both Qwen2-VL sizes use the same 0.63 B vision encoder, so its time is the same: about 238 ms for a 1288×952 image on an L4. The 7B LLM’s prefill takes 359 ms, the 2B’s only 74 ms. So the encoder is 40% of TTFT for the 7B model and 76% for the 2B model. For small VLMs, reducing visual tokens or using a smaller encoder matters most.</div></details>
+<details class="qa"><summary>Your measured TPOT is 2× the estimate. What do you check?<span class="lvl">advanced</span></summary><div class="ans">First, the implied bandwidth efficiency: \(Q_{\text{dec}} / (B_w \cdot \text{TPOT})\). If it is 0.4, something is wrong, because memory-bound kernels usually reach well above that. Then: is the model really 4-bit, or did it load in BF16? Is the lm_head or embedding larger than expected? Are CUDA graphs on, or is kernel launch overhead filling the step? Is the batch really 1, or are other requests sharing the GPU? Is the run stopping and restarting (not streaming)? Is the GPU throttled by power or temperature? Each of these changes either the bytes or the overhead of a step.</div></details>
+<details class="qa"><summary>A 32-frame video request misses the 1 s TTFT target. What are your options?<span class="lvl">advanced</span></summary><div class="ans">32 frames at 448×448 give 16 temporal groups of 1,024 patches, so 4,096 visual tokens. Estimated encoder 393 ms and prefill 954 ms, so TTFT 1.35 s. Options: (1) FP8 W8A8 for the LLM: prefill halves, TTFT about 0.90 s, but decode gets slower than with 4-bit. (2) Fewer frames or lower frame resolution: tokens fall linearly, encoder attention quadratically per group. (3) Token merging or pooling after the encoder (<a href="../vision/visual-token-efficiency.html">session 183</a>). (4) Cache the video encoding if users ask several questions about the same video. (5) Prefix caching of the system prompt. I would pick by which costs the least quality on the target task.</div></details>
+<details class="qa"><summary>Can a 7B VLM ever reach 15 ms per token on an L4?<span class="lvl">advanced</span></summary><div class="ans">Not with 4-bit weights at batch 1 and normal decoding. The step must read about 4.6 GB (4.25-bit LLM, BF16 lm_head, KV cache). 4.6 GB / 15 ms = 307 GB/s, more than the L4’s peak of 300 GB/s. Options: quantize the lm_head too or use 3-bit weights (fewer bytes), speculative decoding (several tokens per weight read, see <a href="../inference/speculative-decoding-1-the-math.html">session 128</a>), a smaller model, or a GPU with more bandwidth.</div></details>
+<details class="qa"><summary>How do you turn one measurement into a better plan?<span class="lvl">core</span></summary><div class="ans">Measure TTFT and TPOT at \(b = 1\) with the exact settings and a fixed output length, after warm-up, and take medians. Compute the implied efficiencies: \(\hat\eta_c = (F_{\text{enc}} + F_{\text{pre}}) / (P \cdot \text{TTFT})\) and \(\hat\eta_m = Q_{\text{dec}} / (B_w \cdot \text{TPOT})\). Check that they are plausible; if not, the model is missing a cost. Put them back into the formulas and redo the batch and GPU count. Finally, run a load test at the chosen batch and look at p95, not only the median.</div></details>
+
+<h2>Exercises</h2>
+<ol>
+<li>A 1920×1080 screenshot goes into Qwen2-VL. After the resize, how many visual tokens does it give? (Round each side to the nearest multiple of 28.)</li>
+<li>Using Figure 2 or the formulas, estimate E2E for Qwen2-VL-2B in BF16 with the 1288×952 photo, 60 text tokens and 128 output tokens.</li>
+<li>For the 4-bit, 896×672 plan, the product team allows answers of only 96 tokens. What is the new E2E at \(b = 1\)?</li>
+<li>With formula (199.8), at what batch size would decode become compute-bound on an L4 for 4-bit weights, if you ignore the KV cache and the lm_head?</li>
+<li>A 64-frame video at 448×448 goes to the BF16 7B model. How much KV cache does one request need at the end of a 128-token answer, and how many such requests fit in 21.6 GB?</li>
+<li>Required TPOT is 15 ms for the 4-bit 7B plan. What bandwidth would that need? Is it possible on an L4?</li></ol>
+<details class="qa"><summary>Answers<span class="lvl">check</span></summary><div class="ans">1. 1920/28 = 68.6 → 69 × 28 = 1,932; 1080/28 = 38.6 → 39 × 28 = 1,092. So 69 × 39 = 2,691 visual tokens (10,764 patches). 2. TTFT = 238 + 74 = 312 ms; TPOT = 13.1 ms; E2E = 0.31 + 128 × 0.0131 = 1.98 s. 3. \(0.272 + 96 \times 0.0192 = 2.11\) s. 4. \(16b/\beta = 403\) with \(\beta = 4.25\) gives \(b \approx 107\). With the KV cache in the denominator it never gets there at a context of 892 tokens: at \(b = 256\), the intensity is only about 210 (Figure 3, which also counts the attention FLOPs of decode). 5. \(T = 8{,}192 + 60 = 8{,}252\) tokens; at the end, \(8{,}252 + 128 = 8{,}380\) tokens × 57,344 bytes = 0.48 GB. Free memory: 21.6 − 16.58 = 5.02 GB, so about 10 requests. 6. \(Q_{\text{dec}} = 4.61\) GB, so 4.61 / 0.015 = 307 GB/s at 100% efficiency: above the L4’s 300 GB/s peak, so not possible at batch 1 without fewer bytes or speculative decoding.</div></details>
+
+<div class="takeaways"><h3>Key takeaways</h3><ul>
+<li>Write down the inputs first: resized image size, frames, visual tokens, text tokens, output tokens, load and targets. The image is usually most of the prompt (199.1).</li>
+<li>Each stage takes the larger of compute time and memory time (199.2). The vision encoder and prefill are compute-bound; decode is bandwidth-bound at every practical batch size on an L4 (199.8).</li>
+<li>TTFT ≈ encoder + prefill; E2E ≈ TTFT + output tokens × TPOT (199.5, 199.7). For a chat answer, decode usually dominates; for video and documents, prefill does.</li>
+<li>Match the knob to the term: resolution and frames for encoder and prefill; 4-bit weights or shorter answers for decode; FP8 for compute-bound prefill.</li>
+<li>Batching raises throughput but adds prefill waiting; pick the largest batch that meets both targets, then GPUs = load / throughput (199.9, 199.10).</li>
+<li>The efficiency factors are guesses. Measure TTFT and TPOT once, compute the implied efficiencies (199.12), and re-plan.</li></ul></div>
+<h3 class="plain">Key formulas</h3>
+<div class="eq">\[ n_{\text{vis}} = \frac{G H' W'}{4 \cdot 14^2}, \qquad t \approx \max\!\left(\frac{F}{\eta_c P}, \frac{Q}{\eta_m B_w}\right), \qquad F \approx 2 N n + \text{attention} \]</div>
+<div class="eq">\[ \text{TTFT} \approx t_{\text{enc}} + t_{\text{pre}}, \qquad \text{TPOT} \approx \frac{\tfrac{\beta}{8} N_{\text{lin}} + 2 N_{\text{head}} + b\, k\, \bar T}{\eta_m B_w}, \qquad \text{E2E} \approx \text{TTFT} + N_{\text{out}}\, \text{TPOT} \]</div>
+<div class="eq">\[ \text{E2E}(b) \approx b\, t_{\text{pf}} + N_{\text{out}} \text{TPOT}(b), \quad X(b) = \frac{b}{\text{E2E}(b)}, \quad n_{\text{GPU}} = \left\lceil \frac{\lambda}{X(b^{*})} \right\rceil, \quad \hat\eta_m = \frac{Q_{\text{dec}}}{B_w\, \text{TPOT}_{\text{meas}}} \]</div>
+<h2 class="plain" id="a-latency-budget-on-an-nvidia-l4-refs">References for this session</h2><ol class="refs-list" style="font:400 16px/1.55 var(--sans)"><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Noyan, Farré, Marafioti, Zohar, <a href="https://www.oreilly.com/library/view/vision-language-models/9798341624030/" target="_blank" rel="noopener"><i>Vision Language Models (O’Reilly, 2026)</i></a>, chapter 7: Deploying Models for Inference at Scale</li><li>Austin et al., Google DeepMind (2025). <a href="https://jax-ml.github.io/scaling-book/" target="_blank" rel="noopener">How to Scale Your Model</a></li><li>Williams et al. (2009). <a href="https://scholar.google.com/scholar?q=&amp;quot;Roofline: An Insightful Visual Performance Model for Multicore Architectures&amp;quot;" target="_blank" rel="noopener">Roofline: An Insightful Visual Performance Model for Multicore Architectures</a></li><li>Wang et al. (2024). <a href="https://arxiv.org/abs/2409.12191" target="_blank" rel="noopener">Qwen2-VL: Enhancing Vision-Language Model’s Perception of the World at Any Resolution</a></li><li>Lin et al. (2023). <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">AWQ: Activation-aware Weight Quantization for LLM Compression and Acceleration</a></li><li>Micikevicius et al. (2022). <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">FP8 Formats for Deep Learning</a></li><li>Kwon et al. (2023). <a href="https://arxiv.org/abs/2309.06180" target="_blank" rel="noopener">Efficient Memory Management for Large Language Model Serving with PagedAttention</a></li><li>Agrawal et al. (2024). <a href="https://scholar.google.com/scholar?q=&amp;quot;Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve&amp;quot;" target="_blank" rel="noopener">Taming Throughput-Latency Tradeoff in LLM Inference with Sarathi-Serve</a></li><li>NVIDIA (2023). <a href="https://www.nvidia.com/en-us/data-center/l4/" target="_blank" rel="noopener">NVIDIA L4 Tensor Core GPU (product page and datasheet)</a></li><li>vLLM project (docs). <a href="https://docs.vllm.ai/en/latest/features/quantization/llm_compressor/fp8/" target="_blank" rel="noopener">vLLM documentation: FP8 W8A8 quantization</a></li></ol><nav class="pn" aria-label="Previous and next session"><a class="prev" href="../vision/serving-vlms-vllm-tensorrt-llm-and-the.html"><small>Previous · session 198</small>Serving VLMs: vLLM, TensorRT-LLM and the edge</a><a class="next" href="../vision/lab-serve-a-vlm-and-measure.html"><small>Next · session 200</small>serve a VLM and measure</a></nav></article></main></div><footer class="foot">LLM &amp; VLM course by Mehdi Seyfi. Built from the book <i>Vision Language Models</i> (O’Reilly, 2026), the survey <i>A Survey on Efficient Inference for Large Language Models</i> (arXiv 2404.14294), and the primary papers cited in each session.</footer><script>(function(){
+"use strict";
+const B=window.Book;const R=document.querySelector('[data-session="a-latency-budget-on-an-nvidia-l4"]');if(!R)return;
+const $=s=>R.querySelector(s);
+function seg(el,attr,cb){el.addEventListener("click",e=>{const b=e.target.closest("button");if(!b)return;el.querySelectorAll("button").forEach(x=>x.setAttribute("aria-pressed",x===b?"true":"false"));cb(b.dataset[attr]);});}
+const f0=v=>v.toFixed(0),f1=v=>v.toFixed(1),f2=v=>v.toFixed(2),f3=v=>v.toFixed(3);
+const cm=v=>v.toLocaleString("en-US");
+
+/* ---------- the budget model (formulas 199.1-199.11), same as the Python on the page ---------- */
+const P16=121e12,P8=242e12,BW=300e9,USABLE=0.9*24e9;
+const VIS={L:32,d:1280,lin:32*(1280*3840+1280*1280+2*1280*5120)+3*2*14*14*1280};
+const MOD={"7B":{L:28,d:3584,ff:18944,kvh:4,hd:128,vocab:152064,tied:false},"2B":{L:28,d:1536,ff:8960,kvh:2,hd:128,vocab:151936,tied:true}};
+Object.values(MOD).forEach(m=>{m.lin=m.L*(2*m.d*m.d+2*m.d*m.kvh*m.hd+3*m.d*m.ff);m.head=m.vocab*m.d;m.emb=m.tied?0:m.vocab*m.d;m.kv=2*m.L*m.kvh*m.hd*2;m.mer=5120*5120+5120*m.d;});
+const BITS={bf16:16,fp8:8,w4:4.25};
+const PNAME={bf16:"BF16",fp8:"FP8 W8A8",w4:"4-bit W4A16"};
+function resize(h,w){const f=28,mn=3136,mx=12845056;let hb=Math.max(f,Math.round(h/f)*f),wb=Math.max(f,Math.round(w/f)*f);
+ if(hb*wb>mx){const b=Math.sqrt(h*w/mx);hb=Math.floor(h/b/f)*f;wb=Math.floor(w/b/f)*f;}
+ else if(hb*wb<mn){const b=Math.sqrt(mn/(h*w));hb=Math.ceil(h*b/f)*f;wb=Math.ceil(w*b/f)*f;}
+ return [hb,wb];}
+function est(o){const c=Object.assign({model:"7B",h:1280,w:960,frames:1,ntext:60,nout:128,prec:"bf16",b:1,ec:0.5,em:0.8},o);const m=MOD[c.model];
+ const [hb,wb]=resize(c.h,c.w);const G=c.frames>1?Math.floor(c.frames/2):1;const pf=(hb/14)*(wb/14);
+ const np=pf*G,nvis=np/4,T=nvis+c.ntext;
+ const Fenc=2*VIS.lin*np+4*VIS.L*pf*pf*VIS.d*G+2*m.mer*nvis,Qenc=2*(VIS.lin+m.mer);
+ const tenc=Math.max(Fenc/(c.ec*P16),Qenc/(c.em*BW));
+ const Pl=c.prec==="fp8"?P8:P16;const wl=BITS[c.prec]/8*m.lin,wh=2*m.head;
+ const FpreLin=2*m.lin*T,FpreAtt=2*m.L*T*T*m.d,Fhead=2*m.head;
+ const tpre=Math.max(FpreLin/(c.ec*Pl)+(FpreAtt+Fhead)/(c.ec*P16),(wl+wh+m.kv*T)/(c.em*BW));
+ const Tb=T+c.nout/2;
+ const Fdt=c.b*2*m.lin/(c.ec*Pl)+c.b*(2*m.head+4*m.L*Tb*m.d)/(c.ec*P16);const Qdec=wl+wh+c.b*m.kv*Tb;
+ const tdec=Math.max(Fdt,Qdec/(c.em*BW));const ttft=tenc+tpre;
+ const e2e=c.b*ttft+c.nout*tdec;
+ const memV=2*(VIS.lin+m.mer),memL=wl,memH=wh+2*m.emb,memKV=c.b*m.kv*(T+c.nout);
+ return {hb,wb,G,np,nvis,T,Fenc,tenc,Fpre:FpreLin+FpreAtt+Fhead,tpre,ttft,tdec,Qdec,Fdt,e2e,burst:c.b*ttft,X:c.b/e2e,memV,memL,memH,memKV,mem:memV+memL+memH+memKV,decBound:Qdec/(c.em*BW)>=Fdt?"bandwidth":"compute"};}
+function bestB(o,lam){let best=null;for(let b=1;b<=64;b++){const r=est(Object.assign({},o,{b}));if(r.e2e<=4&&r.burst<=1&&r.mem<=USABLE)best={b,r};}
+ if(!best)return null;return {b:best.b,r:best.r,gpus:Math.ceil(lam/best.r.X-1e-9)};}
+const OK=v=>v?`<b style="color:var(--ok)">pass</b>`:`<b style="color:var(--bad)">fail</b>`;
+
+/* ---------- Figure 1: the worked example, step by step ---------- */
+(function(){
+ const svg=$("#lb-tl-svg");if(!svg)return;const info=$("#lb-tl-info");
+ const A=est({}),Bq=est({prec:"w4"}),C=est({prec:"w4",h:896,w:672});
+ const ROWS=[["BF16, 1288×952",A],["4-bit, 1288×952",Bq],["4-bit, 896×672",C]];
+ const TXT=[
+  ()=>`<b>Inputs.</b> A 1280×960 photo is resized to ${A.hb}×${A.wb} (multiples of 28): ${cm(A.np)} patches of 14×14, merged 2×2 into <b>${cm(A.nvis)} visual tokens</b>. With 60 text tokens the prompt has T = ${cm(A.T)} tokens. Answer: 128 tokens. Targets: TTFT ≤ 1.0 s, E2E ≤ 4.0 s.`,
+  ()=>`<b>Vision encoder.</b> F = ${f2(A.Fenc/1e12)} TFLOP (linear 7.89, attention 6.41, merger 0.14). At 0.5 × 121 TFLOP/s: <b>${f0(A.tenc*1e3)} ms</b>. Its weights (1.35 GB) take only 5.6 ms to read: compute-bound.`,
+  ()=>`<b>Prefill</b> of ${cm(A.T)} tokens: F = ${f2(A.Fpre/1e12)} TFLOP, <b>${f0(A.tpre*1e3)} ms</b>, also compute-bound. First token after <b>TTFT = ${f0(A.ttft*1e3)} ms</b>: inside the 1.0 s target.`,
+  ()=>`<b>Decode</b> in BF16: each step reads ${f2(A.Qdec/1e9)} GB, so ${f1(A.tdec*1e3)} ms per token at 240 GB/s. 128 tokens take ${f2(128*A.tdec)} s. <b>E2E = ${f2(A.e2e)} s</b>: ${OK(A.e2e<=4)}. Decode is ${f0(100*128*A.tdec/A.e2e)}% of the time.`,
+  ()=>`<b>4-bit LLM weights</b> (AWQ, 4.25 bits): a decode step reads ${f2(Bq.Qdec/1e9)} GB, so ${f1(Bq.tdec*1e3)} ms per token. TTFT does not change (${f0(Bq.ttft*1e3)} ms), because prefill still computes in FP16. <b>E2E = ${f2(Bq.e2e)} s</b>: ${OK(Bq.e2e<=4)} for one request, but there is no room for batching (Step 4).`,
+  ()=>`<b>Lower resolution, 896×672</b>: ${cm(C.nvis)} visual tokens, encoder ${f0(C.tenc*1e3)} ms, prefill ${f0(C.tpre*1e3)} ms, <b>TTFT ${f0(C.ttft*1e3)} ms</b>; TPOT ${f1(C.tdec*1e3)} ms. <b>E2E = ${f2(C.e2e)} s</b>: ${OK(C.e2e<=4)}. Each change moved only the stage it targets.`];
+ function draw(k){const X=v=>150+v/9*470;let g="";
+  for(let s=0;s<=9;s++){g+=`<line x1="${X(s)}" y1="22" x2="${X(s)}" y2="196" stroke="var(--rule)" stroke-width="1"/><text x="${X(s)}" y="212" text-anchor="middle" class="svgs" font-size="11">${s} s</text>`;}
+  [[1,"TTFT 1.0 s"],[4,"E2E 4.0 s"]].forEach(([v,l])=>{g+=`<line x1="${X(v)}" y1="14" x2="${X(v)}" y2="198" stroke="var(--bad)" stroke-width="1.8" stroke-dasharray="5 4"/><text x="${X(v)+4}" y="14" class="svgs" font-size="11.5">${l}</text>`;});
+  const nr=k<=3?1:k-2;
+  for(let i=0;i<nr;i++){const [lab,r]=ROWS[i];const y=40+i*56;
+   g+=`<text x="10" y="${y+21}" class="svgt" font-size="12.5" font-weight="700">${lab}</text>`;
+   const segs=[];if(k>=1)segs.push([r.tenc,"var(--k)"]);if(k>=2)segs.push([r.tpre,"var(--q)"]);if(k>=3)segs.push([128*r.tdec,"var(--v)"]);
+   let x=0;segs.forEach(([v,c])=>{g+=`<rect x="${X(x)}" y="${y}" width="${Math.max(1.5,X(x+v)-X(x))}" height="30" fill="${c}" opacity=".85"/>`;x+=v;});
+   if(k===0)g+=`<text x="${X(0)+6}" y="${y+20}" class="svgs" font-size="12">${cm(r.nvis)} visual tokens + 60 text tokens → ?</text>`;
+   else g+=`<text x="${Math.min(X(x)+6,560)}" y="${y+20}" class="svgm" font-size="12">${k>=3?f2(x)+" s":f0(x*1e3)+" ms"}</text>`;}
+  svg.innerHTML=g;info.innerHTML=TXT[k]();}
+ B.stepper({n:6,prev:$("#lb-tl-prev"),next:$("#lb-tl-next"),play:$("#lb-tl-play"),label:$("#lb-tl-lab"),ms:3400,onStep:draw});
+})();
+
+/* ---------- Figure 2: the budget calculator ---------- */
+(function(){
+ const svg=$("#lb-plan-svg");if(!svg)return;const info=$("#lb-plan-info");
+ const RES=[448,560,672,784,896,1008,1120,1280,1344,1568,1792],FR=[1,2,4,8,16,32,64];
+ const S={res:$("#lb-plan-res"),fr:$("#lb-plan-fr"),txt:$("#lb-plan-txt"),out:$("#lb-plan-out"),b:$("#lb-plan-b")};
+ let model="7B",prec="bf16";
+ seg($("#lb-plan-model"),"m",v=>{model=v;draw();});seg($("#lb-plan-prec"),"p",v=>{prec=v;draw();});
+ function draw(){const L=RES[+S.res.value],F=FR[+S.fr.value],nt=+S.txt.value,no=+S.out.value,b=+S.b.value;
+  const h=L,w=F>1?L:Math.round(L*3/4);
+  $("#lb-plan-resv").value=F>1?`${h}×${w}`:`${h}×${w}`;$("#lb-plan-frv").value=F>1?`${F} frames`:"1 photo";
+  $("#lb-plan-txtv").value=nt;$("#lb-plan-outv").value=no;$("#lb-plan-bv").value=b;
+  const r=est({model,h,w,frames:F,ntext:nt,nout:no,prec,b});
+  const wait=(b-1)*r.ttft;const tot=r.e2e;const mx=Math.max(4.6,tot)*1.04;const X=v=>20+v/mx*600;let g="";
+  g+=`<text x="20" y="18" class="svgt" font-size="13" font-weight="700">Time of one request (s)</text>`;
+  const segs=[[wait,"var(--muted)"],[r.tenc,"var(--k)"],[r.tpre,"var(--q)"],[no*r.tdec,"var(--v)"]];let x=0;
+  segs.forEach(([v,c])=>{if(v<=0)return;g+=`<rect x="${X(x)}" y="30" width="${Math.max(1.5,X(x+v)-X(x))}" height="34" fill="${c}" opacity=".85"/>`;x+=v;});
+  [[1,"TTFT 1 s"],[4,"E2E 4 s"]].forEach(([v,l])=>{g+=`<line x1="${X(v)}" y1="24" x2="${X(v)}" y2="72" stroke="var(--bad)" stroke-width="1.8" stroke-dasharray="5 4"/><text x="${X(v)+3}" y="84" class="svgs" font-size="11">${l}</text>`;});
+  const lg=[["wait for other prefills",wait,"var(--muted)"],["encoder",r.tenc,"var(--k)"],["prefill",r.tpre,"var(--q)"],["decode",no*r.tdec,"var(--v)"]];
+  lg.forEach(([l,v,c],i)=>{const xx=20+i*155;g+=`<rect x="${xx}" y="94" width="12" height="12" fill="${c}" opacity=".85"/><text x="${xx+17}" y="105" class="svgs" font-size="11.5">${l} ${v>=1?f2(v)+" s":f0(v*1e3)+" ms"}</text>`;});
+  const mm=Math.max(24e9,r.mem)*1.04,XM=v=>20+v/mm*600;
+  g+=`<text x="20" y="140" class="svgt" font-size="13" font-weight="700">GPU memory (GB)</text>`;
+  const ms=[[r.memV,"var(--k)","vision"],[r.memL,"var(--q)","LLM linear"],[r.memH,"var(--muted)","emb. + lm_head"],[r.memKV,"var(--v)","KV cache"]];x=0;
+  ms.forEach(([v,c])=>{g+=`<rect x="${XM(x)}" y="150" width="${Math.max(1,XM(x+v)-XM(x))}" height="30" fill="${c}" opacity=".85"/>`;x+=v;});
+  g+=`<line x1="${XM(USABLE)}" y1="144" x2="${XM(USABLE)}" y2="186" stroke="var(--bad)" stroke-width="1.8" stroke-dasharray="5 4"/><text x="${XM(USABLE)-4}" y="198" text-anchor="end" class="svgs" font-size="11">usable 21.6 GB</text>`;
+  ms.forEach(([v,c,l],i)=>{const xx=20+i*158;g+=`<rect x="${xx}" y="210" width="12" height="12" fill="${c}" opacity=".85"/><text x="${xx+17}" y="221" class="svgs" font-size="11.5">${l} ${f2(v/1e9)}</text>`;});
+  svg.innerHTML=g;
+  const fits=r.mem<=USABLE;
+  info.innerHTML=`Qwen2-VL-${model}, ${PNAME[prec]}: ${F>1?F+" frames ("+r.G+" groups) at ":""}${r.hb}×${r.wb} → <b>${cm(r.nvis)} visual tokens</b>, T = ${cm(r.T)}. Encoder ${f0(r.tenc*1e3)} ms, prefill ${f0(r.tpre*1e3)} ms, so TTFT alone <b>${f0(r.ttft*1e3)} ms</b>${b>1?`, in a burst of ${b} <b>${f0(r.burst*1e3)} ms</b>`:""} (${OK(r.burst<=1)}). TPOT <b>${f1(r.tdec*1e3)} ms</b> (${r.decBound}-bound). E2E <b>${f2(r.e2e)} s</b> (${OK(r.e2e<=4)}). Memory ${f2(r.mem/1e9)} GB (${fits?"fits":"<b style='color:var(--bad)'>does not fit</b>"}). Throughput ${f3(r.X)} requests/s.`;}
+ Object.values(S).forEach(e=>e.addEventListener("input",draw));draw();
+})();
+
+/* ---------- Figure 3: the L4 roofline ---------- */
+(function(){
+ const svg=$("#lb-roof-svg");if(!svg)return;const info=$("#lb-roof-info");const BS=[1,2,4,8,16,32,64,128,256,512];
+ let prec="bf16";seg($("#lb-roof-prec"),"p",v=>{prec=v;draw();});const SL=$("#lb-roof-b");
+ const m=MOD["7B"],base=est({prec:"w4",h:896,w:672}),T=base.T,Tb=T+64;
+ const lx0=Math.log10(0.5),lx1=Math.log10(3e4),ly0=11,ly1=Math.log10(6e14);
+ const X=v=>60+(Math.log10(v)-lx0)/(lx1-lx0)*560,Y=v=>290-(Math.log10(v)-ly0)/(ly1-ly0)*270;
+ function draw(){const b=BS[+SL.value];$("#lb-roof-bv").value=b;const P=prec==="fp8"?P8:P16;
+  let g="";
+  [0.5,1,10,100,1e3,1e4].forEach(v=>{g+=`<line x1="${X(v)}" y1="20" x2="${X(v)}" y2="290" stroke="var(--rule)"/><text x="${X(v)}" y="306" text-anchor="middle" class="svgs" font-size="11">${v>=1e3?(v/1e3)+"k":v}</text>`;});
+  [1e11,1e12,1e13,1e14].forEach(v=>{g+=`<line x1="60" y1="${Y(v)}" x2="620" y2="${Y(v)}" stroke="var(--rule)"/><text x="54" y="${Y(v)+4}" text-anchor="end" class="svgs" font-size="11">${v/1e12>=1?v/1e12:v/1e12}</text>`;});
+  g+=`<text x="340" y="324" text-anchor="middle" class="svgs" font-size="11.5">arithmetic intensity (FLOPs per byte, log)</text><text x="14" y="160" class="svgs" font-size="11.5" transform="rotate(-90 14 160)" text-anchor="middle">TFLOP/s (log)</text>`;
+  const roof=(PP,dash)=>{const ridge=PP/BW;return `<path d="M${X(0.5)} ${Y(0.5*BW)} L${X(ridge)} ${Y(PP)} L${X(3e4)} ${Y(PP)}" fill="none" stroke="var(--ink)" stroke-width="2.2" ${dash?'stroke-dasharray="6 4" opacity=".5"':""}/>`;};
+  g+=roof(P16,prec==="fp8");if(prec==="fp8")g+=roof(P8,false);
+  g+=`<line x1="${X(P16/BW)}" y1="${Y(P16)}" x2="${X(P16/BW)}" y2="290" stroke="var(--muted)" stroke-dasharray="3 3"/><text x="${X(P16/BW)+5}" y="284" class="svgs" font-size="11">ridge ${f0(P16/BW)} (BF16)</text>`;
+  if(prec==="fp8")g+=`<text x="${X(P8/BW)+6}" y="${Y(P8)-6}" class="svgs" font-size="11">FP8 roof 242, ridge ${f0(P8/BW)}</text>`;
+  const wl=BITS[prec]/8*m.lin,wh=2*m.head;
+  const Ienc=base.Fenc/(2*(VIS.lin+m.mer));const Ipre=base.Fpre/(wl+wh+m.kv*T);
+  const Fd=b*(2*m.lin+2*m.head+4*m.L*Tb*m.d),Qd=wl+wh+b*m.kv*Tb,Id=Fd/Qd;
+  const att=(I,PP)=>Math.min(PP,I*BW);
+  const pts=[["encoder",Ienc,att(Ienc,P16),"var(--k)"],["prefill",Ipre,att(Ipre,P),"var(--q)"],[`decode b=${b}`,Id,att(Id,P),"var(--v)"]];
+  pts.forEach(([l,I,a,c],i)=>{g+=`<circle cx="${X(I)}" cy="${Y(a)}" r="7" fill="${c}" stroke="var(--ink)" stroke-width="1"/><text x="${X(I)+(i===2?10:-10)}" y="${Y(a)+(i===0?24:i===1?-12:22)}" text-anchor="${i===2?"start":"end"}" class="svgt" font-size="12" font-weight="700">${l}</text>`;});
+  svg.innerHTML=g;
+  const tstep=Math.max(Fd/P,Qd/BW);
+  info.innerHTML=`Decode at b = ${b} (${PNAME[prec]}): ${f1(Fd/1e9)} GFLOP over ${f2(Qd/1e9)} GB, intensity <b>${f1(Id)}</b> FLOPs/byte against a ridge of ${f0(P/BW)}: <b>${Id<P/BW?"bandwidth-bound":"compute-bound"}</b>. Step time at peak ≥ ${f1(tstep*1e3)} ms, so at most <b>${f0(b/tstep)} tokens/s</b> in total. Encoder intensity ${f0(Ienc)}, prefill ${f0(Ipre)}: both compute-bound.`;}
+ SL.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 4: batch size, throughput and GPUs ---------- */
+(function(){
+ const svg=$("#lb-batch-svg");if(!svg)return;const info=$("#lb-batch-info");const LAM=$("#lb-batch-lam");
+ const PLANS={"w4-896":{prec:"w4",h:896,w:672},"w4-1288":{prec:"w4",h:1280,w:960},"fp8-896":{prec:"fp8",h:896,w:672},"bf16-896":{prec:"bf16",h:896,w:672}};
+ let key="w4-896";seg($("#lb-batch-plan"),"k",v=>{key=v;draw();});
+ function draw(){const lam=+LAM.value;$("#lb-batch-lamv").value=lam.toFixed(1);const o=PLANS[key];
+  const rs=[];for(let b=1;b<=16;b++)rs.push(est(Object.assign({},o,{b})));
+  const ym=Math.max(8,...rs.map(r=>Math.min(r.e2e,20)))*1.05,xm=Math.max(...rs.map(r=>r.X))*1.25;
+  const X=b=>60+(b-0.5)/16*540,Y=v=>260-Math.min(v,ym)/ym*235,Y2=v=>260-v/xm*235;let g="";
+  for(let t=0;t<=ym;t+=ym>12?4:2){g+=`<line x1="60" y1="${Y(t)}" x2="600" y2="${Y(t)}" stroke="var(--rule)"/><text x="54" y="${Y(t)+4}" text-anchor="end" class="svgs" font-size="11">${t} s</text>`;}
+  rs.forEach((r,i)=>{const b=i+1;g+=`<rect x="${X(b)-11}" y="${Y2(r.X)}" width="22" height="${260-Y2(r.X)}" fill="var(--k)" opacity=".35"/>`;if(b%2===1||b===16)g+=`<text x="${X(b)}" y="276" text-anchor="middle" class="svgs" font-size="11">${b}</text>`;});
+  [0.5,1,1.5,2,2.5,3].filter(v=>v<xm).forEach(v=>{g+=`<text x="606" y="${Y2(v)+4}" class="svgs" font-size="10.5">${v}</text>`;});
+  [[4,"E2E target 4 s"],[1,"TTFT target 1 s"]].forEach(([v,l])=>{g+=`<line x1="60" y1="${Y(v)}" x2="600" y2="${Y(v)}" stroke="var(--bad)" stroke-width="1.6" stroke-dasharray="5 4"/><text x="64" y="${Y(v)-4}" class="svgs" font-size="11">${l}</text>`;});
+  const line=(f,c)=>`<path d="${rs.map((r,i)=>(i?"L":"M")+X(i+1)+" "+Y(f(r))).join(" ")}" fill="none" stroke="${c}" stroke-width="2.4"/>`;
+  g+=line(r=>r.e2e,"var(--v)")+line(r=>r.burst,"var(--q)");
+  rs.forEach((r,i)=>{const ok=r.e2e<=4&&r.burst<=1;[[r.e2e,"var(--v)"],[r.burst,"var(--q)"]].forEach(([v,c])=>{if(v>ym)return;g+=`<circle cx="${X(i+1)}" cy="${Y(v)}" r="4.5" fill="${ok?c:"var(--card)"}" stroke="${c}" stroke-width="2"/>`;});});
+  g+=`<text x="330" y="294" text-anchor="middle" class="svgs" font-size="11.5">concurrent requests b</text><text x="634" y="140" class="svgs" font-size="11" transform="rotate(90 634 140)" text-anchor="middle">requests/s</text>`;
+  svg.innerHTML=g;
+  const bb=bestB(o,lam);
+  info.innerHTML=bb?`Best batch <b>b* = ${bb.b}</b>: E2E ${f2(bb.r.e2e)} s, burst TTFT ${f2(bb.r.burst)} s, TPOT ${f1(bb.r.tdec*1e3)} ms, throughput <b>${f3(bb.r.X)} requests/s</b> per L4. For ${lam.toFixed(1)} requests/s you need <b>${bb.gpus} L4${bb.gpus>1?"s":""}</b>. At b = ${bb.b+1}: E2E ${f2(rs[bb.b]?rs[bb.b].e2e:est(Object.assign({},o,{b:bb.b+1})).e2e)} s, burst TTFT ${f2(rs[bb.b]?rs[bb.b].burst:est(Object.assign({},o,{b:bb.b+1})).burst)} s.`:`<b style="color:var(--bad)">No batch size meets both targets</b>: even at b = 1, E2E is ${f2(rs[0].e2e)} s and TTFT ${f2(rs[0].burst)} s. Change the precision, the resolution or the output length first.`;}
+ LAM.addEventListener("input",draw);draw();
+})();
+
+/* ---------- Figure 5: calibrate with a measurement ---------- */
+(function(){
+ const svg=$("#lb-cal-svg");if(!svg)return;const info=$("#lb-cal-info");const ST=$("#lb-cal-ttft"),SP=$("#lb-cal-tpot");
+ const o={prec:"w4",h:896,w:672};const e0=est(o);const Fpf=e0.Fenc+e0.Fpre;
+ function draw(){const tt=+ST.value/1e3,tp=+SP.value/1e3;$("#lb-cal-ttftv").value=f0(tt*1e3);$("#lb-cal-tpotv").value=f1(tp*1e3);
+  const ec=Fpf/(P16*tt),em=e0.Qdec/(BW*tp);const o2=Object.assign({},o,{ec,em});const r1=est(o2);
+  const X=v=>170+v/1.25*440,X2=v=>170+v/65*440;let g="";
+  const row=(y,lab,a,bv,XX,u)=>{g+=`<text x="10" y="${y+14}" class="svgt" font-size="12.5" font-weight="700">${lab}</text>`;
+   g+=`<rect x="170" y="${y}" width="${XX(a)-170}" height="16" fill="var(--muted)" opacity=".55"/><text x="${XX(a)+5}" y="${y+13}" class="svgm" font-size="11.5">estimate ${u(a)}</text>`;
+   g+=`<rect x="170" y="${y+20}" width="${XX(bv)-170}" height="16" fill="var(--q)" opacity=".85"/><text x="${XX(bv)+5}" y="${y+33}" class="svgm" font-size="11.5">measured ${u(bv)}</text>`;};
+  row(14,"TTFT",e0.ttft,tt,X,v=>f0(v*1e3)+" ms");row(74,"TPOT",e0.tdec*1e3,tp*1e3,X2,v=>f1(v)+" ms");
+  const pl=(v)=>v>=0.3&&v<=0.9;
+  g+=`<text x="10" y="150" class="svgt" font-size="13">implied η<tspan font-size="10" dy="3">c</tspan><tspan dy="-3"> = ${f2(ec)}</tspan></text><text x="10" y="172" class="svgt" font-size="13">implied η<tspan font-size="10" dy="3">m</tspan><tspan dy="-3"> = ${f2(em)}</tspan></text>`;
+  g+=`<text x="170" y="150" class="svgs" font-size="12">${pl(ec)?"plausible (0.3 to 0.9)":"outside 0.3 to 0.9: look for a missing cost"} — assumed 0.50</text><text x="170" y="172" class="svgs" font-size="12">${pl(em)?"plausible (0.3 to 0.9)":"outside 0.3 to 0.9: look for a missing cost"} — assumed 0.80</text>`;
+  const bb=bestB(o2,2);
+  g+=`<text x="10" y="206" class="svgt" font-size="13" font-weight="700">New plan for 2 requests/s: ${bb?`b* = ${bb.b}, ${bb.gpus} L4s`:"no batch size meets the targets"}</text>`;
+  svg.innerHTML=g;
+  info.innerHTML=`Implied efficiencies: η<sub>c</sub> = ${f3(ec)}, η<sub>m</sub> = ${f3(em)}. Re-estimated E2E at b = 1: <b>${f2(r1.e2e)} s</b>. ${bb?`Best batch <b>b* = ${bb.b}</b> (E2E ${f2(bb.r.e2e)} s, burst TTFT ${f2(bb.r.burst)} s), throughput ${f3(bb.r.X)} requests/s, so <b>${bb.gpus} L4s</b> for 2 requests/s (the uncalibrated plan needed 3).`:`<b style="color:var(--bad)">No batch size meets both targets</b> with these measurements.`}`;}
+ [ST,SP].forEach(e=>e.addEventListener("input",draw));draw();
+})();
+})();
+</script></body></html>
